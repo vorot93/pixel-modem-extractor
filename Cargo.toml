@@ -1,0 +1,30 @@
+[package]
+name = "pixel-modem-extractor"
+version = "1.0.0"
+edition = "2024"
+authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
+license = "Apache-2.0"
+description = "Extract and analyze Pixel/Shannon S5400 modem firmware from a radio FBPK image."
+repository = "https://github.com/vorot93/pixel-modem-extractor"
+readme = "README.md"
+keywords = ["firmware", "baseband", "reverse-engineering", "pixel", "modem"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "pixel-modem-extractor"
+path = "src/bin/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1.5"
+ext4-view = { version = "0.9", features = ["std"] }
+flate2 = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tar = "0.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"

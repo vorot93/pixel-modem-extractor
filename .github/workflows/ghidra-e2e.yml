@@ -1,0 +1,46 @@
+name: ghidra-e2e
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+jobs:
+  ghidra-e2e:
+    name: decompile e2e (real Ghidra)
+    runs-on: ubuntu-latest
+    env:
+      GHIDRA_VERSION: "12.1.2"
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/setup-java@main
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@master
+      - name: Cache Ghidra
+        id: cache-ghidra
+        uses: actions/cache@main
+        with:
+          path: ~/ghidra
+          key: ghidra-${{ env.GHIDRA_VERSION }}
+      - name: Download Ghidra ${{ env.GHIDRA_VERSION }}
+        if: steps.cache-ghidra.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tag="Ghidra_${GHIDRA_VERSION}_build"
+          url=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/${tag}" \
+            | jq -r 'first(.assets[] | select(.name | endswith(".zip")) | .browser_download_url)')
+          test -n "$url"
+          echo "Downloading $url"
+          curl -fsSL -o /tmp/ghidra.zip "$url"
+          mkdir -p ~/ghidra
+          unzip -q /tmp/ghidra.zip -d ~/ghidra
+      - name: Run decompile e2e
+        run: |
+          set -euo pipefail
+          export GHIDRA_INSTALL_DIR="$HOME/ghidra/ghidra_${GHIDRA_VERSION}_PUBLIC"
+          test -x "$GHIDRA_INSTALL_DIR/support/analyzeHeadless"
+          cargo test --test decompile_golden -- --nocapture

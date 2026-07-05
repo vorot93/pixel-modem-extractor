@@ -1,0 +1,420 @@
+use crate::pipeline;
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
+
+#[derive(Parser)]
+#[command(
+    name = "pixel-modem-extractor",
+    about = "Extract Pixel modem artifacts from a radio FBPK .img"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Full pipeline: .img -> ext4 -> rootfs -> rf decompress -> TOC split
+    Extract {
+        img: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Stage 1-2: .img -> modem.ext4
+    UnpackFbpk {
+        img: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Stage 5: modem.bin -> split images
+    SplitToc {
+        modem_bin: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Reconstruct the 02_MAIN source tree from embedded __FILE__ strings
+    SourceTree {
+        input: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        no_attribution: bool,
+        #[arg(long, default_value_t = 4)]
+        gap: usize,
+        #[arg(long, default_value_t = 0.05)]
+        shared_pct: f64,
+        #[arg(long, default_value_t = 3)]
+        min_run: usize,
+    },
+    /// Decode the RF_CFG calibration databases (structural + numeric)
+    DecodeRf {
+        rf_dir: PathBuf,
+        #[arg(long)]
+        hwcfg: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Decode the pw_token_db Pigweed token database (TOKENS) -> CSV + summary
+    DecodeTokens {
+        input: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Summarize hardware_config.json (structural stats + RF_CFG coverage)
+    HardwareConfig {
+        input: PathBuf,
+        #[arg(long)]
+        rf_dir: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Decompile modem TOC images; --run drives Ghidra headless and radare2 for dense Thumb regions
+    Decompile {
+        modem_bin: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        run: bool,
+        #[arg(long)]
+        ghidra_home: Option<PathBuf>,
+        #[arg(long, default_value = "ARM:LE:32:v7")]
+        processor: String,
+    },
+    /// Exhaustive pipeline: extract, Ghidra/radare2 decompile, recovered attribution, and decoders
+    Decompose {
+        img: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        no_verify: bool,
+        #[arg(long)]
+        prune: bool,
+        #[arg(long)]
+        ghidra_home: Option<PathBuf>,
+        #[arg(long, default_value = "ARM:LE:32:v7")]
+        processor: String,
+    },
+    /// Symbolicate a decompose output tree: recover names + log annotations in place, emit symbols.json
+    Symbolicate {
+        path: PathBuf,
+        #[arg(long)]
+        token_db: Option<PathBuf>,
+    },
+}
+
+fn default_out(img: &Path) -> PathBuf {
+    let stem = img
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".into());
+    PathBuf::from(format!("./{stem}.extracted"))
+}
+
+pub fn run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Extract {
+            img,
+            out,
+            no_verify,
+        } => {
+            let out = out.unwrap_or_else(|| default_out(&img));
+            let manifest = pipeline::extract(&img, &out, !no_verify)?;
+            println!("extracted -> {}", out.display());
+            println!("manifest  -> {}", manifest.display());
+        }
+        Commands::UnpackFbpk { img, out } => {
+            let out = out.unwrap_or_else(|| default_out(&img));
+            // v1: no partial-pipeline API yet — runs the full pipeline and reports the ext4 path
+            let _ = pipeline::extract(&img, &out, false)?;
+            println!("ext4 -> {}", out.join("modem.ext4").display());
+        }
+        Commands::SplitToc { modem_bin, out } => {
+            let out = out.unwrap_or_else(|| default_out(&modem_bin));
+            let data = std::fs::read(&modem_bin)?;
+            let toc = crate::toc::Toc::parse(&data)?;
+            toc.split_to_dir(&data, &out.join("modem.bin.split"), true)?;
+            println!("split -> {}", out.join("modem.bin.split").display());
+        }
+        Commands::SourceTree {
+            input,
+            out,
+            no_attribution,
+            gap,
+            shared_pct,
+            min_run,
+        } => {
+            let out = out.unwrap_or_else(|| {
+                let stem = input
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "out".into());
+                PathBuf::from(format!("./{stem}.source_tree"))
+            });
+            let opts = crate::source_tree::Opts {
+                no_attribution,
+                gap,
+                shared_pct,
+                min_run,
+            };
+            let manifest = crate::source_tree::run(&input, &out, &opts)?;
+            println!("source tree -> {}", out.display());
+            println!("manifest    -> {}", manifest.display());
+        }
+        Commands::DecodeRf { rf_dir, hwcfg, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from("./decoded_rf"));
+            crate::decode_rf::run(&rf_dir, &hwcfg, &out)?; // run() prints the console report
+        }
+        Commands::DecodeTokens { input, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from("./decoded_tokens"));
+            crate::tokens::run(&input, &out)?; // run() prints the console report
+        }
+        Commands::HardwareConfig { input, rf_dir, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from("./hwcfg_summary"));
+            crate::hwcfg::run(&input, rf_dir.as_deref(), &out)?; // run() prints the console report
+        }
+        Commands::Decompile {
+            modem_bin,
+            out,
+            image,
+            run,
+            ghidra_home,
+            processor,
+        } => {
+            let out = out.unwrap_or_else(|| {
+                let stem = modem_bin
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "modem".into());
+                PathBuf::from(format!("./{stem}.decompiled"))
+            });
+            let opts = crate::decompile::Opts {
+                run,
+                image,
+                ghidra_home,
+                processor,
+            };
+            crate::decompile::run(&modem_bin, &opts, &out)?; // run() prints the console report
+        }
+        Commands::Decompose {
+            img,
+            out,
+            no_verify,
+            prune,
+            ghidra_home,
+            processor,
+        } => {
+            let out = out.unwrap_or_else(|| {
+                let stem = img
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "out".into());
+                PathBuf::from(format!("./{stem}.decomposed"))
+            });
+            let opts = crate::decompose::Opts {
+                no_verify,
+                prune,
+                ghidra_home,
+                processor,
+            };
+            let report = crate::decompose::run(&img, &opts, &out)?;
+            println!("decomposed -> {}", out.display());
+            println!("report     -> {}", report.display());
+        }
+        Commands::Symbolicate { path, token_db } => {
+            let opts = crate::symbolicate::Opts { token_db };
+            let root = crate::symbolicate::run(&path, &opts)?;
+            println!("symbolicated -> {}", root.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_extract() {
+        let cli = Cli::try_parse_from(["pme", "extract", "/tmp/x.img", "--out", "/tmp/o"]).unwrap();
+        match cli.command {
+            Commands::Extract {
+                img,
+                out,
+                no_verify,
+            } => {
+                assert_eq!(img, PathBuf::from("/tmp/x.img"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/o")));
+                assert!(!no_verify);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_decode_tokens() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decode-tokens",
+            "/tmp/pw_token_db",
+            "--out",
+            "/tmp/o",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::DecodeTokens { input, out } => {
+                assert_eq!(input, PathBuf::from("/tmp/pw_token_db"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/o")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_decompile() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decompile",
+            "/tmp/modem.bin",
+            "--out",
+            "/tmp/o",
+            "--image",
+            "05_DBGCORE",
+            "--run",
+            "--ghidra-home",
+            "/opt/ghidra",
+            "--processor",
+            "ARM:LE:32:v8",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Decompile {
+                modem_bin,
+                out,
+                image,
+                run,
+                ghidra_home,
+                processor,
+            } => {
+                assert_eq!(modem_bin, PathBuf::from("/tmp/modem.bin"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/o")));
+                assert_eq!(image, Some("05_DBGCORE".to_string()));
+                assert!(run);
+                assert_eq!(ghidra_home, Some(PathBuf::from("/opt/ghidra")));
+                assert_eq!(processor, "ARM:LE:32:v8");
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompile_help_mentions_radare2_thumb_regions() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompile")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("radare2"), "help:\n{help}");
+        assert!(help.contains("Thumb"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompose_help_mentions_recovered_attribution_and_tool_requirements() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompose")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("recovered"), "help:\n{help}");
+        assert!(help.contains("Ghidra"), "help:\n{help}");
+        assert!(help.contains("radare2"), "help:\n{help}");
+    }
+
+    #[test]
+    fn parses_hardware_config() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "hardware-config",
+            "/tmp/hardware_config.json",
+            "--rf-dir",
+            "/tmp/rf",
+            "--out",
+            "/tmp/o",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::HardwareConfig { input, rf_dir, out } => {
+                assert_eq!(input, PathBuf::from("/tmp/hardware_config.json"));
+                assert_eq!(rf_dir, Some(PathBuf::from("/tmp/rf")));
+                assert_eq!(out, Some(PathBuf::from("/tmp/o")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_decompose() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decompose",
+            "/tmp/radio.img",
+            "--out",
+            "/tmp/o",
+            "--prune",
+            "--no-verify",
+            "--ghidra-home",
+            "/opt/ghidra",
+            "--processor",
+            "ARM:LE:32:v8",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Decompose {
+                img,
+                out,
+                no_verify,
+                prune,
+                ghidra_home,
+                processor,
+            } => {
+                assert_eq!(img, PathBuf::from("/tmp/radio.img"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/o")));
+                assert!(no_verify);
+                assert!(prune);
+                assert_eq!(ghidra_home, Some(PathBuf::from("/opt/ghidra")));
+                assert_eq!(processor, "ARM:LE:32:v8");
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_symbolicate() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "symbolicate",
+            "/tmp/dec",
+            "--token-db",
+            "/tmp/pw_token_db",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Symbolicate { path, token_db } => {
+                assert_eq!(path, PathBuf::from("/tmp/dec"));
+                assert_eq!(token_db, Some(PathBuf::from("/tmp/pw_token_db")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+}

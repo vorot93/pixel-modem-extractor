@@ -1,0 +1,777 @@
+//! `decompose` — the exhaustive one-command pipeline. Runs extraction, decompiles
+//! every modem image (Ghidra + radare2), and runs every decoder, marshaling all
+//! outputs into one per-image tree with a machine-readable `report.json`. Best-effort:
+//! a stage failure is recorded and the run continues; the process exits non-zero if
+//! anything failed. `--prune` reduces the tree to only the terminal ("leaf") artifacts.
+
+use crate::decompile::{self, ImageOutcome};
+use crate::error::{Error, Result};
+use crate::{
+    decode_rf, hwcfg, manifest, pipeline, recover_source, source_tree, symbolicate, tokens,
+};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+#[derive(Debug, Clone)]
+pub struct Opts {
+    pub no_verify: bool,
+    pub prune: bool,
+    pub ghidra_home: Option<PathBuf>,
+    pub processor: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageReport {
+    pub image: String,
+    pub status: &'static str, // "analyzed" | "failed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_functions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+}
+
+impl ImageReport {
+    pub fn from_result(r: &decompile::ImageResult) -> Self {
+        match r.outcome {
+            ImageOutcome::Analyzed(n) => ImageReport {
+                image: r.label.clone(),
+                status: if r.thumb_error.is_some() {
+                    "failed"
+                } else {
+                    "analyzed"
+                },
+                functions: Some(n),
+                thumb_functions: r.thumb_functions,
+                thumb_error: r.thumb_error.clone(),
+                exit: None,
+            },
+            ImageOutcome::Failed(code) => ImageReport {
+                image: r.label.clone(),
+                status: "failed",
+                functions: None,
+                thumb_functions: r.thumb_functions,
+                thumb_error: r.thumb_error.clone(),
+                exit: Some(code),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct StageReport {
+    pub stage: &'static str,
+    pub status: &'static str, // "ok" | "skipped" | "failed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageReport>,
+    pub duration_ms: u128,
+}
+
+impl StageReport {
+    fn ok(stage: &'static str, output: &str, ms: u128) -> Self {
+        StageReport {
+            stage,
+            status: "ok",
+            output: Some(output.to_string()),
+            reason: None,
+            error: None,
+            images: Vec::new(),
+            duration_ms: ms,
+        }
+    }
+    fn skipped(stage: &'static str, reason: &str) -> Self {
+        StageReport {
+            stage,
+            status: "skipped",
+            output: None,
+            reason: Some(reason.to_string()),
+            error: None,
+            images: Vec::new(),
+            duration_ms: 0,
+        }
+    }
+    fn failed(stage: &'static str, error: String, ms: u128) -> Self {
+        StageReport {
+            stage,
+            status: "failed",
+            output: None,
+            reason: None,
+            error: Some(error),
+            images: Vec::new(),
+            duration_ms: ms,
+        }
+    }
+    fn decompile(images: Vec<ImageReport>, ms: u128) -> Self {
+        let any_failed = images.iter().any(|i| i.status == "failed");
+        StageReport {
+            stage: "decompile",
+            status: if any_failed { "failed" } else { "ok" },
+            output: Some("images/".to_string()),
+            reason: None,
+            error: None,
+            images,
+            duration_ms: ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct GhidraTools {
+    pub headless: String,
+    pub radare2: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub tool_version: String,
+    pub source_image: String,
+    pub source_sha256: String,
+    pub out: String,
+    pub ghidra: GhidraTools,
+    pub pruned: bool,
+    pub ok: bool,
+    pub stages: Vec<StageReport>,
+}
+
+impl Report {
+    fn is_ok(stages: &[StageReport]) -> bool {
+        !stages.iter().any(|s| s.status == "failed")
+    }
+}
+
+/// Both tools are hard requirements; error before anything is written if either is absent.
+fn preflight(headless: Result<PathBuf>, r2: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
+    let headless = headless?;
+    let r2 = r2.ok_or_else(|| {
+        Error::ToolNotFound("radare2 (r2) on PATH — required by `decompose`".into())
+    })?;
+    Ok((headless, r2))
+}
+
+/// The single `<out>/rootfs/images/<sub>/` directory `extract` produced.
+fn rootfs_image_dir(out: &Path) -> Result<PathBuf> {
+    let base = out.join("rootfs").join("images");
+    // Guard the read so a wholly-absent base yields a typed NotFound (not a raw Io error),
+    // matching the empty-directory case below.
+    if base.is_dir() {
+        for entry in std::fs::read_dir(&base)? {
+            let p = entry?.path();
+            if p.is_dir() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(Error::NotFound(format!(
+        "no rootfs image dir under {}",
+        base.display()
+    )))
+}
+
+/// Move one image's decompile artifacts into its unified folder:
+///   `<ghidra>/images/<label>`   (slice file) -> `<images>/<label>/<label>.bin`
+///   `<ghidra>/export/<label>/`  (export dir)  -> `<images>/<label>/decompiled/`
+fn marshal_image(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()> {
+    let dest = images_dir.join(label);
+    std::fs::create_dir_all(&dest)?;
+    let slice = ghidra_dir.join("images").join(label);
+    if slice.exists() {
+        std::fs::rename(&slice, dest.join(format!("{label}.bin")))?;
+    }
+    let export = ghidra_dir.join("export").join(label);
+    if export.exists() {
+        std::fs::rename(&export, dest.join("decompiled"))?;
+    }
+    Ok(())
+}
+
+/// Remove a file or directory if present; a missing path is not an error.
+fn remove_any(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Leaves-only sweep: drop every intermediate, keep terminal artifacts + report/manifest.
+fn prune(out: &Path) -> Result<()> {
+    remove_any(&out.join("modem.ext4"))?;
+    remove_any(&out.join("rootfs"))?;
+    remove_any(&out.join("rf_cfg_decompressed"))?;
+    remove_any(&out.join("ghidra"))?;
+    let images = out.join("images");
+    if images.is_dir() {
+        for entry in std::fs::read_dir(&images)? {
+            let dir = entry?.path();
+            if dir.is_dir()
+                && let Some(label) = dir.file_name().and_then(|n| n.to_str())
+            {
+                remove_any(&dir.join(format!("{label}.bin")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run a `Result<PathBuf>`-returning stage, recording ok/failed with timing.
+fn run_stage(
+    stages: &mut Vec<StageReport>,
+    name: &'static str,
+    output: &str,
+    f: impl FnOnce() -> Result<PathBuf>,
+) {
+    let t = Instant::now();
+    match f() {
+        Ok(_) => stages.push(StageReport::ok(name, output, t.elapsed().as_millis())),
+        Err(e) => stages.push(StageReport::failed(
+            name,
+            e.to_string(),
+            t.elapsed().as_millis(),
+        )),
+    }
+}
+
+/// Write `report.json`; return its path on full success, or `Err` if any stage failed.
+fn finalize(
+    out: &Path,
+    img: &Path,
+    opts: &Opts,
+    headless: &Path,
+    r2: &Path,
+    stages: Vec<StageReport>,
+) -> Result<PathBuf> {
+    let ok = Report::is_ok(&stages);
+    let report = Report {
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        source_image: img.display().to_string(),
+        source_sha256: manifest::sha256_file(img).unwrap_or_default(),
+        out: out.display().to_string(),
+        ghidra: GhidraTools {
+            headless: headless.display().to_string(),
+            radare2: r2.display().to_string(),
+        },
+        pruned: opts.prune,
+        ok,
+        stages,
+    };
+    let path = out.join("report.json");
+    let json =
+        serde_json::to_string_pretty(&report).map_err(|e| Error::Serialize(e.to_string()))?;
+    std::fs::write(&path, json)?;
+    if ok {
+        Ok(path)
+    } else {
+        Err(Error::DecomposeIncomplete(format!(
+            "one or more stages failed; see {}",
+            path.display()
+        )))
+    }
+}
+
+/// Exhaustive pipeline into one per-image tree. Ghidra + radare2 required (probed
+/// first). Best-effort across stages; writes `report.json`; `Err` if any stage failed.
+pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
+    // 1. Preflight — both tools required, before anything is written.
+    let (headless, r2) = preflight(
+        decompile::find_headless(opts.ghidra_home.as_deref()).map(|g| g.headless),
+        decompile::find_radare2(),
+    )?;
+    std::fs::create_dir_all(out)?;
+    let mut stages: Vec<StageReport> = Vec::new();
+
+    // 2. Extract.
+    let t = Instant::now();
+    match pipeline::extract(img, out, !opts.no_verify) {
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(out.join("modem.bin.split")); // superseded by images/
+            stages.push(StageReport::ok(
+                "extract",
+                "manifest.json",
+                t.elapsed().as_millis(),
+            ));
+        }
+        Err(e) => {
+            stages.push(StageReport::failed(
+                "extract",
+                e.to_string(),
+                t.elapsed().as_millis(),
+            ));
+            return finalize(out, img, opts, &headless, &r2, stages); // nothing to analyze
+        }
+    }
+    let rootfs = match rootfs_image_dir(out) {
+        Ok(p) => p,
+        Err(e) => {
+            stages.push(StageReport::failed("locate_rootfs", e.to_string(), 0));
+            return finalize(out, img, opts, &headless, &r2, stages);
+        }
+    };
+    let modem_bin = rootfs.join("modem.bin");
+    let images_dir = out.join("images");
+
+    // 3. Decompile all images into out/ghidra, then marshal into per-image folders.
+    let t = Instant::now();
+    let ghidra_dir = out.join("ghidra");
+    let dopts = decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: opts.ghidra_home.clone(),
+        processor: opts.processor.clone(),
+    };
+    match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
+        Ok(rep) => {
+            let mut image_reports = Vec::new();
+            let mut marshal_err = None;
+            for ir in &rep.images {
+                if let Err(e) = marshal_image(&ghidra_dir, &images_dir, &ir.label) {
+                    marshal_err = Some(e.to_string());
+                    break;
+                }
+                image_reports.push(ImageReport::from_result(ir));
+            }
+            match marshal_err {
+                None => stages.push(StageReport::decompile(
+                    image_reports,
+                    t.elapsed().as_millis(),
+                )),
+                Some(err) => stages.push(StageReport::failed(
+                    "decompile",
+                    format!("marshal: {err}"),
+                    t.elapsed().as_millis(),
+                )),
+            }
+        }
+        Err(e) => stages.push(StageReport::failed(
+            "decompile",
+            e.to_string(),
+            t.elapsed().as_millis(),
+        )),
+    }
+
+    // 4. Source tree — 02_MAIN only.
+    let main_bin = images_dir.join("02_MAIN").join("02_MAIN.bin");
+    if main_bin.exists() {
+        let st_out = images_dir.join("02_MAIN").join("source_tree");
+        let st_opts = source_tree::Opts {
+            no_attribution: false,
+            gap: 4,
+            shared_pct: 0.05,
+            min_run: 3,
+        };
+        run_stage(
+            &mut stages,
+            "source_tree",
+            "images/02_MAIN/source_tree",
+            || source_tree::run(&main_bin, &st_out, &st_opts),
+        );
+    } else {
+        stages.push(StageReport::skipped("source_tree", "no 02_MAIN image"));
+    }
+
+    let source_tree_dir = images_dir.join("02_MAIN").join("source_tree");
+    let decompiled_dir = images_dir.join("02_MAIN").join("decompiled");
+    if source_tree_dir.join("manifest.json").exists()
+        && source_tree_dir.join("tree").is_dir()
+        && decompiled_dir.join("functions.json").exists()
+        && decompiled_dir.join("decompiled.c").exists()
+    {
+        run_stage(
+            &mut stages,
+            "source_attribution",
+            "images/02_MAIN/source_tree/recovered_index.json",
+            || {
+                recover_source::run(
+                    &source_tree_dir,
+                    &decompiled_dir,
+                    &source_tree_dir.join("recovered_index.json"),
+                    &recover_source::Opts::default(),
+                )
+            },
+        );
+    } else {
+        stages.push(StageReport::skipped(
+            "source_attribution",
+            "no 02_MAIN source tree or decompiler artifacts",
+        ));
+    }
+
+    // 5. Decoders (skip on missing optional inputs).
+    let rf_dir = out.join("rf_cfg_decompressed");
+    let hwcfg_path = rootfs.join("hardware_config.json");
+    let rf_present = std::fs::read_dir(&rf_dir)
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false);
+
+    if hwcfg_path.exists() && rf_present {
+        run_stage(&mut stages, "decode_rf", "rf/decoded", || {
+            decode_rf::run(&rf_dir, &hwcfg_path, &out.join("rf").join("decoded"))
+        });
+    } else {
+        stages.push(StageReport::skipped(
+            "decode_rf",
+            "no hardware_config.json or no RF_CFG_* blobs",
+        ));
+    }
+
+    if hwcfg_path.exists() {
+        let rf_arg = rf_present.then(|| rf_dir.clone());
+        run_stage(&mut stages, "hardware_config", "rf/hwcfg_summary", || {
+            hwcfg::run(
+                &hwcfg_path,
+                rf_arg.as_deref(),
+                &out.join("rf").join("hwcfg_summary"),
+            )
+        });
+    } else {
+        stages.push(StageReport::skipped(
+            "hardware_config",
+            "no hardware_config.json",
+        ));
+    }
+
+    let token_db = rootfs.join("pw_token_db");
+    if token_db.exists() {
+        run_stage(&mut stages, "decode_tokens", "tokens", || {
+            tokens::run(&token_db, &out.join("tokens"))
+        });
+    } else {
+        stages.push(StageReport::skipped("decode_tokens", "no pw_token_db"));
+    }
+
+    // 5b. Symbolicate — recover names + log annotations in place, emit symbols.json.
+    //     Runs before prune so the raw split images (images/<label>/<label>.bin) and
+    //     the token DB are still present. Best-effort; degrades without evidence.
+    let sym_token_db = token_db.exists().then(|| token_db.clone());
+    run_stage(
+        &mut stages,
+        "symbolicate",
+        "images/*/decompiled/symbols.json",
+        || {
+            symbolicate::run(
+                out,
+                &symbolicate::Opts {
+                    token_db: sym_token_db.clone(),
+                },
+            )
+        },
+    );
+
+    // 6. Prune (opt-in) then write the report.
+    if opts.prune
+        && let Err(e) = prune(out)
+    {
+        stages.push(StageReport::failed("prune", e.to_string(), 0));
+    }
+    finalize(out, img, opts, &headless, &r2, stages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_serializes_and_ok_reflects_failure() {
+        let stages = vec![
+            StageReport::ok("extract", "manifest.json", 5),
+            StageReport::decompile(
+                vec![
+                    ImageReport {
+                        image: "02_MAIN".into(),
+                        status: "analyzed",
+                        functions: Some(3),
+                        thumb_functions: Some(1),
+                        thumb_error: None,
+                        exit: None,
+                    },
+                    ImageReport {
+                        image: "04_VSS".into(),
+                        status: "failed",
+                        functions: None,
+                        thumb_functions: None,
+                        thumb_error: None,
+                        exit: Some(1),
+                    },
+                ],
+                10,
+            ),
+            StageReport::skipped("decode_tokens", "no pw_token_db"),
+            StageReport::ok(
+                "source_attribution",
+                "images/02_MAIN/source_tree/recovered_index.json",
+                7,
+            ),
+        ];
+        assert!(!Report::is_ok(&stages), "a failed image => not ok");
+
+        let report = Report {
+            tool_version: "1.0.0".into(),
+            source_image: "radio.img".into(),
+            source_sha256: "abc".into(),
+            out: "radio.decomposed".into(),
+            ghidra: GhidraTools {
+                headless: "/g/analyzeHeadless".into(),
+                radare2: "/usr/bin/r2".into(),
+            },
+            pruned: false,
+            ok: Report::is_ok(&stages),
+            stages,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["stages"][0]["stage"], "extract");
+        assert_eq!(v["stages"][1]["status"], "failed");
+        assert_eq!(v["stages"][1]["images"][0]["functions"], 3);
+        assert_eq!(v["stages"][1]["images"][1]["exit"], 1);
+        assert_eq!(v["stages"][2]["status"], "skipped");
+        assert_eq!(v["stages"][2]["reason"], "no pw_token_db");
+        let stage = |name: &str| {
+            v["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["stage"] == name)
+                .unwrap_or_else(|| panic!("missing stage {name}"))
+        };
+        assert_eq!(
+            stage("source_attribution")["output"],
+            "images/02_MAIN/source_tree/recovered_index.json"
+        );
+
+        // skip_serializing_if must actually omit fields — guards against the attrs being dropped
+        assert!(
+            v["stages"][0].get("images").is_none(),
+            "ok stage omits empty images"
+        );
+        assert!(
+            v["stages"][0].get("reason").is_none(),
+            "ok stage omits reason"
+        );
+        assert!(
+            v["stages"][0].get("error").is_none(),
+            "ok stage omits error"
+        );
+        assert!(
+            v["stages"][1]["images"][0].get("exit").is_none(),
+            "analyzed image omits exit"
+        );
+        assert!(
+            v["stages"][1]["images"][0].get("thumb_error").is_none(),
+            "successful image omits thumb_error"
+        );
+        assert!(
+            v["stages"][1]["images"][1].get("functions").is_none(),
+            "failed image omits functions"
+        );
+        assert!(
+            v["stages"][1]["images"][1].get("thumb_functions").is_none(),
+            "failed image omits thumb_functions"
+        );
+        assert!(
+            v["stages"][2].get("output").is_none(),
+            "skipped stage omits output"
+        );
+        assert!(
+            v["stages"][2].get("images").is_none(),
+            "skipped stage omits images"
+        );
+    }
+
+    #[test]
+    fn report_ok_when_no_failures() {
+        let stages = vec![
+            StageReport::ok("extract", "manifest.json", 1),
+            StageReport::skipped("decode_tokens", "no pw_token_db"),
+        ];
+        assert!(Report::is_ok(&stages));
+    }
+
+    #[test]
+    fn decompile_report_marks_analyzed_image_failed_on_thumb_error() {
+        let image = ImageReport::from_result(&decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: ImageOutcome::Analyzed(42),
+            thumb_functions: None,
+            thumb_error: Some("radare2 parser rejected empty stdout".into()),
+        });
+        assert_eq!(image.status, "failed");
+        assert_eq!(image.functions, Some(42));
+        assert_eq!(
+            image.thumb_error.as_deref(),
+            Some("radare2 parser rejected empty stdout")
+        );
+
+        let stage = StageReport::decompile(vec![image], 3);
+        assert_eq!(stage.status, "failed");
+
+        let v: serde_json::Value = serde_json::to_value(&stage).unwrap();
+        assert_eq!(
+            v["images"][0]["thumb_error"],
+            "radare2 parser rejected empty stdout"
+        );
+    }
+
+    #[test]
+    fn decompile_report_keeps_analyzed_status_without_thumb_outcome() {
+        let image = ImageReport::from_result(&decompile::ImageResult {
+            label: "01_BOOT".into(),
+            outcome: ImageOutcome::Analyzed(7),
+            thumb_functions: None,
+            thumb_error: None,
+        });
+
+        assert_eq!(image.status, "analyzed");
+        assert_eq!(image.functions, Some(7));
+        assert!(image.thumb_functions.is_none());
+        assert!(image.thumb_error.is_none());
+    }
+
+    #[test]
+    fn preflight_requires_both_tools() {
+        let g = PathBuf::from("/opt/ghidra/support/analyzeHeadless");
+        let r = PathBuf::from("/usr/bin/r2");
+        assert!(preflight(Ok(g.clone()), Some(r.clone())).is_ok());
+        assert!(matches!(
+            preflight(Err(Error::GhidraNotFound("x".into())), Some(r.clone())),
+            Err(Error::GhidraNotFound(_))
+        ));
+        assert!(matches!(
+            preflight(Ok(g), None),
+            Err(Error::ToolNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn marshal_moves_slice_and_export() {
+        let root = std::env::temp_dir().join(format!("pme_marshal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        std::fs::create_dir_all(ghidra.join("images")).unwrap();
+        std::fs::create_dir_all(ghidra.join("export").join("02_MAIN")).unwrap();
+        std::fs::write(ghidra.join("images").join("02_MAIN"), b"slice").unwrap();
+        std::fs::write(ghidra.join("export").join("02_MAIN").join("out.c"), b"// c").unwrap();
+
+        let images = root.join("images");
+        marshal_image(&ghidra, &images, "02_MAIN").unwrap();
+
+        assert_eq!(
+            std::fs::read(images.join("02_MAIN").join("02_MAIN.bin")).unwrap(),
+            b"slice"
+        );
+        assert!(
+            images
+                .join("02_MAIN")
+                .join("decompiled")
+                .join("out.c")
+                .exists()
+        );
+        assert!(
+            !ghidra.join("images").join("02_MAIN").exists(),
+            "moved, not copied"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_only_leaves() {
+        let out = std::env::temp_dir().join(format!("pme_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("rootfs").join("images").join("g5400i")).unwrap();
+        std::fs::create_dir_all(out.join("rf_cfg_decompressed")).unwrap();
+        std::fs::create_dir_all(out.join("ghidra").join("ghidra_project")).unwrap();
+        std::fs::write(out.join("modem.ext4"), b"ext4").unwrap();
+        std::fs::create_dir_all(out.join("images").join("02_MAIN").join("decompiled")).unwrap();
+        std::fs::write(
+            out.join("images").join("02_MAIN").join("02_MAIN.bin"),
+            b"slice",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("images")
+                .join("02_MAIN")
+                .join("decompiled")
+                .join("out.c"),
+            b"// c",
+        )
+        .unwrap();
+        std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
+        std::fs::create_dir_all(out.join("tokens")).unwrap();
+        std::fs::write(out.join("manifest.json"), b"{}").unwrap();
+
+        prune(&out).unwrap();
+
+        assert!(!out.join("modem.ext4").exists());
+        assert!(!out.join("rootfs").exists());
+        assert!(!out.join("rf_cfg_decompressed").exists());
+        assert!(!out.join("ghidra").exists());
+        assert!(
+            !out.join("images")
+                .join("02_MAIN")
+                .join("02_MAIN.bin")
+                .exists()
+        );
+        assert!(
+            out.join("images")
+                .join("02_MAIN")
+                .join("decompiled")
+                .join("out.c")
+                .exists()
+        );
+        assert!(out.join("rf").join("decoded").exists());
+        assert!(out.join("tokens").exists());
+        assert!(out.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn rootfs_image_dir_finds_single_subdir() {
+        let out = std::env::temp_dir().join(format!("pme_rootfs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("rootfs").join("images").join("g5400i-abc")).unwrap();
+        let d = rootfs_image_dir(&out).unwrap();
+        assert!(d.ends_with("g5400i-abc"));
+    }
+
+    #[test]
+    fn rootfs_image_dir_errors_notfound_when_absent() {
+        let out = std::env::temp_dir().join(format!("pme_rootfs_absent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        // <out>/rootfs/images/ doesn't exist at all -> typed NotFound, not a raw Io error
+        assert!(matches!(rootfs_image_dir(&out), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn symbolicate_stage_runs_over_a_crafted_tree() {
+        let root = std::env::temp_dir().join(format!("pme_decompose_sym_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x10: movw r0, 0xcc9\n").unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#,
+        )
+        .unwrap();
+
+        // no token DB -> token evidence skipped, but the pass still writes symbols.json
+        let out =
+            crate::symbolicate::run(&root, &crate::symbolicate::Opts { token_db: None }).unwrap();
+        assert_eq!(out, root);
+        assert!(dec.join("symbols.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
