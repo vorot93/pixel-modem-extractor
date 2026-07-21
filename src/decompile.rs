@@ -216,6 +216,11 @@ pub struct ImageResult {
     pub thumb_functions: Option<usize>,
     /// Reason-only Thumb/radare2 failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
+    /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
+    /// reported applying. `None` when pass 2 did not run for this image.
+    pub pass2_applied: Option<usize>,
+    /// Reason-only pass-2 failure text (e.g. analyzeHeadless exited non-zero).
+    pub pass2_error: Option<String>,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -508,6 +513,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     outcome,
                     thumb_functions,
                     thumb_error,
+                    pass2_applied: None,
+                    pass2_error: None,
                 },
             )
             .collect();
@@ -1779,6 +1786,8 @@ INFO: second pdfj body was noisy and not parseable
                 outcome: ImageOutcome::Analyzed(12),
                 thumb_functions: None,
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
+                pass2_applied: None,
+                pass2_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -1801,6 +1810,8 @@ INFO: second pdfj body was noisy and not parseable
                     "1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
                         .into(),
                 ),
+                pass2_applied: None,
+                pass2_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };

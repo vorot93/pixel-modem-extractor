@@ -33,6 +33,10 @@ pub struct ImageReport {
     pub thumb_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_applied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_error: Option<String>,
 }
 
 impl ImageReport {
@@ -49,6 +53,8 @@ impl ImageReport {
                 thumb_functions: r.thumb_functions,
                 thumb_error: r.thumb_error.clone(),
                 exit: None,
+                pass2_applied: r.pass2_applied,
+                pass2_error: r.pass2_error.clone(),
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -57,6 +63,8 @@ impl ImageReport {
                 thumb_functions: r.thumb_functions,
                 thumb_error: r.thumb_error.clone(),
                 exit: Some(code),
+                pass2_applied: r.pass2_applied,
+                pass2_error: r.pass2_error.clone(),
             },
         }
     }
@@ -494,6 +502,8 @@ mod tests {
                         thumb_functions: Some(1),
                         thumb_error: None,
                         exit: None,
+                        pass2_applied: None,
+                        pass2_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -502,6 +512,8 @@ mod tests {
                         thumb_functions: None,
                         thumb_error: None,
                         exit: Some(1),
+                        pass2_applied: None,
+                        pass2_error: None,
                     },
                 ],
                 10,
@@ -605,6 +617,8 @@ mod tests {
             outcome: ImageOutcome::Analyzed(42),
             thumb_functions: None,
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
+            pass2_applied: None,
+            pass2_error: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -630,6 +644,8 @@ mod tests {
             outcome: ImageOutcome::Analyzed(7),
             thumb_functions: None,
             thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
         });
 
         assert_eq!(image.status, "analyzed");
