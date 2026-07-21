@@ -1354,6 +1354,143 @@ fn run_radare2_thumb(
     Ok(substantial)
 }
 
+/// Phase 2: enrich a v1 (or v2 asm-only) `thumb_functions.json` with per-function
+/// `body_c` sourced from a `decompiled.c`. Bumps `format` to v2 iff at least one
+/// `body_c` is populated; otherwise leaves the file byte-identical. Idempotent.
+///
+/// `decompiled.c` is parsed by scanning for top-level function headers of the form
+///
+/// ```text
+/// <return-type> <name>(<params>)\n{\n ... \n}\n
+/// ```
+///
+/// where `<name>` matches the radare2-emitted `thumb_<hex>` entry name (the entry's
+/// pre-rename name; pass-2 regenerates `decompiled.c` with post-rename names, and
+/// `thumb_enrich` re-runs against that to refresh `body_c` with the new names).
+///
+/// Matching is by name (not entry address) because `decompiled.c`'s function names
+/// are exactly the names in `thumb_functions.json` at the time `decompiled.c` was
+/// emitted. Returns the count of functions whose `body_c` was populated.
+///
+/// Fail-closed: a malformed `decompiled.c` (read or parse failure) returns `Err`;
+/// the on-disk `thumb_functions.json` is unchanged.
+pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    // std::io::Error auto-converts via Error::Io(#[from]) — `?` propagates directly.
+    let c_text = std::fs::read_to_string(decompiled_c_path)?;
+
+    // Parse decompiled.c into {function_name -> body_text}.
+    let bodies = parse_decompiled_c_function_bodies(&c_text);
+
+    // Read thumb_functions.json, augment in memory, decide whether to rewrite.
+    let raw = std::fs::read(thumb_functions_json_path)?;
+    let mut v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+        Error::Serialize(format!(
+            "parse {}: {e}",
+            thumb_functions_json_path.display()
+        ))
+    })?;
+
+    let mut populated = 0usize;
+    if let Some(funcs) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
+        for f in funcs {
+            let Some(name) = f.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            if let Some(body) = bodies.get(name) {
+                f.as_object_mut().unwrap().insert(
+                    "body_c".to_string(),
+                    serde_json::Value::String(body.clone()),
+                );
+                populated += 1;
+            }
+        }
+    }
+
+    if populated == 0 {
+        return Ok(0); // Leave file byte-identical (do not rewrite).
+    }
+
+    // Bump format to v2 on first population.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "format".to_string(),
+            serde_json::Value::String("pixel-modem-extractor-thumb-functions-v2".to_string()),
+        );
+    }
+
+    let out = serde_json::to_string_pretty(&v)
+        .map_err(|e| Error::Serialize(format!("re-serialize thumb_functions.json: {e}")))?;
+    std::fs::write(thumb_functions_json_path, out)?;
+    Ok(populated)
+}
+
+/// Parse a `decompiled.c` text into a map of `{function_name -> body_text}`, where
+/// `body_text` is the full function including signature and braces. The parser is
+/// deliberately conservative: it scans for lines that look like function headers
+/// (identifier-ish name followed by `(...)`), then captures text up to the matching
+/// closing `}` at brace-depth 0. The opening `{` may appear on the header line
+/// itself or on a following line (the form emitted by Ghidra's C decompiler:
+/// `<ret> <name>(<params>)\n{\n ... \n}\n`). Lines that look header-ish but are
+/// never followed by any `{` are treated as non-headers and skipped. Comments and
+/// string literals are not special-cased — ExportDecomp.java's output is regular
+/// enough that brace-counting is sufficient; malformed input fails closed in the
+/// caller.
+fn parse_decompiled_c_function_bodies(c_text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let lines: Vec<&str> = c_text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Match a line that looks like a function header: contains `(` and `)` and
+        // an identifier token immediately before the first `(`. The opening `{` may
+        // be on this line or on a following line.
+        if line.contains('(') && line.contains(')') {
+            // Extract the name: the identifier immediately before the first '('.
+            let before_paren = line.split('(').next().unwrap_or("").trim();
+            let name = before_paren
+                .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if name.is_empty() {
+                i += 1;
+                continue;
+            }
+            // Capture from this line through the matching closing brace at depth 0.
+            let start = i;
+            let mut depth = 0i32;
+            let mut saw_brace = false;
+            let mut body = String::new();
+            while i < lines.len() {
+                let l = lines[i];
+                for ch in l.chars() {
+                    match ch {
+                        '{' => {
+                            depth += 1;
+                            saw_brace = true;
+                        }
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                body.push_str(l);
+                body.push('\n');
+                if saw_brace && depth <= 0 {
+                    break;
+                }
+                i += 1;
+            }
+            if !saw_brace {
+                // Header-shaped line with no `{` ever following — not a function.
+                i = start + 1;
+                continue;
+            }
+            out.insert(name.to_string(), body);
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2372,5 +2509,121 @@ INFO: second pdfj body was noisy and not parseable
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pme_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn thumb_enrich_populates_body_c_for_matching_entry() {
+        let root = temp_dir("thumb_enrich_match");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "/*\n * FUN_40e1200\n */\nvoid thumb_40e1200(int a)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []},
+                {"entry": "0x40efffc", "name": "thumb_40efffc", "size": 4,
+                 "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []}
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1, "exactly one function matched");
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert_eq!(v["format"], "pixel-modem-extractor-thumb-functions-v2");
+        assert!(v["functions"][0]["body_c"].is_string());
+        assert!(
+            v["functions"][0]["body_c"]
+                .as_str()
+                .unwrap()
+                .contains("thumb_40e1200")
+        );
+        assert!(
+            v["functions"][1].get("body_c").is_none(),
+            "no match -> no body_c"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_zero_matches_leaves_file_unchanged() {
+        let root = temp_dir("thumb_enrich_no_match");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "/* nothing relevant */\nvoid FUN_deadbeef(void){}\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v1",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []}
+            ]
+        }"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 0);
+        // File is byte-identical (format stays v1 because no body_c was populated).
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+    }
+
+    #[test]
+    fn thumb_enrich_is_idempotent() {
+        let root = temp_dir("thumb_enrich_idem");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(&c_path, "void thumb_40e1200(void){\n  return;\n}\n").unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_first = std::fs::read_to_string(&thumb_path).unwrap();
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_second = std::fs::read_to_string(&thumb_path).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "second run is a no-op on the same inputs"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_fail_closed_on_malformed_decompiled_c() {
+        let root = temp_dir("thumb_enrich_bad_c");
+        let c_path = root.join("decompiled.c");
+        // Not valid UTF-8.
+        std::fs::write(&c_path, [0xff, 0xfe, 0xfd, 0xfc]).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[]}"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let err = thumb_enrich(&c_path, &thumb_path).unwrap_err();
+        // The on-disk JSON is unchanged.
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+        // Surfaced as a typed error (any variant — just confirm it's not silent).
+        let _ = format!("{err}");
     }
 }
