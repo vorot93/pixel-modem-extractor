@@ -226,7 +226,10 @@ pub fn run() -> anyhow::Result<()> {
             println!("report     -> {}", report.display());
         }
         Commands::Symbolicate { path, token_db } => {
-            let opts = crate::symbolicate::Opts { token_db };
+            let opts = crate::symbolicate::Opts {
+                token_db,
+                rewrite_decompiled_c: true,
+            };
             let root = crate::symbolicate::run(&path, &opts)?;
             println!("symbolicated -> {}", root.display());
         }

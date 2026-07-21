@@ -18,7 +18,10 @@ fn symbolicate_recovers_names_and_annotations() {
 
     pixel_modem_extractor::symbolicate::run(
         &root,
-        &pixel_modem_extractor::symbolicate::Opts { token_db },
+        &pixel_modem_extractor::symbolicate::Opts {
+            token_db,
+            rewrite_decompiled_c: true,
+        },
     )
     .unwrap();
 

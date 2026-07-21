@@ -462,6 +462,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 out,
                 &symbolicate::Opts {
                     token_db: sym_token_db.clone(),
+                    rewrite_decompiled_c: false,
                 },
             )
         },
@@ -768,8 +769,14 @@ mod tests {
         .unwrap();
 
         // no token DB -> token evidence skipped, but the pass still writes symbols.json
-        let out =
-            crate::symbolicate::run(&root, &crate::symbolicate::Opts { token_db: None }).unwrap();
+        let out = crate::symbolicate::run(
+            &root,
+            &crate::symbolicate::Opts {
+                token_db: None,
+                rewrite_decompiled_c: true,
+            },
+        )
+        .unwrap();
         assert_eq!(out, root);
         assert!(dec.join("symbols.json").exists());
         let _ = std::fs::remove_dir_all(&root);
