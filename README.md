@@ -48,7 +48,7 @@ its full set of flags.
 | Command | What it does |
 |---|---|
 | `extract <radio.img>` | **Main entry.** Full pipeline: FBPK → ext4 → rootfs → gunzip `RF_CFG_*` → split TOC. Default out `./<img>.extracted/`. `--no-verify` skips CRC/size checks. |
-| `decompose <radio.img>` | **Everything, one shot.** Runs `extract`, decompiles all six images (Ghidra), enriches `02_MAIN/source_tree` with recovered-code evidence when attribution is possible, and runs every decoder into one per-image tree (`images/NN_NAME/{decompiled,…}`, `rf/`, `tokens/`) with a `report.json`. **Requires a local Ghidra and radare2** (`r2`), probed up front. `--prune` keeps only the terminal artifacts; `--out`, `--ghidra-home`, `--processor`, `--no-verify` as elsewhere. Default out `./<img>.decomposed/`. Also symbolicates each image (names + annotations + symbols.json). |
+| `decompose <radio.img>` | **Everything, one shot.** Runs `extract`, decompiles all six images (Ghidra), enriches `02_MAIN/source_tree` with recovered-code evidence when attribution is possible, and runs every decoder into one per-image tree (`images/NN_NAME/{decompiled,…}`, `rf/`, `tokens/`) with a `report.json`. **Requires a local Ghidra and radare2** (`r2`), probed up front. `--prune` keeps only the terminal artifacts; `--out`, `--ghidra-home`, `--processor`, `--no-verify` as elsewhere. Default out `./<img>.decomposed/`. **Phase 1:** `decompose` runs decompile **twice** per image — pass 1 analyzes and exports an initial inventory; pass 2 (`ApplySymbols.java` + `ExportDecomp.java`) applies the recovered function names and inline-evidence plate comments so the regenerated `decompiled.c` is born with names baked in (instead of text-substituted afterward). `--no-symbol-pass` skips pass 2 (today's single-pass behavior). |
 | `source-tree <02_MAIN>` | Reconstruct the firmware source-tree layout from embedded `__FILE__` strings — **names and structure only, not original source**. `--no-attribution`, `--gap`, `--shared-pct`, `--min-run` tune the heuristics. |
 | `decode-rf <RF_CFG_dir> --hwcfg <hardware_config.json>` | Semantic decode of the RF_CFG calibration databases (heuristic calibration-vector extraction + per-variant mapping). Default out `./decoded_rf/`. |
 | `decode-tokens <pw_token_db>` | Decode the Pigweed `pw_tokenizer` token database to canonical CSV + `summary.json`. Default out `./decoded_tokens/`. |
@@ -84,6 +84,7 @@ its full set of flags.
     ├── rf/                           # decoded/  +  hwcfg_summary/
     ├── tokens/                       # pw_token_db.csv + summary.json
     ├── manifest.json
+    ├── ghidra/symbol_maps/           # per-image symbol_map.json (input to pass 2; Phase 1+)
     └── report.json
 
 ## Formats

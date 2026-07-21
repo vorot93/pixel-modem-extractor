@@ -11,12 +11,14 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
 const EXPORT_DECOMP_JAVA: &str = include_str!("ghidra/ExportDecomp.java");
 const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
+const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -216,6 +218,11 @@ pub struct ImageResult {
     pub thumb_functions: Option<usize>,
     /// Reason-only Thumb/radare2 failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
+    /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
+    /// reported applying. `None` when pass 2 did not run for this image.
+    pub pass2_applied: Option<usize>,
+    /// Reason-only pass-2 failure text (e.g. analyzeHeadless exited non-zero).
+    pub pass2_error: Option<String>,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -369,13 +376,15 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp}.java
+    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
-    //    writes the decompiled C / disasm listing / function inventory)
+    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols
+    //    post-script is staged for pass-2 symbol application.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
+    std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
 
     // 3. machine-readable load spec -> out/ghidra_load.json
     let source_name = modem_bin
@@ -508,6 +517,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     outcome,
                     thumb_functions,
                     thumb_error,
+                    pass2_applied: None,
+                    pass2_error: None,
                 },
             )
             .collect();
@@ -564,6 +575,134 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
         )));
     }
     None
+}
+
+/// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
+/// `-process` mode on the existing project so there is no re-import and no
+/// re-analysis: `ApplySymbols.java` renames functions and sets plate comments,
+/// then `ExportDecomp.java` regenerates `decompiled.c` with the new names and
+/// comments baked in.
+fn headless_process_args(root: &str, label: &str, map_path: &Path) -> Vec<String> {
+    vec![
+        format!("{root}/ghidra_project"),
+        "pixel-modem".to_string(),
+        "-process".to_string(),
+        label.to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        format!("{root}/scripts"),
+        "-postScript".to_string(),
+        "ApplySymbols.java".to_string(),
+        map_path.to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+        format!("{root}/export/{label}"),
+    ]
+}
+
+/// Extract the `N` from the summary line
+/// `ApplySymbols: image=<image> applied N names, M plate comments, skipped K`.
+/// `None` when the line is missing or the count is not an integer — the caller
+/// treats `None` as "no information from pass 2".
+fn parse_pass2_summary(stdout: &str) -> Option<usize> {
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("ApplySymbols:") else {
+            continue;
+        };
+        let Some(idx) = rest.find("applied ") else {
+            continue;
+        };
+        let after = &rest[idx + "applied ".len()..];
+        let end = after.find(' ').unwrap_or(after.len());
+        if let Ok(n) = after[..end].parse::<usize>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Pass 2 of two-pass decompile. Accepts the pass-1 `report` (callers run pass 1
+/// via `run_report` separately and pass its result here — running pass 1 again
+/// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
+/// `symbol_maps.get(&label)` exists, points at a readable file, and contains at
+/// least one non-null `name`. Per-image pass-2 failures (non-zero exit, spawn
+/// failure) are recorded into `ImageResult.pass2_error`, not propagated — pass 1
+/// already produced a valid `decompiled.c`.
+pub fn run_two_pass(
+    mut report: DecompileReport,
+    opts: &Opts,
+    out: &Path,
+    symbol_maps: &HashMap<String, PathBuf>,
+) -> Result<DecompileReport> {
+    if !opts.run {
+        return Ok(report);
+    }
+    let install = find_ghidra(opts)?;
+    let java_home = resolve_java_home(std::env::var_os("JAVA_HOME"), install.ghidra_run.as_deref());
+    let root = std::fs::canonicalize(out)?;
+    let root_str = root.to_string_lossy().into_owned();
+
+    for ir in &mut report.images {
+        let Some(map_path) = symbol_maps.get(&ir.label) else {
+            continue;
+        };
+        if !map_path.exists() {
+            continue;
+        }
+        // Skip pass 2 when the map has no non-null names — pass 1's decompiled.c
+        // is already fine for that image.
+        let map_str = std::fs::read_to_string(map_path).unwrap_or_default();
+        let map_json: serde_json::Value =
+            serde_json::from_str(&map_str).unwrap_or(serde_json::Value::Null);
+        let has_names = map_json["symbols"]
+            .as_array()
+            .map(|arr| arr.iter().any(|s| !s["name"].is_null()))
+            .unwrap_or(false);
+        if !has_names {
+            continue;
+        }
+
+        tracing::info!("ghidra: pass 2 symbolication for {}", ir.label);
+        let args = headless_process_args(&root_str, &ir.label, map_path);
+        // Spawn failure (e.g. executable bit lost, Ghidra uninstalled mid-run)
+        // lands in `pass2_error` per image instead of propagating — pass 1
+        // already produced a valid `decompiled.c` for every image.
+        let output = match headless_command(&install.headless, &args, &root, java_home.as_deref())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                ir.pass2_error = Some(format!("spawn: {e}"));
+                continue;
+            }
+        };
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            ir.pass2_applied = parse_pass2_summary(&stdout);
+        } else {
+            let code = output.status.code().unwrap_or(-1);
+            tracing::warn!("ghidra: pass 2 for {} failed (exit {code})", ir.label);
+            // Java stack traces and Ghidra script compile errors land on stderr;
+            // keep the tail so the report stays actionable without bloating.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail: String = if stderr.len() > 2048 {
+                stderr
+                    .chars()
+                    .rev()
+                    .take(2048)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            } else {
+                stderr.into_owned()
+            };
+            ir.pass2_error = Some(format!("analyzeHeadless exit {code}; stderr tail:\n{tail}"));
+        }
+    }
+    Ok(report)
 }
 
 /// Generate the kit and (with `--run`) drive Ghidra plus radare2 for dense Thumb
@@ -1275,6 +1414,43 @@ mod tests {
     }
 
     #[test]
+    fn headless_process_args_wires_process_mode_and_post_scripts() {
+        let args = headless_process_args(
+            "/out",
+            "02_MAIN",
+            std::path::Path::new("/out/ghidra/symbol_maps/02_MAIN.json"),
+        );
+        // <projectDir> <projectName> -process <label> -noanalysis -scriptPath <root>/scripts
+        assert_eq!(args[0], "/out/ghidra_project");
+        assert_eq!(args[1], "pixel-modem");
+        let proc = args.iter().position(|a| a == "-process").unwrap();
+        assert_eq!(args[proc + 1], "02_MAIN");
+        let na = args.iter().position(|a| a == "-noanalysis").unwrap();
+        assert!(na > proc);
+        let sp = args.iter().position(|a| a == "-scriptPath").unwrap();
+        assert_eq!(args[sp + 1], "/out/scripts");
+        // ApplySymbols.java comes before ExportDecomp.java, with map path between.
+        let ps1 = args.iter().position(|a| a == "-postScript").unwrap();
+        assert_eq!(args[ps1 + 1], "ApplySymbols.java");
+        assert_eq!(args[ps1 + 2], "/out/ghidra/symbol_maps/02_MAIN.json");
+        // Second -postScript is ExportDecomp.java with the per-image export dir.
+        let ps2 = args.iter().rposition(|a| a == "-postScript").unwrap();
+        assert!(ps2 > ps1);
+        assert_eq!(args[ps2 + 1], "ExportDecomp.java");
+        assert_eq!(args[ps2 + 2], "/out/export/02_MAIN");
+    }
+
+    #[test]
+    fn parse_pass2_summary_reads_applied_count() {
+        let stdout =
+            "...\nApplySymbols: image=02_MAIN applied 42 names, 7 plate comments, skipped 3\n";
+        assert_eq!(parse_pass2_summary(stdout), Some(42));
+        // Missing / malformed summary -> None (caller treats as "no info").
+        assert_eq!(parse_pass2_summary("nothing useful\n"), None);
+        assert_eq!(parse_pass2_summary(""), None);
+    }
+
+    #[test]
     fn headless_command_uses_output_local_ghidra_config() {
         let root = PathBuf::from("/tmp/pme-out");
         let args = vec!["/tmp/pme-out/ghidra_project".to_string()];
@@ -1779,6 +1955,8 @@ INFO: second pdfj body was noisy and not parseable
                 outcome: ImageOutcome::Analyzed(12),
                 thumb_functions: None,
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
+                pass2_applied: None,
+                pass2_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -1801,6 +1979,8 @@ INFO: second pdfj body was noisy and not parseable
                     "1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
                         .into(),
                 ),
+                pass2_applied: None,
+                pass2_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };

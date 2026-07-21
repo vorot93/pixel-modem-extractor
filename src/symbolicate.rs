@@ -14,6 +14,10 @@ pub const GUESS_PREFIX: &str = "guess_";
 
 pub struct Opts {
     pub token_db: Option<PathBuf>,
+    /// Whether `decompiled.c` / `disasm.lst` are text-rewritten in place. The
+    /// standalone `symbolicate` subcommand sets `true`; the `decompose` two-pass
+    /// path (which regenerates `decompiled.c` from Ghidra in pass 2) sets `false`.
+    pub rewrite_decompiled_c: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -597,6 +601,60 @@ fn write_symbols_json(
     Ok(path)
 }
 
+/// Serializable shape of `<out>/ghidra/symbol_maps/<label>.json`, consumed by
+/// `ApplySymbols.java` during pass 2. Field order matches the schema in the
+/// Phase-1 design spec.
+#[derive(Debug, Serialize)]
+struct SymbolMapFile<'a> {
+    tool_version: &'static str,
+    image: &'a str,
+    source_sha256: &'a str,
+    functions_sha256: &'a str,
+    symbols: Vec<SymbolMapEntry<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct SymbolMapEntry<'a> {
+    entry: &'a str,
+    arch: &'a str,
+    original_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    tier: &'a Tier,
+    annotations: &'a [String],
+}
+
+/// Serialize a per-image symbol map to `out_path`. Returns `out_path` on success.
+pub fn write_symbol_map(
+    out_path: &Path,
+    image_label: &str,
+    symbols: &[Symbol],
+    source_sha256: &str,
+    functions_sha256: &str,
+) -> Result<PathBuf> {
+    let entries: Vec<SymbolMapEntry<'_>> = symbols
+        .iter()
+        .map(|s| SymbolMapEntry {
+            entry: &s.address,
+            arch: s.arch,
+            original_name: &s.original_name,
+            name: s.name.as_deref(),
+            tier: &s.tier,
+            annotations: &s.annotations,
+        })
+        .collect();
+    let file = SymbolMapFile {
+        tool_version: env!("CARGO_PKG_VERSION"),
+        image: image_label,
+        source_sha256,
+        functions_sha256,
+        symbols: entries,
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(|e| Error::Serialize(e.to_string()))?;
+    std::fs::write(out_path, json)?;
+    Ok(out_path.to_path_buf())
+}
+
 const SENTINEL: &str = "// pixel-modem-extractor: symbolicated\n";
 
 /// Global `original_name -> name` substitution over decompiled text (safe: replace
@@ -656,8 +714,14 @@ fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
             if obj.contains_key("original_name") {
                 continue; // already symbolicated — idempotent re-run
             }
-            let orig = obj.get("name").cloned().unwrap_or(serde_json::Value::Null);
-            obj.insert("original_name".into(), orig);
+            // Source original_name from the Symbol record, not from obj["name"]:
+            // on the Phase-1 two-pass path, obj["name"] already holds the
+            // recovered name (pass 2 renamed in-program before regenerating
+            // functions.json). The Symbol preserves the true original.
+            obj.insert(
+                "original_name".into(),
+                serde_json::Value::String(sym.original_name.clone()),
+            );
             if let Some(name) = &sym.name {
                 obj.insert("name".into(), serde_json::Value::String(name.clone()));
             }
@@ -721,20 +785,26 @@ fn toc_name(label: &str) -> &str {
     label.split_once('_').map(|(_, n)| n).unwrap_or(label)
 }
 
-/// Symbolicate one image's `decompiled/` dir in place; returns the symbols.json path.
-fn symbolicate_image(
+/// Tunable parameters for `finalize_image`. Today a single flag controls whether
+/// `decompiled.c` / `disasm.lst` are text-rewritten; on the `decompose` two-pass
+/// path (Phase 1+), pass 2 regenerates `decompiled.c` and the rewrite is skipped.
+pub struct FinalizeOpts {
+    pub rewrite_decompiled_c: bool,
+}
+
+/// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
+pub(crate) fn build_map(
     image_dir: &Path,
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
-) -> Result<PathBuf> {
+) -> Result<Vec<Symbol>> {
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
 
     let mut funcs = load_functions(&decompiled, &disasm)?;
     funcs.extend(load_thumb_functions(&decompiled)?);
 
-    // Optional string evidence (needs the raw split image + load_addr).
     let source_tree = image_dir.join("source_tree");
     let (file_occ, file_strings) = if source_tree.join("manifest.json").exists() {
         load_file_occurrences(&source_tree)?
@@ -799,7 +869,20 @@ fn symbolicate_image(
         });
     }
     finalize_names(&mut symbols);
+    Ok(symbols)
+}
 
+/// Apply the built symbols to a per-image `decompiled/` dir in place; returns
+/// the `symbols.json` path. `rewrite_decompiled_c = false` skips the text
+/// rewrite of `decompiled.c` / `disasm.lst` (the two-pass decompose path
+/// regenerates them from Ghidra).
+fn finalize_image(
+    image_dir: &Path,
+    image_label: &str,
+    symbols: &[Symbol],
+    opts: &FinalizeOpts,
+) -> Result<PathBuf> {
+    let decompiled = image_dir.join("decompiled");
     let mut inputs = HashMap::new();
     if let Ok(b) = std::fs::read(decompiled.join("functions.json")) {
         inputs.insert(
@@ -808,9 +891,32 @@ fn symbolicate_image(
         );
     }
 
-    rewrite_functions_json(&decompiled, &symbols)?;
-    rewrite_text_files(&decompiled, &symbols)?;
-    write_symbols_json(&decompiled, image_label, &symbols, inputs)
+    rewrite_functions_json(&decompiled, symbols)?;
+    if opts.rewrite_decompiled_c {
+        rewrite_text_files(&decompiled, symbols)?;
+    }
+    write_symbols_json(&decompiled, image_label, symbols, inputs)
+}
+
+/// Backward-compatible wrapper: build_map + finalize_image with the rewrite on.
+/// Only referenced by tests now that `run` threads `Opts.rewrite_decompiled_c`
+/// directly into `finalize_image`.
+#[cfg(test)]
+fn symbolicate_image(
+    image_dir: &Path,
+    image_label: &str,
+    tokens: &HashMap<u32, String>,
+    manifest: &Path,
+) -> Result<PathBuf> {
+    let symbols = build_map(image_dir, image_label, tokens, manifest)?;
+    finalize_image(
+        image_dir,
+        image_label,
+        &symbols,
+        &FinalizeOpts {
+            rewrite_decompiled_c: true,
+        },
+    )
 }
 
 /// Symbolicate every image under `<root>/images/*` that has a `decompiled/` dir.
@@ -837,7 +943,15 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
         if !dir.join("decompiled").join("functions.json").exists() {
             continue;
         }
-        let out = symbolicate_image(&dir, &label, &tokens, &manifest)?;
+        let symbols = build_map(&dir, &label, &tokens, &manifest)?;
+        let out = finalize_image(
+            &dir,
+            &label,
+            &symbols,
+            &FinalizeOpts {
+                rewrite_decompiled_c: opts.rewrite_decompiled_c,
+            },
+        )?;
         println!("symbolicated {label} -> {}", out.display());
         count += 1;
     }
@@ -1239,6 +1353,37 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_functions_json_keeps_symbol_original_name_when_name_already_renamed() {
+        // Simulates the Phase-1 pass-2 state: functions.json's `name` is already the
+        // recovered name, but the Symbol still carries the true original.
+        let dir = tmp("pme_sym_prov");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("functions.json"),
+            // pass-2 state: name was renamed to "real" already; no original_name field yet.
+            r#"[{"name":"real","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        let syms = vec![Symbol {
+            address: "0x10".into(),
+            arch: "arm",
+            original_name: "FUN_10".into(), // the true original
+            name: Some("real".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        }];
+        rewrite_functions_json(&dir, &syms).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("functions.json")).unwrap()).unwrap();
+        assert_eq!(v[0]["name"], "real");
+        // CRITICAL: original_name must come from the Symbol, not from the renamed
+        // functions.json `name` field. If we read functions.json's name here we'd
+        // record "real" and lose the original.
+        assert_eq!(v[0]["original_name"], "FUN_10");
+    }
+
+    #[test]
     fn symbolicate_image_end_to_end() {
         let root = tmp("pme_sym_e2e");
         let dec = root.join("images/02_MAIN/decompiled");
@@ -1282,5 +1427,161 @@ mod tests {
         // decompiled.c rewritten in place
         let c = std::fs::read_to_string(dec.join("decompiled.c")).unwrap();
         assert!(c.contains("guess_") && !c.contains("FUN_10"));
+    }
+
+    #[test]
+    fn build_map_returns_symbols_without_writing_files() {
+        let root = tmp("pme_sym_build_map");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dec.join("disasm.lst"),
+            "0x10: 41f2 movw r0, 0xcc9\n0x14: 4770 bx lr\n",
+        )
+        .unwrap();
+        let db = crate::tokens::Database {
+            reserved: 0,
+            entries: vec![crate::tokens::Entry {
+                token: 0xcc9,
+                date_removed: None,
+                string: "■format♦Latency %d■domain♦Perf".into(),
+            }],
+        };
+        let tokmap = token_map(&db);
+        let manifest = root.join("manifest.json");
+        std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
+
+        let symbols =
+            build_map(&root.join("images/02_MAIN"), "02_MAIN", &tokmap, &manifest).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert!(symbols[0].name.as_deref().unwrap().starts_with("guess_"));
+        // Crucially: build_map does NOT write symbols.json yet.
+        assert!(!dec.join("symbols.json").exists());
+    }
+
+    #[test]
+    fn finalize_image_writes_symbols_json_when_given_symbols() {
+        let root = tmp("pme_sym_finalize");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        let symbols = vec![Symbol {
+            address: "0x10".into(),
+            arch: "arm",
+            original_name: "FUN_10".into(),
+            name: Some("real".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        }];
+        let opts = FinalizeOpts {
+            rewrite_decompiled_c: true,
+        };
+        let path =
+            finalize_image(&root.join("images/02_MAIN"), "02_MAIN", &symbols, &opts).unwrap();
+        assert!(path.ends_with("symbols.json"));
+        assert!(dec.join("symbols.json").exists());
+        // functions.json was rewritten with original_name.
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dec.join("functions.json")).unwrap()).unwrap();
+        assert_eq!(v[0]["name"], "real");
+        assert_eq!(v[0]["original_name"], "FUN_10");
+    }
+
+    #[test]
+    fn write_symbol_map_round_trips() {
+        let dir = tmp("pme_sym_map_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let symbols = vec![
+            Symbol {
+                address: "0x40e1bff4".into(),
+                arch: "arm",
+                original_name: "FUN_40e1bff4".into(),
+                name: Some("LteRrc_Reestab".into()),
+                tier: Tier::Recovered,
+                evidence: vec![],
+                annotations: vec!["logs: \"RRC Reestab (%d)\" [LTE_RRC_METRICS]".into()],
+            },
+            Symbol {
+                address: "0x40e1c000".into(),
+                arch: "arm",
+                original_name: "FUN_40e1c000".into(),
+                name: None, // Tier::None — no rename
+                tier: Tier::None,
+                evidence: vec![],
+                annotations: vec![],
+            },
+        ];
+        let path =
+            write_symbol_map(&dir.join("m.json"), "02_MAIN", &symbols, "abc", "def").unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed["tool_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed["image"], "02_MAIN");
+        assert_eq!(parsed["source_sha256"], "abc");
+        assert_eq!(parsed["functions_sha256"], "def");
+        let syms = parsed["symbols"].as_array().unwrap();
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0]["entry"], "0x40e1bff4");
+        assert_eq!(syms[0]["arch"], "arm");
+        assert_eq!(syms[0]["original_name"], "FUN_40e1bff4");
+        assert_eq!(syms[0]["name"], "LteRrc_Reestab");
+        assert_eq!(syms[0]["tier"], "recovered");
+        assert_eq!(
+            syms[0]["annotations"][0],
+            "logs: \"RRC Reestab (%d)\" [LTE_RRC_METRICS]"
+        );
+        // name omitted on Tier::None entries via skip_serializing_if
+        assert!(syms[1].get("name").is_none() || syms[1]["name"].is_null());
+        assert_eq!(syms[1]["tier"], "none");
+    }
+
+    #[test]
+    fn finalize_image_with_rewrite_false_leaves_decompiled_c_untouched() {
+        let root = tmp("pme_sym_no_rewrite");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("decompiled.c"), "void FUN_10(void) {}\n").unwrap();
+        let symbols = vec![Symbol {
+            address: "0x10".into(),
+            arch: "arm",
+            original_name: "FUN_10".into(),
+            name: Some("real".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        }];
+        finalize_image(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &symbols,
+            &FinalizeOpts {
+                rewrite_decompiled_c: false,
+            },
+        )
+        .unwrap();
+        // decompiled.c untouched
+        assert_eq!(
+            std::fs::read_to_string(dec.join("decompiled.c")).unwrap(),
+            "void FUN_10(void) {}\n"
+        );
+        // symbols.json still emitted
+        assert!(dec.join("symbols.json").exists());
     }
 }

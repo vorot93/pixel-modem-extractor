@@ -27,6 +27,7 @@ fn decompose_produces_unified_tree() {
         prune: false,
         ghidra_home: None,
         processor: "ARM:LE:32:v7".to_string(),
+        no_symbol_pass: false,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -43,6 +44,14 @@ fn decompose_produces_unified_tree() {
             .join("decompiled")
             .exists(),
         "02_MAIN decompiled"
+    );
+    assert!(
+        out.join("images")
+            .join("02_MAIN")
+            .join("decompiled")
+            .join("symbols.json")
+            .exists(),
+        "02_MAIN symbols.json"
     );
     assert!(
         out.join("images")
@@ -74,6 +83,42 @@ fn decompose_produces_unified_tree() {
     assert!(
         recovered_index.exists(),
         "source_attribution reported ok but recovered_index.json was not produced"
+    );
+
+    // Phase 1: symbol_map stage ran between source_attribution and decompile pass 2.
+    let symbol_map_stage = report["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|stage| stage["stage"] == "symbol_map"))
+        .expect("report.json must contain symbol_map stage");
+    assert_eq!(symbol_map_stage["status"], "ok");
+
+    // Phase 1: pass 2 ran on at least one image (02_MAIN on real firmware has
+    // token-derived names). pass2_applied is recorded into the decompile stage's
+    // per-image report.
+    let decompile_stage = report["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|stage| stage["stage"] == "decompile"))
+        .expect("report.json must contain decompile stage");
+    let any_pass2 = decompile_stage["images"]
+        .as_array()
+        .map(|imgs| imgs.iter().any(|i| i.get("pass2_applied").is_some()))
+        .unwrap_or(false);
+    assert!(
+        any_pass2,
+        "expected at least one image with pass2_applied set"
+    );
+
+    // decompiled.c on 02_MAIN contains a plate comment from inline evidence.
+    let main_c = std::fs::read_to_string(
+        out.join("images")
+            .join("02_MAIN")
+            .join("decompiled")
+            .join("decompiled.c"),
+    )
+    .unwrap_or_default();
+    assert!(
+        main_c.contains("// logs:") || main_c.contains("// file:"),
+        "expected inline-evidence plate comments in 02_MAIN decompiled.c"
     );
 
     let index: serde_json::Value =

@@ -93,6 +93,9 @@ pub enum Commands {
         no_verify: bool,
         #[arg(long)]
         prune: bool,
+        /// Skip the symbolication pass 2 (Phase 1). Today's single-pass decompile behavior.
+        #[arg(long)]
+        no_symbol_pass: bool,
         #[arg(long)]
         ghidra_home: Option<PathBuf>,
         #[arg(long, default_value = "ARM:LE:32:v7")]
@@ -205,6 +208,7 @@ pub fn run() -> anyhow::Result<()> {
             out,
             no_verify,
             prune,
+            no_symbol_pass,
             ghidra_home,
             processor,
         } => {
@@ -220,13 +224,17 @@ pub fn run() -> anyhow::Result<()> {
                 prune,
                 ghidra_home,
                 processor,
+                no_symbol_pass,
             };
             let report = crate::decompose::run(&img, &opts, &out)?;
             println!("decomposed -> {}", out.display());
             println!("report     -> {}", report.display());
         }
         Commands::Symbolicate { path, token_db } => {
-            let opts = crate::symbolicate::Opts { token_db };
+            let opts = crate::symbolicate::Opts {
+                token_db,
+                rewrite_decompiled_c: true,
+            };
             let root = crate::symbolicate::run(&path, &opts)?;
             println!("symbolicated -> {}", root.display());
         }
@@ -373,6 +381,7 @@ mod tests {
             "/tmp/o",
             "--prune",
             "--no-verify",
+            "--no-symbol-pass",
             "--ghidra-home",
             "/opt/ghidra",
             "--processor",
@@ -385,6 +394,7 @@ mod tests {
                 out,
                 no_verify,
                 prune,
+                no_symbol_pass,
                 ghidra_home,
                 processor,
             } => {
@@ -392,6 +402,7 @@ mod tests {
                 assert_eq!(out, Some(PathBuf::from("/tmp/o")));
                 assert!(no_verify);
                 assert!(prune);
+                assert!(no_symbol_pass);
                 assert_eq!(ghidra_home, Some(PathBuf::from("/opt/ghidra")));
                 assert_eq!(processor, "ARM:LE:32:v8");
             }

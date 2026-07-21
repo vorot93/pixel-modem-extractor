@@ -121,6 +121,31 @@ module; when a file outgrows that, split it.
   and is loaded/rewritten whole (~4 s, ~3 GB peak); pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not raw literals, so
   a byte search won't find them).
+- **Two-pass decompile (Phase 1+).** `decompose` runs decompile twice per
+  image: pass 1 (`decompile::run_report`) analyzes and exports an initial
+  inventory + `decompiled.c`. Between passes, `decompose::build_and_write_symbol_maps`
+  builds a `symbol_map.json` per image from pass-1 outputs (using
+  `symbolicate::build_map`, the pure builder split out of `symbolicate_image`).
+  Pass 2 (`decompile::run_two_pass`) drives `analyzeHeadless -process` on the
+  same project, running `ApplySymbols.java` (renames + plate comments) followed
+  by `ExportDecomp.java` (regenerates `decompiled.c` with names + comments baked
+  in). `--no-symbol-pass` skips pass 2 entirely. `decompile --run` (the
+  standalone subcommand) is single-pass and unchanged. The standalone
+  `symbolicate` subcommand still does today's in-place text substitution
+  (controlled by `Opts.rewrite_decompiled_c`, which is `true` for the
+  standalone path and `false` for the decompose path).
+- **Provenance invariant for `functions.json`.** Pass 2 regenerates
+  `functions.json` with recovered names in the `name` field (because
+  `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`
+  sources `original_name` from the `Symbol` record, not from `functions.json`'s
+  `name` field, so the original name is preserved across (a) re-running
+  decompose and (b) running the standalone `symbolicate` against a Phase-1
+  decompose tree.
+- **Fidelity over readability.** No lossy `DecompInterface.setOptions(...)` call
+  in `ExportDecomp.java` — see the script's header comment for the analysis.
+  `Tier::Recovered`'s strict single-identifier-plus-`__FILE__` rule and
+  `Tier::Provisional`'s `guess_…` marker convention are preserved as-is; Phase
+  1 only changes *where* names are applied, not *which* are considered safe.
 
 ## How we work here
 

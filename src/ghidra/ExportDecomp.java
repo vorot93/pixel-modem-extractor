@@ -1,5 +1,25 @@
 // ExportDecomp.java — Ghidra headless post-script for pixel-modem-extractor.
 // Arg[0] = output directory. Writes decompiled.c, disasm.lst, functions.json.
+//
+// FIDELITY POSTURE (Phase 1+): this script intentionally does NOT call
+// DecompInterface.setOptions(...). Ghidra's decompiler defaults are already a
+// fiducial baseline, and setOptions *replaces* the program's "Decompiler"
+// property sheet rather than merging with it, which would clobber user /
+// environment defaults for zero benefit.
+//
+// The candidate readability knobs were reviewed and kept at Ghidra defaults:
+//   - EliminateUnreachable: OFF. Can drop real firmware code reached via
+//     jump tables, computed branches, or tail-call dispatch.
+//   - Simplify: OFF. Extended simplification can elide semantically relevant
+//     intermediate state.
+//   - NoCasts: OFF (default). The alternative hides real type conversions.
+//   - DisableDecompilerParameterNames: OFF (default). The alternative strips
+//     parameter names.
+//   - UseHexadecimal: TRUE (default). Display-only; matches disasm.lst.
+//
+// Pass 2 of `decompose` re-runs this script unchanged after ApplySymbols.java
+// has renamed functions in the program — getC() then emits the regenerated C
+// with names + plate comments baked in.
 //@category PixelModem
 import java.io.File;
 import java.io.FileWriter;
