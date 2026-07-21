@@ -149,7 +149,18 @@ module; when a file outgrows that, split it.
   per image (recorded as `thumb_tighten_error`, image not marked `failed`);
   see **Surface B mechanics** below for the kill path and budget calibration.
   `thumb_enrich` parses `decompiled.c` and fills `body_c`; it is pure Rust,
-  idempotent, runs after pass 1 and again after pass 2.
+  idempotent, runs after pass 1 and again after pass 2. **Production note
+  (Phase 2):** verification on a real `02_MAIN` (Pixel 6 Pro mustang) confirms
+  Surface B's watch correctly fires on the larger dense-Thumb regions after
+  ~28 min of analysis (the smallest region's Task-1 sample did not predict
+  this — full `02_MAIN` produces >100k overlap-repair log lines). The datamark
+  retry succeeds, the image stays `analyzed`, and pass-2 symbolication completes
+  (330+ names applied) — so Phase 1 functionality is intact. But
+  `thumb_decompiled` is `0` on production `02_MAIN` because the datamark retry
+  data-marks the regions `thumb_enrich` would otherwise populate. This is the
+  spec's designed behavior for Surface B (§ Error handling → Surface B). A
+  Phase 2.1 follow-up (per-region tightening) is required to deliver `body_c`
+  on production.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
   can easily break:
   (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
