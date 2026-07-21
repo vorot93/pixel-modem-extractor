@@ -656,8 +656,14 @@ fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
             if obj.contains_key("original_name") {
                 continue; // already symbolicated — idempotent re-run
             }
-            let orig = obj.get("name").cloned().unwrap_or(serde_json::Value::Null);
-            obj.insert("original_name".into(), orig);
+            // Source original_name from the Symbol record, not from obj["name"]:
+            // on the Phase-1 two-pass path, obj["name"] already holds the
+            // recovered name (pass 2 renamed in-program before regenerating
+            // functions.json). The Symbol preserves the true original.
+            obj.insert(
+                "original_name".into(),
+                serde_json::Value::String(sym.original_name.clone()),
+            );
             if let Some(name) = &sym.name {
                 obj.insert("name".into(), serde_json::Value::String(name.clone()));
             }
@@ -1275,6 +1281,37 @@ mod tests {
         assert_eq!(v[0]["name"], "real");
         assert_eq!(v[0]["original_name"], "FUN_10");
         assert_eq!(v[0]["annotations"][0], "logs: \"hi\"");
+    }
+
+    #[test]
+    fn rewrite_functions_json_keeps_symbol_original_name_when_name_already_renamed() {
+        // Simulates the Phase-1 pass-2 state: functions.json's `name` is already the
+        // recovered name, but the Symbol still carries the true original.
+        let dir = tmp("pme_sym_prov");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("functions.json"),
+            // pass-2 state: name was renamed to "real" already; no original_name field yet.
+            r#"[{"name":"real","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        let syms = vec![Symbol {
+            address: "0x10".into(),
+            arch: "arm",
+            original_name: "FUN_10".into(), // the true original
+            name: Some("real".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        }];
+        rewrite_functions_json(&dir, &syms).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("functions.json")).unwrap()).unwrap();
+        assert_eq!(v[0]["name"], "real");
+        // CRITICAL: original_name must come from the Symbol, not from the renamed
+        // functions.json `name` field. If we read functions.json's name here we'd
+        // record "real" and lose the original.
+        assert_eq!(v[0]["original_name"], "FUN_10");
     }
 
     #[test]
