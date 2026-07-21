@@ -1791,15 +1791,27 @@ mod normalize_thumb_addr_tests {
 
     #[test]
     fn strips_0x_prefix_and_leading_zeros() {
-        assert_eq!(normalize_thumb_addr("0x000040e1200").as_deref(), Some("40e1200"));
-        assert_eq!(normalize_thumb_addr("0X40E1200").as_deref(), Some("40e1200"));
+        assert_eq!(
+            normalize_thumb_addr("0x000040e1200").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(
+            normalize_thumb_addr("0X40E1200").as_deref(),
+            Some("40e1200")
+        );
         assert_eq!(normalize_thumb_addr("40e1200").as_deref(), Some("40e1200"));
     }
 
     #[test]
     fn clears_thumb_tbit() {
-        assert_eq!(normalize_thumb_addr("0x40e1201").as_deref(), Some("40e1200"));
-        assert_eq!(normalize_thumb_addr("00040e1201").as_deref(), Some("40e1200"));
+        assert_eq!(
+            normalize_thumb_addr("0x40e1201").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(
+            normalize_thumb_addr("00040e1201").as_deref(),
+            Some("40e1200")
+        );
     }
 
     #[test]
@@ -1851,8 +1863,8 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
         // the wrong address's body until the next real function's `{` — same
         // rationale as the prior parser's lookahead.
         let start = i;
-        let opens_brace_within_2 = (start + 1..std::cmp::min(start + 3, lines.len()))
-            .any(|j| lines[j].contains('{'));
+        let opens_brace_within_2 =
+            (start + 1..std::cmp::min(start + 3, lines.len())).any(|j| lines[j].contains('{'));
         if !opens_brace_within_2 {
             i = start + 1;
             continue;
