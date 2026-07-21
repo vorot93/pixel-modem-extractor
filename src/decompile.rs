@@ -223,6 +223,17 @@ pub struct ImageResult {
     pub pass2_applied: Option<usize>,
     /// Reason-only pass-2 failure text (e.g. analyzeHeadless exited non-zero).
     pub pass2_error: Option<String>,
+    /// Phase 2: count of Thumb functions whose `body_c` was populated by
+    /// `thumb_enrich` from the regenerated `decompiled.c`. `None` when Phase 2
+    /// did not run for this image (no Thumb regions, or `--no-thumb-decompile`).
+    pub thumb_decompiled: Option<usize>,
+    /// Phase 2 / Surface B: reason-only text set when the runtime wall-clock
+    /// or log-spam watch killed the tightened run and fell back to `datamark`.
+    pub thumb_tighten_error: Option<String>,
+    /// Phase 2 / Surface C: reason-only text set when `thumb_enrich` could not
+    /// parse `decompiled.c` (malformed output). The v1 `thumb_functions.json`
+    /// is left intact; downstream stages keep working against v1.
+    pub thumb_enrich_error: Option<String>,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -519,6 +530,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     thumb_error,
                     pass2_applied: None,
                     pass2_error: None,
+                    thumb_decompiled: None,
+                    thumb_tighten_error: None,
+                    thumb_enrich_error: None,
                 },
             )
             .collect();
@@ -1957,6 +1971,9 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
                 pass2_applied: None,
                 pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -1981,6 +1998,9 @@ INFO: second pdfj body was noisy and not parseable
                 ),
                 pass2_applied: None,
                 pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };

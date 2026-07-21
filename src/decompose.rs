@@ -42,6 +42,12 @@ pub struct ImageReport {
     pub pass2_applied: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_decompiled: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_tighten_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_enrich_error: Option<String>,
 }
 
 impl ImageReport {
@@ -60,6 +66,9 @@ impl ImageReport {
                 exit: None,
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
+                thumb_decompiled: r.thumb_decompiled,
+                thumb_tighten_error: r.thumb_tighten_error.clone(),
+                thumb_enrich_error: r.thumb_enrich_error.clone(),
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -70,6 +79,9 @@ impl ImageReport {
                 exit: Some(code),
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
+                thumb_decompiled: r.thumb_decompiled,
+                thumb_tighten_error: r.thumb_tighten_error.clone(),
+                thumb_enrich_error: r.thumb_enrich_error.clone(),
             },
         }
     }
@@ -651,6 +663,9 @@ mod tests {
                         exit: None,
                         pass2_applied: None,
                         pass2_error: None,
+                        thumb_decompiled: None,
+                        thumb_tighten_error: None,
+                        thumb_enrich_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -661,6 +676,9 @@ mod tests {
                         exit: Some(1),
                         pass2_applied: None,
                         pass2_error: None,
+                        thumb_decompiled: None,
+                        thumb_tighten_error: None,
+                        thumb_enrich_error: None,
                     },
                 ],
                 10,
@@ -766,6 +784,9 @@ mod tests {
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
             pass2_applied: None,
             pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -793,6 +814,9 @@ mod tests {
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
         });
 
         assert_eq!(image.status, "analyzed");
@@ -911,6 +935,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         // <out>/rootfs/images/ doesn't exist at all -> typed NotFound, not a raw Io error
         assert!(matches!(rootfs_image_dir(&out), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn image_report_serializes_phase2_fields_as_none_when_absent() {
+        let r = decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(10),
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+        };
+        let report = ImageReport::from_result(&r);
+        let json = serde_json::to_string(&report).unwrap();
+        // New fields must serialize as absent (skip_serializing_if = Option::is_none).
+        assert!(!json.contains("thumb_decompiled"));
+        assert!(!json.contains("thumb_tighten_error"));
+        assert!(!json.contains("thumb_enrich_error"));
+    }
+
+    #[test]
+    fn image_report_serializes_phase2_fields_when_set() {
+        let r = decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(10),
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: Some(3),
+            thumb_tighten_error: None,
+            thumb_enrich_error: Some("malformed decompiled.c".into()),
+        };
+        let report = ImageReport::from_result(&r);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"thumb_decompiled\":3"));
+        assert!(!json.contains("thumb_tighten_error"));
+        assert!(json.contains("\"thumb_enrich_error\":\"malformed decompiled.c\""));
     }
 
     #[test]
