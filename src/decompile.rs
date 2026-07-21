@@ -1344,7 +1344,7 @@ fn run_radare2_thumb(
         })
         .count();
     let wrapped = serde_json::json!({
-        "format": "pixel-modem-extractor-thumb-functions-v1",
+        "format": "pixel-modem-extractor-thumb-functions-v2",
         "functions": all,
     });
     std::fs::write(
@@ -1871,7 +1871,27 @@ INFO: second pdfj body was noisy and not parseable
             std::fs::set_permissions(&r2, perm).unwrap();
         }
 
-        let err = run_radare2_thumb(&r2, &[0u8; 16], 0x4000, &[(0x4000, 16)], &out).unwrap_err();
+        // Under parallel test execution (multiple tests in this module write +
+        // exec stub `r2` scripts concurrently) the kernel occasionally returns
+        // ETXTBSY from execve on the freshly-written stub. Treat Io errors as
+        // transient and retry a few times before giving up; the assertion below
+        // still verifies the expected non-Io failure mode.
+        let mut last = None;
+        for attempt in 0..5u32 {
+            match run_radare2_thumb(&r2, &[0u8; 16], 0x4000, &[(0x4000, 16)], &out) {
+                Ok(_) => break,
+                Err(e) if matches!(e, Error::Io(_)) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(5 * attempt as u64));
+                    continue;
+                }
+                Err(e) => {
+                    last = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = last.expect("expected an error from run_radare2_thumb");
 
         assert!(
             matches!(err, Error::Serialize(message) if message.contains("lacks entry/addr") && message.contains("0x4000"))
@@ -2311,5 +2331,44 @@ INFO: second pdfj body was noisy and not parseable
             "sh:\n{sh}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_radare2_thumb_emits_v2_format_string() {
+        // Phase 2 bumps thumb_functions.json format to v2; the body_c field arrives
+        // in Task 4. Uses the stub-r2 pattern (cf. radare2_thumb_maps_raw_blob_at_region_address)
+        // so the test is hermetic and does not require a real r2 on PATH.
+        let dir = std::env::temp_dir().join(format!("pme_r2_v2_fmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r2 = dir.join("r2");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // Stub r2 emits a single Thumb function at 0x4120 (16672) + matching pdfj —
+        // the same shape as radare2_thumb_maps_raw_blob_at_region_address's stub.
+        // run_radare2_thumb then writes the wrapper JSON regardless of inventory
+        // content; we only need to verify the format string.
+        std::fs::write(
+            &r2,
+            "#!/usr/bin/env sh\ncat <<'EOF'\n[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":32}]\n{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&r2).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&r2, perm).unwrap();
+        }
+
+        let _ = run_radare2_thumb(&r2, &[0u8; 0x180], 0x4000, &[(0x4120, 0x20)], &out).unwrap();
+        let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["format"], "pixel-modem-extractor-thumb-functions-v2",
+            "Phase 2 bumps the format to v2 (body_c field arrives in Task 4)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

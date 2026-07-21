@@ -1084,6 +1084,45 @@ mod tests {
         assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
     }
 
+    #[test]
+    fn parses_optional_radare2_thumb_functions_v2() {
+        // Phase 2 bumps thumb_functions.json to v2 (Task 3). v1 golden trees must
+        // still parse (covered by parses_optional_radare2_thumb_functions above);
+        // this fixture verifies the new v2 default round-trips identically.
+        let root = temp_dir("recover_radare2_v2");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(root.join("disasm.lst"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            r#"{
+              "format": "pixel-modem-extractor-thumb-functions-v2",
+              "functions": [
+                {
+                  "name": "sym.thumb_4120",
+                  "entry": "0x4120",
+                  "end": "0x4150",
+                  "size": 48,
+                  "body_kind": "thumb_disassembly",
+                  "body": "0x4120 push {lr}\n0x4122 bx lr\n",
+                  "data_refs": ["0x9000"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let funcs = RecoveredFunctions::load(&root).unwrap();
+
+        assert_eq!(funcs.functions.len(), 1);
+        assert_eq!(funcs.functions[0].tool, Tool::Radare2);
+        assert_eq!(funcs.functions[0].entry, 0x4120);
+        assert_eq!(funcs.functions[0].end, 0x4150);
+        assert_eq!(funcs.functions[0].body_kind, "thumb_disassembly");
+        assert!(funcs.functions[0].body.contains("push"));
+        assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
+    }
+
     fn source_entry(path: &str, vaddr: u64, offset: usize) -> SourceEntry {
         SourceEntry {
             path: path.to_string(),
