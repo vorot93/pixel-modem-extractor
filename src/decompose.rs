@@ -10,6 +10,7 @@ use crate::{
     decode_rf, hwcfg, manifest, pipeline, recover_source, source_tree, symbolicate, tokens,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -287,6 +288,60 @@ fn finalize(
     }
 }
 
+/// Build the per-image symbol map from pass-1 outputs and write each to
+/// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(label, (path, count))`
+/// per image where `count` is the number of symbols with non-null names.
+fn build_and_write_symbol_maps(
+    out: &Path,
+    images_dir: &Path,
+    token_db: &Path,
+    manifest: &Path,
+) -> Vec<(String, (PathBuf, usize))> {
+    let tokens = if token_db.exists() {
+        std::fs::read(token_db)
+            .ok()
+            .and_then(|b| crate::tokens::parse(&b).ok())
+            .map(|db| symbolicate::token_map(&db))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let maps_dir = out.join("ghidra").join("symbol_maps");
+    let _ = std::fs::create_dir_all(&maps_dir);
+    let mut out_vec = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(images_dir) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let Some(label) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if !dir.join("decompiled").join("functions.json").exists() {
+                continue;
+            }
+            let funcs_sha = std::fs::read(dir.join("decompiled").join("functions.json"))
+                .ok()
+                .map(|b| crate::manifest::sha256_bytes(&b))
+                .unwrap_or_default();
+            let image_sha = std::fs::read(dir.join(format!("{label}.bin")))
+                .ok()
+                .map(|b| crate::manifest::sha256_bytes(&b))
+                .unwrap_or_default();
+            let symbols = match symbolicate::build_map(&dir, &label, &tokens, manifest) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let with_names = symbols.iter().filter(|s| s.name.is_some()).count();
+            let map_path = maps_dir.join(format!("{label}.json"));
+            if symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_sha, &funcs_sha)
+                .is_ok()
+            {
+                out_vec.push((label, (map_path, with_names)));
+            }
+        }
+    }
+    out_vec
+}
+
 /// Exhaustive pipeline into one per-image tree. Ghidra + radare2 required (probed
 /// first). Best-effort across stages; writes `report.json`; `Err` if any stage failed.
 pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
@@ -328,7 +383,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let modem_bin = rootfs.join("modem.bin");
     let images_dir = out.join("images");
 
-    // 3. Decompile all images into out/ghidra, then marshal into per-image folders.
+    // 3. Decompile pass 1 (analyze + inventory + initial decompiled.c) into
+    //    out/ghidra, then marshal into per-image folders.
     let t = Instant::now();
     let ghidra_dir = out.join("ghidra");
     let dopts = decompile::Opts {
@@ -337,7 +393,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         ghidra_home: opts.ghidra_home.clone(),
         processor: opts.processor.clone(),
     };
-    match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
+    let pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
         Ok(rep) => {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
@@ -359,13 +415,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     t.elapsed().as_millis(),
                 )),
             }
+            Some(rep)
         }
-        Err(e) => stages.push(StageReport::failed(
-            "decompile",
-            e.to_string(),
-            t.elapsed().as_millis(),
-        )),
-    }
+        Err(e) => {
+            stages.push(StageReport::failed(
+                "decompile",
+                e.to_string(),
+                t.elapsed().as_millis(),
+            ));
+            None
+        }
+    };
 
     // 4. Source tree — 02_MAIN only.
     let main_bin = images_dir.join("02_MAIN").join("02_MAIN.bin");
@@ -414,7 +474,77 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         ));
     }
 
-    // 5. Decoders (skip on missing optional inputs).
+    // 5. decode_tokens — MOVED EARLIER (Phase 1) so the symbol map can use it.
+    let token_db = rootfs.join("pw_token_db");
+    if token_db.exists() {
+        run_stage(&mut stages, "decode_tokens", "tokens", || {
+            tokens::run(&token_db, &out.join("tokens"))
+        });
+    } else {
+        stages.push(StageReport::skipped("decode_tokens", "no pw_token_db"));
+    }
+
+    // 6. Build the per-image symbol map from pass-1 outputs + attribution +
+    //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
+    let t = Instant::now();
+    let symbol_maps =
+        build_and_write_symbol_maps(out, &images_dir, &token_db, &out.join("manifest.json"));
+    {
+        let total: usize = symbol_maps.iter().map(|(_, (_, n))| *n).sum();
+        let stage = if total == 0 {
+            StageReport::skipped("symbol_map", "no symbols recovered")
+        } else {
+            StageReport::ok("symbol_map", "ghidra/symbol_maps/", t.elapsed().as_millis())
+        };
+        stages.push(stage);
+    }
+
+    // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image with a
+    //    non-empty map. Updates the pass1_report's per-image outcomes in place.
+    if let Some(mut rep) = pass1_report {
+        let t = Instant::now();
+        let map_paths: HashMap<String, PathBuf> = symbol_maps
+            .into_iter()
+            .map(|(label, (path, _))| (label, path))
+            .collect();
+        match decompile::run_two_pass(&modem_bin, &dopts, &ghidra_dir, &map_paths) {
+            Ok(rep2) => {
+                // Refresh the decompile stage's per-image reports with pass-2 fields.
+                rep.images = rep2.images;
+                let image_reports: Vec<ImageReport> =
+                    rep.images.iter().map(ImageReport::from_result).collect();
+                // Replace the last decompile stage entry.
+                if let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") {
+                    stages[pos] = StageReport::decompile(image_reports, t.elapsed().as_millis());
+                }
+            }
+            Err(e) => stages.push(StageReport::failed(
+                "decompile_pass2",
+                e.to_string(),
+                t.elapsed().as_millis(),
+            )),
+        }
+    }
+
+    // 8. Finalize symbolication per image: rewrite thumb_functions.json (still
+    //    asm in Phase 1) and write symbols.json. decompiled.c is left alone on
+    //    this path — pass 2 regenerated it with names baked in.
+    run_stage(
+        &mut stages,
+        "symbolicate_finalize",
+        "images/*/decompiled/symbols.json",
+        || {
+            symbolicate::run(
+                out,
+                &symbolicate::Opts {
+                    token_db: token_db.exists().then(|| token_db.clone()),
+                    rewrite_decompiled_c: false,
+                },
+            )
+        },
+    );
+
+    // 9. Remaining decoders (independent of symbolication).
     let rf_dir = out.join("rf_cfg_decompressed");
     let hwcfg_path = rootfs.join("hardware_config.json");
     let rf_present = std::fs::read_dir(&rf_dir)
@@ -447,34 +577,6 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             "no hardware_config.json",
         ));
     }
-
-    let token_db = rootfs.join("pw_token_db");
-    if token_db.exists() {
-        run_stage(&mut stages, "decode_tokens", "tokens", || {
-            tokens::run(&token_db, &out.join("tokens"))
-        });
-    } else {
-        stages.push(StageReport::skipped("decode_tokens", "no pw_token_db"));
-    }
-
-    // 5b. Symbolicate — recover names + log annotations in place, emit symbols.json.
-    //     Runs before prune so the raw split images (images/<label>/<label>.bin) and
-    //     the token DB are still present. Best-effort; degrades without evidence.
-    let sym_token_db = token_db.exists().then(|| token_db.clone());
-    run_stage(
-        &mut stages,
-        "symbolicate",
-        "images/*/decompiled/symbols.json",
-        || {
-            symbolicate::run(
-                out,
-                &symbolicate::Opts {
-                    token_db: sym_token_db.clone(),
-                    rewrite_decompiled_c: false,
-                },
-            )
-        },
-    );
 
     // 6. Prune (opt-in) then write the report.
     if opts.prune

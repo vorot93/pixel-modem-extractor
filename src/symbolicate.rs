@@ -793,7 +793,7 @@ pub struct FinalizeOpts {
 }
 
 /// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
-fn build_map(
+pub(crate) fn build_map(
     image_dir: &Path,
     image_label: &str,
     tokens: &HashMap<u32, String>,
