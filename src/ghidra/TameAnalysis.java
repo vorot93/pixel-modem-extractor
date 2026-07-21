@@ -30,14 +30,17 @@ public class TameAnalysis extends GhidraScript {
         "Aggressive Instruction Finder",
     };
 
-    // Phase 2 `mode=tighten` body — sourced verbatim from the Phase-2 investigation.
-    // On the smallest dense-Thumb region of a real 02_MAIN (2.06 MiB sample,
-    // N_r2 = 11023), disabling the Aggressive Instruction Finder alone caused
-    // Ghidra 12.1.2 to converge in 80 s with 0 ClearFlowAndRepairCmd log lines
-    // and 70 % coverage (N_ghidra = 7728). No additional analysis options needed
-    // to be disabled; the dense-Thumb region is NOT data-marked in this mode.
+    // Phase 2.1 `mode=tighten` body — sourced verbatim from the Phase-2.1 full-02_MAIN
+    // investigation (2026-07-21-thumb-decompilation-phase2-1-findings.md). On the FULL
+    // ~87 MB 02_MAIN (N_r2_full = 151411 across 5 dense-Thumb regions), disabling the
+    // Aggressive Instruction Finder (shared DISABLE) PLUS the `Repair Flow Damage`
+    // sub-option of `Non-Returning Functions - Discovered` caused Ghidra 12.1.2 to
+    // converge in 1398 s (23.3 min) with 0 ClearFlowAndRepairCmd log lines and 71 %
+    // radare2 coverage (N_ghidra = 107955). Phase 2's status quo (empty TIGHTEN_EXTRA)
+    // spun on the same image: Surface B fired at ~28 min with >100k repair lines.
+    // The dense-Thumb region is NOT data-marked in this mode.
     private static final String[] TIGHTEN_EXTRA = {
-        // empty — investigation found no extra option needed disabling.
+        "Non-Returning Functions - Discovered.Repair Flow Damage",
     };
 
     @Override
