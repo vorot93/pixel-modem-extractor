@@ -963,7 +963,10 @@ mod tests {
         std::fs::create_dir_all(&dec_a).unwrap();
         std::fs::write(
             dec_a.join("decompiled.c"),
-            "void thumb_40e1200(void)\n{\n  return;\n}\n",
+            // Phase 2.1: thumb_enrich parses ExportDecomp.java's
+            // `// <name> @ <addr>` header (address-keyed, T-bit normalized);
+            // the function entry `0x40e1200` matches the normalized `00040e1200`.
+            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
         )
         .unwrap();
         std::fs::write(

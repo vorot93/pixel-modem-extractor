@@ -322,9 +322,10 @@ fn tightened_tame_analysis_dispatchs_tighten_mode() {
 }
 
 /// Phase-2 e2e: `thumb_enrich` populates `body_c` from a synthetic
-/// `decompiled.c` keyed by the radare2-style `thumb_<hex>` function name, and
-/// bumps `format` to v2 on first population. Does not require Ghidra — pure
-/// Rust step — grouped with the Ghidra tests as Phase-2 contract regression.
+/// `decompiled.c` keyed by entry address (Phase 2.1: address-based matching,
+/// T-bit normalized), and bumps `format` to v2 on first population. Does not
+/// require Ghidra — pure Rust step — grouped with the Ghidra tests as Phase-2
+/// contract regression.
 #[test]
 fn thumb_enrich_populates_body_c() {
     let dir = std::env::temp_dir().join(format!(
@@ -337,7 +338,11 @@ fn thumb_enrich_populates_body_c() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let c_path = dir.join("decompiled.c");
-    std::fs::write(&c_path, "void thumb_40e00000(void)\n{\n  return;\n}\n").unwrap();
+    std::fs::write(
+        &c_path,
+        "// FUN_40e00000 @ 00040e00000\nvoid FUN_40e00000(void)\n{\n  return;\n}\n\n",
+    )
+    .unwrap();
     let thumb_path = dir.join("thumb_functions.json");
     std::fs::write(
         &thumb_path,
@@ -362,7 +367,7 @@ fn thumb_enrich_populates_body_c() {
     );
     let body_c = v["functions"][0]["body_c"].as_str().unwrap();
     assert!(
-        body_c.contains("thumb_40e00000"),
+        body_c.contains("FUN_40e00000"),
         "body_c should contain the function body: {body_c:?}"
     );
 
