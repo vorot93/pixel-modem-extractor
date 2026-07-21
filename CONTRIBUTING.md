@@ -193,7 +193,7 @@ module; when a file outgrows that, split it.
   sample didn't, Surface B's watch + datamark retry is the designed mitigation.
 - **Surface B mechanics (Phase 2+).** The watch in `decompile::run_report`'s
   tighten branch fires on wall-clock or log-spam excess, then re-spawns the
-  image as datamark. Three hard-won properties a fresh change can break:
+  image as datamark. Two hard-won properties a fresh change can break:
   (1) **Process-group kill (`cfg(unix)`).** `analyzeHeadless` is a bash launcher
   that forks a JVM; `child.kill()` only reaps the bash and orphans the Java
   grandchild, which keeps holding the Ghidra project lock and breaks the
@@ -201,15 +201,15 @@ module; when a file outgrows that, split it.
   own process group (`spawn_in_own_process_group` →
   `CommandExt::process_group(0)`); the kill path then calls
   `kill_process_group(child.id())` → `libc::kill(-pgid, SIGKILL)` to reach the
-  whole tree. On non-Unix the spawn is a no-op (Windows users fall back to
-  `--no-thumb-decompile`).
-  (2) **Project-lock spin-wait.** Even after a clean group-kill, JVM shutdown
-  I/O can race the datamark retry's project open. After the kill,
-  `wait_for_lock_release(<root>/ghidra_project/pixel-modem.lock, 10s)` polls
-  every 100 ms and gates the retry. If the lock doesn't release in time we
-  warn and proceed — the retry may then fail with `LockException`, recorded
-  as a non-fatal error rather than silently hanging the run.
-  (3) **Per-image byte-count budget.** The tighten baseline is extrapolated
+  whole tree, and `child.wait()` reaps the launcher. The kernel releases the
+  OS `FileChannel` project lock as soon as the JVM is reaped, so no userspace
+  wait is needed (a prior `Path::exists()`-polling spin-wait on the sentinel
+  `.lock` file was removed — it always hit its 10 s cap because no JVM
+  shutdown hook runs to delete the sentinel after `SIGKILL`). On non-Unix the
+  spawn is a no-op; `child.kill()` only `TerminateProcess`es the immediate
+  child and the JVM is orphaned (Windows users fall back to
+  `--no-thumb-decompile` if Surface B fires).
+  (2) **Per-image byte-count budget.** The tighten baseline is extrapolated
   from the image's `dense_thumb_bytes` (`tighten_baseline_for_dense_thumb_bytes`):
   `max(60s, bytes / 1MiB × 40s)`, grounded in Task 1's measurement
   (2 MiB → 80 s on Ghidra 12.1.2). With the default `wall_clock_multiplier=4`,
