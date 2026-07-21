@@ -1873,14 +1873,16 @@ INFO: second pdfj body was noisy and not parseable
 
         // Under parallel test execution (multiple tests in this module write +
         // exec stub `r2` scripts concurrently) the kernel occasionally returns
-        // ETXTBSY from execve on the freshly-written stub. Treat Io errors as
-        // transient and retry a few times before giving up; the assertion below
-        // still verifies the expected non-Io failure mode.
+        // ETXTBSY from execve on the freshly-written stub. Retry only on that
+        // specific transient kind; any other Io failure escalates immediately
+        // so it isn't masked. The assertion below still verifies the expected
+        // non-Io failure mode.
         let mut last = None;
         for attempt in 0..5u32 {
             match run_radare2_thumb(&r2, &[0u8; 16], 0x4000, &[(0x4000, 16)], &out) {
                 Ok(_) => break,
-                Err(e) if matches!(e, Error::Io(_)) => {
+                Err(e) if matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::ExecutableFileBusy) =>
+                {
                     last = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(5 * attempt as u64));
                     continue;
