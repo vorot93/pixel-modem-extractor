@@ -129,9 +129,6 @@ module; when a file outgrows that, split it.
 - **Test first**, keep changes small and reviewable.
 - **Verify before claiming done.** Run fmt + clippy + test, and for a behavior change
   exercise the actual affected command — don't infer success from tests alone.
-- **Commits:** short imperative subjects, capitalized, no trailing period (e.g. "Isolate
-  Ghidra runtime state", "Fix recovered source attribution conflicts"). Branch off
-  `master`; commit and push only when asked.
 - **Keep docs in sync:** a change to a command or convention updates `README.md`
   (user-facing) and/or this file (contributor-facing) in the same change.
 - **Docs are the durable memory.** Here that means the facts this codebase makes you learn
