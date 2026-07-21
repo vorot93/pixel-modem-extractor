@@ -13,6 +13,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonParser;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Listing;
@@ -86,7 +87,7 @@ public class ApplySymbols extends GhidraScript {
                 }
                 if (b.length() > 0) {
                     try {
-                        listing.setPlateComment(a, b.toString());
+                        listing.setComment(a, CodeUnit.PLATE_COMMENT, b.toString());
                         comments++;
                     } catch (Exception e) {
                         println("ApplySymbols: could not set plate comment at " + a + ": " + e.getMessage());
@@ -107,7 +108,7 @@ public class ApplySymbols extends GhidraScript {
             SourceType source = SourceType.ANALYSIS;
             if (sym.has("tier") && sym.get("tier").isJsonPrimitive()
                     && "recovered".equals(sym.get("tier").getAsString())) {
-                source = SourceType.USER;
+                source = SourceType.USER_DEFINED;
             }
             try {
                 fn.setName(name, source);
@@ -121,8 +122,13 @@ public class ApplySymbols extends GhidraScript {
     }
 
     private void summarize(String image, int applied, int comments, int skipped) {
-        println("ApplySymbols: image=" + image + " applied " + applied
-                + " names, " + comments + " plate comments, skipped " + skipped);
+        // Bypass GhidraScript.println (which routes through Msg.info and gets wrapped as
+        // "INFO  ApplySymbols.java> ... (GhidraScript)"): emit on stdout verbatim so the
+        // Rust driver's parse_pass2_summary can strip_prefix("ApplySymbols:").
+        String line = "ApplySymbols: image=" + image + " applied " + applied
+                + " names, " + comments + " plate comments, skipped " + skipped;
+        System.out.println(line);
+        println(line);
     }
 
     private static long parseAddr(String s) throws NumberFormatException {
