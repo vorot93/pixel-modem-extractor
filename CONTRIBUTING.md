@@ -52,7 +52,11 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   tiny ARM blob in a valid TOC, so it needs **no firmware** — but it needs a real Ghidra.
   It locates one via `GHIDRA_INSTALL_DIR` or `/opt/ghidra` (looking for
   `support/analyzeHeadless`) and skips otherwise. CI runs it nightly / on demand via the
-  `ghidra-e2e` workflow.
+  `ghidra-e2e` workflow. Two tests live there: `run_drives_ghidra_end_to_end` (pass-1
+  only, exercises `decompile::run`) and `pass2_renames_function_and_bakes_plate_comment`
+  (Phase 1+; crafts a one-symbol `symbol_map.json`, drives `decompile::run_two_pass`,
+  and asserts the rename + plate comment land in the regenerated `decompiled.c` —
+  the canonical regression test for the two-pass pipeline).
 - **External tools:** the `--run` and `decompose` paths shell out to Ghidra
   (`analyzeHeadless`) and radare2 (`r2`); both are probed up front.
 - Write the failing test first (TDD), then the minimal code to pass it.
@@ -81,7 +85,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`, `ApplySymbols`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -133,7 +137,23 @@ module; when a file outgrows that, split it.
   standalone subcommand) is single-pass and unchanged. The standalone
   `symbolicate` subcommand still does today's in-place text substitution
   (controlled by `Opts.rewrite_decompiled_c`, which is `true` for the
-  standalone path and `false` for the decompose path).
+  standalone path, `true` for the decompose path under `--no-symbol-pass`, and
+  `false` otherwise — pass 2 already baked the names in).
+- **Two-pass sequencing invariants.** Three structural facts a fresh change
+  can easily break:
+  (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
+  does NOT call `run_report` itself.** The caller (`decompose::run`) already
+  has the report — calling `run_report` again would triple Ghidra time on
+  `02_MAIN`. Don't "helpfully" add a fallback `run_report` call inside
+  `run_two_pass`.
+  (2) **`refresh_decompiled` must run per-image after `run_two_pass` returns
+  `Ok`.** Pass 2 writes back to `<ghidra_dir>/export/<label>/`; the per-image
+  tree (`images/<label>/decompiled/`) still has pass-1 output until that
+  helper moves the regenerated files over. Downstream stages
+  (`symbolicate_finalize`) and users read from the per-image tree.
+  (3) **`decode_tokens` runs BEFORE the `symbol_map` stage in `decompose::run`**
+  — the token DB is an input to `symbolicate::build_map`. The other decoders
+  (`decode_rf`, `hardware_config`) are independent and stay late.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`
@@ -146,11 +166,51 @@ module; when a file outgrows that, split it.
   `Tier::Recovered`'s strict single-identifier-plus-`__FILE__` rule and
   `Tier::Provisional`'s `guess_…` marker convention are preserved as-is; Phase
   1 only changes *where* names are applied, not *which* are considered safe.
+- **Ghidra 12 headless API notes (Phase 1+).** Hard-won; verified against
+  `/opt/ghidra` (Ghidra 12.1.2). Don't trust older API recall — `javap` the
+  bundled jars under `/opt/ghidra/Ghidra/Framework/*/lib/*.jar` when in doubt.
+  - **No `Listing.setPlateComment(Address, String)`.** Use
+    `listing.setComment(addr, CodeUnit.PLATE_COMMENT, s)` with
+    `import ghidra.program.model.listing.CodeUnit;`. (Other setXxxComment
+    convenience methods don't exist either — only `setComment(addr, int, String)`
+    and the `CommentType` overload.)
+  - **No `SourceType.USER`.** The enum is `DEFAULT, ANALYSIS, AI, IMPORTED,
+    USER_DEFINED`. The user-settable, highest-priority constant is
+    `USER_DEFINED` (use for `Tier::Recovered`); `ANALYSIS` is the right choice
+    for `Tier::Provisional` (so Ghidra's re-analysis can displace it).
+  - **`GhidraScript.println(String)` log4j-wraps the line** as
+    `INFO  <scriptname>> <msg> (GhidraScript)`. Anything the Rust host parses
+    from stdout by prefix-stripping must also be written via
+    `System.out.println(...)` to land unadorned. (See `ApplySymbols.summarize`
+    for the dual-emit pattern.)
+  - **Gson IS bundled** with Ghidra (`Ghidra/Framework/Generic/lib/gson-*.jar`)
+    and on the headless script classpath — use it for JSON in scripts.
+  - **`-process` mode, not `-import`, for pass 2.** Arg vector:
+    `<projectDir> <projectName> -process <label> -noanalysis -scriptPath … -postScript ApplySymbols.java <map> -postScript ExportDecomp.java <out>`.
+    `-noanalysis` is mandatory — re-running auto-analysis would (a) undo
+    `ApplySymbols` renames that aren't `USER_DEFINED`, and (b) re-trigger the
+    Thumb overlap-repair spin that `TameAnalysis` exists to prevent. Pass 2
+    operates on the existing program — no re-import, no CRC re-check.
+  - **`DecompInterface.setOptions(...)` *replaces* the program's "Decompiler"
+    property sheet** rather than merging. Any call clobbers user/environment
+    defaults; this is why `ExportDecomp.java` doesn't call it.
+- **Pass-2 fail-closed surface.** `decompile::ImageResult` carries
+  `pass2_applied: Option<usize>` (count of names `ApplySymbols.java` reported
+  applying — parsed from its summary line on stdout) and `pass2_error:
+  Option<String>` (set when analyzeHeadless exits non-zero *or* the spawn
+  itself fails; includes a ~2 KB tail of stderr). A pass-2 failure does **not**
+  mark the image `failed` in `report.json` — pass 1 already produced a valid
+  `decompiled.c`. Per-stage `Err` from `run_two_pass` is recorded as a
+  separate `decompile_pass2` failed stage; the pass-1 `decompile` stage stays.
 
 ## How we work here
 
 - **Design before code.** Non-trivial work gets a written design spec and an
-  implementation plan before implementation begins.
+  implementation plan before implementation begins. Phase 1+ specs and plans
+  live under `docs/superpowers/specs/` and `docs/superpowers/plans/`
+  respectively (`YYYY-MM-DD-<topic>-{design,plan}.md`). Read the most recent
+  ones before starting non-trivial work — they capture why approaches were
+  chosen or rejected, which the code alone can't tell you.
 - **Test first**, keep changes small and reviewable.
 - **Verify before claiming done.** Run fmt + clippy + test, and for a behavior change
   exercise the actual affected command — don't infer success from tests alone.
@@ -163,6 +223,11 @@ module; when a file outgrows that, split it.
   reconstruction or attribution threshold (`--gap`, `--shared-pct`, `--min-run`) sits where
   it does (→ a comment beside it). Record structure, offsets, and behavior only — never
   proprietary firmware bytes (see **Ground rules**).
+- **Worktrees for non-trivial work.** Multi-task implementation happens in a
+  git worktree under `.worktrees/<branch>/` (gitignored). The branch is the
+  unit of review and merge; master stays shippable. The subagent-driven
+  execution ledger (per-worktree, gitignored under `.superpowers/sdd/`) is
+  scratch — don't commit it; recover from `git log` if destroyed.
 
 ## Recipe: adding a subcommand or decoder
 
