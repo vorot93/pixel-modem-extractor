@@ -28,6 +28,7 @@ fn decompose_produces_unified_tree() {
         ghidra_home: None,
         processor: "ARM:LE:32:v7".to_string(),
         no_symbol_pass: false,
+        no_thumb_decompile: false,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -106,6 +107,27 @@ fn decompose_produces_unified_tree() {
     assert!(
         any_pass2,
         "expected at least one image with pass2_applied set"
+    );
+
+    // Phase 2: thumb_enrich (pass 1) and thumb_enrich_post_pass2 stages are
+    // both present in the report. Defaults run both; skip rules covered in
+    // Task 10/12.
+    let stage_names: Vec<String> = report["stages"]
+        .as_array()
+        .map(|stages| {
+            stages
+                .iter()
+                .map(|s| s["stage"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        stage_names.iter().any(|s| s == "thumb_enrich"),
+        "expected thumb_enrich stage in report: {stage_names:?}"
+    );
+    assert!(
+        stage_names.iter().any(|s| s == "thumb_enrich_post_pass2"),
+        "expected thumb_enrich_post_pass2 stage in report: {stage_names:?}"
     );
 
     // decompiled.c on 02_MAIN contains a plate comment from inline evidence.

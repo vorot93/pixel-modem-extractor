@@ -227,6 +227,7 @@ pub fn run() -> anyhow::Result<()> {
                 ghidra_home,
                 processor,
                 no_symbol_pass,
+                no_thumb_decompile: false,
             };
             let report = crate::decompose::run(&img, &opts, &out)?;
             println!("decomposed -> {}", out.display());
