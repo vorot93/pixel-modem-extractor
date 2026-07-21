@@ -28,6 +28,11 @@ pub struct Opts {
     /// (Phase-1 behavior) and `thumb_enrich` does not run for either pass.
     /// Task 10 wires the public `--no-thumb-decompile` clap flag to this field.
     pub no_thumb_decompile: bool,
+    /// Phase 2 / Surface B: test-only override that bypasses
+    /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
+    /// budget for the tighten-watch kill decision. Wired by Task 10's hidden
+    /// `--tighten-wall-clock-budget-sec` flag. Production callers leave `None`.
+    pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Serialize)]
@@ -494,7 +499,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         ghidra_home: opts.ghidra_home.clone(),
         processor: opts.processor.clone(),
         no_thumb_decompile: opts.no_thumb_decompile,
-        tighten_wall_clock_budget_override: None,
+        tighten_wall_clock_budget_override: opts.tighten_wall_clock_budget_override,
     };
     let mut pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
         Ok(rep) => {
