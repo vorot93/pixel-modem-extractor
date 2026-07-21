@@ -207,6 +207,22 @@ fn marshal_image(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()
     Ok(())
 }
 
+/// After pass 2, ExportDecomp.java has overwritten {ghidra}/export/{label}/.
+/// Move the fresh files into images/<label>/decompiled/ (replacing pass 1's).
+/// The slice file (<label>.bin) is already in place from pass 1; do not touch it.
+fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()> {
+    let export = ghidra_dir.join("export").join(label);
+    if !export.exists() {
+        return Ok(());
+    }
+    let dest = images_dir.join(label).join("decompiled");
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)?;
+    }
+    std::fs::rename(&export, dest)?;
+    Ok(())
+}
+
 /// Remove a file or directory if present; a missing path is not an error.
 fn remove_any(path: &Path) -> Result<()> {
     if path.is_dir() {
@@ -509,20 +525,32 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     }
 
     // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image with a
-    //    non-empty map. Updates the pass1_report's per-image outcomes in place.
+    //    non-empty map. Consumes pass1_report (pass 1 already ran in step 3).
+    //    Per-image pass-2 failures land in ImageResult.pass2_error and do not
+    //    abort the orchestrator — pass 1 already produced a valid decompiled.c.
     if !opts.no_symbol_pass {
-        if let Some(mut rep) = pass1_report {
+        if let Some(rep) = pass1_report {
             let t = Instant::now();
             let map_paths: HashMap<String, PathBuf> = symbol_maps
                 .into_iter()
                 .map(|(label, (path, _))| (label, path))
                 .collect();
-            match decompile::run_two_pass(&modem_bin, &dopts, &ghidra_dir, &map_paths) {
+            match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &map_paths) {
                 Ok(rep2) => {
+                    // Pass 2 overwrote {ghidra}/export/<label>/; re-marshal each
+                    // image's fresh export into the per-image tree so it does
+                    // not still hold pass 1's FUN_-placeholder decompiled.c.
+                    for ir in &rep2.images {
+                        if let Err(e) = refresh_decompiled(&ghidra_dir, &images_dir, &ir.label) {
+                            tracing::warn!(
+                                "decompose: refresh_decompiled for {} failed: {e}",
+                                ir.label
+                            );
+                        }
+                    }
                     // Refresh the decompile stage's per-image reports with pass-2 fields.
-                    rep.images = rep2.images;
                     let image_reports: Vec<ImageReport> =
-                        rep.images.iter().map(ImageReport::from_result).collect();
+                        rep2.images.iter().map(ImageReport::from_result).collect();
                     // Replace the last decompile stage entry.
                     if let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") {
                         stages[pos] =
@@ -542,7 +570,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 
     // 8. Finalize symbolication per image: rewrite thumb_functions.json (still
     //    asm in Phase 1) and write symbols.json. decompiled.c is left alone on
-    //    this path — pass 2 regenerated it with names baked in.
+    //    the pass-2 path — pass 2 regenerated it with names baked in. With
+    //    --no-symbol-pass (pass 2 skipped), fall back to today's standalone-style
+    //    text substitution so users get the same FUN_ recovery as before, not
+    //    raw Ghidra output.
     run_stage(
         &mut stages,
         "symbolicate_finalize",
@@ -552,7 +583,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 out,
                 &symbolicate::Opts {
                     token_db: token_db.exists().then(|| token_db.clone()),
-                    rewrite_decompiled_c: false,
+                    rewrite_decompiled_c: opts.no_symbol_pass,
                 },
             )
         },

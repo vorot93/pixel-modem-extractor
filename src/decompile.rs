@@ -376,9 +376,10 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp}.java
+    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
-    //    writes the decompiled C / disasm listing / function inventory)
+    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols
+    //    post-script is staged for pass-2 symbol application.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
@@ -620,18 +621,19 @@ fn parse_pass2_summary(stdout: &str) -> Option<usize> {
     None
 }
 
-/// Two-pass decompile. Pass 1 is exactly today's `run_report`. Pass 2 runs only
-/// for images whose `symbol_maps.get(&label)` exists, points at a readable file,
-/// and contains at least one non-null `name`. Per-image pass-2 failures are
-/// recorded into `ImageResult.pass2_error`, not propagated — pass 1 already
-/// produced a valid `decompiled.c`.
+/// Pass 2 of two-pass decompile. Accepts the pass-1 `report` (callers run pass 1
+/// via `run_report` separately and pass its result here — running pass 1 again
+/// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
+/// `symbol_maps.get(&label)` exists, points at a readable file, and contains at
+/// least one non-null `name`. Per-image pass-2 failures (non-zero exit, spawn
+/// failure) are recorded into `ImageResult.pass2_error`, not propagated — pass 1
+/// already produced a valid `decompiled.c`.
 pub fn run_two_pass(
-    modem_bin: &Path,
+    mut report: DecompileReport,
     opts: &Opts,
     out: &Path,
     symbol_maps: &HashMap<String, PathBuf>,
 ) -> Result<DecompileReport> {
-    let mut report = run_report(modem_bin, opts, out)?;
     if !opts.run {
         return Ok(report);
     }
@@ -662,17 +664,42 @@ pub fn run_two_pass(
 
         tracing::info!("ghidra: pass 2 symbolication for {}", ir.label);
         let args = headless_process_args(&root_str, &ir.label, map_path);
-        let output = headless_command(&install.headless, &args, &root, java_home.as_deref())
+        // Spawn failure (e.g. executable bit lost, Ghidra uninstalled mid-run)
+        // lands in `pass2_error` per image instead of propagating — pass 1
+        // already produced a valid `decompiled.c` for every image.
+        let output = match headless_command(&install.headless, &args, &root, java_home.as_deref())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .output()?;
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                ir.pass2_error = Some(format!("spawn: {e}"));
+                continue;
+            }
+        };
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             ir.pass2_applied = parse_pass2_summary(&stdout);
         } else {
             let code = output.status.code().unwrap_or(-1);
             tracing::warn!("ghidra: pass 2 for {} failed (exit {code})", ir.label);
-            ir.pass2_error = Some(format!("analyzeHeadless exit {code}"));
+            // Java stack traces and Ghidra script compile errors land on stderr;
+            // keep the tail so the report stays actionable without bloating.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail: String = if stderr.len() > 2048 {
+                stderr
+                    .chars()
+                    .rev()
+                    .take(2048)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            } else {
+                stderr.into_owned()
+            };
+            ir.pass2_error = Some(format!("analyzeHeadless exit {code}; stderr tail:\n{tail}"));
         }
     }
     Ok(report)
