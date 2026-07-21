@@ -413,6 +413,95 @@ pub fn should_kill_tighten(
     None
 }
 
+/// Phase 2 / Surface B: per-image tighten baseline extrapolated from the
+/// image's dense-Thumb byte count. Grounded in Task 1's measurement — Ghidra
+/// 12.1.2 under `Tighten`-mode `TameAnalysis` converged on a 2 MiB dense-Thumb
+/// sample in 80 s, i.e. ~40 s/MiB. Below the 60 s floor the heuristic keeps the
+/// watch meaningful on tiny regions (a 0-MiB image still gets a 60 s baseline,
+/// which combined with the default 4× multiplier yields a 240 s ceiling).
+///
+/// `should_kill_tighten` multiplies this by `TightenBudget::wall_clock_multiplier`
+/// (default 4×) unless the test-only `--tighten-wall-clock-budget-sec` override
+/// supplies an absolute budget. For a real `02_MAIN` (~42 MiB dense Thumb across
+/// 5 regions) this gives baseline ≈ 1 680 s (~28 min) and a default budget of
+/// ~112 min — generous enough to not fire prematurely on real firmware, tight
+/// enough to catch a true overlap-repair spin (which runs for hours otherwise).
+pub fn tighten_baseline_for_dense_thumb_bytes(dense_thumb_bytes: usize) -> std::time::Duration {
+    const SECONDS_PER_MIB: u64 = 40;
+    const FLOOR_SECONDS: u64 = 60;
+    let mib = (dense_thumb_bytes / (1024 * 1024)) as u64;
+    std::time::Duration::from_secs(FLOOR_SECONDS.max(mib.saturating_mul(SECONDS_PER_MIB)))
+}
+
+/// Phase 2 / Surface B: spin-wait for `lock_path` to disappear, capped at
+/// `timeout`. Returns `true` if the lock is gone (either it disappeared within
+/// the timeout or was absent on entry), `false` if it still exists when the
+/// timeout elapses. Polls every 100 ms — even a JVM that's mid-shutdown needs
+/// a moment to release the project lock after `killpg`.
+///
+/// This is the hardening layer over the process-group kill: the bash launcher
+/// is reaped via `child.wait()`, but the Java grandchild may still be flushing
+/// I/O when the datamark retry tries to open the project, racing the project
+/// lock. The wait converts that race into a deterministic gate.
+fn wait_for_lock_release(lock_path: &Path, timeout: std::time::Duration) -> bool {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    if !lock_path.exists() {
+        return true;
+    }
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        std::thread::sleep(POLL_INTERVAL);
+        if !lock_path.exists() {
+            return true;
+        }
+    }
+    !lock_path.exists()
+}
+
+/// Phase 2 / Surface B (Unix): spawn helper that puts the Ghidra `analyzeHeadless`
+/// process in its own process group so the Surface B watch can kill the whole
+/// tree (bash launcher + Java grandchild) with one `killpg`. Without this the
+/// SIGKILL from `child.kill()` only reaps the bash launcher; the JVM is
+/// orphaned to init and keeps holding the Ghidra project lock, which then
+/// makes the datamark retry fail with `LockException` (the bug fixed by this
+/// module).
+///
+/// On non-Unix targets this is a no-op (Windows users fall back to
+/// `--no-thumb-decompile` if the tighten-watch fires — there is no
+/// cross-platform process-group kill in std).
+#[cfg(unix)]
+fn spawn_in_own_process_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn spawn_in_own_process_group(_cmd: &mut std::process::Command) {
+    // No portable process-group equivalent; child.kill() on Windows already
+    // signals the whole job tree if one was created at spawn. Tighten-watch
+    // users on Windows should prefer --no-thumb-decompile for now.
+}
+
+/// Phase 2 / Surface B (Unix): send SIGKILL to the entire process group led
+/// by `child`. Best-effort — the caller has already SIGKILLed the immediate
+/// child via `child.kill()`. Negative PID means "the process group".
+#[cfg(unix)]
+fn kill_process_group(child_pid: u32) {
+    // SAFETY: `libc::kill` is async-signal-safe and thread-safe; the only
+    // failure modes are ESRCH (already gone — fine), EPERM (not our child,
+    // shouldn't happen for our own spawn), or EINVAL (bad signal — static
+    // input). We discard the return value because every failure mode is
+    // either benign or impossible.
+    unsafe {
+        let _ = libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child_pid: u32) {
+    // No portable killpg; child.kill() on Windows already handles the tree.
+}
+
 /// Write a turnkey `run_ghidra.sh` (one `analyzeHeadless` invocation per image),
 /// built from `headless_args` against a relocatable `$HERE` root.
 fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
@@ -584,17 +673,31 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 let mut cmd =
                     headless_command(&install.headless, &args, &root, java_home.as_deref());
                 cmd.stdout(std::process::Stdio::piped());
+                // Spawn `analyzeHeadless` in its own process group so the
+                // Surface B watch can kill the whole tree (bash launcher +
+                // Java grandchild) with one `killpg`. Without this the JVM
+                // is orphaned to init by `child.kill()`, keeps holding the
+                // Ghidra project lock, and the datamark retry fails with
+                // LockException (the bug this path fixes).
+                spawn_in_own_process_group(&mut cmd);
                 let started = std::time::Instant::now();
                 let mut child = cmd.spawn()?;
+                let child_pid = child.id();
                 let stdout = child.stdout.take().expect("piped stdout");
                 let reader = std::io::BufReader::new(stdout);
                 let budget = TightenBudget::default();
-                // decompile --run has no prior baseline (radare2 ran first in
-                // `decompose`, not here); use a 60 s heuristic for Thumb-bearing
-                // images — combined with the default 4× multiplier this gives a
-                // 240 s ceiling, ample for normal analysis and tight enough to
-                // catch a runaway overlap-repair loop on dense MAIN.
-                let baseline = std::time::Duration::from_secs(60);
+                // `decompile --run` has no prior baseline (radare2 ran first
+                // in `decompose`, not here). Extrapolate from this image's
+                // dense-Thumb byte count (Task 1 measured ~40 s/MiB on Ghidra
+                // 12.1.2 in Tighten mode; floor 60 s for tiny regions). With
+                // the default 4× multiplier: 42 MiB dense Thumb (real 02_MAIN)
+                // → baseline 1 680 s, budget ~112 min — generous enough to
+                // not fire prematurely on production images, tight enough to
+                // catch a true overlap-repair spin (which otherwise runs for
+                // hours). The test-only
+                // `--tighten-wall-clock-budget-sec` override bypasses this.
+                let dense_thumb_bytes: usize = regions.iter().map(|(_, len)| *len as usize).sum();
+                let baseline = tighten_baseline_for_dense_thumb_bytes(dense_thumb_bytes);
                 let mut killed: Option<KillReason> = None;
                 let mut repair_lines = 0usize;
                 for line in std::io::BufRead::lines(reader) {
@@ -631,12 +734,30 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                         tracing::warn!(
                             "ghidra: {label} tighten run killed ({reason}); re-spawning as datamark"
                         );
-                        // Best-effort: signal the child, then reap so we don't
-                        // leak a zombie into the re-spawn. Errors are fine —
-                        // the child may have exited between the last stdout
-                        // line and the kill.
+                        // Best-effort: signal the immediate child, then the
+                        // whole process group (the bash launcher SIGKILLed by
+                        // `child.kill()` only reaps itself — the Java grandchild
+                        // is in the same group and would otherwise survive,
+                        // holding the project lock). Then reap the immediate
+                        // child so we don't leak a zombie into the re-spawn.
                         let _ = child.kill();
+                        kill_process_group(child_pid);
                         let _ = child.wait();
+                        // Even after the group kill, the JVM's project-lock
+                        // release races the datamark retry's project open.
+                        // Spin-wait on the lock file (capped at 10 s) so the
+                        // retry sees a clean project; if the lock doesn't
+                        // release in time, warn and proceed anyway — the
+                        // retry may still fail with LockException, which
+                        // becomes a recorded error rather than a silent one.
+                        let lock_path = root.join("ghidra_project").join("pixel-modem.lock");
+                        let lock_timeout = std::time::Duration::from_secs(10);
+                        if !wait_for_lock_release(&lock_path, lock_timeout) {
+                            tracing::warn!(
+                                "ghidra: {label} project lock {lock_path:?} not released \
+                                 within {lock_timeout:?}; datamark retry may fail"
+                            );
+                        }
                         tighten_error =
                             Some(format!("tighten killed: {reason}; retrying as datamark"));
                         thumb_decompiled_override = Some(0);
@@ -2137,6 +2258,133 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn tighten_baseline_for_dense_thumb_bytes_floor_60s_for_small_input() {
+        // Sub-1-MiB inputs floor at the 60 s heuristic so a tiny region
+        // doesn't collapse the budget below the watch's calibrated minimum.
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(0),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(1024 * 1024),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn tighten_baseline_for_dense_thumb_bytes_extrapolates_40s_per_mib() {
+        // Task 1 grounding: 80 s tighten on a 2 MiB sample ~= 40 s/MiB.
+        // 2 MiB -> 80 s, 10 MiB -> 400 s, 42 MiB -> 1680 s (~28 min).
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(2 * 1024 * 1024),
+            std::time::Duration::from_secs(80)
+        );
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(10 * 1024 * 1024),
+            std::time::Duration::from_secs(400)
+        );
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(42 * 1024 * 1024),
+            std::time::Duration::from_secs(1680)
+        );
+    }
+
+    #[test]
+    fn wait_for_lock_release_returns_quickly_when_lock_disappears() {
+        let dir = std::env::temp_dir().join(format!(
+            "pme_lock_release_{}_{}_disappears",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("pixel-modem.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        // Spawn a remover that fires after 100 ms; the helper polls every
+        // 100 ms, so the wait should complete well under the 5 s timeout.
+        let lock_clone = lock.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = std::fs::remove_file(lock_clone);
+        });
+
+        let start = std::time::Instant::now();
+        let released = wait_for_lock_release(&lock, std::time::Duration::from_secs(5));
+        let elapsed = start.elapsed();
+
+        assert!(released, "lock should be reported released");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should return quickly once the lock disappears, took {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_lock_release_times_out_when_lock_persists() {
+        let dir = std::env::temp_dir().join(format!(
+            "pme_lock_release_{}_{}_persists",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("pixel-modem.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        // Persist the lock; the helper should hit its 300 ms cap and return
+        // false. (Cap is intentionally tight so the test stays fast.)
+        let start = std::time::Instant::now();
+        let released = wait_for_lock_release(&lock, std::time::Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        assert!(!released, "lock never went away, should return false");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "should honor the timeout, not return early; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should not overrun the timeout by more than one poll interval; took {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_file(&lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_lock_release_returns_true_when_lock_absent_upfront() {
+        let dir = std::env::temp_dir().join(format!(
+            "pme_lock_release_{}_{}_absent",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("pixel-modem.lock");
+        // Never create the lock — the helper should return immediately.
+        let start = std::time::Instant::now();
+        let released = wait_for_lock_release(&lock, std::time::Duration::from_secs(5));
+        let elapsed = start.elapsed();
+
+        assert!(released, "absent lock should be reported released");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "absent lock should short-circuit; took {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

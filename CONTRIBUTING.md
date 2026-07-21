@@ -146,7 +146,8 @@ module; when a file outgrows that, split it.
   asm `body` is always populated (radare2 unchanged). `--no-thumb-decompile`
   reverts to Phase-1 datamark behavior. A runtime wall-clock + log-spam watch
   kills Ghidra on overlapping-function-repair spin and falls back to datamark
-  per image (recorded as `thumb_tighten_error`, image not marked `failed`).
+  per image (recorded as `thumb_tighten_error`, image not marked `failed`);
+  see **Surface B mechanics** below for the kill path and budget calibration.
   `thumb_enrich` parses `decompiled.c` and fills `body_c`; it is pure Rust,
   idempotent, runs after pass 1 and again after pass 2.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
@@ -190,6 +191,32 @@ module; when a file outgrows that, split it.
   `docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-findings.md`
   for the full investigation; if the full ~87 MB `02_MAIN` spins where the
   sample didn't, Surface B's watch + datamark retry is the designed mitigation.
+- **Surface B mechanics (Phase 2+).** The watch in `decompile::run_report`'s
+  tighten branch fires on wall-clock or log-spam excess, then re-spawns the
+  image as datamark. Three hard-won properties a fresh change can break:
+  (1) **Process-group kill (`cfg(unix)`).** `analyzeHeadless` is a bash launcher
+  that forks a JVM; `child.kill()` only reaps the bash and orphans the Java
+  grandchild, which keeps holding the Ghidra project lock and breaks the
+  datamark retry with `LockException`. The spawn path puts the child in its
+  own process group (`spawn_in_own_process_group` →
+  `CommandExt::process_group(0)`); the kill path then calls
+  `kill_process_group(child.id())` → `libc::kill(-pgid, SIGKILL)` to reach the
+  whole tree. On non-Unix the spawn is a no-op (Windows users fall back to
+  `--no-thumb-decompile`).
+  (2) **Project-lock spin-wait.** Even after a clean group-kill, JVM shutdown
+  I/O can race the datamark retry's project open. After the kill,
+  `wait_for_lock_release(<root>/ghidra_project/pixel-modem.lock, 10s)` polls
+  every 100 ms and gates the retry. If the lock doesn't release in time we
+  warn and proceed — the retry may then fail with `LockException`, recorded
+  as a non-fatal error rather than silently hanging the run.
+  (3) **Per-image byte-count budget.** The tighten baseline is extrapolated
+  from the image's `dense_thumb_bytes` (`tighten_baseline_for_dense_thumb_bytes`):
+  `max(60s, bytes / 1MiB × 40s)`, grounded in Task 1's measurement
+  (2 MiB → 80 s on Ghidra 12.1.2). With the default `wall_clock_multiplier=4`,
+  a real `02_MAIN` (~42 MiB dense Thumb) gets baseline ≈ 1 680 s and a budget
+  of ~112 min — generous enough to not fire prematurely on production,
+  tight enough to catch a true overlap-repair spin (hours otherwise). The
+  test-only `--tighten-wall-clock-budget-sec` override bypasses this.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`
