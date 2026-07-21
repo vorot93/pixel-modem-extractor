@@ -200,6 +200,7 @@ pub fn run() -> anyhow::Result<()> {
                 image,
                 ghidra_home,
                 processor,
+                no_thumb_decompile: false,
             };
             crate::decompile::run(&modem_bin, &opts, &out)?; // run() prints the console report
         }

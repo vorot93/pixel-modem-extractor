@@ -58,6 +58,7 @@ fn run_drives_ghidra_end_to_end() {
         image: None,
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
     };
     pixel_modem_extractor::decompile::run(&modem_path, &opts, &out).unwrap();
 
@@ -132,6 +133,7 @@ fn pass2_renames_function_and_bakes_plate_comment() {
         image: None,
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
     };
 
     // Pass 1: analyze + initial decompiled.c (with FUN_ placeholder).

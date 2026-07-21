@@ -26,6 +26,11 @@ pub struct Opts {
     pub image: Option<String>,
     pub ghidra_home: Option<PathBuf>,
     pub processor: String,
+    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode
+    /// (today's Phase-1 behavior — dense Thumb regions marked as data, radare2
+    /// handles them, no `thumb_enrich` runs, `thumb_functions.json` stays at v2
+    /// asm-only). Default false (tighten mode).
+    pub no_thumb_decompile: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -101,12 +106,17 @@ pub fn build_load_spec(
 /// truth used both to serialize `run_ghidra.sh` and to spawn under `--run`.
 /// `root` is the path prefix (an absolute out dir for `--run`, or `$HERE` in the
 /// shell script). NOTE: `-loader-baseAddr` is hex WITHOUT a `0x` prefix.
+///
+/// `mode` is "tighten" (Phase 2+ default — attempt Thumb) or "datamark" (Phase-1
+/// fallback — mark regions as data). When "tighten", the `thumb_regions` arg is
+/// ignored (no data-marks passed to the script).
 fn headless_args(
     root: &str,
     label: &str,
     processor: &str,
     base_addr: u32,
     thumb_regions: &[(u32, u32)],
+    mode: &str,
 ) -> Vec<String> {
     let mut args = vec![
         format!("{root}/ghidra_project"),
@@ -121,15 +131,20 @@ fn headless_args(
         format!("{base_addr:08x}"),
         "-scriptPath".to_string(),
         format!("{root}/scripts"),
-        // Pre-script (runs before auto-analysis): disables the Aggressive Instruction
-        // Finder and marks the dense high-entropy regions passed below (each as
-        // "addrHex:lenHex") as data — Thumb-2 protocol-stack code Ghidra can't converge
-        // on, so radare2 analyzes it separately.
+        // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as
+        // its arg[0]. In `datamark` mode it also disables the Aggressive
+        // Instruction Finder and marks the dense high-entropy regions passed
+        // below (each as "addrHex:lenHex") as data — Thumb-2 protocol-stack
+        // code Ghidra can't converge on, so radare2 analyzes it separately. In
+        // `tighten` mode no regions are passed (Phase 2+: let Ghidra try).
         "-preScript".to_string(),
         "TameAnalysis.java".to_string(),
+        mode.to_string(),
     ];
-    for (addr, len) in thumb_regions {
-        args.push(format!("{addr:08x}:{len:x}"));
+    if mode == "datamark" {
+        for (addr, len) in thumb_regions {
+            args.push(format!("{addr:08x}:{len:x}"));
+        }
     }
     args.extend([
         "-postScript".to_string(),
@@ -138,6 +153,15 @@ fn headless_args(
         "-overwrite".to_string(),
     ]);
     args
+}
+
+/// Resolve the mode from Opts: datamark when the escape hatch is set, else tighten.
+fn mode_from_opts(opts: &Opts) -> &'static str {
+    if opts.no_thumb_decompile {
+        "datamark"
+    } else {
+        "tighten"
+    }
 }
 
 fn ghidra_config_home(root: &Path) -> PathBuf {
@@ -354,7 +378,8 @@ fn write_run_script(out: &Path, toc: &Toc, data: &[u8], processor: &str) -> Resu
         let start = (e.offset as usize).min(data.len());
         let end = (e.offset as usize + e.size as usize).min(data.len());
         let regions = thumb_regions(&data[start..end], e.load_addr);
-        let args = headless_args("$HERE", &e.label(), processor, e.load_addr, &regions);
+        let mode = "tighten"; // Phase 2+: kit callers without Opts get tighten (production default).
+        let args = headless_args("$HERE", &e.label(), processor, e.load_addr, &regions, mode);
         s.push_str("\"$HEADLESS\"");
         for a in &args {
             s.push_str(" \"");
@@ -449,7 +474,14 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     regions.len()
                 );
             }
-            let args = headless_args(&root_str, &label, &opts.processor, e.load_addr, &regions);
+            let args = headless_args(
+                &root_str,
+                &label,
+                &opts.processor,
+                e.load_addr,
+                &regions,
+                mode_from_opts(opts),
+            );
             let status =
                 headless_command(&install.headless, &args, &root, java_home.as_deref()).status()?;
             let outcome = if status.success() {
@@ -1544,6 +1576,7 @@ mod tests {
             "ARM:LE:32:v7",
             0x4001_0000,
             &[(0x4109_0000, 0x288_0000)],
+            "datamark",
         );
         assert_eq!(args[0], "/out/ghidra_project");
         assert_eq!(args[1], "pixel-modem");
@@ -1559,19 +1592,59 @@ mod tests {
         let ps = args.iter().position(|a| a == "-postScript").unwrap();
         assert_eq!(args[ps + 1], "ExportDecomp.java");
         assert_eq!(args[ps + 2], "/out/export/02_MAIN");
-        // pre-script wires TameAnalysis.java, then the data-region args, before the post-script
+        // pre-script wires TameAnalysis.java, then mode, then the data-region args
+        // (only in datamark mode), before the post-script
         let pre = args.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(args[pre + 1], "TameAnalysis.java");
-        assert_eq!(args[pre + 2], "41090000:2880000"); // addrHex:lenHex
+        assert_eq!(args[pre + 2], "datamark");
+        assert_eq!(args[pre + 3], "41090000:2880000"); // addrHex:lenHex
         assert!(pre < ps, "pre-script must precede post-script");
         assert!(args.iter().any(|a| a == "-overwrite"));
-        // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly follows
-        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, &[]);
+        // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly
+        // follows the mode arg
+        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, &[], "datamark");
         let zpre = z.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(z[zpre + 1], "TameAnalysis.java");
-        assert_eq!(z[zpre + 2], "-postScript");
+        assert_eq!(z[zpre + 2], "datamark");
+        assert_eq!(z[zpre + 3], "-postScript");
         let bz = z.iter().position(|a| a == "-loader-baseAddr").unwrap();
         assert_eq!(z[bz + 1], "00000000");
+    }
+
+    #[test]
+    fn headless_args_passes_tighten_mode() {
+        let args = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            &[(0x40e12000, 0x100000)],
+            "tighten",
+        );
+        let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
+        // The next arg after the script name is the mode.
+        assert_eq!(args[pre_idx + 1], "tighten");
+        // No addrHex:lenHex follows (tighten mode does not data-mark).
+        assert!(
+            !args[pre_idx + 2..].iter().any(|a| a.contains(':')),
+            "tighten mode must not pass region args: {:?}",
+            &args[pre_idx + 2..]
+        );
+    }
+
+    #[test]
+    fn headless_args_passes_datamark_mode_and_regions() {
+        let args = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            &[(0x40e12000, 0x100000)],
+            "datamark",
+        );
+        let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
+        assert_eq!(args[pre_idx + 1], "datamark");
+        assert!(args[pre_idx + 2..].iter().any(|a| a == "40e12000:100000"));
     }
 
     #[test]
@@ -2121,6 +2194,7 @@ INFO: second pdfj body was noisy and not parseable
             image: None,
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
         };
 
         let rep = run_report(&modem, &opts, &dir.join("out")).unwrap();
@@ -2198,6 +2272,7 @@ INFO: second pdfj body was noisy and not parseable
             image: None,
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
         };
         run(&modem, &opts, &out).unwrap();
 
