@@ -268,7 +268,7 @@ fn read_ghidra_application_log(out: &std::path::Path) -> String {
 /// Together with `no_thumb_decompile_flag_falls_back_to_datamark` this locks in
 /// the per-mode dispatch on the same fixture.
 #[test]
-fn tightened_tame_analysis_emits_thumb_function() {
+fn tightened_tame_analysis_dispatchs_tighten_mode() {
     let Some(home) = find_ghidra_home() else {
         eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
         return;

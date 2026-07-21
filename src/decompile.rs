@@ -38,7 +38,7 @@ pub struct Opts {
     pub no_thumb_decompile: bool,
     /// Phase 2 / Surface B: test-only override that bypasses
     /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
-    /// budget for the tighten-watch kill decision. Wired by Task 10's hidden
+    /// budget for the tighten-watch kill decision. Wired to the hidden
     /// `--tighten-wall-clock-budget-sec` flag (Section 7 verification).
     /// Production callers leave this `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
@@ -419,7 +419,7 @@ pub fn should_kill_tighten(
 }
 
 /// Phase 2 / Surface B: per-image tighten baseline extrapolated from the
-/// image's dense-Thumb byte count. Grounded in Task 1's measurement — Ghidra
+/// image's dense-Thumb byte count. Grounded in initial measurement — Ghidra
 /// 12.1.2 under `Tighten`-mode `TameAnalysis` converged on a 2 MiB dense-Thumb
 /// sample in 80 s, i.e. ~40 s/MiB. Below the 60 s floor the heuristic keeps the
 /// watch meaningful on tiny regions (a 0-MiB image still gets a 60 s baseline,
@@ -601,7 +601,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             tighten_error: Option<String>,
             // When the tighten-watch kills the run, we re-spawn as datamark
             // and there is no `thumb_enrich` to run later; mark the count
-            // definitively zero so downstream stages (Task 8) don't enqueue
+            // definitively zero so downstream stages don't enqueue
             // work against an empty decompiled.c.
             thumb_decompiled: Option<usize>,
         }
@@ -645,7 +645,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             let mut tighten_error: Option<String> = None;
             // When the tighten-watch kills the run, we re-spawn as datamark
             // and there is no `thumb_enrich` to run later; mark the count
-            // definitively zero so downstream stages (Task 8) don't enqueue
+            // definitively zero so downstream stages don't enqueue
             // work against an empty decompiled.c.
             let mut thumb_decompiled_override: Option<usize> = None;
             let status = if mode == "tighten" {
@@ -667,7 +667,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 let budget = TightenBudget::default();
                 // `decompile --run` has no prior baseline (radare2 ran first
                 // in `decompose`, not here). Extrapolate from this image's
-                // dense-Thumb byte count (Task 1 measured ~40 s/MiB on Ghidra
+                // dense-Thumb byte count (prior measurement: ~40 s/MiB on Ghidra
                 // 12.1.2 in Tighten mode; floor 60 s for tiny regions). With
                 // the default 4× multiplier: 42 MiB dense Thumb (real 02_MAIN)
                 // → baseline 1 680 s, budget ~112 min — generous enough to
@@ -741,13 +741,24 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                             &regions,
                             "datamark",
                         );
-                        headless_command(
+                        let retry_status = headless_command(
                             &install.headless,
                             &datamark_args,
                             &root,
                             java_home.as_deref(),
                         )
-                        .status()?
+                        .status()?;
+                        if retry_status.success() {
+                            tracing::info!(
+                                "ghidra: {label} datamark retry succeeded after tighten kill"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "ghidra: {label} datamark retry failed (exit {}) after tighten kill",
+                                retry_status.code().unwrap_or(-1)
+                            );
+                        }
+                        retry_status
                     }
                     None => child.wait()?,
                 }
@@ -1779,7 +1790,7 @@ fn parse_decompiled_c_function_bodies(c_text: &str) -> HashMap<String, String> {
             // one-line `void f(void){}` form) or the next (Ghidra's two-line
             // `<sig>\n{\n` form). The bound is what prevents a header-shaped
             // non-header from absorbing arbitrary following lines into the wrong
-            // name's body — see the Task 4 review.
+            // name's body — see the upstream review notes.
             let start = i;
             let opens_brace =
                 lines[start].contains('{') || lines.get(start + 1).is_some_and(|l| l.contains('{'));
@@ -2248,7 +2259,7 @@ mod tests {
 
     #[test]
     fn tighten_baseline_for_dense_thumb_bytes_extrapolates_40s_per_mib() {
-        // Task 1 grounding: 80 s tighten on a 2 MiB sample ~= 40 s/MiB.
+        // Grounding: 80 s tighten on a 2 MiB sample ~= 40 s/MiB.
         // 2 MiB -> 80 s, 10 MiB -> 400 s, 42 MiB -> 1680 s (~28 min).
         assert_eq!(
             tighten_baseline_for_dense_thumb_bytes(2 * 1024 * 1024),
@@ -2966,7 +2977,7 @@ INFO: second pdfj body was noisy and not parseable
     #[test]
     fn run_radare2_thumb_emits_v2_format_string() {
         // Phase 2 bumps thumb_functions.json format to v2; the body_c field arrives
-        // in Task 4. Uses the stub-r2 pattern (cf. radare2_thumb_maps_raw_blob_at_region_address)
+        // in the enrich step. Uses the stub-r2 pattern (cf. radare2_thumb_maps_raw_blob_at_region_address)
         // so the test is hermetic and does not require a real r2 on PATH.
         let dir = std::env::temp_dir().join(format!("pme_r2_v2_fmt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2996,7 +3007,7 @@ INFO: second pdfj body was noisy and not parseable
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             v["format"], "pixel-modem-extractor-thumb-functions-v2",
-            "Phase 2 bumps the format to v2 (body_c field arrives in Task 4)"
+            "Phase 2 bumps the format to v2 (body_c field arrives in the enrich step)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -567,4 +567,46 @@ mod tests {
             _ => panic!("wrong subcommand"),
         }
     }
+
+    #[test]
+    fn decompile_tighten_wall_clock_budget_sec_is_hidden_from_help() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompile")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(
+            !help.contains("--tighten-wall-clock-budget-sec"),
+            "hidden test-only flag should not appear in help:\n{help}"
+        );
+    }
+
+    #[test]
+    fn decompile_tighten_wall_clock_budget_sec_parses_u64_seconds() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decompile",
+            "--tighten-wall-clock-budget-sec",
+            "42",
+            "/tmp/radio.img",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Decompile {
+                tighten_wall_clock_budget_sec,
+                ..
+            } => {
+                assert_eq!(
+                    tighten_wall_clock_budget_sec,
+                    Some(42),
+                    "--tighten-wall-clock-budget-sec 42 should parse as Some(42)"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
 }

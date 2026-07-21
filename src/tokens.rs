@@ -240,7 +240,7 @@ mod tests {
     use super::*;
 
     /// 3 entries: (1,"AB",present), (2,"C,D",removed 2021-02-03), and an exact
-    /// duplicate of entry 0. The comma in "C,D" exercises CSV quoting (Task 2).
+    /// duplicate of entry 0. The comma in "C,D" exercises CSV quoting.
     fn fixture() -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(b"TOKENS\0\0");

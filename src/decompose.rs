@@ -26,11 +26,11 @@ pub struct Opts {
     pub no_symbol_pass: bool,
     /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode
     /// (Phase-1 behavior) and `thumb_enrich` does not run for either pass.
-    /// Task 10 wires the public `--no-thumb-decompile` clap flag to this field.
+    /// The public `--no-thumb-decompile` clap flag wires to this field.
     pub no_thumb_decompile: bool,
     /// Phase 2 / Surface B: test-only override that bypasses
     /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
-    /// budget for the tighten-watch kill decision. Wired by Task 10's hidden
+    /// budget for the tighten-watch kill decision. Wired to the hidden
     /// `--tighten-wall-clock-budget-sec` flag. Production callers leave `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
 }
@@ -550,6 +550,19 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             outcome,
             enrich_started.elapsed().as_millis(),
         ));
+    } else {
+        // Pass 1 failed entirely (no pass1_report). Record explicit skipped
+        // entries so the report shape stays predictable. The post-pass-2
+        // enrich is also unreachable here; record it once. (When
+        // --no-symbol-pass is also set, step 7 records thumb_enrich_post_pass2
+        // with "--no-symbol-pass" — guard to avoid a duplicate entry.)
+        stages.push(StageReport::skipped("thumb_enrich", "pass 1 failed"));
+        if !opts.no_symbol_pass {
+            stages.push(StageReport::skipped(
+                "thumb_enrich_post_pass2",
+                "pass 1 failed",
+            ));
+        }
     }
 
     // 4. Source tree — 02_MAIN only.

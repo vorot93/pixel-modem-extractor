@@ -5,11 +5,34 @@ Parent spec: `docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-desig
 
 ## Problem
 
-Phase 2 ships with `thumb_decompiled > 0` unreachable on production `02_MAIN`. The
-single per-image `mode=tighten` invocation triggers Ghidra's overlap-repair spin on
-the larger dense-Thumb regions; Surface B's watch correctly fires after ~28 min and
-falls back to `mode=datamark`, but that data-marks every dense region, leaving
-`thumb_enrich` with no Thumb C bodies in `decompiled.c` to populate.
+Phase 2 ships with `thumb_decompiled > 0` unreachable on production `02_MAIN`.
+Body-c dormancy has **two independent causes**, both of which Phase 2.1 must
+address:
+
+1. **`thumb_enrich` matching bug (gate).** `thumb_enrich` matches by function
+   name, but `thumb_functions.json`'s radare2-style names (`thumb_<addr>` /
+   `sym.thumb_<addr>`) never align with `decompiled.c`'s Ghidra names
+   (`FUN_<addr>` or post-pass-2 recovered names). `body_c` stays empty on any
+   image regardless of which mode Ghidra ran in. The Phase 2 spec
+   (`docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-design.md`,
+   § Acceptance → thumb_enrich contract) specified **address-based** matching;
+   the plan deviated to name-based. This is a prerequisite for any body-c
+   population and must land first.
+
+2. **Surface B datamark fallback (production `02_MAIN` only).** The single
+   per-image `mode=tighten` invocation triggers Ghidra's overlap-repair spin on
+   the larger dense-Thumb regions; Surface B's watch correctly fires after
+   ~28 min and falls back to `mode=datamark`, but that data-marks every dense
+   region, leaving `thumb_enrich` with no Thumb C bodies in `decompiled.c` to
+   populate. Addressed by per-region tightening (the original Phase 2.1
+   direction below).
+
+A real Ghidra e2e fixture that triggers Thumb discovery under `ARM:LE:32:v7` is
+also required — the current 6-byte fixture doesn't, so today's
+`tightened_tame_analysis_dispatchs_tighten_mode` test asserts only mode dispatch
+(was renamed from `…_emits_thumb_function` to reflect this). Phase 2.1 must add
+a fixture with a mode-switch instruction so the end-to-end Thumb→C path is
+actually exercised.
 
 Task 1's investigation (`docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-findings.md`)
 validated the tightened config on the *smallest* of 5 detected dense-Thumb regions
@@ -18,13 +41,29 @@ behavior of the larger four (4–19 MiB each).
 
 ## Direction (to be refined in brainstorming)
 
-Per-region tightening. Each detected dense-Thumb region gets its own Ghidra tighten
-invocation (either as a carved standalone program, or via multiple `analyzeHeadless`
-passes over the same project but with per-region `TightenBudget`s). Regions that
-converge produce Thumb C in `decompiled.c`; regions that spin fall back to datamark
-individually. The smallest region (Task 1's sample) is known to converge — it alone
-would deliver non-zero `body_c` on production, validating the Phase 2 architecture
-end-to-end.
+**Required, in order:**
+
+- **Lead with the `thumb_enrich` matching fix.** Switch from name-based to
+  address-based matching (per the Phase 2 spec). Without this, no amount of
+  tightening will deliver `body_c` — the matching gate fires first. Pure Rust,
+  well-bounded by the existing `thumb_enrich_populates_body_c` test (which
+  today uses a hand-aligned name and will need its assertion flipped to
+  address-based).
+- **Add a real Ghidra Thumb e2e fixture.** Construct a fixture with a mode-switch
+  instruction so Ghidra auto-discovers a Thumb function under `ARM:LE:32:v7`;
+  use it to extend the e2e suite beyond mode-dispatch assertions.
+- **Then per-region tightening** (the original direction below) to address
+  Surface B on production `02_MAIN`.
+
+Per-region tightening remains a candidate (and is required for production
+body_c), but it is the third step, not the first — it cannot succeed without
+the matching fix above it. Each detected dense-Thumb region gets its own Ghidra
+tighten invocation (either as a carved standalone program, or via multiple
+`analyzeHeadless` passes over the same project but with per-region
+`TightenBudget`s). Regions that converge produce Thumb C in `decompiled.c`;
+regions that spin fall back to datamark individually. The smallest region
+(Task 1's sample) is known to converge — it alone would deliver non-zero
+`body_c` on production, validating the Phase 2 architecture end-to-end.
 
 Alternative directions to consider in brainstorming:
 

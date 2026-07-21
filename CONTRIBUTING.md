@@ -157,10 +157,16 @@ module; when a file outgrows that, split it.
   retry succeeds, the image stays `analyzed`, and pass-2 symbolication completes
   (330+ names applied) — so Phase 1 functionality is intact. But
   `thumb_decompiled` is `0` on production `02_MAIN` because the datamark retry
-  data-marks the regions `thumb_enrich` would otherwise populate. This is the
-  spec's designed behavior for Surface B (§ Error handling → Surface B). A
-  Phase 2.1 follow-up (per-region tightening) is required to deliver `body_c`
-  on production.
+  data-marks the regions `thumb_enrich` would otherwise populate. A second,
+  independent cause exists even when Surface B doesn't fire: `thumb_enrich`
+  matches by function name, but `thumb_functions.json`'s radare2-style names
+  (`thumb_<addr>` / `sym.thumb_<addr>`) never align with `decompiled.c`'s
+  Ghidra names (`FUN_<addr>` or post-pass-2 recovered names), so `body_c` stays
+  empty on any image regardless of Surface B. The spec specified address-based
+  matching; the plan deviated to name-based. This is the spec's designed
+  behavior for Surface B (§ Error handling → Surface B). A Phase 2.1 follow-up
+  (the `thumb_enrich` matching fix plus per-region tightening) is required to
+  deliver `body_c` on production.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
   can easily break:
   (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
