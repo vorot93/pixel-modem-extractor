@@ -1430,11 +1430,15 @@ pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) 
 /// (identifier-ish name followed by `(...)`), then captures text up to the matching
 /// closing `}` at brace-depth 0. The opening `{` may appear on the header line
 /// itself or on a following line (the form emitted by Ghidra's C decompiler:
-/// `<ret> <name>(<params>)\n{\n ... \n}\n`). Lines that look header-ish but are
-/// never followed by any `{` are treated as non-headers and skipped. Comments and
-/// string literals are not special-cased — ExportDecomp.java's output is regular
-/// enough that brace-counting is sufficient; malformed input fails closed in the
-/// caller.
+/// `<ret> <name>(<params>)\n{\n ... \n}\n`). Lines that look header-ish but
+/// aren't followed by `{` on the same line or the next are treated as
+/// non-headers and skipped (a bounded lookahead — without it, a header-shaped
+/// non-header such as a function call, declaration, or control statement could
+/// commit at position N and absorb following lines into the wrong name's body
+/// until the next real function's `{`, silently skipping intervening real
+/// headers). Comments and string literals are not special-cased —
+/// ExportDecomp.java's output is regular enough that brace-counting is
+/// sufficient; malformed input fails closed in the caller.
 fn parse_decompiled_c_function_bodies(c_text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let lines: Vec<&str> = c_text.lines().collect();
@@ -1455,8 +1459,19 @@ fn parse_decompiled_c_function_bodies(c_text: &str) -> HashMap<String, String> {
                 i += 1;
                 continue;
             }
-            // Capture from this line through the matching closing brace at depth 0.
+            // Bounded lookahead: commit only when `{` appears on this line (the
+            // one-line `void f(void){}` form) or the next (Ghidra's two-line
+            // `<sig>\n{\n` form). The bound is what prevents a header-shaped
+            // non-header from absorbing arbitrary following lines into the wrong
+            // name's body — see the Task 4 review.
             let start = i;
+            let opens_brace =
+                lines[start].contains('{') || lines.get(start + 1).is_some_and(|l| l.contains('{'));
+            if !opens_brace {
+                i = start + 1;
+                continue;
+            }
+            // Capture from this line through the matching closing brace at depth 0.
             let mut depth = 0i32;
             let mut saw_brace = false;
             let mut body = String::new();
@@ -1478,11 +1493,6 @@ fn parse_decompiled_c_function_bodies(c_text: &str) -> HashMap<String, String> {
                     break;
                 }
                 i += 1;
-            }
-            if !saw_brace {
-                // Header-shaped line with no `{` ever following — not a function.
-                i = start + 1;
-                continue;
             }
             out.insert(name.to_string(), body);
         }
