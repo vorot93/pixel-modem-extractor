@@ -27,6 +27,7 @@ fn decompose_produces_unified_tree() {
         prune: false,
         ghidra_home: None,
         processor: "ARM:LE:32:v7".to_string(),
+        no_symbol_pass: false,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return

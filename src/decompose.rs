@@ -20,6 +20,10 @@ pub struct Opts {
     pub prune: bool,
     pub ghidra_home: Option<PathBuf>,
     pub processor: String,
+    /// Skip the Phase-1 symbolication pass 2 (escape hatch). When true, decompose
+    /// uses today's single-pass decompile behavior and emits no symbol_map or
+    /// pass-2 artifacts.
+    pub no_symbol_pass: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -487,9 +491,14 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     // 6. Build the per-image symbol map from pass-1 outputs + attribution +
     //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
     let t = Instant::now();
-    let symbol_maps =
-        build_and_write_symbol_maps(out, &images_dir, &token_db, &out.join("manifest.json"));
-    {
+    let symbol_maps = if opts.no_symbol_pass {
+        Vec::new()
+    } else {
+        build_and_write_symbol_maps(out, &images_dir, &token_db, &out.join("manifest.json"))
+    };
+    if opts.no_symbol_pass {
+        stages.push(StageReport::skipped("symbol_map", "--no-symbol-pass"));
+    } else {
         let total: usize = symbol_maps.iter().map(|(_, (_, n))| *n).sum();
         let stage = if total == 0 {
             StageReport::skipped("symbol_map", "no symbols recovered")
@@ -501,29 +510,34 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 
     // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image with a
     //    non-empty map. Updates the pass1_report's per-image outcomes in place.
-    if let Some(mut rep) = pass1_report {
-        let t = Instant::now();
-        let map_paths: HashMap<String, PathBuf> = symbol_maps
-            .into_iter()
-            .map(|(label, (path, _))| (label, path))
-            .collect();
-        match decompile::run_two_pass(&modem_bin, &dopts, &ghidra_dir, &map_paths) {
-            Ok(rep2) => {
-                // Refresh the decompile stage's per-image reports with pass-2 fields.
-                rep.images = rep2.images;
-                let image_reports: Vec<ImageReport> =
-                    rep.images.iter().map(ImageReport::from_result).collect();
-                // Replace the last decompile stage entry.
-                if let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") {
-                    stages[pos] = StageReport::decompile(image_reports, t.elapsed().as_millis());
+    if !opts.no_symbol_pass {
+        if let Some(mut rep) = pass1_report {
+            let t = Instant::now();
+            let map_paths: HashMap<String, PathBuf> = symbol_maps
+                .into_iter()
+                .map(|(label, (path, _))| (label, path))
+                .collect();
+            match decompile::run_two_pass(&modem_bin, &dopts, &ghidra_dir, &map_paths) {
+                Ok(rep2) => {
+                    // Refresh the decompile stage's per-image reports with pass-2 fields.
+                    rep.images = rep2.images;
+                    let image_reports: Vec<ImageReport> =
+                        rep.images.iter().map(ImageReport::from_result).collect();
+                    // Replace the last decompile stage entry.
+                    if let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") {
+                        stages[pos] =
+                            StageReport::decompile(image_reports, t.elapsed().as_millis());
+                    }
                 }
+                Err(e) => stages.push(StageReport::failed(
+                    "decompile_pass2",
+                    e.to_string(),
+                    t.elapsed().as_millis(),
+                )),
             }
-            Err(e) => stages.push(StageReport::failed(
-                "decompile_pass2",
-                e.to_string(),
-                t.elapsed().as_millis(),
-            )),
         }
+    } else {
+        stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
     }
 
     // 8. Finalize symbolication per image: rewrite thumb_functions.json (still
