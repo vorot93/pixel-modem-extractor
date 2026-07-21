@@ -721,20 +721,26 @@ fn toc_name(label: &str) -> &str {
     label.split_once('_').map(|(_, n)| n).unwrap_or(label)
 }
 
-/// Symbolicate one image's `decompiled/` dir in place; returns the symbols.json path.
-fn symbolicate_image(
+/// Tunable parameters for `finalize_image`. Today a single flag controls whether
+/// `decompiled.c` / `disasm.lst` are text-rewritten; on the `decompose` two-pass
+/// path (Phase 1+), pass 2 regenerates `decompiled.c` and the rewrite is skipped.
+pub struct FinalizeOpts {
+    pub rewrite_decompiled_c: bool,
+}
+
+/// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
+fn build_map(
     image_dir: &Path,
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
-) -> Result<PathBuf> {
+) -> Result<Vec<Symbol>> {
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
 
     let mut funcs = load_functions(&decompiled, &disasm)?;
     funcs.extend(load_thumb_functions(&decompiled)?);
 
-    // Optional string evidence (needs the raw split image + load_addr).
     let source_tree = image_dir.join("source_tree");
     let (file_occ, file_strings) = if source_tree.join("manifest.json").exists() {
         load_file_occurrences(&source_tree)?
@@ -799,7 +805,20 @@ fn symbolicate_image(
         });
     }
     finalize_names(&mut symbols);
+    Ok(symbols)
+}
 
+/// Apply the built symbols to a per-image `decompiled/` dir in place; returns
+/// the `symbols.json` path. `rewrite_decompiled_c = false` skips the text
+/// rewrite of `decompiled.c` / `disasm.lst` (the two-pass decompose path
+/// regenerates them from Ghidra).
+fn finalize_image(
+    image_dir: &Path,
+    image_label: &str,
+    symbols: &[Symbol],
+    opts: &FinalizeOpts,
+) -> Result<PathBuf> {
+    let decompiled = image_dir.join("decompiled");
     let mut inputs = HashMap::new();
     if let Ok(b) = std::fs::read(decompiled.join("functions.json")) {
         inputs.insert(
@@ -808,9 +827,29 @@ fn symbolicate_image(
         );
     }
 
-    rewrite_functions_json(&decompiled, &symbols)?;
-    rewrite_text_files(&decompiled, &symbols)?;
-    write_symbols_json(&decompiled, image_label, &symbols, inputs)
+    rewrite_functions_json(&decompiled, symbols)?;
+    if opts.rewrite_decompiled_c {
+        rewrite_text_files(&decompiled, symbols)?;
+    }
+    write_symbols_json(&decompiled, image_label, symbols, inputs)
+}
+
+/// Backward-compatible wrapper: build_map + finalize_image with the rewrite on.
+fn symbolicate_image(
+    image_dir: &Path,
+    image_label: &str,
+    tokens: &HashMap<u32, String>,
+    manifest: &Path,
+) -> Result<PathBuf> {
+    let symbols = build_map(image_dir, image_label, tokens, manifest)?;
+    finalize_image(
+        image_dir,
+        image_label,
+        &symbols,
+        &FinalizeOpts {
+            rewrite_decompiled_c: true,
+        },
+    )
 }
 
 /// Symbolicate every image under `<root>/images/*` that has a `decompiled/` dir.
@@ -1282,5 +1321,74 @@ mod tests {
         // decompiled.c rewritten in place
         let c = std::fs::read_to_string(dec.join("decompiled.c")).unwrap();
         assert!(c.contains("guess_") && !c.contains("FUN_10"));
+    }
+
+    #[test]
+    fn build_map_returns_symbols_without_writing_files() {
+        let root = tmp("pme_sym_build_map");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dec.join("disasm.lst"),
+            "0x10: 41f2 movw r0, 0xcc9\n0x14: 4770 bx lr\n",
+        )
+        .unwrap();
+        let db = crate::tokens::Database {
+            reserved: 0,
+            entries: vec![crate::tokens::Entry {
+                token: 0xcc9,
+                date_removed: None,
+                string: "■format♦Latency %d■domain♦Perf".into(),
+            }],
+        };
+        let tokmap = token_map(&db);
+        let manifest = root.join("manifest.json");
+        std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
+
+        let symbols =
+            build_map(&root.join("images/02_MAIN"), "02_MAIN", &tokmap, &manifest).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert!(symbols[0].name.as_deref().unwrap().starts_with("guess_"));
+        // Crucially: build_map does NOT write symbols.json yet.
+        assert!(!dec.join("symbols.json").exists());
+    }
+
+    #[test]
+    fn finalize_image_writes_symbols_json_when_given_symbols() {
+        let root = tmp("pme_sym_finalize");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+        )
+        .unwrap();
+        let symbols = vec![Symbol {
+            address: "0x10".into(),
+            arch: "arm",
+            original_name: "FUN_10".into(),
+            name: Some("real".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        }];
+        let opts = FinalizeOpts {
+            rewrite_decompiled_c: true,
+        };
+        let path =
+            finalize_image(&root.join("images/02_MAIN"), "02_MAIN", &symbols, &opts).unwrap();
+        assert!(path.ends_with("symbols.json"));
+        assert!(dec.join("symbols.json").exists());
+        // functions.json was rewritten with original_name.
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dec.join("functions.json")).unwrap()).unwrap();
+        assert_eq!(v[0]["name"], "real");
+        assert_eq!(v[0]["original_name"], "FUN_10");
     }
 }
