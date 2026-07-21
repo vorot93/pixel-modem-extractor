@@ -59,6 +59,7 @@ fn run_drives_ghidra_end_to_end() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
     };
     pixel_modem_extractor::decompile::run(&modem_path, &opts, &out).unwrap();
 
@@ -134,6 +135,7 @@ fn pass2_renames_function_and_bakes_plate_comment() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
     };
 
     // Pass 1: analyze + initial decompiled.c (with FUN_ placeholder).

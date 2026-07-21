@@ -201,6 +201,7 @@ pub fn run() -> anyhow::Result<()> {
                 ghidra_home,
                 processor,
                 no_thumb_decompile: false,
+                tighten_wall_clock_budget_override: None,
             };
             crate::decompile::run(&modem_bin, &opts, &out)?; // run() prints the console report
         }

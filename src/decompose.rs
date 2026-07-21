@@ -425,6 +425,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         ghidra_home: opts.ghidra_home.clone(),
         processor: opts.processor.clone(),
         no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
     };
     let pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
         Ok(rep) => {
