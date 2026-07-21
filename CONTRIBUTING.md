@@ -139,6 +139,34 @@ module; when a file outgrows that, split it.
   (controlled by `Opts.rewrite_decompiled_c`, which is `true` for the
   standalone path, `true` for the decompose path under `--no-symbol-pass`, and
   `false` otherwise — pass 2 already baked the names in).
+- **Phase 2: Thumb decompilation.** Dense Thumb regions in `02_MAIN` are no
+  longer data-marked for Ghidra; the tightened `TameAnalysis` (mode=tighten)
+  lets Ghidra attempt function discovery and decompilation. Per-function hybrid
+  output: `thumb_functions.json` v2 with optional per-function `body_c`; the
+  asm `body` is always populated (radare2 unchanged). `--no-thumb-decompile`
+  reverts to Phase-1 datamark behavior. A runtime wall-clock + log-spam watch
+  kills Ghidra on overlapping-function-repair spin and falls back to datamark
+  per image (recorded as `thumb_tighten_error`, image not marked `failed`);
+  see **Surface B mechanics** below for the kill path and budget calibration.
+  `thumb_enrich` parses `decompiled.c` and fills `body_c`; it is pure Rust,
+  idempotent, runs after pass 1 and again after pass 2. **Production note
+  (Phase 2):** verification on a real `02_MAIN` (Pixel 6 Pro mustang) confirms
+  Surface B's watch correctly fires on the larger dense-Thumb regions after
+  ~28 min of analysis (the smallest region's Task-1 sample did not predict
+  this — full `02_MAIN` produces >100k overlap-repair log lines). The datamark
+  retry succeeds, the image stays `analyzed`, and pass-2 symbolication completes
+  (330+ names applied) — so Phase 1 functionality is intact. But
+  `thumb_decompiled` is `0` on production `02_MAIN` because the datamark retry
+  data-marks the regions `thumb_enrich` would otherwise populate. A second,
+  independent cause exists even when Surface B doesn't fire: `thumb_enrich`
+  matches by function name, but `thumb_functions.json`'s radare2-style names
+  (`thumb_<addr>` / `sym.thumb_<addr>`) never align with `decompiled.c`'s
+  Ghidra names (`FUN_<addr>` or post-pass-2 recovered names), so `body_c` stays
+  empty on any image regardless of Surface B. The spec specified address-based
+  matching; the plan deviated to name-based. This is the spec's designed
+  behavior for Surface B (§ Error handling → Surface B). A Phase 2.1 follow-up
+  (the `thumb_enrich` matching fix plus per-region tightening) is required to
+  deliver `body_c` on production.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
   can easily break:
   (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
@@ -154,6 +182,58 @@ module; when a file outgrows that, split it.
   (3) **`decode_tokens` runs BEFORE the `symbol_map` stage in `decompose::run`**
   — the token DB is an input to `symbolicate::build_map`. The other decoders
   (`decode_rf`, `hardware_config`) are independent and stay late.
+- **Phase 2 invariants.** Three structural facts a fresh change can easily break:
+  (1) **`thumb_enrich` runs after pass 1 AND after `run_two_pass` returns
+  `Ok`.** Skipping the second run leaves `body_c` with placeholder names —
+  same contract as pass-2 skipping on `--no-symbol-pass`. Don't "helpfully"
+  drop the post-pass-2 enrich when adding a fast path.
+  (2) **`--no-thumb-decompile` skips both `thumb_enrich` runs** and forces
+  `TameAnalysis mode=datamark` end-to-end. The output is byte-equivalent to
+  today's Phase-1 behavior (modulo the v2 format bump on `thumb_functions.json`,
+  which is informational-only at load time).
+  (3) **The runtime watch (Surface B) is non-deterministic.** Its data fields
+  (`thumb_tighten_error`) are structurally tested at the report-shape level;
+  the kill behavior itself is verified manually via
+  `--tighten-wall-clock-budget-sec 1`. Don't assert on the kill firing in a
+  unit test — it depends on Ghidra's repair-log cadence against real firmware.
+- **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
+  of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
+  (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
+  ARM Aggressive Instruction Finder) is sufficient for Ghidra 12.1.2 to
+  converge in 80 s with 0 repair-log lines and 70 % radare2 coverage. Losing
+  candidates (one-line rationale each): **Candidate 3** (disable
+  `ClearFlowAndRepairCmd`) and **Candidate 4** (cap repair) were never run —
+  Candidate 2 hit every stop condition first, so neither option name was
+  resolved against Ghidra 12's analysis-properties sheet. See
+  `docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-findings.md`
+  for the full investigation; if the full ~87 MB `02_MAIN` spins where the
+  sample didn't, Surface B's watch + datamark retry is the designed mitigation.
+- **Surface B mechanics (Phase 2+).** The watch in `decompile::run_report`'s
+  tighten branch fires on wall-clock or log-spam excess, then re-spawns the
+  image as datamark. Two hard-won properties a fresh change can break:
+  (1) **Process-group kill (`cfg(unix)`).** `analyzeHeadless` is a bash launcher
+  that forks a JVM; `child.kill()` only reaps the bash and orphans the Java
+  grandchild, which keeps holding the Ghidra project lock and breaks the
+  datamark retry with `LockException`. The spawn path puts the child in its
+  own process group (`spawn_in_own_process_group` →
+  `CommandExt::process_group(0)`); the kill path then calls
+  `kill_process_group(child.id())` → `libc::kill(-pgid, SIGKILL)` to reach the
+  whole tree, and `child.wait()` reaps the launcher. The kernel releases the
+  OS `FileChannel` project lock as soon as the JVM is reaped, so no userspace
+  wait is needed (a prior `Path::exists()`-polling spin-wait on the sentinel
+  `.lock` file was removed — it always hit its 10 s cap because no JVM
+  shutdown hook runs to delete the sentinel after `SIGKILL`). On non-Unix the
+  spawn is a no-op; `child.kill()` only `TerminateProcess`es the immediate
+  child and the JVM is orphaned (Windows users fall back to
+  `--no-thumb-decompile` if Surface B fires).
+  (2) **Per-image byte-count budget.** The tighten baseline is extrapolated
+  from the image's `dense_thumb_bytes` (`tighten_baseline_for_dense_thumb_bytes`):
+  `max(60s, bytes / 1MiB × 40s)`, grounded in Task 1's measurement
+  (2 MiB → 80 s on Ghidra 12.1.2). With the default `wall_clock_multiplier=4`,
+  a real `02_MAIN` (~42 MiB dense Thumb) gets baseline ≈ 1 680 s and a budget
+  of ~112 min — generous enough to not fire prematurely on production,
+  tight enough to catch a true overlap-repair spin (hours otherwise). The
+  test-only `--tighten-wall-clock-budget-sec` override bypasses this.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`

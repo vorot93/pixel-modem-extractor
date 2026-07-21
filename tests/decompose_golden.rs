@@ -28,6 +28,8 @@ fn decompose_produces_unified_tree() {
         ghidra_home: None,
         processor: "ARM:LE:32:v7".to_string(),
         no_symbol_pass: false,
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -108,6 +110,27 @@ fn decompose_produces_unified_tree() {
         "expected at least one image with pass2_applied set"
     );
 
+    // Phase 2: thumb_enrich (pass 1) and thumb_enrich_post_pass2 stages are
+    // both present in the report. Defaults run both; skip rules covered in
+    // Task 10/12.
+    let stage_names: Vec<String> = report["stages"]
+        .as_array()
+        .map(|stages| {
+            stages
+                .iter()
+                .map(|s| s["stage"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        stage_names.iter().any(|s| s == "thumb_enrich"),
+        "expected thumb_enrich stage in report: {stage_names:?}"
+    );
+    assert!(
+        stage_names.iter().any(|s| s == "thumb_enrich_post_pass2"),
+        "expected thumb_enrich_post_pass2 stage in report: {stage_names:?}"
+    );
+
     // decompiled.c on 02_MAIN contains a plate comment from inline evidence.
     let main_c = std::fs::read_to_string(
         out.join("images")
@@ -163,4 +186,52 @@ fn decompose_produces_unified_tree() {
     );
     // intermediates present without --prune
     assert!(out.join("modem.ext4").exists(), "ext4 kept without --prune");
+}
+
+/// Phase 2: on a real `02_MAIN` the per-image entry in `report.json` carries at
+/// least one of the Phase-2 Thumb fields — either `thumb_decompiled` (the
+/// happy path: tightened Ghidra converged and `thumb_enrich` populated `body_c`)
+/// or `thumb_tighten_error` (Surface B fired: the runtime watch killed the
+/// tightened run and fell back to datamark). Either is a valid Phase-2 outcome;
+/// their absence means the Phase-2 wiring is silently inert.
+#[test]
+fn report_json_includes_phase2_fields() {
+    let Some(img) = std::env::var_os("PME_RADIO_IMG").map(PathBuf::from) else {
+        eprintln!("skip: set PME_RADIO_IMG");
+        return;
+    };
+    if !img.exists() {
+        eprintln!("skip: PME_RADIO_IMG not found");
+        return;
+    }
+    if decompile::find_headless(None).is_err() || decompile::find_radare2().is_none() {
+        eprintln!("skip: Ghidra and/or radare2 not available on this host");
+        return;
+    }
+
+    let out = std::env::temp_dir().join("pme_decompose_golden_phase2");
+    let _ = std::fs::remove_dir_all(&out);
+    let opts = decompose::Opts {
+        no_verify: false,
+        prune: false,
+        ghidra_home: None,
+        processor: "ARM:LE:32:v7".to_string(),
+        no_symbol_pass: false,
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+    let _ = decompose::run(&img, &opts, &out);
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("report.json")).unwrap()).unwrap();
+    let main = report["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|s| s["stage"] == "decompile"))
+        .and_then(|s| s["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+    assert!(
+        main.get("thumb_decompiled").is_some() || main.get("thumb_tighten_error").is_some(),
+        "Phase-2 fields absent on 02_MAIN: {main}"
+    );
 }

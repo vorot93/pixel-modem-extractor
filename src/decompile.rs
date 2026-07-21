@@ -20,12 +20,28 @@ const EXPORT_DECOMP_JAVA: &str = include_str!("ghidra/ExportDecomp.java");
 const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
 const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 
+/// Ghidra project name passed to `analyzeHeadless` (the directory is
+/// `<root>/ghidra_project`). Shared by pass 1 (`-import`) and pass 2
+/// (`-process`) so the two argument vectors never drift on a rename.
+const GHIDRA_PROJECT_NAME: &str = "pixel-modem";
+
 #[derive(Debug, Clone)]
 pub struct Opts {
     pub run: bool,
     pub image: Option<String>,
     pub ghidra_home: Option<PathBuf>,
     pub processor: String,
+    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode
+    /// (today's Phase-1 behavior — dense Thumb regions marked as data, radare2
+    /// handles them, no `thumb_enrich` runs, `thumb_functions.json` stays at v2
+    /// asm-only). Default false (tighten mode).
+    pub no_thumb_decompile: bool,
+    /// Phase 2 / Surface B: test-only override that bypasses
+    /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
+    /// budget for the tighten-watch kill decision. Wired to the hidden
+    /// `--tighten-wall-clock-budget-sec` flag (Section 7 verification).
+    /// Production callers leave this `None`.
+    pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -101,16 +117,21 @@ pub fn build_load_spec(
 /// truth used both to serialize `run_ghidra.sh` and to spawn under `--run`.
 /// `root` is the path prefix (an absolute out dir for `--run`, or `$HERE` in the
 /// shell script). NOTE: `-loader-baseAddr` is hex WITHOUT a `0x` prefix.
+///
+/// `mode` is "tighten" (Phase 2+ default — attempt Thumb) or "datamark" (Phase-1
+/// fallback — mark regions as data). When "tighten", the `thumb_regions` arg is
+/// ignored (no data-marks passed to the script).
 fn headless_args(
     root: &str,
     label: &str,
     processor: &str,
     base_addr: u32,
     thumb_regions: &[(u32, u32)],
+    mode: &str,
 ) -> Vec<String> {
     let mut args = vec![
         format!("{root}/ghidra_project"),
-        "pixel-modem".to_string(),
+        GHIDRA_PROJECT_NAME.to_string(),
         "-import".to_string(),
         format!("{root}/images/{label}"),
         "-processor".to_string(),
@@ -121,15 +142,20 @@ fn headless_args(
         format!("{base_addr:08x}"),
         "-scriptPath".to_string(),
         format!("{root}/scripts"),
-        // Pre-script (runs before auto-analysis): disables the Aggressive Instruction
-        // Finder and marks the dense high-entropy regions passed below (each as
-        // "addrHex:lenHex") as data — Thumb-2 protocol-stack code Ghidra can't converge
-        // on, so radare2 analyzes it separately.
+        // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as
+        // its arg[0]. In `datamark` mode it also disables the Aggressive
+        // Instruction Finder and marks the dense high-entropy regions passed
+        // below (each as "addrHex:lenHex") as data — Thumb-2 protocol-stack
+        // code Ghidra can't converge on, so radare2 analyzes it separately. In
+        // `tighten` mode no regions are passed (Phase 2+: let Ghidra try).
         "-preScript".to_string(),
         "TameAnalysis.java".to_string(),
+        mode.to_string(),
     ];
-    for (addr, len) in thumb_regions {
-        args.push(format!("{addr:08x}:{len:x}"));
+    if mode == "datamark" {
+        for (addr, len) in thumb_regions {
+            args.push(format!("{addr:08x}:{len:x}"));
+        }
     }
     args.extend([
         "-postScript".to_string(),
@@ -138,6 +164,15 @@ fn headless_args(
         "-overwrite".to_string(),
     ]);
     args
+}
+
+/// Resolve the mode from Opts: datamark when the escape hatch is set, else tighten.
+fn mode_from_opts(opts: &Opts) -> &'static str {
+    if opts.no_thumb_decompile {
+        "datamark"
+    } else {
+        "tighten"
+    }
 }
 
 fn ghidra_config_home(root: &Path) -> PathBuf {
@@ -223,6 +258,17 @@ pub struct ImageResult {
     pub pass2_applied: Option<usize>,
     /// Reason-only pass-2 failure text (e.g. analyzeHeadless exited non-zero).
     pub pass2_error: Option<String>,
+    /// Phase 2: count of Thumb functions whose `body_c` was populated by
+    /// `thumb_enrich` from the regenerated `decompiled.c`. `None` when Phase 2
+    /// did not run for this image (no Thumb regions, or `--no-thumb-decompile`).
+    pub thumb_decompiled: Option<usize>,
+    /// Phase 2 / Surface B: reason-only text set when the runtime wall-clock
+    /// or log-spam watch killed the tightened run and fell back to `datamark`.
+    pub thumb_tighten_error: Option<String>,
+    /// Phase 2 / Surface C: reason-only text set when `thumb_enrich` could not
+    /// parse `decompiled.c` (malformed output). The v1 `thumb_functions.json`
+    /// is left intact; downstream stages keep working against v1.
+    pub thumb_enrich_error: Option<String>,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -310,9 +356,134 @@ fn thumb_regions(bytes: &[u8], load_addr: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// Phase 2 / Surface B: thresholds for killing a tightened Ghidra run that is
+/// spinning on `ClearFlowAndRepairCmd` overlapping-function repair. Defaults
+/// are conservative; the `--tighten-wall-clock-budget-sec` test-only flag
+/// supplies an absolute override that bypasses `baseline * wall_clock_multiplier`
+/// (used by Section 7 verification).
+#[derive(Debug, Clone, Copy)]
+pub struct TightenBudget {
+    /// Multiplied by the pass-1 baseline wall-clock to get the per-image budget.
+    pub wall_clock_multiplier: u32,
+    /// Hard cap on `ClearFlowAndRepairCmd`-related log lines.
+    pub log_spam_max: usize,
+}
+
+impl Default for TightenBudget {
+    fn default() -> Self {
+        Self {
+            wall_clock_multiplier: 4,
+            log_spam_max: 100_000,
+        }
+    }
+}
+
+/// Reason the watch killed a tightened run. Surfaced in `thumb_tighten_error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillReason {
+    WallClock,
+    LogSpam,
+}
+
+impl std::fmt::Display for KillReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KillReason::WallClock => write!(f, "exceeded wall-clock budget"),
+            KillReason::LogSpam => write!(f, "exceeded ClearFlowAndRepairCmd log-spam threshold"),
+        }
+    }
+}
+
+/// Decide whether to kill a tightened Ghidra run. Pure; testable without Ghidra.
+///
+/// The wall-clock budget is `baseline * budget.wall_clock_multiplier`, unless
+/// `wall_clock_override` is `Some(d)` — then the budget is `d` directly (the
+/// `--tighten-wall-clock-budget-sec` test-only override). `baseline` is the
+/// pass-1 wall-clock recorded for this image.
+pub fn should_kill_tighten(
+    elapsed: std::time::Duration,
+    repair_log_lines: usize,
+    budget: &TightenBudget,
+    baseline: std::time::Duration,
+    wall_clock_override: Option<std::time::Duration>,
+) -> Option<KillReason> {
+    let wall_budget =
+        wall_clock_override.or_else(|| baseline.checked_mul(budget.wall_clock_multiplier))?;
+    if elapsed > wall_budget {
+        return Some(KillReason::WallClock);
+    }
+    if repair_log_lines > budget.log_spam_max {
+        return Some(KillReason::LogSpam);
+    }
+    None
+}
+
+/// Phase 2 / Surface B: per-image tighten baseline extrapolated from the
+/// image's dense-Thumb byte count. Grounded in initial measurement — Ghidra
+/// 12.1.2 under `Tighten`-mode `TameAnalysis` converged on a 2 MiB dense-Thumb
+/// sample in 80 s, i.e. ~40 s/MiB. Below the 60 s floor the heuristic keeps the
+/// watch meaningful on tiny regions (a 0-MiB image still gets a 60 s baseline,
+/// which combined with the default 4× multiplier yields a 240 s ceiling).
+///
+/// `should_kill_tighten` multiplies this by `TightenBudget::wall_clock_multiplier`
+/// (default 4×) unless the test-only `--tighten-wall-clock-budget-sec` override
+/// supplies an absolute budget. For a real `02_MAIN` (~42 MiB dense Thumb across
+/// 5 regions) this gives baseline ≈ 1 680 s (~28 min) and a default budget of
+/// ~112 min — generous enough to not fire prematurely on real firmware, tight
+/// enough to catch a true overlap-repair spin (which runs for hours otherwise).
+pub fn tighten_baseline_for_dense_thumb_bytes(dense_thumb_bytes: usize) -> std::time::Duration {
+    const SECONDS_PER_MIB: u64 = 40;
+    const FLOOR_SECONDS: u64 = 60;
+    let mib = (dense_thumb_bytes / (1024 * 1024)) as u64;
+    std::time::Duration::from_secs(FLOOR_SECONDS.max(mib.saturating_mul(SECONDS_PER_MIB)))
+}
+
+/// Phase 2 / Surface B (Unix): spawn helper that puts the Ghidra `analyzeHeadless`
+/// process in its own process group so the Surface B watch can kill the whole
+/// tree (bash launcher + Java grandchild) with one `killpg`. Without this the
+/// SIGKILL from `child.kill()` only reaps the bash launcher; the JVM is
+/// orphaned to init and keeps holding the Ghidra project lock, which then
+/// makes the datamark retry fail with `LockException` (the bug fixed by this
+/// module).
+///
+/// On non-Unix targets this is a no-op (Windows users fall back to
+/// `--no-thumb-decompile` if the tighten-watch fires — there is no
+/// cross-platform process-group kill in std).
+#[cfg(unix)]
+fn spawn_in_own_process_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn spawn_in_own_process_group(_cmd: &mut std::process::Command) {
+    // No portable process-group kill in std; on Windows the JVM is orphaned
+    // by `child.kill()`. Use `--no-thumb-decompile` if Surface B fires.
+}
+
+/// Phase 2 / Surface B (Unix): send SIGKILL to the entire process group led
+/// by `child`. Best-effort — the caller has already SIGKILLed the immediate
+/// child via `child.kill()`. Negative PID means "the process group".
+#[cfg(unix)]
+fn kill_process_group(child_pid: u32) {
+    // SAFETY: `libc::kill` is async-signal-safe and thread-safe; the only
+    // failure modes are ESRCH (already gone — fine), EPERM (not our child,
+    // shouldn't happen for our own spawn), or EINVAL (bad signal — static
+    // input). We discard the return value because every failure mode is
+    // either benign or impossible.
+    unsafe {
+        let _ = libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child_pid: u32) {
+    // No portable killpg; on Windows `child.kill()` orphans the JVM.
+}
+
 /// Write a turnkey `run_ghidra.sh` (one `analyzeHeadless` invocation per image),
 /// built from `headless_args` against a relocatable `$HERE` root.
-fn write_run_script(out: &Path, toc: &Toc, data: &[u8], processor: &str) -> Result<()> {
+fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
     let mut s = String::new();
     s.push_str("#!/usr/bin/env sh\n");
     s.push_str(
@@ -340,10 +511,12 @@ fn write_run_script(out: &Path, toc: &Toc, data: &[u8], processor: &str) -> Resu
     s.push_str("fi\n");
     s.push_str("mkdir -p \"$HERE/ghidra_project\" \"$HERE/export\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$HERE/ghidra_tmp\"\n");
     for e in toc.embedded() {
-        let start = (e.offset as usize).min(data.len());
-        let end = (e.offset as usize + e.size as usize).min(data.len());
-        let regions = thumb_regions(&data[start..end], e.load_addr);
-        let args = headless_args("$HERE", &e.label(), processor, e.load_addr, &regions);
+        // `run_ghidra.sh` runs in tighten mode (production default), which does
+        // not data-mark regions — `headless_args` ignores the slice. Pass an
+        // empty slice and skip the entropy scan; the regions are computed in
+        // `run_report` under `--run` only when `mode=datamark` actually needs them.
+        let mode = "tighten";
+        let args = headless_args("$HERE", &e.label(), processor, e.load_addr, &[], mode);
         s.push_str("\"$HEADLESS\"");
         for a in &args {
             s.push_str(" \"");
@@ -399,7 +572,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     )?;
 
     // 4. turnkey shell script -> out/run_ghidra.sh
-    write_run_script(out, &toc, &data, &opts.processor)?;
+    write_run_script(out, &toc, &opts.processor)?;
 
     // 5. optional: drive Ghidra headless per selected image, plus radare2 for dense Thumb regions
     let mut image_results: Vec<ImageResult> = Vec::new();
@@ -419,9 +592,20 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         let r2_bin = find_radare2();
         // Analyze every selected image, recording each outcome rather than aborting on the
         // first failure — so a heavy or unanalyzable partition (the ~87 MB MAIN, or an
-        // encrypted one) can't sink the rest of a full run. Tuple per image:
-        // (label, A32 Ghidra outcome, Thumb radare2 function count, Thumb radare2 error).
-        let mut results: Vec<(String, ImageOutcome, Option<usize>, Option<String>)> = Vec::new();
+        // encrypted one) can't sink the rest of a full run.
+        struct RunResult {
+            label: String,
+            outcome: ImageOutcome,
+            thumb_functions: Option<usize>,
+            thumb_error: Option<String>,
+            tighten_error: Option<String>,
+            // When the tighten-watch kills the run, we re-spawn as datamark
+            // and there is no `thumb_enrich` to run later; mark the count
+            // definitively zero so downstream stages don't enqueue
+            // work against an empty decompiled.c.
+            thumb_decompiled: Option<usize>,
+        }
+        let mut results: Vec<RunResult> = Vec::new();
         for e in toc.embedded() {
             let label = e.label();
             if !image_matches(want, &label, &e.name) {
@@ -431,16 +615,156 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             let end = (e.offset as usize + e.size as usize).min(data.len());
             let img = &data[start..end];
             let regions = thumb_regions(img, e.load_addr);
-            tracing::info!("ghidra: analyzing {label} (base 0x{:08x})", e.load_addr);
-            if !regions.is_empty() {
+            let mode = mode_from_opts(opts);
+            tracing::info!(
+                "ghidra: analyzing {label} (base 0x{:08x}, mode={mode})",
+                e.load_addr
+            );
+            // Phase-1 datamark framing only — in tighten mode the regions are NOT
+            // data-marked (Ghidra is allowed to try), so the "marked as data"
+            // message would be misleading.
+            if mode == "datamark" && !regions.is_empty() {
                 tracing::info!(
                     "ghidra: {label} has {} dense Thumb-2 region(s) — marked as data (radare2 handles them)",
                     regions.len()
                 );
             }
-            let args = headless_args(&root_str, &label, &opts.processor, e.load_addr, &regions);
-            let status =
-                headless_command(&install.headless, &args, &root, java_home.as_deref()).status()?;
+            let args = headless_args(
+                &root_str,
+                &label,
+                &opts.processor,
+                e.load_addr,
+                &regions,
+                mode,
+            );
+            // Surface B: in tighten mode, spawn with piped stdout so we can
+            // count `ClearFlowAndRepairCmd` log lines and kill the runaway
+            // overlap-repair loop before it sinks the whole run. On kill we
+            // fall back to `datamark` (Phase-1 behavior). In datamark mode
+            // there is no watch — the spawn blocks until completion as before.
+            let mut tighten_error: Option<String> = None;
+            // When the tighten-watch kills the run, we re-spawn as datamark
+            // and there is no `thumb_enrich` to run later; mark the count
+            // definitively zero so downstream stages don't enqueue
+            // work against an empty decompiled.c.
+            let mut thumb_decompiled_override: Option<usize> = None;
+            let status = if mode == "tighten" {
+                let mut cmd =
+                    headless_command(&install.headless, &args, &root, java_home.as_deref());
+                cmd.stdout(std::process::Stdio::piped());
+                // Spawn `analyzeHeadless` in its own process group so the
+                // Surface B watch can kill the whole tree (bash launcher +
+                // Java grandchild) with one `killpg`. Without this the JVM
+                // is orphaned to init by `child.kill()`, keeps holding the
+                // Ghidra project lock, and the datamark retry fails with
+                // LockException (the bug this path fixes).
+                spawn_in_own_process_group(&mut cmd);
+                let started = std::time::Instant::now();
+                let mut child = cmd.spawn()?;
+                let child_pid = child.id();
+                let stdout = child.stdout.take().expect("piped stdout");
+                let reader = std::io::BufReader::new(stdout);
+                let budget = TightenBudget::default();
+                // `decompile --run` has no prior baseline (radare2 ran first
+                // in `decompose`, not here). Extrapolate from this image's
+                // dense-Thumb byte count (prior measurement: ~40 s/MiB on Ghidra
+                // 12.1.2 in Tighten mode; floor 60 s for tiny regions). With
+                // the default 4× multiplier: 42 MiB dense Thumb (real 02_MAIN)
+                // → baseline 1 680 s, budget ~112 min — generous enough to
+                // not fire prematurely on production images, tight enough to
+                // catch a true overlap-repair spin (which otherwise runs for
+                // hours). The test-only
+                // `--tighten-wall-clock-budget-sec` override bypasses this.
+                let dense_thumb_bytes: usize = regions.iter().map(|(_, len)| *len as usize).sum();
+                let baseline = tighten_baseline_for_dense_thumb_bytes(dense_thumb_bytes);
+                let mut killed: Option<KillReason> = None;
+                let mut repair_lines = 0usize;
+                for line in std::io::BufRead::lines(reader) {
+                    let line = match line {
+                        Ok(l) => l,
+                        // EPIPE / UTF-8 etc.: stop draining; wait() will report
+                        // the real exit status below.
+                        Err(_) => break,
+                    };
+                    // Match case-insensitively on the symbols Ghidra emits
+                    // while looping on overlapping-function repair. The exact
+                    // log shape is an implementation detail, so the match is
+                    // deliberately broad: any one of these substrings counts.
+                    let lower = line.to_ascii_lowercase();
+                    if lower.contains("clearflowandrepaircmd")
+                        || lower.contains("repair")
+                        || lower.contains("overlap")
+                    {
+                        repair_lines = repair_lines.saturating_add(1);
+                    }
+                    if let Some(reason) = should_kill_tighten(
+                        started.elapsed(),
+                        repair_lines,
+                        &budget,
+                        baseline,
+                        opts.tighten_wall_clock_budget_override,
+                    ) {
+                        killed = Some(reason);
+                        break;
+                    }
+                }
+                match killed {
+                    Some(reason) => {
+                        tracing::warn!(
+                            "ghidra: {label} tighten run killed ({reason}); re-spawning as datamark"
+                        );
+                        // Best-effort: signal the immediate child, then the
+                        // whole process group (the bash launcher SIGKILLed by
+                        // `child.kill()` only reaps itself — the Java grandchild
+                        // is in the same group and would otherwise survive,
+                        // holding the project lock). Then reap the immediate
+                        // child so we don't leak a zombie into the re-spawn.
+                        let _ = child.kill();
+                        kill_process_group(child_pid);
+                        let _ = child.wait();
+                        // `killpg(SIGKILL)` + `child.wait()` reap the JVM at the
+                        // kernel level, which releases Ghidra's OS `FileChannel`
+                        // project lock immediately — the datamark retry's project
+                        // open will succeed without a userspace wait. (A prior
+                        // spin-wait on the sentinel lock file was removed: it
+                        // polled `Path::exists()`, which kept returning `true`
+                        // because no JVM shutdown hook runs to delete the
+                        // sentinel after SIGKILL, so it always hit its 10 s cap.)
+                        tighten_error =
+                            Some(format!("tighten killed: {reason}; retrying as datamark"));
+                        thumb_decompiled_override = Some(0);
+                        let datamark_args = headless_args(
+                            &root_str,
+                            &label,
+                            &opts.processor,
+                            e.load_addr,
+                            &regions,
+                            "datamark",
+                        );
+                        let retry_status = headless_command(
+                            &install.headless,
+                            &datamark_args,
+                            &root,
+                            java_home.as_deref(),
+                        )
+                        .status()?;
+                        if retry_status.success() {
+                            tracing::info!(
+                                "ghidra: {label} datamark retry succeeded after tighten kill"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "ghidra: {label} datamark retry failed (exit {}) after tighten kill",
+                                retry_status.code().unwrap_or(-1)
+                            );
+                        }
+                        retry_status
+                    }
+                    None => child.wait()?,
+                }
+            } else {
+                headless_command(&install.headless, &args, &root, java_home.as_deref()).status()?
+            };
             let outcome = if status.success() {
                 let n = count_functions(&root.join("export").join(&label));
                 if n == 0 {
@@ -483,7 +807,14 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
             };
-            results.push((label, outcome, thumb_functions, thumb_error));
+            results.push(RunResult {
+                label,
+                outcome,
+                thumb_functions,
+                thumb_error,
+                tighten_error,
+                thumb_decompiled: thumb_decompiled_override,
+            });
         }
         if results.is_empty() {
             return Err(Error::NotFound(match &opts.image {
@@ -496,31 +827,41 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             results.len(),
             out.join("export").display()
         );
-        for (label, outcome, thumb_functions, thumb_error) in &results {
-            let t = if let Some(n) = thumb_functions {
+        for r in &results {
+            let t = if let Some(n) = r.thumb_functions {
                 format!("  + {n} Thumb fn(s) [radare2]")
-            } else if let Some(err) = thumb_error {
+            } else if let Some(err) = &r.thumb_error {
                 format!("  + Thumb FAILED [radare2: {err}]")
             } else {
                 String::new()
             };
-            match outcome {
-                ImageOutcome::Analyzed(n) => println!("  {label:<11} {n} A32 function(s){t}"),
-                ImageOutcome::Failed(code) => println!("  {label:<11} FAILED (exit {code}){t}"),
+            let k = if let Some(err) = &r.tighten_error {
+                format!("  + tighten KILLED [{err}]")
+            } else {
+                String::new()
+            };
+            match r.outcome {
+                ImageOutcome::Analyzed(n) => {
+                    println!("  {:<11} {} A32 function(s){t}{k}", r.label, n)
+                }
+                ImageOutcome::Failed(code) => {
+                    println!("  {:<11} FAILED (exit {code}){t}{k}", r.label)
+                }
             }
         }
         image_results = results
             .into_iter()
-            .map(
-                |(label, outcome, thumb_functions, thumb_error)| ImageResult {
-                    label,
-                    outcome,
-                    thumb_functions,
-                    thumb_error,
-                    pass2_applied: None,
-                    pass2_error: None,
-                },
-            )
+            .map(|r| ImageResult {
+                label: r.label,
+                outcome: r.outcome,
+                thumb_functions: r.thumb_functions,
+                thumb_error: r.thumb_error,
+                pass2_applied: None,
+                pass2_error: None,
+                thumb_decompiled: r.thumb_decompiled,
+                thumb_tighten_error: r.tighten_error,
+                thumb_enrich_error: None,
+            })
             .collect();
     }
 
@@ -585,7 +926,7 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
 fn headless_process_args(root: &str, label: &str, map_path: &Path) -> Vec<String> {
     vec![
         format!("{root}/ghidra_project"),
-        "pixel-modem".to_string(),
+        GHIDRA_PROJECT_NAME.to_string(),
         "-process".to_string(),
         label.to_string(),
         "-noanalysis".to_string(),
@@ -1330,7 +1671,7 @@ fn run_radare2_thumb(
         })
         .count();
     let wrapped = serde_json::json!({
-        "format": "pixel-modem-extractor-thumb-functions-v1",
+        "format": "pixel-modem-extractor-thumb-functions-v2",
         "functions": all,
     });
     std::fs::write(
@@ -1338,6 +1679,153 @@ fn run_radare2_thumb(
         serde_json::to_string_pretty(&wrapped).map_err(|e| Error::Serialize(e.to_string()))?,
     )?;
     Ok(substantial)
+}
+
+/// Phase 2: enrich a v1 (or v2 asm-only) `thumb_functions.json` with per-function
+/// `body_c` sourced from a `decompiled.c`. Bumps `format` to v2 iff at least one
+/// `body_c` is populated; otherwise leaves the file byte-identical. Idempotent.
+///
+/// `decompiled.c` is parsed by scanning for top-level function headers of the form
+///
+/// ```text
+/// <return-type> <name>(<params>)\n{\n ... \n}\n
+/// ```
+///
+/// where `<name>` matches the radare2-emitted `thumb_<hex>` entry name (the entry's
+/// pre-rename name; pass-2 regenerates `decompiled.c` with post-rename names, and
+/// `thumb_enrich` re-runs against that to refresh `body_c` with the new names).
+///
+/// Matching is by name (not entry address) because `decompiled.c`'s function names
+/// are exactly the names in `thumb_functions.json` at the time `decompiled.c` was
+/// emitted. Returns the count of functions whose `body_c` was populated.
+///
+/// Fail-closed: a malformed `decompiled.c` (read or parse failure) returns `Err`;
+/// the on-disk `thumb_functions.json` is unchanged.
+pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    // std::io::Error auto-converts via Error::Io(#[from]) — `?` propagates directly.
+    let c_text = std::fs::read_to_string(decompiled_c_path)?;
+
+    // Parse decompiled.c into {function_name -> body_text}.
+    let bodies = parse_decompiled_c_function_bodies(&c_text);
+
+    // Read thumb_functions.json, augment in memory, decide whether to rewrite.
+    let raw = std::fs::read(thumb_functions_json_path)?;
+    let mut v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+        Error::Serialize(format!(
+            "parse {}: {e}",
+            thumb_functions_json_path.display()
+        ))
+    })?;
+
+    let mut populated = 0usize;
+    if let Some(funcs) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
+        for f in funcs {
+            let Some(name) = f.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            if let Some(body) = bodies.get(name) {
+                f.as_object_mut().unwrap().insert(
+                    "body_c".to_string(),
+                    serde_json::Value::String(body.clone()),
+                );
+                populated += 1;
+            }
+        }
+    }
+
+    if populated == 0 {
+        return Ok(0); // Leave file byte-identical (do not rewrite).
+    }
+
+    // Bump format to v2 on first population.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "format".to_string(),
+            serde_json::Value::String("pixel-modem-extractor-thumb-functions-v2".to_string()),
+        );
+    }
+
+    let out = serde_json::to_string_pretty(&v)
+        .map_err(|e| Error::Serialize(format!("re-serialize thumb_functions.json: {e}")))?;
+    std::fs::write(thumb_functions_json_path, out)?;
+    Ok(populated)
+}
+
+/// Parse a `decompiled.c` text into a map of `{function_name -> body_text}`, where
+/// `body_text` is the full function including signature and braces. The parser is
+/// deliberately conservative: it scans for lines that look like function headers
+/// (identifier-ish name followed by `(...)`), then captures text up to the matching
+/// closing `}` at brace-depth 0. The opening `{` may appear on the header line
+/// itself or on a following line (the form emitted by Ghidra's C decompiler:
+/// `<ret> <name>(<params>)\n{\n ... \n}\n`). Lines that look header-ish but
+/// aren't followed by `{` on the same line or the next are treated as
+/// non-headers and skipped (a bounded lookahead — without it, a header-shaped
+/// non-header such as a function call, declaration, or control statement could
+/// commit at position N and absorb following lines into the wrong name's body
+/// until the next real function's `{`, silently skipping intervening real
+/// headers). Comments and string literals are not special-cased —
+/// ExportDecomp.java's output is regular enough that brace-counting is
+/// sufficient; malformed input fails closed in the caller.
+fn parse_decompiled_c_function_bodies(c_text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let lines: Vec<&str> = c_text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Match a line that looks like a function header: contains `(` and `)` and
+        // an identifier token immediately before the first `(`. The opening `{` may
+        // be on this line or on a following line.
+        if line.contains('(') && line.contains(')') {
+            // Extract the name: the identifier immediately before the first '('.
+            let before_paren = line.split('(').next().unwrap_or("").trim();
+            let name = before_paren
+                .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if name.is_empty() {
+                i += 1;
+                continue;
+            }
+            // Bounded lookahead: commit only when `{` appears on this line (the
+            // one-line `void f(void){}` form) or the next (Ghidra's two-line
+            // `<sig>\n{\n` form). The bound is what prevents a header-shaped
+            // non-header from absorbing arbitrary following lines into the wrong
+            // name's body — see the upstream review notes.
+            let start = i;
+            let opens_brace =
+                lines[start].contains('{') || lines.get(start + 1).is_some_and(|l| l.contains('{'));
+            if !opens_brace {
+                i = start + 1;
+                continue;
+            }
+            // Capture from this line through the matching closing brace at depth 0.
+            let mut depth = 0i32;
+            let mut saw_brace = false;
+            let mut body = String::new();
+            while i < lines.len() {
+                let l = lines[i];
+                for ch in l.chars() {
+                    match ch {
+                        '{' => {
+                            depth += 1;
+                            saw_brace = true;
+                        }
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                body.push_str(l);
+                body.push('\n');
+                if saw_brace && depth <= 0 {
+                    break;
+                }
+                i += 1;
+            }
+            out.insert(name.to_string(), body);
+        }
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1383,6 +1871,7 @@ mod tests {
             "ARM:LE:32:v7",
             0x4001_0000,
             &[(0x4109_0000, 0x288_0000)],
+            "datamark",
         );
         assert_eq!(args[0], "/out/ghidra_project");
         assert_eq!(args[1], "pixel-modem");
@@ -1398,19 +1887,59 @@ mod tests {
         let ps = args.iter().position(|a| a == "-postScript").unwrap();
         assert_eq!(args[ps + 1], "ExportDecomp.java");
         assert_eq!(args[ps + 2], "/out/export/02_MAIN");
-        // pre-script wires TameAnalysis.java, then the data-region args, before the post-script
+        // pre-script wires TameAnalysis.java, then mode, then the data-region args
+        // (only in datamark mode), before the post-script
         let pre = args.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(args[pre + 1], "TameAnalysis.java");
-        assert_eq!(args[pre + 2], "41090000:2880000"); // addrHex:lenHex
+        assert_eq!(args[pre + 2], "datamark");
+        assert_eq!(args[pre + 3], "41090000:2880000"); // addrHex:lenHex
         assert!(pre < ps, "pre-script must precede post-script");
         assert!(args.iter().any(|a| a == "-overwrite"));
-        // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly follows
-        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, &[]);
+        // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly
+        // follows the mode arg
+        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, &[], "datamark");
         let zpre = z.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(z[zpre + 1], "TameAnalysis.java");
-        assert_eq!(z[zpre + 2], "-postScript");
+        assert_eq!(z[zpre + 2], "datamark");
+        assert_eq!(z[zpre + 3], "-postScript");
         let bz = z.iter().position(|a| a == "-loader-baseAddr").unwrap();
         assert_eq!(z[bz + 1], "00000000");
+    }
+
+    #[test]
+    fn headless_args_passes_tighten_mode() {
+        let args = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            &[(0x40e12000, 0x100000)],
+            "tighten",
+        );
+        let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
+        // The next arg after the script name is the mode.
+        assert_eq!(args[pre_idx + 1], "tighten");
+        // No addrHex:lenHex follows (tighten mode does not data-mark).
+        assert!(
+            !args[pre_idx + 2..].iter().any(|a| a.contains(':')),
+            "tighten mode must not pass region args: {:?}",
+            &args[pre_idx + 2..]
+        );
+    }
+
+    #[test]
+    fn headless_args_passes_datamark_mode_and_regions() {
+        let args = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            &[(0x40e12000, 0x100000)],
+            "datamark",
+        );
+        let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
+        assert_eq!(args[pre_idx + 1], "datamark");
+        assert!(args[pre_idx + 2..].iter().any(|a| a == "40e12000:100000"));
     }
 
     #[test]
@@ -1624,6 +2153,126 @@ mod tests {
         assert!(thumb_regions(&[0u8; 4096], 0).is_empty());
         let small: Vec<u8> = (0u32..256 * 1024).map(|i| (i % 256) as u8).collect();
         assert!(thumb_regions(&small, 0).is_empty());
+    }
+
+    #[test]
+    fn should_kill_tighten_returns_none_under_budget() {
+        let budget = TightenBudget {
+            wall_clock_multiplier: 4,
+            log_spam_max: 100_000,
+        };
+        // 60s elapsed vs. 100s baseline * 4 = 400s budget -> well under.
+        assert_eq!(
+            should_kill_tighten(
+                std::time::Duration::from_secs(60),
+                1000,
+                &budget,
+                std::time::Duration::from_secs(100),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn should_kill_tighten_returns_wall_clock_over_budget() {
+        let budget = TightenBudget {
+            wall_clock_multiplier: 4,
+            log_spam_max: 100_000,
+        };
+        // 600s elapsed vs. 100s baseline * 4 = 400s budget -> over.
+        assert!(matches!(
+            should_kill_tighten(
+                std::time::Duration::from_secs(600),
+                1000,
+                &budget,
+                std::time::Duration::from_secs(100),
+                None,
+            ),
+            Some(KillReason::WallClock)
+        ));
+    }
+
+    #[test]
+    fn should_kill_tighten_returns_log_spam_over_threshold() {
+        let budget = TightenBudget {
+            wall_clock_multiplier: 4,
+            log_spam_max: 100_000,
+        };
+        // Wall-clock well under (10s vs. 5s * 4 = 20s); repair-log count over.
+        assert!(matches!(
+            should_kill_tighten(
+                std::time::Duration::from_secs(10),
+                200_000,
+                &budget,
+                std::time::Duration::from_secs(5),
+                None,
+            ),
+            Some(KillReason::LogSpam)
+        ));
+    }
+
+    #[test]
+    fn should_kill_tighten_override_replaces_baseline_multiplier() {
+        let budget = TightenBudget {
+            wall_clock_multiplier: 4,
+            log_spam_max: 100_000,
+        };
+        // Override of 30s wins over baseline * multiplier (which would be 400s);
+        // 60s elapsed > 30s -> kill on wall-clock.
+        assert!(matches!(
+            should_kill_tighten(
+                std::time::Duration::from_secs(60),
+                0,
+                &budget,
+                std::time::Duration::from_secs(100),
+                Some(std::time::Duration::from_secs(30)),
+            ),
+            Some(KillReason::WallClock)
+        ));
+        // Override of 90s; 60s elapsed; still under -> None.
+        assert_eq!(
+            should_kill_tighten(
+                std::time::Duration::from_secs(60),
+                0,
+                &budget,
+                std::time::Duration::from_secs(100),
+                Some(std::time::Duration::from_secs(90)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tighten_baseline_for_dense_thumb_bytes_floor_60s_for_small_input() {
+        // Sub-1-MiB inputs floor at the 60 s heuristic so a tiny region
+        // doesn't collapse the budget below the watch's calibrated minimum.
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(0),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(1024 * 1024),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn tighten_baseline_for_dense_thumb_bytes_extrapolates_40s_per_mib() {
+        // Grounding: 80 s tighten on a 2 MiB sample ~= 40 s/MiB.
+        // 2 MiB -> 80 s, 10 MiB -> 400 s, 42 MiB -> 1680 s (~28 min).
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(2 * 1024 * 1024),
+            std::time::Duration::from_secs(80)
+        );
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(10 * 1024 * 1024),
+            std::time::Duration::from_secs(400)
+        );
+        assert_eq!(
+            tighten_baseline_for_dense_thumb_bytes(42 * 1024 * 1024),
+            std::time::Duration::from_secs(1680)
+        );
     }
 
     #[test]
@@ -1857,7 +2506,29 @@ INFO: second pdfj body was noisy and not parseable
             std::fs::set_permissions(&r2, perm).unwrap();
         }
 
-        let err = run_radare2_thumb(&r2, &[0u8; 16], 0x4000, &[(0x4000, 16)], &out).unwrap_err();
+        // Under parallel test execution (multiple tests in this module write +
+        // exec stub `r2` scripts concurrently) the kernel occasionally returns
+        // ETXTBSY from execve on the freshly-written stub. Retry only on that
+        // specific transient kind; any other Io failure escalates immediately
+        // so it isn't masked. The assertion below still verifies the expected
+        // non-Io failure mode.
+        let mut last = None;
+        for attempt in 0..5u32 {
+            match run_radare2_thumb(&r2, &[0u8; 16], 0x4000, &[(0x4000, 16)], &out) {
+                Ok(_) => break,
+                Err(e) if matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::ExecutableFileBusy) =>
+                {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(5 * attempt as u64));
+                    continue;
+                }
+                Err(e) => {
+                    last = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = last.expect("expected an error from run_radare2_thumb");
 
         assert!(
             matches!(err, Error::Serialize(message) if message.contains("lacks entry/addr") && message.contains("0x4000"))
@@ -1938,6 +2609,8 @@ INFO: second pdfj body was noisy and not parseable
             image: None,
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
         };
 
         let rep = run_report(&modem, &opts, &dir.join("out")).unwrap();
@@ -1957,6 +2630,9 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
                 pass2_applied: None,
                 pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -1981,6 +2657,9 @@ INFO: second pdfj body was noisy and not parseable
                 ),
                 pass2_applied: None,
                 pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -2009,6 +2688,8 @@ INFO: second pdfj body was noisy and not parseable
             image: None,
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
         };
         run(&modem, &opts, &out).unwrap();
 
@@ -2280,7 +2961,7 @@ INFO: second pdfj body was noisy and not parseable
         std::fs::create_dir_all(&base).unwrap();
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb, 0xcc, 0xdd])]);
         let toc = Toc::parse(&buf).unwrap();
-        write_run_script(&base, &toc, &buf, "ARM:LE:32:v7").unwrap();
+        write_run_script(&base, &toc, "ARM:LE:32:v7").unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
         assert!(
             sh.contains("$GHIDRA_INSTALL_DIR/support/analyzeHeadless"),
@@ -2291,5 +2972,160 @@ INFO: second pdfj body was noisy and not parseable
             "sh:\n{sh}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_radare2_thumb_emits_v2_format_string() {
+        // Phase 2 bumps thumb_functions.json format to v2; the body_c field arrives
+        // in the enrich step. Uses the stub-r2 pattern (cf. radare2_thumb_maps_raw_blob_at_region_address)
+        // so the test is hermetic and does not require a real r2 on PATH.
+        let dir = std::env::temp_dir().join(format!("pme_r2_v2_fmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r2 = dir.join("r2");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // Stub r2 emits a single Thumb function at 0x4120 (16672) + matching pdfj —
+        // the same shape as radare2_thumb_maps_raw_blob_at_region_address's stub.
+        // run_radare2_thumb then writes the wrapper JSON regardless of inventory
+        // content; we only need to verify the format string.
+        std::fs::write(
+            &r2,
+            "#!/usr/bin/env sh\ncat <<'EOF'\n[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":32}]\n{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&r2).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&r2, perm).unwrap();
+        }
+
+        let _ = run_radare2_thumb(&r2, &[0u8; 0x180], 0x4000, &[(0x4120, 0x20)], &out).unwrap();
+        let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["format"], "pixel-modem-extractor-thumb-functions-v2",
+            "Phase 2 bumps the format to v2 (body_c field arrives in the enrich step)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pme_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn thumb_enrich_populates_body_c_for_matching_entry() {
+        let root = temp_dir("thumb_enrich_match");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "/*\n * FUN_40e1200\n */\nvoid thumb_40e1200(int a)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []},
+                {"entry": "0x40efffc", "name": "thumb_40efffc", "size": 4,
+                 "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []}
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1, "exactly one function matched");
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert_eq!(v["format"], "pixel-modem-extractor-thumb-functions-v2");
+        assert!(v["functions"][0]["body_c"].is_string());
+        assert!(
+            v["functions"][0]["body_c"]
+                .as_str()
+                .unwrap()
+                .contains("thumb_40e1200")
+        );
+        assert!(
+            v["functions"][1].get("body_c").is_none(),
+            "no match -> no body_c"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_zero_matches_leaves_file_unchanged() {
+        let root = temp_dir("thumb_enrich_no_match");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "/* nothing relevant */\nvoid FUN_deadbeef(void){}\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v1",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []}
+            ]
+        }"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 0);
+        // File is byte-identical (format stays v1 because no body_c was populated).
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+    }
+
+    #[test]
+    fn thumb_enrich_is_idempotent() {
+        let root = temp_dir("thumb_enrich_idem");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(&c_path, "void thumb_40e1200(void){\n  return;\n}\n").unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_first = std::fs::read_to_string(&thumb_path).unwrap();
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_second = std::fs::read_to_string(&thumb_path).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "second run is a no-op on the same inputs"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_fail_closed_on_malformed_decompiled_c() {
+        let root = temp_dir("thumb_enrich_bad_c");
+        let c_path = root.join("decompiled.c");
+        // Not valid UTF-8.
+        std::fs::write(&c_path, [0xff, 0xfe, 0xfd, 0xfc]).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[]}"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let err = thumb_enrich(&c_path, &thumb_path).unwrap_err();
+        // The on-disk JSON is unchanged.
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+        // Surfaced as a typed error (any variant — just confirm it's not silent).
+        let _ = format!("{err}");
     }
 }

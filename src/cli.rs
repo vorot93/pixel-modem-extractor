@@ -83,6 +83,18 @@ pub enum Commands {
         ghidra_home: Option<PathBuf>,
         #[arg(long, default_value = "ARM:LE:32:v7")]
         processor: String,
+        /// Skip Phase-2 Thumb decompilation: dense Thumb regions stay marked as data
+        /// (today's Phase-1 behavior). `thumb_functions.json` is emitted at v2
+        /// asm-only (no `body_c`). Use when the tightened TameAnalysis regresses on
+        /// your firmware version.
+        #[arg(long)]
+        no_thumb_decompile: bool,
+        /// Test-only override: supply an absolute wall-clock budget (seconds) for the
+        /// tighten-watch kill decision, bypassing the default `baseline * multiplier`
+        /// heuristic. Hidden from `--help` — production users should reach for
+        /// `--no-thumb-decompile` instead.
+        #[arg(long, hide = true)]
+        tighten_wall_clock_budget_sec: Option<u64>,
     },
     /// Exhaustive pipeline: extract, Ghidra/radare2 decompile, recovered attribution, and decoders
     Decompose {
@@ -100,6 +112,17 @@ pub enum Commands {
         ghidra_home: Option<PathBuf>,
         #[arg(long, default_value = "ARM:LE:32:v7")]
         processor: String,
+        /// Skip Phase-2 Thumb decompilation: dense Thumb regions stay marked as data
+        /// (today's Phase-1 behavior). `thumb_functions.json` is emitted at v2
+        /// asm-only (no `body_c`).
+        #[arg(long)]
+        no_thumb_decompile: bool,
+        /// Test-only override: supply an absolute wall-clock budget (seconds) for the
+        /// tighten-watch kill decision, bypassing the default `baseline * multiplier`
+        /// heuristic. Hidden from `--help` — production users should reach for
+        /// `--no-thumb-decompile` instead.
+        #[arg(long, hide = true)]
+        tighten_wall_clock_budget_sec: Option<u64>,
     },
     /// Symbolicate a decompose output tree: recover names + log annotations in place, emit symbols.json
     Symbolicate {
@@ -187,6 +210,8 @@ pub fn run() -> anyhow::Result<()> {
             run,
             ghidra_home,
             processor,
+            no_thumb_decompile,
+            tighten_wall_clock_budget_sec,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = modem_bin
@@ -200,6 +225,9 @@ pub fn run() -> anyhow::Result<()> {
                 image,
                 ghidra_home,
                 processor,
+                no_thumb_decompile,
+                tighten_wall_clock_budget_override: tighten_wall_clock_budget_sec
+                    .map(std::time::Duration::from_secs),
             };
             crate::decompile::run(&modem_bin, &opts, &out)?; // run() prints the console report
         }
@@ -211,6 +239,8 @@ pub fn run() -> anyhow::Result<()> {
             no_symbol_pass,
             ghidra_home,
             processor,
+            no_thumb_decompile,
+            tighten_wall_clock_budget_sec,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = img
@@ -225,6 +255,9 @@ pub fn run() -> anyhow::Result<()> {
                 ghidra_home,
                 processor,
                 no_symbol_pass,
+                no_thumb_decompile,
+                tighten_wall_clock_budget_override: tighten_wall_clock_budget_sec
+                    .map(std::time::Duration::from_secs),
             };
             let report = crate::decompose::run(&img, &opts, &out)?;
             println!("decomposed -> {}", out.display());
@@ -306,6 +339,7 @@ mod tests {
                 run,
                 ghidra_home,
                 processor,
+                ..
             } => {
                 assert_eq!(modem_bin, PathBuf::from("/tmp/modem.bin"));
                 assert_eq!(out, Some(PathBuf::from("/tmp/o")));
@@ -397,6 +431,7 @@ mod tests {
                 no_symbol_pass,
                 ghidra_home,
                 processor,
+                ..
             } => {
                 assert_eq!(img, PathBuf::from("/tmp/radio.img"));
                 assert_eq!(out, Some(PathBuf::from("/tmp/o")));
@@ -424,6 +459,152 @@ mod tests {
             Commands::Symbolicate { path, token_db } => {
                 assert_eq!(path, PathBuf::from("/tmp/dec"));
                 assert_eq!(token_db, Some(PathBuf::from("/tmp/pw_token_db")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompose_help_lists_no_thumb_decompile_flag() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompose")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--no-thumb-decompile"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompile_help_lists_no_thumb_decompile_flag() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompile")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--no-thumb-decompile"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompose_no_thumb_decompile_flag_defaults_false() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "/tmp/radio.img"]).unwrap();
+        match cli.command {
+            Commands::Decompose {
+                no_thumb_decompile, ..
+            } => {
+                assert!(
+                    !no_thumb_decompile,
+                    "default --no-thumb-decompile should be false"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompose_no_thumb_decompile_flag_parses_true() {
+        let cli =
+            Cli::try_parse_from(["pme", "decompose", "--no-thumb-decompile", "/tmp/radio.img"])
+                .unwrap();
+        match cli.command {
+            Commands::Decompose {
+                no_thumb_decompile, ..
+            } => {
+                assert!(
+                    no_thumb_decompile,
+                    "--no-thumb-decompile should parse to true when passed"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompose_tighten_wall_clock_budget_sec_is_hidden_from_help() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompose")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(
+            !help.contains("--tighten-wall-clock-budget-sec"),
+            "hidden test-only flag should not appear in help:\n{help}"
+        );
+    }
+
+    #[test]
+    fn decompose_tighten_wall_clock_budget_sec_parses_u64_seconds() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decompose",
+            "--tighten-wall-clock-budget-sec",
+            "42",
+            "/tmp/radio.img",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Decompose {
+                tighten_wall_clock_budget_sec,
+                ..
+            } => {
+                assert_eq!(
+                    tighten_wall_clock_budget_sec,
+                    Some(42),
+                    "--tighten-wall-clock-budget-sec 42 should parse as Some(42)"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompile_tighten_wall_clock_budget_sec_is_hidden_from_help() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompile")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(
+            !help.contains("--tighten-wall-clock-budget-sec"),
+            "hidden test-only flag should not appear in help:\n{help}"
+        );
+    }
+
+    #[test]
+    fn decompile_tighten_wall_clock_budget_sec_parses_u64_seconds() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decompile",
+            "--tighten-wall-clock-budget-sec",
+            "42",
+            "/tmp/radio.img",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Decompile {
+                tighten_wall_clock_budget_sec,
+                ..
+            } => {
+                assert_eq!(
+                    tighten_wall_clock_budget_sec,
+                    Some(42),
+                    "--tighten-wall-clock-budget-sec 42 should parse as Some(42)"
+                );
             }
             _ => panic!("wrong subcommand"),
         }

@@ -24,6 +24,15 @@ pub struct Opts {
     /// uses today's single-pass decompile behavior and emits no symbol_map or
     /// pass-2 artifacts.
     pub no_symbol_pass: bool,
+    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode
+    /// (Phase-1 behavior) and `thumb_enrich` does not run for either pass.
+    /// The public `--no-thumb-decompile` clap flag wires to this field.
+    pub no_thumb_decompile: bool,
+    /// Phase 2 / Surface B: test-only override that bypasses
+    /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
+    /// budget for the tighten-watch kill decision. Wired to the hidden
+    /// `--tighten-wall-clock-budget-sec` flag. Production callers leave `None`.
+    pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +51,12 @@ pub struct ImageReport {
     pub pass2_applied: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_decompiled: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_tighten_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_enrich_error: Option<String>,
 }
 
 impl ImageReport {
@@ -60,6 +75,9 @@ impl ImageReport {
                 exit: None,
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
+                thumb_decompiled: r.thumb_decompiled,
+                thumb_tighten_error: r.thumb_tighten_error.clone(),
+                thumb_enrich_error: r.thumb_enrich_error.clone(),
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -70,6 +88,9 @@ impl ImageReport {
                 exit: Some(code),
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
+                thumb_decompiled: r.thumb_decompiled,
+                thumb_tighten_error: r.thumb_tighten_error.clone(),
+                thumb_enrich_error: r.thumb_enrich_error.clone(),
             },
         }
     }
@@ -221,6 +242,71 @@ fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Resu
     }
     std::fs::rename(&export, dest)?;
     Ok(())
+}
+
+/// Phase 2: run `decompile::thumb_enrich` against each image's
+/// `images/<label>/decompiled/{decompiled.c,thumb_functions.json}`. Mutates each
+/// `ImageResult.thumb_decompiled` (count) or `thumb_enrich_error` (failure text)
+/// in place. Returns the per-image outcome so the caller can build a StageReport.
+///
+/// Images without a `thumb_functions.json` (no Thumb regions) are silently
+/// skipped — Phase 2 only fires for images where radare2 carved Thumb.
+fn run_thumb_enrich_per_image(
+    images: &mut [decompile::ImageResult],
+    images_dir: &Path,
+) -> ThumbEnrichOutcome {
+    let mut outcome = ThumbEnrichOutcome::default();
+    for ir in images {
+        let label = &ir.label;
+        let decompiled_c = images_dir
+            .join(label)
+            .join("decompiled")
+            .join("decompiled.c");
+        let thumb_json = images_dir
+            .join(label)
+            .join("decompiled")
+            .join("thumb_functions.json");
+        if !thumb_json.exists() {
+            continue; // No Thumb regions on this image.
+        }
+        match decompile::thumb_enrich(&decompiled_c, &thumb_json) {
+            Ok(n) => {
+                ir.thumb_decompiled = Some(n);
+                outcome.counts.push((label.clone(), n));
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                ir.thumb_enrich_error = Some(msg.clone());
+                outcome.errors.push((label.clone(), msg));
+            }
+        }
+    }
+    outcome
+}
+
+/// Per-image outcome of a `thumb_enrich` sweep.
+#[derive(Default)]
+struct ThumbEnrichOutcome {
+    errors: Vec<(String, String)>,
+    counts: Vec<(String, usize)>,
+}
+
+/// Build a `thumb_enrich` StageReport from the per-image loop output.
+fn thumb_enrich_stage(
+    stage: &'static str,
+    outcome: ThumbEnrichOutcome,
+    duration_ms: u128,
+) -> StageReport {
+    let ThumbEnrichOutcome { errors, counts } = outcome;
+    StageReport {
+        stage,
+        status: if errors.is_empty() { "ok" } else { "failed" },
+        output: Some(format!("{} image(s) enriched", counts.len())),
+        reason: None,
+        error: errors.first().map(|(_, e)| e.clone()),
+        images: Vec::new(),
+        duration_ms,
+    }
 }
 
 /// Remove a file or directory if present; a missing path is not an error.
@@ -412,8 +498,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         image: None,
         ghidra_home: opts.ghidra_home.clone(),
         processor: opts.processor.clone(),
+        no_thumb_decompile: opts.no_thumb_decompile,
+        tighten_wall_clock_budget_override: opts.tighten_wall_clock_budget_override,
     };
-    let pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
+    let mut pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
         Ok(rep) => {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
@@ -446,6 +534,36 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             None
         }
     };
+
+    // 3b. Phase 2 — thumb_enrich (pass 1). Pure-Rust pass over each image's
+    //     pass-1 `decompiled.c` to populate `body_c` in `thumb_functions.json`.
+    //     Skipped entirely when `--no-thumb-decompile` is set (Stage 10 wires
+    //     the public flag; today it defaults to false). Mutates `pass1_report`
+    //     in place so the counts flow into the pass-2 input.
+    if opts.no_thumb_decompile {
+        stages.push(StageReport::skipped("thumb_enrich", "--no-thumb-decompile"));
+    } else if let Some(rep) = pass1_report.as_mut() {
+        let enrich_started = Instant::now();
+        let outcome = run_thumb_enrich_per_image(&mut rep.images, &images_dir);
+        stages.push(thumb_enrich_stage(
+            "thumb_enrich",
+            outcome,
+            enrich_started.elapsed().as_millis(),
+        ));
+    } else {
+        // Pass 1 failed entirely (no pass1_report). Record explicit skipped
+        // entries so the report shape stays predictable. The post-pass-2
+        // enrich is also unreachable here; record it once. (When
+        // --no-symbol-pass is also set, step 7 records thumb_enrich_post_pass2
+        // with "--no-symbol-pass" — guard to avoid a duplicate entry.)
+        stages.push(StageReport::skipped("thumb_enrich", "pass 1 failed"));
+        if !opts.no_symbol_pass {
+            stages.push(StageReport::skipped(
+                "thumb_enrich_post_pass2",
+                "pass 1 failed",
+            ));
+        }
+    }
 
     // 4. Source tree — 02_MAIN only.
     let main_bin = images_dir.join("02_MAIN").join("02_MAIN.bin");
@@ -536,7 +654,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 .map(|(label, (path, _))| (label, path))
                 .collect();
             match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &map_paths) {
-                Ok(rep2) => {
+                Ok(mut rep2) => {
                     // Pass 2 overwrote {ghidra}/export/<label>/; re-marshal each
                     // image's fresh export into the per-image tree so it does
                     // not still hold pass 1's FUN_-placeholder decompiled.c.
@@ -547,6 +665,24 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                                 ir.label
                             );
                         }
+                    }
+                    // 7b. Phase 2 — thumb_enrich re-run against the post-pass-2
+                    //     decompiled.c (now baked with recovered names). Overwrites
+                    //     each ImageResult.thumb_decompiled from pass 1. Skipped on
+                    //     `--no-thumb-decompile` (Phase 2 disabled end-to-end).
+                    if opts.no_thumb_decompile {
+                        stages.push(StageReport::skipped(
+                            "thumb_enrich_post_pass2",
+                            "--no-thumb-decompile",
+                        ));
+                    } else {
+                        let enrich_started = Instant::now();
+                        let outcome = run_thumb_enrich_per_image(&mut rep2.images, &images_dir);
+                        stages.push(thumb_enrich_stage(
+                            "thumb_enrich_post_pass2",
+                            outcome,
+                            enrich_started.elapsed().as_millis(),
+                        ));
                     }
                     // Refresh the decompile stage's per-image reports with pass-2 fields.
                     let image_reports: Vec<ImageReport> =
@@ -566,6 +702,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         }
     } else {
         stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
+        stages.push(StageReport::skipped(
+            "thumb_enrich_post_pass2",
+            "--no-symbol-pass",
+        ));
     }
 
     // 8. Finalize symbolication per image: rewrite thumb_functions.json (still
@@ -651,6 +791,9 @@ mod tests {
                         exit: None,
                         pass2_applied: None,
                         pass2_error: None,
+                        thumb_decompiled: None,
+                        thumb_tighten_error: None,
+                        thumb_enrich_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -661,6 +804,9 @@ mod tests {
                         exit: Some(1),
                         pass2_applied: None,
                         pass2_error: None,
+                        thumb_decompiled: None,
+                        thumb_tighten_error: None,
+                        thumb_enrich_error: None,
                     },
                 ],
                 10,
@@ -766,6 +912,9 @@ mod tests {
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
             pass2_applied: None,
             pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -793,12 +942,125 @@ mod tests {
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
         });
 
         assert_eq!(image.status, "analyzed");
         assert_eq!(image.functions, Some(7));
         assert!(image.thumb_functions.is_none());
         assert!(image.thumb_error.is_none());
+    }
+
+    #[test]
+    fn run_thumb_enrich_per_image_populates_count_and_skips_images_without_thumb_json() {
+        let root =
+            std::env::temp_dir().join(format!("pme_thumb_enrich_loop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Image A: has thumb_functions.json + matching decompiled.c.
+        let dec_a = root.join("images").join("02_MAIN").join("decompiled");
+        std::fs::create_dir_all(&dec_a).unwrap();
+        std::fs::write(
+            dec_a.join("decompiled.c"),
+            "void thumb_40e1200(void)\n{\n  return;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dec_a.join("thumb_functions.json"),
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+                {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+                 "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+        // Image B: no thumb_functions.json (no Thumb regions on this image).
+        let dec_b = root.join("images").join("01_BOOT").join("decompiled");
+        std::fs::create_dir_all(&dec_b).unwrap();
+
+        let mut images = vec![
+            decompile::ImageResult {
+                label: "02_MAIN".into(),
+                outcome: ImageOutcome::Analyzed(10),
+                thumb_functions: Some(1),
+                thumb_error: None,
+                pass2_applied: None,
+                pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
+            },
+            decompile::ImageResult {
+                label: "01_BOOT".into(),
+                outcome: ImageOutcome::Analyzed(3),
+                thumb_functions: None,
+                thumb_error: None,
+                pass2_applied: None,
+                pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
+            },
+        ];
+        let images_dir = root.join("images");
+        let outcome = run_thumb_enrich_per_image(&mut images, &images_dir);
+
+        assert_eq!(outcome.counts.len(), 1, "only 02_MAIN had a thumb json");
+        assert_eq!(outcome.counts[0].0, "02_MAIN");
+        assert_eq!(outcome.counts[0].1, 1, "one body_c populated");
+        assert!(outcome.errors.is_empty());
+        assert_eq!(images[0].thumb_decompiled, Some(1));
+        assert!(images[0].thumb_enrich_error.is_none());
+        // Image B without thumb json is unchanged.
+        assert!(images[1].thumb_decompiled.is_none());
+        assert!(images[1].thumb_enrich_error.is_none());
+
+        // The StageReport shape produced from this outcome.
+        let stage = thumb_enrich_stage("thumb_enrich", outcome, 0);
+        assert_eq!(stage.stage, "thumb_enrich");
+        assert_eq!(stage.status, "ok");
+        assert_eq!(stage.output.as_deref(), Some("1 image(s) enriched"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_thumb_enrich_per_image_records_error_on_missing_decompiled_c() {
+        let root =
+            std::env::temp_dir().join(format!("pme_thumb_enrich_err_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dec = root.join("images").join("02_MAIN").join("decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        // thumb_functions.json exists but decompiled.c is absent -> Err.
+        std::fs::write(
+            dec.join("thumb_functions.json"),
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[]}"#,
+        )
+        .unwrap();
+
+        let mut images = vec![decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: ImageOutcome::Analyzed(0),
+            thumb_functions: Some(0),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+        }];
+        let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
+        assert_eq!(outcome.counts.len(), 0);
+        assert_eq!(
+            outcome.errors.len(),
+            1,
+            "missing decompiled.c surfaces as error"
+        );
+        assert!(images[0].thumb_decompiled.is_none());
+        assert!(images[0].thumb_enrich_error.is_some());
+
+        let stage = thumb_enrich_stage("thumb_enrich", outcome, 0);
+        assert_eq!(stage.status, "failed");
+        assert!(stage.error.is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -911,6 +1173,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         // <out>/rootfs/images/ doesn't exist at all -> typed NotFound, not a raw Io error
         assert!(matches!(rootfs_image_dir(&out), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn image_report_serializes_phase2_fields_as_none_when_absent() {
+        let r = decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(10),
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+        };
+        let report = ImageReport::from_result(&r);
+        let json = serde_json::to_string(&report).unwrap();
+        // New fields must serialize as absent (skip_serializing_if = Option::is_none).
+        assert!(!json.contains("thumb_decompiled"));
+        assert!(!json.contains("thumb_tighten_error"));
+        assert!(!json.contains("thumb_enrich_error"));
+    }
+
+    #[test]
+    fn image_report_serializes_phase2_fields_when_set() {
+        let r = decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(10),
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: Some(3),
+            thumb_tighten_error: None,
+            thumb_enrich_error: Some("malformed decompiled.c".into()),
+        };
+        let report = ImageReport::from_result(&r);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"thumb_decompiled\":3"));
+        assert!(!json.contains("thumb_tighten_error"));
+        assert!(json.contains("\"thumb_enrich_error\":\"malformed decompiled.c\""));
     }
 
     #[test]

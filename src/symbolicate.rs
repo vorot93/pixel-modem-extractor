@@ -665,10 +665,17 @@ fn rewrite_text(text: &str, symbols: &[Symbol]) -> String {
     if text.starts_with(SENTINEL) {
         return text.to_string();
     }
-    // Replace longer original names first: a shorter name that is a prefix of a
-    // longer one (e.g. unpadded `thumb_40e1200` vs `thumb_40e12000`) must not fire
-    // inside the longer token. New names never start with `FUN_`/`thumb_`, so no
-    // replacement can re-introduce a match.
+    let renames = build_rename_map(symbols);
+    let out = apply_rename_map(text, &renames);
+    format!("{SENTINEL}{out}")
+}
+
+/// Per-symbol `(original_name, name)` rename pairs, longest-first to avoid prefix
+/// collisions (e.g. shorter `thumb_40e1200` must not fire inside longer
+/// `thumb_40e12000`). New names never start with `FUN_`/`thumb_`, so no
+/// replacement can re-introduce a match. Shared by the file-level rewrite
+/// (`rewrite_text`) and the per-field `body_c` rewrite.
+fn build_rename_map(symbols: &[Symbol]) -> Vec<(&str, &str)> {
     let mut renames: Vec<(&str, &str)> = symbols
         .iter()
         .filter_map(|s| match &s.name {
@@ -679,11 +686,17 @@ fn rewrite_text(text: &str, symbols: &[Symbol]) -> String {
         })
         .collect();
     renames.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+    renames
+}
+
+/// Apply the rename map left-to-right (already sorted longest-first by the
+/// caller via `build_rename_map`). Pure text substitution; no sentinel.
+fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
     let mut out = text.to_string();
     for (orig, name) in renames {
         out = out.replace(orig, name);
     }
-    format!("{SENTINEL}{out}")
+    out
 }
 
 /// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
@@ -769,6 +782,10 @@ fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
 }
 
 /// Rewrite `decompiled.c` and `disasm.lst` in place (text substitution) if present.
+/// Also rewrites the `body_c` field of each entry in `thumb_functions.json`
+/// (when present) using the same rename map — symmetric with `decompiled.c`
+/// since `body_c` is sourced from it. Gated at the call site by
+/// `FinalizeOpts::rewrite_decompiled_c`.
 fn rewrite_text_files(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
     for name in ["decompiled.c", "disasm.lst"] {
         let p = decompiled.join(name);
@@ -777,6 +794,40 @@ fn rewrite_text_files(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
             std::fs::write(&p, rewrite_text(&text, symbols))?;
         }
     }
+    rewrite_body_c_in_thumb_functions(decompiled, symbols)?;
+    Ok(())
+}
+
+/// Walk `thumb_functions.json` and apply the `original_name -> name` rename map
+/// to each function's `body_c` field (when present). Mirrors the `decompiled.c`
+/// text substitution — Phase-2's `body_c` is sourced from `decompiled.c`, so on
+/// the standalone-`symbolicate` path (against a pre-Phase-2 tree) the same
+/// rename must apply. Idempotent: after the first pass the original names are
+/// gone from `body_c`, so subsequent passes are no-ops.
+fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
+    let path = decompiled.join("thumb_functions.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
+        .map_err(|e| Error::Serialize(e.to_string()))?;
+    if let Some(arr) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
+        let renames = build_rename_map(symbols);
+        for func in arr.iter_mut() {
+            let Some(obj) = func.as_object_mut() else {
+                continue;
+            };
+            let Some(body_c) = obj.get("body_c").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let renamed = apply_rename_map(body_c, &renames);
+            obj.insert("body_c".into(), serde_json::Value::String(renamed));
+        }
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&v).map_err(|e| Error::Serialize(e.to_string()))?,
+    )?;
     Ok(())
 }
 
@@ -1583,5 +1634,93 @@ mod tests {
         );
         // symbols.json still emitted
         assert!(dec.join("symbols.json").exists());
+    }
+
+    fn write_thumb_functions_v2_with_body_c(dec: &std::path::Path) {
+        // v2 with one body_c already populated; the function name appears
+        // verbatim in body_c so the test can detect a rewrite (or its absence).
+        let original_json = r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "bx lr",
+                 "body_c": "void thumb_40e1200(void) { return; }",
+                 "data_refs": []}
+            ]
+        }"#;
+        std::fs::write(dec.join("thumb_functions.json"), original_json).unwrap();
+    }
+
+    fn real_name_symbol_for_40e1200() -> Symbol {
+        Symbol {
+            address: "0x40e1200".into(),
+            arch: "thumb",
+            original_name: "thumb_40e1200".into(),
+            name: Some("RealName".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        }
+    }
+
+    #[test]
+    fn finalize_image_preserves_body_c_when_rewrite_decompiled_c_false() {
+        let root = tmp("pme_sym_body_c_preserve");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        write_thumb_functions_v2_with_body_c(&dec);
+
+        let symbols = vec![real_name_symbol_for_40e1200()];
+        finalize_image(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &symbols,
+            &FinalizeOpts {
+                rewrite_decompiled_c: false,
+            },
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dec.join("thumb_functions.json")).unwrap();
+        // body_c-specific: `thumb_40e1200(void)` appears only inside body_c text,
+        // never as a field value (the `name` field legitimately becomes RealName
+        // via the ungated rewrite_functions_json pass).
+        assert!(
+            after.contains("thumb_40e1200(void)"),
+            "body_c must be byte-identical when rewrite_decompiled_c=false: {after}"
+        );
+        assert!(
+            !after.contains("RealName(void)"),
+            "body_c must not be renamed when rewrite_decompiled_c=false: {after}"
+        );
+    }
+
+    #[test]
+    fn finalize_image_renames_body_c_when_rewrite_decompiled_c_true() {
+        let root = tmp("pme_sym_body_c_rename");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        write_thumb_functions_v2_with_body_c(&dec);
+
+        let symbols = vec![real_name_symbol_for_40e1200()];
+        finalize_image(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &symbols,
+            &FinalizeOpts {
+                rewrite_decompiled_c: true,
+            },
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dec.join("thumb_functions.json")).unwrap();
+        assert!(
+            after.contains("RealName(void)"),
+            "body_c must be renamed when rewrite_decompiled_c=true: {after}"
+        );
+        assert!(
+            !after.contains("thumb_40e1200(void)"),
+            "original name must be gone from body_c after rewrite: {after}"
+        );
     }
 }

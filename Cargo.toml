@@ -28,3 +28,8 @@ tar = "0.4"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Unix-only: Surface B's tighten-watch kills the Ghidra process group
+# (`analyzeHeadless` bash launcher + its Java grandchild) via `kill(-pgid, SIGKILL)`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.188"
