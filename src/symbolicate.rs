@@ -4,7 +4,7 @@
 //! attribution), then rewrite the artifacts in place + emit `symbols.json`.
 //! Pure-Rust; ARM and Thumb. Fail-closed and tiered: only `__func__` yields a
 //! real rename, only a token yields a marked `guess_…` name, everything else is
-//! a comment. See docs/superpowers/specs/2026-07-06-modem-symbolication-design.md.
+//! a comment.
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};

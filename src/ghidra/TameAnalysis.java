@@ -3,9 +3,10 @@
 //
 //   arg[0] = "tighten" (new default; Phase 2+): disable the Aggressive Instruction
 //     Finder plus the analysis options identified by the Phase-2 investigation
-//     (see docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-findings.md).
-//     Does NOT data-mark regions; Ghidra attempts Thumb function discovery and
-//     decompilation. Per-function convergence failures fall through to radare2 in
+//     (TIGHTEN_EXTRA is empty: on the smallest dense-Thumb region of a real 02_MAIN,
+//     disabling AIF alone was sufficient — see CONTRIBUTING.md § Winning TameAnalysis
+//     options). Does NOT data-mark regions; Ghidra attempts Thumb function discovery
+//     and decompilation. Per-function convergence failures fall through to radare2 in
 //     the Rust host (see decompile::thumb_enrich).
 //
 //   arg[0] = "datamark" (today's Phase-1 behavior; also used by --no-thumb-decompile):
@@ -29,8 +30,7 @@ public class TameAnalysis extends GhidraScript {
         "Aggressive Instruction Finder",
     };
 
-    // Phase 2 `mode=tighten` body — sourced verbatim from the Phase-2 investigation
-    // (docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-findings.md).
+    // Phase 2 `mode=tighten` body — sourced verbatim from the Phase-2 investigation.
     // On the smallest dense-Thumb region of a real 02_MAIN (2.06 MiB sample,
     // N_r2 = 11023), disabling the Aggressive Instruction Finder alone caused
     // Ghidra 12.1.2 to converge in 80 s with 0 ClearFlowAndRepairCmd log lines

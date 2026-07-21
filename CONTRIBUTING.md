@@ -204,10 +204,11 @@ module; when a file outgrows that, split it.
   candidates (one-line rationale each): **Candidate 3** (disable
   `ClearFlowAndRepairCmd`) and **Candidate 4** (cap repair) were never run —
   Candidate 2 hit every stop condition first, so neither option name was
-  resolved against Ghidra 12's analysis-properties sheet. See
-  `docs/superpowers/specs/2026-07-21-thumb-decompilation-phase2-findings.md`
-  for the full investigation; if the full ~87 MB `02_MAIN` spins where the
-  sample didn't, Surface B's watch + datamark retry is the designed mitigation.
+  resolved against Ghidra 12's analysis-properties sheet. Production verification
+  on a real `02_MAIN` (Pixel 6 Pro mustang) confirmed the sample did not predict
+  the full image: Surface B's watch fires after ~28 min (>100k overlap-repair log
+  lines), the datamark retry succeeds, and `thumb_decompiled` stays at 0 — Phase
+  2.1 picks up from here.
 - **Surface B mechanics (Phase 2+).** The watch in `decompile::run_report`'s
   tighten branch fires on wall-clock or log-spam excess, then re-spawns the
   image as datamark. Two hard-won properties a fresh change can break:
@@ -286,10 +287,13 @@ module; when a file outgrows that, split it.
 ## How we work here
 
 - **Design before code.** Non-trivial work gets a written design spec and an
-  implementation plan before implementation begins. Phase 1+ specs and plans
-  live under `docs/superpowers/specs/` and `docs/superpowers/plans/`
-  respectively (`YYYY-MM-DD-<topic>-{design,plan}.md`). Read the most recent
-  ones before starting non-trivial work — they capture why approaches were
+  implementation plan before implementation begins. The agent that drives this
+  repo keeps those artifacts in its own private data directory
+  (`~/.superpowers/pixel-modem-extractor/`,
+  `YYYY-MM-DD-<topic>-{design,plan,findings}.md`) — they are the *process trail*,
+  not committed documentation. The durable *outcomes* of each iteration land in
+  this file, the README, and code comments. Read this CONTRIBUTING.md and the
+  README before starting non-trivial work — they capture why approaches were
   chosen or rejected, which the code alone can't tell you.
 - **Test first**, keep changes small and reviewable.
 - **Verify before claiming done.** Run fmt + clippy + test, and for a behavior change
