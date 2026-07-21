@@ -17,6 +17,7 @@ use std::{
 
 const EXPORT_DECOMP_JAVA: &str = include_str!("ghidra/ExportDecomp.java");
 const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
+const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -381,6 +382,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
+    std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
 
     // 3. machine-readable load spec -> out/ghidra_load.json
     let source_name = modem_bin
