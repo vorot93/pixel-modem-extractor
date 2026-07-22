@@ -59,7 +59,7 @@ pub enum Arch {
 /// One piece of evidence for a `(address, name)` association. Either a string
 /// that mentions the name, or a function whose `data_refs` were used.
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Evidence {
     /// A string at `address` whose content `value` mentions the global name.
     String { address: String, value: String },
@@ -152,11 +152,12 @@ pub fn run(
         ))
     })?;
 
-    // 2. Read the raw image bytes (for string extraction). Missing .bin is
-    //    treated as an empty image — string_map ends up empty, so the
-    //    unique-identifier rule can't match and we return 0 (defensive path).
+    // 2. Read the raw image bytes (for string extraction). Missing or
+    //    unreadable .bin is a Surface 3.0-A failure — propagate as Err (via
+    //    Error::Io's #[from] std::io::Error conversion) so the caller records
+    //    `globals_error` and skips writing globals.json for this image.
     let bin_path = image_dir.join(format!("{image_label}.bin"));
-    let image_bytes = std::fs::read(&bin_path).unwrap_or_default();
+    let image_bytes = std::fs::read(&bin_path)?;
 
     // 3. Build string_map: {vaddr -> string_content}.
     let mut string_map: HashMap<u64, String> = HashMap::new();
@@ -285,17 +286,36 @@ pub fn run(
             (false, true) => Arch::Thumb,
             (false, false) => unreachable!("no contributing functions"),
         };
-        // One Evidence::Function per contributing function (Phase 3.0 surfaces
-        // the function-side audit trail; the String evidence variant is
-        // reserved for Phase 3.0.1+ use).
+        // Build evidence entries: one (String + Function) pair per contributing
+        // function — the String entry names the global (smallest string_ref
+        // address in that function, deterministic), the Function entry is the
+        // function whose data_refs produced the association. Mirrors Phase 1's
+        // Symbol.evidence precedent (kind-discriminated, multiple entries per
+        // record).
         let evidence: Vec<Evidence> = functions
             .iter()
-            .map(|f| Evidence::Function {
-                address: format!("0x{:x}", f.entry),
-                arch: f.arch,
-                name: f.ghidra_name.clone(),
-                recovered_name: f.recovered_name.clone(),
+            .filter_map(|f| {
+                let s_addr = f
+                    .data_refs
+                    .iter()
+                    .copied()
+                    .filter(|a| string_map.contains_key(a))
+                    .min()?;
+                let value = string_map.get(&s_addr)?.clone();
+                Some(vec![
+                    Evidence::String {
+                        address: format!("0x{s_addr:x}"),
+                        value,
+                    },
+                    Evidence::Function {
+                        address: format!("0x{:x}", f.entry),
+                        arch: f.arch,
+                        name: f.ghidra_name.clone(),
+                        recovered_name: f.recovered_name.clone(),
+                    },
+                ])
             })
+            .flatten()
             .collect();
 
         globals.push(Global {
@@ -565,7 +585,7 @@ mod tests {
         assert_eq!(v["globals"][0]["tier"], "recovered");
         assert_eq!(v["globals"][0]["arch"], "arm");
         assert!(v["globals"][0]["size"].is_null());
-        assert_eq!(v["globals"][0]["evidence"].as_array().unwrap().len(), 1);
+        assert_eq!(v["globals"][0]["evidence"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -656,9 +676,9 @@ mod tests {
             &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
         )
         .unwrap();
-        // One entry, two evidence paths.
+        // One entry, four evidence entries (2 strings + 2 functions).
         assert_eq!(v["globals"].as_array().unwrap().len(), 1);
-        assert_eq!(v["globals"][0]["evidence"].as_array().unwrap().len(), 2);
+        assert_eq!(v["globals"][0]["evidence"].as_array().unwrap().len(), 4);
     }
 
     #[test]
@@ -727,6 +747,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["globals"][0]["arch"], "mixed");
+        assert_eq!(v["globals"][0]["evidence"].as_array().unwrap().len(), 4);
     }
 
     #[test]
@@ -755,24 +776,20 @@ mod tests {
         )
         .unwrap();
         let ev = v["globals"][0]["evidence"].as_array().unwrap();
-        assert_eq!(ev.len(), 2);
-        // First evidence's function address should be the lower one.
-        // Both evidence entries are tagged `kind: function` per the algorithm;
-        // within them, the function address appears. Find the Function variant.
+        assert_eq!(ev.len(), 4);
+        // Function addresses (kind == "function") should sort ascending.
+        // String entries also carry an `address`, so discriminate by kind.
         let fn_addrs: Vec<&str> = ev
             .iter()
+            .filter(|e| e["kind"] == "function")
             .filter_map(|e| e.get("address").and_then(|a| a.as_str()))
             .collect();
         assert_eq!(fn_addrs, vec!["0x2000", "0x2100"]);
     }
 
     #[test]
-    fn passes_through_image_without_raw_bytes_returns_ok_zero() {
+    fn missing_raw_bytes_returns_err_surface_3_0_a() {
         let img = Img::new("no_bin");
-        // No <label>.bin file — defensive path. Algorithm should treat all
-        // data_refs as non-string (since string_map is empty) and process
-        // normally; but with no strings, the unique-identifier rule won't
-        // match, returning 0. Either way: no panic.
         img.write_functions_json(&format!("[{}]", make_arm_function(0x2000, &[0x4000])));
         img.write_thumb_functions_json(
             r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
@@ -780,8 +797,20 @@ mod tests {
         img.write_manifest_load_addr("0x1000");
         // Note: no write_image_bin call.
 
-        let report = run_no_names(&img).unwrap();
-        assert_eq!(report.recovered_count, 0);
+        let err = run_no_names(&img).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no such file") || msg.contains("not found") || msg.contains("No such"),
+            "expected io error message; got: {msg}"
+        );
+        // Confirm globals.json was NOT written (atomicity — Surface 3.0-A).
+        assert!(
+            !img.image_dir()
+                .join("decompiled")
+                .join("globals.json")
+                .exists(),
+            "globals.json must not be written on Surface 3.0-A failure"
+        );
     }
 
     #[test]
