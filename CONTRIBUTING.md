@@ -173,7 +173,17 @@ module; when a file outgrows that, split it.
   (`N_ghidra` = 107,955 of `N_r2_full` = 151,411 across 5 dense-Thumb regions).
   Surface B does not fire under this config (its ~112 min wall-clock budget and
   100k log-spam trigger are never reached), and `body_c` is populated on
-  production. See **Winning TameAnalysis options (Phase 2.1)** below.
+  production. **Verification basis:** Task 5's investigation ran each candidate
+  via direct `analyzeHeadless` (the production pipeline's analysis phase is
+  identical; methodology deviation documented in the findings doc). Body-c
+  population was verified by direct `thumb_enrich` invocation against real
+  `02_MAIN` partial pipeline output (pass-1 + radare2 completed) — 81,763
+  `body_c` populated against 80,396 measured address overlap. A full
+  `decompose` end-to-end was not completed during Phase 2.1 (90-min timeout
+  during 02_MAIN processing); Surface B non-firing is inferential from Task 5's
+  23.3 min standalone measurement vs the 112 min budget, not yet observed in a
+  full-pipeline `report.json`. See **Winning TameAnalysis options (Phase 2.1)**
+  below.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
   can easily break:
   (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
@@ -226,8 +236,9 @@ module; when a file outgrows that, split it.
   `void FUN_x(\n    int a)`, ~35%). The 8-line bound captures 99.6% of real
   headers; the long tail (offset >8, <0.5%) is accepted loss. Production
   verification on a real `02_MAIN` confirmed 81,763 body_c populated against
-  80,396 measured address overlap (99.6% capture, matching the histogram
-  prediction). Two inline regression sentinels
+  80,396 measured address overlap (consistent with the histogram prediction
+  of 99.6% header capture; the 1.7% excess reflects duplicate radare2
+  entries at shared addresses). Two inline regression sentinels
   (`thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines` for
   offset-4 and `thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig`
   for offset-6) catch a future regression to the original 2-line bound, which
