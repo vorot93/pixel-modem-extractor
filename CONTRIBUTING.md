@@ -203,7 +203,7 @@ module; when a file outgrows that, split it.
   the kill behavior itself is verified manually via
   `--tighten-wall-clock-budget-sec 1`. Don't assert on the kill firing in a
   unit test — it depends on Ghidra's repair-log cadence against real firmware.
-- **Phase 2.1 invariants.** Two structural facts a fresh change can easily break:
+-   **Phase 2.1 invariants.** Two structural facts a fresh change can easily break:
   (1) **`thumb_enrich` matches by entry address, not by name.** The matching
   gate fires on the normalized entry address (strip `0x`, strip leading zeros,
   clear low bit for Ghidra's Thumb T-bit) — both the parser (over
@@ -217,6 +217,24 @@ module; when a file outgrows that, split it.
   variant regresses), re-run the multi-candidate investigation; do not edit
   `TIGHTEN_EXTRA` ad hoc. The findings doc lives at
   `~/.superpowers/pixel-modem-extractor/2026-07-21-thumb-decompilation-phase2-1-findings.md`.
+-   **Phase 2.1 parser lookahead (8 lines, calibrated to real
+  ExportDecomp.java).** `parse_decompiled_c_function_bodies_by_addr` commits
+  to a `// FUN_<addr> @ <addr>` header only when `{` appears within the next
+  1–8 lines. Real `ExportDecomp.java` output is bi-modal: offset-4 headers
+  (single-line signatures like `void FUN_x(void)` between two blank lines,
+  ~58% of `02_MAIN`) and offset-6 headers (2-line signatures like
+  `void FUN_x(\n    int a)`, ~35%). The 8-line bound captures 99.6% of real
+  headers; the long tail (offset >8, <0.5%) is accepted loss. Production
+  verification on a real `02_MAIN` confirmed 81,763 body_c populated against
+  80,396 measured address overlap (99.6% capture, matching the histogram
+  prediction). Two inline regression sentinels
+  (`thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines` for
+  offset-4 and `thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig`
+  for offset-6) catch a future regression to the original 2-line bound, which
+  silently populated 0 body_c on production data because the synthetic-fixture
+  test shape (`<sig>\n{\n`, 1-line gap) didn't match real ExportDecomp output
+  (`<header>\n\n<sig>\n\n{\n`, 2-line gaps). Don't tighten this bound without
+  re-running production verification on real `02_MAIN` output.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
