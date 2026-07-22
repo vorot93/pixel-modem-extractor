@@ -804,6 +804,14 @@ fn rewrite_text_files(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
 /// the standalone-`symbolicate` path (against a pre-Phase-2 tree) the same
 /// rename must apply. Idempotent: after the first pass the original names are
 /// gone from `body_c`, so subsequent passes are no-ops.
+///
+/// **Dead on the two-pass `decompose` path under Phase 2.1.** Phase 2.1's
+/// post-pass-2 `thumb_enrich` re-runs against the pass-2-regenerated
+/// `decompiled.c` (which has recovered names baked in by `ApplySymbols`), so
+/// `body_c` is born with recovered names directly — and `FinalizeOpts::
+/// rewrite_decompiled_c` is `false` on that path, skipping this rewrite. Live
+/// on the standalone `symbolicate` subcommand and on `decompose
+/// --no-symbol-pass` (where `rewrite_decompiled_c` is `true`).
 fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
     let path = decompiled.join("thumb_functions.json");
     if !path.exists() {

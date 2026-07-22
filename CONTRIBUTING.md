@@ -139,51 +139,57 @@ module; when a file outgrows that, split it.
   (controlled by `Opts.rewrite_decompiled_c`, which is `true` for the
   standalone path, `true` for the decompose path under `--no-symbol-pass`, and
   `false` otherwise — pass 2 already baked the names in).
-- **Phase 2: Thumb decompilation.** Dense Thumb regions in `02_MAIN` are no
-  longer data-marked for Ghidra; the tightened `TameAnalysis` (mode=tighten)
-  lets Ghidra attempt function discovery and decompilation. Per-function hybrid
-  output: `thumb_functions.json` v2 with optional per-function `body_c`; the
-  asm `body` is always populated (radare2 unchanged). `--no-thumb-decompile`
-  reverts to Phase-1 datamark behavior. A runtime wall-clock + log-spam watch
-  kills Ghidra on overlapping-function-repair spin and falls back to datamark
-  per image (recorded as `thumb_tighten_error`, image not marked `failed`);
-  see **Surface B mechanics** below for the kill path and budget calibration.
-  `thumb_enrich` parses `decompiled.c` and fills `body_c`; it is pure Rust,
-  idempotent, runs after pass 1 and again after pass 2. **Production note
-  (Phase 2):** verification on a real `02_MAIN` (Pixel 6 Pro mustang) confirms
-  Surface B's watch correctly fires on the larger dense-Thumb regions after
-  ~28 min of analysis (the smallest region's Task-1 sample did not predict
-  this — full `02_MAIN` produces >100k overlap-repair log lines). The datamark
-  retry succeeds, the image stays `analyzed`, and pass-2 symbolication completes
-  (330+ names applied) — so Phase 1 functionality is intact. But
-  `thumb_decompiled` is `0` on production `02_MAIN` because the datamark retry
-  data-marks the regions `thumb_enrich` would otherwise populate. A second,
-  independent cause exists even when Surface B doesn't fire: `thumb_enrich`
-  matches by function name, but `thumb_functions.json`'s radare2-style names
-  (`thumb_<addr>` / `sym.thumb_<addr>`) never align with `decompiled.c`'s
-  Ghidra names (`FUN_<addr>` or post-pass-2 recovered names), so `body_c` stays
-  empty on any image regardless of Surface B. The spec specified address-based
-  matching; the plan deviated to name-based. This is the spec's designed
-  behavior for Surface B (§ Error handling → Surface B). Phase 2.1 closed both
-  causes: `thumb_enrich` now matches by entry address (Phase 2's intended
-  contract; see Phase 2.1 invariants below), and `TameAnalysis mode=tighten`
-  carries the winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow Damage"`)
-  which lets Ghidra 12 converge on the full `02_MAIN` in 1398 s (23.3 min) with
-  0 `ClearFlowAndRepairCmd` repair-log lines and 71 % radare2 coverage
-  (`N_ghidra` = 107,955 of `N_r2_full` = 151,411 across 5 dense-Thumb regions).
-  Surface B does not fire under this config (its ~112 min wall-clock budget and
-  100k log-spam trigger are never reached), and `body_c` is populated on
-  production. **Verification basis:** Task 5's investigation ran each candidate
-  via direct `analyzeHeadless` (the production pipeline's analysis phase is
-  identical; methodology deviation documented in the findings doc). Body-c
-  population was verified by direct `thumb_enrich` invocation against real
-  `02_MAIN` partial pipeline output (pass-1 + radare2 completed) — 81,763
-  `body_c` populated against 80,396 measured address overlap. A full
-  `decompose` end-to-end was not completed during Phase 2.1 (90-min timeout
-  during 02_MAIN processing); Surface B non-firing is inferential from Task 5's
-  23.3 min standalone measurement vs the 112 min budget, not yet observed in a
-  full-pipeline `report.json`. See **Winning TameAnalysis options (Phase 2.1)**
-  below.
+- **Phase 2 + 2.1: Thumb decompilation.** Dense Thumb regions in `02_MAIN`
+  are no longer data-marked for Ghidra; the tightened `TameAnalysis`
+  (`mode=tighten`) lets Ghidra attempt function discovery and decompilation.
+  Per-function hybrid output: `thumb_functions.json` v2 with optional
+  per-function `body_c`; the asm `body` is always populated (radare2
+  unchanged). `thumb_enrich` parses `decompiled.c` and fills `body_c` by
+  **entry address** (Phase 2.1's matching fix — Phase 2 shipped name-based
+  matching, which never aligned radare2's `thumb_<addr>` / `sym.thumb_<addr>`
+  with Ghidra's `FUN_<addr>` / recovered names; Phase 2.1 switched to
+  address-based matching per the spec's original intent; see Phase 2.1
+  invariants below). `thumb_enrich` is pure Rust, idempotent, runs after pass
+  1 and again after pass 2. `--no-thumb-decompile` reverts to Phase-1 datamark
+  behavior. A runtime wall-clock + log-spam watch kills Ghidra on
+  overlapping-function-repair spin and falls back to datamark per image
+  (recorded as `thumb_tighten_error`, image not marked `failed`); see
+  **Surface B mechanics** below for the kill path and budget calibration.
+  **Production status:** on a real `02_MAIN` (Pixel 6 Pro mustang), Phase
+  2.1's winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow Damage"`)
+  lets Ghidra 12 converge in 1398 s (23.3 min) with 0 `ClearFlowAndRepairCmd`
+  repair-log lines and 71 % radare2 coverage (`N_ghidra` = 107,955 of
+  `N_r2_full` = 151,411 across 5 dense-Thumb regions). Surface B's budget
+  (~112 min wall-clock, 100k log-spam lines) is never approached. Direct
+  `thumb_enrich` invocation against real `02_MAIN` pass-1 output populated
+  81,763 `body_c` against 80,396 measured address overlap. **Verification
+  basis:** Task 5's investigation ran each candidate via direct
+  `analyzeHeadless` (the production pipeline's analysis phase is identical;
+  methodology deviation documented in the findings doc). A full `decompose`
+  end-to-end was not completed during Phase 2.1 (90-min timeout during
+  02_MAIN processing); Surface B non-firing is inferential from Task 5's
+  23.3 min standalone measurement vs the 112 min budget, not yet observed
+  in a full-pipeline `report.json`. (Phase 2 originally shipped with an
+  empty `TIGHTEN_EXTRA`; on production `02_MAIN`, that config triggered
+  Ghidra's overlap-repair spin (>100k log lines, ~28 min) and Surface B's
+  watch fired + fell back to datamark. Phase 2.1 picked the winning option
+  via a multi-candidate investigation; see **Winning TameAnalysis options
+  (Phase 2.1)** below.)
+- **Don't try to add a synthetic CI fixture for the Thumb→C pipeline.**
+  Phase 2.1 attempted a 14-byte ARM `BLX`-to-Thumb hand-assembled fixture to
+  prove Ghidra's Thumb discovery end-to-end in `tests/decompile_golden.rs`.
+  Empirical verification: Ghidra's `ARM:LE:32:v7` auto-analysis does **not**
+  follow an immediate BLX into Thumb mode for a small synthetic blob. Real-
+  firmware Thumb discovery is driven by radare2 region hints + Ghidra's flow
+  analysis over megabytes of code, not by any single mode-switch instruction
+  a synthetic fixture could carry. Even a working fixture would test an
+  artificial path that could pass CI while production breaks. CI coverage for
+  the matching fix lives in `thumb_enrich`'s inline Rust tests; production
+  verification lives in the full `decompose` on a real `02_MAIN` (see the
+  Phase 2 / 2.1 findings docs in `~/.superpowers/pixel-modem-extractor/`).
+  If you must add CI coverage for Thumb discovery, gate it on a real image
+  (env-gated golden test) — do not spend time on a hand-assembled BLX
+  fixture.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
   can easily break:
   (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
