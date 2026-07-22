@@ -155,26 +155,26 @@ module; when a file outgrows that, split it.
   overlapping-function-repair spin and falls back to datamark per image
   (recorded as `thumb_tighten_error`, image not marked `failed`); see
   **Surface B mechanics** below for the kill path and budget calibration.
-  **Production status:** on a real `02_MAIN` (Pixel 6 Pro mustang), Phase
-  2.1's winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow Damage"`)
-  lets Ghidra 12 converge in 1398 s (23.3 min) with 0 `ClearFlowAndRepairCmd`
-  repair-log lines and 71 % radare2 coverage (`N_ghidra` = 107,955 of
-  `N_r2_full` = 151,411 across 5 dense-Thumb regions). Surface B's budget
-  (~112 min wall-clock, 100k log-spam lines) is never approached. Direct
-  `thumb_enrich` invocation against real `02_MAIN` pass-1 output populated
-  81,763 `body_c` against 80,396 measured address overlap. **Verification
-  basis:** Task 5's investigation ran each candidate via direct
-  `analyzeHeadless` (the production pipeline's analysis phase is identical;
-  methodology deviation documented in the findings doc). A full `decompose`
-  end-to-end was not completed during Phase 2.1 (90-min timeout during
-  02_MAIN processing); Surface B non-firing is inferential from Task 5's
-  23.3 min standalone measurement vs the 112 min budget, not yet observed
-  in a full-pipeline `report.json`. (Phase 2 originally shipped with an
-  empty `TIGHTEN_EXTRA`; on production `02_MAIN`, that config triggered
-  Ghidra's overlap-repair spin (>100k log lines, ~28 min) and Surface B's
-  watch fired + fell back to datamark. Phase 2.1 picked the winning option
-  via a multi-candidate investigation; see **Winning TameAnalysis options
-  (Phase 2.1)** below.)
+  **Production status (verified end-to-end on a real `02_MAIN`, Pixel 6 Pro
+  mustang):** Phase 2.1's winning `TIGHTEN_EXTRA` (`"Non-Returning Functions -
+  Discovered.Repair Flow Damage"`) lets Ghidra 12 converge in 1398 s (23.3
+  min) with 0 `ClearFlowAndRepairCmd` repair-log lines and 71 % radare2
+  coverage (`N_ghidra` = 107,955 of `N_r2_full` = 151,411 across 5
+  dense-Thumb regions). Surface B's budget (~112 min wall-clock, 100k log-spam
+  lines) is never approached. Full `decompose` (full pipeline, observed in
+  `report.json`): `thumb_decompiled` = 81,763 for `02_MAIN`;
+  `thumb_tighten_error` absent (Surface B did not fire); 81,763 entries in
+  `thumb_functions.json` carry `body_c`; decompiled.c contains Thumb-region
+  function bodies (sample: `// FUN_40e18dfe @ 40e18dfe` etc.). The Phase 2
+  fields are surfaced in the `decompile` stage's per-image entry via
+  `refresh_decompile_stage_images` (called after both pass-1 and post-pass-2
+  `thumb_enrich` sweeps); without that refresh, the decompile StageReport
+  carries the pre-enrich snapshot and Phase 2's headline metric is invisible
+  in report.json. (Phase 2 originally shipped with an empty `TIGHTEN_EXTRA`;
+  on production `02_MAIN`, that config triggered Ghidra's overlap-repair spin
+  (>100k log lines, ~28 min) and Surface B's watch fired + fell back to
+  datamark. Phase 2.1 picked the winning option via a multi-candidate
+  investigation; see **Winning TameAnalysis options (Phase 2.1)** below.)
 - **Don't try to add a synthetic CI fixture for the Thumb→C pipeline.**
   Phase 2.1 attempted a 14-byte ARM `BLX`-to-Thumb hand-assembled fixture to
   prove Ghidra's Thumb discovery end-to-end in `tests/decompile_golden.rs`.
@@ -252,6 +252,17 @@ module; when a file outgrows that, split it.
   test shape (`<sig>\n{\n`, 1-line gap) didn't match real ExportDecomp output
   (`<header>\n\n<sig>\n\n{\n`, 2-line gaps). Don't tighten this bound without
   re-running production verification on real `02_MAIN` output.
+-   **Phase 2 report-surface wiring.** `decompose::run` pushes the `decompile`
+  StageReport with per-image entries BEFORE `thumb_enrich` runs, so the
+  pre-enrich snapshot has `thumb_decompiled = None`. Both pass-1 and
+  post-pass-2 `thumb_enrich` sweeps MUST call `refresh_decompile_stage_images`
+  after mutating `ImageResult.thumb_decompiled` / `thumb_enrich_error`,
+  otherwise the Phase 2 headline metric is invisible in `report.json` (the
+  count is computed but never surfaced). Inline regression:
+  `refresh_decompile_stage_images_surfaces_post_enrich_fields`. A 2026-07-22
+  followup found this was wired for the post-pass-2 path but missing on the
+  pass-1-only path (e.g. under `--no-symbol-pass`), hiding Phase 2.1's
+  production body_c count from `report.json`.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
