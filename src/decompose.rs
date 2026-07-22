@@ -57,6 +57,10 @@ pub struct ImageReport {
     pub thumb_tighten_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_enrich_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_recovered: Option<usize>,
 }
 
 impl ImageReport {
@@ -78,6 +82,8 @@ impl ImageReport {
                 thumb_decompiled: r.thumb_decompiled,
                 thumb_tighten_error: r.thumb_tighten_error.clone(),
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
+                globals_error: r.globals_error.clone(),
+                globals_recovered: r.globals_recovered,
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -91,6 +97,8 @@ impl ImageReport {
                 thumb_decompiled: r.thumb_decompiled,
                 thumb_tighten_error: r.thumb_tighten_error.clone(),
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
+                globals_error: r.globals_error.clone(),
+                globals_recovered: r.globals_recovered,
             },
         }
     }
@@ -810,6 +818,8 @@ mod tests {
                         thumb_decompiled: None,
                         thumb_tighten_error: None,
                         thumb_enrich_error: None,
+                        globals_error: None,
+                        globals_recovered: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -823,6 +833,8 @@ mod tests {
                         thumb_decompiled: None,
                         thumb_tighten_error: None,
                         thumb_enrich_error: None,
+                        globals_error: None,
+                        globals_recovered: None,
                     },
                 ],
                 10,
@@ -931,6 +943,8 @@ mod tests {
             thumb_decompiled: None,
             thumb_tighten_error: None,
             thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -961,6 +975,8 @@ mod tests {
             thumb_decompiled: None,
             thumb_tighten_error: None,
             thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
         });
 
         assert_eq!(image.status, "analyzed");
@@ -1007,6 +1023,8 @@ mod tests {
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
                 thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
             },
             decompile::ImageResult {
                 label: "01_BOOT".into(),
@@ -1018,6 +1036,8 @@ mod tests {
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
                 thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
             },
         ];
         let images_dir = root.join("images");
@@ -1063,6 +1083,8 @@ mod tests {
             thumb_decompiled: None, // pre-enrich
             thumb_tighten_error: None,
             thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -1077,6 +1099,8 @@ mod tests {
             thumb_decompiled: Some(81_763), // post-enrich
             thumb_tighten_error: None,
             thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
         }];
 
         refresh_decompile_stage_images(&mut stages, &post_enrich_images);
@@ -1126,6 +1150,8 @@ mod tests {
             thumb_decompiled: None,
             thumb_tighten_error: None,
             thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
         assert_eq!(outcome.counts.len(), 0);
@@ -1267,6 +1293,8 @@ mod tests {
             thumb_decompiled: None,
             thumb_tighten_error: None,
             thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -1288,12 +1316,56 @@ mod tests {
             thumb_decompiled: Some(3),
             thumb_tighten_error: None,
             thumb_enrich_error: Some("malformed decompiled.c".into()),
+            globals_error: None,
+            globals_recovered: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"thumb_decompiled\":3"));
         assert!(!json.contains("thumb_tighten_error"));
         assert!(json.contains("\"thumb_enrich_error\":\"malformed decompiled.c\""));
+    }
+
+    #[test]
+    fn image_report_serializes_phase3_globals_fields_as_none_when_absent() {
+        let r = decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(10),
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_recovered: None,
+            globals_error: None,
+        };
+        let report = ImageReport::from_result(&r);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("globals_recovered"));
+        assert!(!json.contains("globals_error"));
+    }
+
+    #[test]
+    fn image_report_serializes_phase3_globals_fields_when_set() {
+        let r = decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(10),
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_recovered: Some(137),
+            globals_error: Some("malformed functions.json".into()),
+        };
+        let report = ImageReport::from_result(&r);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"globals_recovered\":137"));
+        assert!(json.contains("\"globals_error\":\"malformed functions.json\""));
     }
 
     #[test]
