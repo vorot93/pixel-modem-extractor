@@ -1857,15 +1857,17 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
             i += 1;
             continue;
         };
-        // Bounded lookahead: commit only when `{` appears within the next 1–2
-        // lines (the `<sig>\n{\n` form). Without this bound, a header-shaped
-        // non-header could commit at position N and absorb following lines into
-        // the wrong address's body until the next real function's `{` — same
-        // rationale as the prior parser's lookahead.
+        // Bounded lookahead: commit only when `{` appears within the next 1–4
+        // lines (both the synthetic `<sig>\n{\n` form and ExportDecomp.java's
+        // real `<header>\n\n<sig>\n\n{\n` form, which has 2 blank lines between
+        // the comment header and the opening brace). Without this bound, a
+        // header-shaped non-header could commit at position N and absorb
+        // following lines into the wrong address's body until the next real
+        // function's `{` — same rationale as the prior parser's lookahead.
         let start = i;
-        let opens_brace_within_2 =
-            (start + 1..std::cmp::min(start + 3, lines.len())).any(|j| lines[j].contains('{'));
-        if !opens_brace_within_2 {
+        let opens_brace_within_4 =
+            (start + 1..std::cmp::min(start + 5, lines.len())).any(|j| lines[j].contains('{'));
+        if !opens_brace_within_4 {
             i = start + 1;
             continue;
         }
@@ -3138,6 +3140,39 @@ INFO: second pdfj body was noisy and not parseable
             v["functions"][1].get("body_c").is_none(),
             "no address match -> no body_c"
         );
+    }
+
+    #[test]
+    fn thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines() {
+        // Regression sentinel: real ExportDecomp.java output has TWO blank lines
+        // between the `// FUN_<addr> @ <addr>` comment header and the opening `{`
+        // (one after the header, one after the signature). The original Task 2
+        // parser used 1–2 line lookahead for `{`, which worked on synthetic
+        // fixtures (1 blank line) but matched 0 bodies on real production output.
+        let root = temp_dir("thumb_enrich_real_format");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(int a)\n\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "real ExportDecomp format (2 blank lines between header and `{{`) must match"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
     }
 
     #[test]
