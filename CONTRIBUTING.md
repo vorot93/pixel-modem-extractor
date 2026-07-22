@@ -164,9 +164,26 @@ module; when a file outgrows that, split it.
   Ghidra names (`FUN_<addr>` or post-pass-2 recovered names), so `body_c` stays
   empty on any image regardless of Surface B. The spec specified address-based
   matching; the plan deviated to name-based. This is the spec's designed
-  behavior for Surface B (§ Error handling → Surface B). A Phase 2.1 follow-up
-  (the `thumb_enrich` matching fix plus per-region tightening) is required to
-  deliver `body_c` on production.
+  behavior for Surface B (§ Error handling → Surface B). Phase 2.1 closed both
+  causes: `thumb_enrich` now matches by entry address (Phase 2's intended
+  contract; see Phase 2.1 invariants below), and `TameAnalysis mode=tighten`
+  carries the winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow Damage"`)
+  which lets Ghidra 12 converge on the full `02_MAIN` in 1398 s (23.3 min) with
+  0 `ClearFlowAndRepairCmd` repair-log lines and 71 % radare2 coverage
+  (`N_ghidra` = 107,955 of `N_r2_full` = 151,411 across 5 dense-Thumb regions).
+  Surface B does not fire under this config (its ~112 min wall-clock budget and
+  100k log-spam trigger are never reached), and `body_c` is populated on
+  production. **Verification basis:** Task 5's investigation ran each candidate
+  via direct `analyzeHeadless` (the production pipeline's analysis phase is
+  identical; methodology deviation documented in the findings doc). Body-c
+  population was verified by direct `thumb_enrich` invocation against real
+  `02_MAIN` partial pipeline output (pass-1 + radare2 completed) — 81,763
+  `body_c` populated against 80,396 measured address overlap. A full
+  `decompose` end-to-end was not completed during Phase 2.1 (90-min timeout
+  during 02_MAIN processing); Surface B non-firing is inferential from Task 5's
+  23.3 min standalone measurement vs the 112 min budget, not yet observed in a
+  full-pipeline `report.json`. See **Winning TameAnalysis options (Phase 2.1)**
+  below.
 - **Two-pass sequencing invariants.** Three structural facts a fresh change
   can easily break:
   (1) **`run_two_pass` accepts the pass-1 `DecompileReport` as a parameter; it
@@ -196,6 +213,39 @@ module; when a file outgrows that, split it.
   the kill behavior itself is verified manually via
   `--tighten-wall-clock-budget-sec 1`. Don't assert on the kill firing in a
   unit test — it depends on Ghidra's repair-log cadence against real firmware.
+-   **Phase 2.1 invariants.** Two structural facts a fresh change can easily break:
+  (1) **`thumb_enrich` matches by entry address, not by name.** The matching
+  gate fires on the normalized entry address (strip `0x`, strip leading zeros,
+  clear low bit for Ghidra's Thumb T-bit) — both the parser (over
+  `decompiled.c`'s `// <name> @ <addr>` headers) and the matcher (over
+  `thumb_functions.json`'s `entry` fields) must apply the same normalization.
+  The inline `thumb_enrich_populates_body_c_with_tbit_set` test is the
+  regression sentinel. A future change that flips back to name-based matching
+  silently breaks body_c on every image — Phase 2's bug.
+  (2) **`TIGHTEN_EXTRA` is sourced verbatim from a Phase 2.1 investigation
+  findings doc.** If the production config needs to change (e.g. a new firmware
+  variant regresses), re-run the multi-candidate investigation; do not edit
+  `TIGHTEN_EXTRA` ad hoc. The findings doc lives at
+  `~/.superpowers/pixel-modem-extractor/2026-07-21-thumb-decompilation-phase2-1-findings.md`.
+-   **Phase 2.1 parser lookahead (8 lines, calibrated to real
+  ExportDecomp.java).** `parse_decompiled_c_function_bodies_by_addr` commits
+  to a `// FUN_<addr> @ <addr>` header only when `{` appears within the next
+  1–8 lines. Real `ExportDecomp.java` output is bi-modal: offset-4 headers
+  (single-line signatures like `void FUN_x(void)` between two blank lines,
+  ~58% of `02_MAIN`) and offset-6 headers (2-line signatures like
+  `void FUN_x(\n    int a)`, ~35%). The 8-line bound captures 99.6% of real
+  headers; the long tail (offset >8, <0.5%) is accepted loss. Production
+  verification on a real `02_MAIN` confirmed 81,763 body_c populated against
+  80,396 measured address overlap (consistent with the histogram prediction
+  of 99.6% header capture; the 1.7% excess reflects duplicate radare2
+  entries at shared addresses). Two inline regression sentinels
+  (`thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines` for
+  offset-4 and `thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig`
+  for offset-6) catch a future regression to the original 2-line bound, which
+  silently populated 0 body_c on production data because the synthetic-fixture
+  test shape (`<sig>\n{\n`, 1-line gap) didn't match real ExportDecomp output
+  (`<header>\n\n<sig>\n\n{\n`, 2-line gaps). Don't tighten this bound without
+  re-running production verification on real `02_MAIN` output.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
@@ -209,6 +259,27 @@ module; when a file outgrows that, split it.
   the full image: Surface B's watch fires after ~28 min (>100k overlap-repair log
   lines), the datamark retry succeeds, and `thumb_decompiled` stays at 0 — Phase
   2.1 picks up from here.
+- **Winning TameAnalysis options (Phase 2.1, on success).** On the full
+  `02_MAIN` (~87 MB, Pixel 6 Pro mustang), Phase 2's empty `TIGHTEN_EXTRA` was
+  insufficient — Surface B's watch fired after ~28 min with >100k repair-log
+  lines. The Phase 2.1 investigation found that disabling
+  `"Non-Returning Functions - Discovered.Repair Flow Damage"` (a
+  `ClearFlowAndRepairCmd`-gating sub-option under `FindNoReturnFunctionsAnalyzer`,
+  on top of the Phase 2 `DISABLE` list) lets Ghidra 12.1.2 converge in 1398 s
+  (23.3 min) with 0 repair-log lines and 71 % radare2 coverage of `N_r2_full`
+  (`N_ghidra` = 107,955 of `N_r2_full` = 151,411 across 5 dense-Thumb regions);
+  3/3 spot-checks PASS. Root cause: `ClearFlowAndRepairCmd` is invoked from
+  three places in Ghidra 12 (`FindNoReturnFunctionsAnalyzer`,
+  `CallFixupAnalyzer`, `ArmAggressiveInstructionFinderAnalyzer`); the third is
+  already disabled by `DISABLE`, and the first one's "Repair Flow Damage"
+  sub-option (default ON) was the spin source — disabling it removes the spin at
+  its source while leaving non-return *detection* running, so `N_ghidra` is
+  essentially unaffected. Losing candidates (one-line rationale each):
+  **Candidate 6** (disable `Function Start Search` entirely), **Candidate 7**
+  (cap repair effort), and **Candidate 8** (bounded-analysis timeout) were not
+  run — Candidate 5 hit every stop condition first. The full investigation lives
+  at
+  `~/.superpowers/pixel-modem-extractor/2026-07-21-thumb-decompilation-phase2-1-findings.md`.
 - **Surface B mechanics (Phase 2+).** The watch in `decompile::run_report`'s
   tighten branch fires on wall-clock or log-spam excess, then re-spawns the
   image as datamark. Two hard-won properties a fresh change can break:
