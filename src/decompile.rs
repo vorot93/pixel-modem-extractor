@@ -1857,17 +1857,18 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
             i += 1;
             continue;
         };
-        // Bounded lookahead: commit only when `{` appears within the next 1–4
-        // lines (both the synthetic `<sig>\n{\n` form and ExportDecomp.java's
-        // real `<header>\n\n<sig>\n\n{\n` form, which has 2 blank lines between
-        // the comment header and the opening brace). Without this bound, a
-        // header-shaped non-header could commit at position N and absorb
-        // following lines into the wrong address's body until the next real
-        // function's `{` — same rationale as the prior parser's lookahead.
+        // Bounded lookahead: commit only when `{` appears within the next 1–8
+        // lines. Real ExportDecomp.java output is bi-modal: offset-4 headers
+        // (single-line signatures, ~58% of production 02_MAIN) and offset-6
+        // headers (2-line signatures, ~35%). The 8-line bound captures 99.6% of
+        // real headers (Task 8b histogram). Without this bound, a header-shaped
+        // non-header could commit at position N and absorb following lines into
+        // the wrong address's body until the next real function's `{` — same
+        // rationale as the prior parser's lookahead.
         let start = i;
-        let opens_brace_within_4 =
-            (start + 1..std::cmp::min(start + 5, lines.len())).any(|j| lines[j].contains('{'));
-        if !opens_brace_within_4 {
+        let opens_brace_within_8 =
+            (start + 1..std::cmp::min(start + 9, lines.len())).any(|j| lines[j].contains('{'));
+        if !opens_brace_within_8 {
             i = start + 1;
             continue;
         }
@@ -3169,6 +3170,38 @@ INFO: second pdfj body was noisy and not parseable
         assert_eq!(
             n, 1,
             "real ExportDecomp format (2 blank lines between header and `{{`) must match"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig() {
+        // Regression sentinel for the second peak in real ExportDecomp.java's
+        // header-to-`{` offset distribution: 2-line signatures produce
+        // offset-6 headers (header, blank, sig-line-1, sig-line-2, blank, `{`).
+        // Captured by Task 8b's histogram analysis on production 02_MAIN.
+        let root = temp_dir("thumb_enrich_real_offset_6");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(\n    int a,\n    int b)\n\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "real ExportDecomp format with 2-line signature (offset-6 header) must match"
         );
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
