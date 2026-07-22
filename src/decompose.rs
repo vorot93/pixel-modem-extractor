@@ -7,7 +7,7 @@
 use crate::decompile::{self, ImageOutcome};
 use crate::error::{Error, Result};
 use crate::{
-    decode_rf, hwcfg, manifest, pipeline, recover_source, source_tree, symbolicate, tokens,
+    decode_rf, globals, hwcfg, manifest, pipeline, recover_source, source_tree, symbolicate, tokens,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -329,6 +329,37 @@ fn refresh_decompile_stage_images(stages: &mut [StageReport], images: &[decompil
         return;
     };
     stages[pos].images = images.iter().map(ImageReport::from_result).collect();
+}
+
+/// Phase 3.0 helper: load Phase 1's `symbols.json` and build a lookup map
+/// from function entry address (canonical: lowercase hex, no `0x`, no
+/// leading zeros) to recovered name. Used to enrich `globals::run`'s
+/// evidence with `recovered_name`. Returns an empty map if `symbols.json`
+/// is absent or unreadable (defensive — globals stage degrades gracefully).
+fn load_recovered_function_names(symbols_path: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(bytes) = std::fs::read(symbols_path) else {
+        return out;
+    };
+    let Ok(v): std::result::Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else {
+        return out;
+    };
+    let Some(symbols) = v.get("symbols").and_then(|s| s.as_array()) else {
+        return out;
+    };
+    for sym in symbols {
+        let Some(addr_str) = sym.get("address").and_then(|a| a.as_str()) else {
+            continue;
+        };
+        let Ok(addr) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let canonical = format!("{addr:x}");
+        if let Some(name) = sym.get("name").and_then(|n| n.as_str()) {
+            out.insert(canonical, name.to_string());
+        }
+    }
+    out
 }
 
 /// Remove a file or directory if present; a missing path is not an error.
@@ -676,8 +707,14 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     //    non-empty map. Consumes pass1_report (pass 1 already ran in step 3).
     //    Per-image pass-2 failures land in ImageResult.pass2_error and do not
     //    abort the orchestrator — pass 1 already produced a valid decompiled.c.
+    //
+    //    `pass2_report_opt` hoists the Ok arm's `rep2` to outer scope so the
+    //    Phase 3.0 globals stage (after step 8's symbolicate_finalize) can
+    //    borrow the active image slice. Stays None on --no-symbol-pass, pass-1
+    //    failure, or pass-2 error.
+    let mut pass2_report_opt: Option<decompile::DecompileReport> = None;
     if !opts.no_symbol_pass {
-        if let Some(rep) = pass1_report {
+        if let Some(rep) = pass1_report.take() {
             let t = Instant::now();
             let map_paths: HashMap<String, PathBuf> = symbol_maps
                 .into_iter()
@@ -716,6 +753,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     }
                     // Refresh the decompile stage's per-image reports with pass-2 fields.
                     refresh_decompile_stage_images(&mut stages, &rep2.images);
+                    pass2_report_opt = Some(rep2);
                 }
                 Err(e) => stages.push(StageReport::failed(
                     "decompile_pass2",
@@ -752,6 +790,93 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             )
         },
     );
+
+    // 11. Phase 3.0 — globals recovery (record-only).
+    //     Reads pass-1 functions.json/thumb_functions.json + raw image bytes;
+    //     writes per-image globals.json. Per-image; skips images without raw
+    //     bytes (no .bin file). Mutates ImageResult.globals_recovered /
+    //     globals_error. Refreshes the decompile stage's per-image reports so
+    //     the new fields surface in report.json (Phase 2.1 lesson).
+    //
+    //     Active image slice: pass 2's report if it ran (most up-to-date —
+    //     pass 2 baked recovered names into decompiled.c); else pass 1's
+    //     report (e.g. --no-symbol-pass path); else empty (pass 1 failed).
+    let globals_started = Instant::now();
+    let mut globals_errors: Vec<(String, String)> = Vec::new();
+    let mut globals_counts: Vec<(String, usize)> = Vec::new();
+    let mut globals_conflicts: usize = 0;
+    {
+        let active_images: &mut [decompile::ImageResult] =
+            if let Some(ref mut rep2) = pass2_report_opt {
+                &mut rep2.images
+            } else if let Some(ref mut rep1) = pass1_report {
+                &mut rep1.images
+            } else {
+                &mut []
+            };
+        for ir in active_images.iter_mut() {
+            let label = ir.label.clone();
+            let image_bin = images_dir.join(&label).join(format!("{label}.bin"));
+            if !image_bin.exists() {
+                continue; // No raw bytes -> can't extract strings.
+            }
+            // Build the Phase 1 cross-reference (entry hex -> recovered name)
+            // from this image's symbols.json. Empty map when symbols.json is
+            // absent or unreadable; the algorithm degrades gracefully.
+            let symbols_path = images_dir
+                .join(&label)
+                .join("decompiled")
+                .join("symbols.json");
+            let recovered_map = load_recovered_function_names(&symbols_path);
+
+            match globals::run(
+                &images_dir.join(&label),
+                &label,
+                &out.join("manifest.json"),
+                &recovered_map,
+            ) {
+                Ok(report) => {
+                    ir.globals_recovered = Some(report.recovered_count);
+                    globals_conflicts += report.conflicts_dropped;
+                    globals_counts.push((label.clone(), report.recovered_count));
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    ir.globals_error = Some(msg.clone());
+                    globals_errors.push((label.clone(), msg));
+                }
+            }
+        }
+    }
+    let globals_total: usize = globals_counts.iter().map(|(_, n)| n).sum();
+    stages.push(StageReport {
+        stage: "globals",
+        status: if globals_errors.is_empty() {
+            "ok"
+        } else {
+            "failed"
+        },
+        output: Some(format!(
+            "{} image(s) processed; {} recovered globals total; {} conflicts dropped",
+            globals_counts.len(),
+            globals_total,
+            globals_conflicts
+        )),
+        reason: None,
+        error: globals_errors.first().map(|(_, e)| e.clone()),
+        images: Vec::new(),
+        duration_ms: globals_started.elapsed().as_millis(),
+    });
+    // Refresh the decompile stage's per-image reports with Phase 3.0 fields
+    // (Phase 2.1 lesson: refresh after each sweep that mutates ImageResult).
+    let refresh_source: &[decompile::ImageResult] = if let Some(ref rep2) = pass2_report_opt {
+        &rep2.images
+    } else if let Some(ref rep1) = pass1_report {
+        &rep1.images
+    } else {
+        &[]
+    };
+    refresh_decompile_stage_images(&mut stages, refresh_source);
 
     // 9. Remaining decoders (independent of symbolication).
     let rf_dir = out.join("rf_cfg_decompressed");
