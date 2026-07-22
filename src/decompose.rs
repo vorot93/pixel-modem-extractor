@@ -309,6 +309,20 @@ fn thumb_enrich_stage(
     }
 }
 
+/// Refresh the last `decompile` stage's per-image entries from the current
+/// `ImageResult` slice. Used after `thumb_enrich` (pass 1 and post-pass-2)
+/// mutates each `ImageResult`'s Phase 2 fields (`thumb_decompiled`,
+/// `thumb_enrich_error`) so the report surfaces the post-enrich state rather
+/// than the pre-enrich snapshot captured when the `decompile` StageReport was
+/// first pushed. Preserves the stage's other fields (status, duration_ms,
+/// output, etc.).
+fn refresh_decompile_stage_images(stages: &mut [StageReport], images: &[decompile::ImageResult]) {
+    let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") else {
+        return;
+    };
+    stages[pos].images = images.iter().map(ImageReport::from_result).collect();
+}
+
 /// Remove a file or directory if present; a missing path is not an error.
 fn remove_any(path: &Path) -> Result<()> {
     if path.is_dir() {
@@ -550,6 +564,14 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             outcome,
             enrich_started.elapsed().as_millis(),
         ));
+        // Refresh the decompile stage's per-image reports with Phase 2 fields
+        // (`thumb_decompiled` / `thumb_enrich_error`). Without this refresh,
+        // the decompile StageReport carries the pre-enrich snapshot and the
+        // Phase 2 headline metric is invisible in report.json — `thumb_enrich`
+        // populated 80k+ body_c on production but the count never surfaced
+        // (found during Phase 2.1 followup verification on a real `02_MAIN`
+        // under `--no-symbol-pass`). Mirrors the post-pass-2 refresh below.
+        refresh_decompile_stage_images(&mut stages, &rep.images);
     } else {
         // Pass 1 failed entirely (no pass1_report). Record explicit skipped
         // entries so the report shape stays predictable. The post-pass-2
@@ -685,13 +707,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         ));
                     }
                     // Refresh the decompile stage's per-image reports with pass-2 fields.
-                    let image_reports: Vec<ImageReport> =
-                        rep2.images.iter().map(ImageReport::from_result).collect();
-                    // Replace the last decompile stage entry.
-                    if let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") {
-                        stages[pos] =
-                            StageReport::decompile(image_reports, t.elapsed().as_millis());
-                    }
+                    refresh_decompile_stage_images(&mut stages, &rep2.images);
                 }
                 Err(e) => stages.push(StageReport::failed(
                     "decompile_pass2",
@@ -1023,6 +1039,67 @@ mod tests {
         assert_eq!(stage.status, "ok");
         assert_eq!(stage.output.as_deref(), Some("1 image(s) enriched"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_decompile_stage_images_surfaces_post_enrich_fields() {
+        // Phase 2.1 followup regression: the `decompile` StageReport is pushed
+        // before thumb_enrich runs, so its per-image entries carry pre-enrich
+        // state (thumb_decompiled = None). After thumb_enrich mutates each
+        // ImageResult.thumb_decompiled, refresh_decompile_stage_images must
+        // re-marshal the image entries from the updated ImageResult slice so
+        // the report surfaces the post-enrich count. Without this refresh,
+        // thumb_enrich populated 80k+ body_c on production but the count was
+        // invisible in report.json under `--no-symbol-pass`.
+        let pre_enrich_images = vec![ImageReport {
+            image: "02_MAIN".into(),
+            status: "analyzed",
+            functions: Some(107_955),
+            thumb_functions: Some(117_444),
+            thumb_error: None,
+            exit: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None, // pre-enrich
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+        }];
+        let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
+
+        // Simulate thumb_enrich mutating ImageResult.
+        let post_enrich_images = vec![decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: decompile::ImageOutcome::Analyzed(107_955),
+            thumb_functions: Some(117_444),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: Some(81_763), // post-enrich
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+        }];
+
+        refresh_decompile_stage_images(&mut stages, &post_enrich_images);
+
+        // The decompile stage entry is updated in place; duration_ms preserved.
+        assert_eq!(stages[0].stage, "decompile");
+        assert_eq!(stages[0].duration_ms, 12345);
+        assert_eq!(stages[0].images.len(), 1);
+        assert_eq!(
+            stages[0].images[0].thumb_decompiled,
+            Some(81_763),
+            "refresh must surface the post-enrich thumb_decompiled count"
+        );
+    }
+
+    #[test]
+    fn refresh_decompile_stage_images_no_op_when_no_decompile_stage() {
+        // Defensive: if no `decompile` stage exists (e.g. earlier marshal
+        // failure pushed a `failed` stage instead), refresh is a no-op.
+        let mut stages: Vec<StageReport> = vec![StageReport::skipped("extract", "test")];
+        let images = vec![];
+        refresh_decompile_stage_images(&mut stages, &images);
+        assert_eq!(stages.len(), 1, "no decompile stage to refresh");
     }
 
     #[test]
