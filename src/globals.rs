@@ -286,36 +286,44 @@ pub fn run(
             (false, true) => Arch::Thumb,
             (false, false) => unreachable!("no contributing functions"),
         };
-        // Build evidence entries: one (String + Function) pair per contributing
-        // function — the String entry names the global (smallest string_ref
-        // address in that function, deterministic), the Function entry is the
-        // function whose data_refs produced the association. Mirrors Phase 1's
+        // Build evidence entries: per contributing function, always emit a
+        // Function entry; emit a String entry iff a string mentioning the
+        // recovered name exists among the function's data_refs (best-effort).
+        // The naming string IS the provenance for the name, so it must contain
+        // the name — picking the smallest string_ref blindly can yield a
+        // non-naming string. When multiple strings mention the name, the
+        // lowest-addressed is chosen (deterministic). Mirrors Phase 1's
         // Symbol.evidence precedent (kind-discriminated, multiple entries per
         // record).
         let evidence: Vec<Evidence> = functions
             .iter()
-            .filter_map(|f| {
-                let s_addr = f
+            .flat_map(|f| {
+                // The String evidence is the string that actually contains the
+                // recovered name — not the smallest string_ref address. Filter
+                // to strings whose value mentions `name`, then pick the
+                // lowest-addressed (deterministic).
+                let naming_string_addr = f
                     .data_refs
                     .iter()
                     .copied()
-                    .filter(|a| string_map.contains_key(a))
-                    .min()?;
-                let value = string_map.get(&s_addr)?.clone();
-                Some(vec![
-                    Evidence::String {
+                    .filter(|a| string_map.get(a).is_some_and(|s| s.contains(name.as_str())))
+                    .min();
+                let mut entries = Vec::with_capacity(2);
+                if let Some(s_addr) = naming_string_addr {
+                    let value = string_map.get(&s_addr).cloned().unwrap_or_default();
+                    entries.push(Evidence::String {
                         address: format!("0x{s_addr:x}"),
                         value,
-                    },
-                    Evidence::Function {
-                        address: format!("0x{:x}", f.entry),
-                        arch: f.arch,
-                        name: f.ghidra_name.clone(),
-                        recovered_name: f.recovered_name.clone(),
-                    },
-                ])
+                    });
+                }
+                entries.push(Evidence::Function {
+                    address: format!("0x{:x}", f.entry),
+                    arch: f.arch,
+                    name: f.ghidra_name.clone(),
+                    recovered_name: f.recovered_name.clone(),
+                });
+                entries
             })
-            .flatten()
             .collect();
 
         globals.push(Global {
@@ -834,5 +842,40 @@ mod tests {
         let report = run_no_names(&img).unwrap();
         assert_eq!(report.recovered_count, 1);
         assert_eq!(report.conflicts_dropped, 0);
+    }
+
+    #[test]
+    fn string_evidence_picks_the_string_that_contains_the_name_not_just_lowest_addr() {
+        let img = Img::new("naming_string");
+        // Function references: a non-naming string at 0x3000 (lower addr),
+        // the naming string at 0x3200 (mentions "g_foo"), and the global at 0x4000.
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x3200, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        img.write_image_bin(&image_with_strings(
+            0x1000,
+            &[(0x3000, "unrelated log msg"), (0x3200, "g_foo invalid")],
+        ));
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(report.recovered_count, 1);
+
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        let ev = v["globals"][0]["evidence"].as_array().unwrap();
+        // String + Function pair.
+        assert_eq!(ev.len(), 2);
+        // The String evidence must point at 0x3200 (the naming string),
+        // not 0x3000 (the lower-addressed but non-naming string).
+        let string_evidence = ev.iter().find(|e| e["kind"] == "string").unwrap();
+        assert_eq!(string_evidence["address"], "0x3200");
+        assert!(string_evidence["value"].as_str().unwrap().contains("g_foo"));
     }
 }
