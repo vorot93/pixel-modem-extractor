@@ -2,12 +2,12 @@
 // Runs before auto-analysis. Phase 2+: takes a mode argument.
 //
 //   arg[0] = "tighten" (new default; Phase 2+): disable the Aggressive Instruction
-//     Finder plus the analysis options identified by the Phase-2 investigation
-//     (TIGHTEN_EXTRA is empty: on the smallest dense-Thumb region of a real 02_MAIN,
-//     disabling AIF alone was sufficient — see CONTRIBUTING.md § Winning TameAnalysis
-//     options). Does NOT data-mark regions; Ghidra attempts Thumb function discovery
-//     and decompilation. Per-function convergence failures fall through to radare2 in
-//     the Rust host (see decompile::thumb_enrich).
+//     Finder plus the analysis options identified by the Phase-2.1 investigation
+//     (TIGHTEN_EXTRA disables the `Repair Flow Damage` sub-option of
+//     `Non-Returning Functions - Discovered` — see CONTRIBUTING.md § Winning
+//     TameAnalysis options). Does NOT data-mark regions; Ghidra attempts Thumb
+//     function discovery and decompilation. Per-function convergence failures
+//     fall through to radare2 in the Rust host (see decompile::thumb_enrich).
 //
 //   arg[0] = "datamark" (today's Phase-1 behavior; also used by --no-thumb-decompile):
 //     additionally mark each remaining arg "addrHex:lenHex" as DATA so Ghidra's
