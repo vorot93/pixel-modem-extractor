@@ -146,7 +146,7 @@ pub fn run(
 
     // 1. Resolve the image's load_addr from the manifest.
     let toc_name = toc_name(image_label);
-    let load_addr = load_load_addr(manifest, &toc_name)?.ok_or_else(|| {
+    let load_addr = crate::symbolicate::load_load_addr(manifest, &toc_name)?.ok_or_else(|| {
         Error::Serialize(format!(
             "globals: load_addr missing for {image_label} (toc name {toc_name})"
         ))
@@ -416,29 +416,6 @@ fn toc_name(label: &str) -> String {
         .to_string()
 }
 
-/// Resolve the image's load_addr from the decompose manifest. Mirrors
-/// `symbolicate::load_load_addr` — read the JSON, find the matching image
-/// entry, parse its `load_addr` as hex.
-fn load_load_addr(manifest: &Path, toc_name: &str) -> Result<Option<u64>> {
-    let bytes = std::fs::read(manifest)?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::Serialize(format!("parse manifest: {e}")))?;
-    let Some(images) = v.get("images").and_then(|i| i.as_array()) else {
-        return Ok(None);
-    };
-    for img in images {
-        let name = img.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if name == toc_name
-            && let Some(addr_str) = img.get("load_addr").and_then(|a| a.as_str())
-        {
-            let addr = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16)
-                .map_err(|e| Error::Serialize(format!("parse load_addr: {e}")))?;
-            return Ok(Some(addr));
-        }
-    }
-    Ok(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +448,7 @@ mod tests {
             // Minimal manifest at the root level.
             fs::write(
                 root.join("manifest.json"),
-                r#"{"images":[{"name":"MAIN","load_addr":"0x1000"}]}"#,
+                r#"{"toc":[{"name":"MAIN","load_addr":4096}]}"#,
             )
             .unwrap();
             Self { root, label }
@@ -506,9 +483,10 @@ mod tests {
             fs::write(self.image_dir().join(format!("{}.bin", self.label)), bytes).unwrap();
         }
         fn write_manifest_load_addr(&self, load_addr: &str) {
+            let load_addr = u64::from_str_radix(load_addr.trim_start_matches("0x"), 16).unwrap();
             fs::write(
                 self.root.join("manifest.json"),
-                format!(r#"{{"images":[{{"name":"MAIN","load_addr":"{load_addr}"}}]}}"#),
+                format!(r#"{{"toc":[{{"name":"MAIN","load_addr":{load_addr}}}]}}"#),
             )
             .unwrap();
         }

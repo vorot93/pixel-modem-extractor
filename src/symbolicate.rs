@@ -527,7 +527,7 @@ struct TocEntry {
 }
 
 /// The `load_addr` for a TOC image name (e.g. "MAIN") from the extract manifest.
-fn load_load_addr(manifest: &Path, toc_name: &str) -> Result<Option<u64>> {
+pub(crate) fn load_load_addr(manifest: &Path, toc_name: &str) -> Result<Option<u64>> {
     if !manifest.exists() {
         return Ok(None);
     }
