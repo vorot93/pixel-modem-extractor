@@ -3,6 +3,7 @@
 //! other golden tests.
 
 use pixel_modem_extractor::{decompile, decompose};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 #[test]
@@ -255,8 +256,15 @@ fn report_json_includes_globals_field() {
         eprintln!("skip: Ghidra and/or radare2 not available");
         return;
     }
-    let out = std::env::temp_dir().join("pme_decompose_golden_phase3");
-    let _ = std::fs::remove_dir_all(&out);
+    let out = std::env::temp_dir().join(format!(
+        "pme_decompose_golden_phase3_{}",
+        std::process::id()
+    ));
+    match std::fs::remove_dir_all(&out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => panic!("failed to remove stale output {}: {e}", out.display()),
+    }
     let opts = decompose::Opts {
         no_verify: false,
         prune: false,

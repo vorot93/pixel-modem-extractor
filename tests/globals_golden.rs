@@ -3,7 +3,8 @@
 
 use pixel_modem_extractor::{decompile, decompose};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 fn env_or_skip() -> Option<PathBuf> {
@@ -29,8 +30,12 @@ fn shared_decompose_output() -> Option<PathBuf> {
     static OUT: OnceLock<Option<PathBuf>> = OnceLock::new();
     OUT.get_or_init(|| {
         let img = env_or_skip()?;
-        let out = std::env::temp_dir().join("pme_globals_golden");
-        let _ = std::fs::remove_dir_all(&out);
+        let out = std::env::temp_dir().join(format!("pme_globals_golden_{}", std::process::id()));
+        match std::fs::remove_dir_all(&out) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => panic!("failed to remove stale output {}: {e}", out.display()),
+        }
         let opts = decompose::Opts {
             no_verify: false,
             prune: false,
@@ -48,25 +53,28 @@ fn shared_decompose_output() -> Option<PathBuf> {
     .clone()
 }
 
-#[test]
-fn globals_recovers_nonzero_count_on_real_02_main() {
-    let Some(out) = shared_decompose_output() else {
-        return;
-    };
+fn reported_globals_count(out: &Path) -> u64 {
     let report: Value =
         serde_json::from_slice(&std::fs::read(out.join("report.json")).unwrap()).unwrap();
-    let main = report["stages"]
+    report["stages"]
         .as_array()
         .unwrap()
         .iter()
         .find(|s| s["stage"] == "decompile")
         .and_then(|s| s["images"].as_array())
         .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
-        .expect("02_MAIN entry missing from decompile stage");
-    let count = main
+        .expect("02_MAIN entry missing from decompile stage")
         .get("globals_recovered")
-        .and_then(|g| g.as_u64())
-        .expect("globals_recovered missing on 02_MAIN");
+        .and_then(Value::as_u64)
+        .expect("globals_recovered missing on 02_MAIN")
+}
+
+#[test]
+fn globals_recovers_nonzero_count_on_real_02_main() {
+    let Some(out) = shared_decompose_output() else {
+        return;
+    };
+    let count = reported_globals_count(&out);
     assert!(
         count > 0,
         "Phase 3.0 strict algorithm should recover at least one global on real 02_MAIN; got {count}"
@@ -83,9 +91,20 @@ fn globals_json_schema_matches_v1() {
     assert_eq!(v["format"], "pixel-modem-extractor-globals-v1");
     assert_eq!(v["image"], "02_MAIN");
     let globals = v["globals"].as_array().expect("globals must be an array");
+    assert!(!globals.is_empty(), "real 02_MAIN globals must be nonempty");
+    assert_eq!(
+        u64::try_from(globals.len()).unwrap(),
+        reported_globals_count(&out),
+        "globals.json count must match report.json"
+    );
     for g in globals {
         assert!(g.get("address").is_some(), "global missing address: {g}");
-        assert!(g.get("name").is_some(), "global missing name: {g}");
+        assert!(
+            g.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty()),
+            "global missing nonempty string name: {g}"
+        );
         assert_eq!(g["tier"], "recovered", "Phase 3.0 is Recovered-only");
         let arch = g["arch"].as_str().unwrap();
         assert!(
