@@ -903,6 +903,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 &label,
                 &out.join("manifest.json"),
                 &recovered_map,
+                &globals::GlobalsOpts::default(),
             ) {
                 Ok(report) => {
                     ir.globals_recovered = Some(report.recovered_count);

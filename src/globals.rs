@@ -14,9 +14,11 @@
 
 use crate::error::{Error, Result};
 use crate::source_tree::extract_strings;
+use crate::symbolicate;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Format string for `globals.json` v1. Future revisions add fields without
 /// breaking v1 readers (forward-compat posture identical to Phase 2's
@@ -63,6 +65,35 @@ const GENERIC_TOKENS: &[&str] = &[
     "DBT",    // debug-trace macro marker; very high frequency in modem strings
     "ASSERT", // C assert macro / log prefix; never a global variable name
 ];
+
+/// Shared identifier-validation regex (Phase 3.0 inline rule hoisted here so
+/// Phase 3.0's strict-rule loop and Phase 3.0.1's `filter_identifier_tokens`
+/// stay byte-identical). `^[a-zA-Z_][a-zA-Z0-9_]{2,}$` — first char alpha or
+/// `_`, total length >= 3.
+fn ident_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]{2,}$").unwrap())
+}
+
+/// Extract the set of identifier candidate tokens from one string's content,
+/// applying Phase 3.0's rules verbatim: split on non-`[A-Za-z0-9_]`, keep
+/// tokens with `len >= MIN_IDENT_LEN`, containing at least one `_`, matching
+/// `ident_regex`, and not in `GENERIC_TOKENS`. Hoisted out of `run`'s strict-
+/// rule loop so Phase 3.0.1's per-string-load filtering reuses the exact same
+/// rule — drift between the two paths would silently skew coverage.
+fn filter_identifier_tokens(content: &str) -> BTreeSet<String> {
+    let generic: BTreeSet<&str> = GENERIC_TOKENS.iter().copied().collect();
+    content
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|token| {
+            token.len() >= MIN_IDENT_LEN
+                && token.contains('_')
+                && ident_regex().is_match(token)
+                && !generic.contains(*token)
+        })
+        .map(String::from)
+        .collect()
+}
 
 /// The arch attribution for a global — driven by which functions contributed
 /// evidence. `Mixed` when at least one ARM and one Thumb function contributed.
@@ -222,6 +253,7 @@ pub fn run(
     image_label: &str,
     manifest: &Path,
     recovered_function_names: &HashMap<String, String>,
+    opts: &GlobalsOpts,
 ) -> Result<GlobalsReport> {
     let decompiled = image_dir.join("decompiled");
 
@@ -279,22 +311,20 @@ pub fn run(
         }
     }
 
-    // 5. Apply the strict algorithm: per function, collect (addr, name)
-    //    associations. Multiple functions reinforcing the same (addr, name)
-    //    is fine; conflicts (same addr, different names) are dropped.
+    // 5. Build proposals: addr -> name -> Vec<Contributor>. Two paths feed
+    //    the same map so that same-tier conflicts (Phase 3.0 vs Phase 3.0.1
+    //    proposing different names for the same addr) resolve through one
+    //    strict-drop rule. Cross-tier (Recovered vs Provisional) is Task 7.
     //
     //    Phase 3.0 strict-single-source-of-truth: require at least one
-    //    underscore in the identifier. Real modem-firmware globals are
-    //    conventionally g_/m_/s_/Asn_-prefixed (Hungarian-ish);
-    //    underscoreless CamelCase (fooBar) is rare in this firmware and
-    //    Phase 3.0.1 can relax this if coverage is too low.
-    let ident_re = regex::Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]{2,}$").unwrap();
-    let generic: BTreeSet<&str> = GENERIC_TOKENS.iter().copied().collect();
+    //    underscore in the identifier (real modem-firmware globals are
+    //    conventionally g_/m_/s_/Asn_-prefixed). Phase 3.0.1's per-string
+    //    filtering reuses the exact same rule via `filter_identifier_tokens`.
+    let mut addr_to_proposals: HashMap<u64, HashMap<String, Vec<Contributor>>> = HashMap::new();
 
-    // addr -> (name -> Vec<Function>) — tracks which functions proposed which
-    // name for each address.
-    let mut addr_to_proposals: HashMap<u64, HashMap<String, Vec<Function>>> = HashMap::new();
-
+    // 5a. Phase 3.0 strict-rule path: functions with exactly one non-string
+    //     data_ref (candidate) and exactly one unique identifier across their
+    //     string refs. Evidence shape: [String, Function].
     for f in &all_funcs {
         // Filter data_refs: candidate_refs are non-string refs that fall
         // inside the image (>= load_addr). Sub-load-addr refs are out-of-image
@@ -317,15 +347,7 @@ pub fn run(
         let mut unique_idents: BTreeSet<String> = BTreeSet::new();
         for s_addr in &f.data_refs {
             if let Some(s) = string_map.get(s_addr) {
-                for token in s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-                    if token.len() >= MIN_IDENT_LEN
-                        && token.contains('_')
-                        && ident_re.is_match(token)
-                        && !generic.contains(token)
-                    {
-                        unique_idents.insert(token.to_string());
-                    }
-                }
+                unique_idents.extend(filter_identifier_tokens(s));
             }
         }
         if unique_idents.len() != 1 {
@@ -338,11 +360,79 @@ pub fn run(
             .or_default()
             .entry(name)
             .or_default()
-            .push(f.clone());
+            .push(Contributor {
+                func: f.clone(),
+                string_load: None,
+                global_load: None,
+                naming_string: None,
+            });
+    }
+
+    // 5b. Phase 3.0.1 disasm-anchored Recovered path: functions with two or
+    //     more non-string data_refs (multi-global — too ambiguous for Phase
+    //     3.0's strict single-candidate rule). For each, reconstruct PC-
+    //     tagged load events from the function's disasm slice, then anchor
+    //     string-load/global-load pairs by proximity K. Evidence shape:
+    //     [StringLoad, GlobalLoad, String, Function].
+    //
+    //     Surface 3.0.1-A (disasm-unreadable): best-effort read via
+    //     `unwrap_or_default()` — a missing/unreadable `disasm.lst` means
+    //     zero Phase 3.0.1 recoveries but does NOT fail the image (Phase
+    //     3.0's strict-rule output still emits). Task 8 may surface a
+    //     `phase3_0_1_error` field for visibility; this path mirrors
+    //     `symbolicate::build_map`'s precedent (line 932:
+    //     `read_to_string(...).unwrap_or_default()`).
+    let disasm_text = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
+    for f in &all_funcs {
+        let candidate_refs: Vec<u64> = f
+            .data_refs
+            .iter()
+            .copied()
+            .filter(|a| !string_map.contains_key(a))
+            .filter(|a| *a >= load_addr)
+            .collect();
+        if candidate_refs.len() < 2 {
+            continue;
+        }
+        // Per-function disasm slice. ARM: slice disasm.lst by [entry, end).
+        // Thumb: the per-function `body` field from thumb_functions.json
+        // (radare2 pdfj output — different format from disasm.lst; do NOT
+        // re-slice disasm.lst for Thumb).
+        let (disasm_slice, k) = match f.arch {
+            Arch::Arm => (disasm_slice_for(f.entry, f.end, &disasm_text), opts.k_arm),
+            Arch::Thumb => (f.body.clone().unwrap_or_default(), opts.k_thumb),
+            Arch::Mixed => continue,
+        };
+        let load_events = symbolicate::reconstruct_load_events(&disasm_slice);
+        let recovered = disasm_anchored_recovered_for_function(f, &string_map, &load_events, k);
+        for (addr, name, sl_ev, gl_ev) in recovered {
+            // The StringLoad's address field is the naming string's vaddr —
+            // pinned by the disasm event, not by a data_refs search (Thumb's
+            // data_refs exclude movw/movt-resolved addresses).
+            let naming_string = match &sl_ev {
+                Evidence::StringLoad { address, .. } => {
+                    u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()
+                }
+                _ => None,
+            };
+            addr_to_proposals
+                .entry(addr)
+                .or_default()
+                .entry(name)
+                .or_default()
+                .push(Contributor {
+                    func: f.clone(),
+                    string_load: Some(sl_ev),
+                    global_load: Some(gl_ev),
+                    naming_string,
+                });
+        }
     }
 
     // 6. Build the output: one entry per (addr, name) where the addr had
-    //    exactly one distinct name proposed.
+    //    exactly one distinct name proposed. Same strict-drop rule covers
+    //    Phase 3.0 same-tier, Phase 3.0.1 same-tier, and cross-path
+    //    (Phase 3.0 vs Phase 3.0.1) conflicts uniformly.
     let mut globals: Vec<Global> = Vec::new();
     let mut conflicts_dropped = 0usize;
     // Iterate by ascending addr for deterministic output ordering.
@@ -355,41 +445,47 @@ pub fn run(
             conflicts_dropped += 1;
             continue;
         }
-        let (name, mut functions) = proposals.into_iter().next().unwrap();
-        // Sort evidence by function address ascending.
-        functions.sort_by_key(|f| f.entry);
-        // Compute arch attribution.
-        let has_arm = functions.iter().any(|f| f.arch == Arch::Arm);
-        let has_thumb = functions.iter().any(|f| f.arch == Arch::Thumb);
+        let (name, mut contributors) = proposals.into_iter().next().unwrap();
+        // Sort contributors by function address ascending (deterministic
+        // evidence ordering, mirrors Phase 3.0).
+        contributors.sort_by_key(|c| c.func.entry);
+        let has_arm = contributors.iter().any(|c| c.func.arch == Arch::Arm);
+        let has_thumb = contributors.iter().any(|c| c.func.arch == Arch::Thumb);
         let arch = match (has_arm, has_thumb) {
             (true, true) => Arch::Mixed,
             (true, false) => Arch::Arm,
             (false, true) => Arch::Thumb,
             (false, false) => unreachable!("no contributing functions"),
         };
-        // Build evidence entries: per contributing function, always emit a
-        // Function entry; emit a String entry iff a string mentioning the
-        // recovered name exists among the function's data_refs (best-effort).
-        // The naming string IS the provenance for the name, so it must contain
-        // the name — picking the smallest string_ref blindly can yield a
-        // non-naming string. When multiple strings mention the name, the
-        // lowest-addressed is chosen (deterministic). Mirrors Phase 1's
-        // Symbol.evidence precedent (kind-discriminated, multiple entries per
-        // record).
-        let evidence: Vec<Evidence> = functions
+        // Build evidence: per contributor, emit StringLoad + GlobalLoad first
+        // (Phase 3.0.1 only), then the naming String, then Function. Phase 3.0
+        // strict-rule contributors carry no StringLoad/GlobalLoad, so their
+        // evidence is just [String, Function] — the regression sentinel
+        // `phase3_0_strict_rule_path_emits_no_globalload_evidence` pins this.
+        let evidence: Vec<Evidence> = contributors
             .iter()
-            .flat_map(|f| {
-                // The String evidence is the string that actually contains the
-                // recovered name — not the smallest string_ref address. Filter
-                // to strings whose value mentions `name`, then pick the
-                // lowest-addressed (deterministic).
-                let naming_string_addr = f
-                    .data_refs
-                    .iter()
-                    .copied()
-                    .filter(|a| string_map.get(a).is_some_and(|s| s.contains(name.as_str())))
-                    .min();
-                let mut entries = Vec::with_capacity(2);
+            .flat_map(|c| {
+                let mut entries = Vec::with_capacity(4);
+                if let Some(sl) = &c.string_load {
+                    entries.push(sl.clone());
+                }
+                if let Some(gl) = &c.global_load {
+                    entries.push(gl.clone());
+                }
+                // The naming String evidence. Phase 3.0.1: pinned by the
+                // StringLoad event (the disasm-anchored string that provided
+                // the identifier). Phase 3.0: resolved from data_refs (lowest-
+                // addressed string whose content mentions the name). When
+                // multiple strings mention the name, the lowest-addressed is
+                // chosen (deterministic).
+                let naming_string_addr = c.naming_string.or_else(|| {
+                    c.func
+                        .data_refs
+                        .iter()
+                        .copied()
+                        .filter(|a| string_map.get(a).is_some_and(|s| s.contains(name.as_str())))
+                        .min()
+                });
                 if let Some(s_addr) = naming_string_addr {
                     let value = string_map.get(&s_addr).cloned().unwrap_or_default();
                     entries.push(Evidence::String {
@@ -398,10 +494,10 @@ pub fn run(
                     });
                 }
                 entries.push(Evidence::Function {
-                    address: format!("0x{:x}", f.entry),
-                    arch: f.arch,
-                    name: f.ghidra_name.clone(),
-                    recovered_name: f.recovered_name.clone(),
+                    address: format!("0x{:x}", c.func.entry),
+                    arch: c.func.arch,
+                    name: c.func.ghidra_name.clone(),
+                    recovered_name: c.func.recovered_name.clone(),
                 });
                 entries
             })
@@ -448,10 +544,19 @@ pub fn run(
 #[derive(Debug, Clone)]
 struct Function {
     entry: u64,
+    /// Inclusive end boundary (for ARM disasm.lst slicing `[entry, end)`).
+    /// Defaults to `entry` when the JSON lacks an `end` field.
+    end: u64,
     arch: Arch,
     ghidra_name: String,
     recovered_name: Option<String>,
     data_refs: Vec<u64>,
+    /// Thumb only: the per-function disassembly body from
+    /// `thumb_functions.json`'s `body` field (radare2 pdfj output). `None`
+    /// for ARM — ARM slices `disasm.lst` by `[entry, end)` at processing
+    /// time (Ghidra's full-image disasm, different format from Thumb's
+    /// per-function body).
+    body: Option<String>,
 }
 
 /// Parse one entry from `functions.json` or `thumb_functions.json` into a
@@ -468,6 +573,11 @@ fn parse_function(
         .get("entry")
         .and_then(|e| e.as_str())
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())?;
+    let end = v
+        .get("end")
+        .and_then(|e| e.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(entry);
     let ghidra_name = v
         .get("name")
         .and_then(|n| n.as_str())
@@ -483,14 +593,17 @@ fn parse_function(
                 .collect()
         })
         .unwrap_or_default();
+    let body = v.get("body").and_then(|b| b.as_str()).map(String::from);
     let canonical = format!("{entry:x}");
     let recovered_name = recovered_function_names.get(&canonical).cloned();
     Some(Function {
         entry,
+        end,
         arch,
         ghidra_name,
         recovered_name,
         data_refs,
+        body,
     })
 }
 
@@ -502,6 +615,157 @@ fn toc_name(label: &str) -> String {
         .map(|(_, n)| n)
         .unwrap_or(label)
         .to_string()
+}
+
+/// One function's contribution to a `(addr, name)` proposal. Phase 3.0's
+/// strict-rule path pushes a `Contributor` with `string_load`/`global_load`
+/// both `None` (evidence is `[String, Function]`). Phase 3.0.1's disasm-
+/// anchored path pushes a `Contributor` carrying the `StringLoad`/`GlobalLoad`
+/// evidence plus the naming string's vaddr (evidence is
+/// `[StringLoad, GlobalLoad, String, Function]`).
+#[derive(Clone)]
+struct Contributor {
+    func: Function,
+    string_load: Option<Evidence>,
+    global_load: Option<Evidence>,
+    /// The naming string's vaddr — Phase 3.0.1's `StringLoad` pins which
+    /// specific string provided the identifier; Phase 3.0 leaves this `None`
+    /// and resolves the naming string from `data_refs` at emission.
+    naming_string: Option<u64>,
+}
+
+/// Phase 3.0.1 disasm-anchored Recovered pass for one multi-global function.
+///
+/// For each string-load event (a `movw`/`movt` pair materializing a string
+/// whose content is in `string_map`), find the unique identifier token in
+/// that string; if exactly one survives, look for a global-load event within
+/// proximity `k` (in load-event-count distance). If exactly one global is in
+/// the window, emit `(global_addr, name, StringLoad evidence, GlobalLoad
+/// evidence)`. Ambiguous cases (zero or multiple identifiers, zero or
+/// multiple globals in window) defer to Task 6's name prior.
+///
+/// **Distance metric:** load-event-count — the number of `LoadEvent`s in
+/// `load_events` between the string-load's index and the global-load's index
+/// (`Vec::iter().position()` by PC). NOT raw instruction count. `k=4` means
+/// "≤4 intervening movw/movt lines" ≈ "≤2 address-load pairs." The pre-check
+/// (Task 1) confirmed this approximation grounds the K pinning; do not
+/// silently switch metrics — `recovered_tier_requires_disasm_proximity_within_k`
+/// is the regression sentinel.
+///
+/// **Thumb `data_refs` augmentation (Task 1 Concern 3):** radare2's per-op
+/// `refs` field excludes addresses materialized via `movw`/`movt` pairs (only
+/// Ghidra resolves those into `data_refs` for ARM). Without augmentation, the
+/// Thumb side produces 0 global-load events. For Thumb functions, the values
+/// materialized in `load_events` (== `reconstruct_immediates` results, PC-
+/// tagged) are unioned into the candidate set — mirroring `symbolicate.rs`'s
+/// `imms.extend(f.data_refs...)` pattern. ARM needs no augmentation: Ghidra's
+/// `data_refs` already include movw/movt-resolved addresses.
+fn disasm_anchored_recovered_for_function(
+    func: &Function,
+    string_map: &HashMap<u64, String>,
+    load_events: &[symbolicate::LoadEvent],
+    k: usize,
+) -> Vec<(u64, String, Evidence, Evidence)> {
+    let mut out = Vec::new();
+    if load_events.is_empty() {
+        return out;
+    }
+
+    // Build the global-candidate address set: non-string data_refs, plus
+    // (Thumb only) the values materialized in load_events.
+    let mut non_string_refs: BTreeSet<u64> = func
+        .data_refs
+        .iter()
+        .copied()
+        .filter(|r| !string_map.contains_key(r))
+        .collect();
+    if func.arch == Arch::Thumb {
+        for e in load_events {
+            let v = e.value as u64;
+            if !string_map.contains_key(&v) {
+                non_string_refs.insert(v);
+            }
+        }
+    }
+
+    let string_loads: Vec<&symbolicate::LoadEvent> = load_events
+        .iter()
+        .filter(|e| string_map.contains_key(&(e.value as u64)))
+        .collect();
+    let global_loads: Vec<&symbolicate::LoadEvent> = load_events
+        .iter()
+        .filter(|e| non_string_refs.contains(&(e.value as u64)))
+        .collect();
+
+    for sl in string_loads {
+        let content = string_map.get(&(sl.value as u64)).unwrap();
+        let identifiers = filter_identifier_tokens(content);
+        if identifiers.len() != 1 {
+            continue;
+        }
+        let name = identifiers.into_iter().next().unwrap();
+
+        // Proximity: global_loads whose load-event-index distance from sl is
+        // within k. position()-by-PC is safe: each instruction sits at a
+        // unique address, so PCs are unique in load_events.
+        let sl_idx = load_events.iter().position(|e| e.pc == sl.pc).unwrap();
+        let in_window: Vec<&symbolicate::LoadEvent> = global_loads
+            .iter()
+            .filter_map(|gl| {
+                let gl_idx = load_events.iter().position(|e| e.pc == gl.pc)?;
+                let dist = sl_idx.abs_diff(gl_idx);
+                (dist <= k).then_some(*gl)
+            })
+            .collect();
+        if in_window.len() != 1 {
+            continue;
+        }
+        let gl = in_window[0];
+
+        out.push((
+            gl.value as u64,
+            name,
+            Evidence::StringLoad {
+                pc: format!("0x{:x}", sl.pc),
+                register: sl.register.clone(),
+                address: format!("0x{:x}", sl.value),
+            },
+            Evidence::GlobalLoad {
+                pc: format!("0x{:x}", gl.pc),
+                register: gl.register.clone(),
+                address: format!("0x{:x}", gl.value),
+            },
+        ));
+    }
+    out
+}
+
+/// Parse the leading hex address of a `disasm.lst` line. Mirrors
+/// `symbolicate::line_addr`: the text before the first `": "` separator,
+/// tolerating an address-space prefix (`ram:40010120:` -> `40010120`).
+/// Returns None for non-address lines (comments, blanks).
+fn disasm_line_addr(line: &str) -> Option<u64> {
+    let head = line.trim_start().split_once(": ")?.0;
+    let tok = head.rsplit(':').next()?;
+    u64::from_str_radix(tok.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
+}
+
+/// Slice `disasm` (full-image `disasm.lst` text) to lines whose leading
+/// address is in `[entry, end)`. Mirrors `symbolicate::disasm_body_for` for
+/// the Phase 3.0.1 ARM path (Thumb uses the per-function `body` field
+/// directly — different source, different format).
+fn disasm_slice_for(entry: u64, end: u64, disasm: &str) -> String {
+    let mut out = String::new();
+    for line in disasm.lines() {
+        if let Some(addr) = disasm_line_addr(line)
+            && addr >= entry
+            && addr < end
+        {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -620,12 +884,34 @@ mod tests {
         })
     }
 
-    /// Convenience: call `run` with an empty recovered_function_names map.
-    /// (Task 4's tests don't exercise recovered_name enrichment — that's
-    /// the decompose stage's responsibility via Task 5's symbols.json loader.)
+    /// Convenience: call `run` with an empty recovered_function_names map
+    /// and default `GlobalsOpts` (Phase 3.0.1 Recovered-only, K_ARM/K_THUMB
+    /// at the pinned constants). Task 9 wires real CLI flags into `GlobalsOpts`.
     fn run_no_names(img: &Img) -> Result<GlobalsReport> {
         let empty = HashMap::new();
-        run(&img.image_dir(), img.label(), &img.manifest(), &empty)
+        run(
+            &img.image_dir(),
+            img.label(),
+            &img.manifest(),
+            &empty,
+            &GlobalsOpts::default(),
+        )
+    }
+
+    /// Build a `Function` for direct unit tests of
+    /// `disasm_anchored_recovered_for_function`. The helper only inspects
+    /// `arch` and `data_refs` (the disasm events are passed separately), so
+    /// the other fields get inert defaults.
+    fn sample_func(arch: Arch, data_refs: Vec<u64>) -> Function {
+        Function {
+            entry: 0,
+            end: 0,
+            arch,
+            ghidra_name: "sample".to_string(),
+            recovered_name: None,
+            data_refs,
+            body: None,
+        }
     }
 
     #[test]
@@ -1013,5 +1299,137 @@ mod tests {
         let string_evidence = ev.iter().find(|e| e["kind"] == "string").unwrap();
         assert_eq!(string_evidence["address"], "0x3200");
         assert!(string_evidence["value"].as_str().unwrap().contains("g_foo"));
+    }
+
+    #[test]
+    fn recovered_tier_requires_disasm_proximity_within_k() {
+        // String load at PC=X, global load at PC=X+K (within window): emits Recovered.
+        // At PC=X+K+1 (just outside): does not. THE K-BOUNDARY SENTINEL.
+        let string_addr = 0x40e22000;
+        let global_addr = 0x40e30000;
+        let string_map = HashMap::from([(string_addr, "g_foo is NULL".into())]);
+
+        // Within window (K_ARM = const K_ARM):
+        let disasm_in = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n";
+        let events_in = symbolicate::reconstruct_load_events(disasm_in);
+        let out_in = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Arm, vec![string_addr, global_addr]),
+            &string_map,
+            &events_in,
+            K_ARM,
+        );
+        assert!(out_in.iter().any(|(a, _, _, _)| *a == global_addr));
+
+        // Just outside window (force K_ARM = 1 by passing directly):
+        let out_out = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Arm, vec![string_addr, global_addr]),
+            &string_map,
+            &events_in,
+            1,
+        );
+        assert!(out_out.is_empty());
+    }
+
+    #[test]
+    fn recovered_tier_drops_when_two_globals_in_window() {
+        // Two global-loads in window + one identifier in string -> no Recovered
+        // emission (ambiguous; defers to name prior in Task 6).
+        let string_addr = 0x40e22000;
+        let g1 = 0x40e30000;
+        let g2 = 0x40e31000;
+        let string_map = HashMap::from([(string_addr, "g_only is NULL".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+             0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n\
+             0x20: movw r2, 0x1000\n0x24: movt r2, 0x40e3\n";
+        let events = symbolicate::reconstruct_load_events(disasm);
+        let out = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Arm, vec![string_addr, g1, g2]),
+            &string_map,
+            &events,
+            K_ARM,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn recovered_tier_drops_when_two_identifiers_in_string() {
+        // One global-load in window + two identifiers in string -> no Recovered.
+        let string_addr = 0x40e22000;
+        let g1 = 0x40e30000;
+        let string_map = HashMap::from([(string_addr, "g_foo and g_bar are NULL".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+             0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n";
+        let events = symbolicate::reconstruct_load_events(disasm);
+        let out = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Arm, vec![string_addr, g1]),
+            &string_map,
+            &events,
+            K_ARM,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn recovered_tier_distinguishes_arm_and_thumb_k() {
+        // Same disasm PCs; ARM with K_ARM vs Thumb with K_THUMB. The test
+        // asserts the K-distance boundary is per-arch. (K_ARM == K_THUMB on
+        // this firmware — pinned equal by the pre-check — so both branches
+        // resolve to the same constant; this test confirms both constants
+        // are wired and at least one path emits.)
+        let string_addr = 0x40e22000;
+        let global_addr = 0x40e30000;
+        let string_map = HashMap::from([(string_addr, "g_foo is NULL".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+             0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n";
+        let events = symbolicate::reconstruct_load_events(disasm);
+        let arm_out = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Arm, vec![string_addr, global_addr]),
+            &string_map,
+            &events,
+            K_ARM,
+        );
+        let thumb_out = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Thumb, vec![string_addr, global_addr]),
+            &string_map,
+            &events,
+            K_THUMB,
+        );
+        // Both produce the global when K_ARM and K_THUMB both >= distance(0x14, 0x1c).
+        assert!(
+            arm_out.iter().any(|(a, _, _, _)| *a == global_addr)
+                || thumb_out.iter().any(|(a, _, _, _)| *a == global_addr)
+        );
+    }
+
+    #[test]
+    fn phase3_0_strict_rule_path_emits_no_globalload_evidence() {
+        // Phase 3.0's strict single-global case still emits; evidence shape
+        // is [String, Function] (no GlobalLoad/StringLoad). Regression guard
+        // against backfilling Phase 3.0's evidence with disasm-anchored entries.
+        let img = Img::new("strict_no_gl");
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        img.write_image_bin(&image_with_strings(0x1000, &[(0x3000, "g_foo invalid")]));
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(report.recovered_count, 1);
+
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        let ev = v["globals"][0]["evidence"].as_array().unwrap();
+        assert!(
+            !ev.iter()
+                .any(|e| e["kind"] == "global_load" || e["kind"] == "string_load"),
+            "Phase 3.0 strict-rule path must not emit disasm-anchored evidence"
+        );
+        assert_eq!(ev.len(), 2);
     }
 }
