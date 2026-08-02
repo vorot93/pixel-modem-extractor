@@ -222,6 +222,14 @@ pub struct GlobalsFile {
     pub format: &'static str,
     pub globals: Vec<Global>,
     pub image: String,
+    /// Surface 3.0.1-A visibility: set when Phase 3.0.1 couldn't run because
+    /// `disasm.lst` was absent or unreadable (the read returns `Err`). Lets a
+    /// consumer distinguish "Phase 3.0.1 ran and found nothing" from "Phase
+    /// 3.0.1 couldn't run." NOT set for an empty-but-present (zero-byte)
+    /// `disasm.lst` — that is a valid state: Phase 3.0.1's loops produce no
+    /// output either way, but the absence-vs-empty distinction matters to
+    /// consumers. Phase 3.0's own per-image failure surface is `globals_error`
+    /// on `report.json`, not this field — this field is non-fatal only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase3_0_1_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,14 +386,21 @@ pub fn run(
     //     string-load/global-load pairs by proximity K. Evidence shape:
     //     [StringLoad, GlobalLoad, String, Function].
     //
-    //     Surface 3.0.1-A (disasm-unreadable): best-effort read via
-    //     `unwrap_or_default()` — a missing/unreadable `disasm.lst` means
-    //     zero Phase 3.0.1 recoveries but does NOT fail the image (Phase
-    //     3.0's strict-rule output still emits). Task 8 may surface a
-    //     `phase3_0_1_error` field for visibility; this path mirrors
-    //     `symbolicate::build_map`'s precedent (line 932:
-    //     `read_to_string(...).unwrap_or_default()`).
-    let disasm_text = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
+    //     Surface 3.0.1-A (disasm-unreadable): best-effort read — a missing/
+    //     unreadable `disasm.lst` means zero Phase 3.0.1 recoveries but does
+    //     NOT fail the image (Phase 3.0's strict-rule output still emits).
+    //     An `Err` here threads a message into `GlobalsFile.phase3_0_1_error`
+    //     for serialized-output visibility, so a consumer can distinguish
+    //     "Phase 3.0.1 ran and found nothing" from "Phase 3.0.1 couldn't run
+    //     (no disasm)." An empty-but-present file (zero bytes) is a valid
+    //     state and does NOT set the error field — only `Err` does. Mirrors
+    //     `symbolicate::build_map`'s precedent (line 932).
+    let disasm_path = decompiled.join("disasm.lst");
+    let (disasm_text, phase3_0_1_error): (String, Option<String>) =
+        match std::fs::read_to_string(&disasm_path) {
+            Ok(s) => (s, None),
+            Err(e) => (String::new(), Some(format!("read disasm.lst: {e}"))),
+        };
     for f in &all_funcs {
         let candidate_refs: Vec<u64> = f
             .data_refs
@@ -662,12 +677,15 @@ pub fn run(
     //    write. A serialize failure leaves the on-disk file untouched.
     //    Phase 3.0's strict-rule path leaves both new optional fields `None`,
     //    so they are absent from the output (byte-equivalent with Phase 3.0's
-    //    prior `serde_json::json!{...}` write path).
+    //    prior `serde_json::json!{...}` write path). When `disasm.lst` was
+    //    absent/unreadable (Surface 3.0.1-A), `phase3_0_1_error` carries the
+    //    io message for consumer visibility; Phase 3.0's content is still
+    //    written.
     let file = GlobalsFile {
         format: FORMAT_V1,
         globals,
         image: image_label.to_string(),
-        phase3_0_1_error: None,
+        phase3_0_1_error,
         provisional_suppressed: None,
     };
     let out = serde_json::to_string_pretty(&file)
@@ -2067,5 +2085,84 @@ mod tests {
         )
         .unwrap();
         assert!(v["globals"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn surface_3_0_1_a_writes_phase3_0_content_with_error_when_disasm_missing() {
+        // Fixture: Phase 3.0 inputs present (functions.json + thumb_functions.json
+        // + .bin) but NO disasm.lst (Phase 3.0.1 input absent). Phase 3.0 strict-
+        // rule path still emits; `phase3_0_1_error` is set so consumers can
+        // distinguish "ran and found nothing" from "couldn't run".
+        let img = Img::new("surface_3_0_1_a_missing_disasm");
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        img.write_image_bin(&image_with_strings(0x1000, &[(0x3000, "g_foo invalid")]));
+        // Intentionally no disasm.lst.
+
+        let report = run_no_names(&img).unwrap();
+        assert!(report.recovered_count > 0);
+        assert_eq!(report.provisional_generated, 0);
+
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["globals"].as_array().unwrap().len(), 1);
+        let err = v["phase3_0_1_error"].as_str().unwrap();
+        assert!(
+            err.contains("disasm"),
+            "expected phase3_0_1_error to mention disasm; got: {err}"
+        );
+        // Phase 3.0's field stays absent — it ran cleanly.
+        assert!(
+            v.get("globals_error").is_none(),
+            "Phase 3.0 globals_error must be absent when Phase 3.0 ran cleanly"
+        );
+    }
+
+    #[test]
+    fn surface_3_0_1_a_emits_no_globalload_evidence_when_disasm_missing() {
+        // Same fixture; no emitted global carries GlobalLoad or StringLoad
+        // evidence (Phase 3.0-only evidence shape). Regression sentinel.
+        let img = Img::new("surface_3_0_1_a_no_globalload");
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        img.write_image_bin(&image_with_strings(0x1000, &[(0x3000, "g_foo invalid")]));
+        // Intentionally no disasm.lst.
+
+        let _ = run_no_names(&img).unwrap();
+
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        let globals = v["globals"].as_array().unwrap();
+        assert!(!globals.is_empty());
+        for g in globals {
+            let kinds: Vec<&str> = g["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["kind"].as_str())
+                .collect();
+            assert!(
+                !kinds
+                    .iter()
+                    .any(|k| *k == "global_load" || *k == "string_load"),
+                "Phase 3.0-only evidence shape expected; got kinds: {kinds:?}"
+            );
+        }
     }
 }
