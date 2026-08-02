@@ -301,3 +301,42 @@ fn report_json_includes_globals_field() {
         "Phase 3.0 fields absent on 02_MAIN: {main}"
     );
 }
+
+/// Phase 3.0.1: on a real `02_MAIN`, the per-image entry in the `decompile`
+/// stage's `images[]` carries `globals_provisional` and
+/// `globals_provisional_suppressed` (Some, possibly 0). Their absence means
+/// the `refresh_decompile_stage_images` call is missing after the Phase 3.0.1
+/// globals sweep — the same wiring gap that bit Phase 2.1 on the pass-1 path
+/// (and Phase 3.0 on its initial wiring). Reads `$PME_GOLDEN_DIR/report.json`
+/// (pre-existing decompose output; never auto-runs decompose — production
+/// verification supplies the env); skips cleanly when the env is unset or the
+/// file is absent.
+#[test]
+fn report_json_includes_phase3_0_1_fields() {
+    let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = dir.join("report.json");
+    if !report_path.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report.json readable"))
+            .expect("report.json valid JSON");
+    let main = v["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|s| s["stage"] == "decompile"))
+        .and_then(|s| s["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+    assert!(
+        main.get("globals_provisional").is_some(),
+        "globals_provisional missing — refresh_decompile_stage_images not called after Phase 3.0.1 sweep: {main}"
+    );
+    assert!(
+        main.get("globals_provisional_suppressed").is_some(),
+        "globals_provisional_suppressed missing — refresh_decompile_stage_images not called after Phase 3.0.1 sweep: {main}"
+    );
+}
