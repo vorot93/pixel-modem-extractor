@@ -93,6 +93,48 @@ pub fn reconstruct_immediates(disasm: &str) -> BTreeSet<u32> {
     out
 }
 
+/// One PC-tagged register-load event: a `movw`+`movt` pair (or lone `movw`)
+/// materialized `value` into `register` at `pc`. See `reconstruct_load_events`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadEvent {
+    pub pc: u32,
+    pub register: String,
+    pub value: u32,
+}
+
+/// PC-tagged sibling of `reconstruct_immediates`. Same register-aware
+/// movw/movt tracker, same Ghidra/radare2 format-agnosticism. Emits a
+/// `LoadEvent` for every value `reconstruct_immediates` would emit, plus
+/// the PC at which the value became complete (the `movt` PC for a pair; the
+/// `movw` PC for a lone `movw` with high bits zero).
+///
+/// Phase 3.0.1 globals use this to anchor each candidate global to the
+/// instruction where it entered a register, enabling proximity matching
+/// against nearby string loads.
+pub fn reconstruct_load_events(disasm: &str) -> Vec<LoadEvent> {
+    let mut last_movw: HashMap<String, u32> = HashMap::new();
+    let mut out = Vec::new();
+    for line in disasm.lines() {
+        let pc = line_addr(line).map(|a| a as u32).unwrap_or(0);
+        if let Some((reg, imm)) = parse_mov(line, "movw") {
+            last_movw.insert(reg.clone(), imm & 0xffff);
+            out.push(LoadEvent {
+                pc,
+                register: reg,
+                value: imm & 0xffff,
+            });
+        } else if let Some((reg, imm)) = parse_mov(line, "movt") {
+            let lo = last_movw.get(&reg).copied().unwrap_or(0) & 0xffff;
+            out.push(LoadEvent {
+                pc,
+                register: reg,
+                value: ((imm & 0xffff) << 16) | lo,
+            });
+        }
+    }
+    out
+}
+
 /// Parse a `movw`/`movt`-family line into `(dest_register, immediate)`.
 fn parse_mov(line: &str, op: &str) -> Option<(String, u32)> {
     let pos = line.find(op)?;
@@ -1071,6 +1113,53 @@ mod tests {
         assert!(s.contains(&0x0000_0cc9)); // lone movw (r0)
         // no false 32-bit value when movt has no preceding movw on that reg
         assert!(reconstruct_immediates("movt r5,#0x1234\n").contains(&0x1234_0000));
+    }
+
+    #[test]
+    fn reconstruct_load_events_pc_tagged() {
+        // radare2 Thumb style: movw + movt on r0 -> value 0x4468_14a2 at movt's PC.
+        let d = "0x40e2: movw r0, 0x14a2\n0x40e6: movt r0, 0x4468\n";
+        let events = reconstruct_load_events(d);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.pc == 0x40e6 && e.register == "r0" && e.value == 0x4468_14a2)
+        );
+    }
+
+    #[test]
+    fn reconstruct_load_events_handles_lone_movw() {
+        // Lone movw (no movt): value is low-16-bits, high bits zero; pc is movw's.
+        let d = "0x10: movw r3, 0x00cc\n";
+        let events = reconstruct_load_events(d);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.pc == 0x10 && e.register == "r3" && e.value == 0x0000_00cc)
+        );
+    }
+
+    #[test]
+    fn reconstruct_load_events_matches_reconstruct_immediates_values() {
+        // Every value reconstruct_immediates emits, reconstruct_load_events also
+        // emits (with some PC). Drift sentinel.
+        let d = "0x10: movw r0, 0x1\n0x14: movt r0, 0x2\n0x20: movw r5, 0x9\n";
+        let immediate_set: BTreeSet<u32> = reconstruct_immediates(d).into_iter().collect();
+        let event_set: BTreeSet<u32> = reconstruct_load_events(d)
+            .into_iter()
+            .map(|e| e.value)
+            .collect();
+        assert_eq!(immediate_set, event_set);
+    }
+
+    #[test]
+    fn reconstruct_load_events_pc_is_movt_pc_not_movw_pc() {
+        // The PC is where the value becomes complete (movt's PC), not where the
+        // pair started (movw's PC). Load-bearing for proximity matching.
+        let d = "0x100: movw r0, 0x10\n0x200: movt r0, 0x20\n";
+        let events = reconstruct_load_events(d);
+        let pair_event = events.iter().find(|e| e.value == 0x200010).unwrap();
+        assert_eq!(pair_event.pc, 0x200); // movt's PC, not movw's PC (0x100)
     }
 
     #[test]
