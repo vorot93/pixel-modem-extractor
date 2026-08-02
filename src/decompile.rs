@@ -269,6 +269,14 @@ pub struct ImageResult {
     /// parse `decompiled.c` (malformed output). The v1 `thumb_functions.json`
     /// is left intact; downstream stages keep working against v1.
     pub thumb_enrich_error: Option<String>,
+    /// Phase 3.0 / Surface 3.0-A: reason-only text set when `globals::run`
+    /// returned Err for this image (e.g. malformed functions.json, raw image
+    /// unreadable).
+    pub globals_error: Option<String>,
+    /// Phase 3.0: count of globals with `tier: "recovered"` written to
+    /// `globals.json` for this image. `None` when Phase 3.0 didn't run for
+    /// this image (no raw image bytes, or globals stage skipped).
+    pub globals_recovered: Option<usize>,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -918,6 +926,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 thumb_decompiled: r.thumb_decompiled,
                 thumb_tighten_error: r.tighten_error,
                 thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
             })
             .collect();
     }
@@ -2828,6 +2838,8 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
                 thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -2855,6 +2867,8 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
                 thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };

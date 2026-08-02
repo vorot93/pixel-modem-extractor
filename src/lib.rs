@@ -6,6 +6,7 @@ pub mod decompose;
 pub mod error;
 pub mod ext4;
 pub mod fbpk;
+pub mod globals;
 pub mod gzip;
 pub mod hwcfg;
 pub mod manifest;

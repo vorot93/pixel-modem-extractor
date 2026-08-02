@@ -60,6 +60,12 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   (Phase 1+; crafts a one-symbol `symbol_map.json`, drives `decompile::run_two_pass`,
   and asserts the rename + plate comment land in the regenerated `decompiled.c` —
   the canonical regression test for the two-pass pipeline).
+- **Phase 3.0 production goldens** (`tests/globals_golden.rs` and
+  `report_json_includes_globals_field` in `tests/decompose_golden.rs`) need
+  `PME_RADIO_IMG`, Ghidra, and radare2. Run production-scale cases with
+  `cargo test --release`: debug `symbolicate_finalize` exceeded three hours on
+  the real ~630 MB `thumb_functions.json`, while release runs completed in
+  roughly 2h12m–2h19m. Both tests skip cleanly when prerequisites are absent.
 - **External tools:** the `--run` and `decompose` paths shell out to Ghidra
   (`analyzeHeadless`) and radare2 (`r2`); both are probed up front.
 - Write the failing test first (TDD), then the minimal code to pass it.
@@ -83,6 +89,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
 | `decompile.rs` | Ghidra import kit + `--run` (analyzeHeadless) + radare2 Thumb |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
+| `globals.rs` | Phase 3.0 record-only global-name recovery (+ per-image `globals.json`) |
 | `decompose.rs` | One-shot pipeline over all decoders |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
 | `error.rs` | Error types |
@@ -273,6 +280,38 @@ module; when a file outgrows that, split it.
   followup found this was wired for the post-pass-2 path but missing on the
   pass-1-only path (e.g. under `--no-symbol-pass`), hiding Phase 2.1's
   production body_c count from `report.json`.
+- **Phase 3.0: globals recovery (record-only).** After
+  `symbolicate_finalize`, `decompose` writes
+  `images/<label>/decompiled/globals.json` with format
+  `pixel-modem-extractor-globals-v1`. For each ARM or Thumb function, the
+  algorithm requires exactly one non-string `data_ref` at or above the image
+  load address and exactly one unique identifier surviving across referenced
+  strings. Tokens match `^[a-zA-Z_][a-zA-Z0-9_]{2,}$`, must contain an
+  underscore, and are
+  filtered through the generic-token blocklist. Reinforcing functions combine
+  evidence; conflicting names for one address are dropped rather than
+  arbitrated. `ImageReport.globals_recovered` surfaces the per-image count and
+  `globals_error` carries per-image failures. Current production verification
+  recovered 968 globals on the real `02_MAIN`; the full six-image sweep dropped
+  100 conflicts. These are observations, not stable count guarantees.
+  Coverage is intentionally conservative; disassembly-pattern disambiguation
+  belongs to Phase 3.0.1 rather than this direct-evidence stage.
+- **Phase 3.0 invariants.** Four structural facts are easy to break:
+  (1) **Record-only.** The stage does not modify the Ghidra program or
+  `decompiled.c`; `DAT_<addr>` placeholders remain. Applying names in-program
+  belongs to a later phase.
+  (2) **Strict-single-source-of-truth.** Multiple names proposed for one
+  address are dropped, not ranked or guessed.
+  (3) **Empty-output-is-valid.** A successful zero-match sweep still writes
+  `globals.json` with format v1 and `"globals": []`; absence means the stage
+  did not complete.
+  (4) **Use the extract manifest contract.** Load addresses come from numeric
+  `toc[].load_addr` entries keyed by `toc[].name`. Globals deliberately reuses
+  `symbolicate::load_load_addr`; do not add a second parser or revive the
+  obsolete synthetic `images[]`/hex-string fixture shape.
+  After mutating per-image results, the sweep MUST call
+  `refresh_decompile_stage_images`; otherwise the decompile stage retains its
+  pre-globals snapshot and the Phase 3.0 fields disappear from `report.json`.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +

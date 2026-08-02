@@ -3,6 +3,7 @@
 //! other golden tests.
 
 use pixel_modem_extractor::{decompile, decompose};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 #[test]
@@ -236,5 +237,58 @@ fn report_json_includes_phase2_fields() {
     assert!(
         main.get("thumb_decompiled").is_some() || main.get("thumb_tighten_error").is_some(),
         "Phase-2 fields absent on 02_MAIN: {main}"
+    );
+}
+
+/// Phase 3.0: on a real `02_MAIN`, the per-image entry in the `decompile`
+/// stage's `images[]` carries either `globals_recovered` (happy path) or
+/// `globals_error` (per-image failure). Their absence means the
+/// `refresh_decompile_stage_images` call is missing after the globals sweep
+/// — the same wiring gap that bit Phase 2.1 on the pass-1 path.
+#[test]
+fn report_json_includes_globals_field() {
+    let Some(img) = std::env::var_os("PME_RADIO_IMG").map(PathBuf::from) else {
+        eprintln!("skip: set PME_RADIO_IMG");
+        return;
+    };
+    if !img.exists() {
+        eprintln!("skip: PME_RADIO_IMG not found");
+        return;
+    }
+    if decompile::find_headless(None).is_err() || decompile::find_radare2().is_none() {
+        eprintln!("skip: Ghidra and/or radare2 not available");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!(
+        "pme_decompose_golden_phase3_{}",
+        std::process::id()
+    ));
+    match std::fs::remove_dir_all(&out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => panic!("failed to remove stale output {}: {e}", out.display()),
+    }
+    let opts = decompose::Opts {
+        no_verify: false,
+        prune: false,
+        ghidra_home: None,
+        processor: "ARM:LE:32:v7".to_string(),
+        no_symbol_pass: true,
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+    let _ = decompose::run(&img, &opts, &out);
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("report.json")).unwrap()).unwrap();
+    let main = report["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|s| s["stage"] == "decompile"))
+        .and_then(|s| s["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+    assert!(
+        main.get("globals_recovered").is_some() || main.get("globals_error").is_some(),
+        "Phase 3.0 fields absent on 02_MAIN: {main}"
     );
 }
