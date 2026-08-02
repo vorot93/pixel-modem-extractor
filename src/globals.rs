@@ -23,6 +23,24 @@ use std::path::Path;
 /// `thumb_functions.json` v1→v2).
 pub const FORMAT_V1: &str = "pixel-modem-extractor-globals-v1";
 
+/// Phase 3.0.1 proximity window for ARM functions, in load-events (the count
+/// of `movw`/`movt` lines strictly between two PCs — an approximation of the
+/// design spec's instruction-count metric; the pre-check confirmed this
+/// approximation grounds the K pinning). Sourced verbatim from the Phase 3.0.1
+/// pre-check findings doc
+/// (`~/.superpowers/pixel-modem-extractor/2026-08-02-globals-phase3-0-1-findings.md`);
+/// do not edit ad hoc — re-run the pre-check if a new firmware variant
+/// regresses. Mirrors Phase 2.1's `TIGHTEN_EXTRA` provenance rule (see
+/// `src/ghidra/TameAnalysis.java`).
+pub const K_ARM: usize = 4;
+
+/// Phase 3.0.1 proximity window for Thumb functions. Same metric and
+/// provenance as `K_ARM`. Pinned equal to `K_ARM` on this firmware: the
+/// pre-check's 4×4 K_ARM × K_THUMB grid found maximum Recovered yield at
+/// K=4/4 with no same-tier conflict explosion, so Thumb does not need a wider
+/// window here.
+pub const K_THUMB: usize = 4;
+
 /// Minimum identifier length. Filters out 1–2 char tokens (`id`, `pt`) that
 /// are too generic to be meaningful global names.
 const MIN_IDENT_LEN: usize = 3;
@@ -73,6 +91,22 @@ pub enum Evidence {
         #[serde(skip_serializing_if = "Option::is_none")]
         recovered_name: Option<String>,
     },
+    /// Phase 3.0.1: a `movw`+`movt` pair at `pc` that materializes `address`
+    /// (the global's address) into `register`. Provenance for the
+    /// disasm-anchored algorithm; `pc` is movw's PC.
+    GlobalLoad {
+        pc: String,
+        register: String,
+        address: String,
+    },
+    /// Phase 3.0.1: a `movw`+`movt` pair at `pc` that materializes `address`
+    /// (a string whose content contributed the recovered name) into
+    /// `register`. Pairs with `GlobalLoad` for proximity matching.
+    StringLoad {
+        pc: String,
+        register: String,
+        address: String,
+    },
 }
 
 /// One resolved global: a `(address, name)` pair plus its evidence trail.
@@ -121,6 +155,45 @@ impl GlobalsReport {
             provisional_suppressed_by_recovered: 0,
         }
     }
+}
+
+/// Phase 3.0.1 runtime options. The pipeline always passes through `globals::
+/// run`; Phase 3.0's strict-rule path runs identically regardless of these
+/// fields. `include_provisional` defaults to `false` — Provisional globals
+/// are generated and counted but withheld from the serialized file unless
+/// the consumer opts in via `--globals-provisional`.
+#[derive(Debug, Clone)]
+pub struct GlobalsOpts {
+    pub include_provisional: bool,
+    pub k_arm: usize,
+    pub k_thumb: usize,
+}
+
+impl Default for GlobalsOpts {
+    fn default() -> Self {
+        Self {
+            include_provisional: false,
+            k_arm: K_ARM,
+            k_thumb: K_THUMB,
+        }
+    }
+}
+
+/// Serialized form of `globals.json`. Field declaration order is alphabetical
+/// to match `serde_json`'s default BTreeMap key ordering used by Phase 3.0's
+/// `serde_json::json!{...}` write path — this keeps the Phase 3.0 output
+/// byte-equivalent after the refactor (same `format`/`globals`/`image` top
+/// level). The two new optional fields are skipped when `None`, so they are
+/// absent from Phase 3.0's strict-rule output.
+#[derive(Debug, Serialize)]
+pub struct GlobalsFile {
+    pub format: &'static str,
+    pub globals: Vec<Global>,
+    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase3_0_1_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisional_suppressed: Option<usize>,
 }
 
 /// Phase 3.0: recover global variable names from direct textual evidence.
@@ -349,12 +422,17 @@ pub fn run(
 
     // 7. Write globals.json. Atomicity: serialize to a String first, then
     //    write. A serialize failure leaves the on-disk file untouched.
-    let wrapped = serde_json::json!({
-        "format": FORMAT_V1,
-        "image": image_label,
-        "globals": globals,
-    });
-    let out = serde_json::to_string_pretty(&wrapped)
+    //    Phase 3.0's strict-rule path leaves both new optional fields `None`,
+    //    so they are absent from the output (byte-equivalent with Phase 3.0's
+    //    prior `serde_json::json!{...}` write path).
+    let file = GlobalsFile {
+        format: FORMAT_V1,
+        globals,
+        image: image_label.to_string(),
+        phase3_0_1_error: None,
+        provisional_suppressed: None,
+    };
+    let out = serde_json::to_string_pretty(&file)
         .map_err(|e| Error::Serialize(format!("re-serialize globals.json: {e}")))?;
     std::fs::write(decompiled.join("globals.json"), out)?;
 
@@ -557,6 +635,67 @@ mod tests {
         assert_eq!(r.conflicts_dropped, 0);
         assert_eq!(r.provisional_generated, 0);
         assert_eq!(r.provisional_suppressed_by_recovered, 0);
+    }
+
+    #[test]
+    fn evidence_globalload_serializes_with_pc_register_address() {
+        let e = Evidence::GlobalLoad {
+            pc: "0x40e6".into(),
+            register: "r0".into(),
+            address: "0x446814a2".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "global_load");
+        assert_eq!(v["pc"], "0x40e6");
+        assert_eq!(v["register"], "r0");
+        assert_eq!(v["address"], "0x446814a2");
+    }
+
+    #[test]
+    fn evidence_stringload_serializes_with_pc_register_address() {
+        let e = Evidence::StringLoad {
+            pc: "0x40e0".into(),
+            register: "r1".into(),
+            address: "0x40e22000".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "string_load");
+        assert_eq!(v["pc"], "0x40e0");
+    }
+
+    #[test]
+    fn globals_opts_default_is_recovered_only() {
+        let o = GlobalsOpts::default();
+        assert!(!o.include_provisional);
+        assert_eq!(o.k_arm, K_ARM);
+        assert_eq!(o.k_thumb, K_THUMB);
+    }
+
+    #[test]
+    fn globals_file_omits_optional_fields_when_none() {
+        let f = GlobalsFile {
+            format: FORMAT_V1,
+            image: "02_MAIN".into(),
+            globals: vec![],
+            provisional_suppressed: None,
+            phase3_0_1_error: None,
+        };
+        let v = serde_json::to_string(&f).unwrap();
+        assert!(!v.contains("provisional_suppressed"));
+        assert!(!v.contains("phase3_0_1_error"));
+    }
+
+    #[test]
+    fn globals_file_includes_provisional_suppressed_when_set() {
+        let f = GlobalsFile {
+            format: FORMAT_V1,
+            image: "02_MAIN".into(),
+            globals: vec![],
+            provisional_suppressed: Some(7),
+            phase3_0_1_error: None,
+        };
+        let v = serde_json::to_string(&f).unwrap();
+        assert!(v.contains("\"provisional_suppressed\":7"));
     }
 
     #[test]
