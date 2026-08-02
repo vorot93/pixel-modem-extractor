@@ -31,6 +31,9 @@ fn decompose_produces_unified_tree() {
         no_symbol_pass: false,
         no_thumb_decompile: false,
         tighten_wall_clock_budget_override: None,
+        globals_provisional: false,
+        globals_k_arm: None,
+        globals_k_thumb: None,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -223,6 +226,9 @@ fn report_json_includes_phase2_fields() {
         no_symbol_pass: false,
         no_thumb_decompile: false,
         tighten_wall_clock_budget_override: None,
+        globals_provisional: false,
+        globals_k_arm: None,
+        globals_k_thumb: None,
     };
     let _ = decompose::run(&img, &opts, &out);
 
@@ -276,6 +282,9 @@ fn report_json_includes_globals_field() {
         no_symbol_pass: true,
         no_thumb_decompile: false,
         tighten_wall_clock_budget_override: None,
+        globals_provisional: false,
+        globals_k_arm: None,
+        globals_k_thumb: None,
     };
     let _ = decompose::run(&img, &opts, &out);
 

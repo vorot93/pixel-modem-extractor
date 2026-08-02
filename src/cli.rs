@@ -123,6 +123,18 @@ pub enum Commands {
         /// `--no-thumb-decompile` instead.
         #[arg(long, hide = true)]
         tighten_wall_clock_budget_sec: Option<u64>,
+        /// Phase 3.0.1: emit tier:"provisional" globals (name-prior tiebreakers).
+        /// Off by default. Recovered-tier globals always emitted.
+        #[arg(long)]
+        globals_provisional: bool,
+        /// Phase 3.0.1 test-only: override K (proximity window) for ARM.
+        /// Hidden from `--help`.
+        #[arg(long, hide = true)]
+        globals_k_arm: Option<usize>,
+        /// Phase 3.0.1 test-only: override K (proximity window) for Thumb.
+        /// Hidden from `--help`.
+        #[arg(long, hide = true)]
+        globals_k_thumb: Option<usize>,
     },
     /// Symbolicate a decompose output tree: recover names + log annotations in place, emit symbols.json
     Symbolicate {
@@ -241,6 +253,9 @@ pub fn run() -> anyhow::Result<()> {
             processor,
             no_thumb_decompile,
             tighten_wall_clock_budget_sec,
+            globals_provisional,
+            globals_k_arm,
+            globals_k_thumb,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = img
@@ -258,6 +273,9 @@ pub fn run() -> anyhow::Result<()> {
                 no_thumb_decompile,
                 tighten_wall_clock_budget_override: tighten_wall_clock_budget_sec
                     .map(std::time::Duration::from_secs),
+                globals_provisional,
+                globals_k_arm,
+                globals_k_thumb,
             };
             let report = crate::decompose::run(&img, &opts, &out)?;
             println!("decomposed -> {}", out.display());
@@ -608,5 +626,77 @@ mod tests {
             }
             _ => panic!("wrong subcommand"),
         }
+    }
+
+    #[test]
+    fn decompose_globals_provisional_flag_parses() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "radio.img", "--globals-provisional"])
+            .unwrap();
+        match cli.command {
+            Commands::Decompose {
+                globals_provisional,
+                ..
+            } => assert!(globals_provisional),
+            _ => panic!("not decompose"),
+        }
+    }
+
+    #[test]
+    fn decompose_globals_provisional_defaults_off() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "radio.img"]).unwrap();
+        match cli.command {
+            Commands::Decompose {
+                globals_provisional,
+                ..
+            } => assert!(!globals_provisional),
+            _ => panic!("not decompose"),
+        }
+    }
+
+    #[test]
+    fn decompose_globals_k_arm_hidden_flag_parses() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "radio.img", "--globals-k-arm", "12"])
+            .unwrap();
+        match cli.command {
+            Commands::Decompose { globals_k_arm, .. } => {
+                assert_eq!(globals_k_arm, Some(12));
+            }
+            _ => panic!("not decompose"),
+        }
+    }
+
+    #[test]
+    fn decompose_globals_k_thumb_hidden_flag_parses() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "radio.img", "--globals-k-thumb", "8"])
+            .unwrap();
+        match cli.command {
+            Commands::Decompose {
+                globals_k_thumb, ..
+            } => {
+                assert_eq!(globals_k_thumb, Some(8));
+            }
+            _ => panic!("not decompose"),
+        }
+    }
+
+    #[test]
+    fn decompose_globals_k_flags_are_hidden_from_help() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompose")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(
+            !help.contains("--globals-k-arm"),
+            "hidden test-only flag should not appear in help:\n{help}"
+        );
+        assert!(
+            !help.contains("--globals-k-thumb"),
+            "hidden test-only flag should not appear in help:\n{help}"
+        );
     }
 }

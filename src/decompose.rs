@@ -33,6 +33,16 @@ pub struct Opts {
     /// budget for the tighten-watch kill decision. Wired to the hidden
     /// `--tighten-wall-clock-budget-sec` flag. Production callers leave `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
+    /// Phase 3.0.1: emit tier:"provisional" globals (name-prior tiebreakers).
+    /// Wired to `--globals-provisional`. Off by default; Recovered-tier
+    /// globals always emit.
+    pub globals_provisional: bool,
+    /// Phase 3.0.1 test-only: override the ARM proximity window (`K_ARM`).
+    /// Wired to the hidden `--globals-k-arm`. `None` -> use `globals::K_ARM`.
+    pub globals_k_arm: Option<usize>,
+    /// Phase 3.0.1 test-only: override the Thumb proximity window (`K_THUMB`).
+    /// Wired to the hidden `--globals-k-thumb`. `None` -> use `globals::K_THUMB`.
+    pub globals_k_thumb: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -874,6 +884,16 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let mut globals_errors: Vec<(String, String)> = Vec::new();
     let mut globals_counts: Vec<(String, usize)> = Vec::new();
     let mut globals_conflicts: usize = 0;
+    let mut globals_provisional_total: usize = 0;
+    let mut globals_provisional_suppressed_total: usize = 0;
+    // Phase 3.0.1: construct the globals options from the CLI flags once.
+    // `--globals-k-arm` / `--globals-k-thumb` fall back to the pinned module
+    // constants when unset; `--globals-provisional` is opt-in (default false).
+    let globals_opts = globals::GlobalsOpts {
+        include_provisional: opts.globals_provisional,
+        k_arm: opts.globals_k_arm.unwrap_or(globals::K_ARM),
+        k_thumb: opts.globals_k_thumb.unwrap_or(globals::K_THUMB),
+    };
     {
         let active_images: &mut [decompile::ImageResult] =
             if let Some(ref mut rep2) = pass2_report_opt {
@@ -903,11 +923,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 &label,
                 &out.join("manifest.json"),
                 &recovered_map,
-                &globals::GlobalsOpts::default(),
+                &globals_opts,
             ) {
                 Ok(report) => {
                     ir.globals_recovered = Some(report.recovered_count);
+                    ir.globals_provisional = Some(report.provisional_generated);
+                    ir.globals_provisional_suppressed =
+                        Some(report.provisional_suppressed_by_recovered);
                     globals_conflicts += report.conflicts_dropped;
+                    globals_provisional_total += report.provisional_generated;
+                    globals_provisional_suppressed_total +=
+                        report.provisional_suppressed_by_recovered;
                     globals_counts.push((label.clone(), report.recovered_count));
                 }
                 Err(e) => {
@@ -927,10 +953,13 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             "failed"
         },
         output: Some(format!(
-            "{} image(s) processed; {} recovered globals total; {} conflicts dropped",
+            "{} image(s) processed; {} recovered globals total; {} conflicts dropped; \
+             {} provisional generated ({} suppressed by Recovered)",
             globals_counts.len(),
             globals_total,
-            globals_conflicts
+            globals_conflicts,
+            globals_provisional_total,
+            globals_provisional_suppressed_total,
         )),
         reason: None,
         error: globals_errors.first().map(|(_, e)| e.clone()),

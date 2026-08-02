@@ -44,6 +44,9 @@ fn shared_decompose_output() -> Option<PathBuf> {
             no_symbol_pass: true, // pass 1 only — Phase 3.0 doesn't need pass 2
             no_thumb_decompile: false,
             tighten_wall_clock_budget_override: None,
+            globals_provisional: false,
+            globals_k_arm: None,
+            globals_k_thumb: None,
         };
         // Best-effort: some partitions may fail, but report.json and artifacts
         // are still written. Assert the tree, not the exit status.
