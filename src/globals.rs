@@ -312,10 +312,11 @@ pub fn run(
         }
     }
 
-    // 5. Build proposals: addr -> name -> Vec<Contributor>. Two paths feed
-    //    the same map so that same-tier conflicts (Phase 3.0 vs Phase 3.0.1
-    //    proposing different names for the same addr) resolve through one
-    //    strict-drop rule. Cross-tier (Recovered vs Provisional) is Task 7.
+    // 5. Build proposals: addr -> name -> Vec<Contributor>. Three paths feed
+    //    the same map (Phase 3.0 strict-rule, Phase 3.0.1 disasm-anchored
+    //    Recovered, Phase 3.0.1 name-prior Provisional) so that same-tier
+    //    conflicts resolve through one strict-drop rule and cross-tier
+    //    (Recovered vs Provisional) precedence is applied at emission (step 6).
     //
     //    Phase 3.0 strict-single-source-of-truth: require at least one
     //    underscore in the identifier (real modem-firmware globals are
@@ -448,7 +449,7 @@ pub fn run(
     //
     //     `provisional_generated` is incremented per emission regardless of
     //     `opts.include_provisional` — the flag controls materialization, not
-    //     generation. Proposals always land in the unified map so Task 7's
+    //     generation. Proposals always land in the unified map so step 6's
     //     cross-tier Recovered-beats-Provisional precedence can see both and
     //     increment `provisional_suppressed_by_recovered`.
     //
@@ -499,32 +500,77 @@ pub fn run(
     }
 
     // 6. Build the output: one entry per (addr, name) where the addr had
-    //    exactly one distinct name proposed. Same strict-drop rule covers
-    //    Phase 3.0 same-tier, Phase 3.0.1 same-tier, and cross-path
-    //    (Phase 3.0 vs Phase 3.0.1) conflicts uniformly. Cross-tier
-    //    (Recovered vs Provisional at the same addr proposing different
-    //    names) currently drops as a conflict; Task 7 will tighten this so
-    //    the Recovered wins and `provisional_suppressed_by_recovered`
-    //    increments. The resulting Global's `tier` is `"recovered"` if any
-    //    contributor was Recovered (Recovered names and Provisional
-    //    `guess_…` names never collide within a single (addr, name) entry,
-    //    so a mixed-tier entry is impossible in practice), else
-    //    `"provisional"`. Provisional globals are withheld from the file
-    //    unless `opts.include_provisional` — the count was already taken at
-    //    helper-emit time, so withholding only suppresses materialization.
+    //    exactly one distinct name proposed, OR — when multiple distinct
+    //    names were proposed — the cross-tier Recovered-beats-Provisional
+    //    rule resolves a unique winner. Same-tier multi-name conflicts
+    //    (Phase 3.0 vs Phase 3.0, Phase 3.0.1 Recovered vs Recovered,
+    //    Phase 3.0.1 Provisional vs Provisional, or Phase 3.0 vs Phase
+    //    3.0.1 Recovered — all "recovered" tier) drop via the existing
+    //    strict-drop rule (counted in `conflicts_dropped`). When exactly
+    //    one Recovered name and one-or-more Provisional names collide at
+    //    the same addr, the Recovered wins; each Contributor under a
+    //    Provisional name increments `provisional_suppressed_by_recovered`
+    //    (per the design spec Step 1.5). The resulting Global's `tier` is
+    //    `"recovered"` if any contributor was Recovered (Recovered names
+    //    and Provisional `guess_…` names never collide within a single
+    //    (addr, name) entry, so a mixed-tier entry is impossible in
+    //    practice), else `"provisional"`. Provisional globals are withheld
+    //    from the file unless `opts.include_provisional` — the count was
+    //    already taken at helper-emit time, so withholding only suppresses
+    //    materialization (cross-tier suppression has already been applied
+    //    above by this point).
     let mut globals: Vec<Global> = Vec::new();
     let mut conflicts_dropped = 0usize;
+    let mut provisional_suppressed_by_recovered = 0usize;
     // Iterate by ascending addr for deterministic output ordering.
     let mut sorted_addrs: Vec<u64> = addr_to_proposals.keys().copied().collect();
     sorted_addrs.sort_unstable();
     for addr in sorted_addrs {
         let proposals = addr_to_proposals.remove(&addr).unwrap();
-        if proposals.len() != 1 {
-            // Conflict: multiple distinct names proposed for the same addr.
-            conflicts_dropped += 1;
+        // Resolve the winning proposal for this addr, if any. A single
+        // distinct name -> no conflict, that name wins. Multiple names ->
+        // cross-tier Recovered-beats-Provisional precedence: exactly one
+        // Recovered name suppresses every Provisional name at this addr;
+        // any other multi-name case (multiple Recovered, or all-Provisional
+        // with multiple names) falls back to the same-tier strict-drop.
+        let winner: Option<(String, Vec<Contributor>)> = if proposals.len() == 1 {
+            Some(proposals.into_iter().next().unwrap())
+        } else {
+            let mut recovered: Option<(String, Vec<Contributor>)> = None;
+            let mut recovered_names: usize = 0;
+            let mut provisional_contributors: usize = 0;
+            for (name, contributors) in proposals {
+                if contributors.iter().any(|c| c.tier == "recovered") {
+                    recovered_names += 1;
+                    if recovered.is_none() {
+                        recovered = Some((name, contributors));
+                    }
+                } else {
+                    // Within one (addr, name) entry all contributors share a
+                    // tier (Recovered real-identifier names and Provisional
+                    // `guess_…` names never coincide); `else` == all-
+                    // Provisional. Sum contributor counts across all
+                    // Provisional names at this addr.
+                    provisional_contributors += contributors.len();
+                }
+            }
+            if recovered_names == 1 && provisional_contributors > 0 {
+                // Cross-tier win: keep the Recovered, suppress the Provisionals.
+                provisional_suppressed_by_recovered += provisional_contributors;
+                recovered
+            } else {
+                // Same-tier strict-drop. Covers: multiple Recovered names
+                // (Phase 3.0 invariant), all-Provisional with multiple
+                // names, and Phase 3.0 vs Phase 3.0.1 Recovered cross-path
+                // conflicts. Per design spec Step 1.5, `conflicts_dropped`
+                // counts once per addr with >1 surviving same-tier name.
+                conflicts_dropped += 1;
+                None
+            }
+        };
+        let Some((name, mut contributors)) = winner else {
             continue;
-        }
-        let (name, mut contributors) = proposals.into_iter().next().unwrap();
+        };
         // Resulting tier: Recovered wins over Provisional if both contributed
         // (defensive — within one (addr, name) entry all contributors share a
         // tier because Recovered names and `guess_…` names never coincide).
@@ -535,9 +581,11 @@ pub fn run(
         };
         if tier == "provisional" && !opts.include_provisional {
             // Withhold materialization but keep `provisional_generated` (taken
-            // at helper-emit time). Task 7 may still suppress this entry via
-            // cross-tier Recovered-beats-Provisional precedence and increment
-            // `provisional_suppressed_by_recovered`.
+            // at helper-emit time). Cross-tier Recovered-beats-Provisional
+            // suppression (if any) was already applied earlier in this loop
+            // and counted in `provisional_suppressed_by_recovered`; reaching
+            // here means this Provisional survived precedence and would have
+            // materialized but for the opt-in flag.
             continue;
         }
         // Sort contributors by function address ascending (deterministic
@@ -630,7 +678,7 @@ pub fn run(
         recovered_count,
         conflicts_dropped,
         provisional_generated,
-        provisional_suppressed_by_recovered: 0,
+        provisional_suppressed_by_recovered,
     })
 }
 
@@ -730,7 +778,7 @@ struct Contributor {
     /// disasm-anchored Recovered both set `"recovered"`; Phase 3.0.1 name-prior
     /// Provisional sets `"provisional"`. Used by the emission loop to (a)
     /// stamp the resulting `Global.tier` and (b) withhold materialization when
-    /// `!opts.include_provisional`. Task 7 tightens cross-tier precedence at
+    /// `!opts.include_provisional`. Step 6 applies cross-tier precedence at
     /// the same addr (Recovered beats Provisional) using this field.
     tier: &'static str,
 }
@@ -1816,5 +1864,208 @@ mod tests {
             .filter(|g| g["tier"] == "provisional")
             .count();
         assert_eq!(provisional_in_file, 0);
+    }
+
+    #[test]
+    fn recovered_beats_provisional_at_same_address() {
+        // Cross-tier precedence: one function contributes a Recovered
+        // (addr, "g_foo") via Phase 3.0 strict-rule; another contributes a
+        // Provisional (addr, "guess_..._addr") via the name-prior path. The
+        // Recovered wins; the Provisional is suppressed and counted in
+        // `provisional_suppressed_by_recovered`. `conflicts_dropped` stays 0.
+        let img = Img::new("x_tier");
+        img.write_manifest_load_addr("0x40e20000");
+
+        let string_addr_r = 0x40e22000u64; // "g_foo is NULL" (1 identifier)
+        let string_addr_p = 0x40e22500u64; // 2 identifiers, name-prior residue
+        let g_target = 0x40e30000u64; // shared addr: Recovered and Provisional
+        let g_other = 0x40e31000u64; // 2nd global in Provisional fn's window
+
+        let entry_r = 0x40e40000; // strict-rule only; no disasm needed
+        let end_r = 0x40e40030;
+        let entry_p = 0x40e50000; // needs disasm for the Provisional pass
+        let end_p = 0x40e50030;
+
+        let func_json = serde_json::json!([
+            {
+                "name": format!("FUN_{entry_r:x}"),
+                "entry": format!("0x{entry_r:x}"),
+                "end": format!("0x{end_r:x}"),
+                "size": 0x30,
+                "data_refs": [
+                    format!("0x{string_addr_r:x}"),
+                    format!("0x{g_target:x}"),
+                ],
+            },
+            {
+                "name": format!("FUN_{entry_p:x}"),
+                "entry": format!("0x{entry_p:x}"),
+                "end": format!("0x{end_p:x}"),
+                "size": 0x30,
+                "data_refs": [
+                    format!("0x{string_addr_p:x}"),
+                    format!("0x{g_target:x}"),
+                    format!("0x{g_other:x}"),
+                ],
+            },
+        ])
+        .to_string();
+        img.write_functions_json(&func_json);
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+
+        // disasm.lst with PCs inside [entry_p, end_p) materializing the
+        // Provisional string-load + two global-loads (g_target nearer than
+        // g_other by load-event-index distance → g_target is selected).
+        let disasm = "0x40e50010: movw r0, 0x2500\n0x40e50014: movt r0, 0x40e2\n\
+             0x40e50018: movw r1, 0x0000\n0x40e5001c: movt r1, 0x40e3\n\
+             0x40e50020: movw r2, 0x1000\n0x40e50024: movt r2, 0x40e3\n"
+            .to_string();
+        fs::write(
+            img.image_dir().join("decompiled").join("disasm.lst"),
+            disasm,
+        )
+        .unwrap();
+
+        img.write_image_bin(&image_with_strings(
+            0x40e20000,
+            &[
+                (string_addr_r, "g_foo is NULL"),
+                (string_addr_p, "lteRrc_state and otherModule_field are NULL"),
+            ],
+        ));
+
+        // recovered_function_names: only the Provisional fn needs a name prior.
+        // Canonical key is lowercase hex of entry, no 0x.
+        let mut names = HashMap::new();
+        names.insert(format!("{entry_p:x}"), "LteRrc_CheckState".to_string());
+
+        let report = run(
+            &img.image_dir(),
+            img.label(),
+            &img.manifest(),
+            &names,
+            &GlobalsOpts::default(),
+        )
+        .unwrap();
+
+        // Recovered wins; Provisional suppressed.
+        assert_eq!(report.recovered_count, 1);
+        assert_eq!(report.conflicts_dropped, 0);
+        assert_eq!(report.provisional_suppressed_by_recovered, 1);
+
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        let globals = v["globals"].as_array().unwrap();
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0]["tier"], "recovered");
+        assert_eq!(globals[0]["name"], "g_foo");
+        assert_eq!(globals[0]["address"], format!("0x{g_target:x}"));
+    }
+
+    #[test]
+    fn same_tier_conflict_drops_both_provisional() {
+        // Two functions each emit a Provisional at the same addr with
+        // different names (different identifier slugs). The Phase 3.0 strict-
+        // drop rule extended to the Provisional tier: both drop,
+        // `conflicts_dropped` increments, `provisional_suppressed_by_recovered`
+        // stays 0 (no Recovered involved).
+        let img = Img::new("prov_conflict");
+        img.write_manifest_load_addr("0x40e20000");
+
+        let string_addr_a = 0x40e22000u64;
+        let string_addr_b = 0x40e22500u64;
+        let g_shared = 0x40e30000u64; // both Provisionals target this addr
+        let g_other_a = 0x40e31000u64;
+        let g_other_b = 0x40e32000u64;
+
+        let entry_a = 0x40e40000;
+        let end_a = 0x40e40040;
+        let entry_b = 0x40e50000;
+        let end_b = 0x40e50040;
+
+        let func_json = serde_json::json!([
+            {
+                "name": format!("FUN_{entry_a:x}"),
+                "entry": format!("0x{entry_a:x}"),
+                "end": format!("0x{end_a:x}"),
+                "size": 0x40,
+                "data_refs": [
+                    format!("0x{string_addr_a:x}"),
+                    format!("0x{g_shared:x}"),
+                    format!("0x{g_other_a:x}"),
+                ],
+            },
+            {
+                "name": format!("FUN_{entry_b:x}"),
+                "entry": format!("0x{entry_b:x}"),
+                "end": format!("0x{end_b:x}"),
+                "size": 0x40,
+                "data_refs": [
+                    format!("0x{string_addr_b:x}"),
+                    format!("0x{g_shared:x}"),
+                    format!("0x{g_other_b:x}"),
+                ],
+            },
+        ])
+        .to_string();
+        img.write_functions_json(&func_json);
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+
+        // disasm.lst with both functions' instruction PCs. Each fn loads its
+        // string and two globals; g_shared is the nearer global in each fn.
+        let disasm = "0x40e40010: movw r0, 0x2000\n0x40e40014: movt r0, 0x40e2\n\
+             0x40e40018: movw r1, 0x0000\n0x40e4001c: movt r1, 0x40e3\n\
+             0x40e40020: movw r2, 0x1000\n0x40e40024: movt r2, 0x40e3\n\
+             0x40e50010: movw r0, 0x2500\n0x40e50014: movt r0, 0x40e2\n\
+             0x40e50018: movw r1, 0x0000\n0x40e5001c: movt r1, 0x40e3\n\
+             0x40e50020: movw r2, 0x2000\n0x40e50024: movt r2, 0x40e3\n"
+            .to_string();
+        fs::write(
+            img.image_dir().join("decompiled").join("disasm.lst"),
+            disasm,
+        )
+        .unwrap();
+
+        img.write_image_bin(&image_with_strings(
+            0x40e20000,
+            &[
+                (string_addr_a, "lteRrc_state and otherModule_field are NULL"),
+                (
+                    string_addr_b,
+                    "barModule_thing and otherModule_field are NULL",
+                ),
+            ],
+        ));
+
+        // Each fn gets a matching module prefix so its identifier prefix-matches.
+        let mut names = HashMap::new();
+        names.insert(format!("{entry_a:x}"), "LteRrc_CheckState".to_string());
+        names.insert(format!("{entry_b:x}"), "BarModule_Handle".to_string());
+
+        let report = run(
+            &img.image_dir(),
+            img.label(),
+            &img.manifest(),
+            &names,
+            &GlobalsOpts::default(),
+        )
+        .unwrap();
+
+        // Both Provisionals drop as a same-tier conflict; no Recovered involved.
+        assert_eq!(report.recovered_count, 0);
+        assert_eq!(report.conflicts_dropped, 1);
+        assert_eq!(report.provisional_suppressed_by_recovered, 0);
+
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(v["globals"].as_array().unwrap().is_empty());
     }
 }
