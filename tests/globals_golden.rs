@@ -1,5 +1,12 @@
-//! Phase 3.0: env-gated golden tests for globals recovery on a real `02_MAIN`.
-//! Skip cleanly when PME_RADIO_IMG / GHIDRA_INSTALL_DIR unset or absent.
+//! Env-gated golden tests for globals recovery on a real `02_MAIN`.
+//!
+//! Two cohorts, both skip cleanly without their gating env:
+//! - **Phase 3.0** (first three tests): auto-run decompose when
+//!   `PME_RADIO_IMG` + `GHIDRA_INSTALL_DIR` are set; one shared ~110-min run
+//!   via `shared_decompose_output`.
+//! - **Phase 3.0.1** (last three tests): read pre-existing decompose output
+//!   from `PME_GOLDEN_DIR`; never auto-run decompose. Production
+//!   verification (plan task 11) supplies the env.
 
 use pixel_modem_extractor::{decompile, decompose};
 use serde_json::Value;
@@ -136,4 +143,186 @@ fn globals_no_duplicates_by_address() {
     let before = addrs.len();
     addrs.dedup();
     assert_eq!(addrs.len(), before, "duplicate global addresses present");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.0.1 golden tests.
+//
+// These read pre-existing decompose output from `$PME_GOLDEN_DIR` and never
+// auto-run decompose — production verification (plan task 11) supplies the
+// env. All three skip cleanly when `PME_GOLDEN_DIR` is unset, so they are
+// safe under `cargo test --all-targets` without a real image. They are the
+// integration-coverage sentinels for Phase 3.0.1's three headline invariants
+// on real `02_MAIN`:
+//   1. disasm-anchoring added net-new Recovered signal (count > Phase 3.0
+//      baseline);
+//   2. the grounding invariant — every global carrying GlobalLoad evidence
+//      also carries the paired StringLoad evidence;
+//   3. the Provisional opt-in gate — bare `decompose` materializes zero
+//      tier:"provisional" entries.
+// ---------------------------------------------------------------------------
+
+/// Phase 3.0's known production baseline for `globals_recovered` on real
+/// `02_MAIN`. Phase 3.0.1's disasm-anchoring must exceed this — net-new
+/// signal is the headline invariant.
+const PHASE3_0_RECOVERED_BASELINE: u64 = 968;
+
+/// Read `$PME_GOLDEN_DIR` or skip the test cleanly. Mirrors Phase 3.0's
+/// `env_or_skip` idiom but never falls back to running decompose.
+fn golden_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from)?;
+    if !dir.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR not found on disk: {}", dir.display());
+        return None;
+    }
+    Some(dir)
+}
+
+/// Navigate `report.json` in `dir` to the `02_MAIN` entry of the decompile
+/// stage and return a cloned JSON `Value`.
+fn main_image_report(dir: &Path) -> Value {
+    let report: Value = serde_json::from_slice(
+        &std::fs::read(dir.join("report.json")).expect("report.json readable"),
+    )
+    .expect("report.json valid JSON");
+    report["stages"]
+        .as_array()
+        .expect("stages is an array")
+        .iter()
+        .find(|s| s["stage"] == "decompile")
+        .and_then(|s| s["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .unwrap_or_else(|| panic!("02_MAIN entry missing from decompile stage"))
+        .clone()
+}
+
+/// Load `images/02_MAIN/decompiled/globals.json` from `dir`.
+fn read_globals_json(dir: &Path) -> Value {
+    let path = dir.join("images/02_MAIN/decompiled/globals.json");
+    serde_json::from_slice(&std::fs::read(&path).expect("globals.json readable"))
+        .expect("globals.json valid JSON")
+}
+
+/// Count entries in `globals.json` whose `tier` equals `tier`.
+fn count_tier(globals_json: &Value, tier: &str) -> u64 {
+    globals_json["globals"]
+        .as_array()
+        .expect("globals is an array")
+        .iter()
+        .filter(|g| g["tier"] == tier)
+        .count() as u64
+}
+
+#[test]
+fn phase3_0_1_recovered_exceeds_phase3_0_baseline() {
+    // Sentinel 1 — net-new signal. Phase 3.0's strict-only algorithm recovered
+    // exactly `PHASE3_0_RECOVERED_BASELINE` globals on real `02_MAIN`;
+    // Phase 3.0.1's disasm-anchored path must push that count strictly higher.
+    let Some(dir) = golden_dir() else {
+        return;
+    };
+    let recovered = main_image_report(&dir)
+        .get("globals_recovered")
+        .and_then(Value::as_u64)
+        .expect("globals_recovered present on 02_MAIN");
+    assert!(
+        recovered > PHASE3_0_RECOVERED_BASELINE,
+        "Phase 3.0.1 disasm-anchoring added no net-new signal: \
+         globals_recovered = {recovered} (Phase 3.0 baseline = \
+         {PHASE3_0_RECOVERED_BASELINE})"
+    );
+}
+
+#[test]
+fn phase3_0_1_globals_carry_globalload_evidence() {
+    // Sentinel 2 — grounding invariant. Every emitted global that carries
+    // GlobalLoad evidence (Phase 3.0.1's disasm-anchored naming path) must
+    // also carry the paired StringLoad evidence — the disasm event that
+    // pinned the naming string. `globals.rs` builds this pair by construction
+    // (each Contributor emits StringLoad immediately before GlobalLoad); this
+    // test guards against a schema regression that decoupled them.
+    let Some(dir) = golden_dir() else {
+        return;
+    };
+    let v = read_globals_json(&dir);
+    for g in v["globals"].as_array().expect("globals is an array") {
+        let evidence = g["evidence"].as_array().expect("evidence is an array");
+        let has_global_load = evidence.iter().any(|e| e["kind"] == "global_load");
+        let has_string_load = evidence.iter().any(|e| e["kind"] == "string_load");
+        if has_global_load {
+            assert!(
+                has_string_load,
+                "global {:?} carries GlobalLoad evidence but no paired \
+                 StringLoad — grounding invariant violated",
+                g["address"],
+            );
+        }
+    }
+}
+
+#[test]
+fn phase3_0_1_provisional_emitted_only_with_opt_in() {
+    // Sentinel 3 — Provisional opt-in gate.
+    //
+    // Bare `decompose` (no `--globals-provisional`) MUST materialize zero
+    // tier:"provisional" entries in globals.json: the flag is the sole gate
+    // and Provisional globals are withheld by construction
+    // (`globals::GlobalsOpts::include_provisional` defaults to `false`).
+    //
+    // DEVIATION FROM TASK-10 BRIEF (driven by plan task 1's Scenario 2
+    // pre-check): the brief asserted the opt-in run materializes a NONZERO
+    // count of tier:"provisional". On real `02_MAIN` that is unsatisfiable —
+    // Scenario 2 found the name-prior pass generates only ~4 candidates, all
+    // dropped by strict-drop / cross-tier-suppression, so materialization is
+    // zero regardless of the flag. Per the task-10 decisions we instead
+    // assert a report⇄file consistency relationship for the opt-in run and
+    // never assert nonzero. On Scenario-1 firmware the opt-in materialization
+    // would be > 0 and the same relationship still holds.
+    //
+    // SECOND DEVIATION: the task-10 decision proposed report/file EQUALITY
+    // (`globals_provisional` == materialized count). That does not hold in
+    // general: `globals_provisional` counts Contributors generated by the
+    // name-prior helper BEFORE step-6 cross-tier suppression and same-tier
+    // strict-drop, so generated >= materialized always, with a gap whenever
+    // any provisionals are suppressed/dropped. We assert the always-true
+    // upper bound `materialized <= generated` instead of equality.
+    let Some(dir) = golden_dir() else {
+        return;
+    };
+
+    // Bare run: zero tier:"provisional" materialized (the gate invariant).
+    let bare = read_globals_json(&dir);
+    let bare_provisional = count_tier(&bare, "provisional");
+    assert_eq!(
+        bare_provisional, 0,
+        "bare decompose materialized tier:provisional entries — \
+         --globals-provisional is not the sole gate"
+    );
+
+    // Opt-in run (optional): if a second decompose output produced with
+    // --globals-provisional is supplied via `$PME_GOLDEN_DIR_PROVISIONAL`,
+    // assert the report's generated count is a faithful upper bound on the
+    // file's materialized count. Skipped when that env var is unset/absent.
+    let Some(prov_dir) = std::env::var_os("PME_GOLDEN_DIR_PROVISIONAL").map(PathBuf::from) else {
+        eprintln!("skip opt-in consistency: set PME_GOLDEN_DIR_PROVISIONAL");
+        return;
+    };
+    if !prov_dir.exists() {
+        eprintln!(
+            "skip opt-in consistency: PME_GOLDEN_DIR_PROVISIONAL not found: {}",
+            prov_dir.display()
+        );
+        return;
+    }
+    let generated = main_image_report(&prov_dir)
+        .get("globals_provisional")
+        .and_then(Value::as_u64)
+        .expect("globals_provisional present on opt-in 02_MAIN");
+    let materialized = count_tier(&read_globals_json(&prov_dir), "provisional");
+    assert!(
+        materialized <= generated,
+        "opt-in materialized tier:provisional ({materialized}) exceeds \
+         report.globals_provisional ({generated}) — generated is no longer a \
+         faithful upper bound"
+    );
 }
