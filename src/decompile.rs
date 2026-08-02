@@ -277,6 +277,13 @@ pub struct ImageResult {
     /// `globals.json` for this image. `None` when Phase 3.0 didn't run for
     /// this image (no raw image bytes, or globals stage skipped).
     pub globals_recovered: Option<usize>,
+    /// Phase 3.0.1: total tier:"provisional" globals generated for this image
+    /// (before any suppression). None when Phase 3.0.1 didn't run for this image.
+    pub globals_provisional: Option<usize>,
+    /// Phase 3.0.1: subset dropped because a Recovered (addr, name') exists at
+    /// the same address (tier-conflict suppression — the gate-relevant metric).
+    /// None when Phase 3.0.1 didn't run; Some(0) is a valid value.
+    pub globals_provisional_suppressed: Option<usize>,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -928,6 +935,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             })
             .collect();
     }
@@ -2840,6 +2849,8 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -2869,6 +2880,8 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
         };
@@ -2878,6 +2891,27 @@ INFO: second pdfj body was noisy and not parseable
             err.to_string(),
             "decompose incomplete: radare2 failed on 02_MAIN: 1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
         );
+    }
+
+    #[test]
+    fn image_result_carries_phase3_0_1_fields() {
+        let r = ImageResult {
+            label: "02_MAIN".into(),
+            outcome: ImageOutcome::Analyzed(10),
+            thumb_functions: None,
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: Some(968),
+            globals_provisional: Some(42),
+            globals_provisional_suppressed: Some(7),
+        };
+        assert_eq!(r.globals_provisional, Some(42));
+        assert_eq!(r.globals_provisional_suppressed, Some(7));
     }
 
     #[test]

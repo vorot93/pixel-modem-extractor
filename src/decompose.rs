@@ -61,6 +61,10 @@ pub struct ImageReport {
     pub globals_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub globals_recovered: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_provisional: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_provisional_suppressed: Option<usize>,
 }
 
 impl ImageReport {
@@ -84,6 +88,8 @@ impl ImageReport {
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
                 globals_error: r.globals_error.clone(),
                 globals_recovered: r.globals_recovered,
+                globals_provisional: r.globals_provisional,
+                globals_provisional_suppressed: r.globals_provisional_suppressed,
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -99,6 +105,8 @@ impl ImageReport {
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
                 globals_error: r.globals_error.clone(),
                 globals_recovered: r.globals_recovered,
+                globals_provisional: r.globals_provisional,
+                globals_provisional_suppressed: r.globals_provisional_suppressed,
             },
         }
     }
@@ -1006,6 +1014,8 @@ mod tests {
                         thumb_enrich_error: None,
                         globals_error: None,
                         globals_recovered: None,
+                        globals_provisional: None,
+                        globals_provisional_suppressed: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -1021,6 +1031,8 @@ mod tests {
                         thumb_enrich_error: None,
                         globals_error: None,
                         globals_recovered: None,
+                        globals_provisional: None,
+                        globals_provisional_suppressed: None,
                     },
                 ],
                 10,
@@ -1131,6 +1143,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -1163,6 +1177,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         });
 
         assert_eq!(image.status, "analyzed");
@@ -1211,6 +1227,8 @@ mod tests {
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             },
             decompile::ImageResult {
                 label: "01_BOOT".into(),
@@ -1224,6 +1242,8 @@ mod tests {
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             },
         ];
         let images_dir = root.join("images");
@@ -1271,6 +1291,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -1287,6 +1309,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         }];
 
         refresh_decompile_stage_images(&mut stages, &post_enrich_images);
@@ -1338,6 +1362,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
         assert_eq!(outcome.counts.len(), 0);
@@ -1481,6 +1507,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -1504,6 +1532,8 @@ mod tests {
             thumb_enrich_error: Some("malformed decompiled.c".into()),
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -1526,11 +1556,15 @@ mod tests {
             thumb_enrich_error: None,
             globals_recovered: None,
             globals_error: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("globals_recovered"));
         assert!(!json.contains("globals_error"));
+        assert!(!json.contains("\"globals_provisional\""));
+        assert!(!json.contains("\"globals_provisional_suppressed\""));
     }
 
     #[test]
@@ -1547,11 +1581,15 @@ mod tests {
             thumb_enrich_error: None,
             globals_recovered: Some(137),
             globals_error: Some("malformed functions.json".into()),
+            globals_provisional: Some(50),
+            globals_provisional_suppressed: Some(3),
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"globals_recovered\":137"));
         assert!(json.contains("\"globals_error\":\"malformed functions.json\""));
+        assert!(json.contains("\"globals_provisional\":50"));
+        assert!(json.contains("\"globals_provisional_suppressed\":3"));
     }
 
     #[test]

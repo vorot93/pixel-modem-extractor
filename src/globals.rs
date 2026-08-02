@@ -104,6 +104,12 @@ pub struct GlobalsReport {
     /// single-source-of-truth rule (Phase 1's `Tier::Recovered` extended
     /// cross-function).
     pub conflicts_dropped: usize,
+    /// Phase 3.0.1: total tier:"provisional" globals the algorithm produced,
+    /// before any suppression.
+    pub provisional_generated: usize,
+    /// Phase 3.0.1: subset dropped because a Recovered (addr, name') exists
+    /// at the same address (gate-relevant metric).
+    pub provisional_suppressed_by_recovered: usize,
 }
 
 impl GlobalsReport {
@@ -111,6 +117,8 @@ impl GlobalsReport {
         Self {
             recovered_count: 0,
             conflicts_dropped: 0,
+            provisional_generated: 0,
+            provisional_suppressed_by_recovered: 0,
         }
     }
 }
@@ -353,6 +361,8 @@ pub fn run(
     Ok(GlobalsReport {
         recovered_count,
         conflicts_dropped,
+        provisional_generated: 0,
+        provisional_suppressed_by_recovered: 0,
     })
 }
 
@@ -538,6 +548,15 @@ mod tests {
     fn run_no_names(img: &Img) -> Result<GlobalsReport> {
         let empty = HashMap::new();
         run(&img.image_dir(), img.label(), &img.manifest(), &empty)
+    }
+
+    #[test]
+    fn empty_report_inits_phase3_0_1_fields_to_zero() {
+        let r = GlobalsReport::empty();
+        assert_eq!(r.recovered_count, 0);
+        assert_eq!(r.conflicts_dropped, 0);
+        assert_eq!(r.provisional_generated, 0);
+        assert_eq!(r.provisional_suppressed_by_recovered, 0);
     }
 
     #[test]
