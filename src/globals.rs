@@ -146,8 +146,9 @@ pub struct Global {
     pub address: String,
     pub arch: Arch,
     pub name: String,
-    /// Always `"recovered"` in Phase 3.0. Future Phase 3.0.1 may add
-    /// `"provisional"` for function-name-inferred globals.
+    /// `"recovered"` for Phase 3.0 strict-rule and Phase 3.0.1 disasm-anchored
+    /// globals; `"provisional"` for Phase 3.0.1 name-prior globals (withheld
+    /// from the file unless `GlobalsOpts::include_provisional`).
     pub tier: &'static str,
     /// Always `null` in Phase 3.0 (no type recovery yet). Surfaced as explicit
     /// null so consumers know the field exists and is intentionally absent.
@@ -365,6 +366,7 @@ pub fn run(
                 string_load: None,
                 global_load: None,
                 naming_string: None,
+                tier: "recovered",
             });
     }
 
@@ -425,6 +427,73 @@ pub fn run(
                     string_load: Some(sl_ev),
                     global_load: Some(gl_ev),
                     naming_string,
+                    tier: "recovered",
+                });
+        }
+    }
+
+    // 5c. Phase 3.0.1 name-prior Provisional path: handles the residue the
+    //     disasm-anchored Recovered pass (5b) leaves behind — string-loads
+    //     whose string carries ≥2 underscored identifiers AND whose window
+    //     contains ≥2 globals. Recovered drops these as ambiguous; the name
+    //     prior attempts to break the tie: if the function's `recovered_name`
+    //     is module-prefixed (e.g. `LteRrc_CheckState` -> prefix `LteRrc`) and
+    //     exactly one identifier in the string case-insensitively starts with
+    //     that prefix, pick the global nearest (by load-event-index distance)
+    //     to the string-load. Ties (two identifiers, or two globals at equal
+    //     distance) -> drop. Names follow Phase 1's Tier::Provisional shape:
+    //     `guess_<slug>_<addr_hex>` via `symbolicate::slugify` +
+    //     `GUESS_PREFIX`. Evidence shape: [StringLoad, GlobalLoad, String,
+    //     Function].
+    //
+    //     `provisional_generated` is incremented per emission regardless of
+    //     `opts.include_provisional` — the flag controls materialization, not
+    //     generation. Proposals always land in the unified map so Task 7's
+    //     cross-tier Recovered-beats-Provisional precedence can see both and
+    //     increment `provisional_suppressed_by_recovered`.
+    //
+    //     Scenario 2 (firmware pre-check): this pass materializes zero
+    //     entries on `02_MAIN` — only ~4 candidates survive the prefix filter,
+    //     all dropped by the strict-drop / cross-tier rules. The path is
+    //     exercised here for schema/surface correctness; the count is gated.
+    let mut provisional_generated: usize = 0;
+    for f in &all_funcs {
+        let candidate_refs: Vec<u64> = f
+            .data_refs
+            .iter()
+            .copied()
+            .filter(|a| !string_map.contains_key(a))
+            .filter(|a| *a >= load_addr)
+            .collect();
+        if candidate_refs.len() < 2 {
+            continue;
+        }
+        let (disasm_slice, k) = match f.arch {
+            Arch::Arm => (disasm_slice_for(f.entry, f.end, &disasm_text), opts.k_arm),
+            Arch::Thumb => (f.body.clone().unwrap_or_default(), opts.k_thumb),
+            Arch::Mixed => continue,
+        };
+        let load_events = symbolicate::reconstruct_load_events(&disasm_slice);
+        let provisional = name_prior_provisional_for_function(f, &string_map, &load_events, k);
+        provisional_generated += provisional.len();
+        for (addr, name, sl_ev, gl_ev) in provisional {
+            let naming_string = match &sl_ev {
+                Evidence::StringLoad { address, .. } => {
+                    u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()
+                }
+                _ => None,
+            };
+            addr_to_proposals
+                .entry(addr)
+                .or_default()
+                .entry(name)
+                .or_default()
+                .push(Contributor {
+                    func: f.clone(),
+                    string_load: Some(sl_ev),
+                    global_load: Some(gl_ev),
+                    naming_string,
+                    tier: "provisional",
                 });
         }
     }
@@ -432,7 +501,17 @@ pub fn run(
     // 6. Build the output: one entry per (addr, name) where the addr had
     //    exactly one distinct name proposed. Same strict-drop rule covers
     //    Phase 3.0 same-tier, Phase 3.0.1 same-tier, and cross-path
-    //    (Phase 3.0 vs Phase 3.0.1) conflicts uniformly.
+    //    (Phase 3.0 vs Phase 3.0.1) conflicts uniformly. Cross-tier
+    //    (Recovered vs Provisional at the same addr proposing different
+    //    names) currently drops as a conflict; Task 7 will tighten this so
+    //    the Recovered wins and `provisional_suppressed_by_recovered`
+    //    increments. The resulting Global's `tier` is `"recovered"` if any
+    //    contributor was Recovered (Recovered names and Provisional
+    //    `guess_…` names never collide within a single (addr, name) entry,
+    //    so a mixed-tier entry is impossible in practice), else
+    //    `"provisional"`. Provisional globals are withheld from the file
+    //    unless `opts.include_provisional` — the count was already taken at
+    //    helper-emit time, so withholding only suppresses materialization.
     let mut globals: Vec<Global> = Vec::new();
     let mut conflicts_dropped = 0usize;
     // Iterate by ascending addr for deterministic output ordering.
@@ -446,6 +525,21 @@ pub fn run(
             continue;
         }
         let (name, mut contributors) = proposals.into_iter().next().unwrap();
+        // Resulting tier: Recovered wins over Provisional if both contributed
+        // (defensive — within one (addr, name) entry all contributors share a
+        // tier because Recovered names and `guess_…` names never coincide).
+        let tier: &'static str = if contributors.iter().any(|c| c.tier == "recovered") {
+            "recovered"
+        } else {
+            "provisional"
+        };
+        if tier == "provisional" && !opts.include_provisional {
+            // Withhold materialization but keep `provisional_generated` (taken
+            // at helper-emit time). Task 7 may still suppress this entry via
+            // cross-tier Recovered-beats-Provisional precedence and increment
+            // `provisional_suppressed_by_recovered`.
+            continue;
+        }
         // Sort contributors by function address ascending (deterministic
         // evidence ordering, mirrors Phase 3.0).
         contributors.sort_by_key(|c| c.func.entry);
@@ -507,7 +601,7 @@ pub fn run(
             address: format!("0x{addr:x}"),
             arch,
             name: name.clone(),
-            tier: "recovered",
+            tier,
             size: None,
             evidence,
             annotations: Vec::new(),
@@ -535,7 +629,7 @@ pub fn run(
     Ok(GlobalsReport {
         recovered_count,
         conflicts_dropped,
-        provisional_generated: 0,
+        provisional_generated,
         provisional_suppressed_by_recovered: 0,
     })
 }
@@ -632,6 +726,13 @@ struct Contributor {
     /// specific string provided the identifier; Phase 3.0 leaves this `None`
     /// and resolves the naming string from `data_refs` at emission.
     naming_string: Option<u64>,
+    /// Tier this contributor belongs to. Phase 3.0 strict-rule and Phase 3.0.1
+    /// disasm-anchored Recovered both set `"recovered"`; Phase 3.0.1 name-prior
+    /// Provisional sets `"provisional"`. Used by the emission loop to (a)
+    /// stamp the resulting `Global.tier` and (b) withhold materialization when
+    /// `!opts.include_provisional`. Task 7 tightens cross-tier precedence at
+    /// the same addr (Recovered beats Provisional) using this field.
+    tier: &'static str,
 }
 
 /// Phase 3.0.1 disasm-anchored Recovered pass for one multi-global function.
@@ -725,6 +826,146 @@ fn disasm_anchored_recovered_for_function(
         out.push((
             gl.value as u64,
             name,
+            Evidence::StringLoad {
+                pc: format!("0x{:x}", sl.pc),
+                register: sl.register.clone(),
+                address: format!("0x{:x}", sl.value),
+            },
+            Evidence::GlobalLoad {
+                pc: format!("0x{:x}", gl.pc),
+                register: gl.register.clone(),
+                address: format!("0x{:x}", gl.value),
+            },
+        ));
+    }
+    out
+}
+
+/// Phase 3.0.1 name-prior Provisional pass for one multi-global function.
+///
+/// Handles the residue `disasm_anchored_recovered_for_function` leaves behind:
+/// string-loads whose string carries ≥2 underscored identifiers AND whose
+/// proximity window contains ≥2 globals (Recovered drops both cases as
+/// ambiguous). The function's recovered name supplies the prior.
+///
+/// **Name prior rule (design spec Step 1.4):**
+/// 1. `recovered_name` must be module-prefixed (`"LteRrc_CheckState"` -> prefix
+///    `"LteRrc"`); the first character of the prefix must be ASCII uppercase.
+/// 2. Exactly one identifier in the string must case-insensitively start with
+///    the prefix (zero or multiple matches -> drop).
+/// 3. Among globals within proximity `k` of the string-load, pick the one
+///    nearest by load-event-index distance. A tie (two globals at equal
+///    distance) -> drop.
+///
+/// Names follow Phase 1's `Tier::Provisional` shape: `guess_<slug>_<addr_hex>`,
+/// where `slug = slugify(name_token, None)` and the prefix is `GUESS_PREFIX`.
+///
+/// **Scenario 2 (firmware pre-check):** on real `02_MAIN`, this pass
+/// materializes zero entries. The pass is exercised for schema/surface
+/// correctness; the synthetic unit tests cover the logic.
+fn name_prior_provisional_for_function(
+    func: &Function,
+    string_map: &HashMap<u64, String>,
+    load_events: &[symbolicate::LoadEvent],
+    k: usize,
+) -> Vec<(u64, String, Evidence, Evidence)> {
+    let mut out = Vec::new();
+    if load_events.is_empty() {
+        return out;
+    }
+
+    // Name prior: function must have a module-prefixed recovered_name.
+    let Some(recovered_name) = &func.recovered_name else {
+        return out;
+    };
+    let Some(prefix) = recovered_name.split('_').next() else {
+        return out;
+    };
+    if prefix.is_empty()
+        || !prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return out;
+    }
+
+    // Mirror Task 5's candidate construction (including Thumb augmentation):
+    // the two passes must see the same globals so the residue invariant
+    // (Provisional handles what Recovered dropped) holds.
+    let mut non_string_refs: BTreeSet<u64> = func
+        .data_refs
+        .iter()
+        .copied()
+        .filter(|r| !string_map.contains_key(r))
+        .collect();
+    if func.arch == Arch::Thumb {
+        for e in load_events {
+            let v = e.value as u64;
+            if !string_map.contains_key(&v) {
+                non_string_refs.insert(v);
+            }
+        }
+    }
+
+    let string_loads: Vec<&symbolicate::LoadEvent> = load_events
+        .iter()
+        .filter(|e| string_map.contains_key(&(e.value as u64)))
+        .collect();
+    let global_loads: Vec<&symbolicate::LoadEvent> = load_events
+        .iter()
+        .filter(|e| non_string_refs.contains(&(e.value as u64)))
+        .collect();
+
+    for sl in string_loads {
+        let content = string_map.get(&(sl.value as u64)).unwrap();
+        let identifiers = filter_identifier_tokens(content);
+        // Provisional fires only on the multi-identifier residue (Recovered
+        // owns the unambiguous single-identifier case).
+        if identifiers.len() < 2 {
+            continue;
+        }
+        // Filter identifiers by case-insensitive prefix match against the
+        // function-name prior. Exactly one match -> the name token.
+        let matches: Vec<&String> = identifiers
+            .iter()
+            .filter(|i| i.len() >= prefix.len() && i[..prefix.len()].eq_ignore_ascii_case(prefix))
+            .collect();
+        if matches.len() != 1 {
+            continue;
+        }
+        let name_token = matches[0];
+
+        // Among globals within proximity k of the string-load, pick the
+        // nearest by load-event-index distance. Ties -> drop.
+        let sl_idx = load_events.iter().position(|e| e.pc == sl.pc).unwrap();
+        let in_window: Vec<(&symbolicate::LoadEvent, usize)> = global_loads
+            .iter()
+            .filter_map(|gl| {
+                let gl_idx = load_events.iter().position(|e| e.pc == gl.pc)?;
+                let dist = sl_idx.abs_diff(gl_idx);
+                (dist <= k).then_some((*gl, dist))
+            })
+            .collect();
+        if in_window.is_empty() {
+            continue;
+        }
+        let min_dist = in_window.iter().map(|(_, d)| *d).min().unwrap();
+        let nearest: Vec<&symbolicate::LoadEvent> = in_window
+            .into_iter()
+            .filter(|(_, d)| *d == min_dist)
+            .map(|(gl, _)| gl)
+            .collect();
+        if nearest.len() != 1 {
+            continue; // tie -> drop
+        }
+        let gl = nearest[0];
+
+        let slug = symbolicate::slugify(name_token, None);
+        let guess_name = format!("{}{}_{:x}", symbolicate::GUESS_PREFIX, slug, gl.value);
+        out.push((
+            gl.value as u64,
+            guess_name,
             Evidence::StringLoad {
                 pc: format!("0x{:x}", sl.pc),
                 register: sl.register.clone(),
@@ -1431,5 +1672,149 @@ mod tests {
             "Phase 3.0 strict-rule path must not emit disasm-anchored evidence"
         );
         assert_eq!(ev.len(), 2);
+    }
+
+    #[test]
+    fn provisional_tier_requires_recovered_function_name() {
+        // Function with no recovered_name -> never produces Provisional.
+        let string_addr = 0x40e22000;
+        let g1 = 0x40e30000;
+        let g2 = 0x40e31000;
+        let string_map =
+            HashMap::from([(string_addr, "lteRrc_state and lteRrc_other are NULL".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+             0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n\
+             0x20: movw r2, 0x1000\n0x24: movt r2, 0x40e3\n"
+            .to_string();
+        let events = symbolicate::reconstruct_load_events(&disasm);
+        let mut func = sample_func(Arch::Arm, vec![string_addr, g1, g2]);
+        func.recovered_name = None; // <-- no name prior available
+        let out = name_prior_provisional_for_function(&func, &string_map, &events, K_ARM);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn provisional_tier_resolves_tie_via_name_prior() {
+        // Two globals × two identifiers in window; function name "LteRrc_CheckState";
+        // identifier "lteRrc_state" matches the prefix "LteRrc" -> Provisional emission.
+        let string_addr = 0x40e22000;
+        let g1 = 0x40e30000;
+        let g2 = 0x40e31000;
+        let string_map = HashMap::from([(
+            string_addr,
+            "lteRrc_state and otherModule_field are NULL".into(),
+        )]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+             0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n\
+             0x20: movw r2, 0x1000\n0x24: movt r2, 0x40e3\n"
+            .to_string();
+        let events = symbolicate::reconstruct_load_events(&disasm);
+        let mut func = sample_func(Arch::Arm, vec![string_addr, g1, g2]);
+        func.recovered_name = Some("LteRrc_CheckState".into());
+        let out = name_prior_provisional_for_function(&func, &string_map, &events, K_ARM);
+        assert_eq!(out.len(), 1);
+        let (addr, name, _, _) = &out[0];
+        // Address is whichever global is nearest (by line-distance) to the string-load.
+        assert!(*addr == g1 || *addr == g2);
+        // Name shape: guess_<slug>_<addr_hex>. slug via symbolicate::slugify("lteRrc_state", None).
+        let expected_slug = symbolicate::slugify("lteRrc_state", None);
+        assert!(name.starts_with(&format!("{}{}", symbolicate::GUESS_PREFIX, expected_slug)));
+        assert!(name.ends_with(&format!("_{:x}", addr)));
+    }
+
+    #[test]
+    fn provisional_tier_dropped_when_name_prior_ambiguous() {
+        // Two identifiers both start with the prefix -> name prior doesn't
+        // disambiguate -> drop.
+        let string_addr = 0x40e22000;
+        let g1 = 0x40e30000;
+        let g2 = 0x40e31000;
+        let string_map =
+            HashMap::from([(string_addr, "lteRrc_state and lteRrc_other are NULL".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+             0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n\
+             0x20: movw r2, 0x1000\n0x24: movt r2, 0x40e3\n"
+            .to_string();
+        let events = symbolicate::reconstruct_load_events(&disasm);
+        let mut func = sample_func(Arch::Arm, vec![string_addr, g1, g2]);
+        func.recovered_name = Some("LteRrc_CheckState".into());
+        let out = name_prior_provisional_for_function(&func, &string_map, &events, K_ARM);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn provisional_never_emitted_without_opt_in_flag() {
+        // GlobalsOpts { include_provisional: false } -> no tier:"provisional" in
+        // the serialized globals.json, but provisional_generated counts what
+        // would have been emitted. End-to-end via run(); mirrors
+        // provisional_tier_resolves_tie_via_name_prior over the ARM disasm slice.
+        let img = Img::new("prov_no_opt");
+        // load_addr near the string vaddr so the .bin stays small.
+        img.write_manifest_load_addr("0x40e20000");
+        let entry = 0x40e40000;
+        let end = 0x40e40030;
+        let string_addr = 0x40e22000u64;
+        let g1 = 0x40e30000u64;
+        let g2 = 0x40e31000u64;
+        let func_json = serde_json::json!([{
+            "name": format!("FUN_{entry:x}"),
+            "entry": format!("0x{entry:x}"),
+            "end": format!("0x{end:x}"),
+            "size": 0x30,
+            "data_refs": [
+                format!("0x{string_addr:x}"),
+                format!("0x{g1:x}"),
+                format!("0x{g2:x}"),
+            ],
+        }])
+        .to_string();
+        img.write_functions_json(&func_json);
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        // disasm.lst with PCs inside [entry, end) materializing the string and
+        // two globals (same shape as the unit-test fixture).
+        let disasm = "0x40e40010: movw r0, 0x2000\n0x40e40014: movt r0, 0x40e2\n\
+                      0x40e40018: movw r1, 0x0000\n0x40e4001c: movt r1, 0x40e3\n\
+                      0x40e40020: movw r2, 0x1000\n0x40e40024: movt r2, 0x40e3\n";
+        fs::write(
+            img.image_dir().join("decompiled").join("disasm.lst"),
+            disasm,
+        )
+        .unwrap();
+        img.write_image_bin(&image_with_strings(
+            0x40e20000,
+            &[(string_addr, "lteRrc_state and otherModule_field are NULL")],
+        ));
+
+        // recovered_function_names: entry canonical = lowercase hex, no 0x.
+        let mut names = HashMap::new();
+        names.insert(format!("{entry:x}"), "LteRrc_CheckState".to_string());
+
+        // Default opts: include_provisional = false.
+        let report = run(
+            &img.image_dir(),
+            img.label(),
+            &img.manifest(),
+            &names,
+            &GlobalsOpts::default(),
+        )
+        .unwrap();
+
+        // provisional_generated counts regardless of the opt-in flag.
+        assert_eq!(report.provisional_generated, 1);
+
+        // No tier:"provisional" in the serialized globals.json.
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        let provisional_in_file = v["globals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["tier"] == "provisional")
+            .count();
+        assert_eq!(provisional_in_file, 0);
     }
 }
