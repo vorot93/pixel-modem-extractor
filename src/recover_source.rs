@@ -641,7 +641,16 @@ fn format_recovered_section(attrs: &[Attribution], inline_bodies: bool) -> Strin
 
 fn rewrite_leaf(path: &Path, attrs: &[Attribution], opts: &Opts) -> Result<()> {
     let original = std::fs::read_to_string(path)?;
-    let mut enriched = original;
+    // Idempotent: strip any previously-appended `// Recovered code evidence:` block
+    // before re-appending, so re-running `recover_source` (or any caller that doesn't
+    // wipe `tree/` first) does not double-, triple-, … -append the same section. Same
+    // model as `symbolicate::rewrite_text`'s sentinel.
+    const MARKER: &str = "\n// Recovered code evidence:\n";
+    let base = match original.find(MARKER) {
+        Some(i) => original[..i].to_string(),
+        None => original,
+    };
+    let mut enriched = base;
     if !enriched.ends_with('\n') {
         enriched.push('\n');
     }
@@ -650,7 +659,7 @@ fn rewrite_leaf(path: &Path, attrs: &[Attribution], opts: &Opts) -> Result<()> {
         "{}.tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("leaf")
     ));
-    std::fs::write(&tmp, enriched)?;
+    std::fs::write(&tmp, &enriched)?;
     std::fs::rename(tmp, path)?;
     Ok(())
 }
@@ -1329,5 +1338,77 @@ mod tests {
             json["ambiguous"][0]["candidate_source_paths"],
             serde_json::json!(["foo/a.cc", "foo/b.cc"])
         );
+    }
+
+    #[test]
+    fn rewrite_leaf_is_idempotent() {
+        // Re-running recover_source on an already-enriched leaf must not double-append
+        // the `// Recovered code evidence:` block.
+        let dir = temp_dir("rewrite_leaf_idempotent");
+        let leaf = dir.join("foo.cc");
+        std::fs::write(&leaf, b"// original source\nint main() { return 0; }\n").unwrap();
+
+        let attr = Attribution {
+            function: RecoveredFunction {
+                tool: Tool::Ghidra,
+                name: "FUN_40001000".into(),
+                entry: 0x40001000,
+                end: 0x40001100,
+                size: 0x100,
+                body_kind: "c".into(),
+                body: "int FUN_40001000(void) { return 1; }\n".into(),
+                source_artifact: "02_MAIN".into(),
+                data_refs: vec![],
+            },
+            confidence: Confidence::Direct,
+            reason: "test".into(),
+        };
+        let opts = Opts {
+            inline_bodies: true,
+            ..Opts::default()
+        };
+
+        rewrite_leaf(&leaf, std::slice::from_ref(&attr), &opts).unwrap();
+        let once = std::fs::read_to_string(&leaf).unwrap();
+        assert_eq!(
+            once.matches("// Recovered code evidence:").count(),
+            1,
+            "first write should add one section:\n{once}"
+        );
+        assert!(once.contains("original source"));
+
+        // Second pass — different attrs (different function entry) — must replace the
+        // first section, not append alongside it.
+        let attr2 = Attribution {
+            function: RecoveredFunction {
+                tool: Tool::Radare2,
+                name: "thumb_40e1200".into(),
+                entry: 0x40e1200,
+                end: 0x40e1300,
+                size: 0x100,
+                body_kind: "thumb_disassembly".into(),
+                body: "push {r7}\n".into(),
+                source_artifact: "02_MAIN".into(),
+                data_refs: vec![],
+            },
+            confidence: Confidence::Proximity,
+            reason: "test2".into(),
+        };
+        rewrite_leaf(&leaf, std::slice::from_ref(&attr2), &opts).unwrap();
+        let twice = std::fs::read_to_string(&leaf).unwrap();
+        assert_eq!(
+            twice.matches("// Recovered code evidence:").count(),
+            1,
+            "second write must replace, not append:\n{twice}"
+        );
+        // The new evidence (radare2 thumb @ 0x40e1200, "push {r7}") replaces
+        // the old (ghidra @ 0x40001000). Section format doesn't print the
+        // function name itself — only entry/range/tool/body — so check those.
+        assert!(twice.contains("0x40e1200"));
+        assert!(twice.contains("push {r7}"));
+        assert!(twice.contains("radare2"));
+        assert!(!twice.contains("0x40001000"));
+        // Original content survives both passes.
+        assert!(twice.contains("original source"));
     }
 }

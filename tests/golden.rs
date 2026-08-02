@@ -22,7 +22,7 @@ fn extract_matches_golden() {
         eprintln!("skip: golden inputs absent");
         return;
     }
-    let out = std::env::temp_dir().join("pme_golden");
+    let out = std::env::temp_dir().join(format!("pme_golden_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     pixel_modem_extractor::pipeline::extract(&img, &out, true).unwrap();
 

@@ -481,6 +481,28 @@ fn kill_process_group(_child_pid: u32) {
     // No portable killpg; on Windows `child.kill()` orphans the JVM.
 }
 
+/// POSIX shell-quote: wrap the input in single quotes, escaping any embedded
+/// single quote as `'\''`. Robust against `"`, `$`, backticks, semicolons,
+/// spaces, and any other shell metacharacter — used by the generated
+/// `run_ghidra.sh` for every arg, since `--processor`, `--ghidra-home`, and the
+/// project root flow in from user-controlled inputs. Empty string → `''`.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Write a turnkey `run_ghidra.sh` (one `analyzeHeadless` invocation per image),
 /// built from `headless_args` against a relocatable `$HERE` root.
 fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
@@ -503,6 +525,12 @@ fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
     s.push_str("HERE=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\n");
     s.push_str("export XDG_CONFIG_HOME=\"$HERE/ghidra_config\"\n");
     s.push_str("export XDG_CACHE_HOME=\"$HERE/ghidra_cache\"\n");
+    // NOTE: `$HERE` is interpolated into these `-D…` tokens and the resulting
+    // env var is later word-split unquoted by `analyzeHeadless` itself, so a
+    // `$HERE` containing spaces breaks the launch. We don't escape here because
+    // no shell-quoting survives the unquoted re-split downstream; if you need a
+    // `$HERE` with spaces, invoke the binary directly (the in-process `Command`
+    // path is unaffected).
     s.push_str("GHIDRA_LOCAL_JAVA_OPTIONS=\"-Dapplication.settingsdir=$HERE/ghidra_config -Dapplication.cachedir=$HERE/ghidra_cache -Dapplication.tempdir=$HERE/ghidra_tmp -Djava.io.tmpdir=$HERE/ghidra_tmp\"\n");
     s.push_str("if [ \"${GHIDRA_HEADLESS_JAVA_OPTIONS+x}\" ]; then\n");
     s.push_str("  export GHIDRA_HEADLESS_JAVA_OPTIONS=\"$GHIDRA_HEADLESS_JAVA_OPTIONS $GHIDRA_LOCAL_JAVA_OPTIONS\"\n");
@@ -519,9 +547,13 @@ fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
         let args = headless_args("$HERE", &e.label(), processor, e.load_addr, &[], mode);
         s.push_str("\"$HEADLESS\"");
         for a in &args {
-            s.push_str(" \"");
-            s.push_str(a);
-            s.push('"');
+            // Shell-quote every arg: `--processor` and `--ghidra-home` flow in from
+            // the user and could otherwise inject into the generated script. Labels
+            // are already whitelisted by `toc::TocEntry::label` but quoting is the
+            // robust boundary. POSIX single-quote form: closes the quote on an
+            // embedded `'`, emits `'\''`, reopens.
+            s.push(' ');
+            s.push_str(&shell_quote(a));
         }
         s.push('\n');
     }
@@ -679,23 +711,47 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 let baseline = tighten_baseline_for_dense_thumb_bytes(dense_thumb_bytes);
                 let mut killed: Option<KillReason> = None;
                 let mut repair_lines = 0usize;
-                for line in std::io::BufRead::lines(reader) {
-                    let line = match line {
-                        Ok(l) => l,
-                        // EPIPE / UTF-8 etc.: stop draining; wait() will report
-                        // the real exit status below.
-                        Err(_) => break,
-                    };
-                    // Match case-insensitively on the symbols Ghidra emits
-                    // while looping on overlapping-function repair. The exact
-                    // log shape is an implementation detail, so the match is
-                    // deliberately broad: any one of these substrings counts.
-                    let lower = line.to_ascii_lowercase();
-                    if lower.contains("clearflowandrepaircmd")
-                        || lower.contains("repair")
-                        || lower.contains("overlap")
-                    {
-                        repair_lines = repair_lines.saturating_add(1);
+                // Surface B must also fire on a *silent* spin (GC storm, deadlock,
+                // blocked-on-IO) where Ghidra stops emitting stdout — `BufRead::lines`
+                // blocks on the read and the wall-clock budget would otherwise never
+                // be checked. Drain on a thread, poll via `recv_timeout`, and check
+                // the budget on every poll so a silent hang is still killed.
+                // The drain thread is fire-and-forget: it exits naturally when the
+                // child's stdout closes (either the child exited normally after the
+                // loop, or it gets killed in the Some-branch below). Detaching is
+                // safe — its only job is to keep the pipe drained so the child
+                // never blocks on a full stdout buffer.
+                let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+                let _drain = std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in reader.lines() {
+                        if tx.send(line).is_err() {
+                            break; // main loop dropped rx — stop draining
+                        }
+                    }
+                });
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(Ok(line)) => {
+                            // Match case-insensitively on the symbols Ghidra emits
+                            // while looping on overlapping-function repair. The
+                            // exact log shape is an implementation detail, so the
+                            // match is deliberately broad: any one of these
+                            // substrings counts.
+                            let lower = line.to_ascii_lowercase();
+                            if lower.contains("clearflowandrepaircmd")
+                                || lower.contains("repair")
+                                || lower.contains("overlap")
+                            {
+                                repair_lines = repair_lines.saturating_add(1);
+                            }
+                        }
+                        Ok(Err(_)) => break, // reader errored; wait() reports the real exit
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // No new line in 500 ms — keep checking the wall-clock
+                            // budget so a silent spin is caught.
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // reader EOF
                     }
                     if let Some(reason) = should_kill_tighten(
                         started.elapsed(),
@@ -708,6 +764,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                         break;
                     }
                 }
+                // (Drain thread exits when the child's stdout closes below.)
                 match killed {
                     Some(reason) => {
                         tracing::warn!(
@@ -1648,15 +1705,42 @@ fn run_radare2_thumb(
         let end = off.saturating_add(len as usize).min(image.len());
         let bin = thumb_dir.join(format!("{addr:08x}.bin"));
         std::fs::write(&bin, &image[off..end])?;
-        let output = std::process::Command::new(r2)
+        // Cap r2 stdout (its `aflj;pdfj @@f` JSON is the bulk of memory use —
+        // ~1 KB/function, so ~80 MB on a real 02_MAIN) to defend against a
+        // misbehaving r2 emitting gigabytes. Fail-closed if the cap is hit:
+        // we'd otherwise truncate the JSON mid-array, parse rejects it, and the
+        // whole image is marked failed anyway — explicit is clearer. 256 MiB is
+        // generous against the observed 80 MB ceiling.
+        const R2_STDOUT_CAP: usize = 256 * 1024 * 1024;
+        let mut child = std::process::Command::new(r2)
             .args(["-a", "arm", "-b", "16", "-m"])
             .arg(format!("0x{addr:x}"))
             .args(["-q", "-c", "aaa;aflj;pdfj @@f"])
             .arg(&bin)
             .stderr(std::process::Stdio::null())
-            .output()?;
-        check_radare2_thumb_status(output.status.success(), output.status.code(), addr)?;
-        let parsed = parse_checked_radare2_thumb_output(&output.stdout, addr)?;
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stdout_bytes = Vec::new();
+        let truncated = {
+            use std::io::Read;
+            let mut limited = (&mut stdout).take((R2_STDOUT_CAP + 1) as u64);
+            limited.read_to_end(&mut stdout_bytes)? > R2_STDOUT_CAP
+        };
+        if truncated {
+            // Drop the child so r2 doesn't keep writing into a buffer that
+            // nobody reads; then reap. Pipe buffer (64 KB) was the only back-
+            // pressure, so r2 may already be blocked on write — kill unblocks.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::ToolNotFound(format!(
+                "radare2 emitted > {R2_STDOUT_CAP} bytes for region {addr:08x}; capped to prevent OOM"
+            )));
+        }
+        drop(stdout);
+        let status = child.wait()?;
+        check_radare2_thumb_status(status.success(), status.code(), addr)?;
+        let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
         for (f, pdfj) in parsed.pairs {
             all.push(normalize_radare2_function_checked(&f, &pdfj, addr)?);
         }
@@ -1873,13 +1957,49 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
             continue;
         }
         // Capture from this line through the matching closing brace at depth 0.
+        // State machine tracks string literals + line/block comments so a `}` inside
+        // `"expected }"` or `// close }` doesn't truncate the body. Char literals
+        // (`'}'`) are not tracked — rare in Ghidra decompiled C, and bounded impact
+        // (only affected body_c, matching is by entry address). Mirrors the
+        // string-aware pattern already used by `balanced_json_end`.
         let mut depth = 0i32;
         let mut saw_brace = false;
         let mut body = String::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut in_block_comment = false;
         while i < lines.len() {
             let l = lines[i];
-            for ch in l.chars() {
+            let mut chars = l.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if in_block_comment {
+                    if ch == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        in_block_comment = false;
+                    }
+                    continue;
+                }
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
                 match ch {
+                    '"' => in_string = true,
+                    '/' => {
+                        if chars.peek() == Some(&'/') {
+                            chars.next();
+                            break; // rest of line is a line comment
+                        } else if chars.peek() == Some(&'*') {
+                            chars.next();
+                            in_block_comment = true;
+                        }
+                    }
                     '{' => {
                         depth += 1;
                         saw_brace = true;
@@ -2787,10 +2907,7 @@ INFO: second pdfj body was noisy and not parseable
             sh.contains("TameAnalysis.java"),
             "run script must wire the pre-script:\n{sh}"
         );
-        assert!(
-            sh.contains("\"-loader-baseAddr\" \"40010000\""),
-            "sh:\n{sh}"
-        );
+        assert!(sh.contains("'-loader-baseAddr' '40010000'"), "sh:\n{sh}");
         assert!(!sh.contains("0x40010000"));
         assert!(
             sh.contains("mkdir -p \"$HERE/ghidra_project\""),
@@ -3045,6 +3162,45 @@ INFO: second pdfj body was noisy and not parseable
         assert!(
             sh.contains("$GHIDRA_INSTALL_DIR/libexec/support/analyzeHeadless"),
             "sh:\n{sh}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shell_quote_escapes_metacharacters() {
+        // Plain alphanumeric / path chars stay readable (no quoting noise).
+        assert_eq!(shell_quote("ARM:LE:32:v7"), "'ARM:LE:32:v7'");
+        assert_eq!(shell_quote("40010000"), "'40010000'");
+        // Empty string is the empty-quoted form.
+        assert_eq!(shell_quote(""), "''");
+        // A single embedded quote splits the literal — `'\''` — and the rest reopens.
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn run_script_quotes_processor_arg_against_injection() {
+        // `--processor` flows in unfiltered from the user; an injection attempt
+        // like `a';rm -rf $HOME;echo'` must round-trip as a single-quoted literal
+        // and never break out of the quoted argv token.
+        let base = std::env::temp_dir().join(format!("pme_runscript_inj_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb])]);
+        let toc = Toc::parse(&buf).unwrap();
+        let evil = "a';rm -rf $HOME;echo'";
+        write_run_script(&base, &toc, evil).unwrap();
+        let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
+        // The processor appears only inside the single-quoted, escaped form — never
+        // raw. The dangerous chars (`;`, `$`, ` `, `'`) are inert inside the quotes.
+        assert!(
+            sh.contains(&shell_quote(evil)),
+            "expected processor to be shell-quoted in:\n{sh}"
+        );
+        // The raw payload (with its `;` command separators) must NOT appear
+        // unquoted anywhere in the script — that would be a command injection.
+        assert!(
+            !sh.contains(evil),
+            "raw injection payload leaked unquoted in:\n{sh}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -3307,5 +3463,43 @@ INFO: second pdfj body was noisy and not parseable
         assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
         // Surfaced as a typed error (any variant — just confirm it's not silent).
         let _ = format!("{err}");
+    }
+
+    #[test]
+    fn thumb_enrich_brace_in_string_does_not_truncate_body() {
+        // A `}` inside a C string literal must NOT be counted as a closing brace.
+        // Before the string-aware counter, this truncated `body_c` at the first
+        // in-string `}`. Block and line comments are exercised too.
+        let root = temp_dir("thumb_enrich_brace_in_string");
+        let c_path = root.join("decompiled.c");
+        let c = "// FUN_40e1300 @ 00040e1300\n\
+                 void FUN_40e1300(void)\n\
+                 {\n\
+                 \x20 const char *s = \"expected } close\";\n\
+                 \x20 /* block comment with } brace */\n\
+                 \x20 // line comment with } brace\n\
+                 \x20 helper_call();\n\
+                 \x20 return;\n\
+                 }\n\n";
+        std::fs::write(&c_path, c).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1300","name":"thumb_40e1300","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        let body_c = v["functions"][0]["body_c"].as_str().unwrap();
+        assert!(
+            body_c.contains("helper_call"),
+            "body_c was truncated by an in-string/comment brace:\n{body_c}"
+        );
+        assert!(body_c.contains("expected } close"));
     }
 }

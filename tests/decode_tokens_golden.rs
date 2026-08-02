@@ -38,7 +38,7 @@ fn decode_tokens_matches_golden() {
     );
 
     // run() emits a canonical CSV: 151 sorted rows incl. the spot-checked pair
-    let out = std::env::temp_dir().join("pme_decode_tokens");
+    let out = std::env::temp_dir().join(format!("pme_decode_tokens_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     pixel_modem_extractor::tokens::run(&db_path, &out).unwrap();
     let csv = std::fs::read_to_string(out.join("pw_token_db.csv")).unwrap();

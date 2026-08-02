@@ -26,7 +26,7 @@ fn decode_rf_matches_golden() {
         eprintln!("skip: golden inputs absent");
         return;
     }
-    let out = std::env::temp_dir().join("pme_decode_rf");
+    let out = std::env::temp_dir().join(format!("pme_decode_rf_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     pixel_modem_extractor::decode_rf::run(&rf_dir, &hwcfg, &out).unwrap();
 

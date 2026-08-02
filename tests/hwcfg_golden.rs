@@ -35,7 +35,7 @@ fn hwcfg_matches_golden() {
     assert!(cov.unused.is_empty(), "unused");
 
     // run() writes summary.json with matching stats
-    let out = std::env::temp_dir().join("pme_hwcfg");
+    let out = std::env::temp_dir().join(format!("pme_hwcfg_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     pixel_modem_extractor::hwcfg::run(&hw, Some(rf_dir.as_path()), &out).unwrap();
     let summary: serde_json::Value =

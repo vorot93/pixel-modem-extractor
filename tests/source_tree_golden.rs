@@ -33,7 +33,7 @@ fn source_tree_matches_golden() {
         eprintln!("skip: golden inputs absent");
         return;
     }
-    let out = std::env::temp_dir().join("pme_st_golden");
+    let out = std::env::temp_dir().join(format!("pme_st_golden_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     let opts = pixel_modem_extractor::source_tree::Opts::default();
     pixel_modem_extractor::source_tree::run(&gold_02main, &out, &opts).unwrap();

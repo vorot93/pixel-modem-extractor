@@ -119,13 +119,25 @@ fn parse_mov(line: &str, op: &str) -> Option<(String, u32)> {
     Some((reg, val))
 }
 
-/// token -> string, de-duplicated (first string wins on a collision).
+/// token -> string, de-duplicated. First **live** (non-`date_removed`) entry
+/// wins; if every entry for a token is marked removed, falls back to the first
+/// removed entry. A stale removed entry must not win over a live one for the
+/// same token (the DB can list both).
 pub fn token_map(db: &crate::tokens::Database) -> HashMap<u32, String> {
-    let mut m = HashMap::new();
+    let mut live: HashMap<u32, String> = HashMap::new();
+    let mut removed: HashMap<u32, String> = HashMap::new();
     for e in &db.entries {
-        m.entry(e.token).or_insert_with(|| e.string.clone());
+        if e.date_removed.is_some() {
+            removed.entry(e.token).or_insert_with(|| e.string.clone());
+        } else {
+            live.entry(e.token).or_insert_with(|| e.string.clone());
+        }
     }
-    m
+    // Tokens that only ever had removed entries fall back to the first removed one.
+    for (k, v) in removed {
+        live.entry(k).or_insert(v);
+    }
+    live
 }
 
 /// Split a pw_tokenizer entry into `(format, domain)`. The Shannon build wraps
@@ -303,8 +315,11 @@ fn is_ident(s: &str) -> bool {
 }
 
 /// Recover a function's `__func__` name: it must reference a `__FILE__`
-/// occurrence vaddr (proving an assert/log site), and exactly one of its
-/// `data_refs` must resolve to a bare identifier (unambiguous → fail-closed).
+/// occurrence vaddr (proving an assert/log site), and exactly one *distinct*
+/// `data_refs` identifier must resolve (unambiguous → fail-closed). Dedup by
+/// string content first: Ghidra/radare2 can emit the same `__func__` ref twice
+/// (e.g. two asserts in one function) and that legitimate duplicate must not
+/// make a single identifier look ambiguous.
 pub fn recover_func_name(
     data_refs: &[u64],
     file_occ: &HashSet<u64>,
@@ -313,10 +328,12 @@ pub fn recover_func_name(
     if !data_refs.iter().any(|r| file_occ.contains(r)) {
         return None;
     }
+    let mut seen: HashSet<&str> = HashSet::new();
     let idents: Vec<&String> = data_refs
         .iter()
         .filter_map(|r| strings.get(r))
         .filter(|s| is_ident(s))
+        .filter(|s| seen.insert(s.as_str()))
         .collect();
     match idents.as_slice() {
         [only] => Some((*only).clone()),
@@ -689,14 +706,25 @@ fn build_rename_map(symbols: &[Symbol]) -> Vec<(&str, &str)> {
     renames
 }
 
-/// Apply the rename map left-to-right (already sorted longest-first by the
-/// caller via `build_rename_map`). Pure text substitution; no sentinel.
+/// Apply the rename map by whole-identifier replacement, not substring
+/// substitution. Walks the text matching `[A-Za-z0-9_]+` (one C identifier at
+/// a time) and substitutes only when the captured ident equals an entry in
+/// `renames` — so `FUN_40001000` does NOT fire inside `FUN_40001000_extra` or
+/// inside an unrelated comment/string. `str::replace` was wrong here: it would
+/// corrupt prefix matches in body text. No sentinel.
 fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
-    let mut out = text.to_string();
-    for (orig, name) in renames {
-        out = out.replace(orig, name);
+    if renames.is_empty() {
+        return text.to_string();
     }
-    out
+    let map: HashMap<&str, &str> = renames.iter().copied().collect();
+    // One compilation regardless of map size; the closure looks up each captured
+    // identifier verbatim. Safe because original_names are themselves C idents.
+    let re = regex::Regex::new(r"[A-Za-z0-9_]+").expect("static pattern compiles");
+    re.replace_all(text, |caps: &regex::Captures| -> String {
+        let matched = caps.get(0).expect("capture 0 is the whole match").as_str();
+        map.get(matched).copied().unwrap_or(matched).to_string()
+    })
+    .into_owned()
 }
 
 /// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
@@ -1089,14 +1117,82 @@ mod tests {
         };
         let m = token_map(&db);
         assert_eq!(m.len(), 2);
-        assert_eq!(m[&1], "first"); // first string wins on a collision
+        assert_eq!(m[&1], "first"); // first live string wins on a collision
         assert_eq!(m[&2], "B");
+    }
+
+    #[test]
+    fn token_map_prefers_live_over_removed() {
+        // A stale removed entry ahead of the live one must NOT win.
+        use crate::tokens::{Database, Date, Entry};
+        let db = Database {
+            reserved: 0,
+            entries: vec![
+                Entry {
+                    token: 7,
+                    date_removed: Some(Date {
+                        year: 2020,
+                        month: 1,
+                        day: 2,
+                    }),
+                    string: "stale".into(),
+                },
+                Entry {
+                    token: 7,
+                    date_removed: None,
+                    string: "live".into(),
+                },
+            ],
+        };
+        let m = token_map(&db);
+        assert_eq!(m[&7], "live");
+
+        // And the all-removed case still falls back to the first entry.
+        let db2 = Database {
+            reserved: 0,
+            entries: vec![Entry {
+                token: 8,
+                date_removed: Some(Date {
+                    year: 2021,
+                    month: 3,
+                    day: 4,
+                }),
+                string: "only_removed".into(),
+            }],
+        };
+        let m2 = token_map(&db2);
+        assert_eq!(m2[&8], "only_removed");
     }
 
     #[test]
     fn sanitize_ident_makes_valid_c_identifier() {
         assert_eq!(sanitize_ident("LteRrc_Handle"), "LteRrc_Handle");
         assert_eq!(sanitize_ident("9bad-name"), "_9bad_name");
+    }
+
+    #[test]
+    fn recover_func_name_dedups_repeated_identifier() {
+        // Two data_refs pointing to the same __func__ string used to fail the
+        // "exactly one identifier" gate (idents.len() == 2) and drop a real name.
+        let file_occ = HashSet::from([100u64]);
+        let mut strings = HashMap::new();
+        strings.insert(100, "path/file.c".to_string()); // __FILE__ ref
+        strings.insert(200, "do_thing".to_string()); // __func__ ref (referenced twice)
+        // data_refs visits vaddr 200 twice (two asserts in one function).
+        let data_refs = vec![100u64, 200, 200];
+        let name = recover_func_name(&data_refs, &file_occ, &strings);
+        assert_eq!(name.as_deref(), Some("do_thing"));
+    }
+
+    #[test]
+    fn apply_rename_map_does_not_substring_match() {
+        // FUN_10 must not fire inside FUN_100, FUN_10_x, or a comment containing it.
+        let text = "FUN_10 FUN_100 FUN_10_x /* call FUN_10 here */\nthumb_10";
+        let renames: [(&str, &str); 2] = [("FUN_10", "alpha"), ("thumb_10", "beta")];
+        let out = apply_rename_map(text, &renames);
+        // Only the exact-identifier FUN_10 (first token) and thumb_10 (last) rename;
+        // FUN_100 and FUN_10_x are left intact (no false prefix match).
+        assert_eq!(out, "alpha FUN_100 FUN_10_x /* call alpha here */\nbeta");
     }
 
     fn raw() -> RawEvidence {

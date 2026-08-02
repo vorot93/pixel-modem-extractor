@@ -20,7 +20,7 @@ fn decompose_produces_unified_tree() {
         return;
     }
 
-    let out = std::env::temp_dir().join("pme_decompose_golden");
+    let out = std::env::temp_dir().join(format!("pme_decompose_golden_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     let opts = decompose::Opts {
         no_verify: false,
@@ -209,7 +209,10 @@ fn report_json_includes_phase2_fields() {
         return;
     }
 
-    let out = std::env::temp_dir().join("pme_decompose_golden_phase2");
+    let out = std::env::temp_dir().join(format!(
+        "pme_decompose_golden_phase2_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&out);
     let opts = decompose::Opts {
         no_verify: false,

@@ -15,11 +15,3 @@ pub mod source_tree;
 pub mod symbolicate;
 pub mod toc;
 pub mod tokens;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        assert_eq!(2 + 2, 4);
-    }
-}

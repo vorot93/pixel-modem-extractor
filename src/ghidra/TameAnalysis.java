@@ -72,17 +72,28 @@ public class TameAnalysis extends GhidraScript {
             for (int i = 1; i < args.length; i++) {
                 String arg = args[i];
                 int colon = arg.indexOf(':');
-                if (colon < 0) continue;
-                long addr = Long.parseLong(arg.substring(0, colon), 16);
-                long len = Long.parseLong(arg.substring(colon + 1), 16);
-                Address start = toAddr(addr);
-                Address end = start.add(len - 1);
+                if (colon < 0) {
+                    println("TameAnalysis: skipping malformed region arg (no ':'): " + arg);
+                    continue;
+                }
                 try {
+                    // parseUnsignedLong: a Shannon address can have bit 31 set (e.g. above
+                    // 0x80000000 in some images); signed parseLong would yield a negative and
+                    // `toAddr` would resolve the wrong address. Validate `len` too: 0 underflows
+                    // `start.add(len - 1)`, and >Integer.MAX_VALUE silently truncates the array.
+                    long addr = Long.parseUnsignedLong(arg.substring(0, colon), 16);
+                    long len = Long.parseUnsignedLong(arg.substring(colon + 1), 16);
+                    if (len <= 0 || len > Integer.MAX_VALUE) {
+                        println("TameAnalysis: skipping region with out-of-range len " + len + ": " + arg);
+                        continue;
+                    }
+                    Address start = toAddr(addr);
+                    Address end = start.add(len - 1);
                     listing.clearCodeUnits(start, end, false);
                     listing.createData(start, new ArrayDataType(Undefined1DataType.dataType, (int) len, 1));
                     println("TameAnalysis: marked data region (radare2 handles it) " + start + ".." + end);
                 } catch (Exception e) {
-                    println("TameAnalysis: could not mark " + start + ": " + e.getMessage());
+                    println("TameAnalysis: could not mark region " + arg + ": " + e.getMessage());
                 }
             }
             println("TameAnalysis: mode=datamark (Phase-1 fallback)");

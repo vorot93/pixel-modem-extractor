@@ -19,7 +19,10 @@ radare2.
   Apache-2.0 compatible.
 - **Fail closed.** Parsers and decoders reject malformed or ambiguous binary input and
   return an error rather than emitting silent, plausible-looking garbage. Preserve this —
-  much of the recent history is hardening exactly this behavior.
+  much of the recent history is hardening exactly this behavior. This applies to the
+  decoder shell-outs too: a truncated `RF_CFG_*` (< 0x90 bytes) returns
+  `Error::SizeMismatch` rather than indexing OOB; radare2 stdout > 256 MiB is rejected
+  rather than OOMing the host.
 
 ## Build, lint, test
 
@@ -121,6 +124,13 @@ module; when a file outgrows that, split it.
   `--prune`. It rewrites in place **idempotently** — a sentinel guards `.c`/`.lst`, an
   `original_name` key guards the JSONs, and the loaders prefer `original_name` on a re-run
   (so `symbols.json` provenance stays stable); preserve this if you touch the rewrite path.
+  Name substitution in the rewrite is **whole-identifier** (`[A-Za-z0-9_]+` match +
+  exact-key lookup), not `str::replace` — `FUN_10` must never fire inside `FUN_100`; the
+  `apply_rename_map_does_not_substring_match` test is the regression sentinel. The token
+  map prefers the first **live** (non-`date_removed`) entry per token (a stale removed
+  entry must not win over a live one for the same token); recover_func_name dedups
+  `data_refs` by string content before the "exactly one identifier" check so a repeated
+  `__func__` reference doesn't look ambiguous.
   Scale note: `02_MAIN`'s `thumb_functions.json` is large (~600 MB, ~141k Thumb functions)
   and is loaded/rewritten whole (~4 s, ~3 GB peak); pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not raw literals, so
@@ -323,6 +333,11 @@ module; when a file outgrows that, split it.
   of ~112 min — generous enough to not fire prematurely on production,
   tight enough to catch a true overlap-repair spin (hours otherwise). The
   test-only `--tighten-wall-clock-budget-sec` override bypasses this.
+  (3) **Wall-clock budget must fire on silent hangs too.** Ghidra's stdout is
+  drained on a thread (`mpsc::channel` + `recv_timeout(500ms)`); the main loop
+  checks the budget on every poll, not only after each line, so a GC storm or
+  deadlock that stops emitting stdout is still killed. Do not switch back to a
+  blocking `BufRead::lines` loop — that would re-introduce the blind spot.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`

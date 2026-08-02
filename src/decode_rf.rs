@@ -226,6 +226,16 @@ fn commafy(n: usize) -> String {
 
 fn decode_file(path: &Path, sha2var: &HashMap<String, Vec<Variant>>) -> Result<DecodedFile> {
     let b = std::fs::read(path)?;
+    // `parse_header` reads u32 fields at offsets up to 0x0c and `extract_tables`/`segment_records`
+    // slice from `HDR` (0x90) onward — a truncated or corrupt RF_CFG (e.g. a 0-byte file from a
+    // partial download) would otherwise index out of bounds and abort the whole batch. Fail closed.
+    if b.len() < HDR {
+        return Err(Error::SizeMismatch {
+            name: path.display().to_string(),
+            expected: HDR as u64,
+            actual: b.len() as u64,
+        });
+    }
     let de = data_end(&b);
     let header = parse_header(&b);
     let tables = extract_tables(&b, HDR, de);
@@ -446,5 +456,22 @@ mod tests {
         assert_eq!(commafy(42), "42");
         assert_eq!(commafy(1234), "1,234");
         assert_eq!(commafy(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn decode_file_rejects_truncated_input() {
+        // A sub-header file used to index OOB in `rd_u32` (offset 0x0c) and panic.
+        // Now it must fail closed with SizeMismatch instead.
+        let dir = std::env::temp_dir().join(format!("pme_decode_rf_short_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("RF_CFG_deadbeef");
+        std::fs::write(&path, b"\x00\x00\x00").unwrap();
+        let err = decode_file(&path, &HashMap::new());
+        assert!(
+            matches!(err, Err(Error::SizeMismatch { .. })),
+            "expected SizeMismatch, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

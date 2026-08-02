@@ -68,13 +68,16 @@ fn collect_followers(
     let mut j = idx + 1;
     while j < strings.len() && out.len() < max_follow {
         let (off, b) = strings[j];
-        if off - prev_end > gap {
+        // `saturating_sub` defends against an invariant change in `extract_strings`
+        // (overlap, out-of-order) that would otherwise underflow `usize`. Today
+        // the slice is sorted+non-overlapping so this is a no-op on real inputs.
+        if off.saturating_sub(prev_end) > gap {
             break;
         }
         if src_offsets.contains(&off) {
             break;
         }
-        if off - anchor_off > max_span {
+        if off.saturating_sub(anchor_off) > max_span {
             break;
         }
         out.push(latin1(b));
@@ -156,7 +159,7 @@ fn attribute(
         .len();
 
     let mut attributed: HashMap<String, Vec<String>> = HashMap::new();
-    let mut immediate: HashMap<String, bool> = HashMap::new();
+    let mut immediate: HashSet<String> = HashSet::new();
     for (norm, followers) in &per_occ {
         let bucket = attributed.entry(norm.clone()).or_default();
         for s in followers {
@@ -170,7 +173,7 @@ fn attribute(
         if let Some(first) = followers.first()
             && !is_boilerplate(first, &doc_count, num_paths, shared_pct, shared_abs)
         {
-            immediate.insert(norm.clone(), true);
+            immediate.insert(norm.clone());
         }
     }
     attributed.retain(|_, v| !v.is_empty());
@@ -179,11 +182,7 @@ fn attribute(
     for o in occurrences {
         let n = &o.norm;
         let conf = if attributed.get(n).is_some_and(|v| !v.is_empty()) {
-            if *immediate.get(n).unwrap_or(&false) {
-                "high"
-            } else {
-                "low"
-            }
+            if immediate.contains(n) { "high" } else { "low" }
         } else {
             "none"
         };

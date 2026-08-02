@@ -239,6 +239,14 @@ fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Resu
     let dest = images_dir.join(label).join("decompiled");
     if dest.exists() {
         std::fs::remove_dir_all(&dest)?;
+    } else {
+        // The per-image parent (`images/<label>/`) may not exist yet — e.g. when
+        // an earlier marshal broke out of its loop before creating every image's
+        // dir. `marshal_image` creates it on the happy path; mirror that here so
+        // the rename never fails with ENOENT and silently drops pass-2 output.
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     std::fs::rename(&export, dest)?;
     Ok(())
@@ -408,58 +416,93 @@ fn finalize(
     }
 }
 
+/// Per-image symbol map outcome from [`build_and_write_symbol_maps`]: the
+/// successful `(label, (path, count))` entries plus any per-image errors.
+type SymbolMapsResult = (Vec<(String, (PathBuf, usize))>, Vec<(String, String)>);
+
 /// Build the per-image symbol map from pass-1 outputs and write each to
-/// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(label, (path, count))`
-/// per image where `count` is the number of symbols with non-null names.
+/// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(successes, errors)`:
+/// each success is `(label, (path, count))` where `count` is the number of
+/// symbols with non-null names; each error is `(label, message)`. Surfaces
+/// I/O / parse failures (token DB, build_map, write_symbol_map) so the caller
+/// can distinguish "no symbols recovered" from "stage errored" — the previous
+/// all-`unwrap_or_default` / `.is_ok()` shape silently swallowed real failures
+/// into a benign-looking `symbol_map: skipped`.
 fn build_and_write_symbol_maps(
     out: &Path,
     images_dir: &Path,
     token_db: &Path,
     manifest: &Path,
-) -> Vec<(String, (PathBuf, usize))> {
+) -> SymbolMapsResult {
+    let mut errors: Vec<(String, String)> = Vec::new();
     let tokens = if token_db.exists() {
-        std::fs::read(token_db)
-            .ok()
-            .and_then(|b| crate::tokens::parse(&b).ok())
-            .map(|db| symbolicate::token_map(&db))
-            .unwrap_or_default()
+        match std::fs::read(token_db)
+            .map_err(|e| e.to_string())
+            .and_then(|b| crate::tokens::parse(&b).map_err(|e| e.to_string()))
+        {
+            Ok(db) => symbolicate::token_map(&db),
+            Err(msg) => {
+                errors.push((
+                    "<token_db>".to_string(),
+                    format!("failed to load token db {}: {msg}", token_db.display()),
+                ));
+                HashMap::new()
+            }
+        }
     } else {
         HashMap::new()
     };
     let maps_dir = out.join("ghidra").join("symbol_maps");
-    let _ = std::fs::create_dir_all(&maps_dir);
-    let mut out_vec = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(images_dir) {
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            let Some(label) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
-                continue;
-            };
-            if !dir.join("decompiled").join("functions.json").exists() {
-                continue;
-            }
-            let funcs_sha = std::fs::read(dir.join("decompiled").join("functions.json"))
-                .ok()
-                .map(|b| crate::manifest::sha256_bytes(&b))
-                .unwrap_or_default();
-            let image_sha = std::fs::read(dir.join(format!("{label}.bin")))
-                .ok()
-                .map(|b| crate::manifest::sha256_bytes(&b))
-                .unwrap_or_default();
-            let symbols = match symbolicate::build_map(&dir, &label, &tokens, manifest) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let with_names = symbols.iter().filter(|s| s.name.is_some()).count();
-            let map_path = maps_dir.join(format!("{label}.json"));
-            if symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_sha, &funcs_sha)
-                .is_ok()
-            {
-                out_vec.push((label, (map_path, with_names)));
-            }
-        }
+    if let Err(e) = std::fs::create_dir_all(&maps_dir) {
+        // Without the maps dir we can't write anything; record once and bail.
+        errors.push(("<maps_dir>".into(), format!("create_dir_all: {e}")));
+        return (Vec::new(), errors);
     }
-    out_vec
+    let mut out_vec = Vec::new();
+    let entries = match std::fs::read_dir(images_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push((
+                "<images_dir>".into(),
+                format!("read_dir {}: {e}", images_dir.display()),
+            ));
+            return (out_vec, errors);
+        }
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Some(label) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if !dir.join("decompiled").join("functions.json").exists() {
+            continue;
+        }
+        let funcs_sha = std::fs::read(dir.join("decompiled").join("functions.json"))
+            .ok()
+            .map(|b| crate::manifest::sha256_bytes(&b))
+            .unwrap_or_default();
+        let image_sha = std::fs::read(dir.join(format!("{label}.bin")))
+            .ok()
+            .map(|b| crate::manifest::sha256_bytes(&b))
+            .unwrap_or_default();
+        let symbols = match symbolicate::build_map(&dir, &label, &tokens, manifest) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push((label.clone(), format!("build_map: {e}")));
+                continue;
+            }
+        };
+        let with_names = symbols.iter().filter(|s| s.name.is_some()).count();
+        let map_path = maps_dir.join(format!("{label}.json"));
+        if let Err(e) =
+            symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_sha, &funcs_sha)
+        {
+            errors.push((label.clone(), format!("write_symbol_map: {e}")));
+            continue;
+        }
+        out_vec.push((label, (map_path, with_names)));
+    }
+    (out_vec, errors)
 }
 
 /// Exhaustive pipeline into one per-image tree. Ghidra + radare2 required (probed
@@ -647,8 +690,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     // 6. Build the per-image symbol map from pass-1 outputs + attribution +
     //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
     let t = Instant::now();
-    let symbol_maps = if opts.no_symbol_pass {
-        Vec::new()
+    let (symbol_maps, symbol_map_errors) = if opts.no_symbol_pass {
+        (Vec::new(), Vec::new())
     } else {
         build_and_write_symbol_maps(out, &images_dir, &token_db, &out.join("manifest.json"))
     };
@@ -656,7 +699,25 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         stages.push(StageReport::skipped("symbol_map", "--no-symbol-pass"));
     } else {
         let total: usize = symbol_maps.iter().map(|(_, (_, n))| *n).sum();
-        let stage = if total == 0 {
+        // Real failures surface as a `failed` stage (the prior shape collapsed
+        // them into `skipped, "no symbols recovered"` — a violation of the
+        // fail-closed posture). If there are successes we still report `ok` so
+        // a transient per-image error doesn't poison the headline metric, but
+        // the errors are preserved for the user to see in `report.json`.
+        let stage = if !symbol_map_errors.is_empty() && total == 0 {
+            StageReport::failed(
+                "symbol_map",
+                format!(
+                    "{} error(s); first: {}",
+                    symbol_map_errors.len(),
+                    symbol_map_errors
+                        .first()
+                        .map(|(_, m)| m.as_str())
+                        .unwrap_or("")
+                ),
+                t.elapsed().as_millis(),
+            )
+        } else if total == 0 {
             StageReport::skipped("symbol_map", "no symbols recovered")
         } else {
             StageReport::ok("symbol_map", "ghidra/symbol_maps/", t.elapsed().as_millis())
