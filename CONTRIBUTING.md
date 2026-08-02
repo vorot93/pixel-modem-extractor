@@ -300,8 +300,10 @@ module; when a file outgrows that, split it.
   (1) **Record-only.** The stage does not modify the Ghidra program or
   `decompiled.c`; `DAT_<addr>` placeholders remain. Applying names in-program
   belongs to a later phase.
-  (2) **Strict-single-source-of-truth.** Multiple names proposed for one
-  address are dropped, not ranked or guessed.
+  (2) **Recovered-only and strict-single-source-of-truth.** Every Phase 3.0
+  entry has `tier: "recovered"`; provisional/function-name inference belongs
+  to a later phase. Multiple names proposed for one address are dropped, not
+  ranked or guessed.
   (3) **Empty-output-is-valid.** A successful zero-match sweep still writes
   `globals.json` with format v1 and `"globals": []`; absence means the stage
   did not complete.
