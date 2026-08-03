@@ -301,8 +301,9 @@ module; when a file outgrows that, split it.
   evidence; conflicting names for one address are dropped rather than
   arbitrated. `ImageReport.globals_recovered` surfaces the per-image count and
   `globals_error` carries per-image failures. Current production verification
-  recovered 968 globals on the real `02_MAIN`; the full six-image sweep dropped
-  100 conflicts. These are observations, not stable count guarantees.
+  recovered 968 globals on the real ARM+Thumb `02_MAIN` (ARM-only yield: 424);
+  the full six-image sweep dropped 100 conflicts. These are observations, not
+  stable count guarantees.
   Coverage is intentionally conservative; disassembly-pattern disambiguation
   belongs to Phase 3.0.1 rather than this direct-evidence stage.
 - **Phase 3.0 invariants.** Four structural facts are easy to break:
@@ -372,8 +373,9 @@ module; when a file outgrows that, split it.
   (the inline `reconstruct_load_events_matches_reconstruct_immediates_values`
   sentinel guards the value-set equivalence) — or unify them; the cleanup is
   intentionally deferred.
-- **Phase 3.0 strict-rule path is unchanged.** The 968 Phase-3.0 Recovered
-  still emit with `[String, Function]` evidence; Phase 3.0.1 adds
+- **Phase 3.0 strict-rule path is unchanged.** The Phase-3.0 Recovered
+  (968 ARM+Thumb / 424 ARM-only on production `02_MAIN`) still emit with
+  `[String, Function]` evidence; Phase 3.0.1 adds
   `global_load`/`string_load` only on the disasm-anchored path and does not
   backfill them onto Phase 3.0 entries. A future "unify the evidence shape"
   change is a separate decision; don't fold it into an unrelated fix.
@@ -409,6 +411,31 @@ module; when a file outgrows that, split it.
   the pre-sweep snapshot and the Phase 3.0.1 fields are invisible in
   `report.json`. The `report_json_includes_phase3_0_1_fields` golden test
   (env-gated on `PME_GOLDEN_DIR`) is the regression sentinel.
+- **Phase 3.0.1 production state on `02_MAIN` is ARM-only today.** On ARM-only
+  production (Thumb blocked — see the radare2-cap bullet below), Phase 3.0.1
+  more than doubles Phase 3.0's ARM-only yield: **933 Recovered vs 424 = +509
+  net** (Task 13's first successful end-to-end run; Task 14's conflict
+  characterization). The often-cited 968 figure is Phase 3.0's ARM+Thumb
+  total, so on ARM-only golden dirs the
+  `phase3_0_1_recovered_exceeds_phase3_0_baseline` sentinel asserts
+  `> PHASE3_0_ARM_ONLY_BASELINE` (424), not `> 968`. Once the radare2 cap is
+  lifted, the disasm-anchored path is expected to push the ARM+Thumb total
+  past 968.
+- **Cross-path conflict characterization (Task 14).** Of the 223
+  same-address proposals dropped by strict-single-source on production
+  `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-Phase-3.0.1-disasm
+  disagreements** (the rest are same-path internal conflicts). Strict-
+  precedence would gain +11 Recovered; disasm-precedence +9; **both propagate
+  clearly-wrong names** on the cases they flip. Current strict-drop (drop
+  both on disagreement) is the right call — neither path is reliable enough
+  to arbitrate the other, so the net is 933 (still > 2× the ARM-only Phase
+  3.0 baseline).
+- **radare2 256 MB `R2_STDOUT_CAP` is the Thumb production blocker.** Phase
+  3.0.1 produces zero Thumb recoveries on `02_MAIN` until the cap is lifted or
+  the disasm stream is consumed incrementally (Phase 3.0.1 precheck Concern
+  1; separate follow-up). The ARM-only numbers above are today's production
+  state; the ARM+Thumb projection (~2055 total) stands as the unconfirmed
+  target.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +

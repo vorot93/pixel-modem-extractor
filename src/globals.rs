@@ -65,18 +65,28 @@ const MIN_IDENT_LEN: usize = 3;
 /// C keywords) but are extremely unlikely to be global variable names.
 /// Extend this set if the pre-check (Task 1) surfaces other generic tokens
 /// polluting the results.
+///
+/// `STOPLIST_ADOPTED` below is the union of `src/source_tree.rs`'s
+/// `STOPLIST` (the source-tree reconstruction blocklist) with this set,
+/// deduplicated. The adoption is the quality-pass baseline: the Phase 3.0
+/// pre-check (Task 1 findings) found the `0x4908bbac` "DBT" attractor alone
+/// accounted for 11 of 190 raw proposals, and STOPLIST already neutralized
+/// exactly that class of modem-string noise for source-tree reconstruction.
+/// STOPLIST's non-identifier entries (`"DBT:"`, `".."`, `"."`) cannot survive
+/// the split-on-non-alphanumeric in `filter_identifier_tokens` and are
+/// omitted; only `DBT` and `ASSERT` are identifier-relevant. Both are
+/// underscoreless so the strict-identifier rule drops them today, but they
+/// are listed explicitly so the filter holds if the underscore requirement
+/// is ever relaxed.
 const GENERIC_TOKENS: &[&str] = &[
     "NULL", "null", "true", "false", "TRUE", "FALSE", "void", "int", "char", "long", "short",
     "unsigned", "signed", "src", "main", "include", "define", "struct", "union", "enum", "return",
     "sizeof", "static", "const", "extern", "volatile", "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
     "LOG", "LOGE", "LOGW", "LOGI", "LOGD", "LOGV", "err", "error", "status", "ret", "retval",
     "result",
-    // Cross-checked against `src/source_tree.rs`'s STOPLIST. Both are
-    // underscoreless, so the strict-single-source-of-truth underscore filter
-    // already drops them; listed explicitly to document intent and to be in
-    // place if Phase 3.0.1 relaxes the underscore requirement.
-    "DBT",    // debug-trace macro marker; very high frequency in modem strings
-    "ASSERT", // C assert macro / log prefix; never a global variable name
+    // STOPLIST_ADOPTED from `src/source_tree.rs` — neutralizes the
+    // 0x4908bbac "DBT" attractor and the ASSERT log-prefix (Task 14 findings).
+    "DBT", "ASSERT",
 ];
 
 /// Shared identifier-validation regex (Phase 3.0 inline rule hoisted here so
@@ -366,10 +376,23 @@ pub fn run(
         }
         let global_addr = candidate_refs[0];
 
-        // Collect identifier tokens across all string_refs.
+        // Collect identifier tokens across all string_refs, skipping any
+        // string that IS a __FILE__ source path. A path like
+        // `src/macr_drv/bar.c` (or `.../SMDT/SMDTCORE/Src/sv_SmdtIntfFt.cpp`)
+        // leaks its underscored filename/component as an identifier candidate
+        // — on production `02_MAIN` this named 261 globals after the source
+        // file they happened to be logged from (e.g. 21 distinct addresses
+        // all named `cp_RrcNrDescPrcs` from `cp_RrcNrDescPrcs.c`). Mirrors
+        // `symbolicate::recover_func_name`, where `is_ident` rejects paths
+        // outright (a path contains `/`/`.` and cannot be a bare `__func__`).
+        // The source-path test reuses `source_tree::is_src_path` so the
+        // definition cannot drift from source-tree reconstruction.
         let mut unique_idents: BTreeSet<String> = BTreeSet::new();
         for s_addr in &f.data_refs {
             if let Some(s) = string_map.get(s_addr) {
+                if crate::source_tree::is_src_path(s) {
+                    continue;
+                }
                 unique_idents.extend(filter_identifier_tokens(s));
             }
         }
@@ -1579,6 +1602,44 @@ mod tests {
     }
 
     #[test]
+    fn dbt_attractor_filtered_by_stoplist() {
+        // Regression guard for the STOPLIST adoption: `source_tree.rs`'s
+        // STOPLIST is the baseline blocklist; GENERIC_TOKENS adopts its
+        // identifier-relevant entries (`DBT`, `ASSERT`). On production
+        // `02_MAIN` the `0x4908bbac` "DBT" attractor alone accounted for 11
+        // of 190 raw proposals in the Phase 3.0 pre-check (Task 1 findings).
+        // Both are underscoreless so the strict-identifier rule drops them
+        // today; GENERIC_TOKENS lists them explicitly so the filter holds
+        // even if the underscore requirement is ever relaxed. Here a string
+        // mixes the STOPLIST attractors with one real identifier — the real
+        // identifier survives, the attractors do not.
+        let img = Img::new("dbt_stoplist");
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        img.write_image_bin(&image_with_strings(
+            0x1000,
+            &[(0x3000, "DBT: ASSERT g_real_name")],
+        ));
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(report.recovered_count, 1);
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["globals"][0]["name"], "g_real_name",
+            "STOPLIST attractors (DBT, ASSERT) must be filtered, leaving the real identifier"
+        );
+    }
+
+    #[test]
     fn emits_empty_globals_json_when_nothing_recovers() {
         let img = Img::new("empty");
         // No functions at all → 0 globals. globals.json must still be written.
@@ -1885,6 +1946,43 @@ mod tests {
         assert!(
             normal_out.iter().any(|(a, _, _, _)| *a == global_addr),
             "normal-sized function must still emit Recovered"
+        );
+    }
+
+    #[test]
+    fn strict_rule_filters_file_fragment_identifiers() {
+        // __FILE__ path components with underscores (e.g. the `macr_drv`
+        // directory in `src/macr_drv/bar.c`) survive the identifier rule —
+        // they have an underscore, match the regex, and aren't in
+        // GENERIC_TOKENS — but they are not global names, they are path
+        // fragments. The strict-rule path mirrors
+        // `symbolicate::recover_func_name`, where `is_ident` rejects paths
+        // outright: a string that IS a source path is skipped during
+        // identifier extraction so its filename/component can't leak in as
+        // a candidate name. Here the function's only string ref IS a
+        // __FILE__ path whose only underscored token is a directory name;
+        // without the filter that directory name would be recovered as the
+        // global name.
+        let img = Img::new("strict_file_fragment");
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        // `macr_drv` is the only underscored token; without the __FILE__-
+        // fragment filter it would be proposed as the global name.
+        img.write_image_bin(&image_with_strings(
+            0x1000,
+            &[(0x3000, "src/macr_drv/bar.c")],
+        ));
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(
+            report.recovered_count, 0,
+            "strict-rule path must not propose __FILE__ path fragments as global names"
         );
     }
 
