@@ -401,6 +401,13 @@ pub fn run(
             Ok(s) => (s, None),
             Err(e) => (String::new(), Some(format!("read disasm.lst: {e}"))),
         };
+    // Index disasm.lst ONCE per image (O(L)) so each Phase 3.0.1 per-function
+    // slice lookup is O(log L + k) instead of O(L). Without this, the two
+    // loops below scan the full 7.6M-line `02_MAIN` disasm per function (×
+    // 107,955 ARM functions) → O(N·L) ≈ 8×10¹¹ ops, which blocked production
+    // (150+ min, no `globals.json` emitted). See `DisasmIndex` for the
+    // sortedness invariant.
+    let disasm_index = DisasmIndex::new(&disasm_text);
     for f in &all_funcs {
         let candidate_refs: Vec<u64> = f
             .data_refs
@@ -417,7 +424,7 @@ pub fn run(
         // (radare2 pdfj output — different format from disasm.lst; do NOT
         // re-slice disasm.lst for Thumb).
         let (disasm_slice, k) = match f.arch {
-            Arch::Arm => (disasm_slice_for(f.entry, f.end, &disasm_text), opts.k_arm),
+            Arch::Arm => (disasm_index.slice_for(f.entry, f.end), opts.k_arm),
             Arch::Thumb => (f.body.clone().unwrap_or_default(), opts.k_thumb),
             Arch::Mixed => continue,
         };
@@ -485,7 +492,7 @@ pub fn run(
             continue;
         }
         let (disasm_slice, k) = match f.arch {
-            Arch::Arm => (disasm_slice_for(f.entry, f.end, &disasm_text), opts.k_arm),
+            Arch::Arm => (disasm_index.slice_for(f.entry, f.end), opts.k_arm),
             Arch::Thumb => (f.body.clone().unwrap_or_default(), opts.k_thumb),
             Arch::Mixed => continue,
         };
@@ -1057,22 +1064,59 @@ fn disasm_line_addr(line: &str) -> Option<u64> {
     u64::from_str_radix(tok.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
 }
 
-/// Slice `disasm` (full-image `disasm.lst` text) to lines whose leading
-/// address is in `[entry, end)`. Mirrors `symbolicate::disasm_body_for` for
-/// the Phase 3.0.1 ARM path (Thumb uses the per-function `body` field
-/// directly — different source, different format).
-fn disasm_slice_for(entry: u64, end: u64, disasm: &str) -> String {
-    let mut out = String::new();
-    for line in disasm.lines() {
-        if let Some(addr) = disasm_line_addr(line)
-            && addr >= entry
-            && addr < end
-        {
+/// Address-indexed view of a full-image `disasm.lst` for O(log L + k)
+/// per-function slicing. Replaces the O(L)-per-call linear scan previously
+/// in this file, which made `run`'s Phase 3.0.1 path O(N·L) on large
+/// images (`02_MAIN`: 107,955 ARM functions × 7.6M disasm lines ≈ 8×10¹¹
+/// operations — production ran 150+ min without emitting `globals.json`).
+///
+/// Build ONCE per image (one pass over `disasm.lst`), then look up each
+/// function's slice via `slice_for`.
+///
+/// **Sortedness invariant.** `slice_for` binary-searches by address, so the
+/// backing lines MUST be in non-decreasing address order. Ghidra's
+/// `ExportDecomp.java` emits `disasm.lst` as a linear address-ordered
+/// listing (verified on `02_MAIN`: 0 of 7,627,481 lines out of order); we
+/// preserve file order at construction and trust it at lookup. A future
+/// emitter that breaks sortedness would silently produce wrong slices —
+/// if `disasm.lst` ever stops being sorted, add an explicit sort step
+/// here (or a panic on construction).
+///
+/// Equivalent to a `BTreeMap<u64, &str>` view but without the per-node
+/// overhead: a single sorted `Vec` we binary-search (`partition_point`).
+/// `disasm_line_addr` is reused for address parsing — same PC parsing as
+/// the old linear scan, so slice contents are byte-identical for any
+/// sorted input.
+struct DisasmIndex<'a> {
+    lines: Vec<(u64, &'a str)>,
+}
+
+impl<'a> DisasmIndex<'a> {
+    /// Build the index: one linear pass to parse addresses, dropping
+    /// non-address lines (comments, blanks, the symbolication sentinel).
+    fn new(disasm: &'a str) -> Self {
+        let lines = disasm
+            .lines()
+            .filter_map(|l| disasm_line_addr(l).map(|a| (a, l)))
+            .collect();
+        Self { lines }
+    }
+
+    /// Lines whose leading address is in `[entry, end)`, joined with `\n`
+    /// terminators. O(log L) to find the start, then O(k) to copy the
+    /// matching lines.
+    fn slice_for(&self, entry: u64, end: u64) -> String {
+        let mut out = String::new();
+        let start = self.lines.partition_point(|(a, _)| *a < entry);
+        for (addr, line) in &self.lines[start..] {
+            if *addr >= end {
+                break;
+            }
             out.push_str(line);
             out.push('\n');
         }
+        out
     }
-    out
 }
 
 #[cfg(test)]
@@ -1087,6 +1131,57 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn disasm_index_returns_correct_slice_for_function_range() {
+        // Two functions' worth of address-tagged lines plus a non-address
+        // comment line (which must be skipped) and a trailing line outside
+        // either function's range (which must NOT leak into either slice).
+        // Addresses are emitted in ascending order — matches Ghidra's linear
+        // disassembly listing (the sortedness invariant `DisasmIndex` relies
+        // on, verified on `02_MAIN`: 0/7.6M lines out of order).
+        let disasm = "// pixel-modem-extractor: symbolicated\n\
+                      0x1000: 00402de9  stmdb sp!,{lr}\n\
+                      0x1004: 0a1e72eb  bl 0x41c978f4\n\
+                      0x1008: 0080fde8  ldmia sp!,{pc}^\n\
+                      0x2000: 40000cf1  cpsid f\n\
+                      0x2004: 02e04ee2  sub lr,lr,#0x2\n\
+                      0x3000: 00402de9  stmdb sp!,{lr}\n";
+        let idx = DisasmIndex::new(disasm);
+
+        // Function [0x1000, 0x1008): exactly the first two instruction lines.
+        let s1 = idx.slice_for(0x1000, 0x1008);
+        assert_eq!(
+            s1,
+            "0x1000: 00402de9  stmdb sp!,{lr}\n\
+             0x1004: 0a1e72eb  bl 0x41c978f4\n"
+        );
+
+        // Function [0x2000, 0x2008): the next two. Crucially does NOT include
+        // 0x1008 (prior fn's end — half-open) or 0x3000 (outside range).
+        let s2 = idx.slice_for(0x2000, 0x2008);
+        assert_eq!(
+            s2,
+            "0x2000: 40000cf1  cpsid f\n\
+             0x2004: 02e04ee2  sub lr,lr,#0x2\n"
+        );
+
+        // Range with no matching lines -> empty string (not panic).
+        assert_eq!(idx.slice_for(0x4000, 0x4008), "");
+
+        // Empty range -> empty string.
+        assert_eq!(idx.slice_for(0x1000, 0x1000), "");
+
+        // Single-line range [0x3000, 0x3004): exactly the trailing line.
+        assert_eq!(
+            idx.slice_for(0x3000, 0x3004),
+            "0x3000: 00402de9  stmdb sp!,{lr}\n"
+        );
+
+        // Empty disasm -> empty index, empty slice.
+        let empty = DisasmIndex::new("");
+        assert_eq!(empty.slice_for(0x1000, 0x1008), "");
     }
 
     /// Build a minimal image_dir with decompiled/functions.json +
