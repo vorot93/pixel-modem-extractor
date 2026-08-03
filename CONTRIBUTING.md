@@ -412,15 +412,22 @@ module; when a file outgrows that, split it.
   `report.json`. The `report_json_includes_phase3_0_1_fields` golden test
   (env-gated on `PME_GOLDEN_DIR`) is the regression sentinel.
 - **Phase 3.0.1 production state on `02_MAIN` is ARM-only today.** On ARM-only
-  production (Thumb blocked — see the radare2-cap bullet below), Phase 3.0.1
-  more than doubles Phase 3.0's ARM-only yield: **933 Recovered vs 424 = +509
-  net** (Task 13's first successful end-to-end run; Task 14's conflict
-  characterization). The often-cited 968 figure is Phase 3.0's ARM+Thumb
-  total, so on ARM-only golden dirs the
-  `phase3_0_1_recovered_exceeds_phase3_0_baseline` sentinel asserts
-  `> PHASE3_0_ARM_ONLY_BASELINE` (424), not `> 968`. Once the radare2 cap is
-  lifted, the disasm-anchored path is expected to push the ARM+Thumb total
-  past 968.
+  production (Thumb blocked — see the radare2-cap bullet below), the
+  unfiltered yield was **933 Recovered** (Task 13's first successful end-to-end
+  run; Task 14's conflict characterization). After the `__FILE__`-fragment
+  filter (Item 4 + Task 15 fix — both the strict-rule and disasm-anchored paths
+  now skip strings that ARE source paths, dropping globals named after
+  source-file fragments like `cp_RrcNrDescPrcs.c`), the count is **370**.
+  This is *below* Phase 3.0's 424 ARM-only baseline: many of Phase 3.0/3.0.1's
+  "recoveries" were spurious path-fragment names, so the filter trades recall
+  for precision (full-decompose re-verification pending). The often-cited 968
+  figure is Phase 3.0's ARM+Thumb total. The
+  `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden sentinel asserts
+  `> PHASE3_0_ARM_ONLY_BASELINE` (424) — a premise that now needs recalibration
+  on the next golden re-verification (production-filtered is 370 < 424); the
+  sentinel is env-gated (`PME_GOLDEN_DIR`) so CI is unaffected until then. Once
+  the radare2 cap is lifted, the disasm-anchored path is expected to push the
+  ARM+Thumb total past 968.
 - **Cross-path conflict characterization (Task 14).** Of the 223
   same-address proposals dropped by strict-single-source on production
   `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-Phase-3.0.1-disasm
@@ -428,8 +435,9 @@ module; when a file outgrows that, split it.
   precedence would gain +11 Recovered; disasm-precedence +9; **both propagate
   clearly-wrong names** on the cases they flip. Current strict-drop (drop
   both on disagreement) is the right call — neither path is reliable enough
-  to arbitrate the other, so the net is 933 (still > 2× the ARM-only Phase
-  3.0 baseline).
+  to arbitrate the other, so the net is 933 pre-filter (the Task 14 figure;
+  after the `__FILE__`-fragment filter the net drops further — see the
+  production-state bullet above).
 - **radare2 256 MB `R2_STDOUT_CAP` is the Thumb production blocker.** Phase
   3.0.1 produces zero Thumb recoveries on `02_MAIN` until the cap is lifted or
   the disasm stream is consumed incrementally (Phase 3.0.1 precheck Concern

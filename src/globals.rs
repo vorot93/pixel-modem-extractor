@@ -104,7 +104,22 @@ fn ident_regex() -> &'static regex::Regex {
 /// `ident_regex`, and not in `GENERIC_TOKENS`. Hoisted out of `run`'s strict-
 /// rule loop so Phase 3.0.1's per-string-load filtering reuses the exact same
 /// rule — drift between the two paths would silently skew coverage.
+///
+/// Skips strings that ARE `__FILE__` source paths outright. A path like
+/// `src/macr_drv/bar.c` (or `.../SMDT/SMDTCORE/Src/sv_SmdtIntfFt.cpp`) leaks
+/// its underscored filename/component as an identifier candidate — on
+/// production `02_MAIN` this named globals after the source file they happened
+/// to be logged from. Mirrors `symbolicate::recover_func_name`, where
+/// `is_ident` rejects paths outright (a path contains `/`/`.` and cannot be a
+/// bare `__func__`). Centralizing the skip here means both call sites — the
+/// strict-rule path in `run` and the disasm-anchored
+/// `disasm_anchored_recovered_for_function` — apply it by construction. The
+/// source-path test reuses `source_tree::is_src_path` so the definition cannot
+/// drift from source-tree reconstruction.
 fn filter_identifier_tokens(content: &str) -> BTreeSet<String> {
+    if crate::source_tree::is_src_path(content) {
+        return BTreeSet::new();
+    }
     let generic: BTreeSet<&str> = GENERIC_TOKENS.iter().copied().collect();
     content
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -376,23 +391,13 @@ pub fn run(
         }
         let global_addr = candidate_refs[0];
 
-        // Collect identifier tokens across all string_refs, skipping any
-        // string that IS a __FILE__ source path. A path like
-        // `src/macr_drv/bar.c` (or `.../SMDT/SMDTCORE/Src/sv_SmdtIntfFt.cpp`)
-        // leaks its underscored filename/component as an identifier candidate
-        // — on production `02_MAIN` this named 261 globals after the source
-        // file they happened to be logged from (e.g. 21 distinct addresses
-        // all named `cp_RrcNrDescPrcs` from `cp_RrcNrDescPrcs.c`). Mirrors
-        // `symbolicate::recover_func_name`, where `is_ident` rejects paths
-        // outright (a path contains `/`/`.` and cannot be a bare `__func__`).
-        // The source-path test reuses `source_tree::is_src_path` so the
-        // definition cannot drift from source-tree reconstruction.
+        // Collect identifier tokens across all string_refs. `__FILE__` source
+        // paths are skipped inside the shared `filter_identifier_tokens`
+        // helper (see its doc comment) — centralizing the skip there means
+        // this path and the disasm-anchored path apply it identically.
         let mut unique_idents: BTreeSet<String> = BTreeSet::new();
         for s_addr in &f.data_refs {
             if let Some(s) = string_map.get(s_addr) {
-                if crate::source_tree::is_src_path(s) {
-                    continue;
-                }
                 unique_idents.extend(filter_identifier_tokens(s));
             }
         }
@@ -1983,6 +1988,34 @@ mod tests {
         assert_eq!(
             report.recovered_count, 0,
             "strict-rule path must not propose __FILE__ path fragments as global names"
+        );
+    }
+
+    #[test]
+    fn disasm_path_filters_file_fragment_identifiers() {
+        // Same __FILE__-fragment leakage as the strict-rule path (see
+        // `strict_rule_filters_file_fragment_identifiers`), but exercising the
+        // disasm-anchored helper directly. A string that IS a source path
+        // leaks its underscored directory/filename as the only identifier
+        // candidate (`macr_drv` here); without the `is_src_path` skip inside
+        // the shared `filter_identifier_tokens` helper the disasm path would
+        // recover `macr_drv` as the global name. Moving the skip into the
+        // helper fixes both call sites by construction.
+        let string_addr = 0x40e22000;
+        let global_addr = 0x40e30000;
+        let string_map = HashMap::from([(string_addr, "src/macr_drv/bar.c".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+                      0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n";
+        let events = symbolicate::reconstruct_load_events(disasm);
+        let out = disasm_anchored_recovered_for_function(
+            &sample_func(Arch::Arm, vec![string_addr, global_addr]),
+            &string_map,
+            &events,
+            K_ARM,
+        );
+        assert!(
+            out.is_empty(),
+            "disasm-anchored path must not propose __FILE__ path fragments as global names"
         );
     }
 

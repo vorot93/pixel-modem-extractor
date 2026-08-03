@@ -165,11 +165,16 @@ fn globals_no_duplicates_by_address() {
 /// Phase 3.0's measured ARM-only baseline for `globals_recovered` on real
 /// `02_MAIN`. Task 14's conflict characterization measured Phase 3.0's
 /// ARM-only yield at 424; the often-cited 968 figure is the ARM+Thumb total.
-/// Phase 3.0.1 more than doubles the ARM-only count (933 observed on
-/// production `02_MAIN`) and is expected to push past the 968 ARM+Thumb total
-/// once the radare2 Thumb cap is lifted (separate follow-up). Asserting the
-/// ARM-only lower bound keeps the sentinel meaningful on ARM-only golden dirs
-/// while still catching any Phase 3.0.1 regression that loses net signal.
+/// Phase 3.0.1's unfiltered ARM-only count was 933 (Task 13/14 verification);
+/// after the `__FILE__`-fragment filter (Item 4 + Task 15 fix — strict-rule
+/// and disasm-anchored paths now skip strings that ARE source paths) the
+/// production count drops to 370, *below* this 424 baseline, because many
+/// prior "recoveries" were spurious source-path-fragment names (precision up,
+/// recall down). The `> PHASE3_0_ARM_ONLY_BASELINE` assertion below therefore
+/// needs recalibration on the next golden re-verification; it is env-gated
+/// (`PME_GOLDEN_DIR`) so CI is unaffected until then. Phase 3.0.1 is still
+/// expected to push past the 968 ARM+Thumb total once the radare2 Thumb cap
+/// is lifted (separate follow-up).
 const PHASE3_0_ARM_ONLY_BASELINE: u64 = 424;
 
 /// Read `$PME_GOLDEN_DIR` or skip the test cleanly. Mirrors Phase 3.0's
@@ -222,9 +227,13 @@ fn count_tier(globals_json: &Value, tier: &str) -> u64 {
 fn phase3_0_1_recovered_exceeds_phase3_0_baseline() {
     // Sentinel 1 — net-new signal. Phase 3.0's strict-only algorithm recovered
     // `PHASE3_0_ARM_ONLY_BASELINE` globals on real ARM-only `02_MAIN`;
-    // Phase 3.0.1's disasm-anchored path must push that count strictly higher
-    // (observed 933 on production ARM-only output). On a full ARM+Thumb golden
-    // dir the count is higher still; the ARM-only lower bound holds in both.
+    // Phase 3.0.1's disasm-anchored path was designed to push that count
+    // strictly higher (933 pre-filter on production ARM-only output; 370 after
+    // the `__FILE__`-fragment filter — see the constant's doc comment for why
+    // the post-filter count falls below this baseline and the assertion needs
+    // recalibration on the next golden re-verification). On a full ARM+Thumb
+    // golden dir the count is higher still; the ARM-only lower bound holds in
+    // both.
     let Some(dir) = golden_dir() else {
         return;
     };
