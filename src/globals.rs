@@ -43,6 +43,19 @@ pub const K_ARM: usize = 4;
 /// window here.
 pub const K_THUMB: usize = 4;
 
+/// Defensive perf guard against Ghidra's occasional mis-estimation of function
+/// boundaries, which produces synthetic "functions" spanning megabytes of
+/// `disasm.lst` (production `02_MAIN` worst case: 37 MB disasm / ~865,534 load-
+/// events / 9.3M instructions attributed to a single "function"). Real modem
+/// functions are typically well under 1 MB; anything past 5 MB is almost
+/// certainly a Ghidra artifact. `disasm_anchored_recovered_for_function` skips
+/// such functions silently (returns an empty `Vec`) so Phase 3.0.1 doesn't
+/// spend minutes in the O(sl × gl) matcher on a mis-estimated slice. This is a
+/// perf guard, not a correctness requirement: Phase 3.0.1's coverage on
+/// `02_MAIN` drops only by whatever globals the mega-slices would have
+/// produced (recorded in the Task 13 production verification).
+const MEGA_FN_THRESHOLD: u64 = 5 * 1024 * 1024;
+
 /// Minimum identifier length. Filters out 1–2 char tokens (`id`, `pt`) that
 /// are too generic to be meaningful global names.
 const MIN_IDENT_LEN: usize = 3;
@@ -841,6 +854,13 @@ fn disasm_anchored_recovered_for_function(
     k: usize,
 ) -> Vec<(u64, String, Evidence, Evidence)> {
     let mut out = Vec::new();
+    // Mega-slice guard: skip Ghidra-mis-estimated "functions" whose `[entry,
+    // end)` span exceeds `MEGA_FN_THRESHOLD`. See the const's doc comment for
+    // rationale. Must run before any per-load-event work so the pathological
+    // case never enters the matching loop.
+    if func.end.saturating_sub(func.entry) > MEGA_FN_THRESHOLD {
+        return out;
+    }
     if load_events.is_empty() {
         return out;
     }
@@ -871,6 +891,18 @@ fn disasm_anchored_recovered_for_function(
         .filter(|e| non_string_refs.contains(&(e.value as u64)))
         .collect();
 
+    // O(1) PC -> load_event index. The matching loop below is O(sl × gl); the
+    // former `load_events.iter().position(...)` per pair made it O(sl × gl ×
+    // E_f), which is intractable on Ghidra-mis-estimated mega-functions (E_f
+    // up to ~865k on `02_MAIN`). PCs are unique in `load_events` (one event
+    // per instruction address); `entry().or_insert` defensively keeps the
+    // first index if a duplicate PC ever slips through, matching
+    // `slice::position`'s first-match semantics exactly.
+    let mut pc_to_idx: HashMap<u32, usize> = HashMap::with_capacity(load_events.len());
+    for (i, e) in load_events.iter().enumerate() {
+        pc_to_idx.entry(e.pc).or_insert(i);
+    }
+
     for sl in string_loads {
         let content = string_map.get(&(sl.value as u64)).unwrap();
         let identifiers = filter_identifier_tokens(content);
@@ -880,13 +912,15 @@ fn disasm_anchored_recovered_for_function(
         let name = identifiers.into_iter().next().unwrap();
 
         // Proximity: global_loads whose load-event-index distance from sl is
-        // within k. position()-by-PC is safe: each instruction sits at a
-        // unique address, so PCs are unique in load_events.
-        let sl_idx = load_events.iter().position(|e| e.pc == sl.pc).unwrap();
+        // within k. PC lookup is O(1) via `pc_to_idx`; PCs are unique in
+        // `load_events`, so the index matches the old `position()` result.
+        let sl_idx = pc_to_idx
+            .get(&sl.pc)
+            .expect("sl drawn from load_events; pc present in pc_to_idx");
         let in_window: Vec<&symbolicate::LoadEvent> = global_loads
             .iter()
             .filter_map(|gl| {
-                let gl_idx = load_events.iter().position(|e| e.pc == gl.pc)?;
+                let gl_idx = *pc_to_idx.get(&gl.pc)?;
                 let dist = sl_idx.abs_diff(gl_idx);
                 (dist <= k).then_some(*gl)
             })
@@ -990,6 +1024,17 @@ fn name_prior_provisional_for_function(
         .filter(|e| non_string_refs.contains(&(e.value as u64)))
         .collect();
 
+    // O(1) PC -> load_event index. See the same block in
+    // `disasm_anchored_recovered_for_function` for rationale. Built per-helper
+    // (not shared with Recovered): `run` invokes the two passes in separate
+    // loops over `all_funcs`, so threading a shared map between them would
+    // restructure both call sites for no gain. The O(E_f) build is dominated
+    // by the O(sl × gl) matching it enables (was O(sl × gl × E_f)).
+    let mut pc_to_idx: HashMap<u32, usize> = HashMap::with_capacity(load_events.len());
+    for (i, e) in load_events.iter().enumerate() {
+        pc_to_idx.entry(e.pc).or_insert(i);
+    }
+
     for sl in string_loads {
         let content = string_map.get(&(sl.value as u64)).unwrap();
         let identifiers = filter_identifier_tokens(content);
@@ -1011,11 +1056,13 @@ fn name_prior_provisional_for_function(
 
         // Among globals within proximity k of the string-load, pick the
         // nearest by load-event-index distance. Ties -> drop.
-        let sl_idx = load_events.iter().position(|e| e.pc == sl.pc).unwrap();
+        let sl_idx = pc_to_idx
+            .get(&sl.pc)
+            .expect("sl drawn from load_events; pc present in pc_to_idx");
         let in_window: Vec<(&symbolicate::LoadEvent, usize)> = global_loads
             .iter()
             .filter_map(|gl| {
-                let gl_idx = load_events.iter().position(|e| e.pc == gl.pc)?;
+                let gl_idx = *pc_to_idx.get(&gl.pc)?;
                 let dist = sl_idx.abs_diff(gl_idx);
                 (dist <= k).then_some((*gl, dist))
             })
@@ -1800,6 +1847,44 @@ mod tests {
         assert!(
             arm_out.iter().any(|(a, _, _, _)| *a == global_addr)
                 || thumb_out.iter().any(|(a, _, _, _)| *a == global_addr)
+        );
+    }
+
+    #[test]
+    fn mega_function_guard_skips_oversize_ranges() {
+        // Ghidra occasionally mis-estimates function boundaries, producing
+        // "functions" spanning megabytes of disasm (production `02_MAIN` worst
+        // case: 37 MB disasm / ~865k load-events / 9.3M insns at one "function").
+        // The mega-slice guard at the top of `disasm_anchored_recovered_for_function`
+        // silently skips any function whose `[entry, end)` span exceeds
+        // `MEGA_FN_THRESHOLD`. Real functions (typically < 1 MB) process normally.
+        let string_addr = 0x40e22000;
+        let global_addr = 0x40e30000;
+        let string_map = HashMap::from([(string_addr, "g_foo is NULL".into())]);
+        let disasm = "0x10: movw r0, 0x2000\n0x14: movt r0, 0x40e2\n\
+              0x18: movw r1, 0x0000\n0x1c: movt r1, 0x40e3\n";
+        let events = symbolicate::reconstruct_load_events(disasm);
+
+        // Span strictly greater than MEGA_FN_THRESHOLD -> guard fires, empty.
+        let mut mega = sample_func(Arch::Arm, vec![string_addr, global_addr]);
+        mega.entry = 0x1000;
+        mega.end = mega.entry + MEGA_FN_THRESHOLD + 1;
+        let mega_out = disasm_anchored_recovered_for_function(&mega, &string_map, &events, K_ARM);
+        assert!(
+            mega_out.is_empty(),
+            "mega-slice function (span > MEGA_FN_THRESHOLD) must be skipped"
+        );
+
+        // Same data_refs / events under a normal-sized span still emits — the
+        // guard must not affect ordinary functions.
+        let mut normal = sample_func(Arch::Arm, vec![string_addr, global_addr]);
+        normal.entry = 0x1000;
+        normal.end = 0x2000;
+        let normal_out =
+            disasm_anchored_recovered_for_function(&normal, &string_map, &events, K_ARM);
+        assert!(
+            normal_out.iter().any(|(a, _, _, _)| *a == global_addr),
+            "normal-sized function must still emit Recovered"
         );
     }
 
