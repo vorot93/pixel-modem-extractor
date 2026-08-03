@@ -66,15 +66,8 @@ const MIN_IDENT_LEN: usize = 3;
 /// Extend this set if the pre-check (Task 1) surfaces other generic tokens
 /// polluting the results.
 ///
-/// `STOPLIST_ADOPTED` below is the union of `src/source_tree.rs`'s
-/// `STOPLIST` (the source-tree reconstruction blocklist) with this set,
-/// deduplicated. The adoption is the quality-pass baseline: the Phase 3.0
-/// pre-check (Task 1 findings) found the `0x4908bbac` "DBT" attractor alone
-/// accounted for 11 of 190 raw proposals, and STOPLIST already neutralized
-/// exactly that class of modem-string noise for source-tree reconstruction.
-/// STOPLIST's non-identifier entries (`"DBT:"`, `".."`, `"."`) cannot survive
-/// the split-on-non-alphanumeric in `filter_identifier_tokens` and are
-/// omitted; only `DBT` and `ASSERT` are identifier-relevant. Both are
+/// Includes DBT and ASSERT adopted from source_tree.rs's STOPLIST to
+/// neutralize the 0x4908bbac "DBT" attractor (Task 14 findings). Both are
 /// underscoreless so the strict-identifier rule drops them today, but they
 /// are listed explicitly so the filter holds if the underscore requirement
 /// is ever relaxed.
@@ -84,8 +77,8 @@ const GENERIC_TOKENS: &[&str] = &[
     "sizeof", "static", "const", "extern", "volatile", "ERROR", "WARN", "INFO", "DEBUG", "TRACE",
     "LOG", "LOGE", "LOGW", "LOGI", "LOGD", "LOGV", "err", "error", "status", "ret", "retval",
     "result",
-    // STOPLIST_ADOPTED from `src/source_tree.rs` — neutralizes the
-    // 0x4908bbac "DBT" attractor and the ASSERT log-prefix (Task 14 findings).
+    // Adopted from source_tree.rs's STOPLIST to neutralize the 0x4908bbac
+    // "DBT" attractor and the ASSERT log-prefix (Task 14 findings).
     "DBT", "ASSERT",
 ];
 
@@ -585,6 +578,13 @@ pub fn run(
     let mut globals: Vec<Global> = Vec::new();
     let mut conflicts_dropped = 0usize;
     let mut provisional_suppressed_by_recovered = 0usize;
+    // Provisional entries that survive to the output `Vec<Global>`.
+    // `provisional_generated` (taken above) counts every name-prior
+    // emission; this counts those actually written. The difference is
+    // `provisional_suppressed` in the serialized file (covers all
+    // suppression paths: opt-out flag, cross-tier Recovered win, same-
+    // tier multi-name drop).
+    let mut materialized_provisional = 0usize;
     // Iterate by ascending addr for deterministic output ordering.
     let mut sorted_addrs: Vec<u64> = addr_to_proposals.keys().copied().collect();
     sorted_addrs.sort_unstable();
@@ -717,6 +717,9 @@ pub fn run(
             evidence,
             annotations: Vec::new(),
         });
+        if tier == "provisional" {
+            materialized_provisional += 1;
+        }
     }
 
     let recovered_count = globals.len();
@@ -734,7 +737,8 @@ pub fn run(
         globals,
         image: image_label.to_string(),
         phase3_0_1_error,
-        provisional_suppressed: None,
+        provisional_suppressed: (provisional_generated > 0)
+            .then_some(provisional_generated - materialized_provisional),
     };
     let out = serde_json::to_string_pretty(&file)
         .map_err(|e| Error::Serialize(format!("re-serialize globals.json: {e}")))?;
@@ -2196,6 +2200,82 @@ mod tests {
     }
 
     #[test]
+    fn run_populates_provisional_suppressed_field() {
+        // `provisional_suppressed` distinguishes "no Provisional generated"
+        // from "generated but withheld/suppressed". Spec contract:
+        //   generated == 0                       -> field absent (None)
+        //   generated > 0, all withheld/dropped  -> Some(generated)
+        //   generated > 0, all materialized      -> Some(0)
+        // Same fixture shape as `provisional_never_emitted_without_opt_in_flag`
+        // — one Provisional proposal comes out of the name-prior pass.
+        let mk = |tag: &str, include_provisional: bool| {
+            let img = Img::new(tag);
+            img.write_manifest_load_addr("0x40e20000");
+            let entry = 0x40e40000;
+            let end = 0x40e40030;
+            let string_addr = 0x40e22000u64;
+            let g1 = 0x40e30000u64;
+            let g2 = 0x40e31000u64;
+            let func_json = serde_json::json!([{
+                "name": format!("FUN_{entry:x}"),
+                "entry": format!("0x{entry:x}"),
+                "end": format!("0x{end:x}"),
+                "size": 0x30,
+                "data_refs": [
+                    format!("0x{string_addr:x}"),
+                    format!("0x{g1:x}"),
+                    format!("0x{g2:x}"),
+                ],
+            }])
+            .to_string();
+            img.write_functions_json(&func_json);
+            img.write_thumb_functions_json(
+                r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+            );
+            let disasm = "0x40e40010: movw r0, 0x2000\n0x40e40014: movt r0, 0x40e2\n\
+                          0x40e40018: movw r1, 0x0000\n0x40e4001c: movt r1, 0x40e3\n\
+                          0x40e40020: movw r2, 0x1000\n0x40e40024: movt r2, 0x40e3\n";
+            fs::write(
+                img.image_dir().join("decompiled").join("disasm.lst"),
+                disasm,
+            )
+            .unwrap();
+            img.write_image_bin(&image_with_strings(
+                0x40e20000,
+                &[(string_addr, "lteRrc_state and otherModule_field are NULL")],
+            ));
+            let mut names = HashMap::new();
+            names.insert(format!("{entry:x}"), "LteRrc_CheckState".to_string());
+            let report = run(
+                &img.image_dir(),
+                img.label(),
+                &img.manifest(),
+                &names,
+                &GlobalsOpts {
+                    include_provisional,
+                    ..GlobalsOpts::default()
+                },
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(
+                &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+            )
+            .unwrap();
+            (report, v)
+        };
+
+        // Withheld (default opts): one Provisional generated, none materialized.
+        let (report_out, v_out) = mk("prov_suppressed_out", false);
+        assert_eq!(report_out.provisional_generated, 1);
+        assert_eq!(v_out["provisional_suppressed"], 1);
+
+        // Opt-in: one Provisional generated, one materialized -> Some(0).
+        let (report_in, v_in) = mk("prov_suppressed_in", true);
+        assert_eq!(report_in.provisional_generated, 1);
+        assert_eq!(v_in["provisional_suppressed"], 0);
+    }
+
+    #[test]
     fn recovered_beats_provisional_at_same_address() {
         // Cross-tier precedence: one function contributes a Recovered
         // (addr, "g_foo") via Phase 3.0 strict-rule; another contributes a
@@ -2435,6 +2515,8 @@ mod tests {
             v.get("globals_error").is_none(),
             "Phase 3.0 globals_error must be absent when Phase 3.0 ran cleanly"
         );
+        // No Provisional generated -> field absent.
+        assert!(v.get("provisional_suppressed").is_none());
     }
 
     #[test]

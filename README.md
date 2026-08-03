@@ -103,7 +103,9 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   recovered global names with address, architecture, tier, and direct string/function evidence.
   Phase 3.0.1 adds two evidence variants — `global_load` and `string_load` (a `movw`+`movt` pair
   that materializes the global's / a naming string's address into a register, with the movw PC) —
-  and a top-level `provisional_suppressed` count (set only on `--globals-provisional` runs).
+  and a top-level `provisional_suppressed` count (set whenever any Provisional
+  globals were generated, regardless of `--globals-provisional`; absent only
+  when none were generated).
 
 ## Contributing
 
