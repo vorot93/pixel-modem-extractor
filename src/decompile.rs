@@ -1708,16 +1708,11 @@ fn normalize_radare2_function_checked(
 /// differences and slightly larger images. Exceeding it indicates genuine
 /// r2 pathology (infinite loop, corrupt input triggering verbose output) —
 /// fail-closed rather than OOM the host.
-//
-// Task 2 wires this into `run_radare2_thumb`'s streaming rewrite; until then
-// it has no non-test consumer in the lib build.
-#[allow(dead_code)]
 pub(super) const R2_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Chunk size for `stream_to_cap`. Smaller than the typical Linux pipe
 /// buffer (64 KiB since 2.6.11), so size checks fire promptly when r2 emits
 /// fast; large enough that per-chunk write overhead is negligible.
-#[allow(dead_code)]
 const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Stream up to `cap` bytes from `reader` to `writer`. Returns the number
@@ -1728,10 +1723,6 @@ const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 ///
 /// Pure I/O — no child-process coupling, no filesystem assumptions. Testable
 /// with `Cursor<Vec<u8>>` readers and `Vec<u8>` writers.
-//
-// Task 2 wires this into `run_radare2_thumb`'s streaming rewrite; until then
-// it has no non-test consumer in the lib build.
-#[allow(dead_code)]
 fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1782,13 +1773,10 @@ fn run_radare2_thumb(
         let end = off.saturating_add(len as usize).min(image.len());
         let bin = thumb_dir.join(format!("{addr:08x}.bin"));
         std::fs::write(&bin, &image[off..end])?;
-        // Cap r2 stdout (its `aflj;pdfj @@f` JSON is the bulk of memory use —
-        // ~1 KB/function, so ~80 MB on a real 02_MAIN) to defend against a
-        // misbehaving r2 emitting gigabytes. Fail-closed if the cap is hit:
-        // we'd otherwise truncate the JSON mid-array, parse rejects it, and the
-        // whole image is marked failed anyway — explicit is clearer. 256 MiB is
-        // generous against the observed 80 MB ceiling.
-        const R2_STDOUT_CAP: usize = 256 * 1024 * 1024;
+        // Stream r2 stdout to a per-region temp file. The file is kept after
+        // parse for debugging (disk is cheap; --prune drops it with the rest
+        // of `thumb/`). Cap is `R2_STDOUT_CAP_BYTES` (4 GiB) — see the const's
+        // doc comment for the production grounding.
         let mut child = std::process::Command::new(r2)
             .args(["-a", "arm", "-b", "16", "-m"])
             .arg(format!("0x{addr:x}"))
@@ -1798,25 +1786,41 @@ fn run_radare2_thumb(
             .stdout(std::process::Stdio::piped())
             .spawn()?;
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stdout_bytes = Vec::new();
-        let truncated = {
-            use std::io::Read;
-            let mut limited = (&mut stdout).take((R2_STDOUT_CAP + 1) as u64);
-            limited.read_to_end(&mut stdout_bytes)? > R2_STDOUT_CAP
-        };
-        if truncated {
-            // Drop the child so r2 doesn't keep writing into a buffer that
-            // nobody reads; then reap. Pipe buffer (64 KB) was the only back-
-            // pressure, so r2 may already be blocked on write — kill unblocks.
+        let stdout_path = thumb_dir.join(format!("{addr:08x}.stdout"));
+        let mut file = std::fs::File::create(&stdout_path)?;
+
+        let cap_err = stream_to_cap(&mut stdout, &mut file, R2_STDOUT_CAP_BYTES);
+        drop(file); // close + flush before any read-back or removal
+        drop(stdout); // drop the pipe handle explicitly
+
+        if let Err(e) = cap_err {
+            // Cap exceeded OR genuine I/O error. Either way: kill, reap,
+            // remove the partial file (no value in keeping truncated output),
+            // return Err. The `ErrorKind::Other` discrimination is the
+            // cap-exceed signal from `stream_to_cap`; a genuine I/O error
+            // could in rare cases also surface as `Other`, but the cleanup
+            // path is identical, so a misclassification only changes the
+            // error message — acceptable per the task brief.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::ToolNotFound(format!(
-                "radare2 emitted > {R2_STDOUT_CAP} bytes for region {addr:08x}; capped to prevent OOM"
-            )));
+            let _ = std::fs::remove_file(&stdout_path);
+            if e.kind() == std::io::ErrorKind::Other {
+                return Err(Error::ToolNotFound(format!(
+                    "radare2 emitted > {R2_STDOUT_CAP_BYTES} bytes for region {addr:08x}; capped to prevent OOM"
+                )));
+            }
+            // Genuine I/O error during streaming — propagate as Error::Io.
+            return Err(e.into());
         }
-        drop(stdout);
+
         let status = child.wait()?;
         check_radare2_thumb_status(status.success(), status.code(), addr)?;
+
+        // Read the streamed file back for parsing. Memory peak here is ~file
+        // size (the parse path holds the bytes + builds JSON Value trees).
+        // Acceptable on research machines; a future streaming-JSON-parser
+        // follow-up would reduce this — see CONTRIBUTING's radare2 invariant.
+        let stdout_bytes = std::fs::read(&stdout_path)?;
         let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
         for (f, pdfj) in parsed.pairs {
             all.push(normalize_radare2_function_checked(&f, &pdfj, addr)?);
