@@ -54,6 +54,14 @@ fn is_source_path(s: &[u8]) -> bool {
     SRC_RE.is_match(s)
 }
 
+/// Whether `s` looks like a `__FILE__` source path (e.g. `src/foo/bar.c`).
+/// Public so other modules (e.g. `globals`'s strict-rule path) can reuse the
+/// exact same source-path definition instead of duplicating the regex —
+/// drift between the two would silently skew `__FILE__`-fragment filtering.
+pub fn is_src_path(s: &str) -> bool {
+    is_source_path(s.as_bytes())
+}
+
 fn collect_followers(
     strings: &[(usize, &[u8])],
     idx: usize,

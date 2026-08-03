@@ -66,6 +66,15 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   `cargo test --release`: debug `symbolicate_finalize` exceeded three hours on
   the real ~630 MB `thumb_functions.json`, while release runs completed in
   roughly 2h12m–2h19m. Both tests skip cleanly when prerequisites are absent.
+- **Phase 3.0.1 goldens** (the last three tests in `tests/globals_golden.rs`
+  and `report_json_includes_phase3_0_1_fields` in `tests/decompose_golden.rs`)
+  read pre-existing decompose output from `$PME_GOLDEN_DIR` and never auto-run
+  decompose — production verification (the plan's task 11) supplies the env.
+  All four skip cleanly when `PME_GOLDEN_DIR` is unset, so `cargo test
+  --all-targets` stays green without a real image. The optional
+  `$PME_GOLDEN_DIR_PROVISIONAL` (a second decompose output produced with
+  `--globals-provisional`) gates the opt-in consistency leg of
+  `phase3_0_1_provisional_emitted_only_with_opt_in`.
 - **External tools:** the `--run` and `decompose` paths shell out to Ghidra
   (`analyzeHeadless`) and radare2 (`r2`); both are probed up front.
 - Write the failing test first (TDD), then the minimal code to pass it.
@@ -89,7 +98,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
 | `decompile.rs` | Ghidra import kit + `--run` (analyzeHeadless) + radare2 Thumb |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
-| `globals.rs` | Phase 3.0 record-only global-name recovery (+ per-image `globals.json`) |
+| `globals.rs` | Phase 3.0 record-only global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
 | `decompose.rs` | One-shot pipeline over all decoders |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
 | `error.rs` | Error types |
@@ -292,8 +301,9 @@ module; when a file outgrows that, split it.
   evidence; conflicting names for one address are dropped rather than
   arbitrated. `ImageReport.globals_recovered` surfaces the per-image count and
   `globals_error` carries per-image failures. Current production verification
-  recovered 968 globals on the real `02_MAIN`; the full six-image sweep dropped
-  100 conflicts. These are observations, not stable count guarantees.
+  recovered 968 globals on the real ARM+Thumb `02_MAIN` (ARM-only yield: 424);
+  the full six-image sweep dropped 100 conflicts. These are observations, not
+  stable count guarantees.
   Coverage is intentionally conservative; disassembly-pattern disambiguation
   belongs to Phase 3.0.1 rather than this direct-evidence stage.
 - **Phase 3.0 invariants.** Four structural facts are easy to break:
@@ -314,6 +324,126 @@ module; when a file outgrows that, split it.
   After mutating per-image results, the sweep MUST call
   `refresh_decompile_stage_images`; otherwise the decompile stage retains its
   pre-globals snapshot and the Phase 3.0 fields disappear from `report.json`.
+- **Phase 3.0.1: disasm-anchored Recovered + name-prior Provisional.** Extends
+  Phase 3.0's strict-rule loop without changing it. For each function, the
+  disasm is scanned for `movw`/`movt` load pairs (PC-tagged via
+  `symbolicate::reconstruct_load_events`); when a global-address load sits
+  within K load-events of a string-address load whose extracted identifier
+  survives Phase 3.0's rule, that identifier pins the global's name —
+  *regardless of the function's `data_ref` cardinality*, so functions Phase
+  3.0 rejected (≠1 non-string `data_ref`) become eligible. Conflicts and
+  cross-tier suppression use the same strict-drop posture as Phase 3.0.
+  `--globals-provisional` additionally admits name-prior-derived
+  `tier: "provisional"` entries (see Scenario 2 caveat); it is default-off
+  and the bare output is byte-equivalent to Phase 3.0's for the Recovered
+  set. The full design lives at
+  `~/.superpowers/pixel-modem-extractor/2026-08-02-globals-phase3-0-1-design.md`.
+- **Phase 3.0.1 invariants.** Five structural facts a fresh change can break:
+  (1) **Disasm grounding is necessary for Recovered — name-prior alone never
+  promotes.** A Provisional name with no Recovered at the same address stays
+  Provisional (and is withheld without `--globals-provisional`); it must not
+  be silently upgraded. The disasm-anchored path is the only Recovered
+  promotion vector Phase 3.0.1 adds over Phase 3.0's strict-string rule.
+  (2) **Recovered beats Provisional at the same address.** When both name the
+  same address, Provisional is suppressed and counted into
+  `globals_provisional_suppressed`; the Recovered entry wins verbatim. Do not
+  "harmonize" the two tiers.
+  (3) **`--globals-provisional` is default-off and the bare `globals.json` is
+  byte-equivalent to Phase 3.0's** for the Recovered set — same top-level
+  `format`/`globals`/`image`, no `provisional_suppressed` field, no
+  `tier: "provisional"` entries. A regression here is a wire-level
+  behavioral change masquerading as additive.
+  (4) **K_ARM / K_THUMB are sourced verbatim from the Phase 3.0.1 pre-check
+  findings doc** (`2026-08-02-globals-phase3-0-1-findings.md`) and baked as
+  named constants in `globals.rs`. Do not edit them ad hoc — re-run the
+  pre-check if a new firmware variant regresses. Mirrors Phase 2.1's
+  `TIGHTEN_EXTRA` provenance rule. The pre-check pinned K_ARM = K_THUMB = 4
+  on this firmware (Pixel 6 Pro mustang).
+  (5) **The K distance metric is load-event count, not instruction count.**
+  K counts `movw`/`movt` load-events strictly between the global load and the
+  string load — an approximation of the design spec's "disasm lines between
+  two PCs" metric. The pre-check confirmed this approximation grounds the K
+  pinning; do not silently switch back to a raw line count, and re-run the
+  pre-check if it changes.
+- **movw/movt load-event reconstruction shares the register tracker.**
+  `symbolicate::reconstruct_load_events` (PC-tagged sibling for Phase 3.0.1)
+  and `symbolicate::reconstruct_immediates` (Phase 1's token-immediate
+  recovery) walk the same disasm with the same register-state machine. A
+  future change to either's `movw`/`movt` handling must keep them in sync
+  (the inline `reconstruct_load_events_matches_reconstruct_immediates_values`
+  sentinel guards the value-set equivalence) — or unify them; the cleanup is
+  intentionally deferred.
+- **Phase 3.0 strict-rule path is unchanged.** The Phase-3.0 Recovered
+  (968 ARM+Thumb / 424 ARM-only on production `02_MAIN`) still emit with
+  `[String, Function]` evidence; Phase 3.0.1 adds
+  `global_load`/`string_load` only on the disasm-anchored path and does not
+  backfill them onto Phase 3.0 entries. A future "unify the evidence shape"
+  change is a separate decision; don't fold it into an unrelated fix.
+- **Surface 3.0.1-A: visibility when disasm is unreadable/absent.** When
+  `disasm.lst` is missing or its read returns `Err`, `globals.json` is still
+  written with Phase 3.0-only content (strict-string-rule Recovered) plus a
+  top-level `phase3_0_1_error` field carrying the io error string; Phase 3.0's
+  own per-image failure surface (`globals_error` on `report.json`) stays
+  `None` — Phase 3.0.1's inability to run is non-fatal. Consumers distinguish
+  "Phase 3.0.1 ran and found nothing" (no field) from "Phase 3.0.1 couldn't
+  run" (field present). Note: a zero-byte but present `disasm.lst` is a valid
+  empty state and does NOT set the field.
+- **Scenario 2 caveat: name-prior is inert on real `02_MAIN`.** The
+  pre-check found the name-prior helper generates only ~4 Provisional
+  candidates on this firmware, all dropped by strict-drop /
+  cross-tier-suppression, so `--globals-provisional` materializes zero
+  `tier: "provisional"` entries regardless of the flag. The flag and schema
+  exist per the surface contract (and would materialize >0 on Scenario-1
+  firmware); the `phase3_0_1_provisional_emitted_only_with_opt_in` golden
+  test asserts the always-true upper bound `materialized <= generated`
+  rather than nonzero, precisely because of this.
+- **Thumb data_refs augmentation.** radare2's per-function `refs` exclude
+  movw/movt-constructed addresses (only direct `LDR`/`STR` refs surface);
+  the Thumb path augments `non_string_refs` with
+  `reconstruct_immediates`-style results before applying Phase 3.0's
+  cardinality rule, mirroring the ARM-side `data_refs` source
+  (`symbolicate.rs`'s `data_refs_for` / inline `non_string_refs`
+  augmentation around the Thumb branch).
+- **Phase 3.0.1 report-surface wiring.** Same lesson as Phase 2.1: after
+  the globals sweep mutates `ImageResult.globals_provisional` /
+  `globals_provisional_suppressed`, the sweep MUST call
+  `refresh_decompile_stage_images`; otherwise the decompile stage carries
+  the pre-sweep snapshot and the Phase 3.0.1 fields are invisible in
+  `report.json`. The `report_json_includes_phase3_0_1_fields` golden test
+  (env-gated on `PME_GOLDEN_DIR`) is the regression sentinel.
+- **Phase 3.0.1 production state on `02_MAIN` is ARM-only today.** On ARM-only
+  production (Thumb blocked — see the radare2-cap bullet below), the
+  unfiltered yield was **933 Recovered** (Task 13's first successful end-to-end
+  run; Task 14's conflict characterization). After the `__FILE__`-fragment
+  filter (Item 4 + Task 15 fix — both the strict-rule and disasm-anchored paths
+  now skip strings that ARE source paths, dropping globals named after
+  source-file fragments like `cp_RrcNrDescPrcs.c`), the count is **370**.
+  This is *below* Phase 3.0's 424 ARM-only baseline: many of Phase 3.0/3.0.1's
+  "recoveries" were spurious path-fragment names, so the filter trades recall
+  for precision (full-decompose re-verification pending). The often-cited 968
+  figure is Phase 3.0's ARM+Thumb total. The
+  `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden sentinel asserts
+  `> PHASE3_0_ARM_ONLY_BASELINE` (424) — a premise that now needs recalibration
+  on the next golden re-verification (production-filtered is 370 < 424); the
+  sentinel is env-gated (`PME_GOLDEN_DIR`) so CI is unaffected until then. Once
+  the radare2 cap is lifted, the disasm-anchored path is expected to push the
+  ARM+Thumb total past 968.
+- **Cross-path conflict characterization (Task 14).** Of the 223
+  same-address proposals dropped by strict-single-source on production
+  `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-Phase-3.0.1-disasm
+  disagreements** (the rest are same-path internal conflicts). Strict-
+  precedence would gain +11 Recovered; disasm-precedence +9; **both propagate
+  clearly-wrong names** on the cases they flip. Current strict-drop (drop
+  both on disagreement) is the right call — neither path is reliable enough
+  to arbitrate the other, so the net is 933 pre-filter (the Task 14 figure;
+  after the `__FILE__`-fragment filter the net drops further — see the
+  production-state bullet above).
+- **radare2 256 MB `R2_STDOUT_CAP` is the Thumb production blocker.** Phase
+  3.0.1 produces zero Thumb recoveries on `02_MAIN` until the cap is lifted or
+  the disasm stream is consumed incrementally (Phase 3.0.1 precheck Concern
+  1; separate follow-up). The ARM-only numbers above are today's production
+  state; the ARM+Thumb projection (~2055 total) stands as the unconfirmed
+  target.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +

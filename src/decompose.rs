@@ -33,6 +33,16 @@ pub struct Opts {
     /// budget for the tighten-watch kill decision. Wired to the hidden
     /// `--tighten-wall-clock-budget-sec` flag. Production callers leave `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
+    /// Phase 3.0.1: emit tier:"provisional" globals (name-prior tiebreakers).
+    /// Wired to `--globals-provisional`. Off by default; Recovered-tier
+    /// globals always emit.
+    pub globals_provisional: bool,
+    /// Phase 3.0.1 test-only: override the ARM proximity window (`K_ARM`).
+    /// Wired to the hidden `--globals-k-arm`. `None` -> use `globals::K_ARM`.
+    pub globals_k_arm: Option<usize>,
+    /// Phase 3.0.1 test-only: override the Thumb proximity window (`K_THUMB`).
+    /// Wired to the hidden `--globals-k-thumb`. `None` -> use `globals::K_THUMB`.
+    pub globals_k_thumb: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +71,10 @@ pub struct ImageReport {
     pub globals_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub globals_recovered: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_provisional: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_provisional_suppressed: Option<usize>,
 }
 
 impl ImageReport {
@@ -84,6 +98,8 @@ impl ImageReport {
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
                 globals_error: r.globals_error.clone(),
                 globals_recovered: r.globals_recovered,
+                globals_provisional: r.globals_provisional,
+                globals_provisional_suppressed: r.globals_provisional_suppressed,
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -99,6 +115,8 @@ impl ImageReport {
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
                 globals_error: r.globals_error.clone(),
                 globals_recovered: r.globals_recovered,
+                globals_provisional: r.globals_provisional,
+                globals_provisional_suppressed: r.globals_provisional_suppressed,
             },
         }
     }
@@ -866,6 +884,16 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let mut globals_errors: Vec<(String, String)> = Vec::new();
     let mut globals_counts: Vec<(String, usize)> = Vec::new();
     let mut globals_conflicts: usize = 0;
+    let mut globals_provisional_total: usize = 0;
+    let mut globals_provisional_suppressed_total: usize = 0;
+    // Phase 3.0.1: construct the globals options from the CLI flags once.
+    // `--globals-k-arm` / `--globals-k-thumb` fall back to the pinned module
+    // constants when unset; `--globals-provisional` is opt-in (default false).
+    let globals_opts = globals::GlobalsOpts {
+        include_provisional: opts.globals_provisional,
+        k_arm: opts.globals_k_arm.unwrap_or(globals::K_ARM),
+        k_thumb: opts.globals_k_thumb.unwrap_or(globals::K_THUMB),
+    };
     {
         let active_images: &mut [decompile::ImageResult] =
             if let Some(ref mut rep2) = pass2_report_opt {
@@ -895,10 +923,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 &label,
                 &out.join("manifest.json"),
                 &recovered_map,
+                &globals_opts,
             ) {
                 Ok(report) => {
                     ir.globals_recovered = Some(report.recovered_count);
+                    ir.globals_provisional = Some(report.provisional_generated);
+                    ir.globals_provisional_suppressed =
+                        Some(report.provisional_suppressed_by_recovered);
                     globals_conflicts += report.conflicts_dropped;
+                    globals_provisional_total += report.provisional_generated;
+                    globals_provisional_suppressed_total +=
+                        report.provisional_suppressed_by_recovered;
                     globals_counts.push((label.clone(), report.recovered_count));
                 }
                 Err(e) => {
@@ -918,10 +953,13 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             "failed"
         },
         output: Some(format!(
-            "{} image(s) processed; {} recovered globals total; {} conflicts dropped",
+            "{} image(s) processed; {} recovered globals total; {} conflicts dropped; \
+             {} provisional generated ({} suppressed by Recovered)",
             globals_counts.len(),
             globals_total,
-            globals_conflicts
+            globals_conflicts,
+            globals_provisional_total,
+            globals_provisional_suppressed_total,
         )),
         reason: None,
         error: globals_errors.first().map(|(_, e)| e.clone()),
@@ -1006,6 +1044,8 @@ mod tests {
                         thumb_enrich_error: None,
                         globals_error: None,
                         globals_recovered: None,
+                        globals_provisional: None,
+                        globals_provisional_suppressed: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -1021,6 +1061,8 @@ mod tests {
                         thumb_enrich_error: None,
                         globals_error: None,
                         globals_recovered: None,
+                        globals_provisional: None,
+                        globals_provisional_suppressed: None,
                     },
                 ],
                 10,
@@ -1131,6 +1173,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -1163,6 +1207,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         });
 
         assert_eq!(image.status, "analyzed");
@@ -1211,6 +1257,8 @@ mod tests {
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             },
             decompile::ImageResult {
                 label: "01_BOOT".into(),
@@ -1224,6 +1272,8 @@ mod tests {
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
             },
         ];
         let images_dir = root.join("images");
@@ -1271,6 +1321,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -1287,6 +1339,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         }];
 
         refresh_decompile_stage_images(&mut stages, &post_enrich_images);
@@ -1338,6 +1392,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
         assert_eq!(outcome.counts.len(), 0);
@@ -1481,6 +1537,8 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -1504,6 +1562,8 @@ mod tests {
             thumb_enrich_error: Some("malformed decompiled.c".into()),
             globals_error: None,
             globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -1526,11 +1586,15 @@ mod tests {
             thumb_enrich_error: None,
             globals_recovered: None,
             globals_error: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("globals_recovered"));
         assert!(!json.contains("globals_error"));
+        assert!(!json.contains("\"globals_provisional\""));
+        assert!(!json.contains("\"globals_provisional_suppressed\""));
     }
 
     #[test]
@@ -1547,11 +1611,15 @@ mod tests {
             thumb_enrich_error: None,
             globals_recovered: Some(137),
             globals_error: Some("malformed functions.json".into()),
+            globals_provisional: Some(50),
+            globals_provisional_suppressed: Some(3),
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"globals_recovered\":137"));
         assert!(json.contains("\"globals_error\":\"malformed functions.json\""));
+        assert!(json.contains("\"globals_provisional\":50"));
+        assert!(json.contains("\"globals_provisional_suppressed\":3"));
     }
 
     #[test]
