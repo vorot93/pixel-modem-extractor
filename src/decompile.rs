@@ -1701,6 +1701,64 @@ fn normalize_radare2_function_checked(
     }))
 }
 
+/// Defensive upper bound on a single Thumb region's r2 stdout. Grounded in
+/// production: 02_MAIN's largest dense-Thumb region (`410b0000`, ~20 MiB
+/// carved .bin, ~71 k functions) emits ~1.82 GiB of `aflj;pdfj @@f` JSON
+/// (~25 KiB/function). 4 GiB is ~2× that peak, with headroom for r2 version
+/// differences and slightly larger images. Exceeding it indicates genuine
+/// r2 pathology (infinite loop, corrupt input triggering verbose output) —
+/// fail-closed rather than OOM the host.
+//
+// Task 2 wires this into `run_radare2_thumb`'s streaming rewrite; until then
+// it has no non-test consumer in the lib build.
+#[allow(dead_code)]
+pub(super) const R2_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Chunk size for `stream_to_cap`. Smaller than the typical Linux pipe
+/// buffer (64 KiB since 2.6.11), so size checks fire promptly when r2 emits
+/// fast; large enough that per-chunk write overhead is negligible.
+#[allow(dead_code)]
+const STREAM_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Stream up to `cap` bytes from `reader` to `writer`. Returns the number
+/// of bytes written on EOF. If input would exceed `cap`, returns
+/// `Err(io::Error)` with `ErrorKind::Other` and a cap-exceeded message;
+/// the caller is responsible for process cleanup (kill, reap, remove
+/// partial file).
+///
+/// Pure I/O — no child-process coupling, no filesystem assumptions. Testable
+/// with `Cursor<Vec<u8>>` readers and `Vec<u8>` writers.
+//
+// Task 2 wires this into `run_radare2_thumb`'s streaming rewrite; until then
+// it has no non-test consumer in the lib build.
+#[allow(dead_code)]
+fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cap: usize,
+) -> std::io::Result<usize> {
+    let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut written: usize = 0;
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(written);
+        }
+        // Check before writing so we never write past the cap.
+        if written + n > cap {
+            // Write up to the cap (so the caller sees a partial file of
+            // exactly `cap` bytes if they inspect it before cleanup).
+            let allowed = cap - written;
+            writer.write_all(&chunk[..allowed])?;
+            return Err(std::io::Error::other(format!(
+                "stream_to_cap: input exceeded {cap} bytes"
+            )));
+        }
+        writer.write_all(&chunk[..n])?;
+        written += n;
+    }
+}
+
 /// Analyze an image's dense Thumb-2 regions with radare2. Each region is carved out,
 /// analyzed as ARM/Thumb (`-a arm -b 16`) based at its load address, and its
 /// `aflj`/`pdfj` function output merged into `out_dir/thumb_functions.json` (the carved
@@ -2524,6 +2582,60 @@ mod tests {
         assert_eq!(entry["body"], body);
         assert_eq!(entry["data_refs"][0], "0x9000");
         assert_eq!(entry["data_refs"][1], "0x9004");
+    }
+
+    #[test]
+    fn stream_to_cap_streams_chunks_until_eof() {
+        let input = vec![0xABu8; 100 * 1024]; // 100 KiB
+        let mut reader = std::io::Cursor::new(&input[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        let n = stream_to_cap(&mut reader, &mut writer, 1024 * 1024).unwrap();
+        assert_eq!(n, 100 * 1024);
+        assert_eq!(writer, input);
+    }
+
+    #[test]
+    fn stream_to_cap_returns_err_on_cap_exceed() {
+        let cap = 1024;
+        let input = vec![0xCDu8; cap + 1];
+        let mut reader = std::io::Cursor::new(&input[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        let err = stream_to_cap(&mut reader, &mut writer, cap).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            err.to_string().contains(&format!("{cap}")),
+            "error message should mention the cap value: {err}"
+        );
+        // Writer must contain exactly `cap` bytes — no over-write past the cap.
+        assert_eq!(writer.len(), cap);
+        assert!(writer.iter().all(|b| *b == 0xCD));
+    }
+
+    #[test]
+    fn stream_to_cap_handles_empty_input() {
+        let mut reader = std::io::Cursor::new(b"" as &[u8]);
+        let mut writer: Vec<u8> = Vec::new();
+        let n = stream_to_cap(&mut reader, &mut writer, 1024).unwrap();
+        assert_eq!(n, 0);
+        assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn stream_to_cap_handles_exact_cap_input() {
+        // Equal-to-cap is OK; exceeds is not. Boundary sentinel.
+        let cap = 4096;
+        let input = vec![0xEFu8; cap];
+        let mut reader = std::io::Cursor::new(&input[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        let n = stream_to_cap(&mut reader, &mut writer, cap).unwrap();
+        assert_eq!(n, cap);
+        assert_eq!(writer, input);
+    }
+
+    #[test]
+    fn r2_stdout_cap_bytes_is_4_gib() {
+        // Regression sentinel against accidental value drift.
+        assert_eq!(R2_STDOUT_CAP_BYTES, 4 * 1024 * 1024 * 1024);
     }
 
     #[test]
