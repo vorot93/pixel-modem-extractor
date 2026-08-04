@@ -115,7 +115,9 @@ pub fn reconstruct_load_events(disasm: &str) -> Vec<LoadEvent> {
     let mut last_movw: HashMap<String, u32> = HashMap::new();
     let mut out = Vec::new();
     for line in disasm.lines() {
-        let pc = line_addr(line).map(|a| a as u32).unwrap_or(0);
+        let pc = crate::disasm_index::line_addr(line)
+            .map(|a| a as u32)
+            .unwrap_or(0);
         if let Some((reg, imm)) = parse_mov(line, "movw") {
             last_movw.insert(reg.clone(), imm & 0xffff);
             out.push(LoadEvent {
@@ -419,37 +421,12 @@ struct ThumbFnJson {
     body: String,
 }
 
-/// Lines of `disasm.lst` whose leading hex address is in `[entry, end)`.
-fn disasm_body_for(entry: u64, end: u64, lines_by_addr: &[(u64, &str)]) -> String {
-    let mut out = String::new();
-    for (addr, line) in lines_by_addr {
-        if *addr >= entry && *addr < end {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Parse the leading address of a `disasm.lst` line. The address is the text
-/// before the first ": " (the bytes-column separator); tolerate an optional
-/// address-space prefix (`ram:40010120:` -> `40010120`). Returns None for
-/// non-address lines (comments, the sentinel, blanks).
-fn line_addr(line: &str) -> Option<u64> {
-    let head = line.trim_start().split_once(": ")?.0; // "40010120" or "ram:40010120"
-    let tok = head.rsplit(':').next()?; // offset after an optional "space:" prefix
-    parse_hex(tok).ok()
-}
-
 fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
     let path = decompiled.join("functions.json");
     let bytes = std::fs::read(&path)?;
     let raw: Vec<ArmFnJson> =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    let lines_by_addr: Vec<(u64, &str)> = disasm
-        .lines()
-        .filter_map(|l| line_addr(l).map(|a| (a, l)))
-        .collect();
+    let index = crate::disasm_index::DisasmIndex::new(disasm);
     let mut out = Vec::with_capacity(raw.len());
     for f in raw {
         let entry = parse_hex(&f.entry)?;
@@ -465,7 +442,7 @@ fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
             entry,
             end,
             data_refs,
-            disasm: disasm_body_for(entry, end, &lines_by_addr),
+            disasm: index.slice_for(entry, end),
         });
     }
     Ok(out)
@@ -1433,18 +1410,6 @@ mod tests {
         .unwrap();
         let fns = load_functions(&dir, "").unwrap();
         assert_eq!(fns[0].name, "FUN_10"); // true original recovered, not the renamed value
-    }
-
-    #[test]
-    fn line_addr_parses_plain_and_space_qualified() {
-        assert_eq!(
-            line_addr("400100b4: 00402de9  stmdb sp!,{lr}"),
-            Some(0x400100b4)
-        );
-        assert_eq!(line_addr("ram:40010120: 00  nop"), Some(0x40010120)); // space-qualified
-        assert_eq!(line_addr("0x10: 41f2 movw r0, 0x1"), Some(0x10));
-        assert_eq!(line_addr("// pixel-modem-extractor: symbolicated"), None); // sentinel
-        assert_eq!(line_addr(""), None);
     }
 
     #[test]
