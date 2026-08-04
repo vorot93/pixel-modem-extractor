@@ -509,6 +509,38 @@ module; when a file outgrows that, split it.
   checks the budget on every poll, not only after each line, so a GC storm or
   deadlock that stops emitting stdout is still killed. Do not switch back to a
   blocking `BufRead::lines` loop — that would re-introduce the blind spot.
+- **radare2 stdout streaming (Phase 2+).** `run_radare2_thumb` streams
+  r2 stdout to `thumb/<addr:08x>.stdout` in 8 KiB chunks via the
+  pure-I/O `stream_to_cap` helper, accumulating a byte counter;
+  exceeding `R2_STDOUT_CAP_BYTES = 4 GiB` fails closed (kill + reap +
+  remove partial file + `Error::ToolNotFound`). The 4 GiB value is
+  grounded in production: `02_MAIN`'s `410b0000` region emits ~1.82 GiB
+  of `aflj;pdfj @@f` JSON (~25 KiB/function × ~71 k functions); 4 GiB
+  is ~2× headroom. Do not lower this cap without confirming the
+  largest real image's region still fits — the failure mode
+  (`thumb_error` on the image, no `thumb_functions.json` written) is
+  silent at the JSON level. Do not raise it casually — pathological r2
+  output is what the cap exists to defend against. The full design
+  lives at
+  `~/.superpowers/pixel-modem-extractor/2026-08-03-radare2-stdout-stream-design.md`.
+- **`thumb/<addr:08x>.stdout` retention.** The streamed file is kept
+  after parse (not deleted). Disk is cheap; the debugging value
+  (inspect r2 output when `data_refs` look wrong or parse fails)
+  outweighs storage cost. `--prune` drops it with the rest of the
+  `thumb/` tree.
+- **Why streaming-to-disk.** Three reasons: (1) decouples r2's write
+  rate from Rust's read rate (no pipe-stall during slow parse); (2)
+  persistent artifact for post-hoc inspection; (3) sets up future
+  streaming-parse optionality. **Memory profile is NOT reduced** —
+  read-back-and-parse still peaks at ~2× file size; the cap defends
+  against pathological r2 output, not steady-state memory. Reducing
+  memory needs a streaming JSON parser (deferred follow-up).
+- **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
+  into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
+  so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,
+  `Vec<u8>` writers). Callers own process lifecycle (kill, reap,
+  file removal). Five inline unit tests cover happy path, cap-exceed,
+  empty input, exact-cap boundary, and the constant value.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`

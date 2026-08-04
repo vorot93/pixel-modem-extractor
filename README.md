@@ -26,6 +26,12 @@ Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PA
 supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
 to launch the headless analyzer unless you set your own `JAVA_HOME`.
 
+**Memory:** production `decompose` on a real `02_MAIN` peaks at ~8 GiB
+RSS during the radare2 stdout capture + parse pass (4 GiB temp file +
+~4 GiB parse peak). Minimum recommended host RAM is 16 GiB. Smaller
+images (`00_BOOT`, `01_PSP`, etc.) and `--no-thumb-decompile` runs stay
+under 1 GiB.
+
 ## Quickstart
 
     # 1. Extract everything from a radio image (default out: ./radio.extracted/)
