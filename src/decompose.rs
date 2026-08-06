@@ -1548,6 +1548,85 @@ mod tests {
     }
 
     #[test]
+    fn refresh_decompiled_rejects_invalid_export_without_mutating_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_refresh_reject_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let dest = images.join(label).join("decompiled");
+        std::fs::create_dir_all(dest.join("thumb")).unwrap();
+
+        // Snapshot-worthy destination contents.
+        let old_c = b"KEEP_C";
+        let old_lst = b"KEEP_LST";
+        let old_fn = b"KEEP_FN";
+        let thumb_json = b"KEEP_THUMB_JSON";
+        let thumb_stdout = b"KEEP_STDOUT";
+        std::fs::write(dest.join("decompiled.c"), old_c).unwrap();
+        std::fs::write(dest.join("disasm.lst"), old_lst).unwrap();
+        std::fs::write(dest.join("functions.json"), old_fn).unwrap();
+        std::fs::write(dest.join("thumb_functions.json"), thumb_json).unwrap();
+        std::fs::write(dest.join("thumb").join("410b0000.stdout"), thumb_stdout).unwrap();
+
+        let assert_dest_untouched = |dest: &std::path::Path| {
+            assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), old_c);
+            assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), old_lst);
+            assert_eq!(std::fs::read(dest.join("functions.json")).unwrap(), old_fn);
+            assert_eq!(
+                std::fs::read(dest.join("thumb_functions.json")).unwrap(),
+                thumb_json
+            );
+            assert_eq!(
+                std::fs::read(dest.join("thumb").join("410b0000.stdout")).unwrap(),
+                thumb_stdout
+            );
+        };
+
+        // Case A: incomplete export (missing functions.json).
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(export.join("decompiled.c"), b"NEW_C").unwrap();
+        std::fs::write(export.join("disasm.lst"), b"NEW_LST").unwrap();
+        // deliberately omit functions.json
+        let err = refresh_decompiled(&ghidra, &images, label).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid pass-2 export") || msg.contains("expected exactly"),
+            "incomplete export must error clearly, got: {msg}"
+        );
+        assert_dest_untouched(&dest);
+        assert!(export.exists(), "failed validation must not consume export");
+
+        // Case B: unexpected extra entry.
+        std::fs::write(export.join("functions.json"), b"NEW_FN").unwrap();
+        std::fs::write(export.join("extra.txt"), b"nope").unwrap();
+        let err = refresh_decompiled(&ghidra, &images, label).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid pass-2 export") || msg.contains("expected exactly"),
+            "unexpected entry must error clearly, got: {msg}"
+        );
+        assert_dest_untouched(&dest);
+
+        // Case C: non-file entry (subdirectory) in export.
+        let _ = std::fs::remove_file(export.join("extra.txt"));
+        std::fs::create_dir(export.join("subdir")).unwrap();
+        let err = refresh_decompiled(&ghidra, &images, label).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file") || msg.contains("invalid pass-2 export"),
+            "non-file export entry must error clearly, got: {msg}"
+        );
+        assert_dest_untouched(&dest);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn prune_keeps_only_leaves() {
         let out = std::env::temp_dir().join(format!("pme_prune_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
