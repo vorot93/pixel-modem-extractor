@@ -345,9 +345,8 @@ fn run_thumb_enrich_per_image(
             .join("thumb_functions.json");
         if !thumb_json.exists() {
             if ir.thumb_functions.is_some() {
-                let msg = format!(
-                    "thumb_functions.json missing after radare2 reported Thumb functions"
-                );
+                let msg = "thumb_functions.json missing after radare2 reported Thumb functions"
+                    .to_string();
                 ir.thumb_enrich_error = Some(msg.clone());
                 outcome.errors.push((label.clone(), msg));
             }
@@ -1567,10 +1566,8 @@ mod tests {
 
     #[test]
     fn refresh_decompiled_replaces_ghidra_outputs_and_preserves_sidecars() {
-        let root = std::env::temp_dir().join(format!(
-            "pme_refresh_preserve_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("pme_refresh_preserve_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ghidra = root.join("ghidra");
         let images = root.join("images");
@@ -1598,7 +1595,10 @@ mod tests {
 
         assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), b"NEW_C");
         assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), b"NEW_LST");
-        assert_eq!(std::fs::read(dest.join("functions.json")).unwrap(), b"NEW_FN");
+        assert_eq!(
+            std::fs::read(dest.join("functions.json")).unwrap(),
+            b"NEW_FN"
+        );
         assert_eq!(
             std::fs::read(dest.join("thumb_functions.json")).unwrap(),
             thumb_json,
@@ -1618,10 +1618,7 @@ mod tests {
 
     #[test]
     fn refresh_decompiled_rejects_invalid_export_without_mutating_destination() {
-        let root = std::env::temp_dir().join(format!(
-            "pme_refresh_reject_{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("pme_refresh_reject_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ghidra = root.join("ghidra");
         let images = root.join("images");
