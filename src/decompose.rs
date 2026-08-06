@@ -323,8 +323,11 @@ fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Resu
 /// `ImageResult.thumb_decompiled` (count) or `thumb_enrich_error` (failure text)
 /// in place. Returns the per-image outcome so the caller can build a StageReport.
 ///
-/// Images without a `thumb_functions.json` (no Thumb regions) are silently
-/// skipped — Phase 2 only fires for images where radare2 carved Thumb.
+/// Missing `thumb_functions.json`:
+/// - `thumb_functions == None` → legitimate "no Thumb regions"; skip silently.
+/// - `thumb_functions == Some(_)` → radare2 reported Thumb output but the JSON
+///   is gone (e.g. destroyed by a buggy pass-2 refresh); record
+///   `thumb_enrich_error` and a stage error so the loss cannot go green.
 fn run_thumb_enrich_per_image(
     images: &mut [decompile::ImageResult],
     images_dir: &Path,
@@ -341,7 +344,14 @@ fn run_thumb_enrich_per_image(
             .join("decompiled")
             .join("thumb_functions.json");
         if !thumb_json.exists() {
-            continue; // No Thumb regions on this image.
+            if ir.thumb_functions.is_some() {
+                let msg = format!(
+                    "thumb_functions.json missing after radare2 reported Thumb functions"
+                );
+                ir.thumb_enrich_error = Some(msg.clone());
+                outcome.errors.push((label.clone(), msg));
+            }
+            continue;
         }
         match decompile::thumb_enrich(&decompiled_c, &thumb_json) {
             Ok(n) => {
@@ -1334,6 +1344,65 @@ mod tests {
         assert_eq!(stage.stage, "thumb_enrich");
         assert_eq!(stage.status, "ok");
         assert_eq!(stage.output.as_deref(), Some("1 image(s) enriched"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_thumb_enrich_per_image_reports_missing_json_after_thumb_success() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_thumb_enrich_missing_json_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        // decompiled.c present; thumb_functions.json deliberately absent.
+        let dec = root.join("images").join("02_MAIN").join("decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(
+            dec.join("decompiled.c"),
+            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+
+        let mut images = vec![decompile::ImageResult {
+            label: "02_MAIN".into(),
+            outcome: ImageOutcome::Analyzed(10),
+            // In-memory result says radare2 produced Thumb output.
+            thumb_functions: Some(5),
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
+        }];
+        let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
+
+        assert!(
+            outcome.counts.is_empty(),
+            "missing JSON must not count as enriched"
+        );
+        assert_eq!(outcome.errors.len(), 1, "must surface one per-image error");
+        assert_eq!(outcome.errors[0].0, "02_MAIN");
+        assert!(
+            outcome.errors[0].1.contains("thumb_functions.json")
+                || outcome.errors[0].1.contains("missing"),
+            "error text must name the missing artifact, got: {}",
+            outcome.errors[0].1
+        );
+        assert!(images[0].thumb_decompiled.is_none());
+        assert!(
+            images[0].thumb_enrich_error.is_some(),
+            "ImageResult.thumb_enrich_error must be set"
+        );
+
+        let stage = thumb_enrich_stage("thumb_enrich_post_pass2", outcome, 0);
+        assert_eq!(stage.status, "failed");
+        assert!(stage.error.is_some());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
