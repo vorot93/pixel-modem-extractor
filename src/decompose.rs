@@ -254,27 +254,67 @@ fn marshal_image(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()
     Ok(())
 }
 
-/// After pass 2, ExportDecomp.java has overwritten {ghidra}/export/{label}/.
-/// Move the fresh files into images/<label>/decompiled/ (replacing pass 1's).
-/// The slice file (<label>.bin) is already in place from pass 1; do not touch it.
+/// After pass 2, ExportDecomp.java has overwritten {ghidra}/export/{label}/
+/// with exactly three files it owns: `decompiled.c`, `disasm.lst`,
+/// `functions.json`. Merge those into `images/<label>/decompiled/`, replacing
+/// only the three owned paths. Every other destination entry (e.g.
+/// `thumb_functions.json`, `thumb/`) is owned by another stage and must remain
+/// byte-for-byte unchanged. The slice file (`<label>.bin`) is already in place
+/// from pass 1; do not touch it.
 fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()> {
+    const OWNED: &[&str] = &["decompiled.c", "disasm.lst", "functions.json"];
+
     let export = ghidra_dir.join("export").join(label);
     if !export.exists() {
         return Ok(());
     }
+
+    // Validate the full export set before any destination mutation.
+    let mut entries = Vec::new();
+    for ent in std::fs::read_dir(&export)? {
+        let ent = ent?;
+        let name = ent.file_name();
+        let name = name.to_string_lossy().into_owned();
+        let ft = ent.file_type()?;
+        if !ft.is_file() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "invalid pass-2 export for {label}: entry `{name}` is not a regular file"
+            )));
+        }
+        entries.push(name);
+    }
+    entries.sort();
+    let mut expected: Vec<String> = OWNED.iter().map(|s| (*s).to_string()).collect();
+    expected.sort();
+    if entries != expected {
+        return Err(Error::DecomposeIncomplete(format!(
+            "invalid pass-2 export for {label}: expected exactly {OWNED:?}, found {entries:?}"
+        )));
+    }
+
     let dest = images_dir.join(label).join("decompiled");
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest)?;
-    } else {
-        // The per-image parent (`images/<label>/`) may not exist yet — e.g. when
-        // an earlier marshal broke out of its loop before creating every image's
-        // dir. `marshal_image` creates it on the happy path; mirror that here so
-        // the rename never fails with ENOENT and silently drops pass-2 output.
+    if !dest.exists() {
+        // First-time placement (no pass-1 tree): rename the whole validated
+        // export directory into place, same as the historical happy path.
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        std::fs::rename(&export, &dest)?;
+        return Ok(());
     }
-    std::fs::rename(&export, dest)?;
+
+    // Destination exists: replace only the three owned files. Sidecars stay put.
+    for name in OWNED {
+        let from = export.join(name);
+        let to = dest.join(name);
+        // On Unix rename overwrites an existing file; remove first for
+        // portability across platforms where rename refuses to replace.
+        if to.exists() {
+            std::fs::remove_file(&to)?;
+        }
+        std::fs::rename(&from, &to)?;
+    }
+    std::fs::remove_dir(&export)?;
     Ok(())
 }
 
@@ -1454,6 +1494,57 @@ mod tests {
             !ghidra.join("images").join("02_MAIN").exists(),
             "moved, not copied"
         );
+    }
+
+    #[test]
+    fn refresh_decompiled_replaces_ghidra_outputs_and_preserves_sidecars() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_refresh_preserve_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+
+        // Destination: pass-1 tree with old Ghidra trio + Thumb sidecars.
+        let dest = images.join(label).join("decompiled");
+        std::fs::create_dir_all(dest.join("thumb")).unwrap();
+        std::fs::write(dest.join("decompiled.c"), b"OLD_C").unwrap();
+        std::fs::write(dest.join("disasm.lst"), b"OLD_LST").unwrap();
+        std::fs::write(dest.join("functions.json"), b"OLD_FN").unwrap();
+        let thumb_json = b"{\"format\":\"thumb-v1\",\"functions\":[]}";
+        let thumb_stdout = b"r2-stdout-bytes-must-survive";
+        std::fs::write(dest.join("thumb_functions.json"), thumb_json).unwrap();
+        std::fs::write(dest.join("thumb").join("410b0000.stdout"), thumb_stdout).unwrap();
+
+        // Pass-2 export: exactly the three Ghidra-owned files, new contents.
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(export.join("decompiled.c"), b"NEW_C").unwrap();
+        std::fs::write(export.join("disasm.lst"), b"NEW_LST").unwrap();
+        std::fs::write(export.join("functions.json"), b"NEW_FN").unwrap();
+
+        refresh_decompiled(&ghidra, &images, label).unwrap();
+
+        assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), b"NEW_C");
+        assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), b"NEW_LST");
+        assert_eq!(std::fs::read(dest.join("functions.json")).unwrap(), b"NEW_FN");
+        assert_eq!(
+            std::fs::read(dest.join("thumb_functions.json")).unwrap(),
+            thumb_json,
+            "thumb_functions.json must be byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("thumb").join("410b0000.stdout")).unwrap(),
+            thumb_stdout,
+            "thumb/*.stdout must be byte-identical"
+        );
+        assert!(
+            !export.exists(),
+            "validated export dir must be removed after successful replace"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
