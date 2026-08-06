@@ -21,7 +21,7 @@ radare2.
   return an error rather than emitting silent, plausible-looking garbage. Preserve this —
   much of the recent history is hardening exactly this behavior. This applies to the
   decoder shell-outs too: a truncated `RF_CFG_*` (< 0x90 bytes) returns
-  `Error::SizeMismatch` rather than indexing OOB; radare2 stdout > 256 MiB is rejected
+  `Error::SizeMismatch` rather than indexing OOB; radare2 stdout > 4 GiB is rejected
   rather than OOMing the host.
 
 ## Build, lint, test
@@ -194,17 +194,18 @@ module; when a file outgrows that, split it.
   overlapping-function-repair spin and falls back to datamark per image
   (recorded as `thumb_tighten_error`, image not marked `failed`); see
   **Surface B mechanics** below for the kill path and budget calibration.
-  **Production status (verified end-to-end on a real `02_MAIN`, Pixel 6 Pro
-  mustang):** Phase 2.1's winning `TIGHTEN_EXTRA` (`"Non-Returning Functions -
-  Discovered.Repair Flow Damage"`) lets Ghidra 12 converge in 1398 s (23.3
-  min) with 0 `ClearFlowAndRepairCmd` repair-log lines and 71 % radare2
-  coverage (`N_ghidra` = 107,955 of `N_r2_full` = 151,411 across 5
-  dense-Thumb regions). Surface B's budget (~112 min wall-clock, 100k log-spam
-  lines) is never approached. Full `decompose` (full pipeline, observed in
-  `report.json`): `thumb_decompiled` = 81,763 for `02_MAIN`;
-  `thumb_tighten_error` absent (Surface B did not fire); 81,763 entries in
-  `thumb_functions.json` carry `body_c`; decompiled.c contains Thumb-region
-  function bodies (sample: `// FUN_40e18dfe @ 40e18dfe` etc.). The Phase 2
+  **Production status (verified end-to-end on a real `02_MAIN`):** Phase 2.1's
+  winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow
+  Damage"`) lets Ghidra 12 converge in ~23 min with 0
+  `ClearFlowAndRepairCmd` repair-log lines. Surface B's budget (~112 min
+  wall-clock, 100k log-spam lines) is never approached. Full `decompose`
+  (full pipeline, ~1 h 49 m wall, exit 0, `report.ok=true`): `functions` =
+  107,955; `thumb_functions` = 117,444; `thumb_decompiled` = 10,965;
+  `body_c` on 11,292 of 151,411 Thumb entries; `pass2_applied` = 3,461;
+  `globals_recovered` = 915 (arch: arm 367 / thumb 545 / mixed 3);
+  `thumb_tighten_error` / `thumb_error` / `thumb_enrich_error` /
+  `pass2_error` absent. Ownership-aware `refresh_decompiled` preserves
+  `thumb_functions.json` and `thumb/*.stdout` across pass 2. The Phase 2
   fields are surfaced in the `decompile` stage's per-image entry via
   `refresh_decompile_stage_images` (called after both pass-1 and post-pass-2
   `thumb_enrich` sweeps); without that refresh, the decompile StageReport
@@ -237,14 +238,20 @@ module; when a file outgrows that, split it.
   `02_MAIN`. Don't "helpfully" add a fallback `run_report` call inside
   `run_two_pass`.
   (2) **`refresh_decompiled` must run per-image after `run_two_pass` returns
-  `Ok`.** Pass 2 writes back to `<ghidra_dir>/export/<label>/`; the per-image
-  tree (`images/<label>/decompiled/`) still has pass-1 output until that
-  helper moves the regenerated files over. Downstream stages
-  (`symbolicate_finalize`) and users read from the per-image tree.
+  `Ok`, and it is ownership-aware.** Pass 2's `ExportDecomp.java` owns exactly
+  `decompiled.c`, `disasm.lst`, and `functions.json` under
+  `<ghidra_dir>/export/<label>/`. The helper validates that exact three-file
+  set before any destination mutation, then replaces only those three paths
+  under `images/<label>/decompiled/`. Every other destination entry
+  (`thumb_functions.json`, `thumb/`, future non-Ghidra sidecars) is left
+  byte-for-byte unchanged. An incomplete or unexpected export returns an
+  error and leaves the destination untouched. Downstream stages
+  (`thumb_enrich_post_pass2`, `symbolicate_finalize`, globals) and users read
+  from the per-image tree.
   (3) **`decode_tokens` runs BEFORE the `symbol_map` stage in `decompose::run`**
   — the token DB is an input to `symbolicate::build_map`. The other decoders
   (`decode_rf`, `hardware_config`) are independent and stay late.
-- **Phase 2 invariants.** Three structural facts a fresh change can easily break:
+- **Phase 2 invariants.** Four structural facts a fresh change can easily break:
   (1) **`thumb_enrich` runs after pass 1 AND after `run_two_pass` returns
   `Ok`.** Skipping the second run leaves `body_c` with placeholder names —
   same contract as pass-2 skipping on `--no-symbol-pass`. Don't "helpfully"
@@ -258,6 +265,12 @@ module; when a file outgrows that, split it.
   the kill behavior itself is verified manually via
   `--tighten-wall-clock-budget-sec 1`. Don't assert on the kill firing in a
   unit test — it depends on Ghidra's repair-log cadence against real firmware.
+  (4) **Missing `thumb_functions.json` after radare2 success is an error.**
+  `run_thumb_enrich_per_image` treats `thumb_functions == None` as legitimate
+  "no Thumb regions" and skips; `thumb_functions == Some(_)` with a missing
+  JSON records `thumb_enrich_error` and fails the `thumb_enrich` /
+  `thumb_enrich_post_pass2` stage. Do not restore the silent-skip-on-missing-file
+  path — that is how a destroyed pass-1 artifact looked green.
 -   **Phase 2.1 invariants.** Two structural facts a fresh change can easily break:
   (1) **`thumb_enrich` matches by entry address, not by name.** The matching
   gate fires on the normalized entry address (strip `0x`, strip leading zeros,
@@ -280,10 +293,10 @@ module; when a file outgrows that, split it.
   ~58% of `02_MAIN`) and offset-6 headers (2-line signatures like
   `void FUN_x(\n    int a)`, ~35%). The 8-line bound captures 99.6% of real
   headers; the long tail (offset >8, <0.5%) is accepted loss. Production
-  verification on a real `02_MAIN` confirmed 81,763 body_c populated against
-  80,396 measured address overlap (consistent with the histogram prediction
-  of 99.6% header capture; the 1.7% excess reflects duplicate radare2
-  entries at shared addresses). Two inline regression sentinels
+  verification on a real `02_MAIN` (full two-pass `decompose`) measured
+  `thumb_decompiled` = 10,965 and `body_c` on 11,292 of 151,411 Thumb
+  entries after pass-2 regeneration + post-pass-2 enrich (do not re-assert
+  older pass-1-shaped ~81k figures as current HEAD). Two inline regression sentinels
   (`thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines` for
   offset-4 and `thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig`
   for offset-6) catch a future regression to the original 2-line bound, which
@@ -314,8 +327,9 @@ module; when a file outgrows that, split it.
   evidence; conflicting names for one address are dropped rather than
   arbitrated. `ImageReport.globals_recovered` surfaces the per-image count and
   `globals_error` carries per-image failures. Current production verification
-  recovered 968 globals on the real ARM+Thumb `02_MAIN` (ARM-only yield: 424);
-  the full six-image sweep dropped 100 conflicts. These are observations, not
+  (full two-pass `decompose`, Thumb through pass 2) recovered 915 globals on
+  `02_MAIN` (arch: arm 367 / thumb 545 / mixed 3); the full six-image sweep
+  recovered 921 and dropped 194 conflicts. These are observations, not
   stable count guarantees.
   Coverage is intentionally conservative; disassembly-pattern disambiguation
   belongs to Phase 3.0.1 rather than this direct-evidence stage.
@@ -386,12 +400,13 @@ module; when a file outgrows that, split it.
   (the inline `reconstruct_load_events_matches_reconstruct_immediates_values`
   sentinel guards the value-set equivalence) — or unify them; the cleanup is
   intentionally deferred.
-- **Phase 3.0 strict-rule path is unchanged.** The Phase-3.0 Recovered
-  (968 ARM+Thumb / 424 ARM-only on production `02_MAIN`) still emit with
-  `[String, Function]` evidence; Phase 3.0.1 adds
+- **Phase 3.0 strict-rule path is unchanged.** Phase-3.0 Recovered entries
+  still emit with `[String, Function]` evidence; Phase 3.0.1 adds
   `global_load`/`string_load` only on the disasm-anchored path and does not
   backfill them onto Phase 3.0 entries. A future "unify the evidence shape"
   change is a separate decision; don't fold it into an unrelated fix.
+  (Current production total on `02_MAIN` is 915 Recovered across both
+  paths — see the Phase 3.0.1 production-state bullet.)
 - **Surface 3.0.1-A: visibility when disasm is unreadable/absent.** When
   `disasm.lst` is missing or its read returns `Err`, `globals.json` is still
   written with Phase 3.0-only content (strict-string-rule Recovered) plus a
@@ -424,39 +439,31 @@ module; when a file outgrows that, split it.
   the pre-sweep snapshot and the Phase 3.0.1 fields are invisible in
   `report.json`. The `report_json_includes_phase3_0_1_fields` golden test
   (env-gated on `PME_GOLDEN_DIR`) is the regression sentinel.
-- **Phase 3.0.1 production state on `02_MAIN` is ARM-only today.** On ARM-only
-  production (Thumb blocked — see the radare2-cap bullet below), the
-  unfiltered yield was **933 Recovered** (Task 13's first successful end-to-end
-  run; Task 14's conflict characterization). After the `__FILE__`-fragment
-  filter (Item 4 + Task 15 fix — both the strict-rule and disasm-anchored paths
-  now skip strings that ARE source paths, dropping globals named after
-  source-file fragments like `cp_RrcNrDescPrcs.c`), the count is **370**.
-  This is *below* Phase 3.0's 424 ARM-only baseline: many of Phase 3.0/3.0.1's
-  "recoveries" were spurious path-fragment names, so the filter trades recall
-  for precision (full-decompose re-verification pending). The often-cited 968
-  figure is Phase 3.0's ARM+Thumb total. The
-  `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden sentinel asserts
-  `> PHASE3_0_ARM_ONLY_BASELINE` (424) — a premise that now needs recalibration
-  on the next golden re-verification (production-filtered is 370 < 424); the
-  sentinel is env-gated (`PME_GOLDEN_DIR`) so CI is unaffected until then. Once
-  the radare2 cap is lifted, the disasm-anchored path is expected to push the
-  ARM+Thumb total past 968.
+- **Phase 3.0.1 production state on `02_MAIN` is ARM+Thumb.** Full two-pass
+  `decompose` with ownership-aware pass-2 refresh and 4 GiB radare2 streaming
+  closed Thumb through pass 2: `globals_recovered` = **915** on `02_MAIN`
+  (arch: arm 367 / thumb 545 / mixed 3); stage total recovered 921 with 194
+  conflicts dropped. Older ARM-only figures (370 post-`__FILE__`-fragment
+  filter; 933 unfiltered; Phase 3.0's 424 ARM-only / 968 ARM+Thumb) are
+  historical pre-fix observations — do not cite them as current HEAD
+  production. The `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden
+  sentinel still asserts `> PHASE3_0_ARM_ONLY_BASELINE` (424) and is
+  env-gated (`PME_GOLDEN_DIR`); it holds under the verified 915 total.
 - **Cross-path conflict characterization (Task 14).** Of the 223
-  same-address proposals dropped by strict-single-source on production
-  `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-Phase-3.0.1-disasm
-  disagreements** (the rest are same-path internal conflicts). Strict-
-  precedence would gain +11 Recovered; disasm-precedence +9; **both propagate
-  clearly-wrong names** on the cases they flip. Current strict-drop (drop
-  both on disagreement) is the right call — neither path is reliable enough
-  to arbitrate the other, so the net is 933 pre-filter (the Task 14 figure;
-  after the `__FILE__`-fragment filter the net drops further — see the
-  production-state bullet above).
-- **radare2 256 MB `R2_STDOUT_CAP` is the Thumb production blocker.** Phase
-  3.0.1 produces zero Thumb recoveries on `02_MAIN` until the cap is lifted or
-  the disasm stream is consumed incrementally (Phase 3.0.1 precheck Concern
-  1; separate follow-up). The ARM-only numbers above are today's production
-  state; the ARM+Thumb projection (~2055 total) stands as the unconfirmed
-  target.
+  same-address proposals dropped by strict-single-source on an earlier
+  ARM-only production `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-
+  Phase-3.0.1-disasm disagreements** (the rest are same-path internal
+  conflicts). Strict-precedence would gain +11 Recovered; disasm-precedence
+  +9; **both propagate clearly-wrong names** on the cases they flip. Current
+  strict-drop (drop both on disagreement) is the right call — neither path
+  is reliable enough to arbitrate the other. The verified post-fix net
+  on `02_MAIN` is 915 Recovered (see the production-state bullet above).
+- **radare2 4 GiB `R2_STDOUT_CAP` streaming is verified live.** The former
+  256 MiB in-memory cap blocked Thumb on production; stdout is now streamed
+  to `thumb/<addr:08x>.stdout` with `R2_STDOUT_CAP_BYTES = 4 GiB` (see
+  **radare2 stdout streaming** below). The verified full `decompose` did not
+  hit the cap (`thumb_functions` = 117,444; no `thumb_error`) and closed
+  Thumb through pass 2 (`thumb_decompiled` = 10,965; globals thumb-majority).
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
