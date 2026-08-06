@@ -97,6 +97,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
 | `decompile.rs` | Ghidra import kit + `--run` (analyzeHeadless) + radare2 Thumb |
+| `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
 | `globals.rs` | Phase 3.0 record-only global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
 | `decompose.rs` | One-shot pipeline over all decoders |
@@ -151,6 +152,18 @@ module; when a file outgrows that, split it.
   and is loaded/rewritten whole (~4 s, ~3 GB peak); pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not raw literals, so
   a byte search won't find them).
+- **`disasm_index::DisasmIndex` (shared infra).** Address-indexed view of a
+  `disasm.lst`-format file, O(log L + k) per `slice_for` lookup. Built ONCE
+  per image; consumed by `symbolicate::load_functions` (the ARM function
+  disasm-slice source) and `globals::run`'s Phase 3.0.1 disasm-anchored
+  Recovered path. **Sortedness invariant** — backing lines must be in
+  non-decreasing address order (Ghidra's `ExportDecomp.java` emits
+  address-ordered; 0 of 7.6M lines out of order on `02_MAIN`); a future
+  emitter that breaks sortedness would silently produce wrong slices.
+  Replaces the O(N×L) linear scans that previously made `symbolicate` and
+  `globals::run` take 100+ min on `02_MAIN` (Phase 3.0.1 Task 12 + this
+  fix). Pointer to spec:
+  `~/.superpowers/pixel-modem-extractor/2026-08-04-disasm-index-shared-design.md`.
 - **Two-pass decompile (Phase 1+).** `decompose` runs decompile twice per
   image: pass 1 (`decompile::run_report`) analyzes and exports an initial
   inventory + `decompiled.c`. Between passes, `decompose::build_and_write_symbol_maps`

@@ -3,6 +3,7 @@ pub mod cli;
 pub mod decode_rf;
 pub mod decompile;
 pub mod decompose;
+pub mod disasm_index;
 pub mod error;
 pub mod ext4;
 pub mod fbpk;
