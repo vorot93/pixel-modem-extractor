@@ -410,10 +410,17 @@ fn thumb_enrich_stage(
 /// serialized stage does not retain its initial pass-1 snapshot. Preserves the
 /// stage's other fields (status, duration_ms, output, etc.).
 fn refresh_decompile_stage_images(stages: &mut [StageReport], images: &[decompile::ImageResult]) {
+    install_decompile_stage_image_snapshot(
+        stages,
+        images.iter().map(ImageReport::from_result).collect(),
+    );
+}
+
+fn install_decompile_stage_image_snapshot(stages: &mut [StageReport], images: Vec<ImageReport>) {
     let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") else {
         return;
     };
-    stages[pos].images = images.iter().map(ImageReport::from_result).collect();
+    stages[pos].images = images;
 }
 
 /// Phase 3.0 helper: load Phase 1's `symbols.json` and build a lookup map
@@ -829,6 +836,22 @@ fn run_globals_stage(
     )
 }
 
+/// Record global preparation without exposing a normal-route intermediate
+/// image snapshot. The disabled route may refresh here because application is
+/// conclusively uninvoked; the normal route must wait for its pass-2 outcome.
+fn record_globals_stage(
+    stages: &mut Vec<StageReport>,
+    outcome: GlobalsStageOutcome,
+    images: &[decompile::ImageResult],
+    application_uninvoked: bool,
+) -> HashMap<String, PreparedGlobalMap> {
+    stages.push(outcome.stage);
+    if application_uninvoked {
+        refresh_decompile_stage_images(stages, images);
+    }
+    outcome.maps
+}
+
 fn schedule_symbol_route<C, PrepareIndexes, RunGlobals, RunPassTwo, Finalize, LoadFinalized>(
     state: &mut C,
     no_symbol_pass: bool,
@@ -1210,14 +1233,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 function_name_indexes,
                 &globals_opts,
             );
-            state.stages.push(outcome.stage);
             let refresh_source = state
                 .pass1_report
                 .as_ref()
                 .map(|report| report.images.as_slice())
                 .unwrap_or(&[]);
-            refresh_decompile_stage_images(state.stages.as_mut_slice(), refresh_source);
-            outcome.maps
+            record_globals_stage(state.stages, outcome, refresh_source, opts.no_symbol_pass)
         },
         |state, prepared_global_maps| {
             // 7. Decompile pass 2 — apply each image's prepared function and/or
@@ -1229,6 +1250,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     .push(globals_apply_stage(false, prepared_global_maps, None, 0));
                 return;
             };
+            // run_two_pass takes ownership and can return an early Err without
+            // the report. Retain serialization data only; install it after Err,
+            // never as a speculative pre-application refresh.
+            let fallback_images = rep.images.iter().map(ImageReport::from_result).collect();
             let t = Instant::now();
             let inputs = prepare_pass2_inputs(&function_maps, prepared_global_maps);
             match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &inputs) {
@@ -1275,6 +1300,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         e.to_string(),
                         elapsed,
                     ));
+                    install_decompile_stage_image_snapshot(
+                        state.stages.as_mut_slice(),
+                        fallback_images,
+                    );
                     state.stages.push(globals_apply_stage(
                         false,
                         prepared_global_maps,
@@ -1655,6 +1684,211 @@ mod tests {
 
         assert_eq!(stage.status, "failed");
         assert_eq!(stage.error.as_deref(), Some("first pipeline-image error"));
+    }
+
+    #[test]
+    fn globals_apply_stage_rejects_either_one_sided_success_pair() {
+        // This catches either half of the applied/skipped pair being accepted
+        // as an executed success when the other half is absent.
+        let prepared = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedGlobalMap {
+                map_path: PathBuf::from("globals/02_MAIN.json"),
+                recovered_count: 1,
+            },
+        )]);
+
+        for (applied, skipped) in [(Some(1), None), (None, Some(1))] {
+            let mut image = analyzed_image("02_MAIN");
+            image.globals_applied = applied;
+            image.globals_apply_skipped = skipped;
+
+            let stage = globals_apply_stage(false, &prepared, Some(&[image]), 3);
+
+            assert_eq!(stage.status, "failed");
+            assert_eq!(
+                stage.error.as_deref(),
+                Some("02_MAIN: no valid ApplyGlobals success summary")
+            );
+            assert_eq!(
+                stage.output.as_deref(),
+                Some("0 image(s) processed; 0 globals applied; 0 skipped")
+            );
+        }
+    }
+
+    #[test]
+    fn globals_apply_stage_rejects_per_image_overflow_and_prepared_count_mismatch() {
+        // This catches wrapping the per-image applied+skipped sum or accepting
+        // a conserving pair for a different prepared Recovered count.
+        let overflow_prepared = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedGlobalMap {
+                map_path: PathBuf::from("globals/02_MAIN.json"),
+                recovered_count: usize::MAX,
+            },
+        )]);
+        let mut overflow = analyzed_image("02_MAIN");
+        overflow.globals_applied = Some(usize::MAX);
+        overflow.globals_apply_skipped = Some(1);
+        let overflow_stage = globals_apply_stage(false, &overflow_prepared, Some(&[overflow]), 4);
+        assert_eq!(overflow_stage.status, "failed");
+        assert_eq!(
+            overflow_stage.error.as_deref(),
+            Some("02_MAIN: global application counts overflow")
+        );
+
+        let mismatch_prepared = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedGlobalMap {
+                map_path: PathBuf::from("globals/02_MAIN.json"),
+                recovered_count: 3,
+            },
+        )]);
+        let mut mismatch = analyzed_image("02_MAIN");
+        mismatch.globals_applied = Some(1);
+        mismatch.globals_apply_skipped = Some(1);
+        let mismatch_stage = globals_apply_stage(false, &mismatch_prepared, Some(&[mismatch]), 5);
+        assert_eq!(mismatch_stage.status, "failed");
+        assert_eq!(
+            mismatch_stage.error.as_deref(),
+            Some("02_MAIN: global application counts do not match prepared globals: 2 != 3")
+        );
+    }
+
+    #[test]
+    fn globals_apply_stage_rejects_aggregate_overflow_and_keeps_prior_totals() {
+        // This catches wrapping aggregate totals. The first valid image's
+        // contribution remains visible when the next addition overflows.
+        let prepared = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/02_MAIN.json"),
+                    recovered_count: usize::MAX,
+                },
+            ),
+            (
+                "03_APM".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/03_APM.json"),
+                    recovered_count: 1,
+                },
+            ),
+        ]);
+        let mut main = analyzed_image("02_MAIN");
+        main.globals_applied = Some(usize::MAX);
+        main.globals_apply_skipped = Some(0);
+        let mut apm = analyzed_image("03_APM");
+        apm.globals_applied = Some(1);
+        apm.globals_apply_skipped = Some(0);
+
+        let stage = globals_apply_stage(false, &prepared, Some(&[main, apm]), 6);
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("global application totals overflow")
+        );
+        let expected_output = format!(
+            "1 image(s) processed; {} globals applied; 0 skipped",
+            usize::MAX
+        );
+        assert_eq!(stage.output.as_deref(), Some(expected_output.as_str()));
+    }
+
+    #[test]
+    fn globals_apply_failure_retains_other_success_totals_and_fails_overall_report() {
+        // This catches an error zeroing a prior prepared image's successful
+        // totals or failing to propagate through the top-level report policy.
+        let prepared = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/02_MAIN.json"),
+                    recovered_count: 5,
+                },
+            ),
+            (
+                "03_APM".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/03_APM.json"),
+                    recovered_count: 1,
+                },
+            ),
+        ]);
+        let mut main = analyzed_image("02_MAIN");
+        main.globals_applied = Some(2);
+        main.globals_apply_skipped = Some(3);
+        let mut apm = analyzed_image("03_APM");
+        apm.globals_apply_error = Some("global map rejected".into());
+
+        let stage = globals_apply_stage(false, &prepared, Some(&[main, apm]), 7);
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(stage.error.as_deref(), Some("global map rejected"));
+        assert_eq!(
+            stage.output.as_deref(),
+            Some("1 image(s) processed; 2 globals applied; 3 skipped")
+        );
+        assert!(!Report::is_ok(&[stage]));
+    }
+
+    #[test]
+    fn globals_stage_refreshes_only_when_application_is_known_uninvoked() {
+        // This catches the normal route installing a pre-application snapshot
+        // and relying on a later overwrite. The disabled route may refresh
+        // immediately because application is known not to run.
+        let mut raw = analyzed_image("02_MAIN");
+        raw.globals_recovered = Some(2);
+        let initial = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+        let outcome = || GlobalsStageOutcome {
+            maps: HashMap::new(),
+            stage: StageReport::ok("globals", "globals.json", 1),
+        };
+
+        let mut normal_stages = vec![StageReport::decompile(initial, 10)];
+        let _ = record_globals_stage(
+            &mut normal_stages,
+            outcome(),
+            std::slice::from_ref(&raw),
+            false,
+        );
+        assert_eq!(normal_stages[0].images[0].globals_recovered, None);
+
+        let mut disabled_stages = vec![StageReport::decompile(
+            vec![ImageReport::from_result(&analyzed_image("02_MAIN"))],
+            10,
+        )];
+        let _ = record_globals_stage(
+            &mut disabled_stages,
+            outcome(),
+            std::slice::from_ref(&raw),
+            true,
+        );
+        assert_eq!(disabled_stages[0].images[0].globals_recovered, Some(2));
+    }
+
+    #[test]
+    fn pass2_error_installs_captured_post_globals_snapshot_only_after_outcome() {
+        // This catches removal of the forbidden pre-application refresh also
+        // losing global-preparation fields when run_two_pass consumes the raw
+        // report and returns an early Err.
+        let mut raw = analyzed_image("02_MAIN");
+        raw.globals_recovered = Some(2);
+        let fallback = vec![ImageReport::from_result(&raw)];
+        let mut stages = vec![StageReport::decompile(
+            vec![ImageReport::from_result(&analyzed_image("02_MAIN"))],
+            10,
+        )];
+        assert_eq!(stages[0].images[0].globals_recovered, None);
+
+        install_decompile_stage_image_snapshot(&mut stages, fallback);
+
+        assert_eq!(stages[0].images[0].globals_recovered, Some(2));
+        assert!(stages[0].images[0].globals_applied.is_none());
+        assert!(stages[0].images[0].globals_apply_skipped.is_none());
+        assert!(stages[0].images[0].globals_apply_error.is_none());
     }
 
     #[test]
