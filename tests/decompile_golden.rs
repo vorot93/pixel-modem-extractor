@@ -337,9 +337,10 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     assert!(!c.contains("provisional_must_not_apply"));
     assert!(!c.contains("outside_memory_global"));
 
-    // (b) annotation appears as a comment line. Ghidra's ExportDecomp renders
-    // plate comments as `/* ... */` block comments in decompiled.c (confirmed
-    // against Ghidra 12 — see .superpowers/sdd/applysymbols-fix-report.md).
+    // (b) annotation appears as a comment line. Ghidra 12's ExportDecomp
+    // renders plate comments as `/* ... */` blocks; accept the line-comment
+    // rendering as well so the test remains compatible with either exporter
+    // representation while requiring the exact annotation text.
     let block = format!("/* {annotation} */");
     let line = format!("// {annotation}");
     assert!(

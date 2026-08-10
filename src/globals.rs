@@ -28,11 +28,10 @@ pub const FORMAT_V1: &str = "pixel-modem-extractor-globals-v1";
 /// Phase 3.0.1 proximity window for ARM functions, in load-events (the count
 /// of `movw`/`movt` lines strictly between two PCs — an approximation of the
 /// design spec's instruction-count metric; the pre-check confirmed this
-/// approximation grounds the K pinning). Sourced verbatim from the Phase 3.0.1
-/// pre-check findings doc
-/// (`~/.superpowers/pixel-modem-extractor/2026-08-02-globals-phase3-0-1-findings.md`);
-/// do not edit ad hoc — re-run the pre-check if a new firmware variant
-/// regresses. Mirrors Phase 2.1's `TIGHTEN_EXTRA` provenance rule (see
+/// approximation grounds the K pinning). The production pre-check pinned this
+/// value at 4; `CONTRIBUTING.md` records the metric and revalidation contract.
+/// Do not edit ad hoc — rerun the pre-check if a new firmware variant regresses.
+/// Mirrors Phase 2.1's `TIGHTEN_EXTRA` provenance rule (see
 /// `src/ghidra/TameAnalysis.java`).
 pub const K_ARM: usize = 4;
 
