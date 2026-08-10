@@ -552,9 +552,16 @@ struct PreparedFunctionMap {
     map_path: PathBuf,
     named_count: usize,
     function_names: HashMap<String, String>,
+    evidence_name_projection: globals::FunctionEvidenceNameProjection,
 }
 
 type FunctionNameIndexes = HashMap<String, HashMap<String, String>>;
+
+#[derive(Default)]
+struct PreparedGlobalsFunctionInputs {
+    recovered_names: FunctionNameIndexes,
+    evidence_names: HashMap<String, globals::FunctionEvidenceNameProjection>,
+}
 
 /// A successfully written globals map retained for pass-2 application.
 struct PreparedGlobalMap {
@@ -592,6 +599,7 @@ fn prepare_function_map(map_path: PathBuf, symbols: &[symbolicate::Symbol]) -> P
         map_path,
         named_count,
         function_names,
+        evidence_name_projection: globals::FunctionEvidenceNameProjection::from_symbols(symbols),
     }
 }
 
@@ -602,6 +610,18 @@ fn prepare_function_name_indexes(
         .iter()
         .map(|(label, prepared)| (label.clone(), prepared.function_names.clone()))
         .collect()
+}
+
+fn prepare_globals_function_inputs(
+    function_maps: &HashMap<String, PreparedFunctionMap>,
+) -> PreparedGlobalsFunctionInputs {
+    PreparedGlobalsFunctionInputs {
+        recovered_names: prepare_function_name_indexes(function_maps),
+        evidence_names: function_maps
+            .iter()
+            .map(|(label, prepared)| (label.clone(), prepared.evidence_name_projection.clone()))
+            .collect(),
+    }
 }
 
 fn prepare_pass2_inputs(
@@ -741,7 +761,7 @@ fn run_globals_stage_with<F>(
     images: &mut [decompile::ImageResult],
     images_dir: &Path,
     manifest: &Path,
-    function_name_indexes: &FunctionNameIndexes,
+    function_inputs: &PreparedGlobalsFunctionInputs,
     opts: &globals::GlobalsOpts,
     mut run_image: F,
 ) -> GlobalsStageOutcome
@@ -751,6 +771,7 @@ where
         &str,
         &Path,
         &HashMap<String, String>,
+        Option<&globals::FunctionEvidenceNameProjection>,
         &globals::GlobalsOpts,
     ) -> Result<globals::GlobalsReport>,
 {
@@ -769,8 +790,12 @@ where
         if !image_dir.join(format!("{label}.bin")).exists() {
             continue;
         }
-        let names = function_name_indexes.get(&label).unwrap_or(&empty_names);
-        match run_image(&image_dir, &label, manifest, names, opts) {
+        let names = function_inputs
+            .recovered_names
+            .get(&label)
+            .unwrap_or(&empty_names);
+        let evidence_names = function_inputs.evidence_names.get(&label);
+        match run_image(&image_dir, &label, manifest, names, evidence_names, opts) {
             Ok(report) => {
                 image.globals_recovered = Some(report.recovered_count);
                 image.globals_provisional = Some(report.provisional_generated);
@@ -824,16 +849,16 @@ fn run_globals_stage(
     images: &mut [decompile::ImageResult],
     images_dir: &Path,
     manifest: &Path,
-    function_name_indexes: &FunctionNameIndexes,
+    function_inputs: &PreparedGlobalsFunctionInputs,
     opts: &globals::GlobalsOpts,
 ) -> GlobalsStageOutcome {
     run_globals_stage_with(
         images,
         images_dir,
         manifest,
-        function_name_indexes,
+        function_inputs,
         opts,
-        globals::run,
+        globals::run_with_evidence_projection,
     )
 }
 
@@ -863,11 +888,11 @@ fn schedule_symbol_route<C, PrepareIndexes, RunGlobals, RunPassTwo, Finalize, Lo
     mut load_finalized: LoadFinalized,
 ) -> HashMap<String, PreparedGlobalMap>
 where
-    PrepareIndexes: FnMut(&mut C) -> FunctionNameIndexes,
-    RunGlobals: FnMut(&mut C, &FunctionNameIndexes) -> HashMap<String, PreparedGlobalMap>,
+    PrepareIndexes: FnMut(&mut C) -> PreparedGlobalsFunctionInputs,
+    RunGlobals: FnMut(&mut C, &PreparedGlobalsFunctionInputs) -> HashMap<String, PreparedGlobalMap>,
     RunPassTwo: FnMut(&mut C, &HashMap<String, PreparedGlobalMap>),
     Finalize: FnMut(&mut C),
-    LoadFinalized: FnMut(&mut C) -> FunctionNameIndexes,
+    LoadFinalized: FnMut(&mut C) -> PreparedGlobalsFunctionInputs,
 {
     if no_symbol_pass {
         finalize(state);
@@ -1220,8 +1245,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let _prepared_global_maps = schedule_symbol_route(
         &mut symbol_route_state,
         opts.no_symbol_pass,
-        |_| prepare_function_name_indexes(&function_maps),
-        |state, function_name_indexes| {
+        |_| prepare_globals_function_inputs(&function_maps),
+        |state, function_inputs| {
             let active_images = if let Some(report) = state.pass1_report.as_mut() {
                 report.images.as_mut_slice()
             } else {
@@ -1231,7 +1256,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 active_images,
                 &images_dir,
                 &out.join("manifest.json"),
-                function_name_indexes,
+                function_inputs,
                 &globals_opts,
             );
             let refresh_source = state
@@ -1333,11 +1358,15 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             );
         },
         |state| {
-            state
+            let recovered_names = state
                 .pass1_report
                 .as_ref()
                 .map(|report| load_finalized_function_name_indexes(&images_dir, &report.images))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            PreparedGlobalsFunctionInputs {
+                recovered_names,
+                evidence_names: HashMap::new(),
+            }
         },
     );
 
@@ -1387,6 +1416,23 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_symbol(
+        address: &str,
+        arch: &'static str,
+        name: Option<&str>,
+        tier: symbolicate::Tier,
+    ) -> symbolicate::Symbol {
+        symbolicate::Symbol {
+            address: address.to_string(),
+            arch,
+            original_name: format!("original_{address}"),
+            name: name.map(str::to_string),
+            tier,
+            evidence: Vec::new(),
+            annotations: Vec::new(),
+        }
+    }
 
     fn analyzed_image(label: &str) -> decompile::ImageResult {
         decompile::ImageResult {
@@ -1458,6 +1504,79 @@ mod tests {
     }
 
     #[test]
+    fn prepared_function_map_builds_writer_faithful_evidence_name_projection() {
+        // This catches collapsing the writer-finalized Function evidence name
+        // into the all-tier recovered-name index. ARM applies the last non-null
+        // map entry, while Thumb rewrite observes a final null as a barrier.
+        let symbols = vec![
+            test_symbol(
+                "0x0000ABCD",
+                "arm",
+                Some("ARM_SHARED"),
+                symbolicate::Tier::Recovered,
+            ),
+            test_symbol("0000abcd", "thumb", None, symbolicate::Tier::None),
+            test_symbol(
+                "0x000000EF",
+                "arm",
+                Some("RECOVERED_EF"),
+                symbolicate::Tier::Recovered,
+            ),
+            test_symbol(
+                "000000ef",
+                "thumb",
+                Some("PROVISIONAL_EF"),
+                symbolicate::Tier::Provisional,
+            ),
+            test_symbol(
+                "0x000000A2",
+                "arm",
+                Some("UPPER_A2"),
+                symbolicate::Tier::Recovered,
+            ),
+            test_symbol(
+                "not-hex",
+                "thumb",
+                Some("MALFORMED"),
+                symbolicate::Tier::Recovered,
+            ),
+        ];
+
+        let prepared = prepare_function_map(PathBuf::from("maps/02_MAIN.json"), &symbols);
+
+        assert_eq!(
+            prepared.function_names,
+            HashMap::from([
+                ("abcd".to_string(), "ARM_SHARED".to_string()),
+                ("ef".to_string(), "PROVISIONAL_EF".to_string()),
+                ("a2".to_string(), "UPPER_A2".to_string()),
+            ])
+        );
+        let projection = &prepared.evidence_name_projection;
+        assert_eq!(
+            projection.name_for(globals::Arch::Arm, 0xabcd),
+            Some("ARM_SHARED")
+        );
+        assert_eq!(
+            projection.name_for(globals::Arch::Arm, 0xef),
+            Some("PROVISIONAL_EF")
+        );
+        assert_eq!(
+            projection.name_for(globals::Arch::Arm, 0xa2),
+            Some("UPPER_A2")
+        );
+        assert_eq!(projection.name_for(globals::Arch::Thumb, 0xabcd), None);
+        assert_eq!(
+            projection.name_for(globals::Arch::Thumb, 0xef),
+            Some("PROVISIONAL_EF")
+        );
+        assert_eq!(
+            projection.name_for(globals::Arch::Thumb, 0xa2),
+            Some("UPPER_A2")
+        );
+    }
+
+    #[test]
     fn prepared_pass2_inputs_preserve_combined_function_only_and_globals_only_images() {
         // This catches a union that drops an image present on only one side,
         // loses a prepared count, or attaches the wrong image's map path.
@@ -1468,6 +1587,7 @@ mod tests {
                     map_path: PathBuf::from("functions/02_MAIN.json"),
                     named_count: 3,
                     function_names: HashMap::new(),
+                    evidence_name_projection: Default::default(),
                 },
             ),
             (
@@ -1476,6 +1596,7 @@ mod tests {
                     map_path: PathBuf::from("functions/03_APM.json"),
                     named_count: 2,
                     function_names: HashMap::new(),
+                    evidence_name_projection: Default::default(),
                 },
             ),
         ]);
@@ -1928,18 +2049,20 @@ mod tests {
                     ("40".to_string(), "RecoveredMain".to_string()),
                     ("44".to_string(), "guess_main_44".to_string()),
                 ]),
+                evidence_name_projection: Default::default(),
             },
         )]);
-        let function_name_indexes = prepare_function_name_indexes(&function_maps);
+        let function_inputs = prepare_globals_function_inputs(&function_maps);
         let mut calls = Vec::new();
 
         let outcome = run_globals_stage_with(
             &mut images,
             &images_dir,
             &root.join("manifest.json"),
-            &function_name_indexes,
+            &function_inputs,
             &globals::GlobalsOpts::default(),
-            |image_dir, label, _, names, _| {
+            |image_dir, label, _, names, evidence_names, _| {
+                assert_eq!(evidence_names.is_some(), label == "02_MAIN");
                 calls.push((
                     label.to_string(),
                     std::fs::read(image_dir.join(format!("{label}.bin"))).unwrap(),
@@ -2038,17 +2161,18 @@ mod tests {
                 map_path: PathBuf::from("maps/02_MAIN.json"),
                 named_count: 1,
                 function_names: HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
+                evidence_name_projection: Default::default(),
             },
         )]);
-        let function_name_indexes = prepare_function_name_indexes(&function_maps);
+        let function_inputs = prepare_globals_function_inputs(&function_maps);
 
         let outcome = run_globals_stage_with(
             &mut images,
             &images_dir,
             &root.join("manifest.json"),
-            &function_name_indexes,
+            &function_inputs,
             &globals::GlobalsOpts::default(),
-            |_, label, _, _, _| {
+            |_, label, _, _, _, _| {
                 if label == "02_MAIN" {
                     Err(Error::Serialize("malformed functions.json".into()))
                 } else {
@@ -2126,6 +2250,7 @@ mod tests {
                 map_path: PathBuf::from("maps/02_MAIN.json"),
                 named_count: 3,
                 function_names: HashMap::new(),
+                evidence_name_projection: Default::default(),
             },
         )]);
 
@@ -2133,9 +2258,9 @@ mod tests {
             &mut images,
             &images_dir,
             &root.join("manifest.json"),
-            &prepare_function_name_indexes(&function_maps),
+            &prepare_globals_function_inputs(&function_maps),
             &globals::GlobalsOpts::default(),
-            |_, _, _, _, _| Err(Error::Serialize("malformed functions.json".into())),
+            |_, _, _, _, _, _| Err(Error::Serialize("malformed functions.json".into())),
         );
         let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
         let apply_stage = globals_apply_stage(false, &outcome.maps, Some(&images), 12);
@@ -2228,18 +2353,22 @@ mod tests {
         )
         .unwrap();
         let mut images = vec![analyzed_image("02_MAIN")];
-        let function_name_indexes = load_finalized_function_name_indexes(&images_dir, &images);
+        let function_inputs = PreparedGlobalsFunctionInputs {
+            recovered_names: load_finalized_function_name_indexes(&images_dir, &images),
+            evidence_names: HashMap::new(),
+        };
         let mut calls = 0usize;
 
         let outcome = run_globals_stage_with(
             &mut images,
             &images_dir,
             &root.join("manifest.json"),
-            &function_name_indexes,
+            &function_inputs,
             &globals::GlobalsOpts::default(),
-            |_, label, _, names, _| {
+            |_, label, _, names, evidence_names, _| {
                 calls += 1;
                 assert_eq!(label, "02_MAIN");
+                assert!(evidence_names.is_none());
                 assert_eq!(
                     names,
                     &HashMap::from([
@@ -2279,15 +2408,22 @@ mod tests {
             false,
             |state| {
                 state.events.push("prepare_maps_and_indexes");
-                HashMap::from([(
-                    "02_MAIN".to_string(),
-                    HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
-                )])
+                PreparedGlobalsFunctionInputs {
+                    recovered_names: HashMap::from([(
+                        "02_MAIN".to_string(),
+                        HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
+                    )]),
+                    evidence_names: HashMap::from([(
+                        "02_MAIN".to_string(),
+                        globals::FunctionEvidenceNameProjection::default(),
+                    )]),
+                }
             },
             |state, indexes| {
                 state.events.push("globals");
                 state.globals_calls += 1;
-                assert_eq!(indexes["02_MAIN"]["40"], "RecoveredMain");
+                assert_eq!(indexes.recovered_names["02_MAIN"]["40"], "RecoveredMain");
+                assert!(indexes.evidence_names.contains_key("02_MAIN"));
                 HashMap::from([(
                     "02_MAIN".to_string(),
                     PreparedGlobalMap {
@@ -2323,7 +2459,8 @@ mod tests {
             |state, indexes| {
                 state.events.push("globals");
                 state.globals_calls += 1;
-                assert_eq!(indexes["02_MAIN"]["44"], "guess_main_44");
+                assert_eq!(indexes.recovered_names["02_MAIN"]["44"], "guess_main_44");
+                assert!(indexes.evidence_names.is_empty());
                 HashMap::from([(
                     "02_MAIN".to_string(),
                     PreparedGlobalMap {
@@ -2336,10 +2473,13 @@ mod tests {
             |state| state.events.push("finalize_and_rewrite"),
             |state| {
                 state.events.push("load_finalized_names");
-                HashMap::from([(
-                    "02_MAIN".to_string(),
-                    HashMap::from([("44".to_string(), "guess_main_44".to_string())]),
-                )])
+                PreparedGlobalsFunctionInputs {
+                    recovered_names: HashMap::from([(
+                        "02_MAIN".to_string(),
+                        HashMap::from([("44".to_string(), "guess_main_44".to_string())]),
+                    )]),
+                    evidence_names: HashMap::new(),
+                }
             },
         );
         assert_eq!(

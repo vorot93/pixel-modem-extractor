@@ -135,6 +135,47 @@ pub enum Arch {
     Mixed,
 }
 
+/// Writer-faithful function-name overrides for globals evidence produced
+/// before symbol finalization updates the function inventories.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionEvidenceNameProjection {
+    arm: HashMap<u64, String>,
+    thumb: HashMap<u64, Option<String>>,
+}
+
+impl FunctionEvidenceNameProjection {
+    pub fn from_symbols(symbols: &[symbolicate::Symbol]) -> Self {
+        let mut projection = Self::default();
+        for symbol in symbols {
+            let Some(address) = parse_numeric_symbol_address(&symbol.address) else {
+                continue;
+            };
+            if let Some(name) = &symbol.name {
+                projection.arm.insert(address, name.clone());
+            }
+            projection.thumb.insert(address, symbol.name.clone());
+        }
+        projection
+    }
+
+    pub fn name_for(&self, arch: Arch, entry: u64) -> Option<&str> {
+        match arch {
+            Arch::Arm => self.arm.get(&entry).map(String::as_str),
+            Arch::Thumb => self.thumb.get(&entry).and_then(Option::as_deref),
+            Arch::Mixed => None,
+        }
+    }
+}
+
+fn parse_numeric_symbol_address(address: &str) -> Option<u64> {
+    let trimmed = address.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u64::from_str_radix(digits, 16).ok()
+}
+
 /// One piece of evidence for a `(address, name)` association. Either a string
 /// that mentions the name, or a function whose `data_refs` were used.
 #[derive(Debug, Clone, Serialize)]
@@ -143,8 +184,9 @@ pub enum Evidence {
     /// A string at `address` whose content `value` mentions the global name.
     String { address: String, value: String },
     /// A function at `address` whose `data_refs` produced the association.
-    /// `name` is the Ghidra-side `FUN_<addr>` placeholder; `recovered_name`
-    /// is present (and serialized) only when Phase 1 supplied a recovered name.
+    /// `name` is the writer-projected or already-finalized inventory name;
+    /// `recovered_name` is present (and serialized) only when Phase 1 supplied
+    /// a recovered name.
     Function {
         address: String,
         arch: Arch,
@@ -294,6 +336,24 @@ pub fn run(
     recovered_function_names: &HashMap<String, String>,
     opts: &GlobalsOpts,
 ) -> Result<GlobalsReport> {
+    run_with_evidence_projection(
+        image_dir,
+        image_label,
+        manifest,
+        recovered_function_names,
+        None,
+        opts,
+    )
+}
+
+pub fn run_with_evidence_projection(
+    image_dir: &Path,
+    image_label: &str,
+    manifest: &Path,
+    recovered_function_names: &HashMap<String, String>,
+    evidence_names: Option<&FunctionEvidenceNameProjection>,
+    opts: &GlobalsOpts,
+) -> Result<GlobalsReport> {
     let decompiled = image_dir.join("decompiled");
 
     // 1. Resolve the image's load_addr from the manifest.
@@ -329,7 +389,9 @@ pub fn run(
             .map_err(|e| Error::Serialize(format!("parse functions.json: {e}")))?;
         if let Some(arr) = arm_v.as_array() {
             for f in arr {
-                if let Some(parsed) = parse_function(f, Arch::Arm, recovered_function_names) {
+                if let Some(parsed) =
+                    parse_function(f, Arch::Arm, recovered_function_names, evidence_names)
+                {
                     all_funcs.push(parsed);
                 }
             }
@@ -343,7 +405,9 @@ pub fn run(
             .map_err(|e| Error::Serialize(format!("parse thumb_functions.json: {e}")))?;
         if let Some(arr) = thumb_v.get("functions").and_then(|f| f.as_array()) {
             for f in arr {
-                if let Some(parsed) = parse_function(f, Arch::Thumb, recovered_function_names) {
+                if let Some(parsed) =
+                    parse_function(f, Arch::Thumb, recovered_function_names, evidence_names)
+                {
                     all_funcs.push(parsed);
                 }
             }
@@ -782,6 +846,7 @@ fn parse_function(
     v: &serde_json::Value,
     arch: Arch,
     recovered_function_names: &HashMap<String, String>,
+    evidence_names: Option<&FunctionEvidenceNameProjection>,
 ) -> Option<Function> {
     let entry = v
         .get("entry")
@@ -792,11 +857,15 @@ fn parse_function(
         .and_then(|e| e.as_str())
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .unwrap_or(entry);
-    let ghidra_name = v
+    let source_name = v
         .get("name")
         .and_then(|n| n.as_str())
         .map(String::from)
         .unwrap_or_else(|| format!("FUN_{entry:x}"));
+    let ghidra_name = evidence_names
+        .and_then(|projection| projection.name_for(arch, entry))
+        .map(str::to_owned)
+        .unwrap_or(source_name);
     let data_refs: Vec<u64> = v
         .get("data_refs")
         .and_then(|d| d.as_array())
@@ -1435,6 +1504,187 @@ mod tests {
 }"#;
 
         assert_eq!(actual, historical_v1);
+    }
+
+    #[test]
+    fn early_projected_function_names_match_late_finalized_globals_bytes() {
+        // This catches early globals serializing pass-1 placeholders, or using
+        // recovered_name as the evidence name and thereby renaming a Thumb
+        // function whose final symbol is an explicit null barrier.
+        let late = Img::new("late_finalized_names");
+        let early = Img::new("early_projected_names");
+        let mut late_arm = vec![
+            make_arm_function(0x2000, &[0x3000, 0x4000]),
+            make_arm_function(0x2300, &[0x3300, 0x4300]),
+        ];
+        late_arm[0]["name"] = serde_json::json!("ARM_FINAL_2000");
+        late_arm[1]["name"] = serde_json::json!("COLLISION_FINAL_2300");
+        let early_arm = vec![
+            make_arm_function(0x2000, &[0x3000, 0x4000]),
+            make_arm_function(0x2300, &[0x3300, 0x4300]),
+        ];
+        let mut late_thumb = vec![
+            make_thumb_function(0x2100, &[0x3100, 0x4100]),
+            make_thumb_function(0x2200, &[0x3200, 0x4200]),
+        ];
+        late_thumb[0]["name"] = serde_json::json!("THUMB_FINAL_2100");
+        late_thumb[1]["name"] = serde_json::json!("fcn.2200");
+        let mut early_thumb = late_thumb.clone();
+        early_thumb[0]["name"] = serde_json::json!("fcn.2100");
+
+        late.write_functions_json(&serde_json::to_string(&late_arm).unwrap());
+        early.write_functions_json(&serde_json::to_string(&early_arm).unwrap());
+        late.write_thumb_functions_json(
+            &serde_json::json!({
+                "format": "pixel-modem-extractor-thumb-functions-v2",
+                "functions": late_thumb,
+            })
+            .to_string(),
+        );
+        early.write_thumb_functions_json(
+            &serde_json::json!({
+                "format": "pixel-modem-extractor-thumb-functions-v2",
+                "functions": early_thumb,
+            })
+            .to_string(),
+        );
+        let image = image_with_strings(
+            0x1000,
+            &[
+                (0x3000, "g_arm_2000 invalid"),
+                (0x3100, "g_thumb_2100 invalid"),
+                (0x3200, "g_shared_2200 invalid"),
+                (0x3300, "g_collision_2300 invalid"),
+            ],
+        );
+        for img in [&late, &early] {
+            img.write_image_bin(&image);
+            fs::write(img.image_dir().join("decompiled").join("disasm.lst"), b"").unwrap();
+        }
+
+        let symbols = vec![
+            symbolicate::Symbol {
+                address: "0x2000".into(),
+                arch: "arm",
+                original_name: "FUN_2000".into(),
+                name: Some("ARM_FINAL_2000".into()),
+                tier: symbolicate::Tier::Recovered,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "0x2100".into(),
+                arch: "thumb",
+                original_name: "fcn.2100".into(),
+                name: Some("THUMB_FINAL_2100".into()),
+                tier: symbolicate::Tier::Provisional,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "0x2200".into(),
+                arch: "arm",
+                original_name: "FUN_2200".into(),
+                name: Some("ARM_SHARED_2200".into()),
+                tier: symbolicate::Tier::Recovered,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "0x2200".into(),
+                arch: "thumb",
+                original_name: "fcn.2200".into(),
+                name: None,
+                tier: symbolicate::Tier::None,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "0x2300".into(),
+                arch: "arm",
+                original_name: "FUN_2300".into(),
+                name: Some("COLLISION_FIRST_2300".into()),
+                tier: symbolicate::Tier::Recovered,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "0x2300".into(),
+                arch: "thumb",
+                original_name: "fcn.2300".into(),
+                name: Some("COLLISION_FINAL_2300".into()),
+                tier: symbolicate::Tier::Provisional,
+                evidence: vec![],
+                annotations: vec![],
+            },
+        ];
+        let recovered_names = HashMap::from([
+            ("2000".to_string(), "ARM_FINAL_2000".to_string()),
+            ("2100".to_string(), "THUMB_FINAL_2100".to_string()),
+            ("2200".to_string(), "ARM_SHARED_2200".to_string()),
+            ("2300".to_string(), "COLLISION_FINAL_2300".to_string()),
+        ]);
+        let projection = FunctionEvidenceNameProjection::from_symbols(&symbols);
+
+        let late_report = run(
+            &late.image_dir(),
+            late.label(),
+            &late.manifest(),
+            &recovered_names,
+            &GlobalsOpts::default(),
+        )
+        .unwrap();
+        let early_report = run_with_evidence_projection(
+            &early.image_dir(),
+            early.label(),
+            &early.manifest(),
+            &recovered_names,
+            Some(&projection),
+            &GlobalsOpts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(late_report.recovered_count, early_report.recovered_count);
+        assert_eq!(
+            late_report.conflicts_dropped,
+            early_report.conflicts_dropped
+        );
+        assert_eq!(
+            late_report.provisional_generated,
+            early_report.provisional_generated
+        );
+        assert_eq!(
+            late_report.provisional_suppressed_by_recovered,
+            early_report.provisional_suppressed_by_recovered
+        );
+        let late_bytes =
+            fs::read(late.image_dir().join("decompiled").join("globals.json")).unwrap();
+        let early_bytes =
+            fs::read(early.image_dir().join("decompiled").join("globals.json")).unwrap();
+        let late_json: serde_json::Value = serde_json::from_slice(&late_bytes).unwrap();
+        let early_json: serde_json::Value = serde_json::from_slice(&early_bytes).unwrap();
+        assert_eq!(late_json["globals"], early_json["globals"]);
+        assert_eq!(
+            late_json["globals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|global| global["address"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["0x4000", "0x4100", "0x4200", "0x4300"]
+        );
+        assert!(
+            late_json["globals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|global| global["tier"] == "recovered")
+        );
+        let shared = &late_json["globals"][2]["evidence"][1];
+        assert_eq!(shared["arch"], "thumb");
+        assert_eq!(shared["name"], "fcn.2200");
+        assert_eq!(shared["recovered_name"], "ARM_SHARED_2200");
+        assert_eq!(late_bytes, early_bytes);
     }
 
     #[test]
