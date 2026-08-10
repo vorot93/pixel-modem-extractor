@@ -107,19 +107,24 @@ fn run_drives_ghidra_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Pass-2 symbolication end-to-end: drive pass 1 via `run_report`, build a
-/// one-symbol map with a rename + an annotation, then `run_two_pass` and assert
-/// the rename + plate comment are baked into the regenerated `decompiled.c`.
-/// Exercises the Phase-1 two-pass path against real Ghidra.
+/// Pass-2 application end-to-end: drive pass 1 via `run_report`, then apply a
+/// function and strict Recovered globals in the same saved-project process.
+/// Subsequent attempts prove non-default preservation and invalid-map isolation.
 #[test]
-fn pass2_renames_function_and_bakes_plate_comment() {
+fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let Some(home) = find_ghidra_home() else {
         eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
         return;
     };
 
-    // ARM: `add r0, r0, r1` ; `bx lr`  (little-endian) — yields one tiny FUN_00000000.
-    let arm = [0x01u8, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1];
+    // ARM: `ldr r0, [pc, #0x18]`; `bx lr`; six vector-slot self-branches;
+    // one data word at 0x20. The LDR genuinely references 0x20, while the
+    // self-branches keep vector analysis from flowing into that data word.
+    let mut arm = vec![0x18u8, 0x00, 0x9f, 0xe5, 0x1e, 0xff, 0x2f, 0xe1];
+    for _ in 0..6 {
+        arm.extend([0xfe, 0xff, 0xff, 0xea]); // b .
+    }
+    arm.extend([0x78, 0x56, 0x34, 0x12]);
     let modem = craft_modem_bin(&arm);
 
     let dir = std::env::temp_dir().join(format!("pme_decompile_p2_{}", std::process::id()));
@@ -144,6 +149,21 @@ fn pass2_renames_function_and_bakes_plate_comment() {
     assert!(
         pass1_report.images.iter().any(|r| r.label == "00_BOOT"),
         "pass 1 should have analyzed 00_BOOT"
+    );
+    let pass1_functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
+            .unwrap();
+    assert!(
+        pass1_functions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|function| function["data_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reference| reference == "0x20")),
+        "fixture did not produce a genuine data reference: {pass1_functions}"
     );
 
     // One-symbol map: rename entry 0x0 -> boot_reset_handler with one annotation.
@@ -174,13 +194,47 @@ fn pass2_renames_function_and_bakes_plate_comment() {
     )
     .unwrap();
 
-    let mut symbol_maps: HashMap<String, PathBuf> = HashMap::new();
-    symbol_maps.insert("00_BOOT".to_string(), map_path);
+    let global_map_path = maps_dir.join("00_BOOT-globals.json");
+    let global_map = serde_json::json!({
+        "format": "pixel-modem-extractor-globals-v1",
+        "image": "00_BOOT",
+        "globals": [
+            {
+                "address": "0x20",
+                "name": "recovered_global_word",
+                "tier": "recovered",
+            },
+            {
+                "address": "0x20",
+                "name": "provisional_must_not_apply",
+                "tier": "provisional",
+            },
+            {
+                "address": "0x1000",
+                "name": "outside_memory_global",
+                "tier": "recovered",
+            },
+        ],
+    });
+    std::fs::write(
+        &global_map_path,
+        serde_json::to_string_pretty(&global_map).unwrap(),
+    )
+    .unwrap();
+
+    let inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(map_path.clone()),
+            function_count: 1,
+            global_map: Some(global_map_path.clone()),
+            global_count: 2,
+        },
+    )]);
 
     // Pass 2: pass pass1_report in (do NOT re-run pass 1).
     let rep2 =
-        pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &symbol_maps)
-            .unwrap();
+        pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &inputs).unwrap();
 
     // (c) pass2_applied == Some(1) — ApplySymbols reports 1 rename.
     let boot = rep2
@@ -199,6 +253,13 @@ fn pass2_renames_function_and_bakes_plate_comment() {
         "pass2_error: {:?}",
         boot.pass2_error
     );
+    assert_eq!(boot.globals_applied, Some(1));
+    assert_eq!(boot.globals_apply_skipped, Some(1));
+    assert!(
+        boot.globals_apply_error.is_none(),
+        "globals_apply_error: {:?}",
+        boot.globals_apply_error
+    );
 
     // (a) renamed function appears in the regenerated decompiled.c.
     let exp = out.join("export").join("00_BOOT");
@@ -207,6 +268,12 @@ fn pass2_renames_function_and_bakes_plate_comment() {
         c.contains("boot_reset_handler"),
         "renamed function missing from decompiled.c:\n{c}"
     );
+    assert!(
+        c.contains("recovered_global_word"),
+        "Recovered global missing at the decompiled reference site:\n{c}"
+    );
+    assert!(!c.contains("provisional_must_not_apply"));
+    assert!(!c.contains("outside_memory_global"));
 
     // (b) annotation appears as a comment line. Ghidra's ExportDecomp renders
     // plate comments as `/* ... */` block comments in decompiled.c (confirmed
@@ -218,6 +285,94 @@ fn pass2_renames_function_and_bakes_plate_comment() {
         "annotation plate comment missing from decompiled.c \
          (looked for `{block}` or `{line}`):\n{c}"
     );
+
+    // Second attempt: the exact symbol is now USER_DEFINED, so strict
+    // ownership preserves it and classifies the candidate as non-default.
+    let second_global_map = serde_json::json!({
+        "format": "pixel-modem-extractor-globals-v1",
+        "image": "00_BOOT",
+        "globals": [{
+            "address": "0x20",
+            "name": "second_attempt_must_not_replace",
+            "tier": "recovered",
+        }],
+    });
+    std::fs::write(
+        &global_map_path,
+        serde_json::to_string_pretty(&second_global_map).unwrap(),
+    )
+    .unwrap();
+    let globals_only = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: None,
+            function_count: 0,
+            global_map: Some(global_map_path.clone()),
+            global_count: 1,
+        },
+    )]);
+    let rep3 =
+        pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &globals_only).unwrap();
+    let boot = rep3.images.iter().find(|r| r.label == "00_BOOT").unwrap();
+    assert_eq!(boot.globals_applied, Some(0));
+    assert_eq!(boot.globals_apply_skipped, Some(1));
+    assert!(boot.globals_apply_error.is_none());
+    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
+    assert!(c.contains("recovered_global_word"));
+    assert!(!c.contains("second_attempt_must_not_replace"));
+
+    // A fail-whole-map preflight error returns normally, allowing the
+    // independent function rename and final export to complete in this same
+    // process while applying zero globals.
+    let invalid_global_map = serde_json::json!({
+        "format": "wrong-format",
+        "image": "00_BOOT",
+        "globals": [{
+            "address": "0x20",
+            "name": "invalid_map_must_apply_zero",
+            "tier": "recovered",
+        }],
+    });
+    std::fs::write(
+        &global_map_path,
+        serde_json::to_string_pretty(&invalid_global_map).unwrap(),
+    )
+    .unwrap();
+    let third_function_map = serde_json::json!({
+        "image": "00_BOOT",
+        "symbols": [{
+            "entry": "0x0",
+            "name": "function_exported_despite_invalid_globals",
+            "tier": "recovered",
+            "annotations": [],
+        }],
+    });
+    std::fs::write(
+        &map_path,
+        serde_json::to_string_pretty(&third_function_map).unwrap(),
+    )
+    .unwrap();
+    let invalid_combined = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(map_path),
+            function_count: 1,
+            global_map: Some(global_map_path),
+            global_count: 1,
+        },
+    )]);
+    let rep4 = pixel_modem_extractor::decompile::run_two_pass(rep3, &opts, &out, &invalid_combined)
+        .unwrap();
+    let boot = rep4.images.iter().find(|r| r.label == "00_BOOT").unwrap();
+    assert_eq!(boot.pass2_applied, Some(1));
+    assert!(boot.pass2_error.is_none());
+    assert!(boot.globals_applied.is_none());
+    assert!(boot.globals_apply_skipped.is_none());
+    assert!(boot.globals_apply_error.is_some());
+    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
+    assert!(c.contains("function_exported_despite_invalid_globals"));
+    assert!(c.contains("recovered_global_word"));
+    assert!(!c.contains("invalid_map_must_apply_zero"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

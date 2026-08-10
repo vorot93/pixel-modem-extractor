@@ -19,6 +19,8 @@ use std::{
 const EXPORT_DECOMP_JAVA: &str = include_str!("ghidra/ExportDecomp.java");
 const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
 const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
+const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
+const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 /// Ghidra project name passed to `analyzeHeadless` (the directory is
 /// `<root>/ghidra_project`). Shared by pass 1 (`-import`) and pass 2
@@ -277,6 +279,15 @@ pub struct ImageResult {
     /// `globals.json` for this image. `None` when Phase 3.0 didn't run for
     /// this image (no raw image bytes, or globals stage skipped).
     pub globals_recovered: Option<usize>,
+    /// Count of Recovered global names applied by `ApplyGlobals.java`.
+    /// `None` means global application did not run; `Some(0)` is executed.
+    pub globals_applied: Option<usize>,
+    /// Sum of all four `ApplyGlobals.java` skip categories for an executed
+    /// successful application.
+    pub globals_apply_skipped: Option<usize>,
+    /// Reason-only global-application failure from a valid error summary or a
+    /// missing, duplicate, malformed, wrong-image, or non-conserving summary.
+    pub globals_apply_error: Option<String>,
     /// Phase 3.0.1: total tier:"provisional" globals generated for this image
     /// (before any suppression). None when Phase 3.0.1 didn't run for this image.
     pub globals_provisional: Option<usize>,
@@ -596,15 +607,16 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols}.java
+    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplySymbols
-    //    post-script is staged for pass-2 symbol application.)
+    //    and ApplyGlobals are staged for pass-2 application.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
+    std::fs::write(scripts.join("ApplyGlobals.java"), APPLY_GLOBALS_JAVA)?;
 
     // 3. machine-readable load spec -> out/ghidra_load.json
     let source_name = modem_bin
@@ -935,6 +947,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             })
@@ -996,11 +1011,43 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
 
 /// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
 /// `-process` mode on the existing project so there is no re-import and no
-/// re-analysis: `ApplySymbols.java` renames functions and sets plate comments,
-/// then `ExportDecomp.java` regenerates `decompiled.c` with the new names and
-/// comments baked in.
-fn headless_process_args(root: &str, label: &str, map_path: &Path) -> Vec<String> {
-    vec![
+/// re-analysis: the requested `ApplySymbols.java` and `ApplyGlobals.java`
+/// scripts run in that order, then `ExportDecomp.java` regenerates the export
+/// with applied function and global names baked in.
+#[derive(Debug, Clone, Default)]
+pub struct Pass2Input {
+    pub function_map: Option<PathBuf>,
+    pub function_count: usize,
+    pub global_map: Option<PathBuf>,
+    pub global_count: usize,
+}
+
+impl Pass2Input {
+    fn prepared_function_map(&self) -> Option<&Path> {
+        if self.function_count > 0 {
+            self.function_map.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn prepared_global_map(&self) -> Option<&Path> {
+        if self.global_count > 0 {
+            self.global_map.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+fn headless_process_args(root: &str, label: &str, input: &Pass2Input) -> Option<Vec<String>> {
+    let function_map = input.prepared_function_map();
+    let global_map = input.prepared_global_map();
+    if function_map.is_none() && global_map.is_none() {
+        return None;
+    }
+
+    let mut args = vec![
         format!("{root}/ghidra_project"),
         GHIDRA_PROJECT_NAME.to_string(),
         "-process".to_string(),
@@ -1008,13 +1055,27 @@ fn headless_process_args(root: &str, label: &str, map_path: &Path) -> Vec<String
         "-noanalysis".to_string(),
         "-scriptPath".to_string(),
         format!("{root}/scripts"),
-        "-postScript".to_string(),
-        "ApplySymbols.java".to_string(),
-        map_path.to_string_lossy().into_owned(),
+    ];
+    if let Some(map_path) = function_map {
+        args.extend([
+            "-postScript".to_string(),
+            "ApplySymbols.java".to_string(),
+            map_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    if let Some(map_path) = global_map {
+        args.extend([
+            "-postScript".to_string(),
+            "ApplyGlobals.java".to_string(),
+            map_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend([
         "-postScript".to_string(),
         "ExportDecomp.java".to_string(),
         format!("{root}/export/{label}"),
-    ]
+    ]);
+    Some(args)
 }
 
 /// Extract the `N` from the summary line
@@ -1038,18 +1099,146 @@ fn parse_pass2_summary(stdout: &str) -> Option<usize> {
     None
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyGlobalsSummary {
+    Ok {
+        candidates: usize,
+        applied: usize,
+        skipped_outside_memory: usize,
+        skipped_missing: usize,
+        skipped_non_default: usize,
+        skipped_rejected: usize,
+    },
+    Error {
+        reason: String,
+    },
+}
+
+impl ApplyGlobalsSummary {
+    fn applied_and_skipped(&self) -> Option<(usize, usize)> {
+        let Self::Ok {
+            applied,
+            skipped_outside_memory,
+            skipped_missing,
+            skipped_non_default,
+            skipped_rejected,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let skipped = skipped_outside_memory
+            .checked_add(*skipped_missing)?
+            .checked_add(*skipped_non_default)?
+            .checked_add(*skipped_rejected)?;
+        Some((*applied, skipped))
+    }
+}
+
+fn apply_globals_count(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<usize, String> {
+    let count = object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("ApplyGlobals summary {field} is not an unsigned integer"))?;
+    usize::try_from(count)
+        .map_err(|_| format!("ApplyGlobals summary {field} does not fit in usize"))
+}
+
+fn parse_apply_globals_summary(
+    stdout: &str,
+    expected_image: &str,
+) -> std::result::Result<ApplyGlobalsSummary, String> {
+    let mut payloads = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyGlobals: "));
+    let payload = payloads
+        .next()
+        .ok_or_else(|| "missing ApplyGlobals summary".to_string())?;
+    if payloads.next().is_some() {
+        return Err("duplicate ApplyGlobals summaries".to_string());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| format!("malformed ApplyGlobals summary: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "ApplyGlobals summary is not an object".to_string())?;
+    let image = object
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyGlobals summary image is not a string".to_string())?;
+    if image != expected_image {
+        return Err(format!(
+            "ApplyGlobals summary image {image:?} does not match {expected_image:?}"
+        ));
+    }
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyGlobals summary status is not a string".to_string())?;
+
+    match status {
+        "ok" => {
+            let candidates = apply_globals_count(object, "candidates")?;
+            let applied = apply_globals_count(object, "applied")?;
+            let skipped_outside_memory = apply_globals_count(object, "skipped_outside_memory")?;
+            let skipped_missing = apply_globals_count(object, "skipped_missing")?;
+            let skipped_non_default = apply_globals_count(object, "skipped_non_default")?;
+            let skipped_rejected = apply_globals_count(object, "skipped_rejected")?;
+            let classified = applied
+                .checked_add(skipped_outside_memory)
+                .and_then(|count| count.checked_add(skipped_missing))
+                .and_then(|count| count.checked_add(skipped_non_default))
+                .and_then(|count| count.checked_add(skipped_rejected))
+                .ok_or_else(|| "ApplyGlobals summary counts overflow".to_string())?;
+            if classified != candidates {
+                return Err(format!(
+                    "ApplyGlobals summary does not conserve candidates: {classified} != {candidates}"
+                ));
+            }
+            Ok(ApplyGlobalsSummary::Ok {
+                candidates,
+                applied,
+                skipped_outside_memory,
+                skipped_missing,
+                skipped_non_default,
+                skipped_rejected,
+            })
+        }
+        "error" => {
+            let reason = object
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "ApplyGlobals error summary has no string error".to_string())?;
+            let reason_chars = reason.chars().count();
+            if reason.is_empty() || reason_chars > GLOBALS_APPLY_ERROR_MAX_CHARS {
+                return Err(format!(
+                    "ApplyGlobals error reason length {reason_chars} is outside 1..={GLOBALS_APPLY_ERROR_MAX_CHARS}"
+                ));
+            }
+            Ok(ApplyGlobalsSummary::Error {
+                reason: reason.to_string(),
+            })
+        }
+        other => Err(format!("unknown ApplyGlobals status {other:?}")),
+    }
+}
+
 /// Pass 2 of two-pass decompile. Accepts the pass-1 `report` (callers run pass 1
 /// via `run_report` separately and pass its result here — running pass 1 again
 /// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
-/// `symbol_maps.get(&label)` exists, points at a readable file, and contains at
-/// least one non-null `name`. Per-image pass-2 failures (non-zero exit, spawn
-/// failure) are recorded into `ImageResult.pass2_error`, not propagated — pass 1
-/// already produced a valid `decompiled.c`.
+/// `inputs.get(&label)` contains a prepared non-zero function or global count
+/// with its corresponding map path. Per-image pass-2 failures (non-zero exit,
+/// spawn failure) are recorded into `ImageResult.pass2_error`, not propagated —
+/// pass 1 already produced a valid `decompiled.c`.
 pub fn run_two_pass(
     mut report: DecompileReport,
     opts: &Opts,
     out: &Path,
-    symbol_maps: &HashMap<String, PathBuf>,
+    inputs: &HashMap<String, Pass2Input>,
 ) -> Result<DecompileReport> {
     if !opts.run {
         return Ok(report);
@@ -1060,27 +1249,25 @@ pub fn run_two_pass(
     let root_str = root.to_string_lossy().into_owned();
 
     for ir in &mut report.images {
-        let Some(map_path) = symbol_maps.get(&ir.label) else {
+        let Some(input) = inputs.get(&ir.label) else {
             continue;
         };
-        if !map_path.exists() {
+        let Some(args) = headless_process_args(&root_str, &ir.label, input) else {
             continue;
+        };
+
+        let applies_functions = input.prepared_function_map().is_some();
+        let applies_globals = input.prepared_global_map().is_some();
+        if applies_functions {
+            ir.pass2_applied = None;
         }
-        // Skip pass 2 when the map has no non-null names — pass 1's decompiled.c
-        // is already fine for that image.
-        let map_str = std::fs::read_to_string(map_path).unwrap_or_default();
-        let map_json: serde_json::Value =
-            serde_json::from_str(&map_str).unwrap_or(serde_json::Value::Null);
-        let has_names = map_json["symbols"]
-            .as_array()
-            .map(|arr| arr.iter().any(|s| !s["name"].is_null()))
-            .unwrap_or(false);
-        if !has_names {
-            continue;
+        if applies_globals {
+            ir.globals_applied = None;
+            ir.globals_apply_skipped = None;
+            ir.globals_apply_error = None;
         }
 
-        tracing::info!("ghidra: pass 2 symbolication for {}", ir.label);
-        let args = headless_process_args(&root_str, &ir.label, map_path);
+        tracing::info!("ghidra: pass 2 application for {}", ir.label);
         // Spawn failure (e.g. executable bit lost, Ghidra uninstalled mid-run)
         // lands in `pass2_error` per image instead of propagating — pass 1
         // already produced a valid `decompiled.c` for every image.
@@ -1097,7 +1284,23 @@ pub fn run_two_pass(
         };
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            ir.pass2_applied = parse_pass2_summary(&stdout);
+            if applies_functions {
+                ir.pass2_applied = parse_pass2_summary(&stdout);
+            }
+            if applies_globals {
+                match parse_apply_globals_summary(&stdout, &ir.label) {
+                    Ok(summary @ ApplyGlobalsSummary::Ok { .. }) => {
+                        let (applied, skipped) = summary
+                            .applied_and_skipped()
+                            .expect("ok summary has checked counts");
+                        ir.globals_applied = Some(applied);
+                        ir.globals_apply_skipped = Some(skipped);
+                    }
+                    Ok(ApplyGlobalsSummary::Error { reason }) | Err(reason) => {
+                        ir.globals_apply_error = Some(reason);
+                    }
+                }
+            }
         } else {
             let code = output.status.code().unwrap_or(-1);
             tracing::warn!("ghidra: pass 2 for {} failed (exit {code})", ir.label);
@@ -2218,31 +2421,98 @@ mod tests {
         assert!(args[pre_idx + 2..].iter().any(|a| a == "40e12000:100000"));
     }
 
+    fn pass2_input(function_count: usize, global_count: usize) -> Pass2Input {
+        Pass2Input {
+            function_map: Some(PathBuf::from("/out/ghidra/symbol_maps/02_MAIN.json")),
+            function_count,
+            global_map: Some(PathBuf::from("/out/images/02_MAIN/decompiled/globals.json")),
+            global_count,
+        }
+    }
+
     #[test]
-    fn headless_process_args_wires_process_mode_and_post_scripts() {
-        let args = headless_process_args(
-            "/out",
-            "02_MAIN",
-            std::path::Path::new("/out/ghidra/symbol_maps/02_MAIN.json"),
+    fn headless_process_args_wires_functions_then_globals_then_export() {
+        let args = headless_process_args("/out", "02_MAIN", &pass2_input(1, 1))
+            .expect("non-empty prepared input must invoke pass two");
+
+        assert_eq!(
+            args,
+            vec![
+                "/out/ghidra_project",
+                "pixel-modem",
+                "-process",
+                "02_MAIN",
+                "-noanalysis",
+                "-scriptPath",
+                "/out/scripts",
+                "-postScript",
+                "ApplySymbols.java",
+                "/out/ghidra/symbol_maps/02_MAIN.json",
+                "-postScript",
+                "ApplyGlobals.java",
+                "/out/images/02_MAIN/decompiled/globals.json",
+                "-postScript",
+                "ExportDecomp.java",
+                "/out/export/02_MAIN",
+            ]
         );
-        // <projectDir> <projectName> -process <label> -noanalysis -scriptPath <root>/scripts
-        assert_eq!(args[0], "/out/ghidra_project");
-        assert_eq!(args[1], "pixel-modem");
-        let proc = args.iter().position(|a| a == "-process").unwrap();
-        assert_eq!(args[proc + 1], "02_MAIN");
-        let na = args.iter().position(|a| a == "-noanalysis").unwrap();
-        assert!(na > proc);
-        let sp = args.iter().position(|a| a == "-scriptPath").unwrap();
-        assert_eq!(args[sp + 1], "/out/scripts");
-        // ApplySymbols.java comes before ExportDecomp.java, with map path between.
-        let ps1 = args.iter().position(|a| a == "-postScript").unwrap();
-        assert_eq!(args[ps1 + 1], "ApplySymbols.java");
-        assert_eq!(args[ps1 + 2], "/out/ghidra/symbol_maps/02_MAIN.json");
-        // Second -postScript is ExportDecomp.java with the per-image export dir.
-        let ps2 = args.iter().rposition(|a| a == "-postScript").unwrap();
-        assert!(ps2 > ps1);
-        assert_eq!(args[ps2 + 1], "ExportDecomp.java");
-        assert_eq!(args[ps2 + 2], "/out/export/02_MAIN");
+    }
+
+    #[test]
+    fn headless_process_args_wires_functions_only_then_export() {
+        let args = headless_process_args("/out", "02_MAIN", &pass2_input(1, 0))
+            .expect("prepared function input must invoke pass two");
+
+        assert_eq!(
+            args,
+            vec![
+                "/out/ghidra_project",
+                "pixel-modem",
+                "-process",
+                "02_MAIN",
+                "-noanalysis",
+                "-scriptPath",
+                "/out/scripts",
+                "-postScript",
+                "ApplySymbols.java",
+                "/out/ghidra/symbol_maps/02_MAIN.json",
+                "-postScript",
+                "ExportDecomp.java",
+                "/out/export/02_MAIN",
+            ]
+        );
+        assert!(!args.iter().any(|argument| argument == "ApplyGlobals.java"));
+    }
+
+    #[test]
+    fn headless_process_args_wires_globals_only_then_export() {
+        let args = headless_process_args("/out", "02_MAIN", &pass2_input(0, 1))
+            .expect("prepared global input must invoke pass two");
+
+        assert_eq!(
+            args,
+            vec![
+                "/out/ghidra_project",
+                "pixel-modem",
+                "-process",
+                "02_MAIN",
+                "-noanalysis",
+                "-scriptPath",
+                "/out/scripts",
+                "-postScript",
+                "ApplyGlobals.java",
+                "/out/images/02_MAIN/decompiled/globals.json",
+                "-postScript",
+                "ExportDecomp.java",
+                "/out/export/02_MAIN",
+            ]
+        );
+        assert!(!args.iter().any(|argument| argument == "ApplySymbols.java"));
+    }
+
+    #[test]
+    fn headless_process_args_skips_when_prepared_counts_are_zero() {
+        assert!(headless_process_args("/out", "02_MAIN", &pass2_input(0, 0)).is_none());
     }
 
     #[test]
@@ -2253,6 +2523,121 @@ mod tests {
         // Missing / malformed summary -> None (caller treats as "no info").
         assert_eq!(parse_pass2_summary("nothing useful\n"), None);
         assert_eq!(parse_pass2_summary(""), None);
+    }
+
+    fn ok_globals_summary(
+        candidates: usize,
+        applied: usize,
+        outside: usize,
+        missing: usize,
+        non_default: usize,
+        rejected: usize,
+    ) -> String {
+        format!(
+            "ApplyGlobals: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\
+             \"candidates\":{candidates},\"applied\":{applied},\
+             \"skipped_outside_memory\":{outside},\"skipped_missing\":{missing},\
+             \"skipped_non_default\":{non_default},\"skipped_rejected\":{rejected}}}"
+        )
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_accepts_executed_zero() {
+        let summary =
+            parse_apply_globals_summary(&ok_globals_summary(0, 0, 0, 0, 0, 0), "02_MAIN").unwrap();
+
+        assert_eq!(
+            summary,
+            ApplyGlobalsSummary::Ok {
+                candidates: 0,
+                applied: 0,
+                skipped_outside_memory: 0,
+                skipped_missing: 0,
+                skipped_non_default: 0,
+                skipped_rejected: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_accepts_conserving_skip_categories() {
+        let summary =
+            parse_apply_globals_summary(&ok_globals_summary(5, 1, 1, 1, 1, 1), "02_MAIN").unwrap();
+
+        assert_eq!(summary.applied_and_skipped(), Some((1, 4)));
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_rejects_wrong_image() {
+        assert!(
+            parse_apply_globals_summary(&ok_globals_summary(0, 0, 0, 0, 0, 0), "04_VSS").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_requires_exactly_one_interface_line() {
+        let valid = ok_globals_summary(0, 0, 0, 0, 0, 0);
+        assert!(parse_apply_globals_summary("ordinary Ghidra output", "02_MAIN").is_err());
+        assert!(parse_apply_globals_summary(&format!("{valid}\n{valid}"), "02_MAIN").is_err());
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_rejects_malformed_json_and_counts() {
+        for stdout in [
+            "ApplyGlobals: {",
+            "ApplyGlobals: {\"image\":\"02_MAIN\",\"status\":\"ok\",\"candidates\":\"1\",\"applied\":1,\"skipped_outside_memory\":0,\"skipped_missing\":0,\"skipped_non_default\":0,\"skipped_rejected\":0}",
+            "ApplyGlobals: {\"image\":\"02_MAIN\",\"status\":\"ok\",\"candidates\":-1,\"applied\":0,\"skipped_outside_memory\":0,\"skipped_missing\":0,\"skipped_non_default\":0,\"skipped_rejected\":0}",
+        ] {
+            assert!(
+                parse_apply_globals_summary(stdout, "02_MAIN").is_err(),
+                "malformed summary unexpectedly accepted: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_rejects_unknown_status() {
+        assert!(
+            parse_apply_globals_summary(
+                "ApplyGlobals: {\"image\":\"02_MAIN\",\"status\":\"skipped\"}",
+                "02_MAIN",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_accepts_only_bounded_error_reason() {
+        let summary = parse_apply_globals_summary(
+            "ApplyGlobals: {\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"bad format\"}",
+            "02_MAIN",
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            ApplyGlobalsSummary::Error {
+                reason: "bad format".to_string()
+            }
+        );
+
+        let max_reason = "🛰".repeat(2_048);
+        let at_limit = format!(
+            "ApplyGlobals: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{max_reason}\"}}"
+        );
+        assert!(parse_apply_globals_summary(&at_limit, "02_MAIN").is_ok());
+
+        let over_limit = format!(
+            "ApplyGlobals: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{}\"}}",
+            "🛰".repeat(2_049)
+        );
+        assert!(parse_apply_globals_summary(&over_limit, "02_MAIN").is_err());
+    }
+
+    #[test]
+    fn parse_apply_globals_summary_rejects_non_conserving_counts() {
+        assert!(
+            parse_apply_globals_summary(&ok_globals_summary(6, 1, 1, 1, 1, 1), "02_MAIN").is_err()
+        );
     }
 
     #[test]
@@ -2965,6 +3350,9 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             }],
@@ -2996,6 +3384,9 @@ INFO: second pdfj body was noisy and not parseable
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             }],
@@ -3023,6 +3414,9 @@ INFO: second pdfj body was noisy and not parseable
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: Some(968),
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: Some(42),
             globals_provisional_suppressed: Some(7),
         };

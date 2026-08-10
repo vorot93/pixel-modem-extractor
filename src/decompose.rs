@@ -540,10 +540,6 @@ struct PreparedFunctionMap {
 type FunctionNameIndexes = HashMap<String, HashMap<String, String>>;
 
 /// A successfully written globals map retained for pass-2 application.
-#[allow(
-    dead_code,
-    reason = "Task 4 consumes these retained map inputs after ApplyGlobals lands."
-)]
 struct PreparedGlobalMap {
     map_path: PathBuf,
     recovered_count: usize,
@@ -589,6 +585,28 @@ fn prepare_function_name_indexes(
         .iter()
         .map(|(label, prepared)| (label.clone(), prepared.function_names.clone()))
         .collect()
+}
+
+fn prepare_pass2_inputs(
+    function_maps: &HashMap<String, PreparedFunctionMap>,
+    global_maps: &HashMap<String, PreparedGlobalMap>,
+) -> HashMap<String, decompile::Pass2Input> {
+    let mut inputs = HashMap::new();
+    for (label, prepared) in function_maps {
+        let input = inputs
+            .entry(label.clone())
+            .or_insert_with(decompile::Pass2Input::default);
+        input.function_map = Some(prepared.map_path.clone());
+        input.function_count = prepared.named_count;
+    }
+    for (label, prepared) in global_maps {
+        let input = inputs
+            .entry(label.clone())
+            .or_insert_with(decompile::Pass2Input::default);
+        input.global_map = Some(prepared.map_path.clone());
+        input.global_count = prepared.recovered_count;
+    }
+    inputs
 }
 
 fn load_finalized_function_name_indexes(
@@ -722,7 +740,7 @@ fn schedule_symbol_route<C, PrepareIndexes, RunGlobals, RunPassTwo, Finalize, Lo
 where
     PrepareIndexes: FnMut(&mut C) -> FunctionNameIndexes,
     RunGlobals: FnMut(&mut C, &FunctionNameIndexes) -> HashMap<String, PreparedGlobalMap>,
-    RunPassTwo: FnMut(&mut C),
+    RunPassTwo: FnMut(&mut C, &HashMap<String, PreparedGlobalMap>),
     Finalize: FnMut(&mut C),
     LoadFinalized: FnMut(&mut C) -> FunctionNameIndexes,
 {
@@ -734,7 +752,7 @@ where
     } else {
         let prepared_indexes = prepare_indexes(state);
         let global_maps = run_globals(state, &prepared_indexes);
-        run_pass_two(state);
+        run_pass_two(state, &global_maps);
         finalize(state);
         global_maps
     }
@@ -1099,19 +1117,16 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             refresh_decompile_stage_images(state.stages.as_mut_slice(), refresh_source);
             outcome.maps
         },
-        |state| {
-            // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image
-            // with a non-empty function map. Globals already mutated these
-            // pass-1 ImageResult values, so their fields carry through pass 2.
+        |state, prepared_global_maps| {
+            // 7. Decompile pass 2 — apply each image's prepared function and/or
+            // global map, then export once. Globals already mutated these pass-1
+            // ImageResult values, so their fields carry through pass 2.
             let Some(rep) = state.pass1_report.take() else {
                 return;
             };
             let t = Instant::now();
-            let map_paths: HashMap<String, PathBuf> = function_maps
-                .iter()
-                .map(|(label, prepared)| (label.clone(), prepared.map_path.clone()))
-                .collect();
-            match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &map_paths) {
+            let inputs = prepare_pass2_inputs(&function_maps, prepared_global_maps);
+            match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &inputs) {
                 Ok(mut rep2) => {
                     // Pass 2 overwrote {ghidra}/export/<label>/; re-marshal each
                     // image's fresh export into the per-image tree so it does
@@ -1236,6 +1251,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }
@@ -1286,6 +1304,62 @@ mod tests {
                 ("abcd".to_string(), "recovered_name".to_string()),
                 ("ef".to_string(), "provisional_name".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn prepared_pass2_inputs_preserve_combined_function_only_and_globals_only_images() {
+        // This catches a union that drops an image present on only one side,
+        // loses a prepared count, or attaches the wrong image's map path.
+        let function_maps = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                PreparedFunctionMap {
+                    map_path: PathBuf::from("functions/02_MAIN.json"),
+                    named_count: 3,
+                    function_names: HashMap::new(),
+                },
+            ),
+            (
+                "03_APM".to_string(),
+                PreparedFunctionMap {
+                    map_path: PathBuf::from("functions/03_APM.json"),
+                    named_count: 2,
+                    function_names: HashMap::new(),
+                },
+            ),
+        ]);
+        let global_maps = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/02_MAIN.json"),
+                    recovered_count: 5,
+                },
+            ),
+            (
+                "04_VSS".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/04_VSS.json"),
+                    recovered_count: 7,
+                },
+            ),
+        ]);
+
+        let inputs = prepare_pass2_inputs(&function_maps, &global_maps);
+
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs["02_MAIN"].function_count, 3);
+        assert_eq!(inputs["02_MAIN"].global_count, 5);
+        assert_eq!(
+            inputs["03_APM"].function_map.as_deref(),
+            Some(Path::new("functions/03_APM.json"))
+        );
+        assert_eq!(inputs["03_APM"].global_map, None);
+        assert_eq!(inputs["04_VSS"].function_map, None);
+        assert_eq!(
+            inputs["04_VSS"].global_map.as_deref(),
+            Some(Path::new("globals/04_VSS.json"))
         );
     }
 
@@ -1578,7 +1652,10 @@ mod tests {
                     },
                 )])
             },
-            |state| state.events.push("pass_two"),
+            |state, global_maps| {
+                assert_eq!(global_maps["02_MAIN"].recovered_count, 1);
+                state.events.push("pass_two");
+            },
             |state| state.events.push("finalize"),
             |_| panic!("normal route must not load finalized names"),
         );
@@ -1611,7 +1688,7 @@ mod tests {
                     },
                 )])
             },
-            |_| panic!("disabled route must not run pass two"),
+            |_, _| panic!("disabled route must not run pass two or construct application inputs"),
             |state| state.events.push("finalize_and_rewrite"),
             |state| {
                 state.events.push("load_finalized_names");
@@ -1781,6 +1858,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         });
@@ -1815,6 +1895,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         });
@@ -1865,6 +1948,9 @@ mod tests {
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             },
@@ -1880,6 +1966,9 @@ mod tests {
                 thumb_enrich_error: None,
                 globals_error: None,
                 globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             },
@@ -1934,6 +2023,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }];
@@ -2006,6 +2098,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }];
@@ -2059,6 +2154,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }];
@@ -2332,6 +2430,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -2357,6 +2458,9 @@ mod tests {
             thumb_enrich_error: Some("malformed decompiled.c".into()),
             globals_error: None,
             globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -2381,6 +2485,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_recovered: None,
             globals_error: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -2406,6 +2513,9 @@ mod tests {
             thumb_enrich_error: None,
             globals_recovered: Some(137),
             globals_error: Some("malformed functions.json".into()),
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             globals_provisional: Some(50),
             globals_provisional_suppressed: Some(3),
         };
