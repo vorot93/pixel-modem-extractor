@@ -426,15 +426,22 @@ fn load_recovered_function_names(symbols_path: &Path) -> HashMap<String, String>
         let Some(addr_str) = sym.get("address").and_then(|a| a.as_str()) else {
             continue;
         };
-        let Ok(addr) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16) else {
+        let Some(canonical) = canonical_function_address(addr_str) else {
             continue;
         };
-        let canonical = format!("{addr:x}");
         if let Some(name) = sym.get("name").and_then(|n| n.as_str()) {
             out.insert(canonical, name.to_string());
         }
     }
     out
+}
+
+/// Canonicalize a function address exactly as the `symbols.json` loader does:
+/// strip a lowercase `0x` prefix, parse hexadecimal, then format as lowercase
+/// hexadecimal without a prefix or leading zeroes.
+fn canonical_function_address(address: &str) -> Option<String> {
+    let addr = u64::from_str_radix(address.trim_start_matches("0x"), 16).ok()?;
+    Some(format!("{addr:x}"))
 }
 
 /// Remove a file or directory if present; a missing path is not an error.
@@ -522,14 +529,49 @@ fn finalize(
     }
 }
 
+/// A successfully written function symbol map and the canonical name index
+/// retained for downstream orchestration.
+struct PreparedFunctionMap {
+    map_path: PathBuf,
+    named_count: usize,
+    #[allow(
+        dead_code,
+        reason = "Task 3 consumes this retained index after the preparation refactor lands."
+    )]
+    function_names: HashMap<String, String>,
+}
+
 /// Per-image symbol map outcome from [`build_and_write_symbol_maps`]: the
-/// successful `(label, (path, count))` entries plus any per-image errors.
-type SymbolMapsResult = (Vec<(String, (PathBuf, usize))>, Vec<(String, String)>);
+/// successful `(label, prepared map)` entries plus any per-image errors.
+type SymbolMapsResult = (Vec<(String, PreparedFunctionMap)>, Vec<(String, String)>);
+
+/// Prepare the in-memory result for a function symbol map that was written from
+/// `symbols`. Every non-null name is retained regardless of tier; malformed
+/// addresses are excluded with the same acceptance rules as `symbols.json`.
+fn prepare_function_map(map_path: PathBuf, symbols: &[symbolicate::Symbol]) -> PreparedFunctionMap {
+    let named_count = symbols
+        .iter()
+        .filter(|symbol| symbol.name.is_some())
+        .count();
+    let function_names = symbols
+        .iter()
+        .filter_map(|symbol| {
+            let name = symbol.name.as_ref()?;
+            let address = canonical_function_address(&symbol.address)?;
+            Some((address, name.clone()))
+        })
+        .collect();
+    PreparedFunctionMap {
+        map_path,
+        named_count,
+        function_names,
+    }
+}
 
 /// Build the per-image symbol map from pass-1 outputs and write each to
 /// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(successes, errors)`:
-/// each success is `(label, (path, count))` where `count` is the number of
-/// symbols with non-null names; each error is `(label, message)`. Surfaces
+/// each success is `(label, PreparedFunctionMap)`; each error is `(label,
+/// message)`. Surfaces
 /// I/O / parse failures (token DB, build_map, write_symbol_map) so the caller
 /// can distinguish "no symbols recovered" from "stage errored" — the previous
 /// all-`unwrap_or_default` / `.is_ok()` shape silently swallowed real failures
@@ -598,7 +640,6 @@ fn build_and_write_symbol_maps(
                 continue;
             }
         };
-        let with_names = symbols.iter().filter(|s| s.name.is_some()).count();
         let map_path = maps_dir.join(format!("{label}.json"));
         if let Err(e) =
             symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_sha, &funcs_sha)
@@ -606,7 +647,7 @@ fn build_and_write_symbol_maps(
             errors.push((label.clone(), format!("write_symbol_map: {e}")));
             continue;
         }
-        out_vec.push((label, (map_path, with_names)));
+        out_vec.push((label, prepare_function_map(map_path, &symbols)));
     }
     (out_vec, errors)
 }
@@ -804,7 +845,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     if opts.no_symbol_pass {
         stages.push(StageReport::skipped("symbol_map", "--no-symbol-pass"));
     } else {
-        let total: usize = symbol_maps.iter().map(|(_, (_, n))| *n).sum();
+        let total: usize = symbol_maps
+            .iter()
+            .map(|(_, prepared)| prepared.named_count)
+            .sum();
         // Real failures surface as a `failed` stage (the prior shape collapsed
         // them into `skipped, "no symbols recovered"` — a violation of the
         // fail-closed posture). If there are successes we still report `ok` so
@@ -845,8 +889,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         if let Some(rep) = pass1_report.take() {
             let t = Instant::now();
             let map_paths: HashMap<String, PathBuf> = symbol_maps
-                .into_iter()
-                .map(|(label, (path, _))| (label, path))
+                .iter()
+                .map(|(label, prepared)| (label.clone(), prepared.map_path.clone()))
                 .collect();
             match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &map_paths) {
                 Ok(mut rep2) => {
@@ -1072,6 +1116,54 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_function_map_keeps_every_named_symbol_with_loader_canonical_addresses() {
+        // This catches a preparation path that either filters to Recovered symbols
+        // or retains the source address spelling instead of the symbols.json
+        // loader's canonical lowercase, unprefixed hexadecimal key.
+        let symbols = vec![
+            symbolicate::Symbol {
+                address: "0x0000ABCD".into(),
+                arch: "arm",
+                original_name: "FUN_abcd".into(),
+                name: Some("recovered_name".into()),
+                tier: symbolicate::Tier::Recovered,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "000000EF".into(),
+                arch: "thumb",
+                original_name: "thumb_ef".into(),
+                name: Some("provisional_name".into()),
+                tier: symbolicate::Tier::Provisional,
+                evidence: vec![],
+                annotations: vec![],
+            },
+            symbolicate::Symbol {
+                address: "0x00000012".into(),
+                arch: "arm",
+                original_name: "FUN_12".into(),
+                name: None,
+                tier: symbolicate::Tier::None,
+                evidence: vec![],
+                annotations: vec![],
+            },
+        ];
+
+        let prepared = prepare_function_map(PathBuf::from("maps/02_MAIN.json"), &symbols);
+
+        assert_eq!(prepared.map_path, PathBuf::from("maps/02_MAIN.json"));
+        assert_eq!(prepared.named_count, 2);
+        assert_eq!(
+            prepared.function_names,
+            HashMap::from([
+                ("abcd".to_string(), "recovered_name".to_string()),
+                ("ef".to_string(), "provisional_name".to_string()),
+            ])
+        );
+    }
 
     #[test]
     fn report_serializes_and_ok_reflects_failure() {
