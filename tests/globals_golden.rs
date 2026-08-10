@@ -170,11 +170,10 @@ fn globals_no_duplicates_by_address() {
 /// and disasm-anchored paths now skip strings that ARE source paths) the
 /// production count drops to 370, *below* this 424 baseline, because many
 /// prior "recoveries" were spurious source-path-fragment names (precision up,
-/// recall down). The `> PHASE3_0_ARM_ONLY_BASELINE` assertion below therefore
-/// needs recalibration on the next golden re-verification; it is env-gated
-/// (`PME_GOLDEN_DIR`) so CI is unaffected until then. Phase 3.0.1 is still
-/// expected to push past the 968 ARM+Thumb total once the radare2 Thumb cap
-/// is lifted (separate follow-up).
+/// recall down). The radare2 Thumb cap has since been lifted: re-verified full
+/// ARM+Thumb production output has 915 recovered globals (367 ARM / 545 Thumb
+/// / 3 mixed), so the env-gated assertion below again holds without changing
+/// this historical ARM-only baseline.
 const PHASE3_0_ARM_ONLY_BASELINE: u64 = 424;
 
 /// Read `$PME_GOLDEN_DIR` or skip the test cleanly. Mirrors Phase 3.0's
