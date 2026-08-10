@@ -62,6 +62,12 @@ pub struct ImageReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_applied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_apply_skipped: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals_apply_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_decompiled: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_tighten_error: Option<String>,
@@ -93,6 +99,9 @@ impl ImageReport {
                 exit: None,
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
+                globals_applied: r.globals_applied,
+                globals_apply_skipped: r.globals_apply_skipped,
+                globals_apply_error: r.globals_apply_error.clone(),
                 thumb_decompiled: r.thumb_decompiled,
                 thumb_tighten_error: r.thumb_tighten_error.clone(),
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
@@ -110,6 +119,9 @@ impl ImageReport {
                 exit: Some(code),
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
+                globals_applied: r.globals_applied,
+                globals_apply_skipped: r.globals_apply_skipped,
+                globals_apply_error: r.globals_apply_error.clone(),
                 thumb_decompiled: r.thumb_decompiled,
                 thumb_tighten_error: r.thumb_tighten_error.clone(),
                 thumb_enrich_error: r.thumb_enrich_error.clone(),
@@ -393,12 +405,10 @@ fn thumb_enrich_stage(
 }
 
 /// Refresh the last `decompile` stage's per-image entries from the current
-/// `ImageResult` slice. Used after `thumb_enrich` (pass 1 and post-pass-2)
-/// mutates each `ImageResult`'s Phase 2 fields (`thumb_decompiled`,
-/// `thumb_enrich_error`) so the report surfaces the post-enrich state rather
-/// than the pre-enrich snapshot captured when the `decompile` StageReport was
-/// first pushed. Preserves the stage's other fields (status, duration_ms,
-/// output, etc.).
+/// `ImageResult` slice. Used after later orchestration mutates reporting fields
+/// (globals preparation/application and both `thumb_enrich` sweeps) so the
+/// serialized stage does not retain its initial pass-1 snapshot. Preserves the
+/// stage's other fields (status, duration_ms, output, etc.).
 fn refresh_decompile_stage_images(stages: &mut [StageReport], images: &[decompile::ImageResult]) {
     let Some(pos) = stages.iter().rposition(|s| s.stage == "decompile") else {
         return;
@@ -607,6 +617,97 @@ fn prepare_pass2_inputs(
         input.global_count = prepared.recovered_count;
     }
     inputs
+}
+
+fn globals_apply_stage(
+    no_symbol_pass: bool,
+    prepared_globals: &HashMap<String, PreparedGlobalMap>,
+    images: Option<&[decompile::ImageResult]>,
+    duration_ms: u128,
+) -> StageReport {
+    if no_symbol_pass {
+        return StageReport::skipped("globals_apply", "--no-symbol-pass");
+    }
+    if prepared_globals.is_empty() {
+        return StageReport::skipped("globals_apply", "no recovered globals");
+    }
+
+    let mut labels: Vec<&str> = prepared_globals.keys().map(String::as_str).collect();
+    labels.sort_unstable();
+    let mut processed = 0usize;
+    let mut applied_total = 0usize;
+    let mut skipped_total = 0usize;
+    let mut first_error = None;
+
+    if let Some(images) = images {
+        for image in images {
+            let Ok(index) = labels.binary_search(&image.label.as_str()) else {
+                continue;
+            };
+            let label = labels.remove(index);
+            if let Some(error) = &image.pass2_error {
+                first_error.get_or_insert_with(|| error.clone());
+                continue;
+            }
+            if let Some(error) = &image.globals_apply_error {
+                first_error.get_or_insert_with(|| error.clone());
+                continue;
+            }
+            let (Some(applied), Some(skipped)) =
+                (image.globals_applied, image.globals_apply_skipped)
+            else {
+                first_error.get_or_insert_with(|| {
+                    format!("{label}: no valid ApplyGlobals success summary")
+                });
+                continue;
+            };
+            let Some(classified) = applied.checked_add(skipped) else {
+                first_error
+                    .get_or_insert_with(|| format!("{label}: global application counts overflow"));
+                continue;
+            };
+            let expected = prepared_globals[label].recovered_count;
+            if classified != expected {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "{label}: global application counts do not match prepared globals: \
+                         {classified} != {expected}"
+                    )
+                });
+                continue;
+            }
+            let (Some(next_applied), Some(next_skipped)) = (
+                applied_total.checked_add(applied),
+                skipped_total.checked_add(skipped),
+            ) else {
+                first_error.get_or_insert_with(|| "global application totals overflow".to_string());
+                continue;
+            };
+            applied_total = next_applied;
+            skipped_total = next_skipped;
+            processed += 1;
+        }
+    }
+    for label in labels {
+        first_error.get_or_insert_with(|| format!("{label}: missing pass-2 image result"));
+    }
+
+    StageReport {
+        stage: "globals_apply",
+        status: if first_error.is_some() {
+            "failed"
+        } else {
+            "ok"
+        },
+        output: Some(format!(
+            "{processed} image(s) processed; {applied_total} globals applied; \
+             {skipped_total} skipped"
+        )),
+        reason: None,
+        error: first_error,
+        images: Vec::new(),
+        duration_ms,
+    }
 }
 
 fn load_finalized_function_name_indexes(
@@ -1072,10 +1173,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         k_thumb: opts.globals_k_thumb.unwrap_or(globals::K_THUMB),
     };
 
-    // Preserve the disabled route's two explicit skipped stage entries. The
+    // Preserve the disabled route's explicit skipped stage entries. The
     // scheduler does not invoke its pass-2 operation on this route.
     if opts.no_symbol_pass {
         stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
+        stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
         stages.push(StageReport::skipped(
             "thumb_enrich_post_pass2",
             "--no-symbol-pass",
@@ -1122,6 +1224,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             // global map, then export once. Globals already mutated these pass-1
             // ImageResult values, so their fields carry through pass 2.
             let Some(rep) = state.pass1_report.take() else {
+                state
+                    .stages
+                    .push(globals_apply_stage(false, prepared_global_maps, None, 0));
                 return;
             };
             let t = Instant::now();
@@ -1139,6 +1244,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                             );
                         }
                     }
+                    state.stages.push(globals_apply_stage(
+                        false,
+                        prepared_global_maps,
+                        Some(&rep2.images),
+                        t.elapsed().as_millis(),
+                    ));
                     // 7b. Phase 2 — thumb_enrich re-run against the post-pass-2
                     // decompiled.c. Skipped under --no-thumb-decompile.
                     if opts.no_thumb_decompile {
@@ -1157,11 +1268,20 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     }
                     refresh_decompile_stage_images(state.stages.as_mut_slice(), &rep2.images);
                 }
-                Err(e) => state.stages.push(StageReport::failed(
-                    "decompile_pass2",
-                    e.to_string(),
-                    t.elapsed().as_millis(),
-                )),
+                Err(e) => {
+                    let elapsed = t.elapsed().as_millis();
+                    state.stages.push(StageReport::failed(
+                        "decompile_pass2",
+                        e.to_string(),
+                        elapsed,
+                    ));
+                    state.stages.push(globals_apply_stage(
+                        false,
+                        prepared_global_maps,
+                        None,
+                        elapsed,
+                    ));
+                }
             }
         },
         |state| {
@@ -1364,6 +1484,180 @@ mod tests {
     }
 
     #[test]
+    fn globals_apply_stage_uses_exact_skip_policies() {
+        // This catches disabled application being reported as an executed
+        // result, or the normal zero-input route losing its distinct reason.
+        let prepared = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedGlobalMap {
+                map_path: PathBuf::from("globals/02_MAIN.json"),
+                recovered_count: 1,
+            },
+        )]);
+        let images = vec![analyzed_image("02_MAIN")];
+
+        let disabled = globals_apply_stage(true, &prepared, Some(&images), 99);
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            serde_json::json!({
+                "stage": "globals_apply",
+                "status": "skipped",
+                "reason": "--no-symbol-pass",
+                "duration_ms": 0
+            })
+        );
+
+        let no_recovered = globals_apply_stage(false, &HashMap::new(), Some(&images), 99);
+        assert_eq!(
+            serde_json::to_value(no_recovered).unwrap(),
+            serde_json::json!({
+                "stage": "globals_apply",
+                "status": "skipped",
+                "reason": "no recovered globals",
+                "duration_ms": 0
+            })
+        );
+    }
+
+    #[test]
+    fn globals_apply_stage_aggregates_valid_executed_zero_and_skips_without_function_metrics() {
+        // This catches legitimate skips being treated as failure, executed zero
+        // being treated as absent, or global counts being folded into the
+        // independent function-only pass2_applied metric.
+        let prepared = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/02_MAIN.json"),
+                    recovered_count: 2,
+                },
+            ),
+            (
+                "03_APM".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/03_APM.json"),
+                    recovered_count: 4,
+                },
+            ),
+        ]);
+        let mut main = analyzed_image("02_MAIN");
+        main.pass2_applied = Some(7);
+        main.globals_applied = Some(2);
+        main.globals_apply_skipped = Some(0);
+        let mut apm = analyzed_image("03_APM");
+        apm.pass2_applied = None;
+        apm.globals_applied = Some(0);
+        apm.globals_apply_skipped = Some(4);
+        let mut unrelated = analyzed_image("04_VSS");
+        unrelated.pass2_error = Some("unrelated function-only failure".into());
+        let images = vec![main, apm, unrelated];
+
+        let stage = globals_apply_stage(false, &prepared, Some(&images), 17);
+        assert_eq!(
+            serde_json::to_value(stage).unwrap(),
+            serde_json::json!({
+                "stage": "globals_apply",
+                "status": "ok",
+                "output": "2 image(s) processed; 2 globals applied; 4 skipped",
+                "duration_ms": 17
+            })
+        );
+        assert_eq!(images[0].pass2_applied, Some(7));
+        assert_eq!(images[1].pass2_applied, None);
+    }
+
+    #[test]
+    fn globals_apply_stage_fails_closed_for_every_invalid_prepared_image_outcome() {
+        // These are the real reason-only outcomes produced by Task 4 for a
+        // status:error line and each strict success-summary contract failure.
+        let summary_errors = [
+            "global map rejected",
+            "missing ApplyGlobals summary",
+            "malformed ApplyGlobals summary: expected value at line 1 column 1",
+            "ApplyGlobals summary image \"04_VSS\" does not match \"02_MAIN\"",
+            "ApplyGlobals summary does not conserve candidates: 1 != 2",
+        ];
+        let prepared = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedGlobalMap {
+                map_path: PathBuf::from("globals/02_MAIN.json"),
+                recovered_count: 2,
+            },
+        )]);
+
+        for reason in summary_errors {
+            let mut image = analyzed_image("02_MAIN");
+            image.globals_apply_error = Some(reason.into());
+            let stage = globals_apply_stage(false, &prepared, Some(&[image]), 5);
+            assert_eq!(stage.status, "failed", "reason: {reason}");
+            assert_eq!(
+                stage.error.as_deref(),
+                Some(reason),
+                "first actionable summary error must be retained"
+            );
+            assert_eq!(
+                stage.output.as_deref(),
+                Some("0 image(s) processed; 0 globals applied; 0 skipped")
+            );
+        }
+
+        let mut process_failed = analyzed_image("02_MAIN");
+        process_failed.pass2_error = Some("analyzeHeadless exit 7; stderr tail:\nboom".into());
+        let stage = globals_apply_stage(false, &prepared, Some(&[process_failed]), 6);
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("analyzeHeadless exit 7; stderr tail:\nboom")
+        );
+
+        let no_summary = analyzed_image("02_MAIN");
+        let stage = globals_apply_stage(false, &prepared, Some(&[no_summary]), 7);
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("02_MAIN: no valid ApplyGlobals success summary")
+        );
+
+        let stage = globals_apply_stage(false, &prepared, None, 8);
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("02_MAIN: missing pass-2 image result")
+        );
+    }
+
+    #[test]
+    fn globals_apply_stage_keeps_first_actionable_error_in_image_order() {
+        // This catches HashMap iteration or label sorting replacing the first
+        // pipeline image's actionable failure with a later image's error.
+        let prepared = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/02_MAIN.json"),
+                    recovered_count: 1,
+                },
+            ),
+            (
+                "03_APM".to_string(),
+                PreparedGlobalMap {
+                    map_path: PathBuf::from("globals/03_APM.json"),
+                    recovered_count: 1,
+                },
+            ),
+        ]);
+        let mut apm = analyzed_image("03_APM");
+        apm.globals_apply_error = Some("first pipeline-image error".into());
+        let mut main = analyzed_image("02_MAIN");
+        main.pass2_error = Some("later pipeline-image error".into());
+
+        let stage = globals_apply_stage(false, &prepared, Some(&[apm, main]), 4);
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(stage.error.as_deref(), Some("first pipeline-image error"));
+    }
+
+    #[test]
     fn globals_stage_runs_each_raw_image_once_and_prepares_only_recovered_inputs() {
         // This catches a sweep that skips or repeats an eligible raw image, loses
         // the prepared all-tier function-name index, creates an application input
@@ -1556,6 +1850,118 @@ mod tests {
             )
         );
 
+        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
+        assert_eq!(inputs["02_MAIN"].function_count, 1);
+        assert_eq!(inputs["02_MAIN"].global_count, 0);
+        assert!(inputs["02_MAIN"].function_map.is_some());
+        assert!(inputs["02_MAIN"].global_map.is_none());
+        images[1].globals_applied = Some(0);
+        images[1].globals_apply_skipped = Some(1);
+        let apply_stage = globals_apply_stage(false, &outcome.maps, Some(&images), 0);
+        assert_eq!(apply_stage.status, "ok");
+        assert_eq!(
+            apply_stage.output.as_deref(),
+            Some("1 image(s) processed; 0 globals applied; 1 skipped")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sole_global_preparation_failure_skips_application_but_keeps_function_only_input() {
+        // This catches the separate `globals` preparation failure being
+        // misreported as an invocation, or consuming the same image's valid
+        // function-only pass-2 work.
+        let root = std::env::temp_dir().join(format!(
+            "pme_globals_stage_sole_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let image_dir = images_dir.join("02_MAIN");
+        std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
+        std::fs::write(image_dir.join("02_MAIN.bin"), b"main bytes").unwrap();
+        let mut images = vec![analyzed_image("02_MAIN")];
+        let function_maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedFunctionMap {
+                map_path: PathBuf::from("maps/02_MAIN.json"),
+                named_count: 3,
+                function_names: HashMap::new(),
+            },
+        )]);
+
+        let outcome = run_globals_stage_with(
+            &mut images,
+            &images_dir,
+            &root.join("manifest.json"),
+            &prepare_function_name_indexes(&function_maps),
+            &globals::GlobalsOpts::default(),
+            |_, _, _, _, _| Err(Error::Serialize("malformed functions.json".into())),
+        );
+        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
+        let apply_stage = globals_apply_stage(false, &outcome.maps, Some(&images), 12);
+
+        assert_eq!(outcome.stage.status, "failed");
+        assert!(outcome.maps.is_empty());
+        assert_eq!(inputs["02_MAIN"].function_count, 3);
+        assert_eq!(inputs["02_MAIN"].global_count, 0);
+        assert!(inputs["02_MAIN"].function_map.is_some());
+        assert!(inputs["02_MAIN"].global_map.is_none());
+        assert_eq!(apply_stage.status, "skipped");
+        assert_eq!(apply_stage.reason.as_deref(), Some("no recovered globals"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_summary_failure_does_not_discard_refreshed_function_export() {
+        // This catches aggregate reporting short-circuiting the already-safe
+        // refresh of an independently successful same-process function export.
+        let root = std::env::temp_dir().join(format!(
+            "pme_globals_apply_refresh_isolation_{}",
+            std::process::id()
+        ));
+        let ghidra_dir = root.join("ghidra");
+        let images_dir = root.join("images");
+        let export = ghidra_dir.join("export").join("02_MAIN");
+        let destination = images_dir.join("02_MAIN").join("decompiled");
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        for (name, contents) in [
+            ("decompiled.c", "void refreshed_function(void) {}"),
+            ("disasm.lst", "refreshed disassembly"),
+            ("functions.json", "[]"),
+        ] {
+            std::fs::write(export.join(name), contents).unwrap();
+            std::fs::write(destination.join(name), format!("stale {name}")).unwrap();
+        }
+        std::fs::write(destination.join("thumb_functions.json"), b"sidecar").unwrap();
+        let prepared = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedGlobalMap {
+                map_path: PathBuf::from("globals/02_MAIN.json"),
+                recovered_count: 1,
+            },
+        )]);
+        let mut image = analyzed_image("02_MAIN");
+        image.pass2_applied = Some(1);
+        image.globals_apply_error = Some("global map rejected".into());
+
+        refresh_decompiled(&ghidra_dir, &images_dir, "02_MAIN").unwrap();
+        let stage = globals_apply_stage(false, &prepared, Some(&[image]), 9);
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(stage.error.as_deref(), Some("global map rejected"));
+        assert_eq!(
+            std::fs::read_to_string(destination.join("decompiled.c")).unwrap(),
+            "void refreshed_function(void) {}"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("thumb_functions.json")).unwrap(),
+            b"sidecar"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1724,6 +2130,9 @@ mod tests {
                         exit: None,
                         pass2_applied: None,
                         pass2_error: None,
+                        globals_applied: None,
+                        globals_apply_skipped: None,
+                        globals_apply_error: None,
                         thumb_decompiled: None,
                         thumb_tighten_error: None,
                         thumb_enrich_error: None,
@@ -1741,6 +2150,9 @@ mod tests {
                         exit: Some(1),
                         pass2_applied: None,
                         pass2_error: None,
+                        globals_applied: None,
+                        globals_apply_skipped: None,
+                        globals_apply_error: None,
                         thumb_decompiled: None,
                         thumb_tighten_error: None,
                         thumb_enrich_error: None,
@@ -1842,6 +2254,56 @@ mod tests {
             StageReport::skipped("decode_tokens", "no pw_token_db"),
         ];
         assert!(Report::is_ok(&stages));
+    }
+
+    #[test]
+    fn image_report_distinguishes_uninvoked_executed_zero_and_failed_global_application() {
+        // This catches the ImageReport mirror dropping Task 4's raw outcome,
+        // collapsing executed zero into absent, or serializing stale success
+        // counts together with an application error.
+        let mut uninvoked = analyzed_image("02_MAIN");
+        uninvoked.pass2_applied = Some(3);
+        let uninvoked_json = serde_json::to_value(ImageReport::from_result(&uninvoked)).unwrap();
+        assert_eq!(
+            uninvoked_json,
+            serde_json::json!({
+                "image": "02_MAIN",
+                "status": "analyzed",
+                "functions": 1,
+                "pass2_applied": 3
+            })
+        );
+
+        let mut executed_zero = analyzed_image("03_APM");
+        executed_zero.pass2_applied = Some(2);
+        executed_zero.globals_applied = Some(0);
+        executed_zero.globals_apply_skipped = Some(4);
+        let executed_zero_json =
+            serde_json::to_value(ImageReport::from_result(&executed_zero)).unwrap();
+        assert_eq!(
+            executed_zero_json,
+            serde_json::json!({
+                "image": "03_APM",
+                "status": "analyzed",
+                "functions": 1,
+                "pass2_applied": 2,
+                "globals_applied": 0,
+                "globals_apply_skipped": 4
+            })
+        );
+
+        let mut failed = analyzed_image("04_VSS");
+        failed.globals_apply_error = Some("missing ApplyGlobals summary".into());
+        let failed_json = serde_json::to_value(ImageReport::from_result(&failed)).unwrap();
+        assert_eq!(
+            failed_json,
+            serde_json::json!({
+                "image": "04_VSS",
+                "status": "analyzed",
+                "functions": 1,
+                "globals_apply_error": "missing ApplyGlobals summary"
+            })
+        );
     }
 
     #[test]
@@ -2075,6 +2537,9 @@ mod tests {
             exit: None,
             pass2_applied: None,
             pass2_error: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
             thumb_decompiled: None, // pre-enrich
             thumb_tighten_error: None,
             thumb_enrich_error: None,
