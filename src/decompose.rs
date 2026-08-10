@@ -534,16 +534,30 @@ fn finalize(
 struct PreparedFunctionMap {
     map_path: PathBuf,
     named_count: usize,
-    #[allow(
-        dead_code,
-        reason = "Task 3 consumes this retained index after the preparation refactor lands."
-    )]
     function_names: HashMap<String, String>,
+}
+
+type FunctionNameIndexes = HashMap<String, HashMap<String, String>>;
+
+/// A successfully written globals map retained for pass-2 application.
+#[allow(
+    dead_code,
+    reason = "Task 4 consumes these retained map inputs after ApplyGlobals lands."
+)]
+struct PreparedGlobalMap {
+    map_path: PathBuf,
+    recovered_count: usize,
+}
+
+/// One complete globals sweep: typed pass-2 inputs and the aggregate report.
+struct GlobalsStageOutcome {
+    maps: HashMap<String, PreparedGlobalMap>,
+    stage: StageReport,
 }
 
 /// Per-image symbol map outcome from [`build_and_write_symbol_maps`]: the
 /// successful `(label, prepared map)` entries plus any per-image errors.
-type SymbolMapsResult = (Vec<(String, PreparedFunctionMap)>, Vec<(String, String)>);
+type SymbolMapsResult = (HashMap<String, PreparedFunctionMap>, Vec<(String, String)>);
 
 /// Prepare the in-memory result for a function symbol map that was written from
 /// `symbols`. Every non-null name is retained regardless of tier; malformed
@@ -566,6 +580,134 @@ fn prepare_function_map(map_path: PathBuf, symbols: &[symbolicate::Symbol]) -> P
         named_count,
         function_names,
     }
+}
+
+fn prepare_function_name_indexes(
+    function_maps: &HashMap<String, PreparedFunctionMap>,
+) -> FunctionNameIndexes {
+    function_maps
+        .iter()
+        .map(|(label, prepared)| (label.clone(), prepared.function_names.clone()))
+        .collect()
+}
+
+fn load_finalized_function_name_indexes(
+    images_dir: &Path,
+    images: &[decompile::ImageResult],
+) -> FunctionNameIndexes {
+    images
+        .iter()
+        .map(|image| {
+            let symbols_path = images_dir
+                .join(&image.label)
+                .join("decompiled")
+                .join("symbols.json");
+            (
+                image.label.clone(),
+                load_recovered_function_names(&symbols_path),
+            )
+        })
+        .collect()
+}
+
+fn run_globals_stage_with<F>(
+    images: &mut [decompile::ImageResult],
+    images_dir: &Path,
+    manifest: &Path,
+    function_name_indexes: &FunctionNameIndexes,
+    opts: &globals::GlobalsOpts,
+    mut run_image: F,
+) -> GlobalsStageOutcome
+where
+    F: FnMut(
+        &Path,
+        &str,
+        &Path,
+        &HashMap<String, String>,
+        &globals::GlobalsOpts,
+    ) -> Result<globals::GlobalsReport>,
+{
+    let started = Instant::now();
+    let mut maps = HashMap::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut conflicts = 0usize;
+    let mut provisional_total = 0usize;
+    let mut provisional_suppressed_total = 0usize;
+    let empty_names = HashMap::new();
+
+    for image in images {
+        let label = image.label.clone();
+        let image_dir = images_dir.join(&label);
+        if !image_dir.join(format!("{label}.bin")).exists() {
+            continue;
+        }
+        let names = function_name_indexes.get(&label).unwrap_or(&empty_names);
+        match run_image(&image_dir, &label, manifest, names, opts) {
+            Ok(report) => {
+                image.globals_recovered = Some(report.recovered_count);
+                image.globals_provisional = Some(report.provisional_generated);
+                image.globals_provisional_suppressed =
+                    Some(report.provisional_suppressed_by_recovered);
+                conflicts += report.conflicts_dropped;
+                provisional_total += report.provisional_generated;
+                provisional_suppressed_total += report.provisional_suppressed_by_recovered;
+                counts.push((label.clone(), report.recovered_count));
+                if report.recovered_count > 0 {
+                    maps.insert(
+                        label,
+                        PreparedGlobalMap {
+                            map_path: image_dir.join("decompiled").join("globals.json"),
+                            recovered_count: report.recovered_count,
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                image.globals_error = Some(message.clone());
+                errors.push((label, message));
+            }
+        }
+    }
+
+    let recovered_total: usize = counts.iter().map(|(_, count)| count).sum();
+    let stage = StageReport {
+        stage: "globals",
+        status: if errors.is_empty() { "ok" } else { "failed" },
+        output: Some(format!(
+            "{} image(s) processed; {} recovered globals total; {} conflicts dropped; \
+             {} provisional generated ({} suppressed by Recovered)",
+            counts.len(),
+            recovered_total,
+            conflicts,
+            provisional_total,
+            provisional_suppressed_total,
+        )),
+        reason: None,
+        error: errors.first().map(|(_, error)| error.clone()),
+        images: Vec::new(),
+        duration_ms: started.elapsed().as_millis(),
+    };
+
+    GlobalsStageOutcome { maps, stage }
+}
+
+fn run_globals_stage(
+    images: &mut [decompile::ImageResult],
+    images_dir: &Path,
+    manifest: &Path,
+    function_name_indexes: &FunctionNameIndexes,
+    opts: &globals::GlobalsOpts,
+) -> GlobalsStageOutcome {
+    run_globals_stage_with(
+        images,
+        images_dir,
+        manifest,
+        function_name_indexes,
+        opts,
+        globals::run,
+    )
 }
 
 /// Build the per-image symbol map from pass-1 outputs and write each to
@@ -604,9 +746,9 @@ fn build_and_write_symbol_maps(
     if let Err(e) = std::fs::create_dir_all(&maps_dir) {
         // Without the maps dir we can't write anything; record once and bail.
         errors.push(("<maps_dir>".into(), format!("create_dir_all: {e}")));
-        return (Vec::new(), errors);
+        return (HashMap::new(), errors);
     }
-    let mut out_vec = Vec::new();
+    let mut out_maps = HashMap::new();
     let entries = match std::fs::read_dir(images_dir) {
         Ok(e) => e,
         Err(e) => {
@@ -614,7 +756,7 @@ fn build_and_write_symbol_maps(
                 "<images_dir>".into(),
                 format!("read_dir {}: {e}", images_dir.display()),
             ));
-            return (out_vec, errors);
+            return (out_maps, errors);
         }
     };
     for entry in entries.flatten() {
@@ -647,9 +789,9 @@ fn build_and_write_symbol_maps(
             errors.push((label.clone(), format!("write_symbol_map: {e}")));
             continue;
         }
-        out_vec.push((label, prepare_function_map(map_path, &symbols)));
+        out_maps.insert(label, prepare_function_map(map_path, &symbols));
     }
-    (out_vec, errors)
+    (out_maps, errors)
 }
 
 /// Exhaustive pipeline into one per-image tree. Ghidra + radare2 required (probed
@@ -837,17 +979,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     // 6. Build the per-image symbol map from pass-1 outputs + attribution +
     //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
     let t = Instant::now();
-    let (symbol_maps, symbol_map_errors) = if opts.no_symbol_pass {
-        (Vec::new(), Vec::new())
+    let (function_maps, symbol_map_errors) = if opts.no_symbol_pass {
+        (HashMap::new(), Vec::new())
     } else {
         build_and_write_symbol_maps(out, &images_dir, &token_db, &out.join("manifest.json"))
     };
     if opts.no_symbol_pass {
         stages.push(StageReport::skipped("symbol_map", "--no-symbol-pass"));
     } else {
-        let total: usize = symbol_maps
-            .iter()
-            .map(|(_, prepared)| prepared.named_count)
+        let total: usize = function_maps
+            .values()
+            .map(|prepared| prepared.named_count)
             .sum();
         // Real failures surface as a `failed` stage (the prior shape collapsed
         // them into `skipped, "no symbols recovered"` — a violation of the
@@ -875,20 +1017,52 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         stages.push(stage);
     }
 
+    // Phase 3.0 globals options are route-independent. Normal decompose uses
+    // the in-memory all-tier names prepared alongside the function maps; the
+    // --no-symbol-pass route loads its indexes from finalized symbols.json
+    // later, after the legacy text rewrite has completed.
+    let globals_opts = globals::GlobalsOpts {
+        include_provisional: opts.globals_provisional,
+        k_arm: opts.globals_k_arm.unwrap_or(globals::K_ARM),
+        k_thumb: opts.globals_k_thumb.unwrap_or(globals::K_THUMB),
+    };
+    let function_name_indexes = prepare_function_name_indexes(&function_maps);
+
+    // Normal route: prepare globals before pass 2 so these ImageResult values
+    // carry their globals fields through run_two_pass. Task 4 consumes the
+    // retained typed maps alongside the function maps.
+    let mut _prepared_global_maps = HashMap::new();
+    if !opts.no_symbol_pass {
+        let active_images = if let Some(report) = pass1_report.as_mut() {
+            report.images.as_mut_slice()
+        } else {
+            &mut []
+        };
+        let outcome = run_globals_stage(
+            active_images,
+            &images_dir,
+            &out.join("manifest.json"),
+            &function_name_indexes,
+            &globals_opts,
+        );
+        _prepared_global_maps = outcome.maps;
+        stages.push(outcome.stage);
+        let refresh_source = pass1_report
+            .as_ref()
+            .map(|report| report.images.as_slice())
+            .unwrap_or(&[]);
+        refresh_decompile_stage_images(&mut stages, refresh_source);
+    }
+
     // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image with a
     //    non-empty map. Consumes pass1_report (pass 1 already ran in step 3).
     //    Per-image pass-2 failures land in ImageResult.pass2_error and do not
     //    abort the orchestrator — pass 1 already produced a valid decompiled.c.
     //
-    //    `pass2_report_opt` hoists the Ok arm's `rep2` to outer scope so the
-    //    Phase 3.0 globals stage (after step 8's symbolicate_finalize) can
-    //    borrow the active image slice. Stays None on --no-symbol-pass, pass-1
-    //    failure, or pass-2 error.
-    let mut pass2_report_opt: Option<decompile::DecompileReport> = None;
     if !opts.no_symbol_pass {
         if let Some(rep) = pass1_report.take() {
             let t = Instant::now();
-            let map_paths: HashMap<String, PathBuf> = symbol_maps
+            let map_paths: HashMap<String, PathBuf> = function_maps
                 .iter()
                 .map(|(label, prepared)| (label.clone(), prepared.map_path.clone()))
                 .collect();
@@ -925,7 +1099,6 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     }
                     // Refresh the decompile stage's per-image reports with pass-2 fields.
                     refresh_decompile_stage_images(&mut stages, &rep2.images);
-                    pass2_report_opt = Some(rep2);
                 }
                 Err(e) => stages.push(StageReport::failed(
                     "decompile_pass2",
@@ -963,112 +1136,34 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         },
     );
 
-    // 11. Phase 3.0 — globals recovery (record-only).
-    //     Reads pass-1 functions.json/thumb_functions.json + raw image bytes;
-    //     writes per-image globals.json. Per-image; skips images without raw
-    //     bytes (no .bin file). Mutates ImageResult.globals_recovered /
-    //     globals_error. Refreshes the decompile stage's per-image reports so
-    //     the new fields surface in report.json (Phase 2.1 lesson).
-    //
-    //     Active image slice: pass 2's report if it ran (most up-to-date —
-    //     pass 2 baked recovered names into decompiled.c); else pass 1's
-    //     report (e.g. --no-symbol-pass path); else empty (pass 1 failed).
-    let globals_started = Instant::now();
-    let mut globals_errors: Vec<(String, String)> = Vec::new();
-    let mut globals_counts: Vec<(String, usize)> = Vec::new();
-    let mut globals_conflicts: usize = 0;
-    let mut globals_provisional_total: usize = 0;
-    let mut globals_provisional_suppressed_total: usize = 0;
-    // Phase 3.0.1: construct the globals options from the CLI flags once.
-    // `--globals-k-arm` / `--globals-k-thumb` fall back to the pinned module
-    // constants when unset; `--globals-provisional` is opt-in (default false).
-    let globals_opts = globals::GlobalsOpts {
-        include_provisional: opts.globals_provisional,
-        k_arm: opts.globals_k_arm.unwrap_or(globals::K_ARM),
-        k_thumb: opts.globals_k_thumb.unwrap_or(globals::K_THUMB),
-    };
-    {
-        let active_images: &mut [decompile::ImageResult] =
-            if let Some(ref mut rep2) = pass2_report_opt {
-                &mut rep2.images
-            } else if let Some(ref mut rep1) = pass1_report {
-                &mut rep1.images
-            } else {
-                &mut []
-            };
-        for ir in active_images.iter_mut() {
-            let label = ir.label.clone();
-            let image_bin = images_dir.join(&label).join(format!("{label}.bin"));
-            if !image_bin.exists() {
-                continue; // No raw bytes -> can't extract strings.
-            }
-            // Build the Phase 1 cross-reference (entry hex -> recovered name)
-            // from this image's symbols.json. Empty map when symbols.json is
-            // absent or unreadable; the algorithm degrades gracefully.
-            let symbols_path = images_dir
-                .join(&label)
-                .join("decompiled")
-                .join("symbols.json");
-            let recovered_map = load_recovered_function_names(&symbols_path);
-
-            match globals::run(
-                &images_dir.join(&label),
-                &label,
-                &out.join("manifest.json"),
-                &recovered_map,
-                &globals_opts,
-            ) {
-                Ok(report) => {
-                    ir.globals_recovered = Some(report.recovered_count);
-                    ir.globals_provisional = Some(report.provisional_generated);
-                    ir.globals_provisional_suppressed =
-                        Some(report.provisional_suppressed_by_recovered);
-                    globals_conflicts += report.conflicts_dropped;
-                    globals_provisional_total += report.provisional_generated;
-                    globals_provisional_suppressed_total +=
-                        report.provisional_suppressed_by_recovered;
-                    globals_counts.push((label.clone(), report.recovered_count));
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    ir.globals_error = Some(msg.clone());
-                    globals_errors.push((label.clone(), msg));
-                }
-            }
-        }
-    }
-    let globals_total: usize = globals_counts.iter().map(|(_, n)| n).sum();
-    stages.push(StageReport {
-        stage: "globals",
-        status: if globals_errors.is_empty() {
-            "ok"
+    // --no-symbol-pass keeps the legacy order: symbolication finalizes and
+    // rewrites text first, then globals consumes every non-null finalized name
+    // through the defensive loader. Its maps are deliberately not retained as
+    // application inputs because pass 2 is disabled.
+    if opts.no_symbol_pass {
+        let late_function_name_indexes = pass1_report
+            .as_ref()
+            .map(|report| load_finalized_function_name_indexes(&images_dir, &report.images))
+            .unwrap_or_default();
+        let active_images = if let Some(report) = pass1_report.as_mut() {
+            report.images.as_mut_slice()
         } else {
-            "failed"
-        },
-        output: Some(format!(
-            "{} image(s) processed; {} recovered globals total; {} conflicts dropped; \
-             {} provisional generated ({} suppressed by Recovered)",
-            globals_counts.len(),
-            globals_total,
-            globals_conflicts,
-            globals_provisional_total,
-            globals_provisional_suppressed_total,
-        )),
-        reason: None,
-        error: globals_errors.first().map(|(_, e)| e.clone()),
-        images: Vec::new(),
-        duration_ms: globals_started.elapsed().as_millis(),
-    });
-    // Refresh the decompile stage's per-image reports with Phase 3.0 fields
-    // (Phase 2.1 lesson: refresh after each sweep that mutates ImageResult).
-    let refresh_source: &[decompile::ImageResult] = if let Some(ref rep2) = pass2_report_opt {
-        &rep2.images
-    } else if let Some(ref rep1) = pass1_report {
-        &rep1.images
-    } else {
-        &[]
-    };
-    refresh_decompile_stage_images(&mut stages, refresh_source);
+            &mut []
+        };
+        let outcome = run_globals_stage(
+            active_images,
+            &images_dir,
+            &out.join("manifest.json"),
+            &late_function_name_indexes,
+            &globals_opts,
+        );
+        stages.push(outcome.stage);
+        let refresh_source = pass1_report
+            .as_ref()
+            .map(|report| report.images.as_slice())
+            .unwrap_or(&[]);
+        refresh_decompile_stage_images(&mut stages, refresh_source);
+    }
 
     // 9. Remaining decoders (independent of symbolication).
     let rf_dir = out.join("rf_cfg_decompressed");
@@ -1117,6 +1212,24 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn analyzed_image(label: &str) -> decompile::ImageResult {
+        decompile::ImageResult {
+            label: label.into(),
+            outcome: ImageOutcome::Analyzed(1),
+            thumb_functions: None,
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
+        }
+    }
+
     #[test]
     fn prepared_function_map_keeps_every_named_symbol_with_loader_canonical_addresses() {
         // This catches a preparation path that either filters to Recovered symbols
@@ -1163,6 +1276,261 @@ mod tests {
                 ("ef".to_string(), "provisional_name".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn globals_stage_runs_each_raw_image_once_and_prepares_only_recovered_inputs() {
+        // This catches a sweep that skips or repeats an eligible raw image, loses
+        // the prepared all-tier function-name index, creates an application input
+        // for zero Recovered globals, or counts Provisional globals as applicable.
+        let root =
+            std::env::temp_dir().join(format!("pme_globals_stage_success_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        for (label, bytes) in [
+            ("02_MAIN", b"main bytes".as_slice()),
+            ("03_APM", b"apm bytes".as_slice()),
+            ("04_VSS", b"vss bytes".as_slice()),
+        ] {
+            let image_dir = images_dir.join(label);
+            std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
+            std::fs::write(image_dir.join(format!("{label}.bin")), bytes).unwrap();
+        }
+        let mut images = vec![
+            analyzed_image("02_MAIN"),
+            analyzed_image("03_APM"),
+            analyzed_image("04_VSS"),
+            analyzed_image("05_DBGCORE"),
+        ];
+        let function_maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedFunctionMap {
+                map_path: PathBuf::from("maps/02_MAIN.json"),
+                named_count: 2,
+                function_names: HashMap::from([
+                    ("40".to_string(), "RecoveredMain".to_string()),
+                    ("44".to_string(), "guess_main_44".to_string()),
+                ]),
+            },
+        )]);
+        let function_name_indexes = prepare_function_name_indexes(&function_maps);
+        let mut calls = Vec::new();
+
+        let outcome = run_globals_stage_with(
+            &mut images,
+            &images_dir,
+            &root.join("manifest.json"),
+            &function_name_indexes,
+            &globals::GlobalsOpts::default(),
+            |image_dir, label, _, names, _| {
+                calls.push((
+                    label.to_string(),
+                    std::fs::read(image_dir.join(format!("{label}.bin"))).unwrap(),
+                    names.clone(),
+                ));
+                Ok(match label {
+                    "02_MAIN" => globals::GlobalsReport {
+                        recovered_count: 2,
+                        conflicts_dropped: 1,
+                        provisional_generated: 5,
+                        provisional_suppressed_by_recovered: 1,
+                    },
+                    "03_APM" => globals::GlobalsReport {
+                        recovered_count: 0,
+                        conflicts_dropped: 2,
+                        provisional_generated: 3,
+                        provisional_suppressed_by_recovered: 2,
+                    },
+                    "04_VSS" => globals::GlobalsReport {
+                        recovered_count: 4,
+                        conflicts_dropped: 0,
+                        provisional_generated: 9,
+                        provisional_suppressed_by_recovered: 0,
+                    },
+                    _ => unreachable!("image without raw bytes must not run"),
+                })
+            },
+        );
+
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "02_MAIN".to_string(),
+                    b"main bytes".to_vec(),
+                    HashMap::from([
+                        ("40".to_string(), "RecoveredMain".to_string()),
+                        ("44".to_string(), "guess_main_44".to_string()),
+                    ]),
+                ),
+                ("03_APM".to_string(), b"apm bytes".to_vec(), HashMap::new()),
+                ("04_VSS".to_string(), b"vss bytes".to_vec(), HashMap::new()),
+            ],
+            "each image with raw bytes must run exactly once with its prepared names"
+        );
+        assert_eq!(images[0].globals_recovered, Some(2));
+        assert_eq!(images[0].globals_provisional, Some(5));
+        assert_eq!(images[0].globals_provisional_suppressed, Some(1));
+        assert_eq!(images[1].globals_recovered, Some(0));
+        assert_eq!(images[2].globals_recovered, Some(4));
+        assert_eq!(images[2].globals_provisional, Some(9));
+        assert!(images[3].globals_recovered.is_none());
+        assert_eq!(outcome.maps.len(), 2);
+        assert_eq!(outcome.maps["02_MAIN"].recovered_count, 2);
+        assert_eq!(outcome.maps["04_VSS"].recovered_count, 4);
+        assert_eq!(
+            outcome.maps["04_VSS"].map_path,
+            images_dir
+                .join("04_VSS")
+                .join("decompiled")
+                .join("globals.json")
+        );
+        assert!(!outcome.maps.contains_key("03_APM"));
+        assert_eq!(outcome.stage.stage, "globals");
+        assert_eq!(outcome.stage.status, "ok");
+        assert_eq!(
+            outcome.stage.output.as_deref(),
+            Some(
+                "3 image(s) processed; 6 recovered globals total; 3 conflicts dropped; \
+                 17 provisional generated (3 suppressed by Recovered)"
+            )
+        );
+        assert!(outcome.stage.error.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn globals_stage_failure_keeps_function_map_and_surfaces_failed_image() {
+        // This catches an image-level globals error that consumes or deletes its
+        // function-only pass-2 input, suppresses the error/report failure, or
+        // prevents later images from producing usable globals inputs.
+        let root =
+            std::env::temp_dir().join(format!("pme_globals_stage_failure_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        for label in ["02_MAIN", "04_VSS"] {
+            let image_dir = images_dir.join(label);
+            std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
+            std::fs::write(image_dir.join(format!("{label}.bin")), label).unwrap();
+        }
+        let mut images = vec![analyzed_image("02_MAIN"), analyzed_image("04_VSS")];
+        let function_maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedFunctionMap {
+                map_path: PathBuf::from("maps/02_MAIN.json"),
+                named_count: 1,
+                function_names: HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
+            },
+        )]);
+        let function_name_indexes = prepare_function_name_indexes(&function_maps);
+
+        let outcome = run_globals_stage_with(
+            &mut images,
+            &images_dir,
+            &root.join("manifest.json"),
+            &function_name_indexes,
+            &globals::GlobalsOpts::default(),
+            |_, label, _, _, _| {
+                if label == "02_MAIN" {
+                    Err(Error::Serialize("malformed functions.json".into()))
+                } else {
+                    Ok(globals::GlobalsReport {
+                        recovered_count: 1,
+                        conflicts_dropped: 0,
+                        provisional_generated: 0,
+                        provisional_suppressed_by_recovered: 0,
+                    })
+                }
+            },
+        );
+
+        assert_eq!(
+            function_maps["02_MAIN"].map_path,
+            PathBuf::from("maps/02_MAIN.json"),
+            "globals failure must preserve the function-only pass-2 input"
+        );
+        assert!(!outcome.maps.contains_key("02_MAIN"));
+        assert_eq!(outcome.maps["04_VSS"].recovered_count, 1);
+        assert_eq!(
+            images[0].globals_error.as_deref(),
+            Some("serialize: malformed functions.json")
+        );
+        assert!(images[0].globals_recovered.is_none());
+        assert_eq!(images[1].globals_recovered, Some(1));
+        assert_eq!(outcome.stage.status, "failed");
+        assert_eq!(
+            outcome.stage.error.as_deref(),
+            Some("serialize: malformed functions.json")
+        );
+        assert_eq!(
+            outcome.stage.output.as_deref(),
+            Some(
+                "1 image(s) processed; 1 recovered globals total; 0 conflicts dropped; \
+                 0 provisional generated (0 suppressed by Recovered)"
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn late_no_symbol_globals_uses_every_finalized_non_null_name_once() {
+        // This catches the --no-symbol-pass route running globals before
+        // symbolicate_finalize, bypassing the defensive symbols.json loader, or
+        // filtering finalized Provisional names out of the cross-reference.
+        let root = std::env::temp_dir().join(format!(
+            "pme_globals_stage_no_symbol_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let image_dir = images_dir.join("02_MAIN");
+        std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
+        std::fs::write(image_dir.join("02_MAIN.bin"), b"raw bytes").unwrap();
+        std::fs::write(
+            image_dir.join("decompiled").join("symbols.json"),
+            r#"{"symbols":[
+                {"address":"0x00000040","name":"RecoveredMain"},
+                {"address":"00000044","name":"guess_main_44"},
+                {"address":"0x48","name":null},
+                {"address":"not-hex","name":"MalformedAddress"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut images = vec![analyzed_image("02_MAIN")];
+        let function_name_indexes = load_finalized_function_name_indexes(&images_dir, &images);
+        let mut calls = 0usize;
+
+        let outcome = run_globals_stage_with(
+            &mut images,
+            &images_dir,
+            &root.join("manifest.json"),
+            &function_name_indexes,
+            &globals::GlobalsOpts::default(),
+            |_, label, _, names, _| {
+                calls += 1;
+                assert_eq!(label, "02_MAIN");
+                assert_eq!(
+                    names,
+                    &HashMap::from([
+                        ("40".to_string(), "RecoveredMain".to_string()),
+                        ("44".to_string(), "guess_main_44".to_string()),
+                    ])
+                );
+                Ok(globals::GlobalsReport {
+                    recovered_count: 1,
+                    conflicts_dropped: 0,
+                    provisional_generated: 0,
+                    provisional_suppressed_by_recovered: 0,
+                })
+            },
+        );
+
+        assert_eq!(calls, 1);
+        assert_eq!(outcome.maps["02_MAIN"].recovered_count, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
