@@ -722,7 +722,10 @@ pub fn run(
         }
     }
 
-    let recovered_count = globals.len();
+    let recovered_count = globals
+        .iter()
+        .filter(|global| global.tier == "recovered")
+        .count();
 
     // 7. Write globals.json. Atomicity: serialize to a String first, then
     //    write. A serialize failure leaves the on-disk file untouched.
@@ -2084,33 +2087,51 @@ mod tests {
     }
 
     #[test]
-    fn run_populates_provisional_suppressed_field() {
+    fn recovered_count_excludes_materialized_provisional() {
         // `provisional_suppressed` distinguishes "no Provisional generated"
         // from "generated but withheld/suppressed". Spec contract:
         //   generated == 0                       -> field absent (None)
         //   generated > 0, all withheld/dropped  -> Some(generated)
         //   generated > 0, all materialized      -> Some(0)
         // Same fixture shape as `provisional_never_emitted_without_opt_in_flag`
-        // — one Provisional proposal comes out of the name-prior pass.
+        // plus a strict-rule Recovered proposal at a different address. With
+        // the opt-in enabled, both tiers materialize in globals.json but only
+        // the Recovered entry belongs in report.recovered_count.
         let mk = |tag: &str, include_provisional: bool| {
             let img = Img::new(tag);
             img.write_manifest_load_addr("0x40e20000");
-            let entry = 0x40e40000;
-            let end = 0x40e40030;
-            let string_addr = 0x40e22000u64;
-            let g1 = 0x40e30000u64;
-            let g2 = 0x40e31000u64;
-            let func_json = serde_json::json!([{
-                "name": format!("FUN_{entry:x}"),
-                "entry": format!("0x{entry:x}"),
-                "end": format!("0x{end:x}"),
-                "size": 0x30,
-                "data_refs": [
-                    format!("0x{string_addr:x}"),
-                    format!("0x{g1:x}"),
-                    format!("0x{g2:x}"),
-                ],
-            }])
+            let provisional_entry = 0x40e40000;
+            let provisional_end = 0x40e40030;
+            let provisional_string_addr = 0x40e22000u64;
+            let provisional_target = 0x40e30000u64;
+            let provisional_other = 0x40e31000u64;
+            let recovered_entry = 0x40e50000;
+            let recovered_end = 0x40e50030;
+            let recovered_string_addr = 0x40e22500u64;
+            let recovered_target = 0x40e32000u64;
+            let func_json = serde_json::json!([
+                {
+                    "name": format!("FUN_{provisional_entry:x}"),
+                    "entry": format!("0x{provisional_entry:x}"),
+                    "end": format!("0x{provisional_end:x}"),
+                    "size": 0x30,
+                    "data_refs": [
+                        format!("0x{provisional_string_addr:x}"),
+                        format!("0x{provisional_target:x}"),
+                        format!("0x{provisional_other:x}"),
+                    ],
+                },
+                {
+                    "name": format!("FUN_{recovered_entry:x}"),
+                    "entry": format!("0x{recovered_entry:x}"),
+                    "end": format!("0x{recovered_end:x}"),
+                    "size": 0x30,
+                    "data_refs": [
+                        format!("0x{recovered_string_addr:x}"),
+                        format!("0x{recovered_target:x}"),
+                    ],
+                },
+            ])
             .to_string();
             img.write_functions_json(&func_json);
             img.write_thumb_functions_json(
@@ -2126,10 +2147,19 @@ mod tests {
             .unwrap();
             img.write_image_bin(&image_with_strings(
                 0x40e20000,
-                &[(string_addr, "lteRrc_state and otherModule_field are NULL")],
+                &[
+                    (
+                        provisional_string_addr,
+                        "lteRrc_state and otherModule_field are NULL",
+                    ),
+                    (recovered_string_addr, "g_recovered is NULL"),
+                ],
             ));
             let mut names = HashMap::new();
-            names.insert(format!("{entry:x}"), "LteRrc_CheckState".to_string());
+            names.insert(
+                format!("{provisional_entry:x}"),
+                "LteRrc_CheckState".to_string(),
+            );
             let report = run(
                 &img.image_dir(),
                 img.label(),
@@ -2150,13 +2180,35 @@ mod tests {
 
         // Withheld (default opts): one Provisional generated, none materialized.
         let (report_out, v_out) = mk("prov_suppressed_out", false);
+        assert_eq!(report_out.recovered_count, 1);
         assert_eq!(report_out.provisional_generated, 1);
         assert_eq!(v_out["provisional_suppressed"], 1);
 
         // Opt-in: one Provisional generated, one materialized -> Some(0).
         let (report_in, v_in) = mk("prov_suppressed_in", true);
+        assert_eq!(report_in.recovered_count, 1);
         assert_eq!(report_in.provisional_generated, 1);
         assert_eq!(v_in["provisional_suppressed"], 0);
+        let globals_file = &v_in;
+        assert_eq!(globals_file["globals"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            globals_file["globals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|global| global["tier"] == "recovered")
+                .count(),
+            1
+        );
+        assert_eq!(
+            globals_file["globals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|global| global["tier"] == "provisional")
+                .count(),
+            1
+        );
     }
 
     #[test]
