@@ -30,7 +30,7 @@ Latest stable Rust, edition 2024. These commands mirror CI
 (`.github/workflows/ci.yml`); a change is done only when all pass:
 
     cargo build                                                  # or: cargo build --release
-    cargo fmt --all                                              # CI runs --all --check
+    cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings     # warnings are errors
     cargo test --all-targets
 
@@ -55,11 +55,14 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   tiny ARM blob in a valid TOC, so it needs **no firmware** — but it needs a real Ghidra.
   It locates one via `GHIDRA_INSTALL_DIR` or `/opt/ghidra` (looking for
   `support/analyzeHeadless`) and skips otherwise. CI runs it nightly / on demand via the
-  `ghidra-e2e` workflow. Two tests live there: `run_drives_ghidra_end_to_end` (pass-1
-  only, exercises `decompile::run`) and `pass2_renames_function_and_bakes_plate_comment`
-  (Phase 1+; crafts a one-symbol `symbol_map.json`, drives `decompile::run_two_pass`,
-  and asserts the rename + plate comment land in the regenerated `decompiled.c` —
-  the canonical regression test for the two-pass pipeline).
+  `ghidra-e2e` workflow. The focused pass-2 application test is:
+
+      cargo test --test decompile_golden \
+        pass2_applies_functions_and_strict_globals_in_one_process -- --nocapture
+
+  It drives the real scripts against a synthetic ARM program and skips cleanly when Ghidra is
+  unavailable. `run_drives_ghidra_end_to_end` covers pass 1; the focused test covers function and
+  global application, strict ownership, atomic map rejection, and the independent final export.
 - **Phase 3.0 production goldens** (`tests/globals_golden.rs` and
   `report_json_includes_globals_field` in `tests/decompose_golden.rs`) need
   `PME_RADIO_IMG`, Ghidra, and radare2. Run production-scale cases with
@@ -99,13 +102,13 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `decompile.rs` | Ghidra import kit + `--run` (analyzeHeadless) + radare2 Thumb |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
-| `globals.rs` | Phase 3.0 record-only global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
+| `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
 | `decompose.rs` | One-shot pipeline over all decoders |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`, `ApplySymbols`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -161,23 +164,29 @@ module; when a file outgrows that, split it.
   address-ordered; 0 of 7.6M lines out of order on `02_MAIN`); a future
   emitter that breaks sortedness would silently produce wrong slices.
   Replaces the O(N×L) linear scans that previously made `symbolicate` and
-  `globals::run` take 100+ min on `02_MAIN` (Phase 3.0.1 Task 12 + this
-  fix). Pointer to spec:
-  `~/.superpowers/pixel-modem-extractor/2026-08-04-disasm-index-shared-design.md`.
+  `globals::run` take 100+ min on `02_MAIN`.
 - **Two-pass decompile (Phase 1+).** `decompose` runs decompile twice per
-  image: pass 1 (`decompile::run_report`) analyzes and exports an initial
-  inventory + `decompiled.c`. Between passes, `decompose::build_and_write_symbol_maps`
-  builds a `symbol_map.json` per image from pass-1 outputs (using
-  `symbolicate::build_map`, the pure builder split out of `symbolicate_image`).
-  Pass 2 (`decompile::run_two_pass`) drives `analyzeHeadless -process` on the
-  same project, running `ApplySymbols.java` (renames + plate comments) followed
-  by `ExportDecomp.java` (regenerates `decompiled.c` with names + comments baked
-  in). `--no-symbol-pass` skips pass 2 entirely. `decompile --run` (the
-  standalone subcommand) is single-pass and unchanged. The standalone
-  `symbolicate` subcommand still does today's in-place text substitution
-  (controlled by `Opts.rewrite_decompiled_c`, which is `true` for the
-  standalone path, `true` for the decompose path under `--no-symbol-pass`, and
-  `false` otherwise — pass 2 already baked the names in).
+  eligible image: pass 1 (`decompile::run_report`) analyzes and exports an
+  initial inventory + `decompiled.c`. Between passes,
+  `decompose::build_and_write_symbol_maps` writes each function map and retains
+  an in-memory entry-to-name index containing every non-null built name. Global
+  recovery consumes that index and writes `globals.json` before pass 2 on the
+  normal route. `decompile::run_two_pass` accepts a typed per-image input with
+  optional function and global map paths plus their prepared counts. It starts
+  exactly one `analyzeHeadless -process -noanalysis` saved-project process for
+  each image having either input and orders post-scripts as follows:
+
+      functions + globals: ApplySymbols.java -> ApplyGlobals.java -> ExportDecomp.java
+      functions only:       ApplySymbols.java -> ExportDecomp.java
+      globals only:         ApplyGlobals.java -> ExportDecomp.java
+      neither:              no pass-2 process
+
+  There is no second import, auto-analysis, or third export pass. The
+  `--no-symbol-pass` route instead finalizes the existing text rewrite, loads
+  every non-null name from `symbols.json`, runs the same globals helper once,
+  and retains no application input; its `globals.json` is record-only.
+  `decompile --run` remains single-pass, and the standalone `symbolicate`
+  subcommand still performs in-place text substitution.
 - **Phase 2 + 2.1: Thumb decompilation.** Dense Thumb regions in `02_MAIN`
   are no longer data-marked for Ghidra; the tightened `TameAnalysis`
   (`mode=tighten`) lets Ghidra attempt function discovery and decompilation.
@@ -225,8 +234,7 @@ module; when a file outgrows that, split it.
   a synthetic fixture could carry. Even a working fixture would test an
   artificial path that could pass CI while production breaks. CI coverage for
   the matching fix lives in `thumb_enrich`'s inline Rust tests; production
-  verification lives in the full `decompose` on a real `02_MAIN` (see the
-  Phase 2 / 2.1 findings docs in `~/.superpowers/pixel-modem-extractor/`).
+  verification lives in the full `decompose` on a real `02_MAIN`.
   If you must add CI coverage for Thumb discovery, gate it on a real image
   (env-gated golden test) — do not spend time on a hand-assembled BLX
   fixture.
@@ -243,10 +251,10 @@ module; when a file outgrows that, split it.
   `<ghidra_dir>/export/<label>/`. The helper validates that exact three-file
   set before any destination mutation, then replaces only those three paths
   under `images/<label>/decompiled/`. Every other destination entry
-  (`thumb_functions.json`, `thumb/`, future non-Ghidra sidecars) is left
-  byte-for-byte unchanged. An incomplete or unexpected export returns an
-  error and leaves the destination untouched. Downstream stages
-  (`thumb_enrich_post_pass2`, `symbolicate_finalize`, globals) and users read
+  (`globals.json`, `thumb_functions.json`, `thumb/`, and future non-Ghidra
+  sidecars) is left byte-for-byte unchanged. An incomplete or unexpected
+  export returns an error and leaves the destination untouched. Downstream
+  stages (`thumb_enrich_post_pass2`, `symbolicate_finalize`) and users read
   from the per-image tree.
   (3) **`decode_tokens` runs BEFORE the `symbol_map` stage in `decompose::run`**
   — the token DB is an input to `symbolicate::build_map`. The other decoders
@@ -280,11 +288,9 @@ module; when a file outgrows that, split it.
   The inline `thumb_enrich_populates_body_c_with_tbit_set` test is the
   regression sentinel. A future change that flips back to name-based matching
   silently breaks body_c on every image — Phase 2's bug.
-  (2) **`TIGHTEN_EXTRA` is sourced verbatim from a Phase 2.1 investigation
-  findings doc.** If the production config needs to change (e.g. a new firmware
-  variant regresses), re-run the multi-candidate investigation; do not edit
-  `TIGHTEN_EXTRA` ad hoc. The findings doc lives at
-  `~/.superpowers/pixel-modem-extractor/2026-07-21-thumb-decompilation-phase2-1-findings.md`.
+  (2) **`TIGHTEN_EXTRA` is grounded in a Phase 2.1 multi-candidate
+  investigation.** If a new firmware variant regresses, repeat that
+  investigation; do not edit `TIGHTEN_EXTRA` ad hoc.
 -   **Phase 2.1 parser lookahead (8 lines, calibrated to real
   ExportDecomp.java).** `parse_decompiled_c_function_bodies_by_addr` commits
   to a `// FUN_<addr> @ <addr>` header only when `{` appears within the next
@@ -315,42 +321,63 @@ module; when a file outgrows that, split it.
   followup found this was wired for the post-pass-2 path but missing on the
   pass-1-only path (e.g. under `--no-symbol-pass`), hiding Phase 2.1's
   production body_c count from `report.json`.
-- **Phase 3.0: globals recovery (record-only).** After
-  `symbolicate_finalize`, `decompose` writes
-  `images/<label>/decompiled/globals.json` with format
-  `pixel-modem-extractor-globals-v1`. For each ARM or Thumb function, the
-  algorithm requires exactly one non-string `data_ref` at or above the image
-  load address and exactly one unique identifier surviving across referenced
-  strings. Tokens match `^[a-zA-Z_][a-zA-Z0-9_]{2,}$`, must contain an
-  underscore, and are
-  filtered through the generic-token blocklist. Reinforcing functions combine
-  evidence; conflicting names for one address are dropped rather than
-  arbitrated. `ImageReport.globals_recovered` surfaces the per-image count and
-  `globals_error` carries per-image failures. Current production verification
-  (full two-pass `decompose`, Thumb through pass 2) recovered 915 globals on
-  `02_MAIN` (arch: arm 367 / thumb 545 / mixed 3); the full six-image sweep
-  recovered 921 and dropped 194 conflicts. These are observations, not
-  stable count guarantees.
-  Coverage is intentionally conservative; disassembly-pattern disambiguation
-  belongs to Phase 3.0.1 rather than this direct-evidence stage.
-- **Phase 3.0 invariants.** Four structural facts are easy to break:
-  (1) **Record-only.** The stage does not modify the Ghidra program or
-  `decompiled.c`; `DAT_<addr>` placeholders remain. Applying names in-program
-  belongs to a later phase.
-  (2) **Recovered-only and strict-single-source-of-truth.** Every Phase 3.0
-  entry has `tier: "recovered"`; provisional/function-name inference belongs
-  to a later phase. Multiple names proposed for one address are dropped, not
-  ranked or guessed.
-  (3) **Empty-output-is-valid.** A successful zero-match sweep still writes
-  `globals.json` with format v1 and `"globals": []`; absence means the stage
-  did not complete.
-  (4) **Use the extract manifest contract.** Load addresses come from numeric
-  `toc[].load_addr` entries keyed by `toc[].name`. Globals deliberately reuses
-  `symbolicate::load_load_addr`; do not add a second parser or revive the
-  obsolete synthetic `images[]`/hex-string fixture shape.
-  After mutating per-image results, the sweep MUST call
-  `refresh_decompile_stage_images`; otherwise the decompile stage retains its
-  pre-globals snapshot and the Phase 3.0 fields disappear from `report.json`.
+- **Phase 3.0: globals recovery and strict application.** On normal
+  `decompose`, global recovery runs after function-map preparation and before
+  pass 2. It writes `images/<label>/decompiled/globals.json` with format
+  `pixel-modem-extractor-globals-v1`; the file remains evidence-only and has no
+  application-status fields. For each ARM or Thumb function, the direct rule
+  requires exactly one non-string `data_ref` at or above the image load address
+  and exactly one unique underscored identifier across referenced strings.
+  Reinforcing functions combine evidence; conflicting names for one address
+  are dropped rather than arbitrated. Successful Recovered records become the
+  optional global input to the same saved-project pass 2 that applies function
+  names. Under `--no-symbol-pass`, recovery runs once after finalization and
+  `globals.json` remains record-only.
+- **Phase 3.0 application ownership.** `ApplyGlobals.java` preflights the full
+  selected Recovered map before its first mutation. Provisional and unknown
+  tiers are never selected. A selected address is parsed as unsigned
+  hexadecimal and duplicate detection uses that canonical numeric value, so
+  `0x20` and `00000020` conflict and reject the whole map atomically. For an
+  in-memory candidate, application owns only a primary symbol whose source is
+  exactly `SourceType.DEFAULT`, whose type is exactly `LABEL`, and whose
+  case-insensitive name is exactly `DAT_<hex>` with a suffix numerically equal
+  to the candidate address. It never creates a label or replaces analysis,
+  imported, user-defined, function, or differently generated symbols. A
+  well-formed address outside defined program memory is an individual
+  `skipped_outside_memory` result; the script does not inspect or mutate a
+  symbol there. Invalid or colliding requested names are skips, never renamed
+  variants invented by the tool.
+- **Phase 3.0 failure and reporting contract.** Global preparation is isolated
+  per image: set `globals_error`, omit only that global map, keep any valid
+  function-only input, and continue later images. The script emits exactly one
+  unwrapped `ApplyGlobals: {json}` interface line. A successful summary reports
+  `candidates`, `applied`, and the four skip categories, which must conserve
+  candidates. A map-level failure reports `status: "error"`, applies zero
+  globals, and bounds its non-empty reason to 2,048 Unicode characters; Rust
+  enforces the same bound and rejects missing, duplicate, malformed,
+  wrong-image, unknown-status, non-integer, overflowing, or non-conserving
+  summaries. The independent `ExportDecomp.java` still runs after a reported
+  map error, preserving successfully applied functions. A process failure
+  leaves the valid pass-1 destination untouched.
+
+  `ImageReport.globals_applied` and `globals_apply_skipped` distinguish
+  `None` (not invoked) from `Some(0)` (executed zero), while
+  `globals_apply_error` carries reason-only per-image detail. The aggregate
+  `globals_apply` stage is skipped for `--no-symbol-pass` or no Recovered
+  inputs, succeeds only when every invoked image has a valid conserving
+  summary, and otherwise fails. Aggregate errors are prefixed with the
+  prepared image label in deterministic pipeline-image order; successful
+  totals before a later failure remain visible. `pass2_applied` continues to
+  count function names only. After the outcome is known,
+  `refresh_decompile_stage_images` installs the final per-image snapshot so the
+  preparation and application fields reach `report.json`.
+- **Phase 3.0 evidence invariants.** Default `globals.json` serialization stays
+  format v1 and Recovered-only; `--globals-provisional` may materialize
+  Provisional records, but those never affect application candidates or
+  `globals_recovered`. A successful zero-match sweep still writes
+  `"globals": []`; absence means recovery did not complete. Load addresses
+  come from numeric `toc[].load_addr` entries keyed by `toc[].name` through
+  `symbolicate::load_load_addr`; do not add a second manifest parser.
 - **Phase 3.0.1: disasm-anchored Recovered + name-prior Provisional.** Extends
   Phase 3.0's strict-rule loop without changing it. For each function, the
   disasm is scanned for `movw`/`movt` load pairs (PC-tagged via
@@ -362,9 +389,7 @@ module; when a file outgrows that, split it.
   cross-tier suppression use the same strict-drop posture as Phase 3.0.
   `--globals-provisional` additionally admits name-prior-derived
   `tier: "provisional"` entries (see Scenario 2 caveat); it is default-off
-  and the bare output is byte-equivalent to Phase 3.0's for the Recovered
-  set. The full design lives at
-  `~/.superpowers/pixel-modem-extractor/2026-08-02-globals-phase3-0-1-design.md`.
+  and the bare output is byte-equivalent to Phase 3.0's for the Recovered set.
 - **Phase 3.0.1 invariants.** Five structural facts a fresh change can break:
   (1) **Disasm grounding is necessary for Recovered — name-prior alone never
   promotes.** A Provisional name with no Recovered at the same address stays
@@ -385,7 +410,7 @@ module; when a file outgrows that, split it.
   named constants in `globals.rs`. Do not edit them ad hoc — re-run the
   pre-check if a new firmware variant regresses. Mirrors Phase 2.1's
   `TIGHTEN_EXTRA` provenance rule. The pre-check pinned K_ARM = K_THUMB = 4
-  on this firmware (Pixel 6 Pro mustang).
+  on the accepted production image.
   (5) **The K distance metric is load-event count, not instruction count.**
   K counts `movw`/`movt` load-events strictly between the global load and the
   string load — an approximation of the design spec's "disasm lines between
@@ -473,12 +498,12 @@ module; when a file outgrows that, split it.
   `ClearFlowAndRepairCmd`) and **Candidate 4** (cap repair) were never run —
   Candidate 2 hit every stop condition first, so neither option name was
   resolved against Ghidra 12's analysis-properties sheet. Production verification
-  on a real `02_MAIN` (Pixel 6 Pro mustang) confirmed the sample did not predict
+  on a real `02_MAIN` confirmed the sample did not predict
   the full image: Surface B's watch fires after ~28 min (>100k overlap-repair log
   lines), the datamark retry succeeds, and `thumb_decompiled` stays at 0 — Phase
   2.1 picks up from here.
 - **Winning TameAnalysis options (Phase 2.1, on success).** On the full
-  `02_MAIN` (~87 MB, Pixel 6 Pro mustang), Phase 2's empty `TIGHTEN_EXTRA` was
+  production `02_MAIN` (~87 MB), Phase 2's empty `TIGHTEN_EXTRA` was
   insufficient — Surface B's watch fired after ~28 min with >100k repair-log
   lines. The Phase 2.1 investigation found that disabling
   `"Non-Returning Functions - Discovered.Repair Flow Damage"` (a
@@ -495,9 +520,7 @@ module; when a file outgrows that, split it.
   essentially unaffected. Losing candidates (one-line rationale each):
   **Candidate 6** (disable `Function Start Search` entirely), **Candidate 7**
   (cap repair effort), and **Candidate 8** (bounded-analysis timeout) were not
-  run — Candidate 5 hit every stop condition first. The full investigation lives
-  at
-  `~/.superpowers/pixel-modem-extractor/2026-07-21-thumb-decompilation-phase2-1-findings.md`.
+  run — Candidate 5 hit every stop condition first.
 - **Surface B mechanics (Phase 2+).** The watch in `decompile::run_report`'s
   tighten branch fires on wall-clock or log-spam excess, then re-spawns the
   image as datamark. Two hard-won properties a fresh change can break:
@@ -540,9 +563,7 @@ module; when a file outgrows that, split it.
   largest real image's region still fits — the failure mode
   (`thumb_error` on the image, no `thumb_functions.json` written) is
   silent at the JSON level. Do not raise it casually — pathological r2
-  output is what the cap exists to defend against. The full design
-  lives at
-  `~/.superpowers/pixel-modem-extractor/2026-08-03-radare2-stdout-stream-design.md`.
+  output is what the cap exists to defend against.
 - **`thumb/<addr:08x>.stdout` retention.** The streamed file is kept
   after parse (not deleted). Disk is cheap; the debugging value
   (inspect r2 output when `data_refs` look wrong or parse fails)
@@ -613,12 +634,9 @@ module; when a file outgrows that, split it.
 ## How we work here
 
 - **Design before code.** Non-trivial work gets a written design spec and an
-  implementation plan before implementation begins. The agent that drives this
-  repo keeps those artifacts in its own private data directory
-  (`~/.superpowers/pixel-modem-extractor/`,
-  `YYYY-MM-DD-<topic>-{design,plan,findings}.md`) — they are the *process trail*,
-  not committed documentation. The durable *outcomes* of each iteration land in
-  this file, the README, and code comments. Read this CONTRIBUTING.md and the
+  implementation plan before implementation begins. Keep process artifacts
+  outside the repository; durable outcomes land in this file, the README, and
+  code comments. Read this CONTRIBUTING.md and the
   README before starting non-trivial work — they capture why approaches were
   chosen or rejected, which the code alone can't tell you.
 - **Test first**, keep changes small and reviewable.
@@ -635,9 +653,8 @@ module; when a file outgrows that, split it.
   proprietary firmware bytes (see **Ground rules**).
 - **Worktrees for non-trivial work.** Multi-task implementation happens in a
   git worktree under `.worktrees/<branch>/` (gitignored). The branch is the
-  unit of review and merge; master stays shippable. The subagent-driven
-  execution ledger (per-worktree, gitignored under `.superpowers/sdd/`) is
-  scratch — don't commit it; recover from `git log` if destroyed.
+  unit of review and merge; master stays shippable. Execution ledgers are
+  external scratch — don't commit them; recover from `git log` if destroyed.
 
 ## Recipe: adding a subcommand or decoder
 
