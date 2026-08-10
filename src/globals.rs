@@ -1387,6 +1387,58 @@ mod tests {
     }
 
     #[test]
+    fn default_globals_json_writer_preserves_historical_v1_bytes() {
+        // This drives `run` through its real pretty-serialization and file-write
+        // path. The literal is the historical default v1 output: changing field
+        // order, indentation, optional-field omission, or trailing-newline
+        // behavior must fail byte-for-byte.
+        let img = Img::new("default_v1_bytes");
+        img.write_functions_json(&format!(
+            "[{}]",
+            make_arm_function(0x2000, &[0x3000, 0x4000])
+        ));
+        img.write_thumb_functions_json(
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
+        );
+        img.write_manifest_load_addr("0x1000");
+        img.write_image_bin(&image_with_strings(0x1000, &[(0x3000, "g_foo invalid")]));
+        fs::write(img.image_dir().join("decompiled").join("disasm.lst"), b"").unwrap();
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(report.recovered_count, 1);
+        let actual = fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap();
+        let historical_v1 = br#"{
+  "format": "pixel-modem-extractor-globals-v1",
+  "globals": [
+    {
+      "address": "0x4000",
+      "arch": "arm",
+      "name": "g_foo",
+      "tier": "recovered",
+      "size": null,
+      "evidence": [
+        {
+          "kind": "string",
+          "address": "0x3000",
+          "value": "g_foo invalid"
+        },
+        {
+          "kind": "function",
+          "address": "0x2000",
+          "arch": "arm",
+          "name": "FUN_2000"
+        }
+      ],
+      "annotations": []
+    }
+  ],
+  "image": "02_MAIN"
+}"#;
+
+        assert_eq!(actual, historical_v1);
+    }
+
+    #[test]
     fn skips_function_with_multiple_global_candidates() {
         let img = Img::new("multi_global");
         // Two non-string data_refs → ambiguous, skip.
