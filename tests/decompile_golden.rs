@@ -195,6 +195,68 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     .unwrap();
 
     let global_map_path = maps_dir.join("00_BOOT-globals.json");
+
+    // Characterize ApplyGlobals' fail-whole-map preflight before 0x20 has
+    // been renamed: numerically identical selected addresses in different
+    // hexadecimal spellings reject the entire map atomically. The script
+    // returns normally, so ExportDecomp still completes in this process.
+    let duplicate_global_map = serde_json::json!({
+        "format": "pixel-modem-extractor-globals-v1",
+        "image": "00_BOOT",
+        "globals": [
+            {
+                "address": "0x20",
+                "name": "duplicate_first_must_not_apply",
+                "tier": "recovered",
+            },
+            {
+                "address": "00000020",
+                "name": "duplicate_second_must_not_apply",
+                "tier": "recovered",
+            },
+        ],
+    });
+    std::fs::write(
+        &global_map_path,
+        serde_json::to_string_pretty(&duplicate_global_map).unwrap(),
+    )
+    .unwrap();
+    let duplicate_globals_only = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: None,
+            function_count: 0,
+            global_map: Some(global_map_path.clone()),
+            global_count: 2,
+        },
+    )]);
+    let duplicate_report = pixel_modem_extractor::decompile::run_two_pass(
+        pass1_report,
+        &opts,
+        &out,
+        &duplicate_globals_only,
+    )
+    .unwrap();
+    let boot = duplicate_report
+        .images
+        .iter()
+        .find(|r| r.label == "00_BOOT")
+        .unwrap();
+    assert!(boot.pass2_error.is_none());
+    assert!(boot.globals_applied.is_none());
+    assert!(boot.globals_apply_skipped.is_none());
+    assert!(
+        boot.globals_apply_error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate selected address")),
+        "globals_apply_error: {:?}",
+        boot.globals_apply_error
+    );
+    let exp = out.join("export").join("00_BOOT");
+    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
+    assert!(!c.contains("duplicate_first_must_not_apply"));
+    assert!(!c.contains("duplicate_second_must_not_apply"));
+
     let global_map = serde_json::json!({
         "format": "pixel-modem-extractor-globals-v1",
         "image": "00_BOOT",
@@ -234,7 +296,8 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
 
     // Pass 2: pass pass1_report in (do NOT re-run pass 1).
     let rep2 =
-        pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &inputs).unwrap();
+        pixel_modem_extractor::decompile::run_two_pass(duplicate_report, &opts, &out, &inputs)
+            .unwrap();
 
     // (c) pass2_applied == Some(1) — ApplySymbols reports 1 rename.
     let boot = rep2
@@ -262,7 +325,6 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     );
 
     // (a) renamed function appears in the regenerated decompiled.c.
-    let exp = out.join("export").join("00_BOOT");
     let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
     assert!(
         c.contains("boot_reset_handler"),

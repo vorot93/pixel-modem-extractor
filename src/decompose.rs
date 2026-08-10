@@ -653,11 +653,11 @@ fn globals_apply_stage(
             };
             let label = labels.remove(index);
             if let Some(error) = &image.pass2_error {
-                first_error.get_or_insert_with(|| error.clone());
+                first_error.get_or_insert_with(|| format!("{label}: {error}"));
                 continue;
             }
             if let Some(error) = &image.globals_apply_error {
-                first_error.get_or_insert_with(|| error.clone());
+                first_error.get_or_insert_with(|| format!("{label}: {error}"));
                 continue;
             }
             let (Some(applied), Some(skipped)) =
@@ -687,7 +687,8 @@ fn globals_apply_stage(
                 applied_total.checked_add(applied),
                 skipped_total.checked_add(skipped),
             ) else {
-                first_error.get_or_insert_with(|| "global application totals overflow".to_string());
+                first_error
+                    .get_or_insert_with(|| format!("{label}: global application totals overflow"));
                 continue;
             };
             applied_total = next_applied;
@@ -1621,7 +1622,7 @@ mod tests {
             assert_eq!(stage.status, "failed", "reason: {reason}");
             assert_eq!(
                 stage.error.as_deref(),
-                Some(reason),
+                Some(format!("02_MAIN: {reason}").as_str()),
                 "first actionable summary error must be retained"
             );
             assert_eq!(
@@ -1636,7 +1637,7 @@ mod tests {
         assert_eq!(stage.status, "failed");
         assert_eq!(
             stage.error.as_deref(),
-            Some("analyzeHeadless exit 7; stderr tail:\nboom")
+            Some("02_MAIN: analyzeHeadless exit 7; stderr tail:\nboom")
         );
 
         let no_summary = analyzed_image("02_MAIN");
@@ -1683,7 +1684,10 @@ mod tests {
         let stage = globals_apply_stage(false, &prepared, Some(&[apm, main]), 4);
 
         assert_eq!(stage.status, "failed");
-        assert_eq!(stage.error.as_deref(), Some("first pipeline-image error"));
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("03_APM: first pipeline-image error")
+        );
     }
 
     #[test]
@@ -1788,7 +1792,7 @@ mod tests {
         assert_eq!(stage.status, "failed");
         assert_eq!(
             stage.error.as_deref(),
-            Some("global application totals overflow")
+            Some("03_APM: global application totals overflow")
         );
         let expected_output = format!(
             "1 image(s) processed; {} globals applied; 0 skipped",
@@ -1826,7 +1830,7 @@ mod tests {
         let stage = globals_apply_stage(false, &prepared, Some(&[main, apm]), 7);
 
         assert_eq!(stage.status, "failed");
-        assert_eq!(stage.error.as_deref(), Some("global map rejected"));
+        assert_eq!(stage.error.as_deref(), Some("03_APM: global map rejected"));
         assert_eq!(
             stage.output.as_deref(),
             Some("1 image(s) processed; 2 globals applied; 3 skipped")
@@ -2186,7 +2190,7 @@ mod tests {
         let stage = globals_apply_stage(false, &prepared, Some(&[image]), 9);
 
         assert_eq!(stage.status, "failed");
-        assert_eq!(stage.error.as_deref(), Some("global map rejected"));
+        assert_eq!(stage.error.as_deref(), Some("02_MAIN: global map rejected"));
         assert_eq!(
             std::fs::read_to_string(destination.join("decompiled.c")).unwrap(),
             "void refreshed_function(void) {}"
@@ -2929,7 +2933,8 @@ mod tests {
         let images = root.join("images");
         let label = "02_MAIN";
 
-        // Destination: pass-1 tree with old Ghidra trio + Thumb sidecars.
+        // Destination: pass-1 tree with old Ghidra trio plus globals, Thumb,
+        // and an unrelated future sidecar.
         let dest = images.join(label).join("decompiled");
         std::fs::create_dir_all(dest.join("thumb")).unwrap();
         std::fs::write(dest.join("decompiled.c"), b"OLD_C").unwrap();
@@ -2937,8 +2942,12 @@ mod tests {
         std::fs::write(dest.join("functions.json"), b"OLD_FN").unwrap();
         let thumb_json = b"{\"format\":\"thumb-v1\",\"functions\":[]}";
         let thumb_stdout = b"r2-stdout-bytes-must-survive";
+        let globals_json = b"{\"format\":\"pixel-modem-extractor-globals-v1\",\"globals\":[]}";
+        let future_sidecar = b"future-sidecar-bytes-must-survive";
         std::fs::write(dest.join("thumb_functions.json"), thumb_json).unwrap();
         std::fs::write(dest.join("thumb").join("410b0000.stdout"), thumb_stdout).unwrap();
+        std::fs::write(dest.join("globals.json"), globals_json).unwrap();
+        std::fs::write(dest.join("future-sidecar.bin"), future_sidecar).unwrap();
 
         // Pass-2 export: exactly the three Ghidra-owned files, new contents.
         let export = ghidra.join("export").join(label);
@@ -2964,6 +2973,16 @@ mod tests {
             std::fs::read(dest.join("thumb").join("410b0000.stdout")).unwrap(),
             thumb_stdout,
             "thumb/*.stdout must be byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("globals.json")).unwrap(),
+            globals_json,
+            "globals.json must be byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("future-sidecar.bin")).unwrap(),
+            future_sidecar,
+            "unrelated sidecars must be byte-identical"
         );
         assert!(
             !export.exists(),
