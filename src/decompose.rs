@@ -710,6 +710,36 @@ fn run_globals_stage(
     )
 }
 
+fn schedule_symbol_route<C, PrepareIndexes, RunGlobals, RunPassTwo, Finalize, LoadFinalized>(
+    state: &mut C,
+    no_symbol_pass: bool,
+    mut prepare_indexes: PrepareIndexes,
+    mut run_globals: RunGlobals,
+    mut run_pass_two: RunPassTwo,
+    mut finalize: Finalize,
+    mut load_finalized: LoadFinalized,
+) -> HashMap<String, PreparedGlobalMap>
+where
+    PrepareIndexes: FnMut(&mut C) -> FunctionNameIndexes,
+    RunGlobals: FnMut(&mut C, &FunctionNameIndexes) -> HashMap<String, PreparedGlobalMap>,
+    RunPassTwo: FnMut(&mut C),
+    Finalize: FnMut(&mut C),
+    LoadFinalized: FnMut(&mut C) -> FunctionNameIndexes,
+{
+    if no_symbol_pass {
+        finalize(state);
+        let finalized_indexes = load_finalized(state);
+        let _ = run_globals(state, &finalized_indexes);
+        HashMap::new()
+    } else {
+        let prepared_indexes = prepare_indexes(state);
+        let global_maps = run_globals(state, &prepared_indexes);
+        run_pass_two(state);
+        finalize(state);
+        global_maps
+    }
+}
+
 /// Build the per-image symbol map from pass-1 outputs and write each to
 /// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(successes, errors)`:
 /// each success is `(label, PreparedFunctionMap)`; each error is `(label,
@@ -1017,50 +1047,65 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         stages.push(stage);
     }
 
-    // Phase 3.0 globals options are route-independent. Normal decompose uses
-    // the in-memory all-tier names prepared alongside the function maps; the
-    // --no-symbol-pass route loads its indexes from finalized symbols.json
-    // later, after the legacy text rewrite has completed.
+    // Phase 3.0 globals options are route-independent.
     let globals_opts = globals::GlobalsOpts {
         include_provisional: opts.globals_provisional,
         k_arm: opts.globals_k_arm.unwrap_or(globals::K_ARM),
         k_thumb: opts.globals_k_thumb.unwrap_or(globals::K_THUMB),
     };
-    let function_name_indexes = prepare_function_name_indexes(&function_maps);
 
-    // Normal route: prepare globals before pass 2 so these ImageResult values
-    // carry their globals fields through run_two_pass. Task 4 consumes the
-    // retained typed maps alongside the function maps.
-    let mut _prepared_global_maps = HashMap::new();
-    if !opts.no_symbol_pass {
-        let active_images = if let Some(report) = pass1_report.as_mut() {
-            report.images.as_mut_slice()
-        } else {
-            &mut []
-        };
-        let outcome = run_globals_stage(
-            active_images,
-            &images_dir,
-            &out.join("manifest.json"),
-            &function_name_indexes,
-            &globals_opts,
-        );
-        _prepared_global_maps = outcome.maps;
-        stages.push(outcome.stage);
-        let refresh_source = pass1_report
-            .as_ref()
-            .map(|report| report.images.as_slice())
-            .unwrap_or(&[]);
-        refresh_decompile_stage_images(&mut stages, refresh_source);
+    // Preserve the disabled route's two explicit skipped stage entries. The
+    // scheduler does not invoke its pass-2 operation on this route.
+    if opts.no_symbol_pass {
+        stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
+        stages.push(StageReport::skipped(
+            "thumb_enrich_post_pass2",
+            "--no-symbol-pass",
+        ));
     }
 
-    // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image with a
-    //    non-empty map. Consumes pass1_report (pass 1 already ran in step 3).
-    //    Per-image pass-2 failures land in ImageResult.pass2_error and do not
-    //    abort the orchestrator — pass 1 already produced a valid decompiled.c.
-    //
-    if !opts.no_symbol_pass {
-        if let Some(rep) = pass1_report.take() {
+    struct SymbolRouteState<'a> {
+        pass1_report: &'a mut Option<decompile::DecompileReport>,
+        stages: &'a mut Vec<StageReport>,
+    }
+
+    let mut symbol_route_state = SymbolRouteState {
+        pass1_report: &mut pass1_report,
+        stages: &mut stages,
+    };
+    let _prepared_global_maps = schedule_symbol_route(
+        &mut symbol_route_state,
+        opts.no_symbol_pass,
+        |_| prepare_function_name_indexes(&function_maps),
+        |state, function_name_indexes| {
+            let active_images = if let Some(report) = state.pass1_report.as_mut() {
+                report.images.as_mut_slice()
+            } else {
+                &mut []
+            };
+            let outcome = run_globals_stage(
+                active_images,
+                &images_dir,
+                &out.join("manifest.json"),
+                function_name_indexes,
+                &globals_opts,
+            );
+            state.stages.push(outcome.stage);
+            let refresh_source = state
+                .pass1_report
+                .as_ref()
+                .map(|report| report.images.as_slice())
+                .unwrap_or(&[]);
+            refresh_decompile_stage_images(state.stages.as_mut_slice(), refresh_source);
+            outcome.maps
+        },
+        |state| {
+            // 7. Decompile pass 2 — ApplySymbols + ExportDecomp on each image
+            // with a non-empty function map. Globals already mutated these
+            // pass-1 ImageResult values, so their fields carry through pass 2.
+            let Some(rep) = state.pass1_report.take() else {
+                return;
+            };
             let t = Instant::now();
             let map_paths: HashMap<String, PathBuf> = function_maps
                 .iter()
@@ -1080,90 +1125,56 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         }
                     }
                     // 7b. Phase 2 — thumb_enrich re-run against the post-pass-2
-                    //     decompiled.c (now baked with recovered names). Overwrites
-                    //     each ImageResult.thumb_decompiled from pass 1. Skipped on
-                    //     `--no-thumb-decompile` (Phase 2 disabled end-to-end).
+                    // decompiled.c. Skipped under --no-thumb-decompile.
                     if opts.no_thumb_decompile {
-                        stages.push(StageReport::skipped(
+                        state.stages.push(StageReport::skipped(
                             "thumb_enrich_post_pass2",
                             "--no-thumb-decompile",
                         ));
                     } else {
                         let enrich_started = Instant::now();
                         let outcome = run_thumb_enrich_per_image(&mut rep2.images, &images_dir);
-                        stages.push(thumb_enrich_stage(
+                        state.stages.push(thumb_enrich_stage(
                             "thumb_enrich_post_pass2",
                             outcome,
                             enrich_started.elapsed().as_millis(),
                         ));
                     }
-                    // Refresh the decompile stage's per-image reports with pass-2 fields.
-                    refresh_decompile_stage_images(&mut stages, &rep2.images);
+                    refresh_decompile_stage_images(state.stages.as_mut_slice(), &rep2.images);
                 }
-                Err(e) => stages.push(StageReport::failed(
+                Err(e) => state.stages.push(StageReport::failed(
                     "decompile_pass2",
                     e.to_string(),
                     t.elapsed().as_millis(),
                 )),
             }
-        }
-    } else {
-        stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
-        stages.push(StageReport::skipped(
-            "thumb_enrich_post_pass2",
-            "--no-symbol-pass",
-        ));
-    }
-
-    // 8. Finalize symbolication per image: rewrite thumb_functions.json (still
-    //    asm in Phase 1) and write symbols.json. decompiled.c is left alone on
-    //    the pass-2 path — pass 2 regenerated it with names baked in. With
-    //    --no-symbol-pass (pass 2 skipped), fall back to today's standalone-style
-    //    text substitution so users get the same FUN_ recovery as before, not
-    //    raw Ghidra output.
-    run_stage(
-        &mut stages,
-        "symbolicate_finalize",
-        "images/*/decompiled/symbols.json",
-        || {
-            symbolicate::run(
-                out,
-                &symbolicate::Opts {
-                    token_db: token_db.exists().then(|| token_db.clone()),
-                    rewrite_decompiled_c: opts.no_symbol_pass,
+        },
+        |state| {
+            // 8. Finalize symbolication. The disabled route reaches this before
+            // loading names/globals and keeps its existing text rewrite.
+            run_stage(
+                &mut *state.stages,
+                "symbolicate_finalize",
+                "images/*/decompiled/symbols.json",
+                || {
+                    symbolicate::run(
+                        out,
+                        &symbolicate::Opts {
+                            token_db: token_db.exists().then(|| token_db.clone()),
+                            rewrite_decompiled_c: opts.no_symbol_pass,
+                        },
+                    )
                 },
-            )
+            );
+        },
+        |state| {
+            state
+                .pass1_report
+                .as_ref()
+                .map(|report| load_finalized_function_name_indexes(&images_dir, &report.images))
+                .unwrap_or_default()
         },
     );
-
-    // --no-symbol-pass keeps the legacy order: symbolication finalizes and
-    // rewrites text first, then globals consumes every non-null finalized name
-    // through the defensive loader. Its maps are deliberately not retained as
-    // application inputs because pass 2 is disabled.
-    if opts.no_symbol_pass {
-        let late_function_name_indexes = pass1_report
-            .as_ref()
-            .map(|report| load_finalized_function_name_indexes(&images_dir, &report.images))
-            .unwrap_or_default();
-        let active_images = if let Some(report) = pass1_report.as_mut() {
-            report.images.as_mut_slice()
-        } else {
-            &mut []
-        };
-        let outcome = run_globals_stage(
-            active_images,
-            &images_dir,
-            &out.join("manifest.json"),
-            &late_function_name_indexes,
-            &globals_opts,
-        );
-        stages.push(outcome.stage);
-        let refresh_source = pass1_report
-            .as_ref()
-            .map(|report| report.images.as_slice())
-            .unwrap_or(&[]);
-        refresh_decompile_stage_images(&mut stages, refresh_source);
-    }
 
     // 9. Remaining decoders (independent of symbolication).
     let rf_dir = out.join("rf_cfg_decompressed");
@@ -1531,6 +1542,94 @@ mod tests {
         assert_eq!(outcome.maps["02_MAIN"].recovered_count, 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn symbol_route_scheduler_orders_globals_once_and_discards_disabled_inputs() {
+        // This catches production routing that moves normal globals after pass 2,
+        // moves disabled globals before finalize/name loading, invokes globals
+        // twice, or retains disabled-route maps as application inputs.
+        #[derive(Default)]
+        struct RouteEvents {
+            events: Vec<&'static str>,
+            globals_calls: usize,
+        }
+
+        let mut normal = RouteEvents::default();
+        let normal_maps = schedule_symbol_route(
+            &mut normal,
+            false,
+            |state| {
+                state.events.push("prepare_maps_and_indexes");
+                HashMap::from([(
+                    "02_MAIN".to_string(),
+                    HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
+                )])
+            },
+            |state, indexes| {
+                state.events.push("globals");
+                state.globals_calls += 1;
+                assert_eq!(indexes["02_MAIN"]["40"], "RecoveredMain");
+                HashMap::from([(
+                    "02_MAIN".to_string(),
+                    PreparedGlobalMap {
+                        map_path: PathBuf::from("globals/02_MAIN.json"),
+                        recovered_count: 1,
+                    },
+                )])
+            },
+            |state| state.events.push("pass_two"),
+            |state| state.events.push("finalize"),
+            |_| panic!("normal route must not load finalized names"),
+        );
+        assert_eq!(
+            normal.events,
+            [
+                "prepare_maps_and_indexes",
+                "globals",
+                "pass_two",
+                "finalize"
+            ]
+        );
+        assert_eq!(normal.globals_calls, 1);
+        assert_eq!(normal_maps["02_MAIN"].recovered_count, 1);
+
+        let mut disabled = RouteEvents::default();
+        let disabled_maps = schedule_symbol_route(
+            &mut disabled,
+            true,
+            |_| panic!("disabled route must not prepare function-map indexes"),
+            |state, indexes| {
+                state.events.push("globals");
+                state.globals_calls += 1;
+                assert_eq!(indexes["02_MAIN"]["44"], "guess_main_44");
+                HashMap::from([(
+                    "02_MAIN".to_string(),
+                    PreparedGlobalMap {
+                        map_path: PathBuf::from("globals/02_MAIN.json"),
+                        recovered_count: 1,
+                    },
+                )])
+            },
+            |_| panic!("disabled route must not run pass two"),
+            |state| state.events.push("finalize_and_rewrite"),
+            |state| {
+                state.events.push("load_finalized_names");
+                HashMap::from([(
+                    "02_MAIN".to_string(),
+                    HashMap::from([("44".to_string(), "guess_main_44".to_string())]),
+                )])
+            },
+        );
+        assert_eq!(
+            disabled.events,
+            ["finalize_and_rewrite", "load_finalized_names", "globals"]
+        );
+        assert_eq!(disabled.globals_calls, 1);
+        assert!(
+            disabled_maps.is_empty(),
+            "--no-symbol-pass must not retain globals application inputs"
+        );
     }
 
     #[test]
