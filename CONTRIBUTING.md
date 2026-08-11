@@ -573,9 +573,12 @@ module; when a file outgrows that, split it.
   rate from Rust's read rate (no pipe-stall during slow parse); (2)
   persistent artifact for post-hoc inspection; (3) sets up future
   streaming-parse optionality. **Memory profile is NOT reduced** —
-  read-back-and-parse still peaks at ~2× file size; the cap defends
-  against pathological r2 output, not steady-state memory. Reducing
-  memory needs a streaming JSON parser (deferred follow-up).
+  a full dense-Thumb `decompose` can peak around 56 GiB RSS while retained
+  radare2 JSON captures are read, parsed, and accumulated. The 4 GiB cap
+  limits each capture, not total process memory. Plan for at least 64 GiB RAM
+  plus swap or other headroom; smaller-image and `--no-thumb-decompile` runs
+  stay under 1 GiB. Reducing memory needs a streaming JSON parser (deferred
+  follow-up).
 - **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
   into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
   so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,
@@ -597,6 +600,12 @@ module; when a file outgrows that, split it.
 - **Ghidra 12 headless API notes (Phase 1+).** Hard-won; verified against
   `/opt/ghidra` (Ghidra 12.1.2). Don't trust older API recall — `javap` the
   bundled jars under `/opt/ghidra/Ghidra/Framework/*/lib/*.jar` when in doubt.
+  - **Headless project paths must be canonically dot-free.** Ghidra 12 validates
+    the canonical, symlink-resolved project path and rejects any path component
+    beginning with `.`. A path that looks dot-free can still fail when a symlink
+    resolves beneath a dot-prefixed ancestor. Put production output and Ghidra
+    project state under a root whose canonical path contains no dot-prefixed
+    components.
   - **No `Listing.setPlateComment(Address, String)`.** Use
     `listing.setComment(addr, CodeUnit.PLATE_COMMENT, s)` with
     `import ghidra.program.model.listing.CodeUnit;`. (Other setXxxComment

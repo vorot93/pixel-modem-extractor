@@ -26,11 +26,17 @@ Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PA
 supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
 to launch the headless analyzer unless you set your own `JAVA_HOME`.
 
-**Memory:** production `decompose` on a real `02_MAIN` peaks at ~8 GiB
-RSS during the radare2 stdout capture + parse pass (4 GiB temp file +
-~4 GiB parse peak). Minimum recommended host RAM is 16 GiB. Smaller
-images (`00_BOOT`, `01_PSP`, etc.) and `--no-thumb-decompile` runs stay
-under 1 GiB.
+**Memory:** a full dense-Thumb `decompose` can peak around 56 GiB RSS while
+accumulated radare2 JSON captures are retained and parsed. Plan for at least
+64 GiB RAM plus swap or other headroom. The 4 GiB radare2 stdout cap applies
+per capture and does not cap aggregate parser memory. Smaller images
+(`00_BOOT`, `01_PSP`, etc.) and `--no-thumb-decompile` runs stay under 1 GiB.
+
+**Project path:** Ghidra 12 validates the canonical, symlink-resolved headless
+project path and rejects any component whose name begins with `.`. An output or
+project path beneath a dot-prefixed directory therefore fails even when reached
+through a symlink. Choose a root whose canonical path has no dot-prefixed
+components.
 
 ## Quickstart
 
