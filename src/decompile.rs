@@ -257,9 +257,11 @@ pub struct ImageResult {
     /// Reason-only Thumb/radare2 failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
     /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
-    /// reported applying. `None` when pass 2 did not run for this image.
+    /// reported applying. `None` when no function-map invocation occurred
+    /// (including a globals-only invocation) or no valid function summary was parsed.
     pub pass2_applied: Option<usize>,
-    /// Reason-only pass-2 failure text (e.g. analyzeHeadless exited non-zero).
+    /// Reason-only pass-2 failure text: late typed-map validation, analyzeHeadless
+    /// spawn/non-zero process failure, or caller-owned-export refresh failure.
     pub pass2_error: Option<String>,
     /// Phase 2: count of Thumb functions whose `body_c` was populated by
     /// `thumb_enrich` from the regenerated `decompiled.c`. `None` when Phase 2
@@ -1271,9 +1273,10 @@ fn parse_apply_globals_summary(
 /// via `run_report` separately and pass its result here — running pass 1 again
 /// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
 /// `inputs.get(&label)` contains a prepared non-zero function or global count
-/// with its corresponding map path. Per-image pass-2 failures (non-zero exit,
-/// spawn failure) are recorded into `ImageResult.pass2_error`, not propagated —
-/// pass 1 already produced a valid `decompiled.c`.
+/// with its corresponding map path. This function records late map validation and
+/// spawn/non-zero process failures into `ImageResult.pass2_error`, rather than
+/// propagating them — pass 1 already produced a valid `decompiled.c`. The caller
+/// additionally records owned-export refresh failures in `pass2_error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pass2ProcessOutcome {
     ProcessSucceeded,

@@ -17,9 +17,9 @@
 //     parameter names.
 //   - UseHexadecimal: TRUE (default). Display-only; matches disasm.lst.
 //
-// Pass 2 of `decompose` re-runs this script unchanged after ApplySymbols.java
-// has renamed functions in the program — getC() then emits the regenerated C
-// with names + plate comments baked in.
+// Pass 2 of `decompose` re-runs this script unchanged after the applicable
+// ApplySymbols.java and/or ApplyGlobals.java application — getC() then emits
+// regenerated C with names + plate comments baked in.
 //@category PixelModem
 import java.io.File;
 import java.io.FileWriter;

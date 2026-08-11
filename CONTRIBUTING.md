@@ -655,8 +655,14 @@ module; when a file outgrows that, split it.
     for the dual-emit pattern.)
   - **Gson IS bundled** with Ghidra (`Ghidra/Framework/Generic/lib/gson-*.jar`)
     and on the headless script classpath — use it for JSON in scripts.
-  - **`-process` mode, not `-import`, for pass 2.** Arg vector:
-    `<projectDir> <projectName> -process <label> -noanalysis -scriptPath … -postScript ApplySymbols.java <map> -postScript ExportDecomp.java <out>`.
+  - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
+    vectors, all after `<projectDir> <projectName> -process <label> -noanalysis
+    -scriptPath …`, are:
+
+        functions + globals: -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ExportDecomp.java <out>
+        functions only:      -postScript ApplySymbols.java <function_map> -postScript ExportDecomp.java <out>
+        globals only:        -postScript ApplyGlobals.java <global_map> -postScript ExportDecomp.java <out>
+
     `-noanalysis` is mandatory — re-running auto-analysis would (a) undo
     `ApplySymbols` renames that aren't `USER_DEFINED`, and (b) re-trigger the
     Thumb overlap-repair spin that `TameAnalysis` exists to prevent. Pass 2
@@ -667,8 +673,9 @@ module; when a file outgrows that, split it.
 - **Pass-2 fail-closed surface.** `decompile::ImageResult` carries
   `pass2_applied: Option<usize>` (count of names `ApplySymbols.java` reported
   applying — parsed from its summary line on stdout) and `pass2_error:
-  Option<String>` (set when analyzeHeadless exits non-zero *or* the spawn
-  itself fails; includes a ~2 KB tail of stderr). A pass-2 failure does **not**
+  Option<String>` (set for late typed-map validation, analyzeHeadless spawn or
+  non-zero process failure, or the caller's owned-export refresh failure;
+  process failures include a ~2 KB tail of stderr). A pass-2 failure does **not**
   mark the pass-1 image `failed` in `report.json` — pass 1 already produced a
   valid `decompiled.c`. `run_two_pass` returns an explicit outcome for every
   scheduled label, including labels absent from the pass-1 report. The caller
