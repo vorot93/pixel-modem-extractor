@@ -175,6 +175,9 @@ fn parse_numeric_symbol_address(address: &str) -> Option<u64> {
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     u64::from_str_radix(digits, 16).ok()
 }
 
@@ -1238,6 +1241,63 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn numeric_symbol_address_parser_covers_writer_boundaries() {
+        for (input, expected) in [
+            ("0", 0),
+            ("00000000", 0),
+            ("ff", 0xff),
+            (" FF ", 0xff),
+            ("0xff", 0xff),
+            ("0XFF", 0xff),
+            ("00000000000000FF", 0xff),
+            ("ffffffffffffffff", u64::MAX),
+            ("0xFFFFFFFFFFFFFFFF", u64::MAX),
+        ] {
+            assert_eq!(
+                parse_numeric_symbol_address(input),
+                Some(expected),
+                "{input:?}"
+            );
+        }
+
+        let malformed = [
+            "",
+            " ",
+            "0x",
+            "0X",
+            "+1",
+            "-1",
+            "f f",
+            "0x ff",
+            "0x1_0",
+            "xyz",
+            "10000000000000000",
+            "0x10000000000000000",
+        ];
+        for input in malformed {
+            assert_eq!(parse_numeric_symbol_address(input), None, "{input:?}");
+        }
+
+        let symbols: Vec<_> = malformed
+            .into_iter()
+            .map(|address| symbolicate::Symbol {
+                address: address.to_string(),
+                arch: "arm",
+                original_name: "FUN_invalid".to_string(),
+                name: Some("SHOULD_NOT_PROJECT".to_string()),
+                tier: symbolicate::Tier::Recovered,
+                evidence: Vec::new(),
+                annotations: Vec::new(),
+            })
+            .collect();
+        let projection = FunctionEvidenceNameProjection::from_symbols(&symbols);
+        assert!(projection.arm.is_empty());
+        assert!(projection.thumb.is_empty());
+        assert_eq!(projection.name_for(Arch::Arm, 0), None);
+        assert_eq!(projection.name_for(Arch::Thumb, 0), None);
     }
 
     /// Build a minimal image_dir with decompiled/functions.json +
