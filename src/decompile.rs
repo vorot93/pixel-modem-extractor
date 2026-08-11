@@ -2500,23 +2500,37 @@ mod tests {
 
     #[test]
     fn prepared_pass2_map_canonicalizes_relative_regular_file() {
-        let relative_dir = PathBuf::from("target")
-            .join(format!("pme_task8r_relative_maps_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&relative_dir);
-        std::fs::create_dir_all(&relative_dir).unwrap();
-        let function_path = relative_dir.join("functions.json");
-        let global_path = relative_dir.join("globals.json");
+        let root =
+            std::env::temp_dir().join(format!("pmetask8rrelativemaps{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            root.components()
+                .all(|component| !component.as_os_str().to_string_lossy().starts_with('.'))
+        );
+        let function_path = root.join("functions.json");
+        let global_path = root.join("globals.json");
         std::fs::write(&function_path, b"functions").unwrap();
         std::fs::write(&global_path, b"globals").unwrap();
+        let relative_function_path = relative_spelling_from_current_dir(&function_path);
+        let relative_global_path = relative_spelling_from_current_dir(&global_path);
+        assert!(relative_function_path.is_relative());
+        assert!(relative_global_path.is_relative());
 
         let input = Pass2Input {
             function_map: Some(
-                PreparedPass2Map::new(&function_path, std::num::NonZeroUsize::new(1).unwrap())
-                    .unwrap(),
+                PreparedPass2Map::new(
+                    &relative_function_path,
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                )
+                .unwrap(),
             ),
             global_map: Some(
-                PreparedPass2Map::new(&global_path, std::num::NonZeroUsize::new(2).unwrap())
-                    .unwrap(),
+                PreparedPass2Map::new(
+                    &relative_global_path,
+                    std::num::NonZeroUsize::new(2).unwrap(),
+                )
+                .unwrap(),
             ),
         };
         let args = headless_process_args("/out", "02_MAIN", &input)
@@ -2546,7 +2560,7 @@ mod tests {
         assert!(Path::new(function_argument).is_file());
         assert!(Path::new(global_argument).is_file());
 
-        let _ = std::fs::remove_dir_all(&relative_dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2565,24 +2579,81 @@ mod tests {
 
     #[test]
     fn validated_headless_process_args_rejects_late_disappearance() {
-        let root =
-            PathBuf::from("target").join(format!("pme_task8r_late_map_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("functions.json");
-        std::fs::write(&path, b"functions").unwrap();
-        let input = Pass2Input {
-            function_map: Some(
-                PreparedPass2Map::new(&path, NonZeroUsize::new(1).unwrap()).unwrap(),
-            ),
-            global_map: None,
-        };
-        std::fs::remove_file(&path).unwrap();
+        for missing_map in ["functions.json", "globals.json"] {
+            let root = std::env::temp_dir().join(format!(
+                "pmetask8rlatemap{}{}",
+                missing_map.trim_end_matches(".json"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let function_path = root.join("functions.json");
+            let global_path = root.join("globals.json");
+            std::fs::write(&function_path, b"functions").unwrap();
+            std::fs::write(&global_path, b"globals").unwrap();
+            let input = Pass2Input {
+                function_map: Some(
+                    PreparedPass2Map::new(
+                        &relative_spelling_from_current_dir(&function_path),
+                        NonZeroUsize::new(1).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                global_map: Some(
+                    PreparedPass2Map::new(
+                        &relative_spelling_from_current_dir(&global_path),
+                        NonZeroUsize::new(2).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            };
+            std::fs::remove_file(root.join(missing_map)).unwrap();
+            let mut spawn_called = false;
 
-        let error = headless_process_args("/out", "02_MAIN", &input).unwrap_err();
+            let result = headless_process_args("/out", "02_MAIN", &input).inspect(|args| {
+                spawn_called = args.is_some();
+            });
 
-        assert!(error.to_string().contains("no longer"));
-        let _ = std::fs::remove_dir_all(&root);
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("no longer"));
+            assert!(
+                !spawn_called,
+                "invalid combined input reached the spawn boundary"
+            );
+            assert!(
+                root.join(if missing_map == "functions.json" {
+                    "globals.json"
+                } else {
+                    "functions.json"
+                })
+                .is_file()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    fn relative_spelling_from_current_dir(path: &Path) -> PathBuf {
+        let current_dir = std::env::current_dir().unwrap();
+        let current_components: Vec<_> = current_dir.components().collect();
+        let target_components: Vec<_> = path.components().collect();
+        let common = current_components
+            .iter()
+            .zip(&target_components)
+            .take_while(|(left, right)| left == right)
+            .count();
+        assert!(
+            common > 0,
+            "temporary path and current directory have no common root"
+        );
+
+        let mut relative = PathBuf::new();
+        for _ in common..current_components.len() {
+            relative.push("..");
+        }
+        for component in &target_components[common..] {
+            relative.push(component.as_os_str());
+        }
+        relative
     }
 
     fn pass2_test_map(name: &str, count: usize) -> Option<PreparedPass2Map> {
