@@ -572,13 +572,19 @@ module; when a file outgrows that, split it.
 - **Why streaming-to-disk.** Three reasons: (1) decouples r2's write
   rate from Rust's read rate (no pipe-stall during slow parse); (2)
   persistent artifact for post-hoc inspection; (3) sets up future
-  streaming-parse optionality. **Memory profile is NOT reduced** —
-  a full dense-Thumb `decompose` can peak around 56 GiB RSS while retained
-  radare2 JSON captures are read, parsed, and accumulated. The 4 GiB cap
-  limits each capture, not total process memory. Plan for at least 64 GiB RAM
-  plus swap or other headroom; smaller-image and `--no-thumb-decompile` runs
-  stay under 1 GiB. Reducing memory needs a streaming JSON parser (deferred
-  follow-up).
+  streaming-parse optionality. Raw `.stdout` captures remain on disk.
+  **Memory profile is NOT reduced** — `run_radare2_thumb` reads and parses the
+  current capture while retaining the normalized `serde_json::Value` function
+  collection accumulated from completed regions. A full dense-Thumb
+  `decompose` can therefore peak around 56 GiB RSS. The 4 GiB cap limits each
+  raw capture, not the accumulated normalized collection plus the current
+  capture's read/parse allocations. Plan for at least 64 GiB RAM plus swap or
+  other headroom; smaller images without dense Thumb regions stay under 1 GiB.
+  `--no-thumb-decompile` only selects Ghidra `datamark` mode and skips both
+  `body_c` enrichment sweeps; it still invokes the dense-region radare2
+  capture/read/parse loop and therefore does not avoid the full dense-Thumb
+  memory envelope. Reducing memory requires streaming parsing plus bounded
+  normalized accumulation (deferred follow-up).
 - **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
   into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
   so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,
@@ -600,12 +606,13 @@ module; when a file outgrows that, split it.
 - **Ghidra 12 headless API notes (Phase 1+).** Hard-won; verified against
   `/opt/ghidra` (Ghidra 12.1.2). Don't trust older API recall — `javap` the
   bundled jars under `/opt/ghidra/Ghidra/Framework/*/lib/*.jar` when in doubt.
-  - **Headless project paths must be canonically dot-free.** Ghidra 12 validates
-    the canonical, symlink-resolved project path and rejects any path component
-    beginning with `.`. A path that looks dot-free can still fail when a symlink
-    resolves beneath a dot-prefixed ancestor. Put production output and Ghidra
-    project state under a root whose canonical path contains no dot-prefixed
-    components.
+  - **Headless project paths must be canonically dot-free.**
+    `pixel-modem-extractor` canonicalizes the output root before appending the
+    Ghidra project path. Ghidra 12 rejects any dot-prefixed component in that
+    resulting path. Because canonicalization happens first, a symlink cannot
+    hide a dot-prefixed canonical ancestor from this pipeline. Put production
+    output and Ghidra project state under a root whose canonical path contains
+    no dot-prefixed components.
   - **No `Listing.setPlateComment(Address, String)`.** Use
     `listing.setComment(addr, CodeUnit.PLATE_COMMENT, s)` with
     `import ghidra.program.model.listing.CodeUnit;`. (Other setXxxComment

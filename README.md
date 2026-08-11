@@ -26,17 +26,22 @@ Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PA
 supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
 to launch the headless analyzer unless you set your own `JAVA_HOME`.
 
-**Memory:** a full dense-Thumb `decompose` can peak around 56 GiB RSS while
-accumulated radare2 JSON captures are retained and parsed. Plan for at least
-64 GiB RAM plus swap or other headroom. The 4 GiB radare2 stdout cap applies
-per capture and does not cap aggregate parser memory. Smaller images
-(`00_BOOT`, `01_PSP`, etc.) and `--no-thumb-decompile` runs stay under 1 GiB.
+**Memory:** a full dense-Thumb `decompose` can peak around 56 GiB RSS. Raw
+per-region radare2 JSON captures remain on disk; normalized function values
+from completed regions accumulate in memory while the current capture is read
+and parsed. Plan for at least 64 GiB RAM plus swap or other headroom. The 4 GiB
+radare2 stdout cap applies per capture and does not cap aggregate process
+memory. Smaller images without dense Thumb regions (`00_BOOT`, `01_PSP`, etc.)
+stay under 1 GiB. `--no-thumb-decompile` switches Ghidra to `datamark` mode and
+skips `body_c` enrichment, but it still runs the dense-region radare2
+capture/read/parse path and therefore does not avoid the full dense-Thumb
+memory envelope.
 
-**Project path:** Ghidra 12 validates the canonical, symlink-resolved headless
-project path and rejects any component whose name begins with `.`. An output or
-project path beneath a dot-prefixed directory therefore fails even when reached
-through a symlink. Choose a root whose canonical path has no dot-prefixed
-components.
+**Project path:** `pixel-modem-extractor` canonicalizes its output root before
+constructing the Ghidra headless project path. Ghidra 12 rejects any
+dot-prefixed component in that resulting path, so a symlink cannot hide a
+dot-prefixed canonical ancestor from this pipeline. Choose an output root whose
+canonical path contains no dot-prefixed components.
 
 ## Quickstart
 
