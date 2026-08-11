@@ -4,6 +4,7 @@
 //! proprietary firmware needed.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 fn find_ghidra_home() -> Option<PathBuf> {
@@ -34,6 +35,39 @@ fn craft_modem_bin(payload: &[u8]) -> Vec<u8> {
     buf[entry_off + 28..entry_off + 32].copy_from_slice(&1u32.to_le_bytes()); // index
     buf[payload_off..].copy_from_slice(payload);
     buf
+}
+
+fn relative_spelling_from_current(path: &std::path::Path) -> PathBuf {
+    let current = std::fs::canonicalize(".").unwrap();
+    let target = std::fs::canonicalize(path).unwrap();
+    let current_components: Vec<_> = current.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+    let shared = current_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in shared..current_components.len() {
+        relative.push("..");
+    }
+    for component in &target_components[shared..] {
+        relative.push(component.as_os_str());
+    }
+    relative
+}
+
+fn prepared_pass2_map(
+    path: &std::path::Path,
+    count: usize,
+) -> pixel_modem_extractor::decompile::PreparedPass2Map {
+    let relative = relative_spelling_from_current(path);
+    assert!(relative.is_relative());
+    pixel_modem_extractor::decompile::PreparedPass2Map::new(
+        &relative,
+        NonZeroUsize::new(count).unwrap(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -225,18 +259,17 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         "00_BOOT".to_string(),
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: None,
-            function_count: 0,
-            global_map: Some(global_map_path.clone()),
-            global_count: 2,
+            global_map: Some(prepared_pass2_map(&global_map_path, 2)),
         },
     )]);
-    let duplicate_report = pixel_modem_extractor::decompile::run_two_pass(
+    let duplicate_run = pixel_modem_extractor::decompile::run_two_pass(
         pass1_report,
         &opts,
         &out,
         &duplicate_globals_only,
     )
     .unwrap();
+    let duplicate_report = duplicate_run.report;
     let boot = duplicate_report
         .images
         .iter()
@@ -287,17 +320,16 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let inputs = HashMap::from([(
         "00_BOOT".to_string(),
         pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(map_path.clone()),
-            function_count: 1,
-            global_map: Some(global_map_path.clone()),
-            global_count: 2,
+            function_map: Some(prepared_pass2_map(&map_path, 1)),
+            global_map: Some(prepared_pass2_map(&global_map_path, 2)),
         },
     )]);
 
     // Pass 2: pass pass1_report in (do NOT re-run pass 1).
     let rep2 =
         pixel_modem_extractor::decompile::run_two_pass(duplicate_report, &opts, &out, &inputs)
-            .unwrap();
+            .unwrap()
+            .report;
 
     // (c) pass2_applied == Some(1) — ApplySymbols reports 1 rename.
     let boot = rep2
@@ -369,13 +401,12 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         "00_BOOT".to_string(),
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: None,
-            function_count: 0,
-            global_map: Some(global_map_path.clone()),
-            global_count: 1,
+            global_map: Some(prepared_pass2_map(&global_map_path, 1)),
         },
     )]);
-    let rep3 =
-        pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &globals_only).unwrap();
+    let rep3 = pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &globals_only)
+        .unwrap()
+        .report;
     let boot = rep3.images.iter().find(|r| r.label == "00_BOOT").unwrap();
     assert_eq!(boot.globals_applied, Some(0));
     assert_eq!(boot.globals_apply_skipped, Some(1));
@@ -418,14 +449,18 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let invalid_combined = HashMap::from([(
         "00_BOOT".to_string(),
         pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(map_path),
-            function_count: 1,
-            global_map: Some(global_map_path),
-            global_count: 1,
+            function_map: Some(prepared_pass2_map(&map_path, 1)),
+            global_map: Some(prepared_pass2_map(&global_map_path, 1)),
         },
     )]);
-    let rep4 = pixel_modem_extractor::decompile::run_two_pass(rep3, &opts, &out, &invalid_combined)
-        .unwrap();
+    let invalid_run =
+        pixel_modem_extractor::decompile::run_two_pass(rep3, &opts, &out, &invalid_combined)
+            .unwrap();
+    assert_eq!(
+        invalid_run.outcomes["00_BOOT"],
+        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    );
+    let rep4 = invalid_run.report;
     let boot = rep4.images.iter().find(|r| r.label == "00_BOOT").unwrap();
     assert_eq!(boot.pass2_applied, Some(1));
     assert!(boot.pass2_error.is_none());

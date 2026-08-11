@@ -172,7 +172,12 @@ module; when a file outgrows that, split it.
   an in-memory entry-to-name index containing every non-null built name. Global
   recovery consumes that index and writes `globals.json` before pass 2 on the
   normal route. `decompile::run_two_pass` accepts a typed per-image input with
-  optional function and global map paths plus their prepared counts. It starts
+  optional function and global maps. Each map is constructed only from a
+  non-empty regular file, stores its canonical absolute path and non-zero
+  count, and is revalidated immediately before Ghidra arguments are built.
+  Initial validation is component-local (an invalid function or global map is
+  omitted without suppressing its valid sibling); a late identity/type change
+  fails the whole scheduled image rather than changing its script set. It starts
   exactly one `analyzeHeadless -process -noanalysis` saved-project process for
   each image having either input and orders post-scripts as follows:
 
@@ -245,15 +250,25 @@ module; when a file outgrows that, split it.
   has the report — calling `run_report` again would triple Ghidra time on
   `02_MAIN`. Don't "helpfully" add a fallback `run_report` call inside
   `run_two_pass`.
-  (2) **`refresh_decompiled` must run per-image after `run_two_pass` returns
-  `Ok`, and it is ownership-aware.** Pass 2's `ExportDecomp.java` owns exactly
+  (2) **Pass-2 refresh is process-outcome-aware and ownership-aware.** Only an
+  explicitly scheduled image whose Ghidra process exited successfully may be
+  refreshed; unscheduled and process-failed images leave even stale exports
+  untouched. A successful process must produce the exact export below, and a
+  missing or invalid export is a failed `decompile_pass2` outcome. Pass 2's
+  `ExportDecomp.java` owns exactly
   `decompiled.c`, `disasm.lst`, and `functions.json` under
   `<ghidra_dir>/export/<label>/`. The helper validates that exact three-file
   set before any destination mutation, then replaces only those three paths
   under `images/<label>/decompiled/`. Every other destination entry
   (`globals.json`, `thumb_functions.json`, `thumb/`, and future non-Ghidra
   sidecars) is left byte-for-byte unchanged. An incomplete or unexpected
-  export returns an error and leaves the destination untouched. Downstream
+  export returns an error and leaves the destination untouched. A successful
+  process whose `ApplyGlobals` summary reports an independent map error still
+  refreshes a successfully exported function result; `decompile_pass2` remains
+  successful while `globals_apply` fails separately. Every normal route emits
+  exactly one `decompile_pass2` stage (`skipped`, `ok`, or `failed`), so a
+  function-only process/export/refresh failure makes the final report non-OK.
+  Downstream
   stages (`thumb_enrich_post_pass2`, `symbolicate_finalize`) and users read
   from the per-image tree.
   (3) **`decode_tokens` runs BEFORE the `symbol_map` stage in `decompose::run`**
@@ -648,9 +663,11 @@ module; when a file outgrows that, split it.
   applying — parsed from its summary line on stdout) and `pass2_error:
   Option<String>` (set when analyzeHeadless exits non-zero *or* the spawn
   itself fails; includes a ~2 KB tail of stderr). A pass-2 failure does **not**
-  mark the image `failed` in `report.json` — pass 1 already produced a valid
-  `decompiled.c`. Per-stage `Err` from `run_two_pass` is recorded as a
-  separate `decompile_pass2` failed stage; the pass-1 `decompile` stage stays.
+  mark the pass-1 image `failed` in `report.json` — pass 1 already produced a
+  valid `decompiled.c`. `run_two_pass` returns an explicit outcome for every
+  scheduled label, including labels absent from the pass-1 report. The caller
+  combines process outcomes with exact-export refresh outcomes into the
+  separate `decompile_pass2` stage; the pass-1 `decompile` stage stays intact.
 
 ## How we work here
 

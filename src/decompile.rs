@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -1014,37 +1015,76 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
 /// re-analysis: the requested `ApplySymbols.java` and `ApplyGlobals.java`
 /// scripts run in that order, then `ExportDecomp.java` regenerates the export
 /// with applied function and global names baked in.
+#[derive(Debug, Clone)]
+pub struct PreparedPass2Map {
+    absolute_path: PathBuf,
+    count: NonZeroUsize,
+}
+
+impl PreparedPass2Map {
+    pub fn new(path: &Path, count: NonZeroUsize) -> Result<Self> {
+        let absolute_path = std::fs::canonicalize(path)?;
+        if !absolute_path.is_file() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 map is not a regular file: {}",
+                absolute_path.display()
+            )));
+        }
+        Ok(Self {
+            absolute_path,
+            count,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.absolute_path
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.get()
+    }
+
+    fn validate_for_spawn(&self) -> Result<()> {
+        if !self.absolute_path.is_absolute() || !self.absolute_path.is_file() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 map is no longer an absolute regular file: {}",
+                self.absolute_path.display()
+            )));
+        }
+        let canonical = std::fs::canonicalize(&self.absolute_path)?;
+        if canonical != self.absolute_path {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 map canonical identity changed: {} -> {}",
+                self.absolute_path.display(),
+                canonical.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Pass2Input {
-    pub function_map: Option<PathBuf>,
-    pub function_count: usize,
-    pub global_map: Option<PathBuf>,
-    pub global_count: usize,
+    pub function_map: Option<PreparedPass2Map>,
+    pub global_map: Option<PreparedPass2Map>,
 }
 
-impl Pass2Input {
-    fn prepared_function_map(&self) -> Option<&Path> {
-        if self.function_count > 0 {
-            self.function_map.as_deref()
-        } else {
-            None
-        }
-    }
-
-    fn prepared_global_map(&self) -> Option<&Path> {
-        if self.global_count > 0 {
-            self.global_map.as_deref()
-        } else {
-            None
-        }
-    }
-}
-
-fn headless_process_args(root: &str, label: &str, input: &Pass2Input) -> Option<Vec<String>> {
-    let function_map = input.prepared_function_map();
-    let global_map = input.prepared_global_map();
+fn headless_process_args(
+    root: &str,
+    label: &str,
+    input: &Pass2Input,
+) -> Result<Option<Vec<String>>> {
+    let function_map = input.function_map.as_ref();
+    let global_map = input.global_map.as_ref();
     if function_map.is_none() && global_map.is_none() {
-        return None;
+        return Ok(None);
+    }
+
+    if let Some(map) = function_map {
+        map.validate_for_spawn()?;
+    }
+    if let Some(map) = global_map {
+        map.validate_for_spawn()?;
     }
 
     let mut args = vec![
@@ -1056,18 +1096,18 @@ fn headless_process_args(root: &str, label: &str, input: &Pass2Input) -> Option<
         "-scriptPath".to_string(),
         format!("{root}/scripts"),
     ];
-    if let Some(map_path) = function_map {
+    if let Some(map) = function_map {
         args.extend([
             "-postScript".to_string(),
             "ApplySymbols.java".to_string(),
-            map_path.to_string_lossy().into_owned(),
+            map.path().to_string_lossy().into_owned(),
         ]);
     }
-    if let Some(map_path) = global_map {
+    if let Some(map) = global_map {
         args.extend([
             "-postScript".to_string(),
             "ApplyGlobals.java".to_string(),
-            map_path.to_string_lossy().into_owned(),
+            map.path().to_string_lossy().into_owned(),
         ]);
     }
     args.extend([
@@ -1075,7 +1115,7 @@ fn headless_process_args(root: &str, label: &str, input: &Pass2Input) -> Option<
         "ExportDecomp.java".to_string(),
         format!("{root}/export/{label}"),
     ]);
-    Some(args)
+    Ok(Some(args))
 }
 
 /// Extract the `N` from the summary line
@@ -1234,30 +1274,62 @@ fn parse_apply_globals_summary(
 /// with its corresponding map path. Per-image pass-2 failures (non-zero exit,
 /// spawn failure) are recorded into `ImageResult.pass2_error`, not propagated —
 /// pass 1 already produced a valid `decompiled.c`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pass2ProcessOutcome {
+    ProcessSucceeded,
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub struct Pass2RunReport {
+    pub report: DecompileReport,
+    pub outcomes: HashMap<String, Pass2ProcessOutcome>,
+}
+
 pub fn run_two_pass(
     mut report: DecompileReport,
     opts: &Opts,
     out: &Path,
     inputs: &HashMap<String, Pass2Input>,
-) -> Result<DecompileReport> {
+) -> Result<Pass2RunReport> {
+    let mut outcomes = HashMap::new();
     if !opts.run {
-        return Ok(report);
+        return Ok(Pass2RunReport { report, outcomes });
     }
     let install = find_ghidra(opts)?;
     let java_home = resolve_java_home(std::env::var_os("JAVA_HOME"), install.ghidra_run.as_deref());
     let root = std::fs::canonicalize(out)?;
     let root_str = root.to_string_lossy().into_owned();
 
+    for (label, input) in inputs {
+        if (input.function_map.is_some() || input.global_map.is_some())
+            && !report.images.iter().any(|image| image.label == *label)
+        {
+            outcomes.insert(
+                label.clone(),
+                Pass2ProcessOutcome::Failed("input label absent from pass-1 report".to_string()),
+            );
+        }
+    }
+
     for ir in &mut report.images {
         let Some(input) = inputs.get(&ir.label) else {
             continue;
         };
-        let Some(args) = headless_process_args(&root_str, &ir.label, input) else {
-            continue;
+        ir.pass2_error = None;
+        let args = match headless_process_args(&root_str, &ir.label, input) {
+            Ok(Some(args)) => args,
+            Ok(None) => continue,
+            Err(error) => {
+                let reason = format!("map validation: {error}");
+                ir.pass2_error = Some(reason.clone());
+                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                continue;
+            }
         };
 
-        let applies_functions = input.prepared_function_map().is_some();
-        let applies_globals = input.prepared_global_map().is_some();
+        let applies_functions = input.function_map.is_some();
+        let applies_globals = input.global_map.is_some();
         if applies_functions {
             ir.pass2_applied = None;
         }
@@ -1278,7 +1350,9 @@ pub fn run_two_pass(
         {
             Ok(o) => o,
             Err(e) => {
-                ir.pass2_error = Some(format!("spawn: {e}"));
+                let reason = format!("spawn: {e}");
+                ir.pass2_error = Some(reason.clone());
+                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
                 continue;
             }
         };
@@ -1301,6 +1375,7 @@ pub fn run_two_pass(
                     }
                 }
             }
+            outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::ProcessSucceeded);
         } else {
             let code = output.status.code().unwrap_or(-1);
             tracing::warn!("ghidra: pass 2 for {} failed (exit {code})", ir.label);
@@ -1319,10 +1394,12 @@ pub fn run_two_pass(
             } else {
                 stderr.into_owned()
             };
-            ir.pass2_error = Some(format!("analyzeHeadless exit {code}; stderr tail:\n{tail}"));
+            let reason = format!("analyzeHeadless exit {code}; stderr tail:\n{tail}");
+            ir.pass2_error = Some(reason.clone());
+            outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
         }
     }
-    Ok(report)
+    Ok(Pass2RunReport { report, outcomes })
 }
 
 /// Generate the kit and (with `--run`) drive Ghidra plus radare2 for dense Thumb
@@ -2421,19 +2498,122 @@ mod tests {
         assert!(args[pre_idx + 2..].iter().any(|a| a == "40e12000:100000"));
     }
 
+    #[test]
+    fn prepared_pass2_map_canonicalizes_relative_regular_file() {
+        let relative_dir = PathBuf::from("target")
+            .join(format!("pme_task8r_relative_maps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&relative_dir);
+        std::fs::create_dir_all(&relative_dir).unwrap();
+        let function_path = relative_dir.join("functions.json");
+        let global_path = relative_dir.join("globals.json");
+        std::fs::write(&function_path, b"functions").unwrap();
+        std::fs::write(&global_path, b"globals").unwrap();
+
+        let input = Pass2Input {
+            function_map: Some(
+                PreparedPass2Map::new(&function_path, std::num::NonZeroUsize::new(1).unwrap())
+                    .unwrap(),
+            ),
+            global_map: Some(
+                PreparedPass2Map::new(&global_path, std::num::NonZeroUsize::new(2).unwrap())
+                    .unwrap(),
+            ),
+        };
+        let args = headless_process_args("/out", "02_MAIN", &input)
+            .unwrap()
+            .expect("typed maps schedule pass two");
+        let function_argument = &args[args
+            .iter()
+            .position(|arg| arg == "ApplySymbols.java")
+            .unwrap()
+            + 1];
+        let global_argument = &args[args
+            .iter()
+            .position(|arg| arg == "ApplyGlobals.java")
+            .unwrap()
+            + 1];
+
+        assert_eq!(
+            Path::new(function_argument),
+            std::fs::canonicalize(&function_path).unwrap()
+        );
+        assert_eq!(
+            Path::new(global_argument),
+            std::fs::canonicalize(&global_path).unwrap()
+        );
+        assert!(Path::new(function_argument).is_absolute());
+        assert!(Path::new(global_argument).is_absolute());
+        assert!(Path::new(function_argument).is_file());
+        assert!(Path::new(global_argument).is_file());
+
+        let _ = std::fs::remove_dir_all(&relative_dir);
+    }
+
+    #[test]
+    fn prepared_pass2_map_rejects_missing_and_non_regular_paths() {
+        let root =
+            PathBuf::from("target").join(format!("pme_task8r_invalid_maps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let missing = root.join("missing.json");
+
+        assert!(PreparedPass2Map::new(&missing, NonZeroUsize::new(1).unwrap()).is_err());
+        assert!(PreparedPass2Map::new(&root, NonZeroUsize::new(1).unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validated_headless_process_args_rejects_late_disappearance() {
+        let root =
+            PathBuf::from("target").join(format!("pme_task8r_late_map_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("functions.json");
+        std::fs::write(&path, b"functions").unwrap();
+        let input = Pass2Input {
+            function_map: Some(
+                PreparedPass2Map::new(&path, NonZeroUsize::new(1).unwrap()).unwrap(),
+            ),
+            global_map: None,
+        };
+        std::fs::remove_file(&path).unwrap();
+
+        let error = headless_process_args("/out", "02_MAIN", &input).unwrap_err();
+
+        assert!(error.to_string().contains("no longer"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn pass2_test_map(name: &str, count: usize) -> Option<PreparedPass2Map> {
+        let count = NonZeroUsize::new(count)?;
+        let dir = PathBuf::from("target").join("pme_task8r_pass2_args");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, name).unwrap();
+        Some(PreparedPass2Map::new(&path, count).unwrap())
+    }
+
     fn pass2_input(function_count: usize, global_count: usize) -> Pass2Input {
         Pass2Input {
-            function_map: Some(PathBuf::from("/out/ghidra/symbol_maps/02_MAIN.json")),
-            function_count,
-            global_map: Some(PathBuf::from("/out/images/02_MAIN/decompiled/globals.json")),
-            global_count,
+            function_map: pass2_test_map("functions.json", function_count),
+            global_map: pass2_test_map("globals.json", global_count),
         }
     }
 
     #[test]
     fn headless_process_args_wires_functions_then_globals_then_export() {
-        let args = headless_process_args("/out", "02_MAIN", &pass2_input(1, 1))
+        let input = pass2_input(1, 1);
+        let args = headless_process_args("/out", "02_MAIN", &input)
+            .unwrap()
             .expect("non-empty prepared input must invoke pass two");
+        let function_path = input
+            .function_map
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_string_lossy();
+        let global_path = input.global_map.as_ref().unwrap().path().to_string_lossy();
 
         assert_eq!(
             args,
@@ -2447,10 +2627,10 @@ mod tests {
                 "/out/scripts",
                 "-postScript",
                 "ApplySymbols.java",
-                "/out/ghidra/symbol_maps/02_MAIN.json",
+                function_path.as_ref(),
                 "-postScript",
                 "ApplyGlobals.java",
-                "/out/images/02_MAIN/decompiled/globals.json",
+                global_path.as_ref(),
                 "-postScript",
                 "ExportDecomp.java",
                 "/out/export/02_MAIN",
@@ -2460,8 +2640,16 @@ mod tests {
 
     #[test]
     fn headless_process_args_wires_functions_only_then_export() {
-        let args = headless_process_args("/out", "02_MAIN", &pass2_input(1, 0))
+        let input = pass2_input(1, 0);
+        let args = headless_process_args("/out", "02_MAIN", &input)
+            .unwrap()
             .expect("prepared function input must invoke pass two");
+        let function_path = input
+            .function_map
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_string_lossy();
 
         assert_eq!(
             args,
@@ -2475,7 +2663,7 @@ mod tests {
                 "/out/scripts",
                 "-postScript",
                 "ApplySymbols.java",
-                "/out/ghidra/symbol_maps/02_MAIN.json",
+                function_path.as_ref(),
                 "-postScript",
                 "ExportDecomp.java",
                 "/out/export/02_MAIN",
@@ -2486,8 +2674,11 @@ mod tests {
 
     #[test]
     fn headless_process_args_wires_globals_only_then_export() {
-        let args = headless_process_args("/out", "02_MAIN", &pass2_input(0, 1))
+        let input = pass2_input(0, 1);
+        let args = headless_process_args("/out", "02_MAIN", &input)
+            .unwrap()
             .expect("prepared global input must invoke pass two");
+        let global_path = input.global_map.as_ref().unwrap().path().to_string_lossy();
 
         assert_eq!(
             args,
@@ -2501,7 +2692,7 @@ mod tests {
                 "/out/scripts",
                 "-postScript",
                 "ApplyGlobals.java",
-                "/out/images/02_MAIN/decompiled/globals.json",
+                global_path.as_ref(),
                 "-postScript",
                 "ExportDecomp.java",
                 "/out/export/02_MAIN",
@@ -2512,7 +2703,11 @@ mod tests {
 
     #[test]
     fn headless_process_args_skips_when_prepared_counts_are_zero() {
-        assert!(headless_process_args("/out", "02_MAIN", &pass2_input(0, 0)).is_none());
+        assert!(
+            headless_process_args("/out", "02_MAIN", &pass2_input(0, 0))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
