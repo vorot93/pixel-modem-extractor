@@ -186,6 +186,12 @@ module; when a file outgrows that, split it.
       globals only:         ApplyGlobals.java -> ExportDecomp.java
       neither:              no pass-2 process
 
+  Symbol-map preparation is also fail-closed without discarding partial work:
+  any per-component error makes the aggregate `symbol_map` stage failed, every
+  labelled error is Unicode-bounded and sorted deterministically into the
+  report, and surviving typed maps still continue to pass 2. Partial output
+  remains visible as `ghidra/symbol_maps/`.
+
   There is no second import, auto-analysis, or third export pass. The
   `--no-symbol-pass` route instead finalizes the existing text rewrite, loads
   every non-null name from `symbols.json`, runs the same globals helper once,

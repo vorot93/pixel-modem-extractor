@@ -656,6 +656,53 @@ struct GlobalsStageOutcome {
 /// successful `(label, prepared map)` entries plus any per-image errors.
 type SymbolMapsResult = (HashMap<String, PreparedFunctionMap>, Vec<(String, String)>);
 
+const SYMBOL_MAP_ERROR_MAX_CHARS: usize = 2_048;
+const SYMBOL_MAP_ERROR_TRUNCATION_MARKER: &str = " [truncated]";
+
+fn truncate_symbol_map_error(message: String) -> String {
+    if message.chars().count() <= SYMBOL_MAP_ERROR_MAX_CHARS {
+        return message;
+    }
+    let keep = SYMBOL_MAP_ERROR_MAX_CHARS - SYMBOL_MAP_ERROR_TRUNCATION_MARKER.chars().count();
+    let mut truncated: String = message.chars().take(keep).collect();
+    truncated.push_str(SYMBOL_MAP_ERROR_TRUNCATION_MARKER);
+    truncated
+}
+
+fn symbol_map_stage(
+    function_maps: &HashMap<String, PreparedFunctionMap>,
+    mut errors: Vec<(String, String)>,
+    duration_ms: u128,
+) -> StageReport {
+    let total: usize = function_maps
+        .values()
+        .filter_map(|prepared| prepared.pass2_map.as_ref())
+        .map(decompile::PreparedPass2Map::count)
+        .sum();
+    if !errors.is_empty() {
+        errors.sort();
+        let error = errors
+            .into_iter()
+            .map(|(label, message)| format!("{label}: {}", truncate_symbol_map_error(message)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return StageReport {
+            stage: "symbol_map",
+            status: "failed",
+            output: (total > 0).then(|| "ghidra/symbol_maps/".to_string()),
+            reason: None,
+            error: Some(error),
+            images: Vec::new(),
+            duration_ms,
+        };
+    }
+    if total == 0 {
+        StageReport::skipped("symbol_map", "no symbols recovered")
+    } else {
+        StageReport::ok("symbol_map", "ghidra/symbol_maps/", duration_ms)
+    }
+}
+
 /// Prepare the in-memory result for a function symbol map that was written from
 /// `symbols`. Every non-null name is retained regardless of tier; malformed
 /// addresses are excluded with the same acceptance rules as `symbols.json`.
@@ -1250,35 +1297,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     if opts.no_symbol_pass {
         stages.push(StageReport::skipped("symbol_map", "--no-symbol-pass"));
     } else {
-        let total: usize = function_maps
-            .values()
-            .filter_map(|prepared| prepared.pass2_map.as_ref())
-            .map(decompile::PreparedPass2Map::count)
-            .sum();
-        // Real failures surface as a `failed` stage (the prior shape collapsed
-        // them into `skipped, "no symbols recovered"` — a violation of the
-        // fail-closed posture). If there are successes we still report `ok` so
-        // a transient per-image error doesn't poison the headline metric, but
-        // the errors are preserved for the user to see in `report.json`.
-        let stage = if !symbol_map_errors.is_empty() && total == 0 {
-            StageReport::failed(
-                "symbol_map",
-                format!(
-                    "{} error(s); first: {}",
-                    symbol_map_errors.len(),
-                    symbol_map_errors
-                        .first()
-                        .map(|(_, m)| m.as_str())
-                        .unwrap_or("")
-                ),
-                t.elapsed().as_millis(),
-            )
-        } else if total == 0 {
-            StageReport::skipped("symbol_map", "no symbols recovered")
-        } else {
-            StageReport::ok("symbol_map", "ghidra/symbol_maps/", t.elapsed().as_millis())
-        };
-        stages.push(stage);
+        stages.push(symbol_map_stage(
+            &function_maps,
+            symbol_map_errors,
+            t.elapsed().as_millis(),
+        ));
     }
 
     // Phase 3.0 globals options are route-independent.
@@ -1808,6 +1831,48 @@ mod tests {
         assert!(inputs["02_MAIN"].global_map.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn symbol_map_stage_preserves_all_mixed_errors_and_survivors() {
+        let function_maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            PreparedFunctionMap {
+                pass2_map: Some(prepared_test_map("mixed-survivor.json", 3)),
+                function_names: HashMap::new(),
+                evidence_name_projection: Default::default(),
+            },
+        )]);
+        let long_message = "界".repeat(2_100);
+        let stage = symbol_map_stage(
+            &function_maps,
+            vec![
+                ("04_VSS".to_string(), "zeta failure".to_string()),
+                ("02_MAIN".to_string(), "beta failure".to_string()),
+                ("01_PSP".to_string(), long_message),
+                ("02_MAIN".to_string(), "alpha failure".to_string()),
+            ],
+            11,
+        );
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(stage.output.as_deref(), Some("ghidra/symbol_maps/"));
+        let error = stage.error.as_deref().unwrap();
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("01_PSP: "));
+        assert!(lines[0].ends_with(" [truncated]"));
+        assert!(lines[0].strip_prefix("01_PSP: ").unwrap().chars().count() <= 2_048);
+        assert_eq!(lines[1], "02_MAIN: alpha failure");
+        assert_eq!(lines[2], "02_MAIN: beta failure");
+        assert_eq!(lines[3], "04_VSS: zeta failure");
+        assert_eq!(error.matches("02_MAIN: alpha failure").count(), 1);
+        assert_eq!(error.matches("02_MAIN: beta failure").count(), 1);
+        assert_eq!(error.matches("04_VSS: zeta failure").count(), 1);
+        assert!(!Report::is_ok(&[stage]));
+
+        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new());
+        assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
     }
 
     #[test]
