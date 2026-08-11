@@ -224,15 +224,11 @@ fn count_tier(globals_json: &Value, tier: &str) -> u64 {
 
 #[test]
 fn phase3_0_1_recovered_exceeds_phase3_0_baseline() {
-    // Sentinel 1 — net-new signal. Phase 3.0's strict-only algorithm recovered
-    // `PHASE3_0_ARM_ONLY_BASELINE` globals on real ARM-only `02_MAIN`;
-    // Phase 3.0.1's disasm-anchored path was designed to push that count
-    // strictly higher (933 pre-filter on production ARM-only output; 370 after
-    // the `__FILE__`-fragment filter — see the constant's doc comment for why
-    // the post-filter count falls below this baseline and the assertion needs
-    // recalibration on the next golden re-verification). On a full ARM+Thumb
-    // golden dir the count is higher still; the ARM-only lower bound holds in
-    // both.
+    // Sentinel 1 — net-new signal. `PHASE3_0_ARM_ONLY_BASELINE` preserves
+    // Phase 3.0's historical ARM-only yield of 424. This env-gated sentinel
+    // expects `PME_GOLDEN_DIR` to hold a current full ARM+Thumb golden; verified
+    // output has 915 recovered globals (367 ARM / 545 Thumb / 3 mixed), so the
+    // full-output total must remain strictly above that historical baseline.
     let Some(dir) = golden_dir() else {
         return;
     };
