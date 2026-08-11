@@ -2064,7 +2064,7 @@ mod tests {
 
     #[test]
     fn globals_apply_stage_fails_closed_for_every_invalid_prepared_image_outcome() {
-        // These are the real reason-only outcomes produced by Task 4 for a
+        // These are the real reason-only outcomes produced by pass-2 parsing for a
         // status:error line and each strict success-summary contract failure.
         let summary_errors = [
             "global map rejected",
@@ -2889,7 +2889,7 @@ mod tests {
 
     #[test]
     fn image_report_distinguishes_uninvoked_executed_zero_and_failed_global_application() {
-        // This catches the ImageReport mirror dropping Task 4's raw outcome,
+        // This catches the ImageReport mirror dropping the raw pass-2 outcome,
         // collapsing executed zero into absent, or serializing stale success
         // counts together with an application error.
         let mut uninvoked = analyzed_image("02_MAIN");

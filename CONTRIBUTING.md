@@ -72,7 +72,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 - **Phase 3.0.1 goldens** (the last three tests in `tests/globals_golden.rs`
   and `report_json_includes_phase3_0_1_fields` in `tests/decompose_golden.rs`)
   read pre-existing decompose output from `$PME_GOLDEN_DIR` and never auto-run
-  decompose — production verification (the plan's task 11) supplies the env.
+  decompose — the dedicated production verification supplies the env.
   All four skip cleanly when `PME_GOLDEN_DIR` is unset, so `cargo test
   --all-targets` stays green without a real image. The optional
   `$PME_GOLDEN_DIR_PROVISIONAL` (a second decompose output produced with
@@ -500,7 +500,7 @@ module; when a file outgrows that, split it.
   production. The `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden
   sentinel still asserts `> PHASE3_0_ARM_ONLY_BASELINE` (424) and is
   env-gated (`PME_GOLDEN_DIR`); it holds under the verified 915 total.
-- **Cross-path conflict characterization (Task 14).** Of the 223
+- **Cross-path conflict characterization.** Of the 223
   same-address proposals dropped by strict-single-source on an earlier
   ARM-only production `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-
   Phase-3.0.1-disasm disagreements** (the rest are same-path internal
@@ -567,7 +567,7 @@ module; when a file outgrows that, split it.
   `--no-thumb-decompile` if Surface B fires).
   (2) **Per-image byte-count budget.** The tighten baseline is extrapolated
   from the image's `dense_thumb_bytes` (`tighten_baseline_for_dense_thumb_bytes`):
-  `max(60s, bytes / 1MiB × 40s)`, grounded in Task 1's measurement
+  `max(60s, bytes / 1MiB × 40s)`, grounded in the dense-Thumb measurement
   (2 MiB → 80 s on Ghidra 12.1.2). With the default `wall_clock_multiplier=4`,
   a real `02_MAIN` (~42 MiB dense Thumb) gets baseline ≈ 1 680 s and a budget
   of ~112 min — generous enough to not fire prematurely on production,

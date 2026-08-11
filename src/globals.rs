@@ -54,7 +54,7 @@ pub const K_THUMB: usize = 4;
 /// spend minutes in the O(sl × gl) matcher on a mis-estimated slice. This is a
 /// perf guard, not a correctness requirement: Phase 3.0.1's coverage on
 /// `02_MAIN` drops only by whatever globals the mega-slices would have
-/// produced (recorded in the Task 13 production verification).
+/// produced (recorded in production verification).
 const MEGA_FN_THRESHOLD: u64 = 5 * 1024 * 1024;
 
 /// Minimum identifier length. Filters out 1–2 char tokens (`id`, `pt`) that
@@ -64,11 +64,11 @@ const MIN_IDENT_LEN: usize = 3;
 /// Generic identifier tokens filtered out of the candidate set. These appear
 /// frequently in modem firmware strings (log macros, format specifiers,
 /// C keywords) but are extremely unlikely to be global variable names.
-/// Extend this set if the pre-check (Task 1) surfaces other generic tokens
+/// Extend this set if production pre-checks surface other generic tokens
 /// polluting the results.
 ///
 /// Includes DBT and ASSERT adopted from source_tree.rs's STOPLIST to
-/// neutralize the 0x4908bbac "DBT" attractor (Task 14 findings). Both are
+/// neutralize the observed 0x4908bbac "DBT" attractor. Both are
 /// underscoreless so the strict-identifier rule drops them today, but they
 /// are listed explicitly so the filter holds if the underscore requirement
 /// is ever relaxed.
@@ -79,7 +79,7 @@ const GENERIC_TOKENS: &[&str] = &[
     "LOG", "LOGE", "LOGW", "LOGI", "LOGD", "LOGV", "err", "error", "status", "ret", "retval",
     "result",
     // Adopted from source_tree.rs's STOPLIST to neutralize the 0x4908bbac
-    // "DBT" attractor and the ASSERT log-prefix (Task 14 findings).
+    // observed "DBT" attractor and the ASSERT log-prefix.
     "DBT", "ASSERT",
 ];
 
@@ -957,17 +957,17 @@ struct Contributor {
 /// proximity `k` (in load-event-count distance). If exactly one global is in
 /// the window, emit `(global_addr, name, StringLoad evidence, GlobalLoad
 /// evidence)`. Ambiguous cases (zero or multiple identifiers, zero or
-/// multiple globals in window) defer to Task 6's name prior.
+/// multiple globals in window) defer to the name-prior pass.
 ///
 /// **Distance metric:** load-event-count — the number of `LoadEvent`s in
 /// `load_events` between the string-load's index and the global-load's index
 /// (`Vec::iter().position()` by PC). NOT raw instruction count. `k=4` means
 /// "≤4 intervening movw/movt lines" ≈ "≤2 address-load pairs." The pre-check
-/// (Task 1) confirmed this approximation grounds the K pinning; do not
+/// confirmed this approximation grounds the K pinning; do not
 /// silently switch metrics — `recovered_tier_requires_disasm_proximity_within_k`
 /// is the regression sentinel.
 ///
-/// **Thumb `data_refs` augmentation (Task 1 Concern 3):** radare2's per-op
+/// **Thumb `data_refs` augmentation:** radare2's per-op
 /// `refs` field excludes addresses materialized via `movw`/`movt` pairs (only
 /// Ghidra resolves those into `data_refs` for ARM). Without augmentation, the
 /// Thumb side produces 0 global-load events. For Thumb functions, the values
@@ -1125,7 +1125,7 @@ fn name_prior_provisional_for_function(
         return out;
     }
 
-    // Mirror Task 5's candidate construction (including Thumb augmentation):
+    // Mirror the Recovered pass's candidate construction (including Thumb augmentation):
     // the two passes must see the same globals so the residue invariant
     // (Provisional handles what Recovered dropped) holds.
     let mut non_string_refs: BTreeSet<u64> = func
@@ -1404,7 +1404,7 @@ mod tests {
 
     /// Convenience: call `run` with an empty recovered_function_names map
     /// and default `GlobalsOpts` (Phase 3.0.1 Recovered-only, K_ARM/K_THUMB
-    /// at the pinned constants). Task 9 wires real CLI flags into `GlobalsOpts`.
+    /// at the pinned constants). Real CLI flags are wired into `GlobalsOpts`.
     fn run_no_names(img: &Img) -> Result<GlobalsReport> {
         let empty = HashMap::new();
         run(
@@ -1909,7 +1909,7 @@ mod tests {
         // STOPLIST is the baseline blocklist; GENERIC_TOKENS adopts its
         // identifier-relevant entries (`DBT`, `ASSERT`). On production
         // `02_MAIN` the `0x4908bbac` "DBT" attractor alone accounted for 11
-        // of 190 raw proposals in the Phase 3.0 pre-check (Task 1 findings).
+        // of 190 raw proposals in the Phase 3.0 production pre-check.
         // Both are underscoreless so the strict-identifier rule drops them
         // today; GENERIC_TOKENS lists them explicitly so the filter holds
         // even if the underscore requirement is ever relaxed. Here a string
@@ -2145,7 +2145,7 @@ mod tests {
     #[test]
     fn recovered_tier_drops_when_two_globals_in_window() {
         // Two global-loads in window + one identifier in string -> no Recovered
-        // emission (ambiguous; defers to name prior in Task 6).
+        // emission (ambiguous; defers to the name-prior pass).
         let string_addr = 0x40e22000;
         let g1 = 0x40e30000;
         let g2 = 0x40e31000;

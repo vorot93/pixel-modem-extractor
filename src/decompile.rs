@@ -2306,7 +2306,7 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
         // lines. Real ExportDecomp.java output is bi-modal: offset-4 headers
         // (single-line signatures, ~58% of production 02_MAIN) and offset-6
         // headers (2-line signatures, ~35%). The 8-line bound captures 99.6% of
-        // real headers (Task 8b histogram). Without this bound, a header-shaped
+        // real headers in the production histogram. Without this bound, a header-shaped
         // non-header could commit at position N and absorb following lines into
         // the wrong address's body until the next real function's `{` — same
         // rationale as the prior parser's lookahead.
@@ -4056,7 +4056,7 @@ INFO: second pdfj body was noisy and not parseable
     fn thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines() {
         // Regression sentinel: real ExportDecomp.java output has TWO blank lines
         // between the `// FUN_<addr> @ <addr>` comment header and the opening `{`
-        // (one after the header, one after the signature). The original Task 2
+        // (one after the header, one after the signature). The original
         // parser used 1–2 line lookahead for `{`, which worked on synthetic
         // fixtures (1 blank line) but matched 0 bodies on real production output.
         let root = temp_dir("thumb_enrich_real_format");
@@ -4090,7 +4090,7 @@ INFO: second pdfj body was noisy and not parseable
         // Regression sentinel for the second peak in real ExportDecomp.java's
         // header-to-`{` offset distribution: 2-line signatures produce
         // offset-6 headers (header, blank, sig-line-1, sig-line-2, blank, `{`).
-        // Captured by Task 8b's histogram analysis on production 02_MAIN.
+        // Captured by histogram analysis on production 02_MAIN.
         let root = temp_dir("thumb_enrich_real_offset_6");
         let c_path = root.join("decompiled.c");
         std::fs::write(
