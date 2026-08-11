@@ -15,8 +15,10 @@
 use crate::error::{Error, Result};
 use crate::source_tree::extract_strings;
 use crate::symbolicate;
+use atomic_write_file::AtomicWriteFile;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -306,6 +308,21 @@ pub struct GlobalsFile {
     pub phase3_0_1_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisional_suppressed: Option<usize>,
+}
+
+fn write_globals_json_with_before_commit<F>(
+    path: &Path,
+    bytes: &[u8],
+    before_commit: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let mut file = AtomicWriteFile::open(path)?;
+    file.write_all(bytes)?;
+    before_commit()?;
+    file.commit()?;
+    Ok(())
 }
 
 /// Phase 3.0: recover global variable names from direct textual evidence.
@@ -790,8 +807,9 @@ pub fn run_with_evidence_projection(
         .filter(|global| global.tier == "recovered")
         .count();
 
-    // 7. Write globals.json. Atomicity: serialize to a String first, then
-    //    write. A serialize failure leaves the on-disk file untouched.
+    // 7. Write globals.json. Serialize the complete document before opening
+    //    the atomic writer, then replace the destination only after every
+    //    byte has been written successfully.
     //    Phase 3.0's strict-rule path leaves both new optional fields `None`,
     //    so they are absent from the output (byte-equivalent with Phase 3.0's
     //    prior `serde_json::json!{...}` write path). When `disasm.lst` was
@@ -808,7 +826,11 @@ pub fn run_with_evidence_projection(
     };
     let out = serde_json::to_string_pretty(&file)
         .map_err(|e| Error::Serialize(format!("re-serialize globals.json: {e}")))?;
-    std::fs::write(decompiled.join("globals.json"), out)?;
+    write_globals_json_with_before_commit(
+        &decompiled.join("globals.json"),
+        out.as_bytes(),
+        || Ok(()),
+    )?;
 
     Ok(GlobalsReport {
         recovered_count,
@@ -1452,6 +1474,29 @@ mod tests {
         assert_eq!(v["globals"][0]["arch"], "arm");
         assert!(v["globals"][0]["size"].is_null());
         assert_eq!(v["globals"][0]["evidence"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn atomic_globals_write_preserves_existing_file_before_commit_failure() {
+        let root = tmp_root("atomic_globals_before_commit_failure");
+        let path = root.join("globals.json");
+        let sentinel = b"existing globals.json sentinel\n";
+        let candidate = b"{\n  \"format\": \"replacement candidate\"\n}";
+        fs::write(&path, sentinel).unwrap();
+
+        let error = write_globals_json_with_before_commit(&path, candidate, || {
+            Err(Error::Serialize(
+                "injected failure immediately before commit".into(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Serialize(ref reason)
+                if reason == "injected failure immediately before commit"
+        ));
+        assert_eq!(fs::read(path).unwrap(), sentinel);
     }
 
     #[test]

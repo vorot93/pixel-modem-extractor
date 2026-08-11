@@ -377,7 +377,12 @@ module; when a file outgrows that, split it.
   `globals_recovered`. A successful zero-match sweep still writes
   `"globals": []`; absence means recovery did not complete. Load addresses
   come from numeric `toc[].load_addr` entries keyed by `toc[].name` through
-  `symbolicate::load_load_addr`; do not add a second manifest parser.
+  `symbolicate::load_load_addr`; do not add a second manifest parser. The
+  writer serializes the complete v1 document before opening a same-directory
+  atomic temporary file, then commits it as one replacement. An interrupted or
+  failed pre-commit write therefore leaves an existing `globals.json` intact:
+  consumers observe the complete old file or the complete new file, never a
+  truncate-in-progress intermediate.
 - **Phase 3.0.1: disasm-anchored Recovered + name-prior Provisional.** Extends
   Phase 3.0's strict-rule loop without changing it. For each function, the
   disasm is scanned for `movw`/`movt` load pairs (PC-tagged via
