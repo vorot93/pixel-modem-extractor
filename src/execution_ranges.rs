@@ -183,26 +183,40 @@ pub(crate) fn canonicalize_instruction_extents(
 pub(crate) fn execution_identity(
     entry: u32,
     projection: &ExecutionProjection,
-) -> Option<ExecutionIdentity> {
+) -> Result<Option<ExecutionIdentity>> {
     match projection {
-        ExecutionProjection::Accepted(decode_ranges) => Some(ExecutionIdentity {
-            entry,
-            decode_ranges: decode_ranges.clone(),
-        }),
-        ExecutionProjection::Quarantined(_) => None,
+        ExecutionProjection::Accepted(decode_ranges) if !decode_ranges.is_empty() => {
+            Ok(Some(ExecutionIdentity {
+                entry,
+                decode_ranges: decode_ranges.clone(),
+            }))
+        }
+        ExecutionProjection::Accepted(_) => {
+            Err(invalid("accepted decode projection must not be empty"))
+        }
+        ExecutionProjection::Quarantined(errors) if !errors.is_empty() => Ok(None),
+        ExecutionProjection::Quarantined(_) => {
+            Err(invalid("quarantined decode projection must not be empty"))
+        }
     }
 }
 
-pub(crate) fn projection_to_json(projection: &ExecutionProjection) -> Value {
+pub(crate) fn projection_to_json(projection: &ExecutionProjection) -> Result<Value> {
     match projection {
-        ExecutionProjection::Accepted(ranges) => json!({
+        ExecutionProjection::Accepted(ranges) if !ranges.is_empty() => Ok(json!({
             "decode_ranges": ranges.iter().map(range_to_json).collect::<Vec<_>>(),
             "decode_range_errors": [],
-        }),
-        ExecutionProjection::Quarantined(errors) => json!({
+        })),
+        ExecutionProjection::Quarantined(errors) if !errors.is_empty() => Ok(json!({
             "decode_ranges": [],
             "decode_range_errors": errors.iter().map(error_to_json).collect::<Vec<_>>(),
-        }),
+        })),
+        ExecutionProjection::Accepted(_) => {
+            Err(invalid("accepted decode projection must not be empty"))
+        }
+        ExecutionProjection::Quarantined(_) => {
+            Err(invalid("quarantined decode projection must not be empty"))
+        }
     }
 }
 
@@ -247,6 +261,9 @@ pub(crate) fn validate_inventory_projection(
             }
         }
         ExecutionProjection::Quarantined(errors) => {
+            if errors.is_empty() {
+                return Err(invalid("quarantined decode projection must not be empty"));
+            }
             if errors != &canonicalize_errors(errors.clone()) {
                 return Err(invalid(
                     "decode_range_errors are not sorted and deduplicated",
@@ -257,17 +274,37 @@ pub(crate) fn validate_inventory_projection(
     Ok(())
 }
 
-pub(crate) fn inventory_count_conserved(projections: &[ExecutionProjection]) -> bool {
+pub(crate) fn inventory_count_conserved(
+    raw_count: usize,
+    projections: &[ExecutionProjection],
+) -> bool {
     projections
         .iter()
-        .filter(|projection| {
-            matches!(
-                projection,
-                ExecutionProjection::Accepted(_) | ExecutionProjection::Quarantined(_)
-            )
-        })
-        .count()
-        == projections.len()
+        .try_fold(
+            (0usize, 0usize),
+            |(accepted, quarantined), projection| match projection {
+                ExecutionProjection::Accepted(ranges) if !ranges.is_empty() => accepted
+                    .checked_add(1)
+                    .map(|accepted| (accepted, quarantined)),
+                ExecutionProjection::Quarantined(errors) if !errors.is_empty() => quarantined
+                    .checked_add(1)
+                    .map(|quarantined| (accepted, quarantined)),
+                _ => None,
+            },
+        )
+        .and_then(|(accepted, quarantined)| accepted.checked_add(quarantined))
+        == Some(raw_count)
+}
+
+pub(crate) fn union_function_contexts<I>(contexts: I) -> Vec<(u32, String)>
+where
+    I: IntoIterator<Item = (u32, String)>,
+{
+    contexts
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn range_to_json(range: &DecodeRange) -> Value {
@@ -418,7 +455,7 @@ mod tests {
         }]);
 
         assert_eq!(
-            projection_to_json(&projection),
+            projection_to_json(&projection).unwrap(),
             json!({
                 "decode_ranges": [{"isa":"thumb","start":"0x40010000","end":"0x40010004"}],
                 "decode_range_errors": [],
@@ -567,7 +604,8 @@ mod tests {
             execution_identity(
                 0x4000,
                 &ExecutionProjection::Accepted(arm.decode_ranges.clone())
-            ),
+            )
+            .unwrap(),
             Some(arm)
         );
         assert_eq!(
@@ -578,8 +616,88 @@ mod tests {
                     address: 0x4000,
                     end: None
                 }])
-            ),
+            )
+            .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn empty_tag_payloads_are_rejected_at_every_model_boundary() {
+        let empty_accepted = ExecutionProjection::Accepted(vec![]);
+        let empty_quarantined = ExecutionProjection::Quarantined(vec![]);
+        for projection in [&empty_accepted, &empty_quarantined] {
+            assert!(projection_to_json(projection).is_err());
+            assert!(execution_identity(0x4000, projection).is_err());
+            assert!(validate_inventory_projection(0x4000, projection, 0x4000, 4).is_err());
+        }
+    }
+
+    #[test]
+    fn inventory_conservation_detects_an_omitted_raw_record() {
+        let projections = vec![ExecutionProjection::Accepted(vec![DecodeRange {
+            isa: DecodeIsa::Thumb,
+            start: 0x4000,
+            end: 0x4002,
+        }])];
+        assert!(inventory_count_conserved(1, &projections));
+        assert!(!inventory_count_conserved(2, &projections));
+    }
+
+    #[test]
+    fn projection_parser_rejects_missing_and_malformed_error_fields() {
+        for bad in [
+            json!({"decode_range_errors": []}),
+            json!({"decode_ranges": []}),
+            json!({"decode_ranges": [], "decode_range_errors": [{"kind":"unknown", "address":"0x4000", "end":null}]}),
+            json!({"decode_ranges": [], "decode_range_errors": [{"kind":"empty_projection", "address":16384, "end":null}]}),
+            json!({"decode_ranges": [], "decode_range_errors": [{"kind":"empty_projection", "address":"0x04000", "end":false}]}),
+        ] {
+            assert!(
+                parse_projection(&bad).is_err(),
+                "accepted malformed projection: {bad}"
+            );
+        }
+        assert_eq!(
+            parse_projection(&json!({"decode_ranges": [], "decode_range_errors": [{"kind":"raw_byte_mismatch", "address":"0x4000", "end":"0x4004"}]})).unwrap(),
+            ExecutionProjection::Quarantined(vec![DecodeRangeError { kind: DecodeRangeErrorKind::RawByteMismatch, address: 0x4000, end: Some(0x4004) }])
+        );
+    }
+
+    #[test]
+    fn identity_context_union_is_sorted_and_distinct_overlaps_remain_distinct() {
+        assert_eq!(
+            union_function_contexts(vec![
+                (0x4002, "z".into()),
+                (0x4000, "b".into()),
+                (0x4000, "a".into()),
+                (0x4000, "a".into())
+            ]),
+            vec![
+                (0x4000, "a".into()),
+                (0x4000, "b".into()),
+                (0x4002, "z".into())
+            ]
+        );
+        let left = ExecutionIdentity {
+            entry: 0x4000,
+            decode_ranges: vec![DecodeRange {
+                isa: DecodeIsa::Thumb,
+                start: 0x4000,
+                end: 0x4006,
+            }],
+        };
+        let right = ExecutionIdentity {
+            entry: 0x4002,
+            decode_ranges: vec![DecodeRange {
+                isa: DecodeIsa::Thumb,
+                start: 0x4002,
+                end: 0x4008,
+            }],
+        };
+        assert_ne!(
+            left, right,
+            "same-ISA overlaps remain distinct complete identities"
         );
     }
 }

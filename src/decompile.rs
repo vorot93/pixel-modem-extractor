@@ -9,7 +9,8 @@ use crate::{
     error::{Error, Result},
     execution_ranges::{
         DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionProjection, canonicalize_errors,
-        canonicalize_instruction_extents, error, projection_to_json,
+        canonicalize_instruction_extents, error, inventory_count_conserved, parse_projection,
+        projection_to_json,
     },
     toc::Toc,
 };
@@ -1973,7 +1974,7 @@ fn normalize_radare2_function_checked(
         "body": body,
         "data_refs": data_refs,
     });
-    let tags = projection_to_json(&projection);
+    let tags = projection_to_json(&projection)?;
     output
         .as_object_mut()
         .expect("JSON object")
@@ -2250,6 +2251,8 @@ fn run_radare2_thumb(
         // follow-up would reduce this — see CONTRIBUTING's radare2 invariant.
         let stdout_bytes = std::fs::read(&stdout_path)?;
         let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
+        let raw_record_count = parsed.records.len();
+        let output_start = all.len();
         for (f, pdfj) in parsed.records {
             all.push(normalize_radare2_function_checked(
                 &f,
@@ -2258,6 +2261,15 @@ fn run_radare2_thumb(
                 load_addr,
                 addr,
             )?);
+        }
+        let projections = all[output_start..]
+            .iter()
+            .map(parse_projection)
+            .collect::<Result<Vec<_>>>()?;
+        if !inventory_count_conserved(raw_record_count, &projections) {
+            return Err(Error::Serialize(format!(
+                "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+            )));
         }
     }
     let substantial = all
@@ -3455,7 +3467,7 @@ mod tests {
             0x4000,
         );
         assert_eq!(
-            projection_to_json(&projection),
+            projection_to_json(&projection).unwrap(),
             serde_json::json!({
                 "decode_ranges": [{"isa":"thumb", "start":"0x4000", "end":"0x4006"}],
                 "decode_range_errors": [],
@@ -3464,10 +3476,88 @@ mod tests {
     }
 
     #[test]
+    fn radare2_pdfj_preserves_gaps_and_ignores_legacy_size_as_an_extent() {
+        let raw = serde_json::json!({"offset": 0x4000u64, "size": 0x1000u64});
+        let pdfj = serde_json::json!({"ops": [
+            {"offset": 0x4000u64, "bytes": "00bf"},
+            {"offset": 0x4004u64, "bytes": "00bf"}
+        ]});
+        let entry = normalize_radare2_function_checked(
+            &raw,
+            Some(&pdfj),
+            &[0, 0xbf, 0, 0, 0, 0xbf],
+            0x4000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(entry["size"], 0x1000);
+        assert_eq!(
+            entry["decode_ranges"],
+            serde_json::json!([
+                {"isa":"thumb", "start":"0x4000", "end":"0x4002"},
+                {"isa":"thumb", "start":"0x4004", "end":"0x4006"}
+            ])
+        );
+    }
+
+    #[test]
+    fn radare2_pdfj_quarantines_missing_nonhex_duplicate_overlap_overflow_and_entry_faults() {
+        let cases = [
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64}]}),
+                0x4000,
+                &[0u8; 8][..],
+                DecodeRangeErrorKind::InvalidOperationBytes,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64,"bytes":"zz"}]}),
+                0x4000,
+                &[0u8; 8][..],
+                DecodeRangeErrorKind::InvalidOperationBytes,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64,"bytes":"00bf"},{"offset":0x4000u64,"bytes":"00bf"}]}),
+                0x4000,
+                &[0, 0xbf][..],
+                DecodeRangeErrorKind::DuplicateExtent,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64,"bytes":"00bf0000"},{"offset":0x4002u64,"bytes":"00bf"}]}),
+                0x4000,
+                &[0, 0xbf, 0, 0][..],
+                DecodeRangeErrorKind::OverlappingExtent,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":u32::MAX as u64,"bytes":"00bf"}]}),
+                u32::MAX,
+                &[0u8; 8][..],
+                DecodeRangeErrorKind::InvalidOperationAddress,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4002u64,"bytes":"00bf"}]}),
+                0x4000,
+                &[0, 0, 0, 0xbf][..],
+                DecodeRangeErrorKind::MissingInstructionAtEntry,
+            ),
+        ];
+        for (pdfj, entry, image, kind) in cases {
+            let ExecutionProjection::Quarantined(errors) =
+                radare2_execution_projection(entry, Some(&pdfj), image, 0x4000)
+            else {
+                panic!("fault must quarantine")
+            };
+            assert!(
+                errors.iter().any(|error| error.kind == kind),
+                "missing {kind:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn radare2_missing_pdfj_body_is_a_tagged_quarantine() {
         let projection = radare2_execution_projection(0x4000, None, &[0, 0], 0x4000);
         assert_eq!(
-            projection_to_json(&projection),
+            projection_to_json(&projection).unwrap(),
             serde_json::json!({
                 "decode_ranges": [],
                 "decode_range_errors": [{"kind":"missing_operation_body", "address":"0x4000", "end":null}],
