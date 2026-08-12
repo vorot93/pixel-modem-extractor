@@ -113,6 +113,40 @@ fn decompose_produces_unified_tree() {
         any_pass2,
         "expected at least one image with pass2_applied set"
     );
+    for image in decompile_stage["images"].as_array().unwrap() {
+        let Some(functions) = image.get("functions").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let ghidra_accepted = image["ghidra_execution_accepted"]
+            .as_u64()
+            .expect("analyzed image must report current Ghidra accepted count");
+        let ghidra_quarantined = image["ghidra_execution_quarantined"]
+            .as_u64()
+            .expect("analyzed image must report current Ghidra quarantine count");
+        assert_eq!(
+            functions,
+            ghidra_accepted + ghidra_quarantined,
+            "Ghidra raw records must be conserved: {image}"
+        );
+        match image.get("thumb_functions") {
+            Some(_) => {
+                let accepted = image["thumb_execution_accepted"]
+                    .as_u64()
+                    .expect("retained Thumb inventory must report accepted count");
+                let quarantined = image["thumb_execution_quarantined"]
+                    .as_u64()
+                    .expect("retained Thumb inventory must report quarantine count");
+                assert!(accepted + quarantined > 0, "{image}");
+            }
+            None => {
+                assert!(image.get("thumb_execution_accepted").is_none(), "{image}");
+                assert!(
+                    image.get("thumb_execution_quarantined").is_none(),
+                    "{image}"
+                );
+            }
+        }
+    }
 
     // Phase 2: thumb_enrich (pass 1) and thumb_enrich_post_pass2 stages are
     // both present in the report. Defaults run both; skip rules covered in
@@ -299,6 +333,15 @@ fn report_json_includes_globals_field() {
     assert!(
         main.get("globals_recovered").is_some() || main.get("globals_error").is_some(),
         "Phase 3.0 fields absent on 02_MAIN: {main}"
+    );
+    let functions = main["functions"]
+        .as_u64()
+        .expect("no-symbol-pass must retain current Ghidra raw count");
+    assert_eq!(
+        functions,
+        main["ghidra_execution_accepted"].as_u64().unwrap()
+            + main["ghidra_execution_quarantined"].as_u64().unwrap(),
+        "no-symbol-pass must use the same terminal validation contract: {main}"
     );
 }
 

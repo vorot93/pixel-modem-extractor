@@ -8,15 +8,16 @@
 use crate::{
     error::{Error, Result},
     execution_ranges::{
-        DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionProjection, canonicalize_errors,
-        canonicalize_instruction_extents, error, inventory_count_conserved, parse_projection,
-        projection_to_json,
+        DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionIdentity, ExecutionProjection,
+        TaggedExecutionRecord, canonicalize_errors, canonicalize_instruction_extents, error,
+        inventory_count_conserved, parse_projection, projection_to_json,
+        validate_inventory_records,
     },
     toc::Toc,
 };
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -259,6 +260,17 @@ pub struct ImageResult {
     pub label: String,
     pub outcome: ImageOutcome,
     pub thumb_functions: Option<usize>,
+    /// Current Ghidra source records with a validated accepted projection.
+    pub ghidra_execution_accepted: Option<usize>,
+    /// Current Ghidra source records retained as whole-record quarantines.
+    pub ghidra_execution_quarantined: Option<usize>,
+    /// Current retained Thumb records with a validated accepted projection.
+    pub thumb_execution_accepted: Option<usize>,
+    /// Current retained Thumb records retained as whole-record quarantines.
+    pub thumb_execution_quarantined: Option<usize>,
+    /// Raw-image mapping used to validate terminal execution ranges.
+    pub(crate) image_start: u32,
+    pub(crate) image_len: u32,
     /// Reason-only Thumb/radare2 failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
     /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
@@ -310,6 +322,177 @@ pub struct ImageResult {
 pub struct DecompileReport {
     pub images: Vec<ImageResult>,
     pub spec_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionInventoryCounts {
+    pub raw: usize,
+    pub accepted: usize,
+    pub quarantined: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalInventorySummary {
+    pub ghidra: ExecutionInventoryCounts,
+    pub thumb: Option<ExecutionInventoryCounts>,
+    pub thumb_substantial: Option<usize>,
+    pub accepted_identities: Vec<ExecutionIdentity>,
+    pub ghidra_records: Vec<TaggedExecutionRecord>,
+    pub thumb_records: Vec<TaggedExecutionRecord>,
+}
+
+fn read_json(path: &Path, description: &str) -> Result<serde_json::Value> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Error::Serialize(format!("parse {description}: {error}")))
+}
+
+fn inventory_counts(
+    inventory: &crate::execution_ranges::ValidatedInventory,
+) -> ExecutionInventoryCounts {
+    ExecutionInventoryCounts {
+        raw: inventory.raw_count,
+        accepted: inventory.accepted,
+        quarantined: inventory.quarantined,
+    }
+}
+
+/// Validate one complete terminal Ghidra/optional-Thumb pair. When
+/// `expected_current` is supplied, every normalized tagged source record must
+/// match the already-validated current producer result before refresh.
+pub(crate) fn validate_terminal_inventory_pair(
+    ghidra_functions_path: &Path,
+    thumb_functions_path: &Path,
+    image_start: u32,
+    image_len: u32,
+    expected_thumb_substantial: Option<usize>,
+    expected_current: Option<&TerminalInventorySummary>,
+) -> Result<TerminalInventorySummary> {
+    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")?;
+    let ghidra_records = ghidra_json
+        .as_array()
+        .ok_or_else(|| Error::Serialize("Ghidra functions inventory must be an array".into()))?;
+    let ghidra =
+        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)?;
+    let mut accepted_identities: BTreeSet<ExecutionIdentity> =
+        ghidra.accepted_identities.iter().cloned().collect();
+
+    let (thumb, thumb_substantial, thumb_records) = match expected_thumb_substantial {
+        None => {
+            if thumb_functions_path.exists() {
+                return Err(Error::Serialize(
+                    "unexpected Thumb inventory without a current producer result".into(),
+                ));
+            }
+            (None, None, Vec::new())
+        }
+        Some(expected_substantial) => {
+            let thumb_json = read_json(thumb_functions_path, "Thumb functions inventory")?;
+            let object = thumb_json.as_object().ok_or_else(|| {
+                Error::Serialize("Thumb functions inventory must be an object".into())
+            })?;
+            if object.get("format").and_then(serde_json::Value::as_str)
+                != Some("pixel-modem-extractor-thumb-functions-v2")
+            {
+                return Err(Error::Serialize(
+                    "unsupported Thumb functions inventory format".into(),
+                ));
+            }
+            let records = object
+                .get("functions")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Serialize("Thumb functions inventory lacks functions array".into())
+                })?;
+            let substantial = records.iter().try_fold(0usize, |count, record| {
+                let size = record
+                    .get("size")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        Error::Serialize("Thumb function size must be an unsigned integer".into())
+                    })?;
+                if size >= 32 {
+                    count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Serialize("Thumb substantial count overflow".into()))
+                } else {
+                    Ok(count)
+                }
+            })?;
+            if substantial != expected_substantial {
+                return Err(Error::Serialize(format!(
+                    "Thumb substantial count mismatch: expected {expected_substantial}, found {substantial}"
+                )));
+            }
+            let inventory =
+                validate_inventory_records(records, records.len(), image_start, image_len)?;
+            accepted_identities.extend(inventory.accepted_identities.iter().cloned());
+            (
+                Some(inventory_counts(&inventory)),
+                Some(substantial),
+                inventory.records,
+            )
+        }
+    };
+
+    let summary = TerminalInventorySummary {
+        ghidra: inventory_counts(&ghidra),
+        thumb,
+        thumb_substantial,
+        accepted_identities: accepted_identities.into_iter().collect(),
+        ghidra_records: ghidra.records,
+        thumb_records,
+    };
+    if let Some(expected) = expected_current
+        && &summary != expected
+    {
+        return Err(Error::Serialize(
+            "terminal execution inventory differs from the current producer result".into(),
+        ));
+    }
+    Ok(summary)
+}
+
+pub(crate) fn validate_image_terminal_inventory(
+    ghidra_functions_path: &Path,
+    thumb_functions_path: &Path,
+    image: &ImageResult,
+    expected_current: Option<&TerminalInventorySummary>,
+) -> Result<TerminalInventorySummary> {
+    let summary = validate_terminal_inventory_pair(
+        ghidra_functions_path,
+        thumb_functions_path,
+        image.image_start,
+        image.image_len,
+        image.thumb_functions,
+        expected_current,
+    )?;
+    let raw_functions = match image.outcome {
+        ImageOutcome::Analyzed(raw) => raw,
+        ImageOutcome::Failed(_) => {
+            return Err(Error::Serialize(
+                "failed image has no current terminal inventory".into(),
+            ));
+        }
+    };
+    let reported = (
+        image.ghidra_execution_accepted,
+        image.ghidra_execution_quarantined,
+        image.thumb_execution_accepted,
+        image.thumb_execution_quarantined,
+    );
+    let validated = (
+        Some(summary.ghidra.accepted),
+        Some(summary.ghidra.quarantined),
+        summary.thumb.map(|thumb| thumb.accepted),
+        summary.thumb.map(|thumb| thumb.quarantined),
+    );
+    if summary.ghidra.raw != raw_functions || reported != validated {
+        return Err(Error::Serialize(format!(
+            "terminal inventory counters do not match current producer report: raw {raw_functions}, reported {reported:?}, validated {validated:?}"
+        )));
+    }
+    Ok(summary)
 }
 
 /// Count the functions ExportDecomp.java recorded for an image — its `functions.json`
@@ -664,6 +847,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             label: String,
             outcome: ImageOutcome,
             thumb_functions: Option<usize>,
+            terminal_inventory: Option<TerminalInventorySummary>,
+            image_start: u32,
+            image_len: u32,
             thumb_error: Option<String>,
             tighten_error: Option<String>,
             // When the tighten-watch kills the run, we re-spawn as datamark
@@ -857,14 +1043,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             } else {
                 headless_command(&install.headless, &args, &root, java_home.as_deref()).status()?
             };
-            let outcome = if status.success() {
-                let n = count_functions(&root.join("export").join(&label));
-                if n == 0 {
-                    tracing::warn!(
-                        "ghidra: {label} yielded 0 functions — no decompilable code (e.g. a compressed/encrypted partition)"
-                    );
-                }
-                ImageOutcome::Analyzed(n)
+            let mut outcome = if status.success() {
+                ImageOutcome::Analyzed(count_functions(&root.join("export").join(&label)))
             } else {
                 let code = status.code().unwrap_or(-1);
                 tracing::warn!("ghidra: {label} failed (analyzeHeadless exit {code})");
@@ -899,10 +1079,43 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
             };
+            let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
+                let export = root.join("export").join(&label);
+                match validate_terminal_inventory_pair(
+                    &export.join("functions.json"),
+                    &export.join("thumb_functions.json"),
+                    e.load_addr,
+                    e.size,
+                    thumb_functions,
+                    None,
+                ) {
+                    Ok(summary) => {
+                        outcome = ImageOutcome::Analyzed(summary.ghidra.raw);
+                        Some(summary)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "terminal execution inventory for {label} failed validation: {error}"
+                        );
+                        outcome = ImageOutcome::Failed(-1);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if matches!(outcome, ImageOutcome::Analyzed(0)) {
+                tracing::warn!(
+                    "ghidra: {label} yielded 0 functions — no decompilable code (e.g. a compressed/encrypted partition)"
+                );
+            }
             results.push(RunResult {
                 label,
                 outcome,
                 thumb_functions,
+                terminal_inventory,
+                image_start: e.load_addr,
+                image_len: e.size,
                 thumb_error,
                 tighten_error,
                 thumb_decompiled: thumb_decompiled_override,
@@ -947,6 +1160,24 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 label: r.label,
                 outcome: r.outcome,
                 thumb_functions: r.thumb_functions,
+                ghidra_execution_accepted: r
+                    .terminal_inventory
+                    .as_ref()
+                    .map(|inventory| inventory.ghidra.accepted),
+                ghidra_execution_quarantined: r
+                    .terminal_inventory
+                    .as_ref()
+                    .map(|inventory| inventory.ghidra.quarantined),
+                thumb_execution_accepted: r
+                    .terminal_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.thumb.map(|thumb| thumb.accepted)),
+                thumb_execution_quarantined: r
+                    .terminal_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.thumb.map(|thumb| thumb.quarantined)),
+                image_start: r.image_start,
+                image_len: r.image_len,
                 thumb_error: r.thumb_error,
                 pass2_applied: None,
                 pass2_error: None,
@@ -3566,6 +3797,122 @@ mod tests {
     }
 
     #[test]
+    fn terminal_pair_validates_current_tags_counts_and_complete_identities() {
+        let root = std::env::temp_dir().join(format!("pme_terminal_pair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ghidra = root.join("functions.json");
+        let thumb = root.join("thumb_functions.json");
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "name":"arm_fn", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                    "decode_range_errors":[], "data_refs":[]
+                },
+                {
+                    "name":"quarantined", "entry":"0x4008", "end":"0x400c", "size":4,
+                    "decode_ranges":[],
+                    "decode_range_errors":[{"kind":"missing_isa_context","address":"0x4008","end":"0x400c"}],
+                    "data_refs":[]
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &thumb,
+            serde_json::to_vec(&serde_json::json!({
+                "format":"pixel-modem-extractor-thumb-functions-v2",
+                "functions":[{
+                    "name":"thumb_fn", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"thumb","start":"0x4000","end":"0x4004"}],
+                    "decode_range_errors":[], "body_kind":"thumb_disassembly", "body":"", "data_refs":[]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let summary =
+            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x10, Some(0), None).unwrap();
+
+        assert_eq!(summary.ghidra.raw, 2);
+        assert_eq!(summary.ghidra.accepted, 1);
+        assert_eq!(summary.ghidra.quarantined, 1);
+        assert_eq!(summary.thumb.unwrap().raw, 1);
+        assert_eq!(summary.accepted_identities.len(), 2);
+        assert!(
+            summary
+                .accepted_identities
+                .iter()
+                .any(|identity| { identity.decode_ranges[0].isa == DecodeIsa::Arm })
+        );
+        assert!(
+            summary
+                .accepted_identities
+                .iter()
+                .any(|identity| { identity.decode_ranges[0].isa == DecodeIsa::Thumb })
+        );
+        assert!(
+            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x10, None, None).is_err(),
+            "an unexpected retained Thumb inventory is stale current-run state"
+        );
+
+        let malformed = serde_json::json!([{
+            "name":"stale", "entry":"0x4000", "end":"0x4004", "size":4,
+            "data_refs":[]
+        }]);
+        std::fs::write(&ghidra, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &thumb,
+                0x4000,
+                0x10,
+                Some(0),
+                Some(&summary),
+            )
+            .is_err(),
+            "a stale pass-1 Ghidra inventory without mandatory ranges must fail"
+        );
+
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "name":"arm_fn", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                    "decode_range_errors":[], "data_refs":[]
+                },
+                {
+                    "name":"quarantined", "entry":"0x4008", "end":"0x400c", "size":4,
+                    "decode_ranges":[],
+                    "decode_range_errors":[{"kind":"invalid_isa_context","address":"0x4008","end":"0x400c"}],
+                    "data_refs":[]
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &thumb,
+                0x4000,
+                0x10,
+                Some(0),
+                Some(&summary),
+            )
+            .is_err(),
+            "pass 2 must not silently change a current quarantine projection"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn stream_to_cap_streams_chunks_until_eof() {
         let input = vec![0xABu8; 100 * 1024]; // 100 KiB
         let mut reader = std::io::Cursor::new(&input[..]);
@@ -3938,6 +4285,12 @@ INFO: second pdfj body was noisy and not parseable
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(12),
                 thumb_functions: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
                 pass2_applied: None,
                 pass2_error: None,
@@ -3969,6 +4322,12 @@ INFO: second pdfj body was noisy and not parseable
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(12),
                 thumb_functions: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
                 thumb_error: Some(
                     "1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
                         .into(),
@@ -4002,6 +4361,12 @@ INFO: second pdfj body was noisy and not parseable
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(10),
             thumb_functions: None,
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,

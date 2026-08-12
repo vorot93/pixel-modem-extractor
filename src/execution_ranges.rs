@@ -1,7 +1,6 @@
-#![allow(dead_code)] // Task 3 consumes the strict parser/identity helpers.
-
 use crate::error::{Error, Result};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum DecodeIsa {
@@ -36,14 +35,14 @@ pub(crate) enum DecodeRangeErrorKind {
     EmptyProjection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DecodeRangeError {
     pub kind: DecodeRangeErrorKind,
     pub address: u32,
     pub end: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ExecutionProjection {
     Accepted(Vec<DecodeRange>),
     Quarantined(Vec<DecodeRangeError>),
@@ -53,6 +52,21 @@ pub(crate) enum ExecutionProjection {
 pub(crate) struct ExecutionIdentity {
     pub entry: u32,
     pub decode_ranges: Vec<DecodeRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TaggedExecutionRecord {
+    pub entry: u32,
+    pub projection: ExecutionProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedInventory {
+    pub raw_count: usize,
+    pub accepted: usize,
+    pub quarantined: usize,
+    pub accepted_identities: Vec<ExecutionIdentity>,
+    pub records: Vec<TaggedExecutionRecord>,
 }
 
 pub(crate) fn error(
@@ -296,7 +310,58 @@ pub(crate) fn inventory_count_conserved(
         == Some(raw_count)
 }
 
-pub(crate) fn union_function_contexts<I>(contexts: I) -> Vec<(u32, String)>
+pub(crate) fn validate_inventory_records(
+    records: &[Value],
+    expected_raw_count: usize,
+    image_start: u32,
+    image_len: u32,
+) -> Result<ValidatedInventory> {
+    let mut projections = Vec::with_capacity(records.len());
+    let mut accepted_identities = BTreeSet::new();
+    let mut accepted = 0usize;
+    let mut quarantined = 0usize;
+    let mut tagged_records = Vec::with_capacity(records.len());
+    for record in records {
+        let object = record
+            .as_object()
+            .ok_or_else(|| invalid("inventory record must be an object"))?;
+        let entry = parse_hex(required_string(object, "entry")?)?;
+        let projection = parse_projection(record)?;
+        validate_inventory_projection(entry, &projection, image_start, image_len)?;
+        if let Some(identity) = execution_identity(entry, &projection)? {
+            accepted = accepted
+                .checked_add(1)
+                .ok_or_else(|| invalid("accepted inventory count overflow"))?;
+            accepted_identities.insert(identity);
+        } else {
+            quarantined = quarantined
+                .checked_add(1)
+                .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
+        }
+        tagged_records.push(TaggedExecutionRecord {
+            entry,
+            projection: projection.clone(),
+        });
+        projections.push(projection);
+    }
+    if !inventory_count_conserved(expected_raw_count, &projections)
+        || accepted.checked_add(quarantined) != Some(expected_raw_count)
+    {
+        return Err(invalid(
+            "raw inventory count does not equal accepted plus quarantined",
+        ));
+    }
+    Ok(ValidatedInventory {
+        raw_count: expected_raw_count,
+        accepted,
+        quarantined,
+        accepted_identities: accepted_identities.into_iter().collect(),
+        records: tagged_records,
+    })
+}
+
+#[cfg(test)]
+fn union_function_contexts<I>(contexts: I) -> Vec<(u32, String)>
 where
     I: IntoIterator<Item = (u32, String)>,
 {
@@ -699,5 +764,95 @@ mod tests {
             left, right,
             "same-ISA overlaps remain distinct complete identities"
         );
+    }
+
+    #[test]
+    fn terminal_inventory_deduplicates_only_complete_accepted_identities() {
+        let records = vec![
+            json!({
+                "entry": "0x4000",
+                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                "decode_range_errors": [],
+            }),
+            json!({
+                "entry": "0x4000",
+                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                "decode_range_errors": [],
+            }),
+            json!({
+                "entry": "0x4000",
+                "decode_ranges": [{"isa":"thumb","start":"0x4000","end":"0x4004"}],
+                "decode_range_errors": [],
+            }),
+            json!({
+                "entry": "0x4002",
+                "decode_ranges": [{"isa":"thumb","start":"0x4002","end":"0x4006"}],
+                "decode_range_errors": [],
+            }),
+            json!({
+                "entry": "0x4008",
+                "decode_ranges": [],
+                "decode_range_errors": [{"kind":"empty_projection","address":"0x4008","end":null}],
+            }),
+        ];
+
+        let inventory = validate_inventory_records(&records, 5, 0x4000, 0x10).unwrap();
+
+        assert_eq!(inventory.raw_count, 5);
+        assert_eq!(inventory.accepted, 4);
+        assert_eq!(inventory.quarantined, 1);
+        assert_eq!(inventory.accepted_identities.len(), 3);
+        assert!(inventory.accepted_identities.iter().any(|identity| {
+            identity.entry == 0x4000 && identity.decode_ranges[0].isa == DecodeIsa::Arm
+        }));
+        assert!(inventory.accepted_identities.iter().any(|identity| {
+            identity.entry == 0x4000 && identity.decode_ranges[0].isa == DecodeIsa::Thumb
+        }));
+        assert!(
+            inventory
+                .accepted_identities
+                .iter()
+                .any(|identity| identity.entry == 0x4002)
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_rejects_orphans_malformed_tags_and_count_mismatch() {
+        let valid = json!({
+            "entry": "0x4000",
+            "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+            "decode_range_errors": [],
+        });
+        let invalid_cases = [
+            vec![json!({
+                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                "decode_range_errors": [],
+            })],
+            vec![json!({
+                "entry": "0x4000",
+                "decode_ranges": [],
+                "decode_range_errors": [],
+            })],
+            vec![json!({
+                "entry": "0x4000",
+                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4002"}],
+                "decode_range_errors": [],
+            })],
+            vec![json!({
+                "entry": "0x4000",
+                "decode_ranges": [],
+                "decode_range_errors": [
+                    {"kind":"empty_projection","address":"0x4004","end":null},
+                    {"kind":"empty_projection","address":"0x4000","end":null}
+                ],
+            })],
+        ];
+        for records in invalid_cases {
+            assert!(
+                validate_inventory_records(&records, 1, 0x4000, 0x10).is_err(),
+                "accepted invalid terminal inventory: {records:?}"
+            );
+        }
+        assert!(validate_inventory_records(&[valid], 2, 0x4000, 0x10).is_err());
     }
 }

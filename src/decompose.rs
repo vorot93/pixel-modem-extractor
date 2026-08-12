@@ -54,6 +54,18 @@ pub struct ImageReport {
     pub functions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_functions: Option<usize>,
+    /// Current Ghidra records with accepted execution projections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghidra_execution_accepted: Option<usize>,
+    /// Current Ghidra records retained as whole-record quarantines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ghidra_execution_quarantined: Option<usize>,
+    /// Current retained Thumb records with accepted execution projections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_execution_accepted: Option<usize>,
+    /// Current retained Thumb records retained as whole-record quarantines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_execution_quarantined: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +108,10 @@ impl ImageReport {
                 },
                 functions: Some(n),
                 thumb_functions: r.thumb_functions,
+                ghidra_execution_accepted: r.ghidra_execution_accepted,
+                ghidra_execution_quarantined: r.ghidra_execution_quarantined,
+                thumb_execution_accepted: r.thumb_execution_accepted,
+                thumb_execution_quarantined: r.thumb_execution_quarantined,
                 thumb_error: r.thumb_error.clone(),
                 exit: None,
                 pass2_applied: r.pass2_applied,
@@ -116,6 +132,10 @@ impl ImageReport {
                 status: "failed",
                 functions: None,
                 thumb_functions: r.thumb_functions,
+                ghidra_execution_accepted: r.ghidra_execution_accepted,
+                ghidra_execution_quarantined: r.ghidra_execution_quarantined,
+                thumb_execution_accepted: r.thumb_execution_accepted,
+                thumb_execution_quarantined: r.thumb_execution_quarantined,
                 thumb_error: r.thumb_error.clone(),
                 exit: Some(code),
                 pass2_applied: r.pass2_applied,
@@ -274,8 +294,13 @@ fn marshal_image(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()
 /// `thumb_functions.json`, `thumb/`) is owned by another stage and must remain
 /// byte-for-byte unchanged. The slice file (`<label>.bin`) is already in place
 /// from pass 1; do not touch it.
-fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()> {
+fn refresh_decompiled(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    image: &decompile::ImageResult,
+) -> Result<()> {
     const OWNED: &[&str] = &["decompiled.c", "disasm.lst", "functions.json"];
+    let label = &image.label;
 
     let export = ghidra_dir.join("export").join(label);
     if !export.exists() {
@@ -309,6 +334,22 @@ fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Resu
     }
 
     let dest = images_dir.join(label).join("decompiled");
+    let retained = if dest.exists() {
+        Some(decompile::validate_image_terminal_inventory(
+            &dest.join("functions.json"),
+            &dest.join("thumb_functions.json"),
+            image,
+            None,
+        )?)
+    } else {
+        None
+    };
+    let staged = decompile::validate_image_terminal_inventory(
+        &export.join("functions.json"),
+        &dest.join("thumb_functions.json"),
+        image,
+        retained.as_ref(),
+    )?;
     if !dest.exists() {
         // First-time placement (no pass-1 tree): rename the whole validated
         // export directory into place, same as the historical happy path.
@@ -316,6 +357,12 @@ fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Resu
             std::fs::create_dir_all(parent)?;
         }
         std::fs::rename(&export, &dest)?;
+        decompile::validate_image_terminal_inventory(
+            &dest.join("functions.json"),
+            &dest.join("thumb_functions.json"),
+            image,
+            Some(&staged),
+        )?;
         return Ok(());
     }
 
@@ -331,6 +378,12 @@ fn refresh_decompiled(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Resu
         std::fs::rename(&from, &to)?;
     }
     std::fs::remove_dir(&export)?;
+    decompile::validate_image_terminal_inventory(
+        &dest.join("functions.json"),
+        &dest.join("thumb_functions.json"),
+        image,
+        Some(retained.as_ref().unwrap_or(&staged)),
+    )?;
     Ok(())
 }
 
@@ -340,7 +393,7 @@ fn refresh_pass2_outputs_with<F>(
     mut refresh: F,
 ) -> (usize, Vec<(String, String)>)
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(&decompile::ImageResult) -> Result<()>,
 {
     let mut labels: Vec<&str> = outcomes.keys().map(String::as_str).collect();
     labels.sort_unstable();
@@ -352,16 +405,23 @@ where
             decompile::Pass2ProcessOutcome::Failed(reason) => {
                 errors.push((label.to_string(), reason.clone()));
             }
-            decompile::Pass2ProcessOutcome::ProcessSucceeded => match refresh(label) {
-                Ok(()) => refreshed += 1,
-                Err(error) => {
-                    let reason = format!("refresh: {error}");
-                    if let Some(image) = images.iter_mut().find(|image| image.label == label) {
-                        image.pass2_error = Some(reason.clone());
+            decompile::Pass2ProcessOutcome::ProcessSucceeded => {
+                let Some(index) = images.iter().position(|image| image.label == label) else {
+                    errors.push((
+                        label.to_string(),
+                        "refresh: image absent from pass-2 report".to_string(),
+                    ));
+                    continue;
+                };
+                match refresh(&images[index]) {
+                    Ok(()) => refreshed += 1,
+                    Err(error) => {
+                        let reason = format!("refresh: {error}");
+                        images[index].pass2_error = Some(reason.clone());
+                        errors.push((label.to_string(), reason));
                     }
-                    errors.push((label.to_string(), reason));
                 }
-            },
+            }
         }
     }
     (refreshed, errors)
@@ -1578,6 +1638,12 @@ mod tests {
             label: label.into(),
             outcome: ImageOutcome::Analyzed(1),
             thumb_functions: None,
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -1592,6 +1658,51 @@ mod tests {
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }
+    }
+
+    fn tagged_functions(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "name": name,
+            "entry": "0x4000",
+            "end": "0x4004",
+            "size": 4,
+            "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+            "decode_range_errors": [],
+            "data_refs": []
+        }]))
+        .unwrap()
+    }
+
+    fn tagged_thumb_functions() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": [{
+                "name": "thumb_4000",
+                "entry": "0x4000",
+                "end": "0x4020",
+                "size": 32,
+                "decode_ranges": [{"isa":"thumb","start":"0x4000","end":"0x4004"}],
+                "decode_range_errors": [],
+                "body_kind": "thumb_disassembly",
+                "body": "",
+                "data_refs": []
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn tagged_image(label: &str, with_thumb: bool) -> decompile::ImageResult {
+        let mut image = analyzed_image(label);
+        image.ghidra_execution_accepted = Some(1);
+        image.ghidra_execution_quarantined = Some(0);
+        image.image_start = 0x4000;
+        image.image_len = 0x40;
+        if with_thumb {
+            image.thumb_functions = Some(1);
+            image.thumb_execution_accepted = Some(1);
+            image.thumb_execution_quarantined = Some(0);
+        }
+        image
     }
 
     fn prepared_test_map(name: &str, count: usize) -> decompile::PreparedPass2Map {
@@ -1974,8 +2085,8 @@ mod tests {
         let mut calls = Vec::new();
 
         let (refreshed, errors) =
-            refresh_pass2_outputs_with(&HashMap::new(), &mut images, |label| {
-                calls.push(label.to_string());
+            refresh_pass2_outputs_with(&HashMap::new(), &mut images, |image| {
+                calls.push(image.label.clone());
                 Ok(())
             });
 
@@ -1993,8 +2104,8 @@ mod tests {
         )]);
         let mut calls = Vec::new();
 
-        let (refreshed, errors) = refresh_pass2_outputs_with(&outcomes, &mut images, |label| {
-            calls.push(label.to_string());
+        let (refreshed, errors) = refresh_pass2_outputs_with(&outcomes, &mut images, |image| {
+            calls.push(image.label.clone());
             Ok(())
         });
 
@@ -2701,20 +2812,27 @@ mod tests {
         let destination = images_dir.join("02_MAIN").join("decompiled");
         std::fs::create_dir_all(&export).unwrap();
         std::fs::create_dir_all(&destination).unwrap();
-        for (name, contents) in [
-            ("decompiled.c", "void refreshed_function(void) {}"),
-            ("disasm.lst", "refreshed disassembly"),
-            ("functions.json", "[]"),
-        ] {
-            std::fs::write(export.join(name), contents).unwrap();
-            std::fs::write(destination.join(name), format!("stale {name}")).unwrap();
-        }
-        std::fs::write(destination.join("thumb_functions.json"), b"sidecar").unwrap();
+        std::fs::write(
+            export.join("decompiled.c"),
+            "void refreshed_function(void) {}",
+        )
+        .unwrap();
+        std::fs::write(export.join("disasm.lst"), "refreshed disassembly").unwrap();
+        std::fs::write(export.join("functions.json"), tagged_functions("refreshed")).unwrap();
+        std::fs::write(destination.join("decompiled.c"), "stale decompiled.c").unwrap();
+        std::fs::write(destination.join("disasm.lst"), "stale disasm.lst").unwrap();
+        std::fs::write(
+            destination.join("functions.json"),
+            tagged_functions("stale"),
+        )
+        .unwrap();
+        let thumb_sidecar = tagged_thumb_functions();
+        std::fs::write(destination.join("thumb_functions.json"), &thumb_sidecar).unwrap();
         let prepared = HashMap::from([(
             "02_MAIN".to_string(),
             prepared_global_map("refresh-globals-02_MAIN.json", 1),
         )]);
-        let mut image = analyzed_image("02_MAIN");
+        let mut image = tagged_image("02_MAIN", true);
         image.pass2_applied = Some(1);
         image.globals_apply_error = Some("global map rejected".into());
 
@@ -2738,7 +2856,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(destination.join("thumb_functions.json")).unwrap(),
-            b"sidecar"
+            thumb_sidecar
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2906,6 +3024,10 @@ mod tests {
                         status: "analyzed",
                         functions: Some(3),
                         thumb_functions: Some(1),
+                        ghidra_execution_accepted: None,
+                        ghidra_execution_quarantined: None,
+                        thumb_execution_accepted: None,
+                        thumb_execution_quarantined: None,
                         thumb_error: None,
                         exit: None,
                         pass2_applied: None,
@@ -2926,6 +3048,10 @@ mod tests {
                         status: "failed",
                         functions: None,
                         thumb_functions: None,
+                        ghidra_execution_accepted: None,
+                        ghidra_execution_quarantined: None,
+                        thumb_execution_accepted: None,
+                        thumb_execution_quarantined: None,
                         thumb_error: None,
                         exit: Some(1),
                         pass2_applied: None,
@@ -3092,6 +3218,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(42),
             thumb_functions: None,
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
             pass2_applied: None,
             pass2_error: None,
@@ -3129,6 +3261,12 @@ mod tests {
             label: "01_BOOT".into(),
             outcome: ImageOutcome::Analyzed(7),
             thumb_functions: None,
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3148,6 +3286,45 @@ mod tests {
         assert_eq!(image.functions, Some(7));
         assert!(image.thumb_functions.is_none());
         assert!(image.thumb_error.is_none());
+    }
+
+    #[test]
+    fn image_report_carries_current_execution_projection_counters() {
+        let mut result = tagged_image("02_MAIN", true);
+        result.outcome = ImageOutcome::Analyzed(1);
+
+        let image = ImageReport::from_result(&result);
+
+        assert_eq!(image.functions, Some(1));
+        assert_eq!(image.ghidra_execution_accepted, Some(1));
+        assert_eq!(image.ghidra_execution_quarantined, Some(0));
+        assert_eq!(image.thumb_functions, Some(1));
+        assert_eq!(image.thumb_execution_accepted, Some(1));
+        assert_eq!(image.thumb_execution_quarantined, Some(0));
+    }
+
+    #[test]
+    fn terminal_inventory_rejects_current_report_count_mismatch() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_terminal_count_mismatch_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("functions.json"), tagged_functions("current")).unwrap();
+        let mut image = tagged_image("02_MAIN", false);
+        image.outcome = ImageOutcome::Analyzed(2);
+
+        assert!(
+            decompile::validate_image_terminal_inventory(
+                &root.join("functions.json"),
+                &root.join("thumb_functions.json"),
+                &image,
+                None,
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3182,6 +3359,12 @@ mod tests {
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(10),
                 thumb_functions: Some(1),
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
                 thumb_error: None,
                 pass2_applied: None,
                 pass2_error: None,
@@ -3200,6 +3383,12 @@ mod tests {
                 label: "01_BOOT".into(),
                 outcome: ImageOutcome::Analyzed(3),
                 thumb_functions: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
                 thumb_error: None,
                 pass2_applied: None,
                 pass2_error: None,
@@ -3257,6 +3446,12 @@ mod tests {
             outcome: ImageOutcome::Analyzed(10),
             // In-memory result says radare2 produced Thumb output.
             thumb_functions: Some(5),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3313,6 +3508,10 @@ mod tests {
             status: "analyzed",
             functions: Some(107_955),
             thumb_functions: Some(117_444),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
             thumb_error: None,
             exit: None,
             pass2_applied: None,
@@ -3335,6 +3534,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(107_955),
             thumb_functions: Some(117_444),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3391,6 +3596,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(0),
             thumb_functions: Some(0),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3481,12 +3692,14 @@ mod tests {
         std::fs::create_dir_all(dest.join("thumb")).unwrap();
         std::fs::write(dest.join("decompiled.c"), b"OLD_C").unwrap();
         std::fs::write(dest.join("disasm.lst"), b"OLD_LST").unwrap();
-        std::fs::write(dest.join("functions.json"), b"OLD_FN").unwrap();
-        let thumb_json = b"{\"format\":\"thumb-v1\",\"functions\":[]}";
+        let old_functions = tagged_functions("old_name");
+        let new_functions = tagged_functions("new_name");
+        std::fs::write(dest.join("functions.json"), &old_functions).unwrap();
+        let thumb_json = tagged_thumb_functions();
         let thumb_stdout = b"r2-stdout-bytes-must-survive";
         let globals_json = b"{\"format\":\"pixel-modem-extractor-globals-v1\",\"globals\":[]}";
         let future_sidecar = b"future-sidecar-bytes-must-survive";
-        std::fs::write(dest.join("thumb_functions.json"), thumb_json).unwrap();
+        std::fs::write(dest.join("thumb_functions.json"), &thumb_json).unwrap();
         std::fs::write(dest.join("thumb").join("410b0000.stdout"), thumb_stdout).unwrap();
         std::fs::write(dest.join("globals.json"), globals_json).unwrap();
         std::fs::write(dest.join("future-sidecar.bin"), future_sidecar).unwrap();
@@ -3496,15 +3709,16 @@ mod tests {
         std::fs::create_dir_all(&export).unwrap();
         std::fs::write(export.join("decompiled.c"), b"NEW_C").unwrap();
         std::fs::write(export.join("disasm.lst"), b"NEW_LST").unwrap();
-        std::fs::write(export.join("functions.json"), b"NEW_FN").unwrap();
+        std::fs::write(export.join("functions.json"), &new_functions).unwrap();
 
-        refresh_decompiled(&ghidra, &images, label).unwrap();
+        let image = tagged_image(label, true);
+        refresh_decompiled(&ghidra, &images, &image).unwrap();
 
         assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), b"NEW_C");
         assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), b"NEW_LST");
         assert_eq!(
             std::fs::read(dest.join("functions.json")).unwrap(),
-            b"NEW_FN"
+            new_functions
         );
         assert_eq!(
             std::fs::read(dest.join("thumb_functions.json")).unwrap(),
@@ -3554,6 +3768,7 @@ mod tests {
         std::fs::write(dest.join("functions.json"), old_fn).unwrap();
         std::fs::write(dest.join("thumb_functions.json"), thumb_json).unwrap();
         std::fs::write(dest.join("thumb").join("410b0000.stdout"), thumb_stdout).unwrap();
+        let image = tagged_image(label, false);
 
         let assert_dest_untouched = |dest: &std::path::Path| {
             assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), old_c);
@@ -3575,7 +3790,7 @@ mod tests {
         std::fs::write(export.join("decompiled.c"), b"NEW_C").unwrap();
         std::fs::write(export.join("disasm.lst"), b"NEW_LST").unwrap();
         // deliberately omit functions.json
-        let err = refresh_decompiled(&ghidra, &images, label).unwrap_err();
+        let err = refresh_decompiled(&ghidra, &images, &image).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("invalid pass-2 export") || msg.contains("expected exactly"),
@@ -3587,7 +3802,7 @@ mod tests {
         // Case B: unexpected extra entry.
         std::fs::write(export.join("functions.json"), b"NEW_FN").unwrap();
         std::fs::write(export.join("extra.txt"), b"nope").unwrap();
-        let err = refresh_decompiled(&ghidra, &images, label).unwrap_err();
+        let err = refresh_decompiled(&ghidra, &images, &image).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("invalid pass-2 export") || msg.contains("expected exactly"),
@@ -3598,13 +3813,81 @@ mod tests {
         // Case C: non-file entry (subdirectory) in export.
         let _ = std::fs::remove_file(export.join("extra.txt"));
         std::fs::create_dir(export.join("subdir")).unwrap();
-        let err = refresh_decompiled(&ghidra, &images, label).unwrap_err();
+        let err = refresh_decompiled(&ghidra, &images, &image).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("not a regular file") || msg.contains("invalid pass-2 export"),
             "non-file export entry must error clearly, got: {msg}"
         );
         assert_dest_untouched(&dest);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_decompiled_rejects_stale_terminal_pair_before_any_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_refresh_terminal_reject_{}",
+            std::process::id()
+        ));
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let dest = images.join(label).join("decompiled");
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&export).unwrap();
+        let old_functions = serde_json::to_vec(&serde_json::json!([{
+            "name":"current", "entry":"0x4000", "end":"0x4004", "size":4,
+            "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+            "decode_range_errors":[], "data_refs":[]
+        }]))
+        .unwrap();
+        for (name, old, staged) in [
+            ("decompiled.c", b"OLD_C".as_slice(), b"NEW_C".as_slice()),
+            ("disasm.lst", b"OLD_LST".as_slice(), b"NEW_LST".as_slice()),
+            (
+                "functions.json",
+                old_functions.as_slice(),
+                br#"[{"name":"stale","entry":"0x4000","end":"0x4004","size":4,"data_refs":[]}]"#,
+            ),
+        ] {
+            std::fs::write(dest.join(name), old).unwrap();
+            std::fs::write(export.join(name), staged).unwrap();
+        }
+        let image = decompile::ImageResult {
+            label: label.into(),
+            outcome: ImageOutcome::Analyzed(1),
+            thumb_functions: None,
+            ghidra_execution_accepted: Some(1),
+            ghidra_execution_quarantined: Some(0),
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0x4000,
+            image_len: 0x10,
+            thumb_error: None,
+            pass2_applied: None,
+            pass2_error: None,
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
+        };
+
+        assert!(refresh_decompiled(&ghidra, &images, &image).is_err());
+        assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), b"OLD_C");
+        assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), b"OLD_LST");
+        assert_eq!(
+            std::fs::read(dest.join("functions.json")).unwrap(),
+            old_functions
+        );
+        assert!(export.exists(), "failed validation retains staged evidence");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3682,6 +3965,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
             thumb_functions: Some(5),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3710,6 +3999,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
             thumb_functions: Some(5),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3737,6 +4032,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
             thumb_functions: Some(5),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -3765,6 +4066,12 @@ mod tests {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
             thumb_functions: Some(5),
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
