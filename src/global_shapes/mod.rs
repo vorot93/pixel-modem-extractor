@@ -1,8 +1,9 @@
-// Staged internal API: later tasks introduce the decoder, tracker, and
-// aggregate callers. Until then the types exist only for this loader/schema.
+// Staged internal API: later tasks introduce the tracker and aggregate
+// callers. Until then unused pub(crate) items exist for those stages.
 #![allow(dead_code)]
 
 mod artifact;
+mod decoder;
 
 #[allow(unused_imports)]
 use crate::execution_ranges::{DecodeIsa as Isa, ExecutionIdentity};
