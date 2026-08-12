@@ -5,6 +5,7 @@ pub mod decompile;
 pub mod decompose;
 pub mod disasm_index;
 pub mod error;
+pub(crate) mod execution_ranges;
 pub mod ext4;
 pub mod fbpk;
 pub mod globals;

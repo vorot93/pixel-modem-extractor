@@ -7,6 +7,10 @@
 
 use crate::{
     error::{Error, Result},
+    execution_ranges::{
+        DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionProjection, canonicalize_errors,
+        canonicalize_instruction_extents, error, projection_to_json,
+    },
     toc::Toc,
 };
 use serde::Serialize;
@@ -1800,10 +1804,9 @@ fn is_aflj_function_inventory(value: &serde_json::Value) -> bool {
 struct Radare2ThumbOutput {
     json_value_count: usize,
     has_function_inventory: bool,
-    function_count: usize,
-    pdfj_count: usize,
-    missing_pdfj_count: usize,
-    pairs: Vec<(serde_json::Value, serde_json::Value)>,
+    records: Vec<(serde_json::Value, Option<serde_json::Value>)>,
+    unassignable_function_count: usize,
+    orphan_pdfj_count: usize,
 }
 
 fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
@@ -1816,18 +1819,19 @@ fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
         return Radare2ThumbOutput {
             json_value_count: values.len(),
             has_function_inventory: false,
-            function_count: 0,
-            pdfj_count: 0,
-            missing_pdfj_count: 0,
-            pairs: Vec::new(),
+            records: Vec::new(),
+            unassignable_function_count: 0,
+            orphan_pdfj_count: 0,
         };
     };
     let pdfjs = pdfj_values_from_radare2_output(&values);
     let mut used_pdfjs = vec![false; pdfjs.len()];
     let mut paired_pdfjs: Vec<Option<serde_json::Value>> = vec![None; fns.len()];
+    let mut unassignable_function_count = 0;
 
     for (idx, f) in fns.iter().enumerate() {
         let Some(entry) = radare2_function_entry(f) else {
+            unassignable_function_count += 1;
             continue;
         };
         let Some(pdfj_idx) = pdfjs.iter().enumerate().find_map(|(pdfj_idx, pdfj)| {
@@ -1857,27 +1861,24 @@ fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
         }
     }
 
-    let pairs: Vec<_> = fns
-        .iter()
-        .cloned()
-        .zip(paired_pdfjs)
-        .filter_map(|(f, pdfj)| pdfj.map(|pdfj| (f, pdfj)))
-        .collect();
-    let missing_pdfj_count = fns.len().saturating_sub(pairs.len());
+    let records: Vec<_> = fns.iter().cloned().zip(paired_pdfjs).collect();
 
     Radare2ThumbOutput {
         json_value_count: values.len(),
         has_function_inventory: true,
-        function_count: fns.len(),
-        pdfj_count: pdfjs.len(),
-        missing_pdfj_count,
-        pairs,
+        records,
+        unassignable_function_count,
+        orphan_pdfj_count: used_pdfjs.iter().filter(|used| !**used).count(),
     }
 }
 
 #[cfg(test)]
 fn radare2_thumb_function_pdfjs(stdout: &[u8]) -> Vec<(serde_json::Value, serde_json::Value)> {
-    parse_radare2_thumb_output(stdout).pairs
+    parse_radare2_thumb_output(stdout)
+        .records
+        .into_iter()
+        .filter_map(|(function, body)| body.map(|body| (function, body)))
+        .collect()
 }
 
 fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare2ThumbOutput> {
@@ -1892,40 +1893,26 @@ fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare
             "radare2 produced parseable JSON but no aflj function inventory for Thumb region 0x{addr:x}"
         )));
     }
-    if parsed.missing_pdfj_count > 0 {
-        let pdfj_detail = if parsed.pdfj_count == 0 {
-            "no parseable pdfj bodies".to_string()
-        } else {
-            format!(
-                "missing {} pdfj {}",
-                parsed.missing_pdfj_count,
-                if parsed.missing_pdfj_count == 1 {
-                    "body"
-                } else {
-                    "bodies"
-                }
-            )
-        };
+    if parsed.unassignable_function_count > 0 {
         return Err(Error::Serialize(format!(
-            "radare2 reported {} functions but {pdfj_detail} for Thumb region 0x{addr:x}",
-            parsed.function_count,
+            "radare2 reported {} unassignable aflj function {} for Thumb region 0x{addr:x}",
+            parsed.unassignable_function_count,
+            if parsed.unassignable_function_count == 1 {
+                "record"
+            } else {
+                "records"
+            },
         )));
     }
-    let empty_body_count = parsed
-        .pairs
-        .iter()
-        .filter(|(_, pdfj)| pdfj_body(pdfj).is_empty())
-        .count();
-    if empty_body_count > 0 {
+    if parsed.orphan_pdfj_count > 0 {
         return Err(Error::Serialize(format!(
-            "radare2 reported {} functions but {} paired pdfj {} had an empty pdfj body for Thumb region 0x{addr:x}",
-            parsed.function_count,
-            empty_body_count,
-            if empty_body_count == 1 {
+            "radare2 produced {} orphan pdfj {} for Thumb region 0x{addr:x}",
+            parsed.orphan_pdfj_count,
+            if parsed.orphan_pdfj_count == 1 {
                 "body"
             } else {
                 "bodies"
-            }
+            },
         )));
     }
     Ok(parsed)
@@ -1948,15 +1935,19 @@ fn normalize_radare2_function(
     raw: &serde_json::Value,
     pdfj: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    normalize_radare2_function_checked(raw, pdfj, 0)
+    let mut image = vec![0; 0x1_0000];
+    populate_test_image_from_pdfj(&mut image, pdfj);
+    normalize_radare2_function_checked(raw, Some(pdfj), &image, 0, 0)
 }
 
 fn normalize_radare2_function_checked(
     raw: &serde_json::Value,
-    pdfj: &serde_json::Value,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
     region_addr: u32,
 ) -> Result<serde_json::Value> {
-    let entry = radare2_function_entry(raw).ok_or_else(|| {
+    let entry_u64 = radare2_function_entry(raw).ok_or_else(|| {
         Error::Serialize(format!(
             "radare2 function lacks entry/addr for Thumb region 0x{region_addr:x}"
         ))
@@ -1966,22 +1957,176 @@ fn normalize_radare2_function_checked(
         .get("name")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| format!("thumb_{entry:x}"));
-    let body = pdfj_body(pdfj);
-    if body.is_empty() {
-        return Err(Error::Serialize(format!(
-            "radare2 function 0x{entry:x} has empty pdfj body for Thumb region 0x{region_addr:x}"
-        )));
-    }
-    Ok(serde_json::json!({
+        .unwrap_or_else(|| format!("thumb_{entry_u64:x}"));
+    let entry = u32::try_from(entry_u64).map_err(|_| Error::Serialize(format!(
+        "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+    )))?;
+    let projection = radare2_execution_projection(entry, pdfj, image, load_addr);
+    let body = pdfj.map(pdfj_body).unwrap_or_default();
+    let data_refs = pdfj.map(data_refs_from_pdfj).unwrap_or_default();
+    let mut output = serde_json::json!({
         "name": name,
-        "entry": json_hex(entry),
-        "end": json_hex(entry.saturating_add(size)),
+        "entry": json_hex(entry_u64),
+        "end": json_hex(entry_u64.saturating_add(size)),
         "size": size,
         "body_kind": "thumb_disassembly",
         "body": body,
-        "data_refs": data_refs_from_pdfj(pdfj),
-    }))
+        "data_refs": data_refs,
+    });
+    let tags = projection_to_json(&projection);
+    output
+        .as_object_mut()
+        .expect("JSON object")
+        .extend(tags.as_object().expect("JSON object").clone());
+    Ok(output)
+}
+
+fn strict_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn radare2_execution_projection(
+    entry: u32,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+) -> ExecutionProjection {
+    let Some(pdfj) = pdfj else {
+        return ExecutionProjection::Quarantined(vec![error(
+            DecodeRangeErrorKind::MissingOperationBody,
+            entry,
+            None,
+        )]);
+    };
+    let Some(ops) = pdfj.get("ops").and_then(serde_json::Value::as_array) else {
+        return ExecutionProjection::Quarantined(vec![error(
+            DecodeRangeErrorKind::EmptyProjection,
+            entry,
+            None,
+        )]);
+    };
+    let mut extents = Vec::new();
+    let mut errors = Vec::new();
+    for op in ops {
+        let address = op
+            .get("offset")
+            .or_else(|| op.get("addr"))
+            .and_then(json_u64)
+            .and_then(|address| u32::try_from(address).ok());
+        let Some(address) = address else {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidOperationAddress,
+                entry,
+                None,
+            ));
+            continue;
+        };
+        let bytes = op
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .and_then(strict_hex_bytes);
+        let Some(bytes) = bytes else {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidOperationBytes,
+                address,
+                None,
+            ));
+            continue;
+        };
+        if !matches!(bytes.len(), 2 | 4) {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidInstructionLength,
+                address,
+                None,
+            ));
+            continue;
+        }
+        let Some(end) = address.checked_add(bytes.len() as u32) else {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidOperationAddress,
+                address,
+                None,
+            ));
+            continue;
+        };
+        extents.push(DecodeRange {
+            isa: DecodeIsa::Thumb,
+            start: address,
+            end,
+        });
+        let image_end = load_addr.checked_add(image.len() as u32);
+        if address < load_addr || image_end.is_none_or(|image_end| end > image_end) {
+            errors.push(error(
+                DecodeRangeErrorKind::ExtentOutsideImage,
+                address,
+                Some(end),
+            ));
+        } else {
+            let start = (address - load_addr) as usize;
+            if image.get(start..start + bytes.len()) != Some(bytes.as_slice()) {
+                errors.push(error(
+                    DecodeRangeErrorKind::RawByteMismatch,
+                    address,
+                    Some(end),
+                ));
+            }
+        }
+    }
+    match canonicalize_instruction_extents(
+        entry,
+        extents,
+        load_addr,
+        image.len().try_into().unwrap_or(u32::MAX),
+    ) {
+        ExecutionProjection::Accepted(ranges) if errors.is_empty() => {
+            ExecutionProjection::Accepted(ranges)
+        }
+        ExecutionProjection::Accepted(_) => {
+            ExecutionProjection::Quarantined(canonicalize_errors(errors))
+        }
+        ExecutionProjection::Quarantined(mut canonical_errors) => {
+            canonical_errors.extend(errors);
+            ExecutionProjection::Quarantined(canonicalize_errors(canonical_errors))
+        }
+    }
+}
+
+#[cfg(test)]
+fn populate_test_image_from_pdfj(image: &mut [u8], pdfj: &serde_json::Value) {
+    for op in pdfj
+        .get("ops")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(address) = op
+            .get("offset")
+            .or_else(|| op.get("addr"))
+            .and_then(json_u64)
+            .and_then(|address| usize::try_from(address).ok())
+        else {
+            continue;
+        };
+        let Some(bytes) = op
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .and_then(strict_hex_bytes)
+        else {
+            continue;
+        };
+        if let Some(destination) = image.get_mut(address..address.saturating_add(bytes.len())) {
+            destination.copy_from_slice(&bytes);
+        }
+    }
 }
 
 /// Defensive upper bound on a single Thumb region's r2 stdout. Grounded in
@@ -2105,8 +2250,14 @@ fn run_radare2_thumb(
         // follow-up would reduce this — see CONTRIBUTING's radare2 invariant.
         let stdout_bytes = std::fs::read(&stdout_path)?;
         let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
-        for (f, pdfj) in parsed.pairs {
-            all.push(normalize_radare2_function_checked(&f, &pdfj, addr)?);
+        for (f, pdfj) in parsed.records {
+            all.push(normalize_radare2_function_checked(
+                &f,
+                pdfj.as_ref(),
+                image,
+                load_addr,
+                addr,
+            )?);
         }
     }
     let substantial = all
@@ -2118,6 +2269,19 @@ fn run_radare2_thumb(
                 >= 32
         })
         .count();
+    let accepted = all
+        .iter()
+        .filter(|function| {
+            function
+                .get("decode_ranges")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ranges| !ranges.is_empty())
+        })
+        .count();
+    tracing::info!(
+        "radare2: Thumb execution projections accepted={accepted} quarantined={}",
+        all.len() - accepted
+    );
     let wrapped = serde_json::json!({
         "format": "pixel-modem-extractor-thumb-functions-v2",
         "functions": all,
@@ -3240,6 +3404,75 @@ mod tests {
         assert_eq!(entry["body"], body);
         assert_eq!(entry["data_refs"][0], "0x9000");
         assert_eq!(entry["data_refs"][1], "0x9004");
+        assert_eq!(
+            entry["decode_ranges"],
+            serde_json::json!([{"isa":"thumb", "start":"0x4120", "end":"0x4124"}]),
+            "out-of-order pdfj operations must normalize into an exact tagged Thumb range"
+        );
+        assert_eq!(entry["decode_range_errors"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn radare2_pdfj_quarantines_all_faults_without_salvaging_a_prefix() {
+        let pdfj = serde_json::json!({"ops": [
+            {"offset": 0x4000u64, "bytes": "00bf"},
+            {"offset": 0x4002u64, "bytes": "0"},
+            {"offset": 0x4003u64, "bytes": "00bf"},
+            {"offset": 0x4010u64, "bytes": "00bf"}
+        ]});
+        let projection = radare2_execution_projection(0x4000, Some(&pdfj), &[0; 8], 0x4000);
+        let ExecutionProjection::Quarantined(errors) = projection else {
+            panic!("invalid operation must quarantine the entire record")
+        };
+        assert!(errors.iter().any(|error| error.kind
+            == DecodeRangeErrorKind::InvalidOperationBytes
+            && error.address == 0x4002));
+        assert!(errors.iter().any(|error| error.kind
+            == DecodeRangeErrorKind::MisalignedInstruction
+            && error.address == 0x4003));
+        assert!(errors.iter().any(
+            |error| error.kind == DecodeRangeErrorKind::ExtentOutsideImage
+                && error.address == 0x4010
+        ));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == DecodeRangeErrorKind::RawByteMismatch
+                    && error.address == 0x4003)
+        );
+    }
+
+    #[test]
+    fn radare2_pdfj_merges_adjacent_two_and_four_byte_t32_operations() {
+        let pdfj = serde_json::json!({"ops": [
+            {"offset": 0x4002u64, "bytes": "f0b50000"},
+            {"offset": 0x4000u64, "bytes": "00bf"}
+        ]});
+        let projection = radare2_execution_projection(
+            0x4000,
+            Some(&pdfj),
+            &[0x00, 0xbf, 0xf0, 0xb5, 0x00, 0x00],
+            0x4000,
+        );
+        assert_eq!(
+            projection_to_json(&projection),
+            serde_json::json!({
+                "decode_ranges": [{"isa":"thumb", "start":"0x4000", "end":"0x4006"}],
+                "decode_range_errors": [],
+            })
+        );
+    }
+
+    #[test]
+    fn radare2_missing_pdfj_body_is_a_tagged_quarantine() {
+        let projection = radare2_execution_projection(0x4000, None, &[0, 0], 0x4000);
+        assert_eq!(
+            projection_to_json(&projection),
+            serde_json::json!({
+                "decode_ranges": [],
+                "decode_range_errors": [{"kind":"missing_operation_body", "address":"0x4000", "end":null}],
+            })
+        );
     }
 
     #[test]
@@ -3362,40 +3595,44 @@ Warning: analysis completed
     }
 
     #[test]
-    fn radare2_thumb_rejects_functions_without_parseable_pdfj_bodies() {
+    fn radare2_thumb_retains_known_functions_without_parseable_pdfj_bodies() {
         let stdout = b"Warning: noisy prelude
 [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]
 INFO: no pdfj body followed
 ";
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("no parseable pdfj")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert!(
+            parsed.records[0].1.is_none(),
+            "missing bodies are record quarantines, not producer failure"
+        );
     }
 
     #[test]
-    fn radare2_thumb_rejects_paired_pdfj_with_empty_rendered_body() {
+    fn radare2_thumb_retains_paired_empty_pdfj_body_for_quarantine() {
         let stdout = br#"Warning: noisy prelude
 [{"name":"sym.thumb_func","offset":16384,"size":64}]
 {"addr":16384,"ops":[]}
 "#;
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("empty pdfj body")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert!(parsed.records[0].1.is_some());
     }
 
     #[test]
-    fn radare2_thumb_rejects_partial_pdfj_recovery() {
+    fn radare2_thumb_retains_partial_pdfj_recovery_for_per_record_quarantine() {
         let stdout = br#"Warning: noisy prelude
 [{"name":"sym.first","offset":16384,"size":64},{"name":"sym.second","offset":16448,"size":64}]
 {"addr":16384,"ops":[{"offset":16384,"bytes":"b5f0","disasm":"push {r4, lr}"}]}
 INFO: second pdfj body was noisy and not parseable
 "#;
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("missing 1 pdfj")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert_eq!(parsed.records.len(), 2);
+        assert!(parsed.records[0].1.is_some());
+        assert!(parsed.records[1].1.is_none());
     }
 
     #[test]
@@ -3405,9 +3642,9 @@ INFO: second pdfj body was noisy and not parseable
 {"addr":16448,"ops":[{"offset":16448,"bytes":"4770","disasm":"bx lr"}]}
 "#;
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("missing 1 pdfj")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert!(parsed.records[0].1.is_none());
+        assert!(parsed.records[1].1.is_some());
     }
 
     #[test]
@@ -3420,7 +3657,7 @@ INFO: second pdfj body was noisy and not parseable
 
         let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
 
-        assert!(matches!(err, Error::Serialize(message) if message.contains("missing 1 pdfj")));
+        assert!(matches!(err, Error::Serialize(message) if message.contains("orphan pdfj")));
     }
 
     #[test]
@@ -3515,7 +3752,7 @@ INFO: second pdfj body was noisy and not parseable
         let err = last.expect("expected an error from run_radare2_thumb");
 
         assert!(
-            matches!(err, Error::Serialize(message) if message.contains("lacks entry/addr") && message.contains("0x4000"))
+            matches!(err, Error::Serialize(message) if message.contains("unassignable aflj") && message.contains("0x4000"))
         );
 
         let _ = std::fs::remove_dir_all(&dir);
