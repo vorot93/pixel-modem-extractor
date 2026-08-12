@@ -581,31 +581,6 @@ fn load_attribution(source_tree: &Path) -> Result<BTreeMap<(Tool, u64), String>>
     Ok(m)
 }
 
-#[derive(Deserialize)]
-struct ExtractManifest {
-    #[serde(default)]
-    toc: Vec<TocEntry>,
-}
-#[derive(Deserialize)]
-struct TocEntry {
-    name: String,
-    load_addr: u64,
-}
-
-/// The `load_addr` for a TOC image name (e.g. "MAIN") from the extract manifest.
-pub(crate) fn load_load_addr(manifest: &Path, toc_name: &str) -> Result<Option<u64>> {
-    if !manifest.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(manifest)?;
-    let m: ExtractManifest =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    Ok(m.toc
-        .into_iter()
-        .find(|t| t.name == toc_name)
-        .map(|t| t.load_addr))
-}
-
 #[derive(Serialize)]
 struct Counts {
     functions: usize,
@@ -916,11 +891,6 @@ fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> R
     Ok(())
 }
 
-/// TOC image name for a decompose label, e.g. "02_MAIN" -> "MAIN".
-fn toc_name(label: &str) -> &str {
-    label.split_once('_').map(|(_, n)| n).unwrap_or(label)
-}
-
 /// Tunable parameters for `finalize_image`. Today a single flag controls whether
 /// `decompiled.c` / `disasm.lst` are text-rewritten; on the `decompose` two-pass
 /// path (Phase 1+), pass 2 regenerates `decompiled.c` and the rewrite is skipped.
@@ -950,7 +920,7 @@ pub(crate) fn build_map(
     let attribution = load_attribution(&source_tree)?;
 
     let raw_image_path = image_dir.join(format!("{image_label}.bin"));
-    let string_map = match load_load_addr(manifest, toc_name(image_label))? {
+    let string_map = match crate::manifest::load_addr_for_image(manifest, image_label)? {
         Some(load_addr) if raw_image_path.exists() => {
             build_string_map(&std::fs::read(&raw_image_path)?, load_addr, 3)
         }

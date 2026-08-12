@@ -5067,6 +5067,9 @@ void FUN_10(void)\n\
         let bodies = parse_decompiled_c_function_bodies_by_addr(text);
         let body = bodies.get("10").expect("entry 0x10");
         assert!(body.contains("done();"), "{body}");
-        assert!(body.ends_with("}\n") || body.trim_end().ends_with('}'), "{body}");
+        assert!(
+            body.ends_with("}\n") || body.trim_end().ends_with('}'),
+            "{body}"
+        );
     }
 }
