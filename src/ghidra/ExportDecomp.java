@@ -160,17 +160,18 @@ public class ExportDecomp extends GhidraScript {
         return b.toString();
     }
 
-    private long functionEnd(Function fn) {
-        long end = fn.getEntryPoint().getOffset();
+    private long functionEnd(Function fn) throws Exception {
+        long end = u32ExclusiveEnd(fn.getEntryPoint());
         AddressRangeIterator ranges = fn.getBody().getAddressRanges();
         while (ranges.hasNext()) {
             AddressRange range = ranges.next();
-            long max = range.getMaxAddress().getOffset();
-            if (max > end) {
-                end = max;
+            u32Offset(range.getMinAddress());
+            long exclusiveEnd = u32ExclusiveEnd(range.getMaxAddress());
+            if (exclusiveEnd > end) {
+                end = exclusiveEnd;
             }
         }
-        return end + 1;
+        return end;
     }
 
     private static long u32Offset(Address address) throws Exception {
@@ -182,6 +183,14 @@ public class ExportDecomp extends GhidraScript {
             throw new Exception("unassignable producer address outside u32");
         }
         return offset;
+    }
+
+    private static long u32ExclusiveEnd(Address inclusiveEnd) throws Exception {
+        long offset = u32Offset(inclusiveEnd);
+        if (offset == U32_MAX) {
+            throw new Exception("unassignable producer body exclusive end outside u32");
+        }
+        return offset + 1L;
     }
 
     private DecodeProjection decodeProjection(Function fn, Listing listing) throws Exception {
@@ -261,14 +270,26 @@ public class ExportDecomp extends GhidraScript {
             }
         }
 
-        if (extents.isEmpty()) {
+        List<DecodeRange> ranges = new ArrayList<DecodeRange>();
+        for (DecodeRange extent : extents) {
+            if (!ranges.isEmpty()) {
+                DecodeRange previous = ranges.get(ranges.size() - 1);
+                if (previous.end == extent.start && previous.isa.equals(extent.isa)) {
+                    previous.end = extent.end;
+                    continue;
+                }
+            }
+            ranges.add(new DecodeRange(extent.start, extent.end, extent.isa));
+        }
+
+        if (ranges.isEmpty()) {
             errors.add(new DecodeError("empty_projection", entry, null));
         } else {
             boolean entryStartsRange = false;
             boolean entryInsideRange = false;
-            for (DecodeRange extent : extents) {
-                entryStartsRange |= extent.start == entry;
-                entryInsideRange |= extent.start < entry && entry < extent.end;
+            for (DecodeRange range : ranges) {
+                entryStartsRange |= range.start == entry;
+                entryInsideRange |= range.start < entry && entry < range.end;
             }
             if (!entryStartsRange) {
                 errors.add(new DecodeError(
@@ -284,17 +305,6 @@ public class ExportDecomp extends GhidraScript {
                 new ArrayList<DecodeError>(errors));
         }
 
-        List<DecodeRange> ranges = new ArrayList<DecodeRange>();
-        for (DecodeRange extent : extents) {
-            if (!ranges.isEmpty()) {
-                DecodeRange previous = ranges.get(ranges.size() - 1);
-                if (previous.end == extent.start && previous.isa.equals(extent.isa)) {
-                    previous.end = extent.end;
-                    continue;
-                }
-            }
-            ranges.add(new DecodeRange(extent.start, extent.end, extent.isa));
-        }
         return new DecodeProjection(ranges, Collections.<DecodeError>emptyList());
     }
 

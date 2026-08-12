@@ -299,6 +299,27 @@ fn refresh_decompiled(
     images_dir: &Path,
     image: &decompile::ImageResult,
 ) -> Result<()> {
+    let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+    let mut validate = decompile::validate_image_terminal_inventory;
+    refresh_decompiled_with(ghidra_dir, images_dir, image, &mut rename, &mut validate)
+}
+
+fn refresh_decompiled_with<R, V>(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    image: &decompile::ImageResult,
+    rename: &mut R,
+    validate: &mut V,
+) -> Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+    V: FnMut(
+        &Path,
+        &Path,
+        &decompile::ImageResult,
+        Option<&decompile::TerminalInventorySummary>,
+    ) -> Result<decompile::TerminalInventorySummary>,
+{
     const OWNED: &[&str] = &["decompiled.c", "disasm.lst", "functions.json"];
     let label = &image.label;
 
@@ -335,7 +356,7 @@ fn refresh_decompiled(
 
     let dest = images_dir.join(label).join("decompiled");
     let retained = if dest.exists() {
-        Some(decompile::validate_image_terminal_inventory(
+        Some(validate(
             &dest.join("functions.json"),
             &dest.join("thumb_functions.json"),
             image,
@@ -344,7 +365,7 @@ fn refresh_decompiled(
     } else {
         None
     };
-    let staged = decompile::validate_image_terminal_inventory(
+    let staged = validate(
         &export.join("functions.json"),
         &dest.join("thumb_functions.json"),
         image,
@@ -356,35 +377,129 @@ fn refresh_decompiled(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::rename(&export, &dest)?;
-        decompile::validate_image_terminal_inventory(
+        rename(&export, &dest)?;
+        if let Err(error) = validate(
             &dest.join("functions.json"),
             &dest.join("thumb_functions.json"),
             image,
             Some(&staged),
-        )?;
+        ) {
+            return match rename(&dest, &export) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(transaction_rollback_error(error, &[rollback])),
+            };
+        }
         return Ok(());
     }
 
-    // Destination exists: replace only the three owned files. Sidecars stay put.
-    for name in OWNED {
-        let from = export.join(name);
-        let to = dest.join(name);
-        // On Unix rename overwrites an existing file; remove first for
-        // portability across platforms where rename refuses to replace.
-        if to.exists() {
-            std::fs::remove_file(&to)?;
+    // Destination exists: move the old owned trio aside, install the staged
+    // trio, and roll both sets back on any replacement or final-validation
+    // failure. Sidecars never enter the transaction.
+    let backup = dest
+        .parent()
+        .expect("decompiled destination always has an image parent")
+        .join(".decompiled.refresh-backup");
+    match std::fs::create_dir(&backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(Error::DecomposeIncomplete(format!(
+                "stale pass-2 refresh backup for {label}: {}",
+                backup.display()
+            )));
         }
-        std::fs::rename(&from, &to)?;
+        Err(error) => return Err(error.into()),
     }
-    std::fs::remove_dir(&export)?;
-    decompile::validate_image_terminal_inventory(
+    let mut backed_up = Vec::new();
+    for name in OWNED {
+        if let Err(error) = rename(&dest.join(name), &backup.join(name)) {
+            let rollback_errors =
+                rollback_refresh(&export, &dest, &backup, &[], &backed_up, rename);
+            return Err(transaction_rollback_error(error.into(), &rollback_errors));
+        }
+        backed_up.push(*name);
+    }
+    let mut installed = Vec::new();
+    for name in OWNED {
+        if let Err(error) = rename(&export.join(name), &dest.join(name)) {
+            let rollback_errors =
+                rollback_refresh(&export, &dest, &backup, &installed, &backed_up, rename);
+            return Err(transaction_rollback_error(error.into(), &rollback_errors));
+        }
+        installed.push(*name);
+    }
+    if let Err(error) = validate(
         &dest.join("functions.json"),
         &dest.join("thumb_functions.json"),
         image,
         Some(retained.as_ref().unwrap_or(&staged)),
-    )?;
+    ) {
+        let rollback_errors =
+            rollback_refresh(&export, &dest, &backup, &installed, &backed_up, rename);
+        return Err(transaction_rollback_error(error, &rollback_errors));
+    }
+
+    // Validation is the commit point. Cleanup failures cannot make the
+    // destination partially old/new, so retain recoverable artifacts and warn.
+    for name in OWNED {
+        if let Err(error) = std::fs::remove_file(backup.join(name)) {
+            tracing::warn!(
+                "pass-2 refresh for {label} committed but could not remove backup {name}: {error}"
+            );
+        }
+    }
+    if let Err(error) = std::fs::remove_dir(&backup) {
+        tracing::warn!(
+            "pass-2 refresh for {label} committed but could not remove backup directory: {error}"
+        );
+    }
+    if let Err(error) = std::fs::remove_dir(&export) {
+        tracing::warn!(
+            "pass-2 refresh for {label} committed but could not remove empty export directory: {error}"
+        );
+    }
     Ok(())
+}
+
+fn rollback_refresh<R>(
+    export: &Path,
+    dest: &Path,
+    backup: &Path,
+    installed: &[&str],
+    backed_up: &[&str],
+    rename: &mut R,
+) -> Vec<std::io::Error>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let mut errors = Vec::new();
+    for name in installed.iter().rev() {
+        if let Err(error) = rename(&dest.join(name), &export.join(name)) {
+            errors.push(error);
+        }
+    }
+    for name in backed_up.iter().rev() {
+        if let Err(error) = rename(&backup.join(name), &dest.join(name)) {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = std::fs::remove_dir(backup) {
+        errors.push(error);
+    }
+    errors
+}
+
+fn transaction_rollback_error(original: Error, rollback_errors: &[std::io::Error]) -> Error {
+    if rollback_errors.is_empty() {
+        return original;
+    }
+    let rollback = rollback_errors
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::DecomposeIncomplete(format!(
+        "pass-2 refresh failed: {original}; rollback also failed: {rollback}"
+    ))
 }
 
 fn refresh_pass2_outputs_with<F>(
@@ -3743,6 +3858,225 @@ mod tests {
         assert!(
             !export.exists(),
             "validated export dir must be removed after successful replace"
+        );
+        assert!(
+            !images
+                .join(label)
+                .join(".decompiled.refresh-backup")
+                .exists(),
+            "successful refresh must remove the transaction backup"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_decompiled_rolls_back_second_and_third_replacement_failures() {
+        for fail_at in [2usize, 3] {
+            let root = std::env::temp_dir().join(format!(
+                "pme_refresh_replace_failure_{}_{}",
+                fail_at,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let ghidra = root.join("ghidra");
+            let images = root.join("images");
+            let label = "02_MAIN";
+            let dest = images.join(label).join("decompiled");
+            let export = ghidra.join("export").join(label);
+            std::fs::create_dir_all(&dest).unwrap();
+            std::fs::create_dir_all(&export).unwrap();
+            let old_functions = tagged_functions("old_name");
+            let new_functions = tagged_functions("new_name");
+            for (name, old, new) in [
+                ("decompiled.c", b"OLD_C".as_slice(), b"NEW_C".as_slice()),
+                ("disasm.lst", b"OLD_LST".as_slice(), b"NEW_LST".as_slice()),
+                (
+                    "functions.json",
+                    old_functions.as_slice(),
+                    new_functions.as_slice(),
+                ),
+            ] {
+                std::fs::write(dest.join(name), old).unwrap();
+                std::fs::write(export.join(name), new).unwrap();
+            }
+            std::fs::write(dest.join("sidecar.bin"), b"SIDE").unwrap();
+            let image = tagged_image(label, false);
+            let mut replacements = 0usize;
+            let mut rename = |from: &Path, to: &Path| {
+                if from.parent() == Some(export.as_path()) && to.parent() == Some(dest.as_path()) {
+                    replacements += 1;
+                    if replacements == fail_at {
+                        return Err(std::io::Error::other(format!(
+                            "injected replacement failure {fail_at}"
+                        )));
+                    }
+                }
+                std::fs::rename(from, to)
+            };
+            let mut validate = decompile::validate_image_terminal_inventory;
+
+            assert!(
+                refresh_decompiled_with(&ghidra, &images, &image, &mut rename, &mut validate,)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), b"OLD_C");
+            assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), b"OLD_LST");
+            assert_eq!(
+                std::fs::read(dest.join("functions.json")).unwrap(),
+                old_functions
+            );
+            assert_eq!(std::fs::read(dest.join("sidecar.bin")).unwrap(), b"SIDE");
+            assert_eq!(
+                std::fs::read(export.join("decompiled.c")).unwrap(),
+                b"NEW_C"
+            );
+            assert_eq!(
+                std::fs::read(export.join("disasm.lst")).unwrap(),
+                b"NEW_LST"
+            );
+            assert_eq!(
+                std::fs::read(export.join("functions.json")).unwrap(),
+                new_functions
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn refresh_decompiled_rolls_back_failed_final_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_refresh_final_validation_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let dest = images.join(label).join("decompiled");
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&export).unwrap();
+        let old_functions = tagged_functions("old_name");
+        let new_functions = tagged_functions("new_name");
+        for (name, old, new) in [
+            ("decompiled.c", b"OLD_C".as_slice(), b"NEW_C".as_slice()),
+            ("disasm.lst", b"OLD_LST".as_slice(), b"NEW_LST".as_slice()),
+            (
+                "functions.json",
+                old_functions.as_slice(),
+                new_functions.as_slice(),
+            ),
+        ] {
+            std::fs::write(dest.join(name), old).unwrap();
+            std::fs::write(export.join(name), new).unwrap();
+        }
+        std::fs::write(dest.join("sidecar.bin"), b"SIDE").unwrap();
+        let image = tagged_image(label, false);
+        let mut validation_calls = 0usize;
+        let mut validate =
+            |ghidra_functions: &Path,
+             thumb_functions: &Path,
+             image: &decompile::ImageResult,
+             expected: Option<&decompile::TerminalInventorySummary>| {
+                validation_calls += 1;
+                let summary = decompile::validate_image_terminal_inventory(
+                    ghidra_functions,
+                    thumb_functions,
+                    image,
+                    expected,
+                )?;
+                if validation_calls == 3 {
+                    return Err(Error::DecomposeIncomplete(
+                        "injected final validation failure".into(),
+                    ));
+                }
+                Ok(summary)
+            };
+        let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+
+        assert!(
+            refresh_decompiled_with(&ghidra, &images, &image, &mut rename, &mut validate,).is_err()
+        );
+        assert_eq!(std::fs::read(dest.join("decompiled.c")).unwrap(), b"OLD_C");
+        assert_eq!(std::fs::read(dest.join("disasm.lst")).unwrap(), b"OLD_LST");
+        assert_eq!(
+            std::fs::read(dest.join("functions.json")).unwrap(),
+            old_functions
+        );
+        assert_eq!(std::fs::read(dest.join("sidecar.bin")).unwrap(), b"SIDE");
+        assert_eq!(
+            std::fs::read(export.join("decompiled.c")).unwrap(),
+            b"NEW_C"
+        );
+        assert_eq!(
+            std::fs::read(export.join("disasm.lst")).unwrap(),
+            b"NEW_LST"
+        );
+        assert_eq!(
+            std::fs::read(export.join("functions.json")).unwrap(),
+            new_functions
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_decompiled_first_placement_rolls_back_failed_final_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_refresh_first_final_validation_failure_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let dest = images.join(label).join("decompiled");
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&export).unwrap();
+        let functions = tagged_functions("new_name");
+        std::fs::write(export.join("decompiled.c"), b"NEW_C").unwrap();
+        std::fs::write(export.join("disasm.lst"), b"NEW_LST").unwrap();
+        std::fs::write(export.join("functions.json"), &functions).unwrap();
+        let image = tagged_image(label, false);
+        let mut validation_calls = 0usize;
+        let mut validate =
+            |ghidra_functions: &Path,
+             thumb_functions: &Path,
+             image: &decompile::ImageResult,
+             expected: Option<&decompile::TerminalInventorySummary>| {
+                validation_calls += 1;
+                let summary = decompile::validate_image_terminal_inventory(
+                    ghidra_functions,
+                    thumb_functions,
+                    image,
+                    expected,
+                )?;
+                if validation_calls == 2 {
+                    return Err(Error::DecomposeIncomplete(
+                        "injected final validation failure".into(),
+                    ));
+                }
+                Ok(summary)
+            };
+        let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+
+        assert!(
+            refresh_decompiled_with(&ghidra, &images, &image, &mut rename, &mut validate,).is_err()
+        );
+        assert!(
+            !dest.exists(),
+            "failed first placement must not look current"
+        );
+        assert_eq!(
+            std::fs::read(export.join("decompiled.c")).unwrap(),
+            b"NEW_C"
+        );
+        assert_eq!(
+            std::fs::read(export.join("disasm.lst")).unwrap(),
+            b"NEW_LST"
+        );
+        assert_eq!(
+            std::fs::read(export.join("functions.json")).unwrap(),
+            functions
         );
         let _ = std::fs::remove_dir_all(&root);
     }

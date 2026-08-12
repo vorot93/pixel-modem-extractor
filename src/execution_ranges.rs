@@ -163,23 +163,6 @@ pub(crate) fn canonicalize_instruction_extents(
             maximal_prior = Some(current);
         }
     }
-    if extents.is_empty() {
-        errors.push(error(DecodeRangeErrorKind::EmptyProjection, entry, None));
-    } else if !extents.iter().any(|extent| extent.start == entry) {
-        let kind = if extents
-            .iter()
-            .any(|extent| extent.start < entry && entry < extent.end)
-        {
-            DecodeRangeErrorKind::EntryNotRangeStart
-        } else {
-            DecodeRangeErrorKind::MissingInstructionAtEntry
-        };
-        errors.push(error(kind, entry, None));
-    }
-    if !errors.is_empty() {
-        return ExecutionProjection::Quarantined(canonicalize_errors(errors));
-    }
-
     let mut ranges: Vec<DecodeRange> = Vec::new();
     for extent in extents {
         if let Some(last) = ranges.last_mut()
@@ -190,6 +173,22 @@ pub(crate) fn canonicalize_instruction_extents(
         } else {
             ranges.push(extent);
         }
+    }
+    if ranges.is_empty() {
+        errors.push(error(DecodeRangeErrorKind::EmptyProjection, entry, None));
+    } else if !ranges.iter().any(|range| range.start == entry) {
+        let kind = if ranges
+            .iter()
+            .any(|range| range.start < entry && entry < range.end)
+        {
+            DecodeRangeErrorKind::EntryNotRangeStart
+        } else {
+            DecodeRangeErrorKind::MissingInstructionAtEntry
+        };
+        errors.push(error(kind, entry, None));
+    }
+    if !errors.is_empty() {
+        return ExecutionProjection::Quarantined(canonicalize_errors(errors));
     }
     ExecutionProjection::Accepted(ranges)
 }
@@ -593,6 +592,46 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn canonicalization_quarantines_when_merging_makes_entry_interior() {
+        let projection = canonicalize_instruction_extents(
+            0x4004,
+            vec![
+                DecodeRange {
+                    isa: DecodeIsa::Arm,
+                    start: 0x4000,
+                    end: 0x4004,
+                },
+                DecodeRange {
+                    isa: DecodeIsa::Arm,
+                    start: 0x4004,
+                    end: 0x4008,
+                },
+            ],
+            0x4000,
+            0x10,
+        );
+        let expected = ExecutionProjection::Quarantined(vec![DecodeRangeError {
+            kind: DecodeRangeErrorKind::EntryNotRangeStart,
+            address: 0x4004,
+            end: None,
+        }]);
+        assert_eq!(projection, expected);
+
+        let record = json!({
+            "entry":"0x4004",
+            "decode_ranges":[],
+            "decode_range_errors":[{
+                "kind":"entry_not_range_start",
+                "address":"0x4004",
+                "end":null
+            }]
+        });
+        let inventory = validate_inventory_records(&[record], 1, 0x4000, 0x10).unwrap();
+        assert_eq!(inventory.accepted, 0);
+        assert_eq!(inventory.quarantined, 1);
     }
 
     #[test]
