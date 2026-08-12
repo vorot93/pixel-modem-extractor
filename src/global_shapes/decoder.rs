@@ -396,21 +396,11 @@ fn check_adapter_invariants(
     seen: &BTreeMap<u32, DecodedInstruction>,
     range_end: u32,
 ) -> Result<()> {
-    if instruction.pc != requested_pc {
-        return Err(invalid("decoder returned a PC other than the requested PC"));
-    }
     if instruction.isa != range.isa {
         return Err(invalid("decoder returned an ISA other than the range ISA"));
     }
     if instruction.length == 0 || !valid_isa_length(instruction.isa, instruction.length) {
         return Err(invalid("decoder returned an impossible instruction length"));
-    }
-    let end = instruction
-        .pc
-        .checked_add(u32::from(instruction.length))
-        .ok_or_else(|| invalid("instruction length overflows u32"))?;
-    if end > range_end {
-        return Err(invalid("decoded instruction overruns the declared range"));
     }
     if seen.contains_key(&instruction.pc) {
         return Err(invalid("duplicate decoded instruction PC"));
@@ -421,6 +411,16 @@ fn check_adapter_invariants(
         .is_some_and(|last| instruction.pc < *last)
     {
         return Err(invalid("decoded PC regressed"));
+    }
+    if instruction.pc != requested_pc {
+        return Err(invalid("decoder returned a PC other than the requested PC"));
+    }
+    let end = instruction
+        .pc
+        .checked_add(u32::from(instruction.length))
+        .ok_or_else(|| invalid("instruction length overflows u32"))?;
+    if end > range_end {
+        return Err(invalid("decoded instruction overruns the declared range"));
     }
     Ok(())
 }
@@ -2710,6 +2710,42 @@ fn unsupported(
     )
 }
 
+fn a32_linear(
+    pc: u32,
+    length: u8,
+    cond: Arm32Condition,
+    reads: BTreeSet<Register>,
+    writes: BTreeSet<Register>,
+) -> DecodedInstruction {
+    unsupported(
+        Isa::Arm,
+        pc,
+        length,
+        a32_conditional(cond),
+        reads,
+        writes,
+        ControlFlow::Linear,
+    )
+}
+
+fn a32_stop(
+    pc: u32,
+    length: u8,
+    cond: Arm32Condition,
+    reads: BTreeSet<Register>,
+    writes: BTreeSet<Register>,
+) -> DecodedInstruction {
+    unsupported(
+        Isa::Arm,
+        pc,
+        length,
+        a32_conditional(cond),
+        reads,
+        writes,
+        ControlFlow::Stop,
+    )
+}
+
 fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInstruction {
     match inst {
         ArmA32Instruction::And_Immediate_A1(cond, _, rd, rn, _)
@@ -2719,15 +2755,9 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
         | ArmA32Instruction::Adc_Immediate_A1(cond, _, rd, rn, _)
         | ArmA32Instruction::Sbc_Immediate_A1(cond, _, rd, rn, _)
         | ArmA32Instruction::Rsb_Immediate_A1(cond, _, rd, rn, _)
-        | ArmA32Instruction::Rsc_Immediate_A1(cond, _, rd, rn, _) => unsupported(
-            Isa::Arm,
-            pc,
-            length,
-            a32_conditional(*cond),
-            set([gpr(*rn)]),
-            set([gpr(*rd)]),
-            ControlFlow::Linear,
-        ),
+        | ArmA32Instruction::Rsc_Immediate_A1(cond, _, rd, rn, _) => {
+            a32_linear(pc, length, *cond, set([gpr(*rn)]), set([gpr(*rd)]))
+        }
         ArmA32Instruction::And_Register_A1(cond, _, rd, rn, rm, _)
         | ArmA32Instruction::Eor_Register_A1(cond, _, rd, rn, rm, _)
         | ArmA32Instruction::Orr_Register_A1(cond, _, rd, rn, rm, _)
@@ -2735,43 +2765,291 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
         | ArmA32Instruction::Adc_Register_A1(cond, _, rd, rn, rm, _)
         | ArmA32Instruction::Sbc_Register_A1(cond, _, rd, rn, rm, _)
         | ArmA32Instruction::Rsb_Register_A1(cond, _, rd, rn, rm, _)
-        | ArmA32Instruction::Rsc_Register_A1(cond, _, rd, rn, rm, _) => unsupported(
-            Isa::Arm,
+        | ArmA32Instruction::Rsc_Register_A1(cond, _, rd, rn, rm, _) => a32_linear(
             pc,
             length,
-            a32_conditional(*cond),
+            *cond,
             set([gpr(*rn), gpr(*rm)]),
             set([gpr(*rd)]),
-            ControlFlow::Linear,
         ),
-        ArmA32Instruction::Mvn_Immediate_A1(cond, _, rd, _) => unsupported(
-            Isa::Arm,
-            pc,
-            length,
-            a32_conditional(*cond),
-            BTreeSet::new(),
-            set([gpr(*rd)]),
-            ControlFlow::Linear,
-        ),
+        ArmA32Instruction::And_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Eor_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Sub_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Rsb_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Add_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Adc_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Sbc_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Rsc_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Orr_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs)
+        | ArmA32Instruction::Bic_RegisterShiftedRegister_A1(cond, _, rd, rn, rm, _, rs) => {
+            a32_linear(
+                pc,
+                length,
+                *cond,
+                set([gpr(*rn), gpr(*rm), gpr(*rs)]),
+                set([gpr(*rd)]),
+            )
+        }
+        ArmA32Instruction::Mvn_Immediate_A1(cond, _, rd, _) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rd)]))
+        }
         ArmA32Instruction::Mvn_Register_A1(cond, _, rd, rm, _)
-        | ArmA32Instruction::Mov_Register_A1(cond, _, rd, rm, _) => unsupported(
-            Isa::Arm,
+        | ArmA32Instruction::Mov_Register_A1(cond, _, rd, rm, _) => {
+            a32_linear(pc, length, *cond, set([gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmA32Instruction::Mov_RegisterShiftedRegister_A1(cond, _, rd, rm, _, rs)
+        | ArmA32Instruction::Mvn_RegisterShiftedRegister_A1(cond, _, rd, rm, _, rs) => a32_linear(
             pc,
             length,
-            a32_conditional(*cond),
-            set([gpr(*rm)]),
+            *cond,
+            set([gpr(*rm), gpr(*rs)]),
             set([gpr(*rd)]),
-            ControlFlow::Linear,
         ),
         ArmA32Instruction::Tst_Immediate_A1(cond, rn, _)
         | ArmA32Instruction::Teq_Immediate_A1(cond, rn, _)
         | ArmA32Instruction::Cmp_Immediate_A1(cond, rn, _)
-        | ArmA32Instruction::Cmn_Immediate_A1(cond, rn, _) => unsupported(
+        | ArmA32Instruction::Cmn_Immediate_A1(cond, rn, _) => {
+            a32_linear(pc, length, *cond, set([gpr(*rn)]), BTreeSet::new())
+        }
+        ArmA32Instruction::Tst_Register_A1(cond, rn, rm, _)
+        | ArmA32Instruction::Teq_Register_A1(cond, rn, rm, _)
+        | ArmA32Instruction::Cmp_Register_A1(cond, rn, rm, _)
+        | ArmA32Instruction::Cmn_Register_A1(cond, rn, rm, _) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rn), gpr(*rm)]),
+            BTreeSet::new(),
+        ),
+        ArmA32Instruction::Tst_RegisterShiftedRegister_A1(cond, rn, rm, _, rs)
+        | ArmA32Instruction::Teq_RegisterShiftedRegister_A1(cond, rn, rm, _, rs)
+        | ArmA32Instruction::Cmp_RegisterShiftedRegister_A1(cond, rn, rm, _, rs)
+        | ArmA32Instruction::Cmn_RegisterShiftedRegister_A1(cond, rn, rm, _, rs) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rn), gpr(*rm), gpr(*rs)]),
+            BTreeSet::new(),
+        ),
+        ArmA32Instruction::Mul_A1(cond, _, rd, rn, rm)
+        | ArmA32Instruction::Smulw_A1(cond, rd, rn, rm, _)
+        | ArmA32Instruction::Smul_A1(cond, rd, rn, rm, _, _)
+        | ArmA32Instruction::Smuad_A1(cond, rd, rn, rm, _)
+        | ArmA32Instruction::Smusd_A1(cond, rd, rn, rm, _)
+        | ArmA32Instruction::Smmul_A1(cond, rd, rn, rm, _)
+        | ArmA32Instruction::Usad8_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::Qadd_A1(cond, rd, rm, rn)
+        | ArmA32Instruction::Qsub_A1(cond, rd, rm, rn)
+        | ArmA32Instruction::Qdadd_A1(cond, rd, rm, rn)
+        | ArmA32Instruction::Qdsub_A1(cond, rd, rm, rn)
+        | ArmA32Instruction::Sel_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::ParallelAddSub_A1(cond, _, _, rd, rn, rm)
+        | ArmA32Instruction::Crc32b_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::Crc32h_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::Crc32w_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::Crc32cb_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::Crc32ch_A1(cond, rd, rn, rm)
+        | ArmA32Instruction::Crc32cw_A1(cond, rd, rn, rm) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rn), gpr(*rm)]),
+            set([gpr(*rd)]),
+        ),
+        ArmA32Instruction::Mla_A1(cond, _, rd, rn, rm, ra)
+        | ArmA32Instruction::Mls_A1(cond, rd, rn, rm, ra)
+        | ArmA32Instruction::Smla_A1(cond, rd, rn, rm, ra, _, _)
+        | ArmA32Instruction::Smlaw_A1(cond, rd, rn, rm, ra, _)
+        | ArmA32Instruction::Smlad_A1(cond, rd, rn, rm, ra, _)
+        | ArmA32Instruction::Smlsd_A1(cond, rd, rn, rm, ra, _)
+        | ArmA32Instruction::Smmla_A1(cond, rd, rn, rm, ra, _)
+        | ArmA32Instruction::Smmls_A1(cond, rd, rn, rm, ra, _)
+        | ArmA32Instruction::Usada8_A1(cond, rd, rn, rm, ra) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rn), gpr(*rm), gpr(*ra)]),
+            set([gpr(*rd)]),
+        ),
+        ArmA32Instruction::Umull_A1(cond, _, rdlo, rdhi, rn, rm)
+        | ArmA32Instruction::Umlal_A1(cond, _, rdlo, rdhi, rn, rm)
+        | ArmA32Instruction::Smull_A1(cond, _, rdlo, rdhi, rn, rm)
+        | ArmA32Instruction::Smlal_A1(cond, _, rdlo, rdhi, rn, rm)
+        | ArmA32Instruction::Umaal_A1(cond, rdlo, rdhi, rn, rm)
+        | ArmA32Instruction::Smlal_Halfword_A1(cond, rdlo, rdhi, rn, rm, _, _)
+        | ArmA32Instruction::Smlald_A1(cond, rdlo, rdhi, rn, rm, _)
+        | ArmA32Instruction::Smlsld_A1(cond, rdlo, rdhi, rn, rm, _) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rdlo), gpr(*rdhi), gpr(*rn), gpr(*rm)]),
+            set([gpr(*rdlo), gpr(*rdhi)]),
+        ),
+        ArmA32Instruction::Extend_A1(cond, _, rd, rm, _)
+        | ArmA32Instruction::Rev_A1(cond, rd, rm)
+        | ArmA32Instruction::Rev16_A1(cond, rd, rm)
+        | ArmA32Instruction::Revsh_A1(cond, rd, rm)
+        | ArmA32Instruction::Rbit_A1(cond, rd, rm)
+        | ArmA32Instruction::Clz_A1(cond, rd, rm)
+        | ArmA32Instruction::Ssat_A1(cond, rd, _, rm, _)
+        | ArmA32Instruction::Usat_A1(cond, rd, _, rm, _)
+        | ArmA32Instruction::Ssat16_A1(cond, rd, _, rm)
+        | ArmA32Instruction::Usat16_A1(cond, rd, _, rm) => {
+            a32_linear(pc, length, *cond, set([gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmA32Instruction::ExtendAndAdd_A1(cond, _, rd, rn, rm, _)
+        | ArmA32Instruction::Pkhbt_A1(cond, rd, rn, rm, _)
+        | ArmA32Instruction::Pkhtb_A1(cond, rd, rn, rm, _) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rn), gpr(*rm)]),
+            set([gpr(*rd)]),
+        ),
+        ArmA32Instruction::Bfc_A1(cond, rd, _, _) => {
+            a32_linear(pc, length, *cond, set([gpr(*rd)]), set([gpr(*rd)]))
+        }
+        ArmA32Instruction::Bfi_A1(cond, rd, rn, _, _)
+        | ArmA32Instruction::Sbfx_A1(cond, rd, rn, _, _)
+        | ArmA32Instruction::Ubfx_A1(cond, rd, rn, _, _) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rd), gpr(*rn)]),
+            set([gpr(*rd)]),
+        ),
+        ArmA32Instruction::Ldrt_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Ldrbt_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Ldrht_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Ldrsbt_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Ldrsht_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Lda_A1(cond, rt, rn)
+        | ArmA32Instruction::Ldab_A1(cond, rt, rn)
+        | ArmA32Instruction::Ldah_A1(cond, rt, rn)
+        | ArmA32Instruction::Ldaex_A1(cond, rt, rn)
+        | ArmA32Instruction::Ldaexb_A1(cond, rt, rn)
+        | ArmA32Instruction::Ldaexh_A1(cond, rt, rn) => {
+            a32_linear(pc, length, *cond, set([gpr(*rn)]), set([gpr(*rt)]))
+        }
+        ArmA32Instruction::Ldaexd_A1(cond, rt, rn) => {
+            let mut writes = set([gpr(*rt)]);
+            if let Some(rt2) = pair_reg(gpr(*rt)) {
+                writes.insert(rt2);
+            }
+            a32_linear(pc, length, *cond, set([gpr(*rn)]), writes)
+        }
+        ArmA32Instruction::Strt_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Strbt_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Strht_A1(cond, rt, rn, _)
+        | ArmA32Instruction::Stl_A1(cond, rt, rn)
+        | ArmA32Instruction::Stlb_A1(cond, rt, rn)
+        | ArmA32Instruction::Stlh_A1(cond, rt, rn) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rt), gpr(*rn)]),
+            BTreeSet::new(),
+        ),
+        ArmA32Instruction::Stlex_A1(cond, rd, rt, rn)
+        | ArmA32Instruction::Stlexb_A1(cond, rd, rt, rn)
+        | ArmA32Instruction::Stlexh_A1(cond, rd, rt, rn)
+        | ArmA32Instruction::Stlexd_A1(cond, rd, rt, rn) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rt), gpr(*rn)]),
+            set([gpr(*rd)]),
+        ),
+        ArmA32Instruction::Mrs_A1(cond, _, rd)
+        | ArmA32Instruction::MrsBanked_A1(cond, _, _, rd) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rd)]))
+        }
+        ArmA32Instruction::Msr_Register_A1(cond, _, _, rm)
+        | ArmA32Instruction::MsrBanked_A1(cond, _, _, rm) => {
+            a32_linear(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new())
+        }
+        ArmA32Instruction::Msr_Immediate_A1(cond, _, _, _) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmA32Instruction::Mrc_A1(cond, _, _, rt, _, _, _) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rt)]))
+        }
+        ArmA32Instruction::Mrc2_A1(_, _, rt, _, _, _) => unsupported(
             Isa::Arm,
             pc,
             length,
-            a32_conditional(*cond),
+            false,
+            BTreeSet::new(),
+            set([gpr(*rt)]),
+            ControlFlow::Linear,
+        ),
+        ArmA32Instruction::Mcr_A1(cond, _, _, rt, _, _, _) => {
+            a32_linear(pc, length, *cond, set([gpr(*rt)]), BTreeSet::new())
+        }
+        ArmA32Instruction::Mcr2_A1(_, _, rt, _, _, _) => unsupported(
+            Isa::Arm,
+            pc,
+            length,
+            false,
+            set([gpr(*rt)]),
+            BTreeSet::new(),
+            ControlFlow::Linear,
+        ),
+        ArmA32Instruction::Mrrc_A1(cond, _, _, rt, rt2, _) => a32_linear(
+            pc,
+            length,
+            *cond,
+            BTreeSet::new(),
+            set([gpr(*rt), gpr(*rt2)]),
+        ),
+        ArmA32Instruction::Mrrc2_A1(_, _, rt, rt2, _) => unsupported(
+            Isa::Arm,
+            pc,
+            length,
+            false,
+            BTreeSet::new(),
+            set([gpr(*rt), gpr(*rt2)]),
+            ControlFlow::Linear,
+        ),
+        ArmA32Instruction::Mcrr_A1(cond, _, _, rt, rt2, _) => a32_linear(
+            pc,
+            length,
+            *cond,
+            set([gpr(*rt), gpr(*rt2)]),
+            BTreeSet::new(),
+        ),
+        ArmA32Instruction::Mcrr2_A1(_, _, rt, rt2, _) => unsupported(
+            Isa::Arm,
+            pc,
+            length,
+            false,
+            set([gpr(*rt), gpr(*rt2)]),
+            BTreeSet::new(),
+            ControlFlow::Linear,
+        ),
+        ArmA32Instruction::Ldc_A1(cond, _, _, _, rn, _, _, _)
+        | ArmA32Instruction::Stc_A1(cond, _, _, _, rn, _, _, _) => {
+            a32_linear(pc, length, *cond, set([gpr(*rn)]), set([gpr(*rn)]))
+        }
+        ArmA32Instruction::Ldc2_A1(_, _, _, rn, _, _, _)
+        | ArmA32Instruction::Stc2_A1(_, _, _, rn, _, _, _) => unsupported(
+            Isa::Arm,
+            pc,
+            length,
+            false,
             set([gpr(*rn)]),
+            set([gpr(*rn)]),
+            ControlFlow::Linear,
+        ),
+        ArmA32Instruction::Cdp_A1(cond, _, _, _, _, _, _) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmA32Instruction::Cdp2_A1(_, _, _, _, _, _) => unsupported(
+            Isa::Arm,
+            pc,
+            length,
+            false,
+            BTreeSet::new(),
             BTreeSet::new(),
             ControlFlow::Linear,
         ),
@@ -2779,26 +3057,40 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
         | ArmA32Instruction::Yield_A1(cond)
         | ArmA32Instruction::Wfe_A1(cond)
         | ArmA32Instruction::Wfi_A1(cond)
-        | ArmA32Instruction::Sev_A1(cond) => unsupported(
+        | ArmA32Instruction::Sev_A1(cond)
+        | ArmA32Instruction::Dbg_A1(cond, _)
+        | ArmA32Instruction::Csdb_A1(cond)
+        | ArmA32Instruction::Esb_A1(cond)
+        | ArmA32Instruction::Sevl_A1(cond) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmA32Instruction::Dmb_A1(_)
+        | ArmA32Instruction::Dsb_A1(_)
+        | ArmA32Instruction::Isb_A1(_)
+        | ArmA32Instruction::Clrex_A1
+        | ArmA32Instruction::Setend_A1(_)
+        | ArmA32Instruction::Setpan_A1(_)
+        | ArmA32Instruction::Cps_A1(_, _, _, _, _) => unsupported(
             Isa::Arm,
             pc,
             length,
-            a32_conditional(*cond),
+            false,
             BTreeSet::new(),
             BTreeSet::new(),
             ControlFlow::Linear,
         ),
+        ArmA32Instruction::Bxj_A1(cond, rm) => {
+            a32_stop(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new())
+        }
         ArmA32Instruction::Svc_A1(cond, _)
         | ArmA32Instruction::Bkpt_A1(cond, _)
-        | ArmA32Instruction::Bxj_A1(cond, _) => unsupported(
-            Isa::Arm,
-            pc,
-            length,
-            a32_conditional(*cond),
-            BTreeSet::new(),
-            BTreeSet::new(),
-            ControlFlow::Stop,
-        ),
+        | ArmA32Instruction::Hlt_A1(cond, _)
+        | ArmA32Instruction::Hvc_A1(cond, _)
+        | ArmA32Instruction::Smc_A1(cond, _)
+        | ArmA32Instruction::Udf_A1(cond, _)
+        | ArmA32Instruction::Eret_A1(cond) => {
+            a32_stop(pc, length, *cond, BTreeSet::new(), BTreeSet::new())
+        }
         _ => unsupported(
             Isa::Arm,
             pc,
@@ -2811,6 +3103,40 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
     }
 }
 
+fn t32_linear(
+    pc: u32,
+    length: u8,
+    reads: BTreeSet<Register>,
+    writes: BTreeSet<Register>,
+) -> DecodedInstruction {
+    unsupported(
+        Isa::Thumb,
+        pc,
+        length,
+        false,
+        reads,
+        writes,
+        ControlFlow::Linear,
+    )
+}
+
+fn t32_stop(
+    pc: u32,
+    length: u8,
+    reads: BTreeSet<Register>,
+    writes: BTreeSet<Register>,
+) -> DecodedInstruction {
+    unsupported(
+        Isa::Thumb,
+        pc,
+        length,
+        false,
+        reads,
+        writes,
+        ControlFlow::Stop,
+    )
+}
+
 fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInstruction {
     match inst {
         ArmT32Instruction::And_Register_T1(rdn, rm)
@@ -2818,15 +3144,31 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         | ArmT32Instruction::Orr_Register_T1(rdn, rm)
         | ArmT32Instruction::Bic_Register_T1(rdn, rm)
         | ArmT32Instruction::Adc_Register_T1(rdn, rm)
-        | ArmT32Instruction::Sbc_Register_T1(rdn, rm) => unsupported(
-            Isa::Thumb,
+        | ArmT32Instruction::Sbc_Register_T1(rdn, rm)
+        | ArmT32Instruction::Lsl_Register_T1(rdn, rm)
+        | ArmT32Instruction::Lsr_Register_T1(rdn, rm)
+        | ArmT32Instruction::Asr_Register_T1(rdn, rm)
+        | ArmT32Instruction::Ror_Register_T1(rdn, rm)
+        | ArmT32Instruction::Mul_T1(rdn, rm) => t32_linear(
             pc,
             length,
-            false,
             set([low_reg(*rdn), low_reg(*rm)]),
             set([low_reg(*rdn)]),
-            ControlFlow::Linear,
         ),
+        ArmT32Instruction::Lsl_Immediate_T1(rd, rm, _)
+        | ArmT32Instruction::Lsr_Immediate_T1(rd, rm, _)
+        | ArmT32Instruction::Asr_Immediate_T1(rd, rm, _)
+        | ArmT32Instruction::Mvn_Register_T1(rd, rm)
+        | ArmT32Instruction::Rev_T1(rd, rm)
+        | ArmT32Instruction::Rev16_T1(rd, rm)
+        | ArmT32Instruction::Revsh_T1(rd, rm)
+        | ArmT32Instruction::Sxtb_T1(rd, rm)
+        | ArmT32Instruction::Sxth_T1(rd, rm)
+        | ArmT32Instruction::Uxtb_T1(rd, rm)
+        | ArmT32Instruction::Uxth_T1(rd, rm)
+        | ArmT32Instruction::Rsb_Immediate_T1(rd, rm) => {
+            t32_linear(pc, length, set([low_reg(*rm)]), set([low_reg(*rd)]))
+        }
         ArmT32Instruction::And_Immediate_T1(rd, rn, _, _)
         | ArmT32Instruction::Eor_Immediate_T1(rd, rn, _, _)
         | ArmT32Instruction::Orr_Immediate_T1(rd, rn, _, _)
@@ -2834,54 +3176,160 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         | ArmT32Instruction::Adc_Immediate_T1(rd, rn, _, _)
         | ArmT32Instruction::Sbc_Immediate_T1(rd, rn, _, _)
         | ArmT32Instruction::Rsb_Immediate_T2(rd, rn, _, _)
-        | ArmT32Instruction::Orn_Immediate_T1(rd, rn, _, _) => unsupported(
-            Isa::Thumb,
+        | ArmT32Instruction::Orn_Immediate_T1(rd, rn, _, _)
+        | ArmT32Instruction::Ssat_T1(rd, _, rn, _)
+        | ArmT32Instruction::Usat_T1(rd, _, rn, _)
+        | ArmT32Instruction::Ssat16_T1(rd, _, rn)
+        | ArmT32Instruction::Usat16_T1(rd, _, rn) => {
+            t32_linear(pc, length, set([gpr(*rn)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::And_Register_T2(rd, rn, rm, _, _)
+        | ArmT32Instruction::Orr_Register_T2(rd, rn, rm, _, _)
+        | ArmT32Instruction::Eor_Register_T2(rd, rn, rm, _, _)
+        | ArmT32Instruction::Bic_Register_T2(rd, rn, rm, _, _)
+        | ArmT32Instruction::Adc_Register_T2(rd, rn, rm, _, _)
+        | ArmT32Instruction::Sbc_Register_T2(rd, rn, rm, _, _)
+        | ArmT32Instruction::Rsb_Register_T1(rd, rn, rm, _, _)
+        | ArmT32Instruction::Orn_Register_T1(rd, rn, rm, _, _)
+        | ArmT32Instruction::Mul_T2(rd, rn, rm)
+        | ArmT32Instruction::Sdiv_T1(rd, rn, rm)
+        | ArmT32Instruction::Udiv_T1(rd, rn, rm) => {
+            t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Mvn_Immediate_T1(rd, _, _) | ArmT32Instruction::Mrs_T1(rd, _) => {
+            t32_linear(pc, length, BTreeSet::new(), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Mvn_Register_T2(rd, rm, _, _)
+        | ArmT32Instruction::Clz_T1(rd, rm)
+        | ArmT32Instruction::Rbit_T1(rd, rm)
+        | ArmT32Instruction::Sxtb_T2(rd, rm, _)
+        | ArmT32Instruction::Uxtb_T2(rd, rm, _)
+        | ArmT32Instruction::Sxth_T2(rd, rm, _)
+        | ArmT32Instruction::Uxth_T2(rd, rm, _)
+        | ArmT32Instruction::Rev_T2(rd, rm)
+        | ArmT32Instruction::Rev16_T2(rd, rm)
+        | ArmT32Instruction::Revsh_T2(rd, rm)
+        | ArmT32Instruction::Sxtb16_T1(rd, rm, _)
+        | ArmT32Instruction::Uxtb16_T1(rd, rm, _) => {
+            t32_linear(pc, length, set([gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Bfc_T1(rd, _, _) => {
+            t32_linear(pc, length, set([gpr(*rd)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Bfi_T1(rd, rn, _, _)
+        | ArmT32Instruction::Sbfx_T1(rd, rn, _, _)
+        | ArmT32Instruction::Ubfx_T1(rd, rn, _, _) => {
+            t32_linear(pc, length, set([gpr(*rd), gpr(*rn)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Qadd_T1(rd, rm, rn)
+        | ArmT32Instruction::Qsub_T1(rd, rm, rn)
+        | ArmT32Instruction::Qdadd_T1(rd, rm, rn)
+        | ArmT32Instruction::Qdsub_T1(rd, rm, rn)
+        | ArmT32Instruction::Sxtab_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Uxtab_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Sxtah_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Uxtah_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Sxtab16_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Uxtab16_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Pkhbt_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Pkhtb_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Sel_T1(rd, rn, rm)
+        | ArmT32Instruction::Usad8_T1(rd, rn, rm)
+        | ArmT32Instruction::ParallelAddSub_T1(_, _, rd, rn, rm)
+        | ArmT32Instruction::Smul_T1(rd, rn, rm, _, _)
+        | ArmT32Instruction::Smulw_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Smuad_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Smusd_T1(rd, rn, rm, _)
+        | ArmT32Instruction::Smmul_T1(rd, rn, rm, _) => {
+            t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Usada8_T1(rd, rn, rm, ra)
+        | ArmT32Instruction::Smla_T1(rd, rn, rm, ra, _, _)
+        | ArmT32Instruction::Smlaw_T1(rd, rn, rm, ra, _)
+        | ArmT32Instruction::Smlad_T1(rd, rn, rm, ra, _)
+        | ArmT32Instruction::Smlsd_T1(rd, rn, rm, ra, _)
+        | ArmT32Instruction::Smmla_T1(rd, rn, rm, ra, _)
+        | ArmT32Instruction::Smmls_T1(rd, rn, rm, ra, _) => t32_linear(
             pc,
             length,
-            false,
-            set([gpr(*rn)]),
+            set([gpr(*rn), gpr(*rm), gpr(*ra)]),
             set([gpr(*rd)]),
-            ControlFlow::Linear,
         ),
+        ArmT32Instruction::Smull_T1(rdlo, rdhi, rn, rm)
+        | ArmT32Instruction::Umull_T1(rdlo, rdhi, rn, rm)
+        | ArmT32Instruction::Smlal_T1(rdlo, rdhi, rn, rm)
+        | ArmT32Instruction::Umlal_T1(rdlo, rdhi, rn, rm)
+        | ArmT32Instruction::Umaal_T1(rdlo, rdhi, rn, rm)
+        | ArmT32Instruction::Smlal_Halfword_T1(rdlo, rdhi, rn, rm, _, _)
+        | ArmT32Instruction::Smlald_T1(rdlo, rdhi, rn, rm, _)
+        | ArmT32Instruction::Smlsld_T1(rdlo, rdhi, rn, rm, _) => t32_linear(
+            pc,
+            length,
+            set([gpr(*rdlo), gpr(*rdhi), gpr(*rn), gpr(*rm)]),
+            set([gpr(*rdlo), gpr(*rdhi)]),
+        ),
+        ArmT32Instruction::Cmp_Immediate_T1(rn, _) => {
+            t32_linear(pc, length, set([low_reg(*rn)]), BTreeSet::new())
+        }
+        ArmT32Instruction::Cmp_Immediate_T2(rn, _)
+        | ArmT32Instruction::Tst_Immediate_T1(rn, _)
+        | ArmT32Instruction::Teq_Immediate_T1(rn, _)
+        | ArmT32Instruction::Cmn_Immediate_T1(rn, _) => {
+            t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
+        }
+        ArmT32Instruction::Tst_Register_T1(rn, rm)
+        | ArmT32Instruction::Cmp_Register_T1(rn, rm)
+        | ArmT32Instruction::Cmn_Register_T1(rn, rm) => t32_linear(
+            pc,
+            length,
+            set([low_reg(*rn), low_reg(*rm)]),
+            BTreeSet::new(),
+        ),
+        ArmT32Instruction::Cmp_Register_T2(rn, rm)
+        | ArmT32Instruction::Tst_Register_T2(rn, rm, _)
+        | ArmT32Instruction::Teq_Register_T1(rn, rm, _)
+        | ArmT32Instruction::Cmn_Register_T2(rn, rm, _)
+        | ArmT32Instruction::Cmp_Register_T3(rn, rm, _) => {
+            t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), BTreeSet::new())
+        }
+        ArmT32Instruction::Msr_Register_T1(_, rn) => {
+            t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
+        }
+        ArmT32Instruction::LoadAcquire_T1(_, _, rt, rn)
+        | ArmT32Instruction::UnprivLoadStore_T1(true, _, _, rt, rn, _) => {
+            t32_linear(pc, length, set([gpr(*rn)]), set([gpr(*rt)]))
+        }
+        ArmT32Instruction::StoreRelease_T1(_, rt, rn)
+        | ArmT32Instruction::UnprivLoadStore_T1(false, _, _, rt, rn, _) => {
+            t32_linear(pc, length, set([gpr(*rt), gpr(*rn)]), BTreeSet::new())
+        }
+        ArmT32Instruction::StoreReleaseExclusive_T1(_, rd, rt, rn) => {
+            t32_linear(pc, length, set([gpr(*rt), gpr(*rn)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Pld_Immediate_T1(rn, _) | ArmT32Instruction::Pli_Immediate_T1(rn, _) => {
+            t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
+        }
         ArmT32Instruction::Nop_T1
         | ArmT32Instruction::Yield_T1
         | ArmT32Instruction::Wfe_T1
         | ArmT32Instruction::Wfi_T1
-        | ArmT32Instruction::Sev_T1 => unsupported(
-            Isa::Thumb,
-            pc,
-            length,
-            false,
-            BTreeSet::new(),
-            BTreeSet::new(),
-            ControlFlow::Linear,
-        ),
-        ArmT32Instruction::Tst_Register_T1(rn, rm)
-        | ArmT32Instruction::Cmp_Register_T1(rn, rm)
-        | ArmT32Instruction::Cmn_Register_T1(rn, rm) => unsupported(
-            Isa::Thumb,
-            pc,
-            length,
-            false,
-            set([low_reg(*rn), low_reg(*rm)]),
-            BTreeSet::new(),
-            ControlFlow::Linear,
-        ),
+        | ArmT32Instruction::Sev_T1
+        | ArmT32Instruction::Dmb_T1(_)
+        | ArmT32Instruction::Dsb_T1(_)
+        | ArmT32Instruction::Isb_T1(_)
+        | ArmT32Instruction::Clrex_T1
+        | ArmT32Instruction::Cps_T1(_)
+        | ArmT32Instruction::Setpan_T1(_) => {
+            t32_linear(pc, length, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmT32Instruction::Tbb_T1(rn, rm) | ArmT32Instruction::Tbh_T1(rn, rm) => {
+            t32_stop(pc, length, set([gpr(*rn), gpr(*rm)]), BTreeSet::new())
+        }
         ArmT32Instruction::Svc_T1(_)
         | ArmT32Instruction::Bkpt_T1(_)
         | ArmT32Instruction::Hlt_T1(_)
         | ArmT32Instruction::Udf_T1(_)
-        | ArmT32Instruction::Udf_T2(_)
-        | ArmT32Instruction::Tbb_T1(_, _)
-        | ArmT32Instruction::Tbh_T1(_, _) => unsupported(
-            Isa::Thumb,
-            pc,
-            length,
-            false,
-            BTreeSet::new(),
-            BTreeSet::new(),
-            ControlFlow::Stop,
-        ),
+        | ArmT32Instruction::Udf_T2(_) => t32_stop(pc, length, BTreeSet::new(), BTreeSet::new()),
         _ => unsupported(
             Isa::Thumb,
             pc,
@@ -4083,6 +4531,48 @@ mod tests {
                     linear(),
                 ),
             },
+            NamedFixture {
+                name: "t32_cmp_imm",
+                isa: Isa::Thumb,
+                bytes: &[0x00, 0x28],
+                expected: expected(
+                    Isa::Thumb,
+                    2,
+                    false,
+                    &[R0],
+                    &[],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "a32_cmp_reg",
+                isa: Isa::Arm,
+                bytes: &[0x01, 0x00, 0x50, 0xe1],
+                expected: expected(
+                    Isa::Arm,
+                    4,
+                    false,
+                    &[R0, R1],
+                    &[],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_lsls",
+                isa: Isa::Thumb,
+                bytes: &[0x88, 0x00],
+                expected: expected(
+                    Isa::Thumb,
+                    2,
+                    false,
+                    &[R1],
+                    &[R0],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
         ]
     }
 
@@ -4358,6 +4848,36 @@ mod tests {
             let message = err_message(result);
             assert!(message.contains(needle), "{name}: {message}");
         }
+    }
+
+    #[test]
+    fn decode_function_rejects_duplicate_pcs() {
+        let decoder = ScriptedDecoder::new(vec![
+            Scripted::Insn(linear_at(Isa::Arm, 0x1000, 4)),
+            Scripted::Insn(linear_at(Isa::Arm, 0x1000, 4)),
+        ]);
+        let message = err_message(decode_function(
+            &decoder,
+            &function(0x1000, vec![arm_range(0x1000, 0x1008)]),
+            &[0; 16],
+            0x1000,
+        ));
+        assert!(message.contains("duplicate"), "duplicate PC: {message}");
+    }
+
+    #[test]
+    fn decode_function_rejects_pc_regression() {
+        let decoder = ScriptedDecoder::new(vec![
+            Scripted::Insn(linear_at(Isa::Arm, 0x1000, 4)),
+            Scripted::Insn(linear_at(Isa::Arm, 0x0ffc, 4)),
+        ]);
+        let message = err_message(decode_function(
+            &decoder,
+            &function(0x1000, vec![arm_range(0x1000, 0x1008)]),
+            &[0; 16],
+            0x1000,
+        ));
+        assert!(message.contains("regressed"), "PC regression: {message}");
     }
 
     #[test]
