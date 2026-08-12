@@ -2728,15 +2728,14 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
             continue;
         }
         // Capture from this line through the matching closing brace at depth 0.
-        // State machine tracks string literals + line/block comments so a `}` inside
-        // `"expected }"` or `// close }` doesn't truncate the body. Char literals
-        // (`'}'`) are not tracked — rare in Ghidra decompiled C, and bounded impact
-        // (only affected body_c, matching is by entry address). Mirrors the
-        // string-aware pattern already used by `balanced_json_end`.
+        // State machine tracks string/char literals + line/block comments so a `}`
+        // inside `"expected }"`, `'}'`, or `// close }` doesn't truncate the body.
+        // Mirrors the string-aware pattern already used by `balanced_json_end`.
         let mut depth = 0i32;
         let mut saw_brace = false;
         let mut body = String::new();
         let mut in_string = false;
+        let mut in_char = false;
         let mut escaped = false;
         let mut in_block_comment = false;
         while i < lines.len() {
@@ -2760,8 +2759,19 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
                     }
                     continue;
                 }
+                if in_char {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '\'' {
+                        in_char = false;
+                    }
+                    continue;
+                }
                 match ch {
                     '"' => in_string = true,
+                    '\'' => in_char = true,
                     '/' => {
                         if chars.peek() == Some(&'/') {
                             chars.next();
@@ -5020,5 +5030,43 @@ INFO: second pdfj body was noisy and not parseable
             "body_c was truncated by an in-string/comment brace:\n{body_c}"
         );
         assert!(body_c.contains("expected } close"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_does_not_treat_char_literal_brace_as_body_end() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char c = '}';\n\
+  helper();\n\
+}\n\
+// FUN_20 @ 00000020\n\
+void FUN_20(void)\n\
+{\n\
+  return;\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        // Keys are normalize_thumb_addr output (strip leading zeros, clear T-bit).
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("helper();"), "{body}");
+        assert!(!body.contains("FUN_20"), "{body}");
+        assert!(bodies.contains_key("20"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_tracks_escaped_char_literals() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char q = '\\'';\n\
+  char b = '}';\n\
+  done();\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("done();"), "{body}");
+        assert!(body.ends_with("}\n") || body.trim_end().ends_with('}'), "{body}");
     }
 }
