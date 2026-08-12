@@ -3079,6 +3079,59 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
             BTreeSet::new(),
             ControlFlow::Linear,
         ),
+        ArmA32Instruction::Pld_A1(rn, offset)
+        | ArmA32Instruction::Pldw_A1(rn, offset)
+        | ArmA32Instruction::Pli_A1(rn, offset) => {
+            let resolved = a32_offset(offset);
+            let mut reads = BTreeSet::new();
+            if !is_pc(*rn) {
+                reads.insert(gpr(*rn));
+            }
+            if let Some(register) = resolved.extra_read {
+                reads.insert(register);
+            }
+            unsupported(
+                Isa::Arm,
+                pc,
+                length,
+                false,
+                reads,
+                BTreeSet::new(),
+                ControlFlow::Linear,
+            )
+        }
+        ArmA32Instruction::Rfe_A1(_, rn, writeback) => {
+            let writes = if *writeback {
+                set([gpr(*rn)])
+            } else {
+                BTreeSet::new()
+            };
+            unsupported(
+                Isa::Arm,
+                pc,
+                length,
+                false,
+                set([gpr(*rn)]),
+                writes,
+                ControlFlow::Stop,
+            )
+        }
+        ArmA32Instruction::Srs_A1(_, writeback, _) => {
+            let writes = if *writeback {
+                set([SP])
+            } else {
+                BTreeSet::new()
+            };
+            unsupported(
+                Isa::Arm,
+                pc,
+                length,
+                false,
+                set([SP]),
+                writes,
+                ControlFlow::Linear,
+            )
+        }
         ArmA32Instruction::Bxj_A1(cond, rm) => {
             a32_stop(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new())
         }
@@ -3199,7 +3252,8 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         ArmT32Instruction::Mvn_Immediate_T1(rd, _, _) | ArmT32Instruction::Mrs_T1(rd, _) => {
             t32_linear(pc, length, BTreeSet::new(), set([gpr(*rd)]))
         }
-        ArmT32Instruction::Mvn_Register_T2(rd, rm, _, _)
+        ArmT32Instruction::Mov_Register_T3(rd, rm, _, _)
+        | ArmT32Instruction::Mvn_Register_T2(rd, rm, _, _)
         | ArmT32Instruction::Clz_T1(rd, rm)
         | ArmT32Instruction::Rbit_T1(rd, rm)
         | ArmT32Instruction::Sxtb_T2(rd, rm, _)
@@ -3243,7 +3297,9 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         | ArmT32Instruction::Smmul_T1(rd, rn, rm, _) => {
             t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
         }
-        ArmT32Instruction::Usada8_T1(rd, rn, rm, ra)
+        ArmT32Instruction::Mla_T1(rd, rn, rm, ra)
+        | ArmT32Instruction::Mls_T1(rd, rn, rm, ra)
+        | ArmT32Instruction::Usada8_T1(rd, rn, rm, ra)
         | ArmT32Instruction::Smla_T1(rd, rn, rm, ra, _, _)
         | ArmT32Instruction::Smlaw_T1(rd, rn, rm, ra, _)
         | ArmT32Instruction::Smlad_T1(rd, rn, rm, ra, _)
@@ -3309,6 +3365,62 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         ArmT32Instruction::Pld_Immediate_T1(rn, _) | ArmT32Instruction::Pli_Immediate_T1(rn, _) => {
             t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
         }
+        ArmT32Instruction::Coproc_Mcr_T1(_, false, _, _, rt, _, _, _) => {
+            t32_linear(pc, length, set([gpr(*rt)]), BTreeSet::new())
+        }
+        ArmT32Instruction::Coproc_Mcr_T1(_, true, _, _, rt, _, _, _) => {
+            t32_linear(pc, length, BTreeSet::new(), set([gpr(*rt)]))
+        }
+        ArmT32Instruction::Coproc_Mcrr_T1(_, false, _, _, rt, rt2, _) => {
+            t32_linear(pc, length, set([gpr(*rt), gpr(*rt2)]), BTreeSet::new())
+        }
+        ArmT32Instruction::Coproc_Mcrr_T1(_, true, _, _, rt, rt2, _) => {
+            t32_linear(pc, length, BTreeSet::new(), set([gpr(*rt), gpr(*rt2)]))
+        }
+        ArmT32Instruction::Coproc_Ldc_T1(_, _, _, _, _, rn, _) => {
+            t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
+        }
+        ArmT32Instruction::Coproc_Cdp_T1(_, _, _, _, _, _, _) => {
+            t32_linear(pc, length, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmT32Instruction::PacbtiHint_T1(_) => {
+            t32_linear(pc, length, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmT32Instruction::PacbtiData_T1(2, _, rn, rm) => {
+            t32_stop(pc, length, set([gpr(*rn), gpr(*rm)]), BTreeSet::new())
+        }
+        ArmT32Instruction::PacbtiData_T1(_, rd, rn, rm) => {
+            t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Cde_Cx1_T1(_, dual, _, rd, _) => {
+            let mut writes = set([gpr(*rd)]);
+            if *dual && let Some(pair) = pair_reg(gpr(*rd)) {
+                writes.insert(pair);
+            }
+            t32_linear(pc, length, BTreeSet::new(), writes)
+        }
+        ArmT32Instruction::Cde_Cx2_T1(_, dual, _, rd, rn, _) => {
+            let mut writes = set([gpr(*rd)]);
+            if *dual && let Some(pair) = pair_reg(gpr(*rd)) {
+                writes.insert(pair);
+            }
+            t32_linear(pc, length, set([gpr(*rn)]), writes)
+        }
+        ArmT32Instruction::Cde_Cx3_T1(_, dual, _, rd, rn, rm, _) => {
+            let mut writes = set([gpr(*rd)]);
+            if *dual && let Some(pair) = pair_reg(gpr(*rd)) {
+                writes.insert(pair);
+            }
+            t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), writes)
+        }
+        ArmT32Instruction::Bf_T1(_, _)
+        | ArmT32Instruction::Bfl_T4(_, _)
+        | ArmT32Instruction::Bfcsel_T2(_, _, _, _) => {
+            t32_stop(pc, length, BTreeSet::new(), BTreeSet::new())
+        }
+        ArmT32Instruction::Bfx_T3(_, rn) | ArmT32Instruction::Bflx_T5(_, rn) => {
+            t32_stop(pc, length, set([gpr(*rn)]), BTreeSet::new())
+        }
         ArmT32Instruction::Nop_T1
         | ArmT32Instruction::Yield_T1
         | ArmT32Instruction::Wfe_T1
@@ -3354,6 +3466,7 @@ mod tests {
     const R0: Register = Register(0);
     const R1: Register = Register(1);
     const R2: Register = Register(2);
+    const R3: Register = Register(3);
 
     fn decode(isa: Isa, pc: u32, bytes: &[u8]) -> DecodedInstruction {
         let decoder = PureRustDecoder;
@@ -4569,6 +4682,62 @@ mod tests {
                     false,
                     &[R1],
                     &[R0],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_lsl_w",
+                isa: Isa::Thumb,
+                bytes: &[0x4f, 0xea, 0xc1, 0x00],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R1],
+                    &[R0],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_mla",
+                isa: Isa::Thumb,
+                bytes: &[0x01, 0xfb, 0x02, 0x30],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R1, R2, R3],
+                    &[R0],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "a32_pld",
+                isa: Isa::Arm,
+                bytes: &[0x08, 0xf0, 0xd0, 0xf5],
+                expected: expected(
+                    Isa::Arm,
+                    4,
+                    false,
+                    &[R0],
+                    &[],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_mcr",
+                isa: Isa::Thumb,
+                bytes: &[0x00, 0xee, 0x10, 0x1f],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R1],
+                    &[],
                     SemanticEffect::Unsupported,
                     linear(),
                 ),
