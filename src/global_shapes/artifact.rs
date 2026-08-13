@@ -570,7 +570,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_atomic_with_before_commit(path, bytes, || Ok(()))
 }
 
-fn write_atomic_with_before_commit(
+pub(crate) fn write_atomic_with_before_commit(
     path: &Path,
     bytes: &[u8],
     before_commit: impl FnOnce() -> Result<()>,
