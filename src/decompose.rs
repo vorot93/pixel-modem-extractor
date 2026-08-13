@@ -5605,6 +5605,92 @@ mod tests {
     }
 
     #[test]
+    fn global_shapes_stage_both_routes_enter_wrapper_once_after_terminal_events() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_routes_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_shape_manifest(&manifest, &["02_MAIN"]);
+
+        for no_symbol_pass in [false, true] {
+            let mut events = Vec::new();
+            let mut wrapper_calls = 0usize;
+            orchestrate_symbol_route(no_symbol_pass, |step| match step {
+                SymbolRouteStep::DispatchPass2 => events.push("refresh".into()),
+                SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly) => {
+                    events.push("skip".into())
+                }
+                other => events.push(format!("{other:?}")),
+            });
+            orchestrate_post_symbol_route(|step| match step {
+                PostSymbolStep::GlobalShapes => {
+                    events.push("global_shapes".into());
+                    let mut stages = vec![StageReport::decompile(
+                        vec![eligible_shape_image(
+                            "02_MAIN", 1, 1, 0, None, None, None, 0,
+                        )],
+                        1,
+                    )];
+                    run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+                        wrapper_calls += 1;
+                        assert_eq!(request.image_label, "02_MAIN");
+                        global_shapes::run_image(request)
+                    });
+                    assert_eq!(last_stage(&stages).stage, "global_shapes");
+                    assert_eq!(last_stage(&stages).status, "ok");
+                    assert_nine_shape_counts(&stages[0].images[0], Some(0));
+                }
+                PostSymbolStep::DecodeRf => events.push("decode_rf".into()),
+                PostSymbolStep::HardwareConfig => events.push("hardware_config".into()),
+            });
+
+            assert_eq!(
+                wrapper_calls, 1,
+                "both routes must enter the same wrapper once (no_symbol_pass={no_symbol_pass})"
+            );
+            let shapes = events
+                .iter()
+                .position(|event| event == "global_shapes")
+                .expect("global_shapes event");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| *event == "global_shapes")
+                    .count(),
+                1
+            );
+            let terminal = if no_symbol_pass { "skip" } else { "refresh" };
+            let terminal_pos = events
+                .iter()
+                .position(|event| event == terminal)
+                .unwrap_or_else(|| panic!("{terminal} event missing: {events:?}"));
+            assert!(
+                terminal_pos < shapes,
+                "global_shapes must follow {terminal}: {events:?}"
+            );
+            let decode_rf = events
+                .iter()
+                .position(|event| event == "decode_rf")
+                .unwrap();
+            let hardware = events
+                .iter()
+                .position(|event| event == "hardware_config")
+                .unwrap();
+            assert!(shapes < decode_rf && decode_rf < hardware, "{events:?}");
+        }
+
+        let sidecar =
+            std::fs::read(images_dir.join("02_MAIN/decompiled/global_shapes.json")).unwrap();
+        assert!(images_dir.join("02_MAIN/decompiled/globals.json").is_file());
+        assert!(!sidecar.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn symbolicate_stage_runs_over_a_crafted_tree() {
         let root = std::env::temp_dir().join(format!("pme_decompose_sym_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

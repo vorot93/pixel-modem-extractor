@@ -146,6 +146,18 @@ fn decompose_produces_unified_tree() {
                 );
             }
         }
+        if current_global_shapes_inputs_succeeded(image) {
+            for key in NINE_GLOBAL_SHAPES_FIELDS {
+                assert!(
+                    image.get(key).and_then(serde_json::Value::as_u64).is_some(),
+                    "successful global-shapes image must report {key}, including explicit zeros: {image}"
+                );
+            }
+            assert!(
+                image.get("global_shapes_error").is_none(),
+                "successful global-shapes image must omit global_shapes_error: {image}"
+            );
+        }
     }
 
     // Phase 2: thumb_enrich (pass 1) and thumb_enrich_post_pass2 stages are
@@ -168,6 +180,127 @@ fn decompose_produces_unified_tree() {
         stage_names.iter().any(|s| s == "thumb_enrich_post_pass2"),
         "expected thumb_enrich_post_pass2 stage in report: {stage_names:?}"
     );
+    let shapes_positions: Vec<usize> = stage_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| *name == "global_shapes")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        shapes_positions.len(),
+        1,
+        "expected exactly one global_shapes stage: {stage_names:?}"
+    );
+    let shapes = shapes_positions[0];
+    let thumb_post = stage_names
+        .iter()
+        .position(|name| name == "thumb_enrich_post_pass2")
+        .unwrap();
+    assert!(
+        thumb_post < shapes,
+        "global_shapes must follow thumb_enrich_post_pass2: {stage_names:?}"
+    );
+    for decoder in ["decode_rf", "hardware_config"] {
+        if let Some(pos) = stage_names.iter().position(|name| name == decoder) {
+            assert!(
+                shapes < pos,
+                "global_shapes must precede {decoder}: {stage_names:?}"
+            );
+        }
+    }
+
+    let shapes_stage = report["stages"]
+        .as_array()
+        .and_then(|stages| {
+            stages
+                .iter()
+                .find(|stage| stage["stage"] == "global_shapes")
+        })
+        .expect("report.json must contain global_shapes stage");
+    let images = decompile_stage["images"]
+        .as_array()
+        .expect("decompile images");
+    let any_shape_error = images
+        .iter()
+        .any(|image| image.get("global_shapes_error").is_some());
+    assert_eq!(
+        shapes_stage["status"],
+        if any_shape_error { "failed" } else { "ok" },
+        "global_shapes stage status must agree with per-image errors: {shapes_stage}"
+    );
+    let output = shapes_stage["output"]
+        .as_str()
+        .expect("global_shapes stage output");
+    assert!(
+        output.contains("images/*/decompiled/global_shapes.json"),
+        "stage output must name the sidecar glob: {output}"
+    );
+    let mut totals = [0u64; 9];
+    for image in images {
+        if image.get("global_shapes_error").is_some() {
+            continue;
+        }
+        for (index, key) in NINE_GLOBAL_SHAPES_FIELDS.into_iter().enumerate() {
+            totals[index] += image
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+        }
+    }
+    for (key, expected) in [
+        ("inferred=", totals[0]),
+        ("no_evidence=", totals[1]),
+        ("conflicting=", totals[2]),
+        ("observations=", totals[3]),
+        ("ghidra_quarantined=", totals[4]),
+        ("thumb_quarantined=", totals[5]),
+        ("quarantine_errors=", totals[6]),
+        ("decode_failures=", totals[7]),
+        ("state_barriers=", totals[8]),
+    ] {
+        let start = output
+            .find(key)
+            .unwrap_or_else(|| panic!("stage output missing {key}: {output}"));
+        let rest = &output[start + key.len()..];
+        let end = rest
+            .find([',', ')'])
+            .unwrap_or_else(|| panic!("unterminated {key} in {output}"));
+        let actual: u64 = rest[..end]
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid {key} in {output}"));
+        assert_eq!(actual, expected, "stage output {key} mismatch in {output}");
+    }
+    let main = images
+        .iter()
+        .find(|image| image["image"] == "02_MAIN")
+        .expect("02_MAIN entry missing from decompile stage");
+    if current_global_shapes_inputs_succeeded(main) {
+        assert!(
+            out.join("images")
+                .join("02_MAIN")
+                .join("decompiled")
+                .join("global_shapes.json")
+                .exists(),
+            "02_MAIN current inputs succeeded but global_shapes.json is missing"
+        );
+        if main.get("global_shapes_error").is_none() {
+            assert_eq!(
+                main["global_shapes_inferred"]
+                    .as_u64()
+                    .expect("02_MAIN inferred")
+                    + main["global_shapes_no_evidence"]
+                        .as_u64()
+                        .expect("02_MAIN no_evidence")
+                    + main["global_shapes_conflicting"]
+                        .as_u64()
+                        .expect("02_MAIN conflicting"),
+                main["globals_recovered"]
+                    .as_u64()
+                    .expect("02_MAIN globals_recovered"),
+                "status counts must conserve Recovered globals: {main}"
+            );
+        }
+    }
 
     // decompiled.c on 02_MAIN contains a plate comment from inline evidence.
     let main_c = std::fs::read_to_string(
@@ -382,4 +515,134 @@ fn report_json_includes_phase3_0_1_fields() {
         main.get("globals_provisional_suppressed").is_some(),
         "globals_provisional_suppressed missing — refresh_decompile_stage_images not called after Phase 3.0.1 sweep: {main}"
     );
+}
+
+const NINE_GLOBAL_SHAPES_FIELDS: [&str; 9] = [
+    "global_shapes_inferred",
+    "global_shapes_no_evidence",
+    "global_shapes_conflicting",
+    "global_shape_observations",
+    "global_shapes_ghidra_quarantined",
+    "global_shapes_thumb_quarantined",
+    "global_shapes_quarantine_errors",
+    "global_shapes_decode_failures",
+    "global_shapes_state_barriers",
+];
+
+fn current_global_shapes_inputs_succeeded(image: &serde_json::Value) -> bool {
+    if image
+        .get("functions")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        return false;
+    }
+    let (Some(accepted), Some(quarantined)) = (
+        image
+            .get("ghidra_execution_accepted")
+            .and_then(serde_json::Value::as_u64),
+        image
+            .get("ghidra_execution_quarantined")
+            .and_then(serde_json::Value::as_u64),
+    ) else {
+        return false;
+    };
+    if accepted + quarantined != image["functions"].as_u64().unwrap() {
+        return false;
+    }
+    if image.get("thumb_error").is_some() || image.get("globals_error").is_some() {
+        return false;
+    }
+    let thumb_fields = (
+        image.get("thumb_functions").is_some(),
+        image.get("thumb_execution_accepted").is_some(),
+        image.get("thumb_execution_quarantined").is_some(),
+    );
+    if !matches!(thumb_fields, (false, false, false) | (true, true, true)) {
+        return false;
+    }
+    image
+        .get("globals_recovered")
+        .and_then(serde_json::Value::as_u64)
+        .is_some()
+}
+
+/// Phase 3.2: retained `report.json` carries the `global_shapes` stage and
+/// the nine per-image analysis numbers on a successful current-input image.
+/// Reads `$PME_GOLDEN_DIR/report.json` only and never launches decompose.
+/// Pre-stage corpora (no stage and no per-image fields) skip cleanly.
+#[test]
+fn report_json_includes_global_shapes_fields() {
+    let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = dir.join("report.json");
+    if !report_path.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report.json readable"))
+            .expect("report.json valid JSON");
+    let stages = v["stages"]
+        .as_array()
+        .expect("report.json stages must be an array");
+    let has_stage = stages.iter().any(|stage| stage["stage"] == "global_shapes");
+    let main = stages
+        .iter()
+        .find(|stage| stage["stage"] == "decompile")
+        .and_then(|stage| stage["images"].as_array())
+        .and_then(|images| images.iter().find(|image| image["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+    let has_fields = NINE_GLOBAL_SHAPES_FIELDS
+        .iter()
+        .any(|key| main.get(*key).is_some())
+        || main.get("global_shapes_error").is_some();
+    if !has_stage && !has_fields {
+        eprintln!(
+            "skip: retained tree predates the global_shapes stage ({})",
+            dir.display()
+        );
+        return;
+    }
+    if has_stage {
+        let names: Vec<&str> = stages
+            .iter()
+            .filter_map(|stage| stage["stage"].as_str())
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "global_shapes")
+                .count(),
+            1,
+            "exactly one global_shapes stage: {names:?}"
+        );
+        let shapes = names
+            .iter()
+            .position(|name| *name == "global_shapes")
+            .unwrap();
+        let thumb = names
+            .iter()
+            .position(|name| *name == "thumb_enrich_post_pass2")
+            .expect("thumb_enrich_post_pass2 must precede global_shapes");
+        assert!(thumb < shapes, "{names:?}");
+        for decoder in ["decode_rf", "hardware_config"] {
+            if let Some(pos) = names.iter().position(|name| *name == decoder) {
+                assert!(
+                    shapes < pos,
+                    "global_shapes must precede {decoder}: {names:?}"
+                );
+            }
+        }
+    }
+    if current_global_shapes_inputs_succeeded(main) && main.get("global_shapes_error").is_none() {
+        for key in NINE_GLOBAL_SHAPES_FIELDS {
+            assert!(
+                main.get(key).and_then(serde_json::Value::as_u64).is_some(),
+                "{key} missing on successful 02_MAIN: {main}"
+            );
+        }
+    }
 }
