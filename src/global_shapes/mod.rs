@@ -14,12 +14,12 @@ use artifact::{
     AnalysisWire, DecoderWire, GlobalShapesFile, InputHashesWire, LoadedInputs, Status, serialize,
     write_atomic,
 };
-use decoder::{InstructionDecoder, decode_function, reachable_blocks};
+use decoder::{InstructionDecoder, Register, decode_function, reachable_blocks};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use tracker::CandidateObservation;
+use tracker::{CallFact, CallHop, CandidateObservation};
 
 pub const FORMAT_V2: &str = "pixel-modem-extractor-global-shapes-v2";
 pub use validate::{validate_artifact, validate_artifact_files};
@@ -126,6 +126,47 @@ fn run_image_with(
     Ok(analysis.report)
 }
 
+/// Pass-2 bookkeeping for one distinct (callee identity, seed vector) replay:
+/// every resolved `CallFact` that harvested this exact seed for this exact
+/// callee contributes to `hops_by_address`, keyed by the recovered global
+/// address each seed entry carried (never by register), since a candidate's
+/// `via` is stamped purely from which address it proves, not from how the
+/// callee's own register flow happened to reach it.
+struct SeedGroup<'a> {
+    callee: &'a FunctionExecution,
+    seed: BTreeMap<Register, u32>,
+    hops_by_address: BTreeMap<u32, BTreeSet<CallHop>>,
+}
+
+/// Strict depth-1 callee resolution: an accepted identity's entry must equal
+/// `target` exactly, and its first decode range's ISA (the ISA the entry is
+/// actually invoked in) must equal `isa`. Zero or more than one surviving
+/// match is unresolved, never a guess.
+fn resolve_callee<'a>(
+    entry_index: &BTreeMap<u32, Vec<&'a FunctionExecution>>,
+    target: u32,
+    isa: Isa,
+) -> Option<&'a FunctionExecution> {
+    let mut matches = entry_index
+        .get(&target)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|candidate| {
+            candidate
+                .identity
+                .decode_ranges
+                .first()
+                .map(|range| range.isa)
+                == Some(isa)
+        });
+    let callee = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(callee)
+}
+
 fn analyze_loaded_inputs(
     image_label: &str,
     inputs: &LoadedInputs,
@@ -137,21 +178,39 @@ fn analyze_loaded_inputs(
     ) -> Result<Aggregation>,
 ) -> Result<ImageAnalysis> {
     let identity = decoder.identity();
-    // Pass 1 (below) tracks every function cold, with no interprocedural
-    // seed, and its evidence is attributed intra-procedurally. A later task
-    // adds the seeded pass 2 replay and supplies real `inter` evidence.
+    // Pass 1 tracks every accepted identity cold (no interprocedural seed),
+    // collecting both its intra-procedural candidates and any call-facts it
+    // harvests. Pass 2 (below) resolves those call-facts strictly against
+    // the accepted-identity index, groups them by (callee identity, seed
+    // vector), and re-tracks each distinct group once with its seed; only
+    // evidence that traces back to a seeded global is kept as `inter`.
     let mut intra = Vec::new();
+    let mut inter_candidates = Vec::new();
     let mut instructions_decoded = 0usize;
     let mut decode_failures = 0usize;
     let mut state_barriers = 0usize;
     let mut arm_functions = 0usize;
     let mut thumb_functions = 0usize;
+    let mut direct_calls_resolved = 0usize;
+    let mut call_facts_unresolved = 0usize;
+    let mut seeded_callees = 0usize;
+    let mut seed_vectors = 0usize;
 
     if !inputs.globals.is_empty() {
         let recovered: BTreeSet<u32> = inputs.globals.iter().map(|global| global.address).collect();
         let mut functions: Vec<&FunctionExecution> = inputs.functions.iter().collect();
         functions.sort_by(|left, right| left.identity.cmp(&right.identity));
         (arm_functions, thumb_functions) = count_isa_identities(functions.iter().copied())?;
+
+        let mut entry_index: BTreeMap<u32, Vec<&FunctionExecution>> = BTreeMap::new();
+        for function in &functions {
+            entry_index
+                .entry(function.identity.entry)
+                .or_default()
+                .push(*function);
+        }
+
+        let mut call_facts: Vec<CallFact> = Vec::new();
         for function in functions {
             let decoded = decode_function(decoder, function, &inputs.image, inputs.load_address)?;
             for range in &decoded.ranges {
@@ -184,12 +243,83 @@ fn analyze_loaded_inputs(
             )?;
             state_barriers = add_count(state_barriers, tracked.state_barriers, "state_barriers")?;
             intra.extend(tracked.candidates);
+            call_facts.extend(tracked.call_facts);
         }
+
+        // Resolve, then group resolved facts by (callee identity, seed
+        // vector) so identical seeds harvested from different call sites
+        // replay the callee exactly once; union their CallHop provenance.
+        let mut groups: BTreeMap<(ExecutionIdentity, Vec<(u8, u32)>), SeedGroup<'_>> =
+            BTreeMap::new();
+        for fact in &call_facts {
+            let Some(callee) = resolve_callee(&entry_index, fact.callee_target, fact.callee_isa)
+            else {
+                bump(&mut call_facts_unresolved, "call_facts_unresolved")?;
+                continue;
+            };
+            bump(&mut direct_calls_resolved, "direct_calls_resolved")?;
+            let seed_key: Vec<(u8, u32)> = fact
+                .seed
+                .iter()
+                .map(|(register, address)| (register.0, *address))
+                .collect();
+            let group = groups
+                .entry((callee.identity.clone(), seed_key))
+                .or_insert_with(|| SeedGroup {
+                    callee,
+                    seed: fact.seed.clone(),
+                    hops_by_address: BTreeMap::new(),
+                });
+            for (register, address) in &fact.seed {
+                for context in &fact.caller_contexts {
+                    group
+                        .hops_by_address
+                        .entry(*address)
+                        .or_default()
+                        .insert(CallHop {
+                            caller_entry: fact.caller_entry,
+                            caller_name: context.name.clone(),
+                            call_pc: fact.call_pc,
+                            arg_register: register.0,
+                        });
+                }
+            }
+        }
+
+        // Pass 2: re-track each distinct group once with its seed. Its own
+        // harvested call-facts are discarded (depth-1: no seed originates
+        // from a seeded run). A resulting candidate is kept only when its
+        // target address is one this group actually seeded — anything else
+        // is evidence this same callee would produce on its own and is
+        // already covered by its own Pass-1 cold run.
+        seed_vectors = groups.len();
+        let mut seeded_callee_identities: BTreeSet<ExecutionIdentity> = BTreeSet::new();
+        for group in groups.values() {
+            seeded_callee_identities.insert(group.callee.identity.clone());
+            let decoded =
+                decode_function(decoder, group.callee, &inputs.image, inputs.load_address)?;
+            let blocks = reachable_blocks(group.callee, &decoded)?;
+            let tracked = tracker::track_function(
+                group.callee,
+                &decoded,
+                &blocks,
+                &inputs.image,
+                inputs.load_address,
+                &recovered,
+                &group.seed,
+            )?;
+            for mut candidate in tracked.candidates {
+                let Some(hops) = group.hops_by_address.get(&candidate.target_address) else {
+                    continue;
+                };
+                candidate.via = hops.iter().cloned().collect();
+                inter_candidates.push(candidate);
+            }
+        }
+        seeded_callees = seeded_callee_identities.len();
     }
 
-    // A later (coordinator) task supplies real interprocedural candidates
-    // here; for now the seeded pass 2 replay does not exist yet.
-    let aggregation = aggregate_fn(&inputs.globals, intra, Vec::new())?;
+    let aggregation = aggregate_fn(&inputs.globals, intra, inter_candidates)?;
     let file = GlobalShapesFile {
         format: FORMAT_V2,
         image: image_label.to_owned(),
@@ -215,13 +345,10 @@ fn analyze_loaded_inputs(
             state_barriers,
             observations: aggregation.observations,
             conflicts: aggregation.conflicts,
-            // A later task wires real direct-call and seeding counters;
-            // this stage does not run the seeded pass 2 replay yet, so
-            // these always report zero here.
-            direct_calls_resolved: 0,
-            call_facts_unresolved: 0,
-            seeded_callees: 0,
-            seed_vectors: 0,
+            direct_calls_resolved,
+            call_facts_unresolved,
+            seeded_callees,
+            seed_vectors,
             interprocedural_observations: aggregation.interprocedural_observations,
             interprocedural_dropped: aggregation.interprocedural_dropped,
         },
@@ -387,6 +514,10 @@ fn revalidate(
             || file.analysis.state_barriers != 0
             || file.analysis.observations != 0
             || file.analysis.conflicts != 0
+            || file.analysis.direct_calls_resolved != 0
+            || file.analysis.call_facts_unresolved != 0
+            || file.analysis.seeded_callees != 0
+            || file.analysis.seed_vectors != 0
             || file.analysis.interprocedural_observations != 0
             || file.analysis.interprocedural_dropped != 0)
     {
@@ -495,7 +626,7 @@ mod tests {
         SummaryWire, serialize, write_atomic, write_atomic_with_before_commit,
     };
     use crate::global_shapes::decoder::{
-        AccessKind, AddressBase, AddressExpr, AddressOffset, ControlFlow, DecodeError,
+        AccessKind, AddressBase, AddressExpr, AddressOffset, CallTarget, ControlFlow, DecodeError,
         DecodedInstruction, DecoderIdentity, InstructionDecoder, MemoryEffect, MemoryTransfer,
         PureRustDecoder, Register, SemanticEffect, ValueExpr, decode_function,
     };
@@ -514,6 +645,9 @@ mod tests {
     const ARRAY: u32 = 0x5100;
     const NONE: u32 = 0x5200;
     const OLD_SIDECAR: &[u8] = b"older global_shapes.json";
+    const INTERPROC_CALLER_ENTRY: u32 = 0x4000;
+    const INTERPROC_CALL_PC: u32 = 0x4004;
+    const INTERPROC_CALLEE_ENTRY: u32 = 0x4100;
 
     struct Fixture {
         root: PathBuf,
@@ -822,6 +956,52 @@ mod tests {
         BoundRequest::from_fixture(fixture, 5, 4, 1, Some(1), Some(1), Some(0), recovered)
     }
 
+    // A separate, dedicated fixture for the depth-1 interprocedural
+    // coordinator test (below). It deliberately does not extend
+    // `synthetic_image_bytes`/`write_synthetic_sources`: those are shared by
+    // every test above via `synthetic_bound`, and several pin exact byte
+    // counts (`instructions_decoded`, `arm_functions`/`thumb_functions`,
+    // ghidra/thumb accepted counts) against the golden
+    // `synthetic_image_writes_complete_v2_sidecar` sidecar. A single accepted
+    // ARM caller and Thumb callee keep this fixture minimal and independent.
+    fn interproc_image_bytes() -> Vec<u8> {
+        vec![0u8; 0x200]
+    }
+
+    fn write_interproc_sources(fixture: &Fixture) {
+        fixture.write_manifest();
+        fixture.write_image(&interproc_image_bytes());
+        fixture.write_globals(&globals_file(&[recovered_global(
+            &hex(SCALAR),
+            "g_scalar",
+            "arm",
+        )]));
+        fixture.write_functions(&json!([ghidra_accepted(
+            "FUN_caller",
+            &hex(INTERPROC_CALLER_ENTRY),
+            &hex(INTERPROC_CALLER_ENTRY + 8),
+            8,
+            vec![arm_range(
+                &hex(INTERPROC_CALLER_ENTRY),
+                &hex(INTERPROC_CALLER_ENTRY + 8),
+            )],
+        )]));
+        fixture.write_thumb(&thumb_file(&[thumb_accepted(
+            "thumb_callee",
+            &hex(INTERPROC_CALLEE_ENTRY),
+            32,
+            vec![thumb_range(
+                &hex(INTERPROC_CALLEE_ENTRY),
+                &hex(INTERPROC_CALLEE_ENTRY + 2),
+            )],
+        )]));
+    }
+
+    fn interproc_bound(fixture: &Fixture) -> BoundRequest {
+        write_interproc_sources(fixture);
+        BoundRequest::from_fixture(fixture, 1, 1, 0, Some(1), Some(1), Some(0), 1)
+    }
+
     fn hex(value: u32) -> String {
         format!("0x{value:x}")
     }
@@ -969,6 +1149,54 @@ mod tests {
             decoder
                 .insns
                 .insert((Isa::Arm, 0x4000), wrong_pc(Isa::Arm, 0x4000));
+            decoder
+        }
+
+        /// A dedicated (non-`fixture`-derived) decoder for the depth-1
+        /// interprocedural coordinator test: an ARM caller does
+        /// `mov r0, &g_scalar` then a direct `bl` into a Thumb callee, which
+        /// dereferences the seeded `r0` with `str [r0, #0]`.
+        fn with_interproc_call() -> Self {
+            let mut decoder = Self {
+                crate_name: "test-decoder",
+                version: "fixture",
+                insns: BTreeMap::new(),
+                errors: BTreeMap::new(),
+                panic_at: None,
+            };
+            decoder.insns.insert(
+                (Isa::Arm, INTERPROC_CALLER_ENTRY),
+                mov_imm(Isa::Arm, INTERPROC_CALLER_ENTRY, 4, R0, SCALAR),
+            );
+            decoder.insns.insert(
+                (Isa::Arm, INTERPROC_CALL_PC),
+                insn(
+                    Isa::Arm,
+                    INTERPROC_CALL_PC,
+                    4,
+                    [],
+                    SemanticEffect::None,
+                    ControlFlow::Call {
+                        target: Some(CallTarget {
+                            entry: INTERPROC_CALLEE_ENTRY,
+                            isa: Isa::Thumb,
+                        }),
+                    },
+                ),
+            );
+            decoder.insns.insert(
+                (Isa::Thumb, INTERPROC_CALLEE_ENTRY),
+                mem(
+                    Isa::Thumb,
+                    INTERPROC_CALLEE_ENTRY,
+                    2,
+                    R0,
+                    0,
+                    AccessKind::Write,
+                    4,
+                    [],
+                ),
+            );
             decoder
         }
     }
@@ -1188,6 +1416,37 @@ mod tests {
         let expected = serialize(&expected_synthetic_file(&fixture)).unwrap();
         assert_eq!(fs::read(fixture.sidecar()).unwrap(), expected);
         assert!(!expected.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn interprocedural_pass_recovers_shape_through_a_direct_call() {
+        let fixture = Fixture::new("interproc");
+        let bound = interproc_bound(&fixture);
+        let report = run_image_with_decoder(&bound.get(), &MapDecoder::with_interproc_call())
+            .expect("interprocedural synthetic run");
+        let file: Value = serde_json::from_slice(&fs::read(fixture.sidecar()).unwrap()).unwrap();
+        let g = file["globals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "g_scalar")
+            .unwrap();
+        assert_eq!(g["status"], "inferred");
+        let via = g["observations"][0]["via"].as_array().unwrap();
+        assert_eq!(via.len(), 1);
+        assert_eq!(via[0]["arg_register"], "r0");
+        assert_eq!(file["analysis"]["direct_calls_resolved"], 1);
+        assert_eq!(file["analysis"]["call_facts_unresolved"], 0);
+        assert_eq!(file["analysis"]["seeded_callees"], 1);
+        assert_eq!(file["analysis"]["seed_vectors"], 1);
+        assert!(
+            file["analysis"]["interprocedural_observations"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(file["analysis"]["interprocedural_dropped"], 0);
+        assert!(report.inferred >= 1);
     }
 
     #[test]
