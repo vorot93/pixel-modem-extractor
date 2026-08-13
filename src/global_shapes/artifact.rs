@@ -1708,7 +1708,8 @@ mod tests {
             conflict_read,
             golden_obs(0x4500, DecodeIsa::Thumb, 0x4030, AccessKind::Write, 4, 0),
         ];
-        let aggregation = aggregate(&recovered, candidates).expect("golden aggregation");
+        let aggregation =
+            aggregate(&recovered, candidates, Vec::new()).expect("golden aggregation");
         GlobalShapesFile {
             format: FORMAT_V2,
             image: LABEL.into(),

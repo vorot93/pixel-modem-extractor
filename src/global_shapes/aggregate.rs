@@ -1,11 +1,11 @@
 // Same-PC agreement, conflicts, and conservative summaries.
 
 use super::artifact::{
-    AccessKindWire, AlternativeWire, ConflictWire, FunctionContextWire, GlobalWire, IsaWire,
-    ObservationWire, ProvisionalShape, Status, SummaryWire,
+    AccessKindWire, AlternativeWire, CallHopWire, ConflictWire, FunctionContextWire, GlobalWire,
+    IsaWire, ObservationWire, ProvisionalShape, Status, SummaryWire,
 };
 use super::decoder::AccessKind;
-use super::tracker::CandidateObservation;
+use super::tracker::{CallHop, CandidateObservation};
 use super::{FunctionContext, RecoveredGlobal};
 use crate::error::{Error, Result};
 use crate::execution_ranges::DecodeIsa as Isa;
@@ -19,14 +19,17 @@ pub(crate) struct Aggregation {
     pub conflicting: usize,
     pub observations: usize,
     pub conflicts: usize,
+    pub interprocedural_observations: usize,
+    pub interprocedural_dropped: usize,
 }
 
 pub(crate) fn aggregate(
     globals: &[RecoveredGlobal],
-    candidates: Vec<CandidateObservation>,
+    intra: Vec<CandidateObservation>,
+    inter: Vec<CandidateObservation>,
 ) -> Result<Aggregation> {
     let recovered = recovered_addresses(globals)?;
-    for candidate in &candidates {
+    for candidate in intra.iter().chain(inter.iter()) {
         if !recovered.contains(&candidate.target_address) {
             return Err(invalid(&format!(
                 "unknown target address {}",
@@ -36,7 +39,7 @@ pub(crate) fn aggregate(
     }
 
     let mut groups: BTreeMap<(Isa, u32), BTreeMap<SemanticKey, Accumulator>> = BTreeMap::new();
-    for candidate in candidates {
+    for candidate in intra {
         let key = SemanticKey {
             target_address: candidate.target_address,
             conditional: candidate.conditional,
@@ -68,7 +71,10 @@ pub(crate) fn aggregate(
 
     // One semantic key at a PC is agreement. Two or more is a conflict; every
     // implicated Recovered target receives the complete alternative group.
-    // Support count and function order never choose a winner.
+    // Support count and function order never choose a winner. Agreed keys
+    // are retained per (target, isa, pc) so the interprocedural merge below
+    // can tell whether inter evidence agrees with, or must defer to, intra.
+    let mut intra_keys: BTreeMap<(u32, Isa, u32), SemanticKey> = BTreeMap::new();
     for ((isa, pc), alternatives) in groups {
         if alternatives.len() == 1 {
             let (key, accumulator) = alternatives
@@ -78,6 +84,7 @@ pub(crate) fn aggregate(
             let slot = per_global
                 .get_mut(&key.target_address)
                 .ok_or_else(|| invalid("agreed target is not recovered"))?;
+            intra_keys.insert((key.target_address, isa, pc), key);
             slot.observations.push(Observation {
                 isa,
                 pc,
@@ -87,25 +94,34 @@ pub(crate) fn aggregate(
                 offset: key.offset,
                 functions: accumulator.functions,
                 paths: accumulator.paths,
+                via: BTreeSet::new(),
             });
         } else {
             let implicated: BTreeSet<u32> =
                 alternatives.keys().map(|key| key.target_address).collect();
+            let mut built = Vec::with_capacity(alternatives.len());
+            for (key, accumulator) in alternatives {
+                // Conflicts are intra-only: every candidate that reaches
+                // this branch came from `intra`, which never carries `via`.
+                if !accumulator.via.is_empty() {
+                    return Err(invalid(
+                        "conflict alternative must not carry interprocedural via evidence",
+                    ));
+                }
+                built.push(Alternative {
+                    target_address: key.target_address,
+                    conditional: key.conditional,
+                    kind: key.kind,
+                    width: key.width,
+                    offset: key.offset,
+                    functions: accumulator.functions,
+                    paths: accumulator.paths,
+                });
+            }
             let conflict = Conflict {
                 isa,
                 pc,
-                alternatives: alternatives
-                    .into_iter()
-                    .map(|(key, accumulator)| Alternative {
-                        target_address: key.target_address,
-                        conditional: key.conditional,
-                        kind: key.kind,
-                        width: key.width,
-                        offset: key.offset,
-                        functions: accumulator.functions,
-                        paths: accumulator.paths,
-                    })
-                    .collect(),
+                alternatives: built,
             };
             for address in implicated {
                 let slot = per_global
@@ -115,6 +131,9 @@ pub(crate) fn aggregate(
             }
         }
     }
+
+    let (interprocedural_observations, interprocedural_dropped) =
+        merge_interprocedural(inter, &intra_keys, &mut per_global)?;
 
     let mut inferred = 0usize;
     let mut no_evidence = 0usize;
@@ -147,9 +166,110 @@ pub(crate) fn aggregate(
         conflicting,
         observations,
         conflicts,
+        interprocedural_observations,
+        interprocedural_dropped,
     };
     validate(&aggregation, globals)?;
     Ok(aggregation)
+}
+
+// Per target, per `(isa, pc)`, per semantic key — mirrors the intra `groups`
+// shape but scoped under an outer target level, since inter candidates are
+// grouped per-target before ever looking at `(isa, pc)`.
+type InterGroups = BTreeMap<u32, BTreeMap<(Isa, u32), BTreeMap<SemanticKey, Accumulator>>>;
+
+// Interprocedural candidates are attributed directly to their proven
+// `target_address` and never enter the cross-global `(isa, pc)` conflict
+// pool: a shared callee instruction seeded with different globals from
+// different call sites yields one true observation per global, never a
+// conflict. Grouping happens per target first (proven), then per `(isa,
+// pc)`, unioning `functions`/`paths`/`via` for identical semantic keys.
+//
+// Intra is authoritative: an inter observation that lands on an `(isa, pc)`
+// where intra already agreed on a *different* semantic key is dropped (and
+// counted); one that agrees is merged into the existing intra observation;
+// one with no intra observation at that `(isa, pc)` becomes new evidence.
+// Inter observations never create conflicts and never touch another
+// global's record.
+fn merge_interprocedural(
+    inter: Vec<CandidateObservation>,
+    intra_keys: &BTreeMap<(u32, Isa, u32), SemanticKey>,
+    per_global: &mut BTreeMap<u32, PerGlobal>,
+) -> Result<(usize, usize)> {
+    let mut inter_groups: InterGroups = BTreeMap::new();
+    for candidate in inter {
+        let key = SemanticKey {
+            target_address: candidate.target_address,
+            conditional: candidate.conditional,
+            kind: candidate.kind,
+            width: candidate.width,
+            offset: candidate.offset,
+        };
+        let accumulator = inter_groups
+            .entry(candidate.target_address)
+            .or_default()
+            .entry((candidate.isa, candidate.pc))
+            .or_default()
+            .entry(key)
+            .or_default();
+        accumulator.functions.extend(candidate.functions);
+        accumulator.paths.insert(candidate.provenance_path);
+        accumulator.via.extend(candidate.via);
+    }
+
+    let mut interprocedural_observations = 0usize;
+    let mut interprocedural_dropped = 0usize;
+    for (target_address, pcs) in inter_groups {
+        let slot = per_global
+            .get_mut(&target_address)
+            .ok_or_else(|| invalid("interprocedural target is not recovered"))?;
+        for ((isa, pc), keys) in pcs {
+            for (key, accumulator) in keys {
+                match intra_keys.get(&(target_address, isa, pc)) {
+                    Some(intra_key) if *intra_key != key => {
+                        interprocedural_dropped =
+                            add_count(interprocedural_dropped, 1, "interprocedural_dropped")?;
+                    }
+                    Some(_) => {
+                        let existing = slot
+                            .observations
+                            .iter_mut()
+                            .find(|observation| observation.isa == isa && observation.pc == pc)
+                            .ok_or_else(|| {
+                                invalid("intra semantic key present without a matching observation")
+                            })?;
+                        existing.functions.extend(accumulator.functions);
+                        existing.paths.extend(accumulator.paths);
+                        existing.via.extend(accumulator.via);
+                        interprocedural_observations = add_count(
+                            interprocedural_observations,
+                            1,
+                            "interprocedural_observations",
+                        )?;
+                    }
+                    None => {
+                        slot.observations.push(Observation {
+                            isa,
+                            pc,
+                            conditional: key.conditional,
+                            kind: key.kind,
+                            width: key.width,
+                            offset: key.offset,
+                            functions: accumulator.functions,
+                            paths: accumulator.paths,
+                            via: accumulator.via,
+                        });
+                        interprocedural_observations = add_count(
+                            interprocedural_observations,
+                            1,
+                            "interprocedural_observations",
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok((interprocedural_observations, interprocedural_dropped))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -165,6 +285,7 @@ struct SemanticKey {
 struct Accumulator {
     functions: BTreeSet<FunctionContext>,
     paths: BTreeSet<Vec<u32>>,
+    via: BTreeSet<CallHop>,
 }
 
 struct Observation {
@@ -176,6 +297,7 @@ struct Observation {
     offset: u32,
     functions: BTreeSet<FunctionContext>,
     paths: BTreeSet<Vec<u32>>,
+    via: BTreeSet<CallHop>,
 }
 
 #[derive(Clone)]
@@ -278,10 +400,21 @@ fn observation_wire(observation: &Observation) -> ObservationWire {
         offset: observation.offset,
         functions: functions_wire(&observation.functions),
         provenance_paths: paths_wire(&observation.paths),
-        // Depth-1 interprocedural call hops are not tracked yet; a later
-        // task threads them from `CandidateObservation` through here.
-        via: Vec::new(),
+        via: via_wire(&observation.via),
     }
+}
+
+fn via_wire(via: &BTreeSet<CallHop>) -> Vec<CallHopWire> {
+    let mut hops: Vec<&CallHop> = via.iter().collect();
+    hops.sort();
+    hops.into_iter()
+        .map(|hop| CallHopWire {
+            caller_entry: hex(hop.caller_entry),
+            caller_name: hop.caller_name.clone(),
+            call_pc: hex(hop.call_pc),
+            arg_register: format!("r{}", hop.arg_register),
+        })
+        .collect()
 }
 
 fn conflict_wire(conflict: &Conflict) -> ConflictWire {
@@ -426,6 +559,8 @@ fn validate(aggregation: &Aggregation, source: &[RecoveredGlobal]) -> Result<()>
     let mut inferred = 0usize;
     let mut no_evidence = 0usize;
     let mut conflicting = 0usize;
+    let mut interprocedural_observations = 0usize;
+    let mut via_bearing: Vec<(&str, &ObservationWire)> = Vec::new();
     for (wire, recovered) in aggregation.globals.iter().zip(source) {
         if wire.address != hex(recovered.address)
             || wire.name != recovered.name
@@ -446,6 +581,10 @@ fn validate(aggregation: &Aggregation, source: &[RecoveredGlobal]) -> Result<()>
                 wire.address
             )));
         }
+        // `AlternativeWire` has no `via` field: conflicts are intra-only by
+        // construction (`aggregate` fails closed if interprocedural `via`
+        // evidence ever reached the conflict path), so no alternative can
+        // carry one.
         for conflict in &wire.conflicts {
             for alternative in &conflict.alternatives {
                 let target = parse_hex(&alternative.target_address)?;
@@ -499,6 +638,16 @@ fn validate(aggregation: &Aggregation, source: &[RecoveredGlobal]) -> Result<()>
                 bump(&mut conflicting, "conflicting")?;
             }
         }
+        for observation in &wire.observations {
+            if !observation.via.is_empty() {
+                interprocedural_observations = add_count(
+                    interprocedural_observations,
+                    1,
+                    "interprocedural_observations",
+                )?;
+                via_bearing.push((wire.address.as_str(), observation));
+            }
+        }
         observations = add_count(observations, wire.observations.len(), "observation")?;
         conflicts = add_count(conflicts, wire.conflicts.len(), "conflict")?;
     }
@@ -520,6 +669,30 @@ fn validate(aggregation: &Aggregation, source: &[RecoveredGlobal]) -> Result<()>
             "observation or conflict count does not equal serialized entries",
         ));
     }
+    if aggregation.interprocedural_observations != interprocedural_observations {
+        return Err(invalid(
+            "interprocedural_observations does not equal via-bearing observation count",
+        ));
+    }
+    // Every via-bearing observation lives on exactly one global: no two
+    // globals may carry byte-identical via-bearing evidence (a shared
+    // callee `(isa, pc)` seeded from two call sites is fine, since each
+    // side's `via` hop differs; two globals surfacing the exact same
+    // observation, `via` included, would mean attribution leaked).
+    for outer in 0..via_bearing.len() {
+        for inner in (outer + 1)..via_bearing.len() {
+            let (left_address, left) = via_bearing[outer];
+            let (right_address, right) = via_bearing[inner];
+            if left_address != right_address && left == right {
+                return Err(invalid(
+                    "via-bearing observation appears on more than one global",
+                ));
+            }
+        }
+    }
+    // `interprocedural_dropped` counts evidence that never reaches the wire
+    // output, so it has no independent trace to recompute here; its only
+    // producer is `merge_interprocedural`'s single increment site.
     Ok(())
 }
 
@@ -657,7 +830,30 @@ mod tests {
     }
 
     fn run(recovered: &[RecoveredGlobal], candidates: Vec<CandidateObservation>) -> Aggregation {
-        aggregate(recovered, candidates).expect("aggregate")
+        aggregate(recovered, candidates, Vec::new()).expect("aggregate")
+    }
+
+    fn inter(
+        target: u32,
+        isa: Isa,
+        pc: u32,
+        kind: AccessKind,
+        width: u8,
+        offset: u32,
+        hop: CallHop,
+    ) -> CandidateObservation {
+        let mut c = cand(target, isa, pc, false, kind, width, offset);
+        c.via = vec![hop];
+        c
+    }
+
+    fn hop(caller: u32, call_pc: u32, reg: u8) -> CallHop {
+        CallHop {
+            caller_entry: caller,
+            caller_name: "FUN".into(),
+            call_pc,
+            arg_register: reg,
+        }
     }
 
     fn hex(value: u32) -> String {
@@ -699,7 +895,7 @@ mod tests {
         recovered: &[RecoveredGlobal],
         candidates: Vec<CandidateObservation>,
     ) -> String {
-        match aggregate(recovered, candidates) {
+        match aggregate(recovered, candidates, Vec::new()) {
             Err(Error::Serialize(message)) => message,
             other => panic!("expected serialize error, got {other:?}"),
         }
@@ -1298,5 +1494,93 @@ mod tests {
         assert_eq!(aggregation.globals[0].arch, "mixed");
         assert_eq!(aggregation.globals[1].name, "middle");
         assert_eq!(aggregation.globals[2].name, "last");
+    }
+
+    #[test]
+    fn interprocedural_shared_callee_pc_is_not_a_conflict() {
+        // Same callee PC seeded with two different globals from two call
+        // sites => two independent observations, NOT a conflict.
+        let recovered = globals(&[G0, G1]);
+        let agg = aggregate(
+            &recovered,
+            Vec::new(),
+            vec![
+                inter(
+                    G0,
+                    Isa::Thumb,
+                    PC0,
+                    AccessKind::Read,
+                    4,
+                    0,
+                    hop(0xA00, 0xA10, 0),
+                ),
+                inter(
+                    G1,
+                    Isa::Thumb,
+                    PC0,
+                    AccessKind::Read,
+                    4,
+                    0,
+                    hop(0xB00, 0xB10, 0),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(by_addr(&agg, G0).status, Status::Inferred);
+        assert_eq!(by_addr(&agg, G1).status, Status::Inferred);
+        assert!(by_addr(&agg, G0).conflicts.is_empty());
+        // the observation carries its via hop
+        assert_eq!(by_addr(&agg, G0).observations[0].via.len(), 1);
+    }
+
+    #[test]
+    fn interprocedural_never_demotes_an_intra_inferred() {
+        // G0 is intra-inferred at PC0; an interprocedural obs at the SAME
+        // pc with a different semantic key is dropped (intra wins), G0
+        // stays inferred.
+        let recovered = globals(&[G0]);
+        let agg = aggregate(
+            &recovered,
+            vec![cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0)],
+            vec![inter(
+                G0,
+                Isa::Arm,
+                PC0,
+                AccessKind::Write,
+                2,
+                0,
+                hop(0xA00, 0xA10, 1),
+            )],
+        )
+        .unwrap();
+        assert_eq!(by_addr(&agg, G0).status, Status::Inferred);
+        assert_eq!(by_addr(&agg, G0).observations.len(), 1);
+        assert_eq!(by_addr(&agg, G0).observations[0].kind, AccessKindWire::Read);
+        assert_eq!(agg.interprocedural_dropped, 1);
+    }
+
+    #[test]
+    fn interprocedural_enriches_summary_of_existing_inferred() {
+        // intra obs at offset 0 width 4; inter obs at offset 8 width 4
+        // grows minimum_size.
+        let recovered = globals(&[G0]);
+        let agg = aggregate(
+            &recovered,
+            vec![cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0)],
+            vec![inter(
+                G0,
+                Isa::Arm,
+                PC1,
+                AccessKind::Read,
+                4,
+                8,
+                hop(0xA00, 0xA10, 0),
+            )],
+        )
+        .unwrap();
+        let g = by_addr(&agg, G0);
+        assert_eq!(g.status, Status::Inferred);
+        assert_eq!(g.summary.as_ref().unwrap().minimum_size, 12);
+        assert_eq!(agg.interprocedural_observations, 1);
     }
 }

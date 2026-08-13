@@ -1400,6 +1400,7 @@ fn add_global_shapes_totals(
     totals.quarantine_errors += report.quarantine_errors;
     totals.decode_failures += report.decode_failures;
     totals.state_barriers += report.state_barriers;
+    totals.interprocedural_dropped += report.interprocedural_dropped;
 }
 
 fn run_global_shapes_stage_with(
@@ -1432,6 +1433,7 @@ fn run_global_shapes_stage_with(
         quarantine_errors: 0,
         decode_failures: 0,
         state_barriers: 0,
+        interprocedural_dropped: 0,
     };
     let mut errors: Vec<(String, String)> = Vec::new();
 
@@ -4857,6 +4859,7 @@ mod tests {
             quarantine_errors: 0,
             decode_failures: 0,
             state_barriers: 0,
+            interprocedural_dropped: 0,
         }
     }
 
@@ -5082,6 +5085,7 @@ mod tests {
                 quarantine_errors: 1,
                 decode_failures: 0,
                 state_barriers: 0,
+                interprocedural_dropped: 0,
             })
         });
 

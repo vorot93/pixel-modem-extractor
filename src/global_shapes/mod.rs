@@ -49,6 +49,7 @@ pub(crate) struct GlobalShapesReport {
     pub quarantine_errors: usize,
     pub decode_failures: usize,
     pub state_barriers: usize,
+    pub interprocedural_dropped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,7 +102,11 @@ fn run_image_with_decoder(
 fn run_image_with(
     request: &RunRequest<'_>,
     decoder: &impl InstructionDecoder,
-    aggregate_fn: impl FnOnce(&[RecoveredGlobal], Vec<CandidateObservation>) -> Result<Aggregation>,
+    aggregate_fn: impl FnOnce(
+        &[RecoveredGlobal],
+        Vec<CandidateObservation>,
+        Vec<CandidateObservation>,
+    ) -> Result<Aggregation>,
     serialize_fn: impl FnOnce(&GlobalShapesFile) -> Result<Vec<u8>>,
     write_fn: impl FnOnce(&Path, &[u8]) -> Result<()>,
 ) -> Result<GlobalShapesReport> {
@@ -125,10 +130,17 @@ fn analyze_loaded_inputs(
     image_label: &str,
     inputs: &LoadedInputs,
     decoder: &impl InstructionDecoder,
-    aggregate_fn: impl FnOnce(&[RecoveredGlobal], Vec<CandidateObservation>) -> Result<Aggregation>,
+    aggregate_fn: impl FnOnce(
+        &[RecoveredGlobal],
+        Vec<CandidateObservation>,
+        Vec<CandidateObservation>,
+    ) -> Result<Aggregation>,
 ) -> Result<ImageAnalysis> {
     let identity = decoder.identity();
-    let mut candidates = Vec::new();
+    // Pass 1 (below) tracks every function cold, with no interprocedural
+    // seed, and its evidence is attributed intra-procedurally. A later task
+    // adds the seeded pass 2 replay and supplies real `inter` evidence.
+    let mut intra = Vec::new();
     let mut instructions_decoded = 0usize;
     let mut decode_failures = 0usize;
     let mut state_barriers = 0usize;
@@ -161,8 +173,6 @@ fn analyze_loaded_inputs(
             {
                 bump(&mut decode_failures, "decode_failures")?;
             }
-            // Pass 1 tracks every function cold, with no interprocedural
-            // seed; a later task adds the seeded pass 2 replay.
             let tracked = tracker::track_function(
                 function,
                 &decoded,
@@ -173,11 +183,13 @@ fn analyze_loaded_inputs(
                 &BTreeMap::new(),
             )?;
             state_barriers = add_count(state_barriers, tracked.state_barriers, "state_barriers")?;
-            candidates.extend(tracked.candidates);
+            intra.extend(tracked.candidates);
         }
     }
 
-    let aggregation = aggregate_fn(&inputs.globals, candidates)?;
+    // A later (coordinator) task supplies real interprocedural candidates
+    // here; for now the seeded pass 2 replay does not exist yet.
+    let aggregation = aggregate_fn(&inputs.globals, intra, Vec::new())?;
     let file = GlobalShapesFile {
         format: FORMAT_V2,
         image: image_label.to_owned(),
@@ -203,14 +215,15 @@ fn analyze_loaded_inputs(
             state_barriers,
             observations: aggregation.observations,
             conflicts: aggregation.conflicts,
-            // A later task wires real interprocedural counters; this stage
-            // is depth-1-unaware and always reports zero here.
+            // A later task wires real direct-call and seeding counters;
+            // this stage does not run the seeded pass 2 replay yet, so
+            // these always report zero here.
             direct_calls_resolved: 0,
             call_facts_unresolved: 0,
             seeded_callees: 0,
             seed_vectors: 0,
-            interprocedural_observations: 0,
-            interprocedural_dropped: 0,
+            interprocedural_observations: aggregation.interprocedural_observations,
+            interprocedural_dropped: aggregation.interprocedural_dropped,
         },
         globals: aggregation.globals,
     };
@@ -225,6 +238,7 @@ fn analyze_loaded_inputs(
             quarantine_errors: inputs.source_counts.quarantine_errors,
             decode_failures,
             state_barriers,
+            interprocedural_dropped: aggregation.interprocedural_dropped,
         },
         file,
     })
@@ -259,12 +273,27 @@ fn revalidate(
     let mut conflicting = 0usize;
     let mut observations = 0usize;
     let mut conflicts = 0usize;
+    // Depth-1 interprocedural evidence has no marker of its own beyond a
+    // non-empty `via`; the status invariants and summary-recompute below
+    // already run over each global's complete (intra + surviving
+    // interprocedural) observation set, since `wire.observations` is the
+    // merged list `aggregate` produced.
+    let mut interprocedural_observations = 0usize;
     for (wire, recovered) in file.globals.iter().zip(&inputs.globals) {
         if wire.address != hex(recovered.address)
             || wire.name != recovered.name
             || wire.arch != recovered.arch
         {
             return Err(invalid("source order, name, or arch was not preserved"));
+        }
+        for observation in &wire.observations {
+            if !observation.via.is_empty() {
+                interprocedural_observations = add_count(
+                    interprocedural_observations,
+                    1,
+                    "interprocedural_observations",
+                )?;
+            }
         }
         match wire.status {
             Status::Inferred => {
@@ -326,6 +355,14 @@ fn revalidate(
             "observation or conflict count does not equal serialized entries",
         ));
     }
+    if file.analysis.interprocedural_observations != interprocedural_observations {
+        return Err(invalid(
+            "interprocedural_observations does not equal via-bearing observation count",
+        ));
+    }
+    if file.analysis.interprocedural_dropped != report.interprocedural_dropped {
+        return Err(invalid("interprocedural_dropped does not match the report"));
+    }
     if file.analysis.ghidra_records_quarantined != inputs.source_counts.ghidra_quarantined
         || file.analysis.thumb_records_quarantined != inputs.source_counts.thumb_quarantined
         || file.analysis.quarantine_errors != inputs.source_counts.quarantine_errors
@@ -349,7 +386,9 @@ fn revalidate(
             || file.analysis.decode_failures != 0
             || file.analysis.state_barriers != 0
             || file.analysis.observations != 0
-            || file.analysis.conflicts != 0)
+            || file.analysis.conflicts != 0
+            || file.analysis.interprocedural_observations != 0
+            || file.analysis.interprocedural_dropped != 0)
     {
         return Err(invalid("empty recovered set must not analyze identities"));
     }
@@ -1143,6 +1182,7 @@ mod tests {
                 quarantine_errors: 1,
                 decode_failures: 0,
                 state_barriers: 1,
+                interprocedural_dropped: 0,
             }
         );
         let expected = serialize(&expected_synthetic_file(&fixture)).unwrap();
@@ -1209,6 +1249,7 @@ mod tests {
                 quarantine_errors: 1,
                 decode_failures: 0,
                 state_barriers: 0,
+                interprocedural_dropped: 0,
             }
         );
         let file: Value = serde_json::from_slice(&fs::read(fixture.sidecar()).unwrap()).unwrap();
@@ -1255,8 +1296,8 @@ mod tests {
         let message = serialize_err(run_image_with(
             &bound.get(),
             &MapDecoder::fixture(),
-            |globals, candidates| {
-                let mut aggregation = aggregate(globals, candidates)?;
+            |globals, intra, inter| {
+                let mut aggregation = aggregate(globals, intra, inter)?;
                 aggregation.observations = aggregation
                     .observations
                     .checked_add(1)
