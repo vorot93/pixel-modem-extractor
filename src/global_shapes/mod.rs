@@ -2,6 +2,7 @@
 // Until then unused pub(crate) items exist for those stages.
 #![allow(dead_code)]
 
+mod aggregate;
 mod artifact;
 mod decoder;
 mod tracker;

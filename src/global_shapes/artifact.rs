@@ -586,13 +586,14 @@ fn write_atomic_with_before_commit(
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessKindWire, AlternativeWire, AnalysisWire, ConflictWire, DecoderWire,
-        FunctionContextWire, GlobalShapesFile, GlobalWire, InputHashesWire, IsaWire,
-        ObservationWire, ProvisionalShape, Status, SummaryWire, load_inputs, serialize,
-        write_atomic, write_atomic_with_before_commit,
+        AnalysisWire, DecoderWire, FunctionContextWire, GlobalShapesFile, InputHashesWire,
+        load_inputs, serialize, write_atomic, write_atomic_with_before_commit,
     };
     use crate::error::Error;
     use crate::execution_ranges::{DecodeIsa, DecodeRange};
+    use crate::global_shapes::aggregate::aggregate;
+    use crate::global_shapes::decoder::AccessKind;
+    use crate::global_shapes::tracker::CandidateObservation;
     use crate::global_shapes::{
         FORMAT_V1, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
     };
@@ -1612,7 +1613,84 @@ mod tests {
         );
     }
 
+    fn golden_obs(
+        target: u32,
+        isa: DecodeIsa,
+        pc: u32,
+        kind: AccessKind,
+        width: u8,
+        offset: u32,
+    ) -> CandidateObservation {
+        CandidateObservation {
+            target_address: target,
+            isa,
+            pc,
+            conditional: false,
+            kind,
+            width,
+            offset,
+            functions: BTreeSet::new(),
+            provenance_path: Vec::new(),
+        }
+    }
+
     fn golden_file() -> GlobalShapesFile {
+        let recovered = vec![
+            RecoveredGlobal {
+                source_index: 0,
+                address: 0x4100,
+                name: "g_scalar".into(),
+                arch: "arm".into(),
+            },
+            RecoveredGlobal {
+                source_index: 1,
+                address: 0x4200,
+                name: "g_array".into(),
+                arch: "thumb".into(),
+            },
+            RecoveredGlobal {
+                source_index: 2,
+                address: 0x4300,
+                name: "g_unknown".into(),
+                arch: "mixed".into(),
+            },
+            RecoveredGlobal {
+                source_index: 3,
+                address: 0x4400,
+                name: "g_none".into(),
+                arch: "arm".into(),
+            },
+            RecoveredGlobal {
+                source_index: 4,
+                address: 0x4500,
+                name: "g_conflict".into(),
+                arch: "thumb".into(),
+            },
+        ];
+        let mut scalar = golden_obs(0x4100, DecodeIsa::Arm, 0x4000, AccessKind::Read, 4, 0);
+        scalar.functions = BTreeSet::from([FunctionContext {
+            entry: 0x4000,
+            name: "FUN_4000".into(),
+        }]);
+        scalar.provenance_path = vec![0x4000];
+        let mut array_tail = golden_obs(0x4200, DecodeIsa::Thumb, 0x4010, AccessKind::Write, 2, 4);
+        array_tail.conditional = true;
+        let mut conflict_read =
+            golden_obs(0x4500, DecodeIsa::Thumb, 0x4030, AccessKind::Read, 4, 0);
+        conflict_read.functions = BTreeSet::from([FunctionContext {
+            entry: 0x4030,
+            name: "thumb_4030".into(),
+        }]);
+        conflict_read.provenance_path = vec![0x4030, 0x4032];
+        let candidates = vec![
+            scalar,
+            golden_obs(0x4200, DecodeIsa::Thumb, 0x4008, AccessKind::Write, 2, 0),
+            array_tail,
+            golden_obs(0x4300, DecodeIsa::Arm, 0x4020, AccessKind::ReadWrite, 1, 1),
+            conflict_read,
+            golden_obs(0x4500, DecodeIsa::Thumb, 0x4030, AccessKind::Write, 4, 0),
+        ];
+        let aggregation = aggregate(&recovered, candidates).expect("golden aggregation");
         GlobalShapesFile {
             format: FORMAT_V1,
             image: LABEL.into(),
@@ -1639,125 +1717,10 @@ mod tests {
                 instructions_decoded: 9,
                 decode_failures: 1,
                 state_barriers: 3,
-                observations: 3,
-                conflicts: 1,
+                observations: aggregation.observations,
+                conflicts: aggregation.conflicts,
             },
-            globals: vec![
-                GlobalWire {
-                    address: "0x4100".into(),
-                    name: "g_scalar".into(),
-                    arch: "arm".into(),
-                    status: Status::Inferred,
-                    observations: vec![ObservationWire {
-                        arch: IsaWire::Arm,
-                        pc: "0x4000".into(),
-                        conditional: false,
-                        kind: AccessKindWire::Read,
-                        width: 4,
-                        offset: 0,
-                        functions: vec![FunctionContextWire {
-                            entry: "0x4000".into(),
-                            name: "FUN_4000".into(),
-                        }],
-                        provenance_paths: vec![vec!["0x4000".into()]],
-                    }],
-                    conflicts: vec![],
-                    summary: Some(SummaryWire {
-                        minimum_size: 4,
-                        observed_widths: vec![4],
-                        accessed_offsets: vec![0],
-                        reads: 1,
-                        writes: 0,
-                        provisional_shape: ProvisionalShape::ScalarCandidate { width: 4 },
-                    }),
-                },
-                GlobalWire {
-                    address: "0x4200".into(),
-                    name: "g_array".into(),
-                    arch: "thumb".into(),
-                    status: Status::Inferred,
-                    observations: vec![ObservationWire {
-                        arch: IsaWire::Thumb,
-                        pc: "0x4010".into(),
-                        conditional: true,
-                        kind: AccessKindWire::Write,
-                        width: 2,
-                        offset: 4,
-                        functions: vec![],
-                        provenance_paths: vec![],
-                    }],
-                    conflicts: vec![],
-                    summary: Some(SummaryWire {
-                        minimum_size: 6,
-                        observed_widths: vec![2],
-                        accessed_offsets: vec![0, 4],
-                        reads: 0,
-                        writes: 1,
-                        provisional_shape: ProvisionalShape::ArrayCandidate {
-                            element_width: 2,
-                            minimum_elements: 3,
-                        },
-                    }),
-                },
-                GlobalWire {
-                    address: "0x4300".into(),
-                    name: "g_unknown".into(),
-                    arch: "mixed".into(),
-                    status: Status::Inferred,
-                    observations: vec![ObservationWire {
-                        arch: IsaWire::Arm,
-                        pc: "0x4020".into(),
-                        conditional: false,
-                        kind: AccessKindWire::ReadWrite,
-                        width: 1,
-                        offset: 1,
-                        functions: vec![],
-                        provenance_paths: vec![],
-                    }],
-                    conflicts: vec![],
-                    summary: Some(SummaryWire {
-                        minimum_size: 2,
-                        observed_widths: vec![1, 4],
-                        accessed_offsets: vec![0, 1],
-                        reads: 1,
-                        writes: 1,
-                        provisional_shape: ProvisionalShape::Unknown,
-                    }),
-                },
-                GlobalWire {
-                    address: "0x4400".into(),
-                    name: "g_none".into(),
-                    arch: "arm".into(),
-                    status: Status::NoEvidence,
-                    observations: vec![],
-                    conflicts: vec![],
-                    summary: None,
-                },
-                GlobalWire {
-                    address: "0x4500".into(),
-                    name: "g_conflict".into(),
-                    arch: "thumb".into(),
-                    status: Status::Conflicting,
-                    observations: vec![],
-                    conflicts: vec![ConflictWire {
-                        arch: IsaWire::Thumb,
-                        pc: "0x4030".into(),
-                        alternatives: vec![AlternativeWire {
-                            target_address: "0x4500".into(),
-                            conditional: false,
-                            kind: AccessKindWire::Read,
-                            width: 4,
-                            offset: 0,
-                            functions: vec![FunctionContextWire {
-                                entry: "0x4030".into(),
-                                name: "thumb_4030".into(),
-                            }],
-                            provenance_paths: vec![vec!["0x4030".into(), "0x4032".into()]],
-                        }],
-                    }],
-                    summary: None,
-                },
-            ],
+            globals: aggregation.globals,
         }
     }
 
@@ -1784,7 +1747,7 @@ mod tests {
     "instructions_decoded": 9,
     "decode_failures": 1,
     "state_barriers": 3,
-    "observations": 3,
+    "observations": 4,
     "conflicts": 1
   },
   "globals": [
@@ -1839,13 +1802,27 @@ mod tests {
       "observations": [
         {
           "arch": "thumb",
+          "pc": "0x4008",
+          "conditional": false,
+          "kind": "write",
+          "width": 2,
+          "offset": 0,
+          "functions": [],
+          "provenance_paths": [
+            []
+          ]
+        },
+        {
+          "arch": "thumb",
           "pc": "0x4010",
           "conditional": true,
           "kind": "write",
           "width": 2,
           "offset": 4,
           "functions": [],
-          "provenance_paths": []
+          "provenance_paths": [
+            []
+          ]
         }
       ],
       "conflicts": [],
@@ -1859,7 +1836,7 @@ mod tests {
           4
         ],
         "reads": 0,
-        "writes": 1,
+        "writes": 2,
         "provisional_shape": {
           "kind": "array_candidate",
           "element_width": 2,
@@ -1881,18 +1858,18 @@ mod tests {
           "width": 1,
           "offset": 1,
           "functions": [],
-          "provenance_paths": []
+          "provenance_paths": [
+            []
+          ]
         }
       ],
       "conflicts": [],
       "summary": {
         "minimum_size": 2,
         "observed_widths": [
-          1,
-          4
+          1
         ],
         "accessed_offsets": [
-          0,
           1
         ],
         "reads": 1,
@@ -1939,6 +1916,17 @@ mod tests {
                   "0x4030",
                   "0x4032"
                 ]
+              ]
+            },
+            {
+              "target_address": "0x4500",
+              "conditional": false,
+              "kind": "write",
+              "width": 4,
+              "offset": 0,
+              "functions": [],
+              "provenance_paths": [
+                []
               ]
             }
           ]
