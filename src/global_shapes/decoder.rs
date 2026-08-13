@@ -102,8 +102,22 @@ pub(crate) enum SemanticEffect {
 pub(crate) enum ControlFlow {
     Linear,
     DirectBranch { target: u32, has_fallthrough: bool },
-    Call,
+    Call { target: Option<CallTarget> },
     Stop,
+}
+
+/// A direct `bl` call target resolved to a same-ISA entry PC.
+///
+/// Only direct `bl` (A32 `Bl_A1` / T32 `Bl_T1`) resolves to `Some`. The other
+/// `ControlFlow::Call` sources — `blx`-immediate (cross-ISA resolution is
+/// deferred), `blx`/`blxns` register forms — always carry `target: None`;
+/// fabricating a target for those would misattribute interprocedural
+/// evidence. `bx` (register branch, no link) is `ControlFlow::Stop`, not
+/// `Call`, and has no target at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallTarget {
+    pub entry: u32,
+    pub isa: Isa,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +267,7 @@ pub(crate) fn reachable_blocks(
                         boundaries.insert(fallthrough);
                     }
                 }
-                ControlFlow::Call | ControlFlow::Stop => {
+                ControlFlow::Call { .. } | ControlFlow::Stop => {
                     if range.instructions.contains_key(&fallthrough) {
                         boundaries.insert(fallthrough);
                     }
@@ -497,7 +511,7 @@ fn successors(
             }
             next
         }
-        ControlFlow::Call => {
+        ControlFlow::Call { .. } => {
             if fallthrough_in_range {
                 vec![fallthrough]
             } else {
@@ -957,7 +971,7 @@ fn map_a32(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInstruction 
             regs.iter().copied().map(gpr).collect(),
         ),
         ArmA32Instruction::B_A1(cond, offset) => a32_branch(pc, length, *cond, *offset),
-        ArmA32Instruction::Bl_A1(cond, _) => insn(
+        ArmA32Instruction::Bl_A1(cond, offset) => insn(
             Isa::Arm,
             pc,
             length,
@@ -965,8 +979,15 @@ fn map_a32(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInstruction 
             BTreeSet::new(),
             BTreeSet::new(),
             SemanticEffect::None,
-            ControlFlow::Call,
+            ControlFlow::Call {
+                target: Some(CallTarget {
+                    entry: branch_target(Isa::Arm, pc, *offset),
+                    isa: Isa::Arm,
+                }),
+            },
         ),
+        // blx-immediate is a same-encoding-family, cross-ISA (Arm -> Thumb) call.
+        // Resolving it is deferred for v1 (see plan handoff note); target stays None.
         ArmA32Instruction::Blx_Immediate_A1(_) => insn(
             Isa::Arm,
             pc,
@@ -975,7 +996,7 @@ fn map_a32(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInstruction 
             BTreeSet::new(),
             BTreeSet::new(),
             SemanticEffect::None,
-            ControlFlow::Call,
+            ControlFlow::Call { target: None },
         ),
         ArmA32Instruction::Blx_Register_A1(cond, rm) => insn(
             Isa::Arm,
@@ -985,7 +1006,7 @@ fn map_a32(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInstruction 
             set([gpr(*rm)]),
             BTreeSet::new(),
             SemanticEffect::None,
-            ControlFlow::Call,
+            ControlFlow::Call { target: None },
         ),
         ArmA32Instruction::Bx_A1(cond, rm) => insn(
             Isa::Arm,
@@ -1828,7 +1849,7 @@ fn map_t32(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInstruction 
         ArmT32Instruction::Cbnz_T1(rn, offset) => {
             t32_compare_branch(pc, length, low_reg(*rn), *offset)
         }
-        ArmT32Instruction::Bl_T1(_) => insn(
+        ArmT32Instruction::Bl_T1(offset) => insn(
             Isa::Thumb,
             pc,
             length,
@@ -1836,7 +1857,12 @@ fn map_t32(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInstruction 
             BTreeSet::new(),
             BTreeSet::new(),
             SemanticEffect::None,
-            ControlFlow::Call,
+            ControlFlow::Call {
+                target: Some(CallTarget {
+                    entry: branch_target(Isa::Thumb, pc, *offset),
+                    isa: Isa::Thumb,
+                }),
+            },
         ),
         ArmT32Instruction::Blx_Register_T1(rm) => insn(
             Isa::Thumb,
@@ -1846,7 +1872,7 @@ fn map_t32(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInstruction 
             set([gpr(*rm)]),
             BTreeSet::new(),
             SemanticEffect::None,
-            ControlFlow::Call,
+            ControlFlow::Call { target: None },
         ),
         ArmT32Instruction::Bx_T1(rm) => insn(
             Isa::Thumb,
@@ -3489,7 +3515,7 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
             set([gpr(*rm)]),
             BTreeSet::new(),
             SemanticEffect::None,
-            ControlFlow::Call,
+            ControlFlow::Call { target: None },
         ),
         ArmT32Instruction::Nop_T1
         | ArmT32Instruction::Yield_T1
@@ -4062,7 +4088,12 @@ mod tests {
                     &[],
                     &[],
                     SemanticEffect::None,
-                    ControlFlow::Call,
+                    ControlFlow::Call {
+                        target: Some(CallTarget {
+                            entry: 0x1008,
+                            isa: Isa::Arm,
+                        }),
+                    },
                 ),
             },
             NamedFixture {
@@ -4090,7 +4121,7 @@ mod tests {
                     &[R0],
                     &[],
                     SemanticEffect::None,
-                    ControlFlow::Call,
+                    ControlFlow::Call { target: None },
                 ),
             },
             NamedFixture {
@@ -4586,7 +4617,12 @@ mod tests {
                     &[],
                     &[],
                     SemanticEffect::None,
-                    ControlFlow::Call,
+                    ControlFlow::Call {
+                        target: Some(CallTarget {
+                            entry: 0x1004,
+                            isa: Isa::Thumb,
+                        }),
+                    },
                 ),
             },
             NamedFixture {
@@ -4614,7 +4650,7 @@ mod tests {
                     &[R0],
                     &[],
                     SemanticEffect::None,
-                    ControlFlow::Call,
+                    ControlFlow::Call { target: None },
                 ),
             },
             NamedFixture {
@@ -4968,6 +5004,52 @@ mod tests {
             let result = decoder.decode_one(&mut state, isa, 0x1000, bytes);
             assert!(result.is_err(), "{name} unexpectedly decoded {result:?}");
         }
+    }
+
+    #[test]
+    fn a32_bl_carries_resolved_same_isa_target() {
+        // BL +0x10 (A1): imm24 = 0x10 >> 2 = 4, encoded as `04 00 00 eb`.
+        // target = pc(0x1000) + 8 + 0x10 = 0x1018.
+        let insn = decode_a32(0x1000, &[0x04, 0x00, 0x00, 0xeb]).expect("fixture must decode");
+        assert_eq!(
+            insn.flow,
+            ControlFlow::Call {
+                target: Some(CallTarget {
+                    entry: 0x1018,
+                    isa: Isa::Arm,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn t32_bl_carries_resolved_thumb_target() {
+        // BL +0 (T1), same bytes as the `t32_bl` fixture, decoded at a different pc
+        // to confirm the target tracks the caller's pc, not a fixed offset.
+        let mut state = ItRangeState::default();
+        let insn =
+            decode_t32(&mut state, 0x2000, &[0x00, 0xf0, 0x00, 0xf8]).expect("fixture must decode");
+        match insn.flow {
+            ControlFlow::Call { target: Some(t) } => {
+                assert_eq!(
+                    t,
+                    CallTarget {
+                        entry: 0x2004,
+                        isa: Isa::Thumb
+                    }
+                );
+            }
+            other => panic!("expected resolved thumb call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blx_and_bx_do_not_resolve_a_target() {
+        // BLX r0 / BX lr (A32 register forms) must not fabricate a target.
+        let blx = decode_a32(0x1000, &[0x30, 0xff, 0x2f, 0xe1]).expect("fixture must decode");
+        assert!(matches!(blx.flow, ControlFlow::Call { target: None }));
+        let bx = decode_a32(0x1000, &[0x1e, 0xff, 0x2f, 0xe1]).expect("fixture must decode");
+        assert!(matches!(bx.flow, ControlFlow::Stop));
     }
 
     fn function(entry: u32, ranges: Vec<DecodeRange>) -> FunctionExecution {
@@ -5519,7 +5601,7 @@ mod tests {
             vec![(
                 range,
                 vec![
-                    flow_at(Isa::Arm, 0x1000, 4, ControlFlow::Call),
+                    flow_at(Isa::Arm, 0x1000, 4, ControlFlow::Call { target: None }),
                     linear_at(Isa::Arm, 0x1004, 4),
                 ],
             )],

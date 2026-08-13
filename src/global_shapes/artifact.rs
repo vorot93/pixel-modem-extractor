@@ -1,4 +1,4 @@
-// Input validation, source hashes, v1 schema, and atomic sidecar commit.
+// Input validation, source hashes, v2 schema, and atomic sidecar commit.
 
 use super::{
     FunctionContext, FunctionExecution, RecoveredGlobal, RunRequest, SourceProjectionCounts,
@@ -460,6 +460,12 @@ pub(crate) struct AnalysisWire {
     pub state_barriers: usize,
     pub observations: usize,
     pub conflicts: usize,
+    pub direct_calls_resolved: usize,
+    pub call_facts_unresolved: usize,
+    pub seeded_callees: usize,
+    pub seed_vectors: usize,
+    pub interprocedural_observations: usize,
+    pub interprocedural_dropped: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -491,12 +497,24 @@ pub(crate) struct ObservationWire {
     pub offset: u32,
     pub functions: Vec<FunctionContextWire>,
     pub provenance_paths: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<CallHopWire>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct FunctionContextWire {
     pub entry: String,
     pub name: String,
+}
+
+/// One depth-1 `bl` hop from a caller's entry block into the tracked
+/// callee, recorded on observations whose evidence crossed a direct call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CallHopWire {
+    pub caller_entry: String,
+    pub caller_name: String,
+    pub call_pc: String,
+    pub arg_register: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -594,7 +612,7 @@ mod tests {
     use crate::global_shapes::decoder::AccessKind;
     use crate::global_shapes::tracker::CandidateObservation;
     use crate::global_shapes::{
-        FORMAT_V1, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
+        FORMAT_V2, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
     };
     use crate::manifest::sha256_bytes;
     use serde_json::{Value, json};
@@ -1630,6 +1648,7 @@ mod tests {
             offset,
             functions: BTreeSet::new(),
             provenance_path: Vec::new(),
+            via: Vec::new(),
         }
     }
 
@@ -1689,9 +1708,10 @@ mod tests {
             conflict_read,
             golden_obs(0x4500, DecodeIsa::Thumb, 0x4030, AccessKind::Write, 4, 0),
         ];
-        let aggregation = aggregate(&recovered, candidates).expect("golden aggregation");
+        let aggregation =
+            aggregate(&recovered, candidates, Vec::new()).expect("golden aggregation");
         GlobalShapesFile {
-            format: FORMAT_V1,
+            format: FORMAT_V2,
             image: LABEL.into(),
             load_address: "0x40000000".into(),
             inputs: InputHashesWire {
@@ -1718,13 +1738,19 @@ mod tests {
                 state_barriers: 3,
                 observations: aggregation.observations,
                 conflicts: aggregation.conflicts,
+                direct_calls_resolved: 0,
+                call_facts_unresolved: 0,
+                seeded_callees: 0,
+                seed_vectors: 0,
+                interprocedural_observations: 0,
+                interprocedural_dropped: 0,
             },
             globals: aggregation.globals,
         }
     }
 
-    const V1_WIRE_GOLDEN: &str = r#"{
-  "format": "pixel-modem-extractor-global-shapes-v1",
+    const V2_WIRE_GOLDEN: &str = r#"{
+  "format": "pixel-modem-extractor-global-shapes-v2",
   "image": "02_MAIN",
   "load_address": "0x40000000",
   "inputs": {
@@ -1747,7 +1773,13 @@ mod tests {
     "decode_failures": 1,
     "state_barriers": 3,
     "observations": 4,
-    "conflicts": 1
+    "conflicts": 1,
+    "direct_calls_resolved": 0,
+    "call_facts_unresolved": 0,
+    "seeded_callees": 0,
+    "seed_vectors": 0,
+    "interprocedural_observations": 0,
+    "interprocedural_dropped": 0
   },
   "globals": [
     {
@@ -1937,9 +1969,9 @@ mod tests {
 }"#;
 
     #[test]
-    fn v1_wire_bytes_are_exact() {
+    fn v2_wire_bytes_are_exact() {
         let bytes = serialize(&golden_file()).unwrap();
-        assert_eq!(bytes, V1_WIRE_GOLDEN.as_bytes());
+        assert_eq!(bytes, V2_WIRE_GOLDEN.as_bytes());
         assert!(!bytes.ends_with(b"\n"));
     }
 
