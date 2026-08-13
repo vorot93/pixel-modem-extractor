@@ -78,6 +78,16 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   `$PME_GOLDEN_DIR_PROVISIONAL` (a second decompose output produced with
   `--globals-provisional`) gates the opt-in consistency leg of
   `phase3_0_1_provisional_emitted_only_with_opt_in`.
+- **Phase 3.2 goldens** (`tests/global_shapes_golden.rs` and
+  `report_json_includes_global_shapes_fields` in `tests/decompose_golden.rs`)
+  read a retained or fresh decompose tree from `$PME_GOLDEN_DIR` and never
+  auto-run decompose. They skip cleanly when the env is unset, the directory
+  is absent, or the tree predates `global_shapes`. The ignored retained-tree
+  replay (`global_shapes::tests::retained_tree_replay_is_deterministic_and_non_mutating`)
+  also needs `$PME_GLOBAL_SHAPES_REPLAY=1` and an unpruned tree that still has
+  the raw per-image slices; it analyzes twice in memory, does not write, and
+  asserts the tree is unchanged. Point it at a disposable complete tree, not
+  a pruned golden.
 - **External tools:** the `--run` and `decompose` paths shell out to Ghidra
   (`analyzeHeadless`) and radare2 (`r2`); both are probed up front.
 - Write the failing test first (TDD), then the minimal code to pass it.
@@ -103,7 +113,14 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
-| `decompose.rs` | One-shot pipeline over all decoders |
+| `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by the Ghidra and radare2 producers and `global_shapes` |
+| `global_shapes/mod.rs` | Phase 3.2 per-image coordinator: one-function decode/track/aggregate, panic containment, atomic sidecar commit |
+| `global_shapes/decoder.rs` | Pure-Rust adapter over `scaleservers-arm32-assembly` 1.0.0; project-owned instructions only |
+| `global_shapes/tracker.rs` | Conservative per-block fact tracking and Recovered-global access observations |
+| `global_shapes/aggregate.rs` | Same-PC agreement/conflict grouping and conservative summaries |
+| `global_shapes/artifact.rs` | Input validation, source hashes, v1 schema, deterministic serialize, atomic replace |
+| `global_shapes/validate.rs` | Shared v1 sidecar checks for goldens and retained-tree replay |
+| `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
@@ -219,12 +236,13 @@ module; when a file outgrows that, split it.
   Damage"`) lets Ghidra 12 converge in ~23 min with 0
   `ClearFlowAndRepairCmd` repair-log lines. Surface B's budget (~112 min
   wall-clock, 100k log-spam lines) is never approached. Full `decompose`
-  (full pipeline, ~1 h 49 m wall, exit 0, `report.ok=true`): `functions` =
-  107,955; `thumb_functions` = 117,444; `thumb_decompiled` = 10,965;
-  `body_c` on 11,292 of 151,411 Thumb entries; `pass2_applied` = 3,461;
+  (full pipeline, ~1 h 37 m wall, exit 0, `report.ok=true`): `functions` =
+  107,955; `thumb_functions` = 117,444; `thumb_decompiled` = 77,456;
+  `pass2_applied` = 3,461;
   `globals_recovered` = 915 (arch: arm 367 / thumb 545 / mixed 3);
   `thumb_tighten_error` / `thumb_error` / `thumb_enrich_error` /
-  `pass2_error` absent. Ownership-aware `refresh_decompiled` preserves
+  `pass2_error` absent. Do not re-assert older `thumb_decompiled` = 10,965
+  figures as current HEAD. Ownership-aware `refresh_decompiled` preserves
   `thumb_functions.json` and `thumb/*.stdout` across pass 2. The Phase 2
   fields are surfaced in the `decompile` stage's per-image entry via
   `refresh_decompile_stage_images` (called after both pass-1 and post-pass-2
@@ -266,8 +284,8 @@ module; when a file outgrows that, split it.
   `<ghidra_dir>/export/<label>/`. The helper validates that exact three-file
   set before any destination mutation, then replaces only those three paths
   under `images/<label>/decompiled/`. Every other destination entry
-  (`globals.json`, `thumb_functions.json`, `thumb/`, and future non-Ghidra
-  sidecars) is left byte-for-byte unchanged. An incomplete or unexpected
+  (`globals.json`, `global_shapes.json`, `thumb_functions.json`, `thumb/`,
+  and future non-Ghidra sidecars) is left byte-for-byte unchanged. An incomplete or unexpected
   export returns an error and leaves the destination untouched. A successful
   process whose `ApplyGlobals` summary reports an independent map error still
   refreshes a successfully exported function result; `decompile_pass2` remains
@@ -321,9 +339,9 @@ module; when a file outgrows that, split it.
   `void FUN_x(\n    int a)`, ~35%). The 8-line bound captures 99.6% of real
   headers; the long tail (offset >8, <0.5%) is accepted loss. Production
   verification on a real `02_MAIN` (full two-pass `decompose`) measured
-  `thumb_decompiled` = 10,965 and `body_c` on 11,292 of 151,411 Thumb
-  entries after pass-2 regeneration + post-pass-2 enrich (do not re-assert
-  older pass-1-shaped ~81k figures as current HEAD). Two inline regression sentinels
+  `thumb_decompiled` = 77,456 after pass-2 regeneration + post-pass-2 enrich
+  (do not re-assert older 10,965 or pass-1-shaped ~81k figures as current
+  HEAD). Two inline regression sentinels
   (`thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines` for
   offset-4 and `thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig`
   for offset-6) catch a future regression to the original 2-line bound, which
@@ -398,7 +416,7 @@ module; when a file outgrows that, split it.
   `globals_recovered`. A successful zero-match sweep still writes
   `"globals": []`; absence means recovery did not complete. Load addresses
   come from numeric `toc[].load_addr` entries keyed by `toc[].name` through
-  `symbolicate::load_load_addr`; do not add a second manifest parser. The
+  `manifest::load_addr_for_image`; do not add a second manifest parser. The
   writer serializes the complete v1 document before opening a same-directory
   atomic temporary file, then commits it as one replacement. An interrupted or
   failed pre-commit write therefore leaves an existing `globals.json` intact:
@@ -514,7 +532,160 @@ module; when a file outgrows that, split it.
   to `thumb/<addr:08x>.stdout` with `R2_STDOUT_CAP_BYTES = 4 GiB` (see
   **radare2 stdout streaming** below). The verified full `decompose` did not
   hit the cap (`thumb_functions` = 117,444; no `thumb_error`) and closed
-  Thumb through pass 2 (`thumb_decompiled` = 10,965; globals thumb-majority).
+  Thumb through pass 2 (`thumb_decompiled` = 77,456; globals thumb-majority).
+- **Phase 3.2: global storage-shape recovery.** Default-on in every
+  `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback). The
+  stage runs **once**, immediately after the complete symbol route returns
+  and before `decode_rf` / `hardware_config`, via one shared
+  `PostSymbolStep::GlobalShapes` call. That placement is binding: pass 2
+  replaces `functions.json`, so an earlier run would bind evidence to an
+  inventory that is no longer on disk. Both routes therefore analyze the
+  **terminal** `images/<label>/<label>.bin`, `globals.json`,
+  `functions.json`, and (when the current decompile result reports a Thumb
+  inventory) `thumb_functions.json`. A valid empty Recovered set still
+  writes a source-hashed empty sidecar; it is not a skipped analysis.
+  `globals.json` is never rewritten. `--prune` retains
+  `decompiled/global_shapes.json`. Pass-2 refresh still owns only
+  `decompiled.c` / `disasm.lst` / `functions.json` and must not touch this
+  sidecar.
+- **Phase 3.2 currentness.** The stage does not infer readiness from file
+  existence. `current_global_shapes_run` copies the current decompile
+  snapshot: raw Ghidra `functions` plus both Ghidra projection counters
+  (their sum must equal `functions`); Thumb substantial / accepted /
+  quarantined either all absent or all present; `thumb_error` absent;
+  `globals_error` absent; `globals_recovered: Some` (zero is invoked, not
+  skipped). Missing current-run markers, a stale `globals.json` from an
+  earlier failed rerun, or a count mismatch is a per-image hard failure:
+  the analyzer is not called, an existing sidecar is left byte-identical,
+  later images continue, and the aggregate `global_shapes` stage is
+  `failed`. **Absent versus stale Thumb:** no current Thumb inventory plus
+  no file is valid (`thumb_functions_sha256` is JSON `null`). No current
+  Thumb inventory plus an unexpected old `thumb_functions.json` is a hard
+  currentness error. A reported Thumb count requires a present, valid file
+  whose substantial / accepted / quarantined counts match the current
+  request. `ImageReport.thumb_functions` remains the substantial-size
+  metric (`size >= 32`); every retained record is still validated.
+- **Phase 3.2 tagged projections.** Every `functions.json` and
+  `thumb_functions.json` record is a strict tagged union. Accepted:
+  non-empty `decode_ranges`, empty `decode_range_errors`. Quarantined:
+  empty ranges, one or more errors. Both empty, both non-empty, or a
+  missing field is an unsupported/malformed producer schema, not an
+  implicit empty. Any record-local defect quarantines that **complete**
+  record; prefixes are not salvaged and the other inventory cannot rescue
+  it. The closed error `kind` set is:
+  `missing_instruction_at_entry`, `missing_isa_context`,
+  `invalid_isa_context`, `overridden_instruction_length`,
+  `invalid_instruction_length`, `misaligned_instruction`,
+  `extent_outside_function`, `extent_outside_image`,
+  `missing_operation_body`, `invalid_operation_address`,
+  `invalid_operation_bytes`, `raw_byte_mismatch`, `duplicate_extent`,
+  `overlapping_extent`, `entry_not_range_start`, `empty_projection`.
+  Each inventory conserves `raw = accepted + quarantined`. Execution
+  identity is entry plus the complete ordered range list; identical
+  identities union `(entry, name)` contexts and are decoded once. Distinct
+  identities coexist even when their bytes overlap across ISAs — no
+  source, alignment, decoder result, order, or support count wins.
+  Quarantined records never reach the decoder. Quarantine counters stay
+  separate from accepted-range `decode_failures`.
+- **Phase 3.2 decoder.** The only production adapter is
+  `scaleservers-arm32-assembly` **1.0.0** (`ArmA32Instruction::decode` /
+  `ArmT32Instruction::decode`). It is a current, correct, pure-Rust crate
+  with no C/C++/FFI/native build. Dependency-specific enums stay inside
+  `decoder.rs`; the rest of the crate sees only the project-owned
+  instruction. The sidecar records `decoder.crate` and `decoder.version`
+  from the adapter identity; those constants must stay in lockstep with
+  `Cargo.toml`. Revalidation after analysis rejects a v1 artifact whose
+  status, source order, hashes, or conservation invariants do not match
+  the loaded inputs. VFP/NEON/MVE/unrecognized encodings are explicit
+  unsupported/decode-failure events, never guessed. An accepted identity
+  whose **entry** is not a decoded instruction PC is recoverable evidence
+  loss: `reachable_blocks` returns `Ok([])`, the coordinator counts one
+  `decode_failure` if no range already recorded one, later identities
+  still run, and the sidecar may commit. Adapter-invariant errors
+  (duplicate PC, PC regression, wrong ISA, zero/impossible length,
+  overrun) remain hard per-image failures and preserve any older sidecar.
+- **Phase 3.2 state model.** The coordinator keeps at most one function's
+  decoded instruction map and releases it before the next. Blocks are
+  **direct-only**: boundaries are the function entry, every valid direct
+  branch target that is an instruction PC in the same map, and the
+  fallthrough after a control transfer when that PC exists. Traversal
+  starts only at the entry. No edge is invented across a gap, into an
+  undecoded suffix, or for a call / return / indirect transfer. A call's
+  fallthrough block may be visited but begins unknown; the callee is not
+  entered. Every reachable block starts with all registers unknown; no
+  fact crosses an edge. `state_barriers` counts a non-entry block start
+  plus every instruction that kills at least one known fact or clears
+  unbounded state.
+- **Phase 3.2 anchoring.** A fact becomes a Recovered global only when an
+  exact 32-bit value equals a Recovered address. There is no
+  nearest-global attribution. Once anchored, copy/arithmetic keep that
+  identity and never retarget just because the numeric result equals
+  another Recovered base. `movw` establishes an exact value; `movt`
+  updates an already-exact low half and otherwise leaves the destination
+  unknown. Observations are collected against the pre-write state;
+  writeback and leftover destinations are applied afterwards. Negative
+  offsets, overflowing `offset + width`, and u32 address wrap kill the
+  fact and do not observe.
+- **Phase 3.2 aggregation and artifact.** Observations that agree at one
+  `(ISA, PC)` union contexts and provenance. Two or more semantic
+  alternatives at that PC are a conflict; every implicated Recovered
+  target receives the complete alternative group. Support count and
+  function order never choose a winner. Distinct cross-ISA PCs never
+  collapse because their byte intervals overlap. Status invariants:
+  `inferred` has observations, no conflicts, and a summary; `no_evidence`
+  has empty observations/conflicts and `summary: null`; `conflicting` has
+  non-empty conflicts and `summary: null`. `inferred + no_evidence +
+  conflicting` equals the Recovered count. `minimum_size` is the maximum
+  checked `offset + width`. Provisional labels are
+  `scalar_candidate { width }`, `array_candidate { element_width,
+  minimum_elements }`, or `unknown` — never an allocation size or C type.
+  Wire field order is the struct declaration order. Serialization is
+  `serde_json` pretty (two-space) with **no trailing newline**. Addresses
+  are canonical lowercase `0x…`; SHA-256 values are lowercase 64-hex.
+  The complete byte vector is serialized before the destination is opened,
+  then atomically replaced. A decoder/adapter panic is caught, bounded to
+  2,048 Unicode characters, fails that image, and does not prevent later
+  images. Per-image `None` vs `Some(0)`: the nine `global_shapes_*`
+  numeric `ImageReport` fields (including `global_shape_observations`)
+  omit when analysis did not complete and emit `0` for a completed zero;
+  `global_shapes_error` is reason-only and exclusive with those counts.
+- **Phase 3.2 focused tests and replay.**
+  ```
+  cargo test global_shapes:: -- --nocapture
+  cargo test execution_ranges::tests -- --nocapture
+  cargo test decompose::tests::global_shapes_stage_ -- --nocapture
+  cargo test decompose::tests::image_report_serializes_global_shapes -- --nocapture
+  cargo test decompose::tests::refresh_decompiled_replaces_ghidra_outputs_and_preserves_sidecars -- --nocapture
+  cargo test decompose::tests::prune_keeps_only_leaves -- --nocapture
+  cargo test --test global_shapes_golden -- --nocapture
+  cargo test --test decompose_golden report_json_includes_global_shapes_fields -- --nocapture
+  PME_GLOBAL_SHAPES_REPLAY=1 PME_GOLDEN_DIR=/path/to/unpruned/decompose \
+    cargo test --release \
+    global_shapes::tests::retained_tree_replay_is_deterministic_and_non_mutating \
+    -- --ignored --nocapture
+  ```
+  Goldens skip when `$PME_GOLDEN_DIR` is unset. Replay also needs the raw
+  image slices and does not write.
+- **Phase 3.2 production baselines (verified full `decompose`, ~1 h 37 m,
+  exit 0).** Decoder `scaleservers-arm32-assembly` 1.0.0. Recovered shapes
+  915 MAIN / 921 total; MAIN observations 32 ARM + 907 Thumb; 125 inferred
+  / 787 `no_evidence` / 3 conflicting; MAIN `decode_failures` = 37,629
+  (recoverable; the image still succeeds). Producer conservation on MAIN:
+  Ghidra 107,955 = 107,785 accepted + 170 quarantined; Thumb 151,411 =
+  149,169 accepted + 2,242 quarantined. Established MAIN
+  `functions` = 107,955, `thumb_functions` = 117,444,
+  `thumb_decompiled` = 77,456, `globals_recovered` = 915. `globals.json`
+  is unchanged by the new stage. `--prune` keeps the sidecar. Do not cite
+  `thumb_decompiled` = 10,965 as current HEAD.
+- **Phase 3.2 environment traps.** Currentness comes from the current-run
+  markers, not leftover files. A Ghidra 12 output root must stay
+  canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
+  goldens need a complete unpruned tree; a pruned golden has no raw
+  `.bin` slices. The dense-Thumb memory envelope (~56 GiB RSS) still
+  applies — shape recovery is not the peak. Do not parse Ghidra/radare2
+  disassembly text, infer ISA from alignment or inventory name, attribute
+  an address to the nearest global, or leak decoder-crate enums outside
+  `decoder.rs`.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +

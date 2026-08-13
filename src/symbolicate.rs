@@ -6,8 +6,9 @@
 //! real rename, only a token yields a marked `guess_…` name, everything else is
 //! a comment.
 use crate::error::{Error, Result};
+use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const GUESS_PREFIX: &str = "guess_";
@@ -70,6 +71,10 @@ pub struct FuncRec {
     pub end: u64,
     pub data_refs: Vec<u64>,
     pub disasm: String, // ARM: disasm.lst lines in range; Thumb: the `body`
+    /// Which recovery tool produced this function record. ARM/`functions.json`
+    /// is Ghidra; Thumb/`thumb_functions.json` is radare2. Used to look up
+    /// source attribution keyed by `(tool, entry)`.
+    pub tool: Tool,
 }
 
 /// 32-bit constants materialized by `movw`/`movt` (and lone `movw`) in a block
@@ -443,6 +448,7 @@ fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
             end,
             data_refs,
             disasm: index.slice_for(entry, end),
+            tool: Tool::Ghidra,
         });
     }
     Ok(out)
@@ -476,6 +482,7 @@ fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
             end,
             data_refs,
             disasm: f.body,
+            tool: Tool::Radare2,
         });
     }
     Ok(out)
@@ -530,50 +537,48 @@ struct RiSource {
 }
 #[derive(Deserialize)]
 struct RiFn {
+    tool: Tool,
     entry: String,
 }
 
-/// function entry-vaddr -> attributed source path, from `recovered_index.json`.
-fn load_attribution(source_tree: &Path) -> Result<HashMap<u64, String>> {
+/// `(tool, entry-vaddr) -> attributed source path` from `recovered_index.json`.
+/// Distinct tools may claim the same entry; the same tool naming two paths is
+/// a hard failure. Returned as a `BTreeMap` (not `HashMap`) so repeated loads
+/// and conflict path order are deterministic under Debug / iteration.
+fn load_attribution(source_tree: &Path) -> Result<BTreeMap<(Tool, u64), String>> {
     let path = source_tree.join("recovered_index.json");
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok(BTreeMap::new());
     }
     let bytes = std::fs::read(&path)?;
     let idx: RiIndex =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    let mut m = HashMap::new();
-    for (src, s) in idx.sources {
+    // Walk sources in path order so first-seen conflict path is stable.
+    let sources: BTreeMap<String, RiSource> = idx.sources.into_iter().collect();
+    let mut m = BTreeMap::new();
+    for (src, s) in sources {
         for f in s.functions {
-            m.insert(parse_hex(&f.entry)?, src.clone());
+            let entry = parse_hex(&f.entry)?;
+            let key = (f.tool, entry);
+            match m.get(&key) {
+                Some(prev) if prev == &src => {} // same (tool, entry) + same path: idempotent
+                Some(prev) => {
+                    let tool = match f.tool {
+                        Tool::Ghidra => "ghidra",
+                        Tool::Radare2 => "radare2",
+                    };
+                    return Err(Error::DecomposeIncomplete(format!(
+                        "source attribution conflict for {tool} entry 0x{entry:x}: \
+                         {prev:?} vs {src:?}"
+                    )));
+                }
+                None => {
+                    m.insert(key, src.clone());
+                }
+            }
         }
     }
     Ok(m)
-}
-
-#[derive(Deserialize)]
-struct ExtractManifest {
-    #[serde(default)]
-    toc: Vec<TocEntry>,
-}
-#[derive(Deserialize)]
-struct TocEntry {
-    name: String,
-    load_addr: u64,
-}
-
-/// The `load_addr` for a TOC image name (e.g. "MAIN") from the extract manifest.
-pub(crate) fn load_load_addr(manifest: &Path, toc_name: &str) -> Result<Option<u64>> {
-    if !manifest.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(manifest)?;
-    let m: ExtractManifest =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    Ok(m.toc
-        .into_iter()
-        .find(|t| t.name == toc_name)
-        .map(|t| t.load_addr))
 }
 
 #[derive(Serialize)]
@@ -886,11 +891,6 @@ fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> R
     Ok(())
 }
 
-/// TOC image name for a decompose label, e.g. "02_MAIN" -> "MAIN".
-fn toc_name(label: &str) -> &str {
-    label.split_once('_').map(|(_, n)| n).unwrap_or(label)
-}
-
 /// Tunable parameters for `finalize_image`. Today a single flag controls whether
 /// `decompiled.c` / `disasm.lst` are text-rewritten; on the `decompose` two-pass
 /// path (Phase 1+), pass 2 regenerates `decompiled.c` and the rewrite is skipped.
@@ -920,7 +920,7 @@ pub(crate) fn build_map(
     let attribution = load_attribution(&source_tree)?;
 
     let raw_image_path = image_dir.join(format!("{image_label}.bin"));
-    let string_map = match load_load_addr(manifest, toc_name(image_label))? {
+    let string_map = match crate::manifest::load_addr_for_image(manifest, image_label)? {
         Some(load_addr) if raw_image_path.exists() => {
             build_string_map(&std::fs::read(&raw_image_path)?, load_addr, 3)
         }
@@ -950,7 +950,7 @@ pub(crate) fn build_map(
         } else {
             recover_func_name(&f.data_refs, &file_occ, &string_map)
         };
-        let file = attribution.get(&f.entry).cloned();
+        let file = attribution.get(&(f.tool, f.entry)).cloned();
         let fstrings = file
             .as_ref()
             .and_then(|p| file_strings.get(p))
@@ -1420,14 +1420,92 @@ mod tests {
             r#"{"files":{"A/x.c":{"occurrences":[{"vaddr":"0x100"}],"attributed_strings":["reest"]}}}"#).unwrap();
         std::fs::write(
             dir.join("recovered_index.json"),
-            r#"{"sources":{"A/x.c":{"functions":[{"entry":"0x10"}]}}}"#,
+            r#"{"sources":{"A/x.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]}}}"#,
         )
         .unwrap();
         let (occ, strs) = load_file_occurrences(&dir).unwrap();
         assert!(occ.contains(&0x100));
         assert_eq!(strs["A/x.c"], vec!["reest".to_string()]);
         let attr = load_attribution(&dir).unwrap();
-        assert_eq!(attr.get(&0x10).map(String::as_str), Some("A/x.c"));
+        assert_eq!(
+            attr.get(&(crate::recover_source::Tool::Ghidra, 0x10))
+                .map(String::as_str),
+            Some("A/x.c")
+        );
+    }
+
+    #[test]
+    fn load_attribution_keeps_distinct_tool_claims_at_the_same_entry() {
+        let dir = tmp("pme_sym_attr_tools");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{
+            "ghidra/a.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]},
+            "r2/b.c":{"functions":[{"tool":"radare2","entry":"0x10"}]}
+        }}"#,
+        )
+        .unwrap();
+        let attr = load_attribution(&dir).unwrap();
+        assert_eq!(
+            attr.get(&(crate::recover_source::Tool::Ghidra, 0x10))
+                .map(String::as_str),
+            Some("ghidra/a.c")
+        );
+        assert_eq!(
+            attr.get(&(crate::recover_source::Tool::Radare2, 0x10))
+                .map(String::as_str),
+            Some("r2/b.c")
+        );
+    }
+
+    #[test]
+    fn load_attribution_fails_closed_on_same_tool_path_conflict() {
+        let dir = tmp("pme_sym_attr_conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{
+            "a.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]},
+            "b.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]}
+        }}"#,
+        )
+        .unwrap();
+        let err = load_attribution(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghidra"), "{msg}");
+        assert!(msg.contains("0x10") || msg.contains("10"), "{msg}");
+        assert!(msg.contains("a.c") && msg.contains("b.c"), "{msg}");
+    }
+
+    #[test]
+    fn load_attribution_fails_closed_on_missing_tool() {
+        let dir = tmp("pme_sym_attr_missing_tool");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{"A/x.c":{"functions":[{"entry":"0x10"}]}}}"#,
+        )
+        .unwrap();
+        assert!(load_attribution(&dir).is_err());
+    }
+
+    #[test]
+    fn load_attribution_is_deterministic_across_repeated_loads() {
+        let dir = tmp("pme_sym_attr_det");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{
+            "ghidra/a.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]},
+            "r2/b.c":{"functions":[{"tool":"radare2","entry":"0x10"}]}
+        }}"#,
+        )
+        .unwrap();
+        let first = format!("{:?}", load_attribution(&dir).unwrap());
+        for _ in 0..32 {
+            assert_eq!(format!("{:?}", load_attribution(&dir).unwrap()), first);
+        }
     }
 
     // small helper: a fresh temp dir path (see std::env::temp_dir usage in repo tests)

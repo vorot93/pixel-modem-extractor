@@ -131,12 +131,506 @@ fn run_drives_ghidra_end_to_end() {
             .is_some(),
         "functions.json entry missing data_refs array: {first}"
     );
+    assert_eq!(
+        first["decode_ranges"],
+        serde_json::json!([{"isa":"arm", "start":"0x0", "end":"0x4"}]),
+        "the normal A32 fixture must export its exact instruction-backed range: {first}"
+    );
+    assert_eq!(first["decode_range_errors"], serde_json::json!([]));
 
     // generation artifacts exist alongside the export
     assert!(out.join("ghidra_load.json").exists());
     assert!(out.join("run_ghidra.sh").exists());
     assert!(out.join("scripts").join("ExportDecomp.java").exists());
     assert!(out.join("images").join("00_BOOT").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exporter_quarantines_instruction_when_tmode_register_is_missing() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let modem = craft_modem_bin(&[0xc3]); // x86 `ret`; language has no ARM TMode register.
+    let dir = std::env::temp_dir().join(format!(
+        "pme_decompile_missing_tmode_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home),
+            processor: "x86:LE:32:default".to_string(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
+        },
+        &out,
+    )
+    .unwrap();
+    let boot = report
+        .images
+        .iter()
+        .find(|image| image.label == "00_BOOT")
+        .unwrap();
+    assert_eq!(boot.ghidra_execution_accepted, Some(0));
+    assert_eq!(boot.ghidra_execution_quarantined, Some(1));
+    let functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
+            .unwrap();
+    assert_eq!(functions.as_array().unwrap().len(), 1, "{functions}");
+    assert_eq!(functions[0]["decode_ranges"], serde_json::json!([]));
+    assert_eq!(
+        functions[0]["decode_range_errors"],
+        serde_json::json!([
+            {"kind":"empty_projection","address":"0x0","end":null},
+            {"kind":"missing_isa_context","address":"0x0","end":"0x1"}
+        ])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let payload = [
+        0x1eu8, 0xff, 0x2f, 0xe1, // A32: bx lr
+        0, 0, 0, 0, // exact Function-body gap
+        0x70, 0x47, // T32: bx lr
+    ];
+    let modem = craft_modem_bin(&payload);
+    let dir = std::env::temp_dir().join(format!("pme_decompile_mixed_gap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home),
+        processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+    let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+
+    // Fixture-only replacement: run_two_pass executes this against the saved
+    // temporary project before the shipping ExportDecomp.java post-script.
+    std::fs::write(
+        out.join("scripts/ApplySymbols.java"),
+        r#"//@category PixelModemTest
+import java.math.BigInteger;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.listing.ProgramContext;
+import ghidra.program.model.symbol.SourceType;
+
+public class ApplySymbols extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        while (functions.getFunctionCount() != 0) {
+            FunctionIterator iterator = functions.getFunctions(true);
+            Function function = iterator.next();
+            functions.removeFunction(function.getEntryPoint());
+        }
+        Address arm = toAddr(0);
+        Address thumb = toAddr(8);
+        clearListing(arm, toAddr(9));
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        ProgramContext context = currentProgram.getProgramContext();
+        context.setValue(tMode, arm, toAddr(3), BigInteger.ZERO);
+        if (!disassemble(arm)) throw new Exception("failed to disassemble A32 fixture");
+        context.setValue(tMode, thumb, toAddr(9), BigInteger.ONE);
+        if (!disassemble(thumb)) throw new Exception("failed to disassemble T32 fixture");
+        AddressSet body = new AddressSet();
+        body.addRange(arm, toAddr(3));
+        body.addRange(thumb, toAddr(9));
+        functions.createFunction("mixed_gap", arm, body, SourceType.USER_DEFINED);
+        println("ApplySymbols: applied 1 names, 0 plate comments, skipped 0");
+    }
+}
+"#,
+    )
+    .unwrap();
+    let map = out.join("mixed-gap-map.json");
+    std::fs::write(&map, b"{}").unwrap();
+    let inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(prepared_pass2_map(&map, 1)),
+            global_map: None,
+        },
+    )]);
+    let pass2 =
+        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
+    assert_eq!(
+        pass2.outcomes["00_BOOT"],
+        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    );
+
+    let functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
+            .unwrap();
+    assert_eq!(functions.as_array().unwrap().len(), 1, "{functions}");
+    assert_eq!(functions[0]["name"], "mixed_gap");
+    assert_eq!(functions[0]["entry"], "0x0");
+    assert_eq!(functions[0]["end"], "0xa");
+    assert_eq!(functions[0]["size"], 6);
+    assert_eq!(
+        functions[0]["decode_ranges"],
+        serde_json::json!([
+            {"isa":"arm", "start":"0x0", "end":"0x4"},
+            {"isa":"thumb", "start":"0x8", "end":"0xa"}
+        ])
+    );
+    assert_eq!(functions[0]["decode_range_errors"], serde_json::json!([]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_program_quarantines_when_same_isa_merge_makes_entry_interior() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let payload = [
+        0x1eu8, 0xff, 0x2f, 0xe1, // A32: bx lr before the function entry
+        0x1e, 0xff, 0x2f, 0xe1, // A32: bx lr at the function entry
+    ];
+    let modem = craft_modem_bin(&payload);
+    let dir = std::env::temp_dir().join(format!(
+        "pme_decompile_entry_interior_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home),
+        processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+    let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+
+    std::fs::write(
+        out.join("scripts/ApplySymbols.java"),
+        r#"//@category PixelModemTest
+import java.math.BigInteger;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.listing.ProgramContext;
+import ghidra.program.model.symbol.SourceType;
+
+public class ApplySymbols extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        while (functions.getFunctionCount() != 0) {
+            FunctionIterator iterator = functions.getFunctions(true);
+            Function function = iterator.next();
+            functions.removeFunction(function.getEntryPoint());
+        }
+        clearListing(toAddr(0), toAddr(7));
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        ProgramContext context = currentProgram.getProgramContext();
+        context.setValue(tMode, toAddr(0), toAddr(7), BigInteger.ZERO);
+        if (!disassemble(toAddr(0)) || !disassemble(toAddr(4))) {
+            throw new Exception("failed to disassemble adjacent A32 fixture");
+        }
+        AddressSet body = new AddressSet(toAddr(0), toAddr(7));
+        functions.createFunction(
+            "entry_interior", toAddr(4), body, SourceType.USER_DEFINED);
+        println("ApplySymbols: applied 1 names, 0 plate comments, skipped 0");
+    }
+}
+"#,
+    )
+    .unwrap();
+    let map = out.join("entry-interior-map.json");
+    std::fs::write(&map, b"{}").unwrap();
+    let inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(prepared_pass2_map(&map, 1)),
+            global_map: None,
+        },
+    )]);
+    let pass2 =
+        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
+    assert_eq!(
+        pass2.outcomes["00_BOOT"],
+        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    );
+
+    let functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
+            .unwrap();
+    assert_eq!(functions.as_array().unwrap().len(), 1, "{functions}");
+    assert_eq!(functions[0]["entry"], "0x4");
+    assert_eq!(functions[0]["decode_ranges"], serde_json::json!([]));
+    assert_eq!(
+        functions[0]["decode_range_errors"],
+        serde_json::json!([
+            {"kind":"entry_not_range_start","address":"0x4","end":null}
+        ])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_program_rejects_instruction_free_body_range_outside_u32() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let modem = craft_modem_bin(&[0xc3]); // x86-64 `ret`
+    let dir = std::env::temp_dir().join(format!(
+        "pme_decompile_body_outside_u32_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home),
+        processor: "x86:LE:64:default".to_string(),
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+    let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+
+    std::fs::write(
+        out.join("scripts/ApplySymbols.java"),
+        r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.SourceType;
+
+public class ApplySymbols extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        while (functions.getFunctionCount() != 0) {
+            FunctionIterator iterator = functions.getFunctions(true);
+            Function function = iterator.next();
+            functions.removeFunction(function.getEntryPoint());
+        }
+        Address entry = toAddr(0);
+        clearListing(entry, entry);
+        if (!disassemble(entry)) throw new Exception("failed to disassemble x86 fixture");
+        Address high = toAddr(0x1_0000_0000L);
+        currentProgram.getMemory().createInitializedBlock(
+            "outside_u32", high, 4, (byte) 0, monitor, false);
+        AddressSet body = new AddressSet(entry, entry);
+        body.addRange(high, high.add(3));
+        functions.createFunction(
+            "body_outside_u32", entry, body, SourceType.USER_DEFINED);
+        println("ApplySymbols: applied 1 names, 0 plate comments, skipped 0");
+    }
+}
+"#,
+    )
+    .unwrap();
+    let map = out.join("body-outside-u32-map.json");
+    std::fs::write(&map, b"{}").unwrap();
+    let inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(prepared_pass2_map(&map, 1)),
+            global_map: None,
+        },
+    )]);
+    let _pass2 =
+        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
+    let functions = std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap();
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&functions).is_err(),
+        "an instruction-free out-of-domain body range must abort before a complete inventory is emitted"
+    );
+    let application_log = read_ghidra_application_log(&out);
+    assert!(
+        application_log.contains("unassignable producer address outside u32"),
+        "missing producer-integrity failure in application log:\n{application_log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_program_quarantines_complete_defective_records_and_continues() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let mut payload = Vec::new();
+    for _ in 0..7 {
+        payload.extend([0x1e, 0xff, 0x2f, 0xe1]); // A32: bx lr
+    }
+    let modem = craft_modem_bin(&payload);
+    let dir = std::env::temp_dir().join(format!("pme_decompile_quarantine_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home),
+        processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+    let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+    std::fs::write(
+        out.join("scripts/ApplySymbols.java"),
+        r#"//@category PixelModemTest
+import java.math.BigInteger;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.ProgramContext;
+import ghidra.program.model.symbol.SourceType;
+
+public class ApplySymbols extends GhidraScript {
+    private AddressSet body(long min, long max) {
+        AddressSet body = new AddressSet();
+        body.addRange(toAddr(min), toAddr(max));
+        return body;
+    }
+
+    @Override
+    public void run() throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        while (functions.getFunctionCount() != 0) {
+            FunctionIterator iterator = functions.getFunctions(true);
+            Function function = iterator.next();
+            functions.removeFunction(function.getEntryPoint());
+        }
+        clearListing(toAddr(0), toAddr(27));
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        ProgramContext context = currentProgram.getProgramContext();
+        context.setValue(tMode, toAddr(0), toAddr(27), BigInteger.ZERO);
+        for (long address : new long[] {0, 8, 12, 20, 24}) {
+            if (!disassemble(toAddr(address))) {
+                throw new Exception("failed to disassemble fixture at " + address);
+            }
+        }
+        Instruction overridden = currentProgram.getListing().getInstructionAt(toAddr(8));
+        overridden.setLengthOverride(2);
+        functions.createFunction("accepted_before", toAddr(0), body(0, 3), SourceType.USER_DEFINED);
+        functions.createFunction("overridden", toAddr(8), body(8, 11), SourceType.USER_DEFINED);
+        functions.createFunction("body_escape", toAddr(12), body(12, 13), SourceType.USER_DEFINED);
+        AddressSet missingEntryBody = body(16, 16);
+        missingEntryBody.addRange(toAddr(20), toAddr(23));
+        functions.createFunction("missing_entry", toAddr(16), missingEntryBody, SourceType.USER_DEFINED);
+        functions.createFunction("accepted_after", toAddr(24), body(24, 27), SourceType.USER_DEFINED);
+        println("ApplySymbols: applied 1 names, 0 plate comments, skipped 0");
+    }
+}
+"#,
+    )
+    .unwrap();
+    let map = out.join("quarantine-map.json");
+    std::fs::write(&map, b"{}").unwrap();
+    let inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(prepared_pass2_map(&map, 1)),
+            global_map: None,
+        },
+    )]);
+    let pass2 =
+        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
+    assert_eq!(
+        pass2.outcomes["00_BOOT"],
+        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    );
+    let functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
+            .unwrap();
+    let by_name: HashMap<&str, &serde_json::Value> = functions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|function| (function["name"].as_str().unwrap(), function))
+        .collect();
+    assert_eq!(
+        by_name["accepted_before"]["decode_ranges"],
+        serde_json::json!([{"isa":"arm","start":"0x0","end":"0x4"}])
+    );
+    assert_eq!(
+        by_name["overridden"]["decode_ranges"],
+        serde_json::json!([]),
+        "a defective record must not retain a valid-looking range prefix"
+    );
+    assert_eq!(
+        by_name["overridden"]["decode_range_errors"],
+        serde_json::json!([
+            {"kind":"misaligned_instruction","address":"0x8","end":"0xa"},
+            {"kind":"overridden_instruction_length","address":"0x8","end":"0xa"}
+        ])
+    );
+    assert_eq!(
+        by_name["body_escape"]["decode_range_errors"],
+        serde_json::json!([
+            {"kind":"extent_outside_function","address":"0xc","end":"0x10"}
+        ])
+    );
+    assert_eq!(
+        by_name["missing_entry"]["decode_range_errors"],
+        serde_json::json!([
+            {"kind":"missing_instruction_at_entry","address":"0x10","end":null}
+        ])
+    );
+    assert_eq!(
+        by_name["accepted_after"]["decode_ranges"],
+        serde_json::json!([{"isa":"arm","start":"0x18","end":"0x1c"}]),
+        "later functions must still export after record-local quarantines"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -199,6 +693,34 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
                 .any(|reference| reference == "0x20")),
         "fixture did not produce a genuine data reference: {pass1_functions}"
     );
+    let pass1_projections: HashMap<String, serde_json::Value> = pass1_functions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|function| {
+            (
+                function["entry"].as_str().unwrap().to_string(),
+                serde_json::json!({
+                    "decode_ranges": function["decode_ranges"],
+                    "decode_range_errors": function["decode_range_errors"],
+                }),
+            )
+        })
+        .collect();
+    let retained_thumb = serde_json::to_vec(&serde_json::json!({
+        "format":"pixel-modem-extractor-thumb-functions-v2",
+        "functions":[{
+            "name":"retained_thumb_fixture", "entry":"0x0", "end":"0x2", "size":2,
+            "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2"}],
+            "decode_range_errors":[], "body_kind":"thumb_disassembly", "body":"", "data_refs":[]
+        }]
+    }))
+    .unwrap();
+    std::fs::write(
+        out.join("export/00_BOOT/thumb_functions.json"),
+        &retained_thumb,
+    )
+    .unwrap();
 
     // One-symbol map: rename entry 0x0 -> boot_reset_handler with one annotation.
     // ApplySymbols.java reads `entry`, `name`, `tier=recovered`, and `annotations[]`.
@@ -471,6 +993,24 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     assert!(c.contains("function_exported_despite_invalid_globals"));
     assert!(c.contains("recovered_global_word"));
     assert!(!c.contains("invalid_map_must_apply_zero"));
+    let final_functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(exp.join("functions.json")).unwrap()).unwrap();
+    for function in final_functions.as_array().unwrap() {
+        let entry = function["entry"].as_str().unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "decode_ranges": function["decode_ranges"],
+                "decode_range_errors": function["decode_range_errors"],
+            }),
+            pass1_projections[entry],
+            "pass 2 changed mandatory execution projection for {entry}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(exp.join("thumb_functions.json")).unwrap(),
+        retained_thumb,
+        "pass 2 must preserve the retained tagged Thumb sidecar byte-for-byte"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -377,12 +377,13 @@ pub fn run_with_evidence_projection(
     let decompiled = image_dir.join("decompiled");
 
     // 1. Resolve the image's load_addr from the manifest.
-    let toc_name = toc_name(image_label);
-    let load_addr = crate::symbolicate::load_load_addr(manifest, &toc_name)?.ok_or_else(|| {
-        Error::Serialize(format!(
-            "globals: load_addr missing for {image_label} (toc name {toc_name})"
-        ))
-    })?;
+    let toc_name = crate::manifest::toc_name(image_label);
+    let load_addr =
+        crate::manifest::load_addr_for_image(manifest, image_label)?.ok_or_else(|| {
+            Error::Serialize(format!(
+                "globals: load_addr missing for {image_label} (toc name {toc_name})"
+            ))
+        })?;
 
     // 2. Read the raw image bytes (for string extraction). Missing or
     //    unreadable .bin is a Surface 3.0-A failure — propagate as Err (via
@@ -913,16 +914,6 @@ fn parse_function(
         data_refs,
         body,
     })
-}
-
-/// TOC image name for a decompose label, e.g. "02_MAIN" -> "MAIN".
-/// Mirrors `symbolicate::toc_name`.
-fn toc_name(label: &str) -> String {
-    label
-        .split_once('_')
-        .map(|(_, n)| n)
-        .unwrap_or(label)
-        .to_string()
 }
 
 /// One function's contribution to a `(addr, name)` proposal. Phase 3.0's

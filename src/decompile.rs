@@ -7,11 +7,17 @@
 
 use crate::{
     error::{Error, Result},
+    execution_ranges::{
+        DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionIdentity, ExecutionProjection,
+        TaggedExecutionRecord, canonicalize_errors, canonicalize_instruction_extents, error,
+        inventory_count_conserved, parse_projection, projection_to_json,
+        validate_inventory_records,
+    },
     toc::Toc,
 };
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -254,6 +260,17 @@ pub struct ImageResult {
     pub label: String,
     pub outcome: ImageOutcome,
     pub thumb_functions: Option<usize>,
+    /// Current Ghidra source records with a validated accepted projection.
+    pub ghidra_execution_accepted: Option<usize>,
+    /// Current Ghidra source records retained as whole-record quarantines.
+    pub ghidra_execution_quarantined: Option<usize>,
+    /// Current retained Thumb records with a validated accepted projection.
+    pub thumb_execution_accepted: Option<usize>,
+    /// Current retained Thumb records retained as whole-record quarantines.
+    pub thumb_execution_quarantined: Option<usize>,
+    /// Raw-image mapping used to validate terminal execution ranges.
+    pub(crate) image_start: u32,
+    pub(crate) image_len: u32,
     /// Reason-only Thumb/radare2 failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
     /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
@@ -305,6 +322,177 @@ pub struct ImageResult {
 pub struct DecompileReport {
     pub images: Vec<ImageResult>,
     pub spec_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionInventoryCounts {
+    pub raw: usize,
+    pub accepted: usize,
+    pub quarantined: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalInventorySummary {
+    pub ghidra: ExecutionInventoryCounts,
+    pub thumb: Option<ExecutionInventoryCounts>,
+    pub thumb_substantial: Option<usize>,
+    pub accepted_identities: Vec<ExecutionIdentity>,
+    pub ghidra_records: Vec<TaggedExecutionRecord>,
+    pub thumb_records: Vec<TaggedExecutionRecord>,
+}
+
+fn read_json(path: &Path, description: &str) -> Result<serde_json::Value> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Error::Serialize(format!("parse {description}: {error}")))
+}
+
+fn inventory_counts(
+    inventory: &crate::execution_ranges::ValidatedInventory,
+) -> ExecutionInventoryCounts {
+    ExecutionInventoryCounts {
+        raw: inventory.raw_count,
+        accepted: inventory.accepted,
+        quarantined: inventory.quarantined,
+    }
+}
+
+/// Validate one complete terminal Ghidra/optional-Thumb pair. When
+/// `expected_current` is supplied, every normalized tagged source record must
+/// match the already-validated current producer result before refresh.
+pub(crate) fn validate_terminal_inventory_pair(
+    ghidra_functions_path: &Path,
+    thumb_functions_path: &Path,
+    image_start: u32,
+    image_len: u32,
+    expected_thumb_substantial: Option<usize>,
+    expected_current: Option<&TerminalInventorySummary>,
+) -> Result<TerminalInventorySummary> {
+    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")?;
+    let ghidra_records = ghidra_json
+        .as_array()
+        .ok_or_else(|| Error::Serialize("Ghidra functions inventory must be an array".into()))?;
+    let ghidra =
+        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)?;
+    let mut accepted_identities: BTreeSet<ExecutionIdentity> =
+        ghidra.accepted_identities.iter().cloned().collect();
+
+    let (thumb, thumb_substantial, thumb_records) = match expected_thumb_substantial {
+        None => {
+            if thumb_functions_path.exists() {
+                return Err(Error::Serialize(
+                    "unexpected Thumb inventory without a current producer result".into(),
+                ));
+            }
+            (None, None, Vec::new())
+        }
+        Some(expected_substantial) => {
+            let thumb_json = read_json(thumb_functions_path, "Thumb functions inventory")?;
+            let object = thumb_json.as_object().ok_or_else(|| {
+                Error::Serialize("Thumb functions inventory must be an object".into())
+            })?;
+            if object.get("format").and_then(serde_json::Value::as_str)
+                != Some("pixel-modem-extractor-thumb-functions-v2")
+            {
+                return Err(Error::Serialize(
+                    "unsupported Thumb functions inventory format".into(),
+                ));
+            }
+            let records = object
+                .get("functions")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Serialize("Thumb functions inventory lacks functions array".into())
+                })?;
+            let substantial = records.iter().try_fold(0usize, |count, record| {
+                let size = record
+                    .get("size")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        Error::Serialize("Thumb function size must be an unsigned integer".into())
+                    })?;
+                if size >= 32 {
+                    count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Serialize("Thumb substantial count overflow".into()))
+                } else {
+                    Ok(count)
+                }
+            })?;
+            if substantial != expected_substantial {
+                return Err(Error::Serialize(format!(
+                    "Thumb substantial count mismatch: expected {expected_substantial}, found {substantial}"
+                )));
+            }
+            let inventory =
+                validate_inventory_records(records, records.len(), image_start, image_len)?;
+            accepted_identities.extend(inventory.accepted_identities.iter().cloned());
+            (
+                Some(inventory_counts(&inventory)),
+                Some(substantial),
+                inventory.records,
+            )
+        }
+    };
+
+    let summary = TerminalInventorySummary {
+        ghidra: inventory_counts(&ghidra),
+        thumb,
+        thumb_substantial,
+        accepted_identities: accepted_identities.into_iter().collect(),
+        ghidra_records: ghidra.records,
+        thumb_records,
+    };
+    if let Some(expected) = expected_current
+        && &summary != expected
+    {
+        return Err(Error::Serialize(
+            "terminal execution inventory differs from the current producer result".into(),
+        ));
+    }
+    Ok(summary)
+}
+
+pub(crate) fn validate_image_terminal_inventory(
+    ghidra_functions_path: &Path,
+    thumb_functions_path: &Path,
+    image: &ImageResult,
+    expected_current: Option<&TerminalInventorySummary>,
+) -> Result<TerminalInventorySummary> {
+    let summary = validate_terminal_inventory_pair(
+        ghidra_functions_path,
+        thumb_functions_path,
+        image.image_start,
+        image.image_len,
+        image.thumb_functions,
+        expected_current,
+    )?;
+    let raw_functions = match image.outcome {
+        ImageOutcome::Analyzed(raw) => raw,
+        ImageOutcome::Failed(_) => {
+            return Err(Error::Serialize(
+                "failed image has no current terminal inventory".into(),
+            ));
+        }
+    };
+    let reported = (
+        image.ghidra_execution_accepted,
+        image.ghidra_execution_quarantined,
+        image.thumb_execution_accepted,
+        image.thumb_execution_quarantined,
+    );
+    let validated = (
+        Some(summary.ghidra.accepted),
+        Some(summary.ghidra.quarantined),
+        summary.thumb.map(|thumb| thumb.accepted),
+        summary.thumb.map(|thumb| thumb.quarantined),
+    );
+    if summary.ghidra.raw != raw_functions || reported != validated {
+        return Err(Error::Serialize(format!(
+            "terminal inventory counters do not match current producer report: raw {raw_functions}, reported {reported:?}, validated {validated:?}"
+        )));
+    }
+    Ok(summary)
 }
 
 /// Count the functions ExportDecomp.java recorded for an image — its `functions.json`
@@ -659,6 +847,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             label: String,
             outcome: ImageOutcome,
             thumb_functions: Option<usize>,
+            terminal_inventory: Option<TerminalInventorySummary>,
+            image_start: u32,
+            image_len: u32,
             thumb_error: Option<String>,
             tighten_error: Option<String>,
             // When the tighten-watch kills the run, we re-spawn as datamark
@@ -852,14 +1043,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             } else {
                 headless_command(&install.headless, &args, &root, java_home.as_deref()).status()?
             };
-            let outcome = if status.success() {
-                let n = count_functions(&root.join("export").join(&label));
-                if n == 0 {
-                    tracing::warn!(
-                        "ghidra: {label} yielded 0 functions — no decompilable code (e.g. a compressed/encrypted partition)"
-                    );
-                }
-                ImageOutcome::Analyzed(n)
+            let mut outcome = if status.success() {
+                ImageOutcome::Analyzed(count_functions(&root.join("export").join(&label)))
             } else {
                 let code = status.code().unwrap_or(-1);
                 tracing::warn!("ghidra: {label} failed (analyzeHeadless exit {code})");
@@ -894,10 +1079,43 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
             };
+            let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
+                let export = root.join("export").join(&label);
+                match validate_terminal_inventory_pair(
+                    &export.join("functions.json"),
+                    &export.join("thumb_functions.json"),
+                    e.load_addr,
+                    e.size,
+                    thumb_functions,
+                    None,
+                ) {
+                    Ok(summary) => {
+                        outcome = ImageOutcome::Analyzed(summary.ghidra.raw);
+                        Some(summary)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "terminal execution inventory for {label} failed validation: {error}"
+                        );
+                        outcome = ImageOutcome::Failed(-1);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if matches!(outcome, ImageOutcome::Analyzed(0)) {
+                tracing::warn!(
+                    "ghidra: {label} yielded 0 functions — no decompilable code (e.g. a compressed/encrypted partition)"
+                );
+            }
             results.push(RunResult {
                 label,
                 outcome,
                 thumb_functions,
+                terminal_inventory,
+                image_start: e.load_addr,
+                image_len: e.size,
                 thumb_error,
                 tighten_error,
                 thumb_decompiled: thumb_decompiled_override,
@@ -942,6 +1160,24 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 label: r.label,
                 outcome: r.outcome,
                 thumb_functions: r.thumb_functions,
+                ghidra_execution_accepted: r
+                    .terminal_inventory
+                    .as_ref()
+                    .map(|inventory| inventory.ghidra.accepted),
+                ghidra_execution_quarantined: r
+                    .terminal_inventory
+                    .as_ref()
+                    .map(|inventory| inventory.ghidra.quarantined),
+                thumb_execution_accepted: r
+                    .terminal_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.thumb.map(|thumb| thumb.accepted)),
+                thumb_execution_quarantined: r
+                    .terminal_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.thumb.map(|thumb| thumb.quarantined)),
+                image_start: r.image_start,
+                image_len: r.image_len,
                 thumb_error: r.thumb_error,
                 pass2_applied: None,
                 pass2_error: None,
@@ -1800,10 +2036,9 @@ fn is_aflj_function_inventory(value: &serde_json::Value) -> bool {
 struct Radare2ThumbOutput {
     json_value_count: usize,
     has_function_inventory: bool,
-    function_count: usize,
-    pdfj_count: usize,
-    missing_pdfj_count: usize,
-    pairs: Vec<(serde_json::Value, serde_json::Value)>,
+    records: Vec<(serde_json::Value, Option<serde_json::Value>)>,
+    unassignable_function_count: usize,
+    orphan_pdfj_count: usize,
 }
 
 fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
@@ -1816,18 +2051,19 @@ fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
         return Radare2ThumbOutput {
             json_value_count: values.len(),
             has_function_inventory: false,
-            function_count: 0,
-            pdfj_count: 0,
-            missing_pdfj_count: 0,
-            pairs: Vec::new(),
+            records: Vec::new(),
+            unassignable_function_count: 0,
+            orphan_pdfj_count: 0,
         };
     };
     let pdfjs = pdfj_values_from_radare2_output(&values);
     let mut used_pdfjs = vec![false; pdfjs.len()];
     let mut paired_pdfjs: Vec<Option<serde_json::Value>> = vec![None; fns.len()];
+    let mut unassignable_function_count = 0;
 
     for (idx, f) in fns.iter().enumerate() {
         let Some(entry) = radare2_function_entry(f) else {
+            unassignable_function_count += 1;
             continue;
         };
         let Some(pdfj_idx) = pdfjs.iter().enumerate().find_map(|(pdfj_idx, pdfj)| {
@@ -1857,27 +2093,24 @@ fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
         }
     }
 
-    let pairs: Vec<_> = fns
-        .iter()
-        .cloned()
-        .zip(paired_pdfjs)
-        .filter_map(|(f, pdfj)| pdfj.map(|pdfj| (f, pdfj)))
-        .collect();
-    let missing_pdfj_count = fns.len().saturating_sub(pairs.len());
+    let records: Vec<_> = fns.iter().cloned().zip(paired_pdfjs).collect();
 
     Radare2ThumbOutput {
         json_value_count: values.len(),
         has_function_inventory: true,
-        function_count: fns.len(),
-        pdfj_count: pdfjs.len(),
-        missing_pdfj_count,
-        pairs,
+        records,
+        unassignable_function_count,
+        orphan_pdfj_count: used_pdfjs.iter().filter(|used| !**used).count(),
     }
 }
 
 #[cfg(test)]
 fn radare2_thumb_function_pdfjs(stdout: &[u8]) -> Vec<(serde_json::Value, serde_json::Value)> {
-    parse_radare2_thumb_output(stdout).pairs
+    parse_radare2_thumb_output(stdout)
+        .records
+        .into_iter()
+        .filter_map(|(function, body)| body.map(|body| (function, body)))
+        .collect()
 }
 
 fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare2ThumbOutput> {
@@ -1892,40 +2125,26 @@ fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare
             "radare2 produced parseable JSON but no aflj function inventory for Thumb region 0x{addr:x}"
         )));
     }
-    if parsed.missing_pdfj_count > 0 {
-        let pdfj_detail = if parsed.pdfj_count == 0 {
-            "no parseable pdfj bodies".to_string()
-        } else {
-            format!(
-                "missing {} pdfj {}",
-                parsed.missing_pdfj_count,
-                if parsed.missing_pdfj_count == 1 {
-                    "body"
-                } else {
-                    "bodies"
-                }
-            )
-        };
+    if parsed.unassignable_function_count > 0 {
         return Err(Error::Serialize(format!(
-            "radare2 reported {} functions but {pdfj_detail} for Thumb region 0x{addr:x}",
-            parsed.function_count,
+            "radare2 reported {} unassignable aflj function {} for Thumb region 0x{addr:x}",
+            parsed.unassignable_function_count,
+            if parsed.unassignable_function_count == 1 {
+                "record"
+            } else {
+                "records"
+            },
         )));
     }
-    let empty_body_count = parsed
-        .pairs
-        .iter()
-        .filter(|(_, pdfj)| pdfj_body(pdfj).is_empty())
-        .count();
-    if empty_body_count > 0 {
+    if parsed.orphan_pdfj_count > 0 {
         return Err(Error::Serialize(format!(
-            "radare2 reported {} functions but {} paired pdfj {} had an empty pdfj body for Thumb region 0x{addr:x}",
-            parsed.function_count,
-            empty_body_count,
-            if empty_body_count == 1 {
+            "radare2 produced {} orphan pdfj {} for Thumb region 0x{addr:x}",
+            parsed.orphan_pdfj_count,
+            if parsed.orphan_pdfj_count == 1 {
                 "body"
             } else {
                 "bodies"
-            }
+            },
         )));
     }
     Ok(parsed)
@@ -1948,15 +2167,19 @@ fn normalize_radare2_function(
     raw: &serde_json::Value,
     pdfj: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    normalize_radare2_function_checked(raw, pdfj, 0)
+    let mut image = vec![0; 0x1_0000];
+    populate_test_image_from_pdfj(&mut image, pdfj);
+    normalize_radare2_function_checked(raw, Some(pdfj), &image, 0, 0)
 }
 
 fn normalize_radare2_function_checked(
     raw: &serde_json::Value,
-    pdfj: &serde_json::Value,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
     region_addr: u32,
 ) -> Result<serde_json::Value> {
-    let entry = radare2_function_entry(raw).ok_or_else(|| {
+    let entry_u64 = radare2_function_entry(raw).ok_or_else(|| {
         Error::Serialize(format!(
             "radare2 function lacks entry/addr for Thumb region 0x{region_addr:x}"
         ))
@@ -1966,22 +2189,176 @@ fn normalize_radare2_function_checked(
         .get("name")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| format!("thumb_{entry:x}"));
-    let body = pdfj_body(pdfj);
-    if body.is_empty() {
-        return Err(Error::Serialize(format!(
-            "radare2 function 0x{entry:x} has empty pdfj body for Thumb region 0x{region_addr:x}"
-        )));
-    }
-    Ok(serde_json::json!({
+        .unwrap_or_else(|| format!("thumb_{entry_u64:x}"));
+    let entry = u32::try_from(entry_u64).map_err(|_| Error::Serialize(format!(
+        "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+    )))?;
+    let projection = radare2_execution_projection(entry, pdfj, image, load_addr);
+    let body = pdfj.map(pdfj_body).unwrap_or_default();
+    let data_refs = pdfj.map(data_refs_from_pdfj).unwrap_or_default();
+    let mut output = serde_json::json!({
         "name": name,
-        "entry": json_hex(entry),
-        "end": json_hex(entry.saturating_add(size)),
+        "entry": json_hex(entry_u64),
+        "end": json_hex(entry_u64.saturating_add(size)),
         "size": size,
         "body_kind": "thumb_disassembly",
         "body": body,
-        "data_refs": data_refs_from_pdfj(pdfj),
-    }))
+        "data_refs": data_refs,
+    });
+    let tags = projection_to_json(&projection)?;
+    output
+        .as_object_mut()
+        .expect("JSON object")
+        .extend(tags.as_object().expect("JSON object").clone());
+    Ok(output)
+}
+
+fn strict_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn radare2_execution_projection(
+    entry: u32,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+) -> ExecutionProjection {
+    let Some(pdfj) = pdfj else {
+        return ExecutionProjection::Quarantined(vec![error(
+            DecodeRangeErrorKind::MissingOperationBody,
+            entry,
+            None,
+        )]);
+    };
+    let Some(ops) = pdfj.get("ops").and_then(serde_json::Value::as_array) else {
+        return ExecutionProjection::Quarantined(vec![error(
+            DecodeRangeErrorKind::EmptyProjection,
+            entry,
+            None,
+        )]);
+    };
+    let mut extents = Vec::new();
+    let mut errors = Vec::new();
+    for op in ops {
+        let address = op
+            .get("offset")
+            .or_else(|| op.get("addr"))
+            .and_then(json_u64)
+            .and_then(|address| u32::try_from(address).ok());
+        let Some(address) = address else {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidOperationAddress,
+                entry,
+                None,
+            ));
+            continue;
+        };
+        let bytes = op
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .and_then(strict_hex_bytes);
+        let Some(bytes) = bytes else {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidOperationBytes,
+                address,
+                None,
+            ));
+            continue;
+        };
+        if !matches!(bytes.len(), 2 | 4) {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidInstructionLength,
+                address,
+                None,
+            ));
+            continue;
+        }
+        let Some(end) = address.checked_add(bytes.len() as u32) else {
+            errors.push(error(
+                DecodeRangeErrorKind::InvalidOperationAddress,
+                address,
+                None,
+            ));
+            continue;
+        };
+        extents.push(DecodeRange {
+            isa: DecodeIsa::Thumb,
+            start: address,
+            end,
+        });
+        let image_end = load_addr.checked_add(image.len() as u32);
+        if address < load_addr || image_end.is_none_or(|image_end| end > image_end) {
+            errors.push(error(
+                DecodeRangeErrorKind::ExtentOutsideImage,
+                address,
+                Some(end),
+            ));
+        } else {
+            let start = (address - load_addr) as usize;
+            if image.get(start..start + bytes.len()) != Some(bytes.as_slice()) {
+                errors.push(error(
+                    DecodeRangeErrorKind::RawByteMismatch,
+                    address,
+                    Some(end),
+                ));
+            }
+        }
+    }
+    match canonicalize_instruction_extents(
+        entry,
+        extents,
+        load_addr,
+        image.len().try_into().unwrap_or(u32::MAX),
+    ) {
+        ExecutionProjection::Accepted(ranges) if errors.is_empty() => {
+            ExecutionProjection::Accepted(ranges)
+        }
+        ExecutionProjection::Accepted(_) => {
+            ExecutionProjection::Quarantined(canonicalize_errors(errors))
+        }
+        ExecutionProjection::Quarantined(mut canonical_errors) => {
+            canonical_errors.extend(errors);
+            ExecutionProjection::Quarantined(canonicalize_errors(canonical_errors))
+        }
+    }
+}
+
+#[cfg(test)]
+fn populate_test_image_from_pdfj(image: &mut [u8], pdfj: &serde_json::Value) {
+    for op in pdfj
+        .get("ops")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(address) = op
+            .get("offset")
+            .or_else(|| op.get("addr"))
+            .and_then(json_u64)
+            .and_then(|address| usize::try_from(address).ok())
+        else {
+            continue;
+        };
+        let Some(bytes) = op
+            .get("bytes")
+            .and_then(serde_json::Value::as_str)
+            .and_then(strict_hex_bytes)
+        else {
+            continue;
+        };
+        if let Some(destination) = image.get_mut(address..address.saturating_add(bytes.len())) {
+            destination.copy_from_slice(&bytes);
+        }
+    }
 }
 
 /// Defensive upper bound on a single Thumb region's r2 stdout. Grounded in
@@ -2105,8 +2482,25 @@ fn run_radare2_thumb(
         // follow-up would reduce this — see CONTRIBUTING's radare2 invariant.
         let stdout_bytes = std::fs::read(&stdout_path)?;
         let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
-        for (f, pdfj) in parsed.pairs {
-            all.push(normalize_radare2_function_checked(&f, &pdfj, addr)?);
+        let raw_record_count = parsed.records.len();
+        let output_start = all.len();
+        for (f, pdfj) in parsed.records {
+            all.push(normalize_radare2_function_checked(
+                &f,
+                pdfj.as_ref(),
+                image,
+                load_addr,
+                addr,
+            )?);
+        }
+        let projections = all[output_start..]
+            .iter()
+            .map(parse_projection)
+            .collect::<Result<Vec<_>>>()?;
+        if !inventory_count_conserved(raw_record_count, &projections) {
+            return Err(Error::Serialize(format!(
+                "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+            )));
         }
     }
     let substantial = all
@@ -2118,6 +2512,19 @@ fn run_radare2_thumb(
                 >= 32
         })
         .count();
+    let accepted = all
+        .iter()
+        .filter(|function| {
+            function
+                .get("decode_ranges")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ranges| !ranges.is_empty())
+        })
+        .count();
+    tracing::info!(
+        "radare2: Thumb execution projections accepted={accepted} quarantined={}",
+        all.len() - accepted
+    );
     let wrapped = serde_json::json!({
         "format": "pixel-modem-extractor-thumb-functions-v2",
         "functions": all,
@@ -2321,15 +2728,14 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
             continue;
         }
         // Capture from this line through the matching closing brace at depth 0.
-        // State machine tracks string literals + line/block comments so a `}` inside
-        // `"expected }"` or `// close }` doesn't truncate the body. Char literals
-        // (`'}'`) are not tracked — rare in Ghidra decompiled C, and bounded impact
-        // (only affected body_c, matching is by entry address). Mirrors the
-        // string-aware pattern already used by `balanced_json_end`.
+        // State machine tracks string/char literals + line/block comments so a `}`
+        // inside `"expected }"`, `'}'`, or `// close }` doesn't truncate the body.
+        // Mirrors the string-aware pattern already used by `balanced_json_end`.
         let mut depth = 0i32;
         let mut saw_brace = false;
         let mut body = String::new();
         let mut in_string = false;
+        let mut in_char = false;
         let mut escaped = false;
         let mut in_block_comment = false;
         while i < lines.len() {
@@ -2353,8 +2759,19 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
                     }
                     continue;
                 }
+                if in_char {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '\'' {
+                        in_char = false;
+                    }
+                    continue;
+                }
                 match ch {
                     '"' => in_string = true,
+                    '\'' => in_char = true,
                     '/' => {
                         if chars.peek() == Some(&'/') {
                             chars.next();
@@ -3240,6 +3657,269 @@ mod tests {
         assert_eq!(entry["body"], body);
         assert_eq!(entry["data_refs"][0], "0x9000");
         assert_eq!(entry["data_refs"][1], "0x9004");
+        assert_eq!(
+            entry["decode_ranges"],
+            serde_json::json!([{"isa":"thumb", "start":"0x4120", "end":"0x4124"}]),
+            "out-of-order pdfj operations must normalize into an exact tagged Thumb range"
+        );
+        assert_eq!(entry["decode_range_errors"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn radare2_pdfj_quarantines_all_faults_without_salvaging_a_prefix() {
+        let pdfj = serde_json::json!({"ops": [
+            {"offset": 0x4000u64, "bytes": "00bf"},
+            {"offset": 0x4002u64, "bytes": "0"},
+            {"offset": 0x4003u64, "bytes": "00bf"},
+            {"offset": 0x4010u64, "bytes": "00bf"}
+        ]});
+        let projection = radare2_execution_projection(0x4000, Some(&pdfj), &[0; 8], 0x4000);
+        let ExecutionProjection::Quarantined(errors) = projection else {
+            panic!("invalid operation must quarantine the entire record")
+        };
+        assert!(errors.iter().any(|error| error.kind
+            == DecodeRangeErrorKind::InvalidOperationBytes
+            && error.address == 0x4002));
+        assert!(errors.iter().any(|error| error.kind
+            == DecodeRangeErrorKind::MisalignedInstruction
+            && error.address == 0x4003));
+        assert!(errors.iter().any(
+            |error| error.kind == DecodeRangeErrorKind::ExtentOutsideImage
+                && error.address == 0x4010
+        ));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == DecodeRangeErrorKind::RawByteMismatch
+                    && error.address == 0x4003)
+        );
+    }
+
+    #[test]
+    fn radare2_pdfj_merges_adjacent_two_and_four_byte_t32_operations() {
+        let pdfj = serde_json::json!({"ops": [
+            {"offset": 0x4002u64, "bytes": "f0b50000"},
+            {"offset": 0x4000u64, "bytes": "00bf"}
+        ]});
+        let projection = radare2_execution_projection(
+            0x4000,
+            Some(&pdfj),
+            &[0x00, 0xbf, 0xf0, 0xb5, 0x00, 0x00],
+            0x4000,
+        );
+        assert_eq!(
+            projection_to_json(&projection).unwrap(),
+            serde_json::json!({
+                "decode_ranges": [{"isa":"thumb", "start":"0x4000", "end":"0x4006"}],
+                "decode_range_errors": [],
+            })
+        );
+    }
+
+    #[test]
+    fn radare2_pdfj_preserves_gaps_and_ignores_legacy_size_as_an_extent() {
+        let raw = serde_json::json!({"offset": 0x4000u64, "size": 0x1000u64});
+        let pdfj = serde_json::json!({"ops": [
+            {"offset": 0x4000u64, "bytes": "00bf"},
+            {"offset": 0x4004u64, "bytes": "00bf"}
+        ]});
+        let entry = normalize_radare2_function_checked(
+            &raw,
+            Some(&pdfj),
+            &[0, 0xbf, 0, 0, 0, 0xbf],
+            0x4000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(entry["size"], 0x1000);
+        assert_eq!(
+            entry["decode_ranges"],
+            serde_json::json!([
+                {"isa":"thumb", "start":"0x4000", "end":"0x4002"},
+                {"isa":"thumb", "start":"0x4004", "end":"0x4006"}
+            ])
+        );
+    }
+
+    #[test]
+    fn radare2_pdfj_quarantines_missing_nonhex_duplicate_overlap_overflow_and_entry_faults() {
+        let cases = [
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64}]}),
+                0x4000,
+                &[0u8; 8][..],
+                DecodeRangeErrorKind::InvalidOperationBytes,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64,"bytes":"zz"}]}),
+                0x4000,
+                &[0u8; 8][..],
+                DecodeRangeErrorKind::InvalidOperationBytes,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64,"bytes":"00bf"},{"offset":0x4000u64,"bytes":"00bf"}]}),
+                0x4000,
+                &[0, 0xbf][..],
+                DecodeRangeErrorKind::DuplicateExtent,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4000u64,"bytes":"00bf0000"},{"offset":0x4002u64,"bytes":"00bf"}]}),
+                0x4000,
+                &[0, 0xbf, 0, 0][..],
+                DecodeRangeErrorKind::OverlappingExtent,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":u32::MAX as u64,"bytes":"00bf"}]}),
+                u32::MAX,
+                &[0u8; 8][..],
+                DecodeRangeErrorKind::InvalidOperationAddress,
+            ),
+            (
+                serde_json::json!({"ops":[{"offset":0x4002u64,"bytes":"00bf"}]}),
+                0x4000,
+                &[0, 0, 0, 0xbf][..],
+                DecodeRangeErrorKind::MissingInstructionAtEntry,
+            ),
+        ];
+        for (pdfj, entry, image, kind) in cases {
+            let ExecutionProjection::Quarantined(errors) =
+                radare2_execution_projection(entry, Some(&pdfj), image, 0x4000)
+            else {
+                panic!("fault must quarantine")
+            };
+            assert!(
+                errors.iter().any(|error| error.kind == kind),
+                "missing {kind:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn radare2_missing_pdfj_body_is_a_tagged_quarantine() {
+        let projection = radare2_execution_projection(0x4000, None, &[0, 0], 0x4000);
+        assert_eq!(
+            projection_to_json(&projection).unwrap(),
+            serde_json::json!({
+                "decode_ranges": [],
+                "decode_range_errors": [{"kind":"missing_operation_body", "address":"0x4000", "end":null}],
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_pair_validates_current_tags_counts_and_complete_identities() {
+        let root = std::env::temp_dir().join(format!("pme_terminal_pair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ghidra = root.join("functions.json");
+        let thumb = root.join("thumb_functions.json");
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "name":"arm_fn", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                    "decode_range_errors":[], "data_refs":[]
+                },
+                {
+                    "name":"quarantined", "entry":"0x4008", "end":"0x400c", "size":4,
+                    "decode_ranges":[],
+                    "decode_range_errors":[{"kind":"missing_isa_context","address":"0x4008","end":"0x400c"}],
+                    "data_refs":[]
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &thumb,
+            serde_json::to_vec(&serde_json::json!({
+                "format":"pixel-modem-extractor-thumb-functions-v2",
+                "functions":[{
+                    "name":"thumb_fn", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"thumb","start":"0x4000","end":"0x4004"}],
+                    "decode_range_errors":[], "body_kind":"thumb_disassembly", "body":"", "data_refs":[]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let summary =
+            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x10, Some(0), None).unwrap();
+
+        assert_eq!(summary.ghidra.raw, 2);
+        assert_eq!(summary.ghidra.accepted, 1);
+        assert_eq!(summary.ghidra.quarantined, 1);
+        assert_eq!(summary.thumb.unwrap().raw, 1);
+        assert_eq!(summary.accepted_identities.len(), 2);
+        assert!(
+            summary
+                .accepted_identities
+                .iter()
+                .any(|identity| { identity.decode_ranges[0].isa == DecodeIsa::Arm })
+        );
+        assert!(
+            summary
+                .accepted_identities
+                .iter()
+                .any(|identity| { identity.decode_ranges[0].isa == DecodeIsa::Thumb })
+        );
+        assert!(
+            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x10, None, None).is_err(),
+            "an unexpected retained Thumb inventory is stale current-run state"
+        );
+
+        let malformed = serde_json::json!([{
+            "name":"stale", "entry":"0x4000", "end":"0x4004", "size":4,
+            "data_refs":[]
+        }]);
+        std::fs::write(&ghidra, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &thumb,
+                0x4000,
+                0x10,
+                Some(0),
+                Some(&summary),
+            )
+            .is_err(),
+            "a stale pass-1 Ghidra inventory without mandatory ranges must fail"
+        );
+
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "name":"arm_fn", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                    "decode_range_errors":[], "data_refs":[]
+                },
+                {
+                    "name":"quarantined", "entry":"0x4008", "end":"0x400c", "size":4,
+                    "decode_ranges":[],
+                    "decode_range_errors":[{"kind":"invalid_isa_context","address":"0x4008","end":"0x400c"}],
+                    "data_refs":[]
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &thumb,
+                0x4000,
+                0x10,
+                Some(0),
+                Some(&summary),
+            )
+            .is_err(),
+            "pass 2 must not silently change a current quarantine projection"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3362,40 +4042,44 @@ Warning: analysis completed
     }
 
     #[test]
-    fn radare2_thumb_rejects_functions_without_parseable_pdfj_bodies() {
+    fn radare2_thumb_retains_known_functions_without_parseable_pdfj_bodies() {
         let stdout = b"Warning: noisy prelude
 [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]
 INFO: no pdfj body followed
 ";
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("no parseable pdfj")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert!(
+            parsed.records[0].1.is_none(),
+            "missing bodies are record quarantines, not producer failure"
+        );
     }
 
     #[test]
-    fn radare2_thumb_rejects_paired_pdfj_with_empty_rendered_body() {
+    fn radare2_thumb_retains_paired_empty_pdfj_body_for_quarantine() {
         let stdout = br#"Warning: noisy prelude
 [{"name":"sym.thumb_func","offset":16384,"size":64}]
 {"addr":16384,"ops":[]}
 "#;
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("empty pdfj body")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert_eq!(parsed.records.len(), 1);
+        assert!(parsed.records[0].1.is_some());
     }
 
     #[test]
-    fn radare2_thumb_rejects_partial_pdfj_recovery() {
+    fn radare2_thumb_retains_partial_pdfj_recovery_for_per_record_quarantine() {
         let stdout = br#"Warning: noisy prelude
 [{"name":"sym.first","offset":16384,"size":64},{"name":"sym.second","offset":16448,"size":64}]
 {"addr":16384,"ops":[{"offset":16384,"bytes":"b5f0","disasm":"push {r4, lr}"}]}
 INFO: second pdfj body was noisy and not parseable
 "#;
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("missing 1 pdfj")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert_eq!(parsed.records.len(), 2);
+        assert!(parsed.records[0].1.is_some());
+        assert!(parsed.records[1].1.is_none());
     }
 
     #[test]
@@ -3405,9 +4089,9 @@ INFO: second pdfj body was noisy and not parseable
 {"addr":16448,"ops":[{"offset":16448,"bytes":"4770","disasm":"bx lr"}]}
 "#;
 
-        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
-
-        assert!(matches!(err, Error::Serialize(message) if message.contains("missing 1 pdfj")));
+        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
+        assert!(parsed.records[0].1.is_none());
+        assert!(parsed.records[1].1.is_some());
     }
 
     #[test]
@@ -3420,7 +4104,7 @@ INFO: second pdfj body was noisy and not parseable
 
         let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
 
-        assert!(matches!(err, Error::Serialize(message) if message.contains("missing 1 pdfj")));
+        assert!(matches!(err, Error::Serialize(message) if message.contains("orphan pdfj")));
     }
 
     #[test]
@@ -3515,7 +4199,7 @@ INFO: second pdfj body was noisy and not parseable
         let err = last.expect("expected an error from run_radare2_thumb");
 
         assert!(
-            matches!(err, Error::Serialize(message) if message.contains("lacks entry/addr") && message.contains("0x4000"))
+            matches!(err, Error::Serialize(message) if message.contains("unassignable aflj") && message.contains("0x4000"))
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3611,6 +4295,12 @@ INFO: second pdfj body was noisy and not parseable
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(12),
                 thumb_functions: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
                 pass2_applied: None,
                 pass2_error: None,
@@ -3642,6 +4332,12 @@ INFO: second pdfj body was noisy and not parseable
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(12),
                 thumb_functions: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
                 thumb_error: Some(
                     "1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
                         .into(),
@@ -3675,6 +4371,12 @@ INFO: second pdfj body was noisy and not parseable
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(10),
             thumb_functions: None,
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 0,
             thumb_error: None,
             pass2_applied: None,
             pass2_error: None,
@@ -4328,5 +5030,46 @@ INFO: second pdfj body was noisy and not parseable
             "body_c was truncated by an in-string/comment brace:\n{body_c}"
         );
         assert!(body_c.contains("expected } close"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_does_not_treat_char_literal_brace_as_body_end() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char c = '}';\n\
+  helper();\n\
+}\n\
+// FUN_20 @ 00000020\n\
+void FUN_20(void)\n\
+{\n\
+  return;\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        // Keys are normalize_thumb_addr output (strip leading zeros, clear T-bit).
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("helper();"), "{body}");
+        assert!(!body.contains("FUN_20"), "{body}");
+        assert!(bodies.contains_key("20"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_tracks_escaped_char_literals() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char q = '\\'';\n\
+  char b = '}';\n\
+  done();\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("done();"), "{body}");
+        assert!(
+            body.ends_with("}\n") || body.trim_end().ends_with('}'),
+            "{body}"
+        );
     }
 }
