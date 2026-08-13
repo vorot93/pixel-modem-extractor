@@ -649,6 +649,46 @@ module; when a file outgrows that, split it.
   numeric `ImageReport` fields (including `global_shape_observations`)
   omit when analysis did not complete and emit `0` for a completed zero;
   `global_shapes_error` is reason-only and exclusive with those counts.
+- **Phase 3.2 depth-1 interprocedural pass.** After Pass 1's intra-procedural
+  tracking, `analyze_loaded_inputs` (`mod.rs`) runs a second pass that extends
+  Recovered-global evidence across one direct call hop. Load-bearing
+  invariants:
+  (1) **Depth-1.** Call-facts are harvested only from Pass 1's unseeded run;
+  Pass 2 re-tracks a seeded callee with the same `track_function` and so
+  emits call-facts of its own, but the coordinator discards them — no seed
+  ever originates from an already-seeded run, so the harvest cannot recurse
+  past one hop.
+  (2) **Direct `bl` + AAPCS r0–r3 only.** `ControlFlow::Call { target:
+  Option<CallTarget> }` resolves to `Some` only for direct `bl` (A32 `Bl_A1` /
+  T32 `Bl_T1`, same-ISA entry); `blx`-immediate (cross-ISA resolution
+  deferred) and `blx`/`blxns`/`bl`-register (indirect) always carry `target:
+  None` and harvest nothing. A call-fact's seed draws only from r0–r3, and
+  only a register holding a bare recovered-global address (displacement 0)
+  counts — an interior `&global + k` does not seed.
+  (3) **Strict entry+ISA callee resolution.** `resolve_callee` requires the
+  call's target to equal an accepted identity's entry exactly, with that
+  identity's first decode-range ISA matching the call's resolved ISA; zero or
+  more than one surviving match is unresolved and counted into
+  `call_facts_unresolved`, never guessed.
+  (4) **Entry-block-only seeding.** The seed is installed only into the
+  callee's entry-block state; every other block still starts empty, matching
+  the existing per-block model.
+  (5) **Attribution, not conflict.** An interprocedural observation is
+  attributed directly to the global that seeded it and never enters the
+  cross-global same-`(ISA, PC)` conflict pool intra evidence uses — a shared
+  callee instruction seeded from two different globals yields two independent
+  observations, never a conflict.
+  (6) **Additive-only.** Intra is authoritative: an interprocedural
+  observation that collides with a different intra semantic key at the same
+  `(ISA, PC)` is dropped and counted (`interprocedural_dropped`) rather than
+  overriding it; interprocedural evidence alone never demotes an `inferred`
+  global and never produces `conflicting`.
+  (7) **`via` iff interprocedural.** A non-empty `via` (caller→callee call
+  hops: `caller_entry`, `caller_name`, `call_pc`, `arg_register` as
+  `"r0"`–`"r3"`) marks an observation as interprocedural; `aggregate`'s
+  `validate` recomputes `interprocedural_observations` from the via-bearing
+  observation count and fails that image's `global_shapes` stage closed on
+  any mismatch.
 - **Phase 3.2 focused tests and replay.**
   ```
   cargo test global_shapes:: -- --nocapture
@@ -663,9 +703,17 @@ module; when a file outgrows that, split it.
     cargo test --release \
     global_shapes::tests::retained_tree_replay_is_deterministic_and_non_mutating \
     -- --ignored --nocapture
+  PME_GLOBAL_SHAPES_MEASURE=1 PME_GOLDEN_DIR=/path/to/unpruned/decompose \
+    cargo test --release -p pixel-modem-extractor --lib \
+    global_shapes::tests::interprocedural_yield_on_retained_tree \
+    -- --ignored --nocapture
   ```
   Goldens skip when `$PME_GOLDEN_DIR` is unset. Replay also needs the raw
-  image slices and does not write.
+  image slices and does not write. The interprocedural yield measurement
+  reuses the same replay machinery (two in-memory
+  `analyze_to_bytes_without_commit` passes, no write) and only `println!`s
+  the status split plus the six new `analysis` counters — see **Phase 3.2
+  interprocedural measured reality** below for the recorded numbers.
 - **Phase 3.2 production baselines (verified full `decompose`, ~1 h 37 m,
   exit 0).** Decoder `scaleservers-arm32-assembly` 1.0.0. Recovered shapes
   915 MAIN / 921 total; MAIN observations 32 ARM + 907 Thumb; 125 inferred
@@ -677,6 +725,34 @@ module; when a file outgrows that, split it.
   `thumb_decompiled` = 77,456, `globals_recovered` = 915. `globals.json`
   is unchanged by the new stage. `--prune` keeps the sidecar. Do not cite
   `thumb_decompiled` = 10,965 as current HEAD.
+- **Phase 3.2 interprocedural measured reality.** The depth-1 pass above is
+  correct, deterministic, and fail-closed, but its measured net yield on the
+  same production `02_MAIN` tree as the baselines above is **zero**.
+  `inferred`/`no_evidence`/`conflicting` held at 125/787/3 — identical to the
+  intra-only baseline — even though the pass did real work:
+  `direct_calls_resolved` 191, `call_facts_unresolved` 287, `seeded_callees`
+  52, `seed_vectors` 60, `interprocedural_observations` 3,
+  `interprocedural_dropped` 0. All 3 interprocedural observations
+  corroborated globals that were already `inferred` from intra-procedural
+  evidence; none converted a `no_evidence` global. Two compounding v1
+  limitations explain the zero: (1) **store-not-dereference** — the
+  pass-by-reference call sites this pass targets are registration/logging
+  tables, and the callee typically *stores* `&global` into the table rather
+  than dereferencing it, so the evidence it reveals is the table's shape, not
+  the global's; the dereferences that would reveal the global's own shape
+  happen later, through the stored pointer (pointer/alias following — a v1
+  non-goal); (2) **entry-block-only seeding** — a dereference after the
+  callee's first branch is invisible to the seed (callee-side cross-block
+  seeding — also a v1 non-goal). Meaningful yield on this firmware needs one
+  or both of those, both larger efforts than depth-1 argument propagation;
+  the call-fact primitive and the six counters above are the foundation for
+  them, not a finished win by themselves. Do not cite this pass as recovering
+  shapes on production `02_MAIN` — cite it as correct, additive-only, and
+  honestly measured at zero. Full design:
+  `2026-08-13-interprocedural-global-shapes-design.md`; measurement and
+  root-cause diagnosis: `2026-08-13-no-evidence-dominance-findings.md` (both
+  process artifacts under `~/.superpowers/pixel-modem-extractor/`, not part
+  of this repo).
 - **Phase 3.2 environment traps.** Currentness comes from the current-run
   markers, not leftover files. A Ghidra 12 output root must stay
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
