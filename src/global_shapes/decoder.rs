@@ -235,10 +235,9 @@ pub(crate) fn reachable_blocks(
 ) -> Result<Vec<Block>> {
     let decoded_pcs = decoded_pc_map(decoded);
     let entry = function.identity.entry;
+    // Undecoded entry is recoverable evidence loss: no walk, no invented length.
     if !decoded_pcs.contains_key(&entry) {
-        return Err(invalid(
-            "function entry is not a successfully decoded instruction PC",
-        ));
+        return Ok(Vec::new());
     }
 
     let mut boundaries = BTreeSet::from([entry]);
@@ -5429,11 +5428,9 @@ mod tests {
                 }),
             }],
         };
-        let message = match reachable_blocks(&function, &decoded) {
-            Err(Error::Serialize(message)) => message,
-            other => panic!("expected invariant error, got {other:?}"),
-        };
-        assert!(message.contains("entry"));
+        let blocks =
+            reachable_blocks(&function, &decoded).expect("undecoded entry is recoverable loss");
+        assert_eq!(blocks, Vec::new());
     }
 
     #[test]

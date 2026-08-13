@@ -153,6 +153,14 @@ fn analyze_loaded_inputs(
                 }
             }
             let blocks = reachable_blocks(function, &decoded)?;
+            if blocks.is_empty()
+                && decoded
+                    .ranges
+                    .iter()
+                    .all(|range| range.decode_failure.is_none())
+            {
+                bump(&mut decode_failures, "decode_failures")?;
+            }
             let tracked = tracker::track_function(
                 function,
                 &decoded,
@@ -1122,6 +1130,47 @@ mod tests {
         let expected = serialize(&expected_synthetic_file(&fixture)).unwrap();
         assert_eq!(fs::read(fixture.sidecar()).unwrap(), expected);
         assert!(!expected.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn undecoded_entry_is_recoverable_and_later_identities_still_run() {
+        let fixture = Fixture::new("undecoded_entry");
+        let bound = synthetic_bound(&fixture, 3);
+        let mut decoder = MapDecoder::fixture();
+        decoder
+            .errors
+            .insert((Isa::Arm, 0x4000), "unrecognized encoding");
+        let report = run_image_with_decoder(&bound.get(), &decoder)
+            .expect("undecoded entry must not fail the image");
+        assert!(
+            report.decode_failures >= 1,
+            "failed entry must count as a decode failure: {report:?}"
+        );
+        assert!(
+            report.observations >= 1,
+            "later identities must still produce evidence: {report:?}"
+        );
+        assert!(
+            fixture.sidecar().exists(),
+            "recoverable entry loss must still commit the sidecar"
+        );
+        let file: Value = serde_json::from_slice(&fs::read(fixture.sidecar()).unwrap()).unwrap();
+        let globals = file["globals"].as_array().expect("globals array");
+        let scalar = globals
+            .iter()
+            .find(|global| global["address"] == hex(SCALAR))
+            .expect("scalar global");
+        assert_eq!(scalar["status"], "no_evidence");
+        assert_eq!(scalar["observations"], json!([]));
+        let array = globals
+            .iter()
+            .find(|global| global["address"] == hex(ARRAY))
+            .expect("array global");
+        assert_eq!(array["status"], "inferred");
+        assert!(
+            !array["observations"].as_array().unwrap().is_empty(),
+            "second identity must still emit observations"
+        );
     }
 
     #[test]
