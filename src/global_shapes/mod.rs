@@ -5,6 +5,7 @@ mod aggregate;
 mod artifact;
 mod decoder;
 mod tracker;
+mod validate;
 
 use crate::error::{Error, Result};
 use crate::execution_ranges::{DecodeIsa as Isa, ExecutionIdentity};
@@ -21,6 +22,7 @@ use std::path::Path;
 use tracker::CandidateObservation;
 
 pub const FORMAT_V1: &str = "pixel-modem-extractor-global-shapes-v1";
+pub use validate::{validate_artifact, validate_artifact_files};
 
 #[derive(Debug)]
 pub(crate) struct RunRequest<'a> {
@@ -425,7 +427,7 @@ mod tests {
     use super::{
         GlobalShapesReport, RunRequest, aggregate, analyze_to_bytes_without_commit,
         commit_artifact_with, decoder_panic_error, run_image, run_image_with,
-        run_image_with_decoder,
+        run_image_with_decoder, validate_artifact, validate_artifact_files,
     };
     use crate::error::Error;
     use crate::execution_ranges::DecodeIsa as Isa;
@@ -1442,28 +1444,106 @@ mod tests {
         let file: Value = serde_json::from_slice(&first).unwrap();
         assert_eq!(file["format"], FORMAT_V1);
         assert_eq!(file["globals"].as_array().unwrap().len(), 3);
+        let mut report_image = json!({
+            "image": LABEL,
+            "functions": bound.ghidra_records,
+            "ghidra_execution_accepted": bound.ghidra_accepted,
+            "ghidra_execution_quarantined": bound.ghidra_quarantined,
+            "globals_recovered": bound.recovered,
+        });
+        if let (Some(substantial), Some(accepted), Some(quarantined)) = (
+            bound.thumb_substantial,
+            bound.thumb_accepted,
+            bound.thumb_quarantined,
+        ) {
+            report_image["thumb_functions"] = json!(substantial);
+            report_image["thumb_execution_accepted"] = json!(accepted);
+            report_image["thumb_execution_quarantined"] = json!(quarantined);
+        }
+        validate_artifact_files(
+            &fixture.image_dir(),
+            &fixture.manifest_path(),
+            &report_image,
+            &file,
+        );
+    }
+
+    #[test]
+    fn shape_sidecar_snapshot_detects_write_that_content_hash_ignores() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_sidecar_snap_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("decompiled")).unwrap();
+        fs::write(root.join("keep.bin"), b"terminal").unwrap();
+        let before_hash = hash_tree_except_shapes(&root);
+        let before_sidecars = shape_sidecar_states(&root);
+        assert!(before_sidecars.is_empty(), "no sidecar present yet");
+
+        fs::write(root.join("decompiled/global_shapes.json"), b"committed").unwrap();
+        assert_eq!(
+            hash_tree_except_shapes(&root),
+            before_hash,
+            "content hash still ignores sidecar writes"
+        );
+        let after_create = shape_sidecar_states(&root);
+        assert_ne!(
+            after_create, before_sidecars,
+            "sidecar snapshot must see a newly written global_shapes.json"
+        );
+
+        fs::write(root.join("decompiled/global_shapes.json"), b"changed").unwrap();
+        assert_ne!(
+            shape_sidecar_states(&root),
+            after_create,
+            "sidecar snapshot must see byte changes"
+        );
+
+        fs::remove_file(root.join("decompiled/global_shapes.json")).unwrap();
+        assert_eq!(
+            shape_sidecar_states(&root),
+            before_sidecars,
+            "absent after delete must match the original absent snapshot"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn walk_files(dir: &Path, visit: &mut impl FnMut(&Path, &fs::DirEntry)) {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                walk_files(&path, visit);
+            } else if file_type.is_file() {
+                visit(&path, &entry);
+            }
+        }
     }
 
     fn hash_tree_except_shapes(root: &Path) -> BTreeMap<PathBuf, String> {
         let mut hashes = BTreeMap::new();
-        fn walk(dir: &Path, hashes: &mut BTreeMap<PathBuf, String>) {
-            let entries = match fs::read_dir(dir) {
-                Ok(entries) => entries,
-                Err(_) => return,
-            };
-            for entry in entries {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                let file_type = entry.file_type().unwrap();
-                if file_type.is_dir() {
-                    walk(&path, hashes);
-                } else if file_type.is_file() && entry.file_name() != "global_shapes.json" {
-                    hashes.insert(path.clone(), sha256_bytes(&fs::read(&path).unwrap()));
-                }
+        walk_files(root, &mut |path, entry| {
+            if entry.file_name() != "global_shapes.json" {
+                hashes.insert(path.to_path_buf(), sha256_bytes(&fs::read(path).unwrap()));
             }
-        }
-        walk(root, &mut hashes);
+        });
         hashes
+    }
+
+    fn shape_sidecar_states(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut states = BTreeMap::new();
+        walk_files(root, &mut |path, entry| {
+            if entry.file_name() == "global_shapes.json" {
+                states.insert(path.to_path_buf(), fs::read(path).unwrap());
+            }
+        });
+        states
     }
 
     fn replay_eligible(image: &Value) -> Option<BoundReplay> {
@@ -1535,91 +1615,6 @@ mod tests {
         }
     }
 
-    fn assert_replay_bytes_valid(
-        bytes: &[u8],
-        request: &RunRequest<'_>,
-        report: &GlobalShapesReport,
-    ) {
-        let file: Value = serde_json::from_slice(bytes).expect("artifact JSON");
-        assert_eq!(file["format"], FORMAT_V1);
-        assert_eq!(file["image"], request.image_label);
-        assert!(!bytes.ends_with(b"\n"));
-        let globals = file["globals"].as_array().expect("globals array");
-        assert_eq!(globals.len(), request.expected_recovered_globals);
-        let mut inferred = 0usize;
-        let mut no_evidence = 0usize;
-        let mut conflicting = 0usize;
-        let mut observations = 0usize;
-        let mut conflicts = 0usize;
-        for global in globals {
-            match global["status"].as_str() {
-                Some("inferred") => {
-                    assert!(!global["observations"].as_array().unwrap().is_empty());
-                    assert!(global["conflicts"].as_array().unwrap().is_empty());
-                    assert!(global.get("summary").is_some_and(|s| !s.is_null()));
-                    inferred += 1;
-                }
-                Some("no_evidence") => {
-                    assert!(global["observations"].as_array().unwrap().is_empty());
-                    assert!(global["conflicts"].as_array().unwrap().is_empty());
-                    assert!(global["summary"].is_null());
-                    no_evidence += 1;
-                }
-                Some("conflicting") => {
-                    assert!(!global["conflicts"].as_array().unwrap().is_empty());
-                    assert!(global["summary"].is_null());
-                    conflicting += 1;
-                }
-                other => panic!("unknown status {other:?}"),
-            }
-            observations += global["observations"].as_array().unwrap().len();
-            conflicts += global["conflicts"].as_array().unwrap().len();
-            let address = global["address"].as_str().unwrap();
-            assert!(address.starts_with("0x"));
-            assert!(
-                address[2..]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            );
-        }
-        assert_eq!(inferred, report.inferred);
-        assert_eq!(no_evidence, report.no_evidence);
-        assert_eq!(conflicting, report.conflicting);
-        assert_eq!(observations, report.observations);
-        assert_eq!(file["analysis"]["observations"], observations);
-        assert_eq!(file["analysis"]["conflicts"], conflicts);
-        assert_eq!(
-            file["analysis"]["ghidra_records_quarantined"],
-            report.ghidra_quarantined
-        );
-        assert_eq!(
-            file["analysis"]["thumb_records_quarantined"],
-            report.thumb_quarantined
-        );
-        assert_eq!(
-            file["analysis"]["quarantine_errors"],
-            report.quarantine_errors
-        );
-        assert_eq!(file["analysis"]["decode_failures"], report.decode_failures);
-        assert_eq!(file["analysis"]["state_barriers"], report.state_barriers);
-        for key in ["image_sha256", "globals_sha256", "functions_sha256"] {
-            let hash = file["inputs"][key].as_str().unwrap();
-            assert_eq!(hash.len(), 64);
-            assert!(
-                hash.bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            );
-        }
-        match file["inputs"].get("thumb_functions_sha256") {
-            Some(Value::Null) => assert!(request.expected_thumb_accepted.is_none()),
-            Some(Value::String(hash)) => {
-                assert!(request.expected_thumb_accepted.is_some());
-                assert_eq!(hash.len(), 64);
-            }
-            other => panic!("unexpected thumb hash {other:?}"),
-        }
-    }
-
     #[test]
     #[ignore = "requires retained production tree and is intentionally expensive"]
     fn retained_tree_replay_is_deterministic_and_non_mutating() {
@@ -1649,6 +1644,7 @@ mod tests {
             })
             .expect("decompile images");
         let before = hash_tree_except_shapes(&dir);
+        let before_sidecars = shape_sidecar_states(&dir);
         let manifest = dir.join("manifest.json");
         for image in images {
             let Some(bound) = replay_eligible(image) else {
@@ -1678,8 +1674,9 @@ mod tests {
                 "{} report drifted",
                 bound.label
             );
-            assert_replay_bytes_valid(&first, &request, &first_report);
-            let file: Value = serde_json::from_slice(&first).unwrap();
+            let artifact: Value = serde_json::from_slice(&first).expect("artifact JSON");
+            validate_artifact(&dir, image, &artifact);
+            let file = artifact;
             println!(
                 "global_shapes replay {}: wall={:?} sha256={} accepted_identities={}/{} ghidra_quarantined={} thumb_quarantined={} quarantine_errors={} instructions_decoded={} decode_failures={} state_barriers={}",
                 bound.label,
@@ -1699,6 +1696,11 @@ mod tests {
             hash_tree_except_shapes(&dir),
             before,
             "retained tree must not be mutated"
+        );
+        assert_eq!(
+            shape_sidecar_states(&dir),
+            before_sidecars,
+            "global_shapes.json must not appear or change"
         );
     }
 }
