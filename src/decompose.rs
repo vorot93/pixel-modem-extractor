@@ -5595,7 +5595,7 @@ mod tests {
             std::fs::read_to_string(images_dir.join("02_MAIN/decompiled/global_shapes.json"))
                 .unwrap();
         let value: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
-        assert_eq!(value["format"], "pixel-modem-extractor-global-shapes-v1");
+        assert_eq!(value["format"], "pixel-modem-extractor-global-shapes-v2");
         assert_eq!(value["globals"], serde_json::json!([]));
         assert_eq!(
             std::fs::read(images_dir.join("02_MAIN/decompiled/globals.json")).unwrap(),

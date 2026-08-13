@@ -5,7 +5,7 @@
 //! sidecars (a pre-`global_shapes` corpus). The validator does not hardcode
 //! a yield percentage.
 
-use pixel_modem_extractor::global_shapes::{FORMAT_V1, validate_artifact};
+use pixel_modem_extractor::global_shapes::{FORMAT_V2, validate_artifact};
 use pixel_modem_extractor::manifest::sha256_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -177,7 +177,7 @@ fn parse_stage_totals(output: &str) -> [u64; 9] {
 }
 
 #[test]
-fn artifacts_satisfy_v1_invariants() {
+fn artifacts_satisfy_v2_invariants() {
     let Some(tree) = shapes_tree() else {
         return;
     };
@@ -192,7 +192,7 @@ fn artifacts_satisfy_v1_invariants() {
             serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         validate_artifact(&tree.dir, report_image(&tree.report, label), &artifact);
         assert!(is_sha256_hex(&sha256_bytes(&bytes)));
-        assert_eq!(artifact["format"], FORMAT_V1);
+        assert_eq!(artifact["format"], FORMAT_V2);
     }
 }
 

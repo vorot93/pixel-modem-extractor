@@ -118,8 +118,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `global_shapes/decoder.rs` | Pure-Rust adapter over `scaleservers-arm32-assembly` 1.0.0; project-owned instructions only |
 | `global_shapes/tracker.rs` | Conservative per-block fact tracking and Recovered-global access observations |
 | `global_shapes/aggregate.rs` | Same-PC agreement/conflict grouping and conservative summaries |
-| `global_shapes/artifact.rs` | Input validation, source hashes, v1 schema, deterministic serialize, atomic replace |
-| `global_shapes/validate.rs` | Shared v1 sidecar checks for goldens and retained-tree replay |
+| `global_shapes/artifact.rs` | Input validation, source hashes, v2 schema, deterministic serialize, atomic replace |
+| `global_shapes/validate.rs` | Shared v2 sidecar checks for goldens and retained-tree replay |
 | `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
 | `error.rs` | Error types |

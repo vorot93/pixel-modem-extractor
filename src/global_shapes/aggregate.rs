@@ -278,6 +278,9 @@ fn observation_wire(observation: &Observation) -> ObservationWire {
         offset: observation.offset,
         functions: functions_wire(&observation.functions),
         provenance_paths: paths_wire(&observation.paths),
+        // Depth-1 interprocedural call hops are not tracked yet; a later
+        // task threads them from `CandidateObservation` through here.
+        via: Vec::new(),
     }
 }
 

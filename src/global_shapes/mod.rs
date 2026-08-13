@@ -21,7 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use tracker::CandidateObservation;
 
-pub const FORMAT_V1: &str = "pixel-modem-extractor-global-shapes-v1";
+pub const FORMAT_V2: &str = "pixel-modem-extractor-global-shapes-v2";
 pub use validate::{validate_artifact, validate_artifact_files};
 
 #[derive(Debug)]
@@ -176,7 +176,7 @@ fn analyze_loaded_inputs(
 
     let aggregation = aggregate_fn(&inputs.globals, candidates)?;
     let file = GlobalShapesFile {
-        format: FORMAT_V1,
+        format: FORMAT_V2,
         image: image_label.to_owned(),
         load_address: hex(inputs.load_address),
         inputs: InputHashesWire {
@@ -200,6 +200,14 @@ fn analyze_loaded_inputs(
             state_barriers,
             observations: aggregation.observations,
             conflicts: aggregation.conflicts,
+            // A later task wires real interprocedural counters; this stage
+            // is depth-1-unaware and always reports zero here.
+            direct_calls_resolved: 0,
+            call_facts_unresolved: 0,
+            seeded_callees: 0,
+            seed_vectors: 0,
+            interprocedural_observations: 0,
+            interprocedural_dropped: 0,
         },
         globals: aggregation.globals,
     };
@@ -234,8 +242,8 @@ fn revalidate(
     inputs: &LoadedInputs,
     report: &GlobalShapesReport,
 ) -> Result<()> {
-    if file.format != FORMAT_V1 {
-        return Err(invalid("artifact format is not v1"));
+    if file.format != FORMAT_V2 {
+        return Err(invalid("artifact format is not v2"));
     }
     if file.globals.len() != inputs.globals.len() {
         return Err(invalid(
@@ -449,7 +457,7 @@ mod tests {
         DecodedInstruction, DecoderIdentity, InstructionDecoder, MemoryEffect, MemoryTransfer,
         PureRustDecoder, Register, SemanticEffect, ValueExpr, decode_function,
     };
-    use crate::global_shapes::{FORMAT_V1, FunctionContext, FunctionExecution};
+    use crate::global_shapes::{FORMAT_V2, FunctionContext, FunctionExecution};
     use crate::manifest::sha256_bytes;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -997,13 +1005,14 @@ mod tests {
                 name: name.to_owned(),
             }],
             provenance_paths: vec![provenance.iter().copied().map(hex).collect()],
+            via: Vec::new(),
         }
     }
 
     fn expected_synthetic_file(fixture: &Fixture) -> GlobalShapesFile {
         let (image_sha256, globals_sha256, functions_sha256, thumb_sha256) = fixture.hash_sources();
         GlobalShapesFile {
-            format: FORMAT_V1,
+            format: FORMAT_V2,
             image: LABEL.into(),
             load_address: hex(LOAD_ADDR),
             inputs: InputHashesWire {
@@ -1027,6 +1036,12 @@ mod tests {
                 state_barriers: 1,
                 observations: 3,
                 conflicts: 0,
+                direct_calls_resolved: 0,
+                call_facts_unresolved: 0,
+                seeded_callees: 0,
+                seed_vectors: 0,
+                interprocedural_observations: 0,
+                interprocedural_dropped: 0,
             },
             globals: vec![
                 GlobalWire {
@@ -1108,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_image_writes_complete_v1_sidecar() {
+    fn synthetic_image_writes_complete_v2_sidecar() {
         let fixture = Fixture::new("synthetic");
         let bound = synthetic_bound(&fixture, 3);
         let report = run_image_with_decoder(&bound.get(), &MapDecoder::fixture())
@@ -1432,7 +1447,7 @@ mod tests {
         let path = root.join("global_shapes.json");
         fs::write(&path, OLD_SIDECAR).unwrap();
         let file = GlobalShapesFile {
-            format: FORMAT_V1,
+            format: FORMAT_V2,
             image: LABEL.into(),
             load_address: hex(LOAD_ADDR),
             inputs: InputHashesWire {
@@ -1456,6 +1471,12 @@ mod tests {
                 state_barriers: 0,
                 observations: 0,
                 conflicts: 0,
+                direct_calls_resolved: 0,
+                call_facts_unresolved: 0,
+                seeded_callees: 0,
+                seed_vectors: 0,
+                interprocedural_observations: 0,
+                interprocedural_dropped: 0,
             },
             globals: vec![],
         };
@@ -1491,7 +1512,7 @@ mod tests {
         assert_eq!(fixture.hash_sources(), before);
         assert!(!first.ends_with(b"\n"));
         let file: Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(file["format"], FORMAT_V1);
+        assert_eq!(file["format"], FORMAT_V2);
         assert_eq!(file["globals"].as_array().unwrap().len(), 3);
         let mut report_image = json!({
             "image": LABEL,
