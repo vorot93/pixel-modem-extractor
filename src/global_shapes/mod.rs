@@ -1,5 +1,5 @@
-// Per-image coordinator. The pipeline stage is the remaining unused caller.
-#![allow(dead_code)]
+// Per-image coordinator: decode, track, aggregate, and atomically commit
+// one `global_shapes.json` sidecar.
 
 mod aggregate;
 mod artifact;

@@ -1,5 +1,4 @@
-// Staged internal API: later tasks call these helpers from the stage runner.
-#![allow(dead_code)]
+// Input validation, source hashes, v1 schema, and atomic sidecar commit.
 
 use super::{
     FunctionContext, FunctionExecution, RecoveredGlobal, RunRequest, SourceProjectionCounts,

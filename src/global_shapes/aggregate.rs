@@ -1,7 +1,4 @@
-// Same-PC agreement, conflicts, and conservative summaries. Later tasks
-// call this from the stage runner; until then unused pub(crate) items
-// exist for those stages.
-#![allow(dead_code)]
+// Same-PC agreement, conflicts, and conservative summaries.
 
 use super::artifact::{
     AccessKindWire, AlternativeWire, ConflictWire, FunctionContextWire, GlobalWire, IsaWire,

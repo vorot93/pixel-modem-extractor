@@ -1,5 +1,4 @@
-// Staged internal API: later tasks call the adapter from the tracker.
-#![allow(dead_code)]
+// Pure-Rust adapter over `scaleservers-arm32-assembly` 1.0.0.
 #![allow(clippy::too_many_arguments)]
 
 use super::FunctionExecution;
@@ -5131,8 +5130,14 @@ mod tests {
         );
         let calls = decoder.decode_log.borrow();
         assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].isa, Isa::Arm);
+        assert_eq!(calls[0].pc, 0x1000);
         assert_eq!(calls[0].bytes, image[0..8]);
+        assert_eq!(calls[1].isa, Isa::Arm);
+        assert_eq!(calls[1].pc, 0x1004);
         assert_eq!(calls[1].bytes, image[4..8]);
+        assert_eq!(calls[2].isa, Isa::Thumb);
+        assert_eq!(calls[2].pc, 0x1010);
         assert_eq!(calls[2].bytes, image[0x10..0x12]);
         assert_eq!(decoded.ranges.len(), 2);
         assert_eq!(decoded.ranges[0].instructions.len(), 2);

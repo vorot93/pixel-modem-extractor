@@ -1,6 +1,4 @@
-// Conservative per-block fact tracking. Later tasks aggregate these
-// candidates; until then unused pub(crate) items exist for those stages.
-#![allow(dead_code)]
+// Conservative per-block fact tracking.
 
 use super::decoder::{
     AccessKind, AddressBase, AddressExpr, AddressOffset, Block, DecodedFunction,
