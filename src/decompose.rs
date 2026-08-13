@@ -7,7 +7,8 @@
 use crate::decompile::{self, ImageOutcome};
 use crate::error::{Error, Result};
 use crate::{
-    decode_rf, globals, hwcfg, manifest, pipeline, recover_source, source_tree, symbolicate, tokens,
+    decode_rf, global_shapes, globals, hwcfg, manifest, pipeline, recover_source, source_tree,
+    symbolicate, tokens,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -94,6 +95,26 @@ pub struct ImageReport {
     pub globals_provisional: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub globals_provisional_suppressed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_inferred: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_no_evidence: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_conflicting: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shape_observations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_ghidra_quarantined: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_thumb_quarantined: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_quarantine_errors: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_decode_failures: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_state_barriers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_shapes_error: Option<String>,
 }
 
 impl ImageReport {
@@ -126,6 +147,16 @@ impl ImageReport {
                 globals_recovered: r.globals_recovered,
                 globals_provisional: r.globals_provisional,
                 globals_provisional_suppressed: r.globals_provisional_suppressed,
+                global_shapes_inferred: None,
+                global_shapes_no_evidence: None,
+                global_shapes_conflicting: None,
+                global_shape_observations: None,
+                global_shapes_ghidra_quarantined: None,
+                global_shapes_thumb_quarantined: None,
+                global_shapes_quarantine_errors: None,
+                global_shapes_decode_failures: None,
+                global_shapes_state_barriers: None,
+                global_shapes_error: None,
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -150,6 +181,16 @@ impl ImageReport {
                 globals_recovered: r.globals_recovered,
                 globals_provisional: r.globals_provisional,
                 globals_provisional_suppressed: r.globals_provisional_suppressed,
+                global_shapes_inferred: None,
+                global_shapes_no_evidence: None,
+                global_shapes_conflicting: None,
+                global_shape_observations: None,
+                global_shapes_ghidra_quarantined: None,
+                global_shapes_thumb_quarantined: None,
+                global_shapes_quarantine_errors: None,
+                global_shapes_decode_failures: None,
+                global_shapes_state_barriers: None,
+                global_shapes_error: None,
             },
         }
     }
@@ -865,6 +906,19 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostSymbolStep {
+    GlobalShapes,
+    DecodeRf,
+    HardwareConfig,
+}
+
+fn orchestrate_post_symbol_route(mut run_step: impl FnMut(PostSymbolStep)) {
+    run_step(PostSymbolStep::GlobalShapes);
+    run_step(PostSymbolStep::DecodeRf);
+    run_step(PostSymbolStep::HardwareConfig);
+}
+
 const SYMBOL_MAP_ERROR_MAX_CHARS: usize = 2_048;
 const SYMBOL_MAP_ERROR_TRUNCATION_MARKER: &str = " [truncated]";
 
@@ -1207,6 +1261,241 @@ fn run_globals_stage(
         opts,
         globals::run_with_evidence_projection,
     )
+}
+
+const GLOBAL_SHAPES_REASON_MAX_CHARS: usize = 2_048;
+
+struct GlobalShapesCurrentRun {
+    ghidra_records: usize,
+    ghidra_accepted: usize,
+    ghidra_quarantined: usize,
+    thumb_substantial: Option<usize>,
+    thumb_accepted: Option<usize>,
+    thumb_quarantined: Option<usize>,
+    recovered: usize,
+}
+
+fn bound_global_shapes_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .take(GLOBAL_SHAPES_REASON_MAX_CHARS)
+        .collect()
+}
+
+fn clear_global_shapes_fields(image: &mut ImageReport) {
+    image.global_shapes_inferred = None;
+    image.global_shapes_no_evidence = None;
+    image.global_shapes_conflicting = None;
+    image.global_shape_observations = None;
+    image.global_shapes_ghidra_quarantined = None;
+    image.global_shapes_thumb_quarantined = None;
+    image.global_shapes_quarantine_errors = None;
+    image.global_shapes_decode_failures = None;
+    image.global_shapes_state_barriers = None;
+    image.global_shapes_error = None;
+}
+
+fn apply_global_shapes_success(
+    image: &mut ImageReport,
+    report: &global_shapes::GlobalShapesReport,
+) {
+    image.global_shapes_inferred = Some(report.inferred);
+    image.global_shapes_no_evidence = Some(report.no_evidence);
+    image.global_shapes_conflicting = Some(report.conflicting);
+    image.global_shape_observations = Some(report.observations);
+    image.global_shapes_ghidra_quarantined = Some(report.ghidra_quarantined);
+    image.global_shapes_thumb_quarantined = Some(report.thumb_quarantined);
+    image.global_shapes_quarantine_errors = Some(report.quarantine_errors);
+    image.global_shapes_decode_failures = Some(report.decode_failures);
+    image.global_shapes_state_barriers = Some(report.state_barriers);
+    image.global_shapes_error = None;
+}
+
+fn current_global_shapes_run(
+    image: &ImageReport,
+) -> std::result::Result<GlobalShapesCurrentRun, String> {
+    let Some(ghidra_records) = image.functions else {
+        return Err("missing current ARM inventory".into());
+    };
+    let (Some(ghidra_accepted), Some(ghidra_quarantined)) = (
+        image.ghidra_execution_accepted,
+        image.ghidra_execution_quarantined,
+    ) else {
+        return Err("missing current ARM inventory".into());
+    };
+    match ghidra_accepted.checked_add(ghidra_quarantined) {
+        Some(sum) if sum == ghidra_records => {}
+        _ => {
+            return Err("ghidra execution counts do not equal functions".into());
+        }
+    }
+    if image.thumb_error.is_some() {
+        return Err("current Thumb inventory failed".into());
+    }
+    let (thumb_substantial, thumb_accepted, thumb_quarantined) = match (
+        image.thumb_functions,
+        image.thumb_execution_accepted,
+        image.thumb_execution_quarantined,
+    ) {
+        (None, None, None) => (None, None, None),
+        (Some(substantial), Some(accepted), Some(quarantined)) => {
+            (Some(substantial), Some(accepted), Some(quarantined))
+        }
+        _ => {
+            return Err("thumb inventory fields must be all present or all absent".into());
+        }
+    };
+    if image.globals_error.is_some() {
+        return Err("current globals failed".into());
+    }
+    let Some(recovered) = image.globals_recovered else {
+        return Err("missing current recovered globals".into());
+    };
+    Ok(GlobalShapesCurrentRun {
+        ghidra_records,
+        ghidra_accepted,
+        ghidra_quarantined,
+        thumb_substantial,
+        thumb_accepted,
+        thumb_quarantined,
+        recovered,
+    })
+}
+
+fn record_global_shapes_failure(image: &mut ImageReport, reason: String) -> String {
+    let reason = bound_global_shapes_reason(&reason);
+    image.global_shapes_error = Some(reason.clone());
+    reason
+}
+
+fn global_shapes_stage_output(
+    completed: usize,
+    eligible: usize,
+    totals: &global_shapes::GlobalShapesReport,
+) -> String {
+    format!(
+        "images/*/decompiled/global_shapes.json (completed={completed}/{eligible}, inferred={}, no_evidence={}, conflicting={}, observations={}, ghidra_quarantined={}, thumb_quarantined={}, quarantine_errors={}, decode_failures={}, state_barriers={})",
+        totals.inferred,
+        totals.no_evidence,
+        totals.conflicting,
+        totals.observations,
+        totals.ghidra_quarantined,
+        totals.thumb_quarantined,
+        totals.quarantine_errors,
+        totals.decode_failures,
+        totals.state_barriers,
+    )
+}
+
+fn add_global_shapes_totals(
+    totals: &mut global_shapes::GlobalShapesReport,
+    report: &global_shapes::GlobalShapesReport,
+) {
+    totals.inferred += report.inferred;
+    totals.no_evidence += report.no_evidence;
+    totals.conflicting += report.conflicting;
+    totals.observations += report.observations;
+    totals.ghidra_quarantined += report.ghidra_quarantined;
+    totals.thumb_quarantined += report.thumb_quarantined;
+    totals.quarantine_errors += report.quarantine_errors;
+    totals.decode_failures += report.decode_failures;
+    totals.state_barriers += report.state_barriers;
+}
+
+fn run_global_shapes_stage_with(
+    stages: &mut Vec<StageReport>,
+    images_dir: &Path,
+    manifest_path: &Path,
+    mut run_image: impl for<'a> FnMut(
+        &global_shapes::RunRequest<'a>,
+    ) -> Result<global_shapes::GlobalShapesReport>,
+) {
+    let Some(decompile_pos) = stages.iter().rposition(|stage| stage.stage == "decompile") else {
+        stages.push(StageReport::skipped("global_shapes", "no code image"));
+        return;
+    };
+    if stages[decompile_pos].images.is_empty() {
+        stages.push(StageReport::skipped("global_shapes", "no code image"));
+        return;
+    }
+
+    let started = Instant::now();
+    let eligible = stages[decompile_pos].images.len();
+    let mut completed = 0usize;
+    let mut totals = global_shapes::GlobalShapesReport {
+        inferred: 0,
+        no_evidence: 0,
+        conflicting: 0,
+        observations: 0,
+        ghidra_quarantined: 0,
+        thumb_quarantined: 0,
+        quarantine_errors: 0,
+        decode_failures: 0,
+        state_barriers: 0,
+    };
+    let mut errors: Vec<(String, String)> = Vec::new();
+
+    for image in &mut stages[decompile_pos].images {
+        clear_global_shapes_fields(image);
+        let label = image.image.clone();
+        let current = match current_global_shapes_run(image) {
+            Ok(current) => current,
+            Err(reason) => {
+                let reason = record_global_shapes_failure(image, reason);
+                errors.push((label, reason));
+                continue;
+            }
+        };
+        let image_dir = images_dir.join(&label);
+        let request = global_shapes::RunRequest {
+            image_dir: &image_dir,
+            image_label: &label,
+            manifest_path,
+            expected_ghidra_records: current.ghidra_records,
+            expected_ghidra_accepted: current.ghidra_accepted,
+            expected_ghidra_quarantined: current.ghidra_quarantined,
+            expected_thumb_substantial: current.thumb_substantial,
+            expected_thumb_accepted: current.thumb_accepted,
+            expected_thumb_quarantined: current.thumb_quarantined,
+            expected_recovered_globals: current.recovered,
+        };
+        match run_image(&request) {
+            Ok(report) => {
+                apply_global_shapes_success(image, &report);
+                add_global_shapes_totals(&mut totals, &report);
+                completed += 1;
+            }
+            Err(error) => {
+                let reason = record_global_shapes_failure(image, error.to_string());
+                errors.push((label, reason));
+            }
+        }
+    }
+
+    let error = if errors.is_empty() {
+        None
+    } else {
+        Some(
+            errors
+                .into_iter()
+                .map(|(label, reason)| format!("{label}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    };
+    stages.push(StageReport {
+        stage: "global_shapes",
+        status: if error.is_some() { "failed" } else { "ok" },
+        output: Some(global_shapes_stage_output(completed, eligible, &totals)),
+        reason: None,
+        error,
+        images: Vec::new(),
+        duration_ms: started.elapsed().as_millis(),
+    });
+}
+
+fn run_global_shapes_stage(stages: &mut Vec<StageReport>, images_dir: &Path, manifest_path: &Path) {
+    run_global_shapes_stage_with(stages, images_dir, manifest_path, global_shapes::run_image);
 }
 
 /// Record global preparation without exposing a normal-route intermediate
@@ -1684,39 +1973,48 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         }
     });
 
-    // 9. Remaining decoders (independent of symbolication).
+    // Remaining post-symbol stages: global shape recovery, then the RF and
+    // hardware decoders. Both symbol routes share this exact sequence.
     let rf_dir = out.join("rf_cfg_decompressed");
     let hwcfg_path = rootfs.join("hardware_config.json");
     let rf_present = std::fs::read_dir(&rf_dir)
         .map(|mut it| it.next().is_some())
         .unwrap_or(false);
 
-    if hwcfg_path.exists() && rf_present {
-        run_stage(&mut stages, "decode_rf", "rf/decoded", || {
-            decode_rf::run(&rf_dir, &hwcfg_path, &out.join("rf").join("decoded"))
-        });
-    } else {
-        stages.push(StageReport::skipped(
-            "decode_rf",
-            "no hardware_config.json or no RF_CFG_* blobs",
-        ));
-    }
-
-    if hwcfg_path.exists() {
-        let rf_arg = rf_present.then(|| rf_dir.clone());
-        run_stage(&mut stages, "hardware_config", "rf/hwcfg_summary", || {
-            hwcfg::run(
-                &hwcfg_path,
-                rf_arg.as_deref(),
-                &out.join("rf").join("hwcfg_summary"),
-            )
-        });
-    } else {
-        stages.push(StageReport::skipped(
-            "hardware_config",
-            "no hardware_config.json",
-        ));
-    }
+    orchestrate_post_symbol_route(|step| match step {
+        PostSymbolStep::GlobalShapes => {
+            run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
+        }
+        PostSymbolStep::DecodeRf => {
+            if hwcfg_path.exists() && rf_present {
+                run_stage(&mut stages, "decode_rf", "rf/decoded", || {
+                    decode_rf::run(&rf_dir, &hwcfg_path, &out.join("rf").join("decoded"))
+                });
+            } else {
+                stages.push(StageReport::skipped(
+                    "decode_rf",
+                    "no hardware_config.json or no RF_CFG_* blobs",
+                ));
+            }
+        }
+        PostSymbolStep::HardwareConfig => {
+            if hwcfg_path.exists() {
+                let rf_arg = rf_present.then(|| rf_dir.clone());
+                run_stage(&mut stages, "hardware_config", "rf/hwcfg_summary", || {
+                    hwcfg::run(
+                        &hwcfg_path,
+                        rf_arg.as_deref(),
+                        &out.join("rf").join("hwcfg_summary"),
+                    )
+                });
+            } else {
+                stages.push(StageReport::skipped(
+                    "hardware_config",
+                    "no hardware_config.json",
+                ));
+            }
+        }
+    });
 
     // 6. Prune (opt-in) then write the report.
     if opts.prune
@@ -3031,6 +3329,48 @@ mod tests {
             SymbolRouteStep::RunGlobals(GlobalsRouteMode::PrepareApplicationInput)
                 | SymbolRouteStep::DispatchPass2
         )));
+
+        let mut post = Vec::new();
+        orchestrate_post_symbol_route(|step| post.push(step));
+        assert_eq!(
+            post,
+            vec![
+                PostSymbolStep::GlobalShapes,
+                PostSymbolStep::DecodeRf,
+                PostSymbolStep::HardwareConfig,
+            ]
+        );
+        assert_eq!(
+            post.iter()
+                .filter(|step| matches!(step, PostSymbolStep::GlobalShapes))
+                .count(),
+            1
+        );
+
+        let mut combined = Vec::new();
+        orchestrate_symbol_route(false, |step| combined.push(format!("{step:?}")));
+        orchestrate_post_symbol_route(|step| combined.push(format!("{step:?}")));
+        let finalize = combined
+            .iter()
+            .position(|step| step.starts_with("Finalize"))
+            .expect("normal route ends with Finalize");
+        let shapes = combined
+            .iter()
+            .position(|step| step == "GlobalShapes")
+            .expect("post-symbol route starts with GlobalShapes");
+        let decode_rf = combined.iter().position(|step| step == "DecodeRf").unwrap();
+        let hardware = combined
+            .iter()
+            .position(|step| step == "HardwareConfig")
+            .unwrap();
+        assert!(finalize < shapes && shapes < decode_rf && decode_rf < hardware);
+        assert_eq!(
+            combined
+                .iter()
+                .filter(|step| step.as_str() == "GlobalShapes")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3157,6 +3497,16 @@ mod tests {
                         globals_recovered: None,
                         globals_provisional: None,
                         globals_provisional_suppressed: None,
+                        global_shapes_inferred: None,
+                        global_shapes_no_evidence: None,
+                        global_shapes_conflicting: None,
+                        global_shape_observations: None,
+                        global_shapes_ghidra_quarantined: None,
+                        global_shapes_thumb_quarantined: None,
+                        global_shapes_quarantine_errors: None,
+                        global_shapes_decode_failures: None,
+                        global_shapes_state_barriers: None,
+                        global_shapes_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -3181,6 +3531,16 @@ mod tests {
                         globals_recovered: None,
                         globals_provisional: None,
                         globals_provisional_suppressed: None,
+                        global_shapes_inferred: None,
+                        global_shapes_no_evidence: None,
+                        global_shapes_conflicting: None,
+                        global_shape_observations: None,
+                        global_shapes_ghidra_quarantined: None,
+                        global_shapes_thumb_quarantined: None,
+                        global_shapes_quarantine_errors: None,
+                        global_shapes_decode_failures: None,
+                        global_shapes_state_barriers: None,
+                        global_shapes_error: None,
                     },
                 ],
                 10,
@@ -3641,6 +4001,16 @@ mod tests {
             globals_recovered: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            global_shapes_inferred: None,
+            global_shapes_no_evidence: None,
+            global_shapes_conflicting: None,
+            global_shape_observations: None,
+            global_shapes_ghidra_quarantined: None,
+            global_shapes_thumb_quarantined: None,
+            global_shapes_quarantine_errors: None,
+            global_shapes_decode_failures: None,
+            global_shapes_state_barriers: None,
+            global_shapes_error: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -3817,6 +4187,8 @@ mod tests {
         std::fs::write(dest.join("thumb_functions.json"), &thumb_json).unwrap();
         std::fs::write(dest.join("thumb").join("410b0000.stdout"), thumb_stdout).unwrap();
         std::fs::write(dest.join("globals.json"), globals_json).unwrap();
+        let global_shapes_json = b"{\"sentinel\":true}";
+        std::fs::write(dest.join("global_shapes.json"), global_shapes_json).unwrap();
         std::fs::write(dest.join("future-sidecar.bin"), future_sidecar).unwrap();
 
         // Pass-2 export: exactly the three Ghidra-owned files, new contents.
@@ -3849,6 +4221,11 @@ mod tests {
             std::fs::read(dest.join("globals.json")).unwrap(),
             globals_json,
             "globals.json must be byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("global_shapes.json")).unwrap(),
+            global_shapes_json,
+            "global_shapes.json must be byte-identical"
         );
         assert_eq!(
             std::fs::read(dest.join("future-sidecar.bin")).unwrap(),
@@ -4248,6 +4625,11 @@ mod tests {
             b"// c",
         )
         .unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/decompiled/global_shapes.json"),
+            b"{\"sentinel\":true}",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
@@ -4270,6 +4652,10 @@ mod tests {
                 .join("decompiled")
                 .join("out.c")
                 .exists()
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/decompiled/global_shapes.json")).unwrap(),
+            b"{\"sentinel\":true}"
         );
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());
@@ -4426,6 +4812,796 @@ mod tests {
         assert!(json.contains("\"globals_error\":\"malformed functions.json\""));
         assert!(json.contains("\"globals_provisional\":50"));
         assert!(json.contains("\"globals_provisional_suppressed\":3"));
+        assert!(!json.contains("global_shapes_inferred"));
+        assert!(!json.contains("global_shapes_error"));
+    }
+
+    fn absent_global_shapes_keys(value: &serde_json::Value) {
+        for key in [
+            "global_shapes_inferred",
+            "global_shapes_no_evidence",
+            "global_shapes_conflicting",
+            "global_shape_observations",
+            "global_shapes_ghidra_quarantined",
+            "global_shapes_thumb_quarantined",
+            "global_shapes_quarantine_errors",
+            "global_shapes_decode_failures",
+            "global_shapes_state_barriers",
+            "global_shapes_error",
+        ] {
+            assert!(value.get(key).is_none(), "{key} must be omitted");
+        }
+    }
+
+    fn set_zero_global_shapes(image: &mut ImageReport) {
+        image.global_shapes_inferred = Some(0);
+        image.global_shapes_no_evidence = Some(0);
+        image.global_shapes_conflicting = Some(0);
+        image.global_shape_observations = Some(0);
+        image.global_shapes_ghidra_quarantined = Some(0);
+        image.global_shapes_thumb_quarantined = Some(0);
+        image.global_shapes_quarantine_errors = Some(0);
+        image.global_shapes_decode_failures = Some(0);
+        image.global_shapes_state_barriers = Some(0);
+        image.global_shapes_error = None;
+    }
+
+    fn zero_shapes_report() -> global_shapes::GlobalShapesReport {
+        global_shapes::GlobalShapesReport {
+            inferred: 0,
+            no_evidence: 0,
+            conflicting: 0,
+            observations: 0,
+            ghidra_quarantined: 0,
+            thumb_quarantined: 0,
+            quarantine_errors: 0,
+            decode_failures: 0,
+            state_barriers: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eligible_shape_image(
+        label: &str,
+        functions: usize,
+        accepted: usize,
+        quarantined: usize,
+        thumb_functions: Option<usize>,
+        thumb_accepted: Option<usize>,
+        thumb_quarantined: Option<usize>,
+        recovered: usize,
+    ) -> ImageReport {
+        let mut image = ImageReport::from_result(&analyzed_image(label));
+        image.functions = Some(functions);
+        image.ghidra_execution_accepted = Some(accepted);
+        image.ghidra_execution_quarantined = Some(quarantined);
+        image.thumb_functions = thumb_functions;
+        image.thumb_execution_accepted = thumb_accepted;
+        image.thumb_execution_quarantined = thumb_quarantined;
+        image.globals_recovered = Some(recovered);
+        image
+    }
+
+    fn empty_globals_json(label: &str) -> String {
+        format!(
+            r#"{{"format":"pixel-modem-extractor-globals-v1","image":"{label}","globals":[],"phase3_0_1_error":null,"provisional_suppressed":0}}"#
+        )
+    }
+
+    fn write_empty_shape_image(images_dir: &Path, label: &str) {
+        let image_dir = images_dir.join(label);
+        let decompiled = image_dir.join("decompiled");
+        std::fs::create_dir_all(&decompiled).unwrap();
+        std::fs::write(image_dir.join(format!("{label}.bin")), vec![0u8; 0x40]).unwrap();
+        std::fs::write(decompiled.join("functions.json"), tagged_functions(label)).unwrap();
+        std::fs::write(decompiled.join("globals.json"), empty_globals_json(label)).unwrap();
+    }
+
+    fn write_shape_manifest(path: &Path, labels: &[&str]) {
+        let toc: Vec<String> = labels
+            .iter()
+            .map(|label| {
+                let name = label
+                    .rsplit_once('_')
+                    .map(|(_, name)| name)
+                    .unwrap_or(label);
+                format!(r#"{{"name":"{name}","load_addr":16384}}"#)
+            })
+            .collect();
+        std::fs::write(path, format!(r#"{{"toc":[{}]}}"#, toc.join(","))).unwrap();
+    }
+
+    fn last_stage(stages: &[StageReport]) -> &StageReport {
+        stages.last().expect("stage report")
+    }
+
+    fn assert_nine_shape_counts(image: &ImageReport, expected: Option<usize>) {
+        assert_eq!(image.global_shapes_inferred, expected);
+        assert_eq!(image.global_shapes_no_evidence, expected);
+        assert_eq!(image.global_shapes_conflicting, expected);
+        assert_eq!(image.global_shape_observations, expected);
+        assert_eq!(image.global_shapes_ghidra_quarantined, expected);
+        assert_eq!(image.global_shapes_thumb_quarantined, expected);
+        assert_eq!(image.global_shapes_quarantine_errors, expected);
+        assert_eq!(image.global_shapes_decode_failures, expected);
+        assert_eq!(image.global_shapes_state_barriers, expected);
+    }
+
+    #[test]
+    fn image_report_serializes_global_shapes_fields_as_none_when_absent() {
+        let report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "image": "02_MAIN",
+                "status": "analyzed",
+                "functions": 1
+            })
+        );
+        absent_global_shapes_keys(&value);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("thumb_decompiled"));
+        assert!(!json.contains("globals_recovered"));
+        assert!(!json.contains("global_shapes_"));
+        assert!(!json.contains("global_shape_observations"));
+    }
+
+    #[test]
+    fn image_report_serializes_global_shapes_zero_success() {
+        let mut report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        set_zero_global_shapes(&mut report);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "image": "02_MAIN",
+                "status": "analyzed",
+                "functions": 1,
+                "global_shapes_inferred": 0,
+                "global_shapes_no_evidence": 0,
+                "global_shapes_conflicting": 0,
+                "global_shape_observations": 0,
+                "global_shapes_ghidra_quarantined": 0,
+                "global_shapes_thumb_quarantined": 0,
+                "global_shapes_quarantine_errors": 0,
+                "global_shapes_decode_failures": 0,
+                "global_shapes_state_barriers": 0
+            })
+        );
+        assert!(value.get("global_shapes_error").is_none());
+    }
+
+    #[test]
+    fn image_report_serializes_global_shapes_nonzero_success() {
+        let mut report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        report.global_shapes_inferred = Some(4);
+        report.global_shapes_no_evidence = Some(5);
+        report.global_shapes_conflicting = Some(1);
+        report.global_shape_observations = Some(9);
+        report.global_shapes_ghidra_quarantined = Some(2);
+        report.global_shapes_thumb_quarantined = Some(3);
+        report.global_shapes_quarantine_errors = Some(6);
+        report.global_shapes_decode_failures = Some(7);
+        report.global_shapes_state_barriers = Some(8);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["global_shapes_inferred"], 4);
+        assert_eq!(value["global_shapes_no_evidence"], 5);
+        assert_eq!(value["global_shapes_conflicting"], 1);
+        assert_eq!(value["global_shape_observations"], 9);
+        assert_eq!(value["global_shapes_ghidra_quarantined"], 2);
+        assert_eq!(value["global_shapes_thumb_quarantined"], 3);
+        assert_eq!(value["global_shapes_quarantine_errors"], 6);
+        assert_eq!(value["global_shapes_decode_failures"], 7);
+        assert_eq!(value["global_shapes_state_barriers"], 8);
+        assert!(value.get("global_shapes_error").is_none());
+    }
+
+    #[test]
+    fn image_report_serializes_global_shapes_failure_omits_counts() {
+        let mut result = tagged_image("02_MAIN", true);
+        result.outcome = ImageOutcome::Analyzed(1);
+        let mut report = ImageReport::from_result(&result);
+        report.global_shapes_error = Some("malformed functions.json".into());
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["ghidra_execution_accepted"], 1);
+        assert_eq!(value["ghidra_execution_quarantined"], 0);
+        assert_eq!(value["thumb_execution_accepted"], 1);
+        assert_eq!(value["thumb_execution_quarantined"], 0);
+        assert_eq!(value["global_shapes_error"], "malformed functions.json");
+        for key in [
+            "global_shapes_inferred",
+            "global_shapes_no_evidence",
+            "global_shapes_conflicting",
+            "global_shape_observations",
+            "global_shapes_ghidra_quarantined",
+            "global_shapes_thumb_quarantined",
+            "global_shapes_quarantine_errors",
+            "global_shapes_decode_failures",
+            "global_shapes_state_barriers",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "{key} must stay absent on failure"
+            );
+        }
+    }
+
+    #[test]
+    fn global_shapes_stage_invokes_each_eligible_image_once_in_pipeline_order() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_order_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        let mut stages = vec![
+            StageReport::ok("extract", "manifest.json", 1),
+            StageReport::decompile(
+                vec![
+                    eligible_shape_image("02_MAIN", 2, 1, 1, Some(1), Some(1), Some(0), 3),
+                    eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+                ],
+                10,
+            ),
+        ];
+        let mut calls = Vec::new();
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+            calls.push((
+                request.image_label.to_string(),
+                request.image_dir.to_path_buf(),
+                request.manifest_path.to_path_buf(),
+                request.expected_ghidra_records,
+                request.expected_ghidra_accepted,
+                request.expected_ghidra_quarantined,
+                request.expected_thumb_substantial,
+                request.expected_thumb_accepted,
+                request.expected_thumb_quarantined,
+                request.expected_recovered_globals,
+            ));
+            Ok(global_shapes::GlobalShapesReport {
+                inferred: if request.image_label == "02_MAIN" {
+                    2
+                } else {
+                    0
+                },
+                no_evidence: if request.image_label == "02_MAIN" {
+                    1
+                } else {
+                    0
+                },
+                conflicting: 0,
+                observations: if request.image_label == "02_MAIN" {
+                    4
+                } else {
+                    0
+                },
+                ghidra_quarantined: request.expected_ghidra_quarantined,
+                thumb_quarantined: request.expected_thumb_quarantined.unwrap_or(0),
+                quarantine_errors: 1,
+                decode_failures: 0,
+                state_barriers: 0,
+            })
+        });
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "02_MAIN");
+        assert_eq!(calls[0].1, images_dir.join("02_MAIN"));
+        assert_eq!(calls[0].2, manifest);
+        assert_eq!(calls[0].3, 2);
+        assert_eq!(calls[0].4, 1);
+        assert_eq!(calls[0].5, 1);
+        assert_eq!(calls[0].6, Some(1));
+        assert_eq!(calls[0].7, Some(1));
+        assert_eq!(calls[0].8, Some(0));
+        assert_eq!(calls[0].9, 3);
+        assert_eq!(calls[1].0, "03_APM");
+        assert_eq!(calls[1].9, 0);
+        assert_eq!(calls[1].6, None);
+        assert_eq!(calls[1].7, None);
+        assert_eq!(calls[1].8, None);
+        assert_eq!(stages.len(), 3);
+        assert!(stages[0].images.is_empty());
+        assert!(last_stage(&stages).images.is_empty());
+        assert_eq!(last_stage(&stages).stage, "global_shapes");
+        assert_eq!(last_stage(&stages).status, "ok");
+        assert_eq!(
+            last_stage(&stages).output.as_deref(),
+            Some(
+                "images/*/decompiled/global_shapes.json (completed=2/2, inferred=2, no_evidence=1, conflicting=0, observations=4, ghidra_quarantined=1, thumb_quarantined=0, quarantine_errors=2, decode_failures=0, state_barriers=0)"
+            )
+        );
+        assert!(last_stage(&stages).error.is_none());
+        assert_eq!(stages[1].images[0].global_shapes_inferred, Some(2));
+        assert_eq!(stages[1].images[0].global_shapes_no_evidence, Some(1));
+        assert_eq!(stages[1].images[1].global_shapes_inferred, Some(0));
+        assert_eq!(stages[1].status, "ok");
+        assert_eq!(stages[1].images[0].status, "analyzed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_invokes_zero_recovered_and_skips_unready_images() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_gates_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        let missing_arm = eligible_shape_image("00_BOOT", 1, 1, 0, None, None, None, 0);
+        let mut missing_arm = ImageReport {
+            functions: None,
+            ghidra_execution_accepted: None,
+            ghidra_execution_quarantined: None,
+            ..missing_arm
+        };
+        missing_arm.global_shapes_inferred = Some(9);
+        let mut thumb_failed = eligible_shape_image("01_PSP", 1, 1, 0, None, None, None, 0);
+        thumb_failed.thumb_error = Some("radare2 failed".into());
+        let mut missing_globals = eligible_shape_image("04_VSS", 1, 1, 0, None, None, None, 0);
+        missing_globals.globals_recovered = None;
+        let mut globals_failed = eligible_shape_image("05_DBGCORE", 1, 1, 0, None, None, None, 4);
+        globals_failed.globals_error = Some("old globals stale".into());
+        let zero = eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0);
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                missing_arm,
+                thumb_failed,
+                missing_globals,
+                globals_failed,
+                zero,
+            ],
+            4,
+        )];
+        let mut calls = Vec::new();
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+            calls.push(request.image_label.to_string());
+            assert_eq!(request.expected_recovered_globals, 0);
+            Ok(zero_shapes_report())
+        });
+
+        assert_eq!(calls, vec!["03_APM".to_string()]);
+        assert_eq!(stages[0].status, "ok");
+        assert_eq!(stages[0].images[0].status, "analyzed");
+        assert_eq!(
+            stages[0].images[0].global_shapes_error.as_deref(),
+            Some("missing current ARM inventory")
+        );
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert_eq!(
+            stages[0].images[1].global_shapes_error.as_deref(),
+            Some("current Thumb inventory failed")
+        );
+        assert_eq!(
+            stages[0].images[2].global_shapes_error.as_deref(),
+            Some("missing current recovered globals")
+        );
+        assert_eq!(
+            stages[0].images[3].global_shapes_error.as_deref(),
+            Some("current globals failed")
+        );
+        assert_nine_shape_counts(&stages[0].images[4], Some(0));
+        assert!(stages[0].images[4].global_shapes_error.is_none());
+        assert_eq!(last_stage(&stages).status, "failed");
+        assert!(!Report::is_ok(&stages));
+        assert_eq!(
+            last_stage(&stages).error.as_deref(),
+            Some(
+                "00_BOOT: missing current ARM inventory; 01_PSP: current Thumb inventory failed; 04_VSS: missing current recovered globals; 05_DBGCORE: current globals failed"
+            )
+        );
+        assert_eq!(
+            last_stage(&stages).output.as_deref(),
+            Some(
+                "images/*/decompiled/global_shapes.json (completed=1/5, inferred=0, no_evidence=0, conflicting=0, observations=0, ghidra_quarantined=0, thumb_quarantined=0, quarantine_errors=0, decode_failures=0, state_barriers=0)"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_one_analyzer_failure_does_not_prevent_later_images() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_continue_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        let mut first = eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 1);
+        first.global_shapes_inferred = Some(8);
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                first,
+                eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+            ],
+            6,
+        )];
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+            if request.image_label == "02_MAIN" {
+                return Err(Error::Serialize("é".repeat(3_000)));
+            }
+            Ok(zero_shapes_report())
+        });
+
+        let reason = stages[0].images[0]
+            .global_shapes_error
+            .as_ref()
+            .expect("bounded reason");
+        assert_eq!(reason.chars().count(), 2_048);
+        assert!(reason.starts_with("serialize: "));
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert_eq!(stages[0].images[0].status, "analyzed");
+        assert_nine_shape_counts(&stages[0].images[1], Some(0));
+        assert_eq!(last_stage(&stages).status, "failed");
+        assert!(
+            last_stage(&stages)
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("02_MAIN: serialize: ")
+        );
+        assert!(
+            !last_stage(&stages)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("03_APM")
+        );
+        assert_eq!(
+            last_stage(&stages).output.as_deref(),
+            Some(
+                "images/*/decompiled/global_shapes.json (completed=1/2, inferred=0, no_evidence=0, conflicting=0, observations=0, ghidra_quarantined=0, thumb_quarantined=0, quarantine_errors=0, decode_failures=0, state_barriers=0)"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_skips_when_no_decompile_images() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_skip_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut empty = vec![StageReport::decompile(Vec::new(), 2)];
+        let mut called = false;
+        run_global_shapes_stage_with(&mut empty, &root, &root.join("manifest.json"), |_| {
+            called = true;
+            Ok(zero_shapes_report())
+        });
+        assert!(!called);
+        assert_eq!(empty.len(), 2);
+        assert_eq!(empty[1].stage, "global_shapes");
+        assert_eq!(empty[1].status, "skipped");
+        assert_eq!(empty[1].reason.as_deref(), Some("no code image"));
+        assert_eq!(empty[1].duration_ms, 0);
+        assert!(empty[1].images.is_empty());
+
+        let mut missing = vec![StageReport::ok("extract", "manifest.json", 1)];
+        run_global_shapes_stage_with(&mut missing, &root, &root.join("manifest.json"), |_| {
+            called = true;
+            Ok(zero_shapes_report())
+        });
+        assert!(!called);
+        assert_eq!(missing[1].status, "skipped");
+        assert_eq!(missing[1].reason.as_deref(), Some("no code image"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_rejects_ghidra_count_mismatch_without_calling_analyzer() {
+        let mut stages = vec![StageReport::decompile(
+            vec![eligible_shape_image(
+                "02_MAIN", 2, 1, 0, None, None, None, 0,
+            )],
+            1,
+        )];
+        let mut called = false;
+        run_global_shapes_stage_with(
+            &mut stages,
+            Path::new("/tmp"),
+            Path::new("/tmp/manifest.json"),
+            |_| {
+                called = true;
+                Ok(zero_shapes_report())
+            },
+        );
+        assert!(!called);
+        assert_eq!(
+            stages[0].images[0].global_shapes_error.as_deref(),
+            Some("ghidra execution counts do not equal functions")
+        );
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert_eq!(last_stage(&stages).status, "failed");
+    }
+
+    #[test]
+    fn global_shapes_stage_rejects_mixed_thumb_fields_without_calling_analyzer() {
+        let mut mixed = eligible_shape_image("02_MAIN", 1, 1, 0, Some(1), None, None, 0);
+        mixed.ghidra_execution_accepted = Some(1);
+        let mut stages = vec![StageReport::decompile(vec![mixed], 1)];
+        let mut called = false;
+        run_global_shapes_stage_with(
+            &mut stages,
+            Path::new("/tmp"),
+            Path::new("/tmp/manifest.json"),
+            |_| {
+                called = true;
+                Ok(zero_shapes_report())
+            },
+        );
+        assert!(!called);
+        assert_eq!(
+            stages[0].images[0].global_shapes_error.as_deref(),
+            Some("thumb inventory fields must be all present or all absent")
+        );
+        assert_eq!(last_stage(&stages).status, "failed");
+    }
+
+    #[test]
+    fn global_shapes_stage_analyzes_pass2_fallback_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_empty_shape_image(&images_dir, "03_APM");
+        write_shape_manifest(&manifest, &["02_MAIN", "03_APM"]);
+
+        let mut raw = tagged_image("02_MAIN", false);
+        raw.globals_recovered = Some(0);
+        let mut later = tagged_image("03_APM", false);
+        later.globals_recovered = Some(0);
+        let fallback = vec![
+            ImageReport::from_result(&raw),
+            ImageReport::from_result(&later),
+        ];
+        let mut stages = vec![
+            StageReport::decompile(
+                vec![
+                    ImageReport::from_result(&analyzed_image("02_MAIN")),
+                    ImageReport::from_result(&analyzed_image("03_APM")),
+                ],
+                10,
+            ),
+            StageReport::failed("decompile_pass2", "process failed".into(), 5),
+        ];
+        install_decompile_stage_image_snapshot(&mut stages, fallback);
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+
+        assert_eq!(stages[0].images[0].globals_recovered, Some(0));
+        assert_nine_shape_counts(&stages[0].images[0], Some(0));
+        assert_nine_shape_counts(&stages[0].images[1], Some(0));
+        assert!(stages[0].images[0].global_shapes_error.is_none());
+        assert_eq!(last_stage(&stages).stage, "global_shapes");
+        assert_eq!(last_stage(&stages).status, "ok");
+        assert!(
+            images_dir
+                .join("02_MAIN/decompiled/global_shapes.json")
+                .is_file()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_malformed_terminal_functions_fail_and_continue() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_malformed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_empty_shape_image(&images_dir, "03_APM");
+        write_shape_manifest(&manifest, &["02_MAIN", "03_APM"]);
+        std::fs::write(
+            images_dir.join("02_MAIN/decompiled/functions.json"),
+            b"not-json",
+        )
+        .unwrap();
+
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 0),
+                eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+            ],
+            8,
+        )];
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+
+        assert!(stages[0].images[0].global_shapes_error.is_some());
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert_nine_shape_counts(&stages[0].images[1], Some(0));
+        assert_eq!(last_stage(&stages).status, "failed");
+        assert!(
+            last_stage(&stages)
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("02_MAIN: ")
+        );
+        assert!(
+            !last_stage(&stages)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("03_APM")
+        );
+        assert_eq!(
+            last_stage(&stages).output.as_deref(),
+            Some(
+                "images/*/decompiled/global_shapes.json (completed=1/2, inferred=0, no_evidence=0, conflicting=0, observations=0, ghidra_quarantined=0, thumb_quarantined=0, quarantine_errors=0, decode_failures=0, state_barriers=0)"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_preserves_old_sidecars_when_current_globals_failed() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_stale_globals_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_empty_shape_image(&images_dir, "03_APM");
+        write_shape_manifest(&manifest, &["02_MAIN", "03_APM"]);
+        let old_globals = b"{\"old\":true}";
+        let old_shapes = b"older global_shapes.json";
+        std::fs::write(
+            images_dir.join("02_MAIN/decompiled/globals.json"),
+            old_globals,
+        )
+        .unwrap();
+        std::fs::write(
+            images_dir.join("02_MAIN/decompiled/global_shapes.json"),
+            old_shapes,
+        )
+        .unwrap();
+
+        let mut failed = eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 4);
+        failed.globals_error = Some("globals stage failed".into());
+        let mut called = Vec::new();
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                failed,
+                eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+            ],
+            3,
+        )];
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+            called.push(request.image_label.to_string());
+            global_shapes::run_image(request)
+        });
+
+        assert_eq!(called, vec!["03_APM".to_string()]);
+        assert_eq!(
+            std::fs::read(images_dir.join("02_MAIN/decompiled/globals.json")).unwrap(),
+            old_globals
+        );
+        assert_eq!(
+            std::fs::read(images_dir.join("02_MAIN/decompiled/global_shapes.json")).unwrap(),
+            old_shapes
+        );
+        assert_eq!(
+            stages[0].images[0].global_shapes_error.as_deref(),
+            Some("current globals failed")
+        );
+        assert_nine_shape_counts(&stages[0].images[1], Some(0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_stale_or_missing_thumb_fails_currentness_and_continues() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_thumb_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_empty_shape_image(&images_dir, "04_VSS");
+        write_empty_shape_image(&images_dir, "03_APM");
+        write_shape_manifest(&manifest, &["02_MAIN", "04_VSS", "03_APM"]);
+        std::fs::write(
+            images_dir.join("02_MAIN/decompiled/thumb_functions.json"),
+            tagged_thumb_functions(),
+        )
+        .unwrap();
+        let old_shapes = b"stale-shapes";
+        std::fs::write(
+            images_dir.join("02_MAIN/decompiled/global_shapes.json"),
+            old_shapes,
+        )
+        .unwrap();
+
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 0),
+                eligible_shape_image("04_VSS", 1, 1, 0, Some(0), Some(0), Some(0), 0),
+                eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+            ],
+            9,
+        )];
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+
+        assert!(
+            stages[0].images[0]
+                .global_shapes_error
+                .as_deref()
+                .unwrap()
+                .contains("unexpected thumb_functions.json")
+        );
+        assert_eq!(
+            std::fs::read(images_dir.join("02_MAIN/decompiled/global_shapes.json")).unwrap(),
+            old_shapes
+        );
+        assert!(stages[0].images[1].global_shapes_error.is_some());
+        assert_nine_shape_counts(&stages[0].images[1], None);
+        assert_nine_shape_counts(&stages[0].images[2], Some(0));
+        assert_eq!(last_stage(&stages).status, "failed");
+        assert!(
+            last_stage(&stages)
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("02_MAIN: ")
+        );
+        assert!(
+            last_stage(&stages)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("04_VSS: ")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_empty_recovered_writes_current_empty_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_stage_empty_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_shape_manifest(&manifest, &["02_MAIN"]);
+        let globals_before =
+            std::fs::read(images_dir.join("02_MAIN/decompiled/globals.json")).unwrap();
+
+        let mut stages = vec![StageReport::decompile(
+            vec![eligible_shape_image(
+                "02_MAIN", 1, 1, 0, None, None, None, 0,
+            )],
+            2,
+        )];
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+
+        assert_eq!(last_stage(&stages).status, "ok");
+        assert_nine_shape_counts(&stages[0].images[0], Some(0));
+        let sidecar =
+            std::fs::read_to_string(images_dir.join("02_MAIN/decompiled/global_shapes.json"))
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
+        assert_eq!(value["format"], "pixel-modem-extractor-global-shapes-v1");
+        assert_eq!(value["globals"], serde_json::json!([]));
+        assert_eq!(
+            std::fs::read(images_dir.join("02_MAIN/decompiled/globals.json")).unwrap(),
+            globals_before
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
