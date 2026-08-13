@@ -690,6 +690,13 @@ fn all_core_registers() -> BTreeSet<Register> {
     (0..CORE_REGISTER_COUNT).map(Register).collect()
 }
 
+fn clrm_writes(list: u16) -> BTreeSet<Register> {
+    (0u8..15)
+        .filter(|bit| list & (1 << bit) != 0)
+        .map(Register)
+        .collect()
+}
+
 fn address(base: AddressBase, offset: AddressOffset) -> AddressExpr {
     AddressExpr { base, offset }
 }
@@ -3070,7 +3077,8 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
         | ArmA32Instruction::Clrex_A1
         | ArmA32Instruction::Setend_A1(_)
         | ArmA32Instruction::Setpan_A1(_)
-        | ArmA32Instruction::Cps_A1(_, _, _, _, _) => unsupported(
+        | ArmA32Instruction::Cps_A1(_, _, _, _, _)
+        | ArmA32Instruction::Sb_A1 => unsupported(
             Isa::Arm,
             pc,
             length,
@@ -3383,12 +3391,18 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         ArmT32Instruction::Coproc_Cdp_T1(_, _, _, _, _, _, _) => {
             t32_linear(pc, length, BTreeSet::new(), BTreeSet::new())
         }
-        ArmT32Instruction::PacbtiHint_T1(_) => {
+        ArmT32Instruction::PacbtiHint_T1(0) => {
             t32_linear(pc, length, BTreeSet::new(), BTreeSet::new())
         }
-        ArmT32Instruction::PacbtiData_T1(2, _, rn, rm) => {
-            t32_stop(pc, length, set([gpr(*rn), gpr(*rm)]), BTreeSet::new())
+        ArmT32Instruction::PacbtiHint_T1(_) => {
+            t32_linear(pc, length, set([SP, LR]), set([Register(12)]))
         }
+        ArmT32Instruction::PacbtiData_T1(2, rd, rn, rm) => t32_stop(
+            pc,
+            length,
+            set([gpr(*rd), gpr(*rn), gpr(*rm)]),
+            BTreeSet::new(),
+        ),
         ArmT32Instruction::PacbtiData_T1(_, rd, rn, rm) => {
             t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
         }
@@ -3421,6 +3435,53 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         ArmT32Instruction::Bfx_T3(_, rn) | ArmT32Instruction::Bflx_T5(_, rn) => {
             t32_stop(pc, length, set([gpr(*rn)]), BTreeSet::new())
         }
+        ArmT32Instruction::Csel_T1(_, rd, rn, rm, _) => {
+            t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Clrm_T1(list) => {
+            t32_linear(pc, length, BTreeSet::new(), clrm_writes(*list))
+        }
+        ArmT32Instruction::LongShiftImm_T1(_, lo, hi, _)
+        | ArmT32Instruction::SatShiftLongImm_T1(_, lo, hi, _) => t32_linear(
+            pc,
+            length,
+            set([gpr(*lo), gpr(*hi)]),
+            set([gpr(*lo), gpr(*hi)]),
+        ),
+        ArmT32Instruction::LongShiftReg_T1(_, lo, hi, rm)
+        | ArmT32Instruction::SatShiftLongReg_T1(_, lo, hi, rm, _) => t32_linear(
+            pc,
+            length,
+            set([gpr(*lo), gpr(*hi), gpr(*rm)]),
+            set([gpr(*lo), gpr(*hi)]),
+        ),
+        ArmT32Instruction::SatShiftImm_T1(_, rda, _) => {
+            t32_linear(pc, length, set([gpr(*rda)]), set([gpr(*rda)]))
+        }
+        ArmT32Instruction::SatShiftReg_T1(_, rda, rm) => {
+            t32_linear(pc, length, set([gpr(*rda), gpr(*rm)]), set([gpr(*rda)]))
+        }
+        ArmT32Instruction::Tt_T1(rd, rn, _, _) => {
+            t32_linear(pc, length, set([gpr(*rn)]), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Csdb_T1
+        | ArmT32Instruction::Dbg_T1(_)
+        | ArmT32Instruction::Esb_T1
+        | ArmT32Instruction::Ssbb_T1
+        | ArmT32Instruction::Pssbb_T1
+        | ArmT32Instruction::Sb_T1
+        | ArmT32Instruction::Sg_T1 => t32_linear(pc, length, BTreeSet::new(), BTreeSet::new()),
+        ArmT32Instruction::Bxns_T1(rm) => t32_stop(pc, length, set([gpr(*rm)]), BTreeSet::new()),
+        ArmT32Instruction::Blxns_T1(rm) => insn(
+            Isa::Thumb,
+            pc,
+            length,
+            false,
+            set([gpr(*rm)]),
+            BTreeSet::new(),
+            SemanticEffect::None,
+            ControlFlow::Call,
+        ),
         ArmT32Instruction::Nop_T1
         | ArmT32Instruction::Yield_T1
         | ArmT32Instruction::Wfe_T1
@@ -3467,6 +3528,7 @@ mod tests {
     const R1: Register = Register(1);
     const R2: Register = Register(2);
     const R3: Register = Register(3);
+    const R12: Register = Register(12);
 
     fn decode(isa: Isa, pc: u32, bytes: &[u8]) -> DecodedInstruction {
         let decoder = PureRustDecoder;
@@ -4738,6 +4800,90 @@ mod tests {
                     false,
                     &[R1],
                     &[],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_csel",
+                isa: Isa::Thumb,
+                bytes: &[0x51, 0xea, 0x02, 0x80],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R1, R2],
+                    &[R0],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_clrm",
+                isa: Isa::Thumb,
+                bytes: &[0x9f, 0xe8, 0x07, 0x00],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[],
+                    &[R0, R1, R2],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_asrl",
+                isa: Isa::Thumb,
+                bytes: &[0x50, 0xea, 0x6f, 0x11],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R0, R1],
+                    &[R0, R1],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_tt",
+                isa: Isa::Thumb,
+                bytes: &[0x41, 0xe8, 0x00, 0xf0],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R1],
+                    &[R0],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_bxns",
+                isa: Isa::Thumb,
+                bytes: &[0x1c, 0x47],
+                expected: expected(
+                    Isa::Thumb,
+                    2,
+                    false,
+                    &[R3],
+                    &[],
+                    SemanticEffect::Unsupported,
+                    ControlFlow::Stop,
+                ),
+            },
+            NamedFixture {
+                name: "t32_pac",
+                isa: Isa::Thumb,
+                bytes: &[0xaf, 0xf3, 0x1d, 0x80],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[SP, LR],
+                    &[R12],
                     SemanticEffect::Unsupported,
                     linear(),
                 ),
