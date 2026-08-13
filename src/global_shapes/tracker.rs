@@ -445,11 +445,7 @@ fn eval_address(
             target_address,
             displacement,
             ..
-        } => Fact::Global {
-            target_address,
-            displacement: displacement.checked_add(delta)?,
-            provenance,
-        },
+        } => displace_global(target_address, displacement, delta, provenance)?,
         Fact::Exact { value, .. } => Fact::Exact {
             value: add_u32_i64(value, delta)?,
             provenance,
@@ -473,11 +469,7 @@ fn combine(state: &State, left: Register, right: &Operand, subtract: bool) -> Op
             target_address,
             displacement,
             ..
-        } => Some(Fact::Global {
-            target_address: *target_address,
-            displacement: displacement.checked_add(delta)?,
-            provenance,
-        }),
+        } => displace_global(*target_address, *displacement, delta, provenance),
         Fact::Exact { value, .. } => Some(Fact::Exact {
             value: add_u32_i64(*value, delta)?,
             provenance,
@@ -533,6 +525,21 @@ fn add_u32_i64(value: u32, delta: i64) -> Option<u32> {
     u32::try_from(i64::from(value).checked_add(delta)?).ok()
 }
 
+fn displace_global(
+    target_address: u32,
+    displacement: i64,
+    delta: i64,
+    provenance: Vec<u32>,
+) -> Option<Fact> {
+    let displacement = displacement.checked_add(delta)?;
+    add_u32_i64(target_address, displacement)?;
+    Some(Fact::Global {
+        target_address,
+        displacement,
+        provenance,
+    })
+}
+
 fn numeric(fact: &Fact) -> Option<u32> {
     match *fact {
         Fact::Exact { value, .. } => Some(value),
@@ -574,7 +581,8 @@ fn observation_from(
         return None;
     }
     let offset = u32::try_from(*displacement).ok()?;
-    offset.checked_add(u32::from(width))?;
+    let start = target_address.checked_add(offset)?;
+    start.checked_add(u32::from(width))?;
     Some(CandidateObservation {
         target_address: *target_address,
         isa: insn.isa,
@@ -1048,6 +1056,35 @@ mod tests {
             &[GLOBAL],
         );
         assert!(report.candidates.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn anchor_wrap_overflow_kills_and_does_not_observe() {
+        let wrap = track_linear(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, 0xffff_0000),
+                add_imm(0x1004, R0, R0, 0x2_0000),
+                sub_imm(0x1008, R0, R0, 0x2_0000),
+                load(0x100c, R1, R0, 0, 4),
+            ],
+            &[0xffff_0000],
+        );
+        assert!(
+            wrap.candidates.is_empty(),
+            "u32 wrap must kill the Global rather than keep offset 0x20000: {wrap:?}"
+        );
+
+        let high_base = track_linear(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, 0xffff_fffc),
+                load(0x1004, R1, R0, 4, 4),
+            ],
+            &[0xffff_fffc],
+        );
+        assert!(
+            high_base.candidates.is_empty(),
+            "high-base wrap must not observe at offset 4: {high_base:?}"
+        );
     }
 
     #[test]
