@@ -2076,4 +2076,101 @@ mod tests {
             "global_shapes.json must not appear or change"
         );
     }
+
+    #[test]
+    #[ignore = "measurement: PME_GLOBAL_SHAPES_MEASURE=1 PME_GOLDEN_DIR=<tree>"]
+    fn interprocedural_yield_on_retained_tree() {
+        if std::env::var("PME_GLOBAL_SHAPES_MEASURE").ok().as_deref() != Some("1") {
+            eprintln!("skip: set PME_GLOBAL_SHAPES_MEASURE=1");
+            return;
+        }
+        let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+            eprintln!("skip: set PME_GOLDEN_DIR");
+            return;
+        };
+        if !dir.exists() {
+            eprintln!("skip: PME_GOLDEN_DIR not found: {}", dir.display());
+            return;
+        }
+        let report: Value = serde_json::from_slice(
+            &fs::read(dir.join("report.json")).expect("report.json readable"),
+        )
+        .expect("report.json valid JSON");
+        let images = report["stages"]
+            .as_array()
+            .and_then(|stages| {
+                stages
+                    .iter()
+                    .find(|stage| stage["stage"] == "decompile")
+                    .and_then(|stage| stage["images"].as_array())
+            })
+            .expect("decompile images");
+        let Some(image) = images.iter().find(|image| image["image"] == LABEL) else {
+            eprintln!("skip: {LABEL} not present in report.json decompile images");
+            return;
+        };
+        let Some(bound) = replay_eligible(image) else {
+            eprintln!("skip: {LABEL} not replay-eligible");
+            return;
+        };
+        let image_dir = dir.join("images").join(&bound.label);
+        if !image_dir.join(format!("{}.bin", bound.label)).is_file() {
+            eprintln!("skip: {LABEL} missing raw image");
+            return;
+        }
+        let manifest = dir.join("manifest.json");
+        let request = bound.request(&image_dir, &manifest);
+
+        let before = hash_tree_except_shapes(&dir);
+        let before_sidecars = shape_sidecar_states(&dir);
+
+        let started = std::time::Instant::now();
+        let (first, first_report) = analyze_to_bytes_without_commit(&request)
+            .unwrap_or_else(|e| panic!("{LABEL} first analyze: {e}"));
+        let first_elapsed = started.elapsed();
+        let (second, second_report) = analyze_to_bytes_without_commit(&request)
+            .unwrap_or_else(|e| panic!("{LABEL} second analyze: {e}"));
+
+        assert_eq!(first, second, "{LABEL} artifact bytes drifted between runs");
+        assert_eq!(
+            sha256_bytes(&first),
+            sha256_bytes(&second),
+            "{LABEL} artifact hash drifted between runs"
+        );
+        assert_eq!(
+            first_report, second_report,
+            "{LABEL} report drifted between runs"
+        );
+
+        // Non-mutation: analyze_to_bytes_without_commit writes nothing, so the
+        // retained tree (including any global_shapes.json sidecars) must be
+        // byte-identical before and after both analyze passes.
+        assert_eq!(
+            hash_tree_except_shapes(&dir),
+            before,
+            "retained tree must not be mutated"
+        );
+        assert_eq!(
+            shape_sidecar_states(&dir),
+            before_sidecars,
+            "global_shapes.json must not appear or change"
+        );
+
+        let artifact: Value = serde_json::from_slice(&first).expect("artifact JSON");
+        let analysis = &artifact["analysis"];
+        println!(
+            "global_shapes interprocedural yield {LABEL}: wall={:?} sha256={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={}",
+            first_elapsed,
+            sha256_bytes(&first),
+            first_report.inferred,
+            first_report.no_evidence,
+            first_report.conflicting,
+            analysis["direct_calls_resolved"],
+            analysis["call_facts_unresolved"],
+            analysis["seeded_callees"],
+            analysis["seed_vectors"],
+            analysis["interprocedural_observations"],
+            analysis["interprocedural_dropped"],
+        );
+    }
 }
