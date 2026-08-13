@@ -746,18 +746,28 @@ module; when a file outgrows that, split it.
   seeding — also a v1 non-goal). Meaningful yield on this firmware needs one
   or both of those, both larger efforts than depth-1 argument propagation;
   the call-fact primitive and the six counters above are the foundation for
-  them, not a finished win by themselves. Corollary for whoever picks this
-  up: because the barrier is store-not-dereference (not call depth), **deeper
-  (depth-K) argument propagation would not help** — the lever is a targeted
-  pointer/alias analysis that follows `&global` through the store into a table
-  and the later load-and-dereference, feeding the *same* additive-attribution
-  + `via` + seeded-retrack machinery this pass established. Do not cite this pass as recovering
-  shapes on production `02_MAIN` — cite it as correct, additive-only, and
-  honestly measured at zero. Full design:
-  `2026-08-13-interprocedural-global-shapes-design.md`; measurement and
-  root-cause diagnosis: `2026-08-13-no-evidence-dominance-findings.md` (both
-  process artifacts under `~/.superpowers/pixel-modem-extractor/`, not part
-  of this repo).
+  them, not a finished win by themselves. Corollary for whoever picks this up:
+  because the barrier is store-not-dereference (not call depth), **deeper
+  (depth-K) argument propagation would not help** — and neither would the
+  targeted pointer/alias analysis this note once proposed as the successor
+  lever. A 2026-08-13 ceiling spike (throwaway instrumentation of the real
+  decoder/tracker over production r2, funnel over the `&global` → store → slot
+  → load → dereference chain) measured that lever at **≤ 1 recoverable global
+  on `02_MAIN`**: of 787 stuck globals only 80 store `&global` as a value at
+  all, 27 reach a static (constant-address) slot (53 use dynamic `[table,
+  rIndex]` slots), and just 1 of the 26 static slots is ever read back. An
+  unsound "seed every callee block" upper bound leaves that funnel unchanged,
+  so it is a true ceiling, not a seeding artifact; the other deferred lever,
+  callee-side cross-block, is ≤ 3. **Treat interprocedural shape recovery as
+  closed at ~0 for this firmware and do not build it** — the only lever with
+  measured yield is the sound *intra*-procedural cross-block dataflow pass
+  (~+5%, ~41 globals). Do not cite this pass as recovering shapes on production
+  `02_MAIN` — cite it as correct, additive-only, and honestly measured at zero.
+  Full design: `2026-08-13-interprocedural-global-shapes-design.md`;
+  interprocedural root-cause: `2026-08-13-no-evidence-dominance-findings.md`;
+  pointer-tracking ceiling: `2026-08-13-pointer-tracking-ceiling-findings.md`
+  (all process artifacts under `~/.superpowers/pixel-modem-extractor/`, not
+  part of this repo).
 - **Phase 3.2 environment traps.** Currentness comes from the current-run
   markers, not leftover files. A Ghidra 12 output root must stay
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
