@@ -1955,7 +1955,7 @@ mod tests {
                     false,
                     [],
                     SemanticEffect::None,
-                    ControlFlow::Call,
+                    ControlFlow::Call { target: None },
                 ),
                 load(0x1008, R1, R0, 0, 4),
             ],
