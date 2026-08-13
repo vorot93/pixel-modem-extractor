@@ -3435,6 +3435,17 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         ArmT32Instruction::Bfx_T3(_, rn) | ArmT32Instruction::Bflx_T5(_, rn) => {
             t32_stop(pc, length, set([gpr(*rn)]), BTreeSet::new())
         }
+        // Plain DLS/WLS/LE need only LOB, not MVE. LR is the implicit loop
+        // register. DLS copies Rn→LR and continues; WLS does the same then
+        // either falls into the body or skips it (Linear keeps the body and
+        // other GPR facts; Call would wipe the fallthrough like BL). LE
+        // decrements LR and either loops back or exits — Linear so the exit
+        // path stays reachable. Tail-predicated DLSTP/WLSTP/LETP and LCTP
+        // stay on `_` as MVE.
+        ArmT32Instruction::LobStart(_, None, rn, _) => {
+            t32_linear(pc, length, set([gpr(*rn)]), set([LR]))
+        }
+        ArmT32Instruction::LobEnd(false, _) => t32_linear(pc, length, set([LR]), set([LR])),
         ArmT32Instruction::Csel_T1(_, rd, rn, rm, _) => {
             t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
         }
@@ -4884,6 +4895,51 @@ mod tests {
                     false,
                     &[SP, LR],
                     &[R12],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_dls",
+                isa: Isa::Thumb,
+                // crate: LobStart(false, None, R0, 0) — `dls lr, r0`
+                bytes: &[0x40, 0xf0, 0x01, 0xe0],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R0],
+                    &[LR],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_wls",
+                isa: Isa::Thumb,
+                // crate: LobStart(true, None, R0, 12) — `wls lr, r0, .+16`
+                bytes: &[0x40, 0xf0, 0x07, 0xc0],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[R0],
+                    &[LR],
+                    SemanticEffect::Unsupported,
+                    linear(),
+                ),
+            },
+            NamedFixture {
+                name: "t32_le",
+                isa: Isa::Thumb,
+                // crate: LobEnd(false, -12) — `le lr, .-8`
+                bytes: &[0x0f, 0xf0, 0x07, 0xc0],
+                expected: expected(
+                    Isa::Thumb,
+                    4,
+                    false,
+                    &[LR],
+                    &[LR],
                     SemanticEffect::Unsupported,
                     linear(),
                 ),
