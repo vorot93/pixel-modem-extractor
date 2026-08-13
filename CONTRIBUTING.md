@@ -746,7 +746,12 @@ module; when a file outgrows that, split it.
   seeding — also a v1 non-goal). Meaningful yield on this firmware needs one
   or both of those, both larger efforts than depth-1 argument propagation;
   the call-fact primitive and the six counters above are the foundation for
-  them, not a finished win by themselves. Do not cite this pass as recovering
+  them, not a finished win by themselves. Corollary for whoever picks this
+  up: because the barrier is store-not-dereference (not call depth), **deeper
+  (depth-K) argument propagation would not help** — the lever is a targeted
+  pointer/alias analysis that follows `&global` through the store into a table
+  and the later load-and-dereference, feeding the *same* additive-attribution
+  + `via` + seeded-retrack machinery this pass established. Do not cite this pass as recovering
   shapes on production `02_MAIN` — cite it as correct, additive-only, and
   honestly measured at zero. Full design:
   `2026-08-13-interprocedural-global-shapes-design.md`; measurement and
