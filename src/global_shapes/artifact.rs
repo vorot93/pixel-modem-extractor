@@ -1648,6 +1648,7 @@ mod tests {
             offset,
             functions: BTreeSet::new(),
             provenance_path: Vec::new(),
+            via: Vec::new(),
         }
     }
 

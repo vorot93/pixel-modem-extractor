@@ -16,7 +16,7 @@ use artifact::{
 };
 use decoder::{InstructionDecoder, decode_function, reachable_blocks};
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use tracker::CandidateObservation;
@@ -161,6 +161,8 @@ fn analyze_loaded_inputs(
             {
                 bump(&mut decode_failures, "decode_failures")?;
             }
+            // Pass 1 tracks every function cold, with no interprocedural
+            // seed; a later task adds the seeded pass 2 replay.
             let tracked = tracker::track_function(
                 function,
                 &decoded,
@@ -168,6 +170,7 @@ fn analyze_loaded_inputs(
                 &inputs.image,
                 inputs.load_address,
                 &recovered,
+                &BTreeMap::new(),
             )?;
             state_barriers = add_count(state_barriers, tracked.state_barriers, "state_barriers")?;
             candidates.extend(tracked.candidates);

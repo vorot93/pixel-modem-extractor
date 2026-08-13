@@ -1,8 +1,8 @@
 // Conservative per-block fact tracking.
 
 use super::decoder::{
-    AccessKind, AddressBase, AddressExpr, AddressOffset, Block, DecodedFunction,
-    DecodedInstruction, Operand, Register, SemanticEffect, Shift, ValueExpr,
+    AccessKind, AddressBase, AddressExpr, AddressOffset, Block, CallTarget, ControlFlow,
+    DecodedFunction, DecodedInstruction, Operand, Register, SemanticEffect, Shift, ValueExpr,
 };
 use super::{FunctionContext, FunctionExecution};
 use crate::error::{Error, Result};
@@ -23,12 +23,45 @@ pub(crate) struct CandidateObservation {
     pub offset: u32,
     pub functions: BTreeSet<FunctionContext>,
     pub provenance_path: Vec<u32>,
+    /// Depth-1 call hops this evidence crossed. Always empty here: the
+    /// tracker only ever sees one function at a time, so it cannot know
+    /// whether a candidate came from a seeded entry block. The coordinator
+    /// (a later stage) stamps this once it replays a `CallFact`'s seed into
+    /// a callee and keeps the resulting evidence.
+    pub via: Vec<CallHop>,
 }
 
-#[derive(Debug, Default)]
+/// One depth-1 `bl` hop from a caller's entry block into a tracked callee.
+/// Field names mirror `artifact::CallHopWire` (its wire counterpart, all
+/// `String`); keep them identical so the later wire conversion stays a
+/// straight field-by-field mapping.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallHop {
+    pub caller_entry: u32,
+    pub caller_name: String,
+    pub call_pc: u32,
+    pub arg_register: u8,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct TrackerReport {
     pub candidates: Vec<CandidateObservation>,
+    pub call_facts: Vec<CallFact>,
     pub state_barriers: usize,
+}
+
+/// A depth-1 call-site fact: at `call_pc` inside `caller_entry`, one or more
+/// AAPCS argument registers (r0-r3) provably held a recovered global's base
+/// address (displacement zero — the pointer itself, not `&global + k`). A
+/// later stage seeds the callee's entry block from `seed` and re-tracks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallFact {
+    pub caller_entry: u32,
+    pub caller_contexts: BTreeSet<FunctionContext>,
+    pub call_pc: u32,
+    pub callee_target: u32,
+    pub callee_isa: Isa,
+    pub seed: BTreeMap<Register, u32>,
 }
 
 pub(crate) fn track_function(
@@ -38,16 +71,41 @@ pub(crate) fn track_function(
     image: &[u8],
     load_address: u32,
     recovered_addresses: &BTreeSet<u32>,
+    seed: &BTreeMap<Register, u32>,
 ) -> Result<TrackerReport> {
     let instructions = instruction_map(decoded)?;
     let mut candidates = Vec::new();
+    let mut call_facts = Vec::new();
     let mut state_barriers = 0;
     for block in blocks {
         if block.start != function.identity.entry {
             state_barriers += 1;
         }
         let mut state = State::new();
+        if block.start == function.identity.entry {
+            for (register, address) in seed {
+                state.insert(
+                    *register,
+                    Fact::Global {
+                        target_address: *address,
+                        displacement: 0,
+                        provenance: Vec::new(),
+                    },
+                );
+            }
+        }
         for insn in block_instructions(&instructions, *block)? {
+            // Harvested before `apply_instruction` runs the call's effect.
+            // `bl` has empty `writes` and `SemanticEffect::None`, so the
+            // argument registers are unchanged either way; harvesting first
+            // just keeps the "state at the call site" framing exact.
+            if let ControlFlow::Call {
+                target: Some(target),
+            } = insn.flow
+                && let Some(call_fact) = harvest_call_fact(&state, function, insn.pc, target)
+            {
+                call_facts.push(call_fact);
+            }
             let step = apply_instruction(
                 &mut state,
                 insn,
@@ -65,7 +123,41 @@ pub(crate) fn track_function(
     sort_candidates(&mut candidates);
     Ok(TrackerReport {
         candidates,
+        call_facts,
         state_barriers,
+    })
+}
+
+// Only the AAPCS integer argument registers (r0-r3) are in scope for depth-1
+// seeding; only a bare recovered base (displacement 0) counts as passing the
+// global itself rather than an interior pointer into it.
+fn harvest_call_fact(
+    state: &State,
+    function: &FunctionExecution,
+    call_pc: u32,
+    target: CallTarget,
+) -> Option<CallFact> {
+    let mut seed = BTreeMap::new();
+    for number in 0u8..=3 {
+        if let Some(Fact::Global {
+            target_address,
+            displacement: 0,
+            ..
+        }) = state.get(Register(number))
+        {
+            seed.insert(Register(number), *target_address);
+        }
+    }
+    if seed.is_empty() {
+        return None;
+    }
+    Some(CallFact {
+        caller_entry: function.identity.entry,
+        caller_contexts: function.contexts.clone(),
+        call_pc,
+        callee_target: target.entry,
+        callee_isa: target.isa,
+        seed,
     })
 }
 
@@ -591,6 +683,7 @@ fn observation_from(
         offset,
         functions: functions.clone(),
         provenance_path: provenance.clone(),
+        via: Vec::new(),
     })
 }
 
@@ -637,7 +730,8 @@ fn invalid(message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::super::decoder::{
-        ControlFlow, DecodeFailure, DecodedRange, MemoryEffect, MemoryTransfer, reachable_blocks,
+        CallTarget, ControlFlow, DecodeFailure, DecodedRange, MemoryEffect, MemoryTransfer,
+        reachable_blocks,
     };
     use super::*;
     use crate::execution_ranges::{DecodeRange, ExecutionIdentity};
@@ -887,6 +981,7 @@ mod tests {
             image,
             load_address,
             &recovered.iter().copied().collect(),
+            &BTreeMap::new(),
         )
         .expect("linear track")
     }
@@ -904,6 +999,7 @@ mod tests {
             &[],
             0,
             &recovered.iter().copied().collect(),
+            &BTreeMap::new(),
         )
         .expect("reachable track")
     }
@@ -925,6 +1021,7 @@ mod tests {
             offset,
             functions: contexts(),
             provenance_path: provenance.to_vec(),
+            via: Vec::new(),
         }
     }
 
@@ -2376,9 +2473,105 @@ mod tests {
             &[],
             0,
             &BTreeSet::from([GLOBAL, OTHER]),
+            &BTreeMap::new(),
         )
         .expect("unioned contexts");
         assert_eq!(report.state_barriers, 1);
         assert!(report.candidates.is_empty());
+    }
+
+    #[test]
+    fn harvest_emits_call_fact_when_arg_reg_holds_global() {
+        // mov r0, GLOBAL ; bl <callee 0x1200 (arm)>
+        let report = track_linear(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                insn(
+                    Isa::Arm,
+                    0x1004,
+                    4,
+                    false,
+                    [],
+                    SemanticEffect::None,
+                    ControlFlow::Call {
+                        target: Some(CallTarget {
+                            entry: 0x1200,
+                            isa: Isa::Arm,
+                        }),
+                    },
+                ),
+            ],
+            &[GLOBAL],
+        );
+        assert_eq!(report.call_facts.len(), 1);
+        let cf = &report.call_facts[0];
+        assert_eq!(cf.callee_target, 0x1200);
+        assert_eq!(cf.callee_isa, Isa::Arm);
+        assert_eq!(cf.call_pc, 0x1004);
+        assert_eq!(cf.seed.get(&R0), Some(&GLOBAL));
+    }
+
+    #[test]
+    fn harvest_ignores_interior_pointer_and_indirect_call() {
+        // &GLOBAL+8 in r0 must not seed; a target:None call must not harvest.
+        let interior = track_linear(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                add_imm(0x1004, R0, R0, 8),
+                insn(
+                    Isa::Arm,
+                    0x1008,
+                    4,
+                    false,
+                    [],
+                    SemanticEffect::None,
+                    ControlFlow::Call {
+                        target: Some(CallTarget {
+                            entry: 0x1200,
+                            isa: Isa::Arm,
+                        }),
+                    },
+                ),
+            ],
+            &[GLOBAL],
+        );
+        assert!(interior.call_facts.is_empty(), "{interior:?}");
+        let indirect = track_linear(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                insn(
+                    Isa::Arm,
+                    0x1004,
+                    4,
+                    false,
+                    [],
+                    SemanticEffect::None,
+                    ControlFlow::Call { target: None },
+                ),
+            ],
+            &[GLOBAL],
+        );
+        assert!(indirect.call_facts.is_empty());
+    }
+
+    #[test]
+    fn seeded_entry_block_observes_dereference_of_seeded_global() {
+        // callee entry: str [r1, #4]  — with r1 seeded = &GLOBAL, expect write obs at offset 4.
+        let (function, decoded, blocks) = linear_decoded(vec![store(0x1200, R1, 4, 4)]);
+        let seed = BTreeMap::from([(R1, GLOBAL)]);
+        let report = track_function(
+            &function,
+            &decoded,
+            &blocks,
+            &[],
+            0,
+            &BTreeSet::from([GLOBAL]),
+            &seed,
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].target_address, GLOBAL);
+        assert_eq!(report.candidates[0].offset, 4);
+        assert_eq!(report.candidates[0].kind, AccessKind::Write);
     }
 }
