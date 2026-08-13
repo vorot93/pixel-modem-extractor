@@ -1400,7 +1400,6 @@ fn add_global_shapes_totals(
     totals.quarantine_errors += report.quarantine_errors;
     totals.decode_failures += report.decode_failures;
     totals.state_barriers += report.state_barriers;
-    totals.interprocedural_dropped += report.interprocedural_dropped;
 }
 
 fn run_global_shapes_stage_with(

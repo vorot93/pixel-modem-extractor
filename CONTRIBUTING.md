@@ -661,10 +661,10 @@ module; when a file outgrows that, split it.
   (2) **Direct `bl` + AAPCS r0–r3 only.** `ControlFlow::Call { target:
   Option<CallTarget> }` resolves to `Some` only for direct `bl` (A32 `Bl_A1` /
   T32 `Bl_T1`, same-ISA entry); `blx`-immediate (cross-ISA resolution
-  deferred) and `blx`/`blxns`/`bl`-register (indirect) always carry `target:
-  None` and harvest nothing. A call-fact's seed draws only from r0–r3, and
-  only a register holding a bare recovered-global address (displacement 0)
-  counts — an interior `&global + k` does not seed.
+  deferred) and `blx`-register / `blxns`-register (indirect) always carry
+  `target: None` and harvest nothing. A call-fact's seed draws only from
+  r0–r3, and only a register holding a bare recovered-global address
+  (displacement 0) counts — an interior `&global + k` does not seed.
   (3) **Strict entry+ISA callee resolution.** `resolve_callee` requires the
   call's target to equal an accepted identity's entry exactly, with that
   identity's first decode-range ISA matching the call's resolved ISA; zero or

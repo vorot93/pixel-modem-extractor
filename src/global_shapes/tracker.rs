@@ -43,7 +43,7 @@ pub(crate) struct CallHop {
     pub arg_register: u8,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub(crate) struct TrackerReport {
     pub candidates: Vec<CandidateObservation>,
     pub call_facts: Vec<CallFact>,
