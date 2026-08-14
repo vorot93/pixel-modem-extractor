@@ -168,14 +168,14 @@ mod tests {
         for id in [
             "RF_SM_Set_ET_Voltage",
             "Asn_Foo_r4",
-            "TMU_G",
+            "TmuGlobal",
             "AliasedName",
             "NS_REQ",
         ] {
             count.insert(id.to_string(), 1);
         }
         count.insert("Shared_Api".to_string(), 2); // referenced by two functions
-        let globals: HashSet<String> = ["TMU_G".to_string()].into_iter().collect();
+        let globals: HashSet<String> = ["TmuGlobal".to_string()].into_iter().collect();
         let fn_names: HashSet<String> = ["AliasedName".to_string()].into_iter().collect();
         (count, globals, fn_names)
     }
@@ -198,8 +198,12 @@ mod tests {
         let (count, g, f) = ctx();
         assert_eq!(string_ref_guess(None, &count, &g, &f), None); // no candidate
         assert_eq!(string_ref_guess(Some("NS_REQ"), &count, &g, &f), None); // all-caps const
-        assert_eq!(string_ref_guess(Some("TMU_G"), &count, &g, &f), None); // recovered global
+        assert_eq!(string_ref_guess(Some("TmuGlobal"), &count, &g, &f), None); // recovered global — rejected only via globals.contains
         assert_eq!(string_ref_guess(Some("AliasedName"), &count, &g, &f), None); // another fn's name
         assert_eq!(string_ref_guess(Some("Shared_Api"), &count, &g, &f), None); // not 1:1 image-wide
+        assert_eq!(
+            string_ref_guess(Some("Never_Referenced"), &count, &g, &f),
+            None
+        ); // never referenced -> count 0 -> != 1
     }
 }
