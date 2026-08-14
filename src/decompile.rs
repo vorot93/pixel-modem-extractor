@@ -2434,11 +2434,84 @@ fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
     }
 }
 
+/// Cap on radare2's own virtual address space (`RLIMIT_AS`) while it analyzes one
+/// Thumb region. Grounded in measurement: healthy `aaa` on the densest real
+/// regions peaks ~1.5 GiB RSS (mustang `02_MAIN`'s 19 MiB region) and completes,
+/// while a pathological region — cheetah `01_MAIN`'s `0x42310000`, only 4 MiB —
+/// runs away to 90+ GiB and OOM-kills the host. 16 GiB is ~10x the measured
+/// healthy peak (ample headroom for larger images) yet far below the RAM of any
+/// machine that can run this pipeline (a full decompose peaks ~56 GiB), so a
+/// runaway region hits the limit and fails closed (r2 gets `ENOMEM` and exits)
+/// rather than exhausting host memory. Same "fail-closed rather than OOM the host"
+/// intent as [`R2_STDOUT_CAP_BYTES`], but for r2's *own* memory rather than the
+/// stdout we read back from it.
+pub(super) const R2_ADDRESS_SPACE_CAP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Apply [`R2_ADDRESS_SPACE_CAP_BYTES`] to `cmd` as a soft+hard `RLIMIT_AS`, so a
+/// runaway radare2 is denied further allocations by the kernel and exits instead
+/// of OOM-killing the host. Unix-only; a no-op elsewhere (Windows has no portable
+/// per-child address-space limit — the same platform gap documented on
+/// [`spawn_in_own_process_group`]).
+#[cfg(unix)]
+fn limit_r2_address_space(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child between `fork(2)` and
+    // `execvp(2)`. It calls only `setrlimit` (async-signal-safe) and reads a
+    // `const`; it touches no shared state and allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: R2_ADDRESS_SPACE_CAP_BYTES as libc::rlim_t,
+                rlim_max: R2_ADDRESS_SPACE_CAP_BYTES as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn limit_r2_address_space(_cmd: &mut std::process::Command) {}
+
+/// A Thumb region whose radare2 analysis failed and was skipped so the rest of
+/// the image's regions still produce output. `reason` is the underlying error
+/// text (r2 spawn/kill/non-zero exit — including the address-space cap firing on
+/// a pathological blob — a stdout-cap exceed, or malformed output).
+struct SkippedRegion {
+    addr: u32,
+    reason: String,
+}
+
+/// Fold per-region radare2 outcomes into the surviving functions plus the list of
+/// skipped regions. A region's `Err` is recorded, never propagated, so one
+/// runaway or malformed region degrades Thumb coverage locally instead of
+/// aborting the whole stage and zeroing `thumb_functions.json`.
+fn collect_thumb_regions(
+    region_results: Vec<(u32, Result<Vec<serde_json::Value>>)>,
+) -> (Vec<serde_json::Value>, Vec<SkippedRegion>) {
+    let mut all = Vec::new();
+    let mut skipped = Vec::new();
+    for (addr, result) in region_results {
+        match result {
+            Ok(functions) => all.extend(functions),
+            Err(e) => skipped.push(SkippedRegion {
+                addr,
+                reason: e.to_string(),
+            }),
+        }
+    }
+    (all, skipped)
+}
+
 /// Analyze an image's dense Thumb-2 regions with radare2. Each region is carved out,
 /// analyzed as ARM/Thumb (`-a arm -b 16`) based at its load address, and its
 /// `aflj`/`pdfj` function output merged into `out_dir/thumb_functions.json` (the carved
 /// blobs are kept under `out_dir/thumb/` for follow-up). Returns the count of substantial
-/// (>= 32-byte) functions recovered.
+/// (>= 32-byte) functions recovered. Per-region failures are tolerated (see
+/// [`collect_thumb_regions`]): one runaway region does not zero the others.
 fn run_radare2_thumb(
     r2: &Path,
     image: &[u8],
@@ -2448,84 +2521,26 @@ fn run_radare2_thumb(
 ) -> Result<usize> {
     let thumb_dir = out_dir.join("thumb");
     std::fs::create_dir_all(&thumb_dir)?;
-    let mut all: Vec<serde_json::Value> = Vec::new();
-    for &(addr, len) in regions {
-        let off = addr.wrapping_sub(load_addr) as usize;
-        if off >= image.len() {
-            continue;
-        }
-        let end = off.saturating_add(len as usize).min(image.len());
-        let bin = thumb_dir.join(format!("{addr:08x}.bin"));
-        std::fs::write(&bin, &image[off..end])?;
-        // Stream r2 stdout to a per-region temp file. The file is kept after
-        // parse for debugging (disk is cheap; --prune drops it with the rest
-        // of `thumb/`). Cap is `R2_STDOUT_CAP_BYTES` (4 GiB) — see the const's
-        // doc comment for the production grounding.
-        let mut child = std::process::Command::new(r2)
-            .args(["-a", "arm", "-b", "16", "-m"])
-            .arg(format!("0x{addr:x}"))
-            .args(["-q", "-c", "aaa;aflj;pdfj @@f"])
-            .arg(&bin)
-            .stderr(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let stdout_path = thumb_dir.join(format!("{addr:08x}.stdout"));
-        let mut file = std::fs::File::create(&stdout_path)?;
-
-        let cap_err = stream_to_cap(&mut stdout, &mut file, R2_STDOUT_CAP_BYTES);
-        drop(file); // close + flush before any read-back or removal
-        drop(stdout); // drop the pipe handle explicitly
-
-        if let Err(e) = cap_err {
-            // Cap exceeded OR genuine I/O error. Either way: kill, reap,
-            // remove the partial file (no value in keeping truncated output),
-            // return Err. The `ErrorKind::Other` discrimination is the
-            // cap-exceed signal from `stream_to_cap`; a genuine I/O error
-            // could in rare cases also surface as `Other`, but the cleanup
-            // path is identical, so a misclassification only changes the
-            // error message — acceptable per the task brief.
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&stdout_path);
-            if e.kind() == std::io::ErrorKind::Other {
-                return Err(Error::ToolNotFound(format!(
-                    "radare2 emitted > {R2_STDOUT_CAP_BYTES} bytes for region {addr:08x}; capped to prevent OOM"
-                )));
-            }
-            // Genuine I/O error during streaming — propagate as Error::Io.
-            return Err(e.into());
-        }
-
-        let status = child.wait()?;
-        check_radare2_thumb_status(status.success(), status.code(), addr)?;
-
-        // Read the streamed file back for parsing. Memory peak here is ~file
-        // size (the parse path holds the bytes + builds JSON Value trees).
-        // Acceptable on research machines; a future streaming-JSON-parser
-        // follow-up would reduce this — see CONTRIBUTING's radare2 invariant.
-        let stdout_bytes = std::fs::read(&stdout_path)?;
-        let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
-        let raw_record_count = parsed.records.len();
-        let output_start = all.len();
-        for (f, pdfj) in parsed.records {
-            all.push(normalize_radare2_function_checked(
-                &f,
-                pdfj.as_ref(),
-                image,
-                load_addr,
+    // Analyze each region independently and tolerate per-region failure: a region
+    // whose r2 run fails — most consequentially the address-space cap firing on a
+    // pathological blob — is recorded and skipped so the remaining regions still
+    // populate thumb_functions.json instead of the whole stage aborting.
+    let region_results: Vec<(u32, Result<Vec<serde_json::Value>>)> = regions
+        .iter()
+        .map(|&(addr, len)| {
+            (
                 addr,
-            )?);
-        }
-        let projections = all[output_start..]
-            .iter()
-            .map(parse_projection)
-            .collect::<Result<Vec<_>>>()?;
-        if !inventory_count_conserved(raw_record_count, &projections) {
-            return Err(Error::Serialize(format!(
-                "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
-            )));
-        }
+                run_radare2_thumb_region(r2, image, load_addr, addr, len, &thumb_dir),
+            )
+        })
+        .collect();
+    let (all, skipped) = collect_thumb_regions(region_results);
+    for region in &skipped {
+        tracing::warn!(
+            "radare2: Thumb region 0x{:x} skipped (analysis failed, fail-closed): {}",
+            region.addr,
+            region.reason
+        );
     }
     let substantial = all
         .iter()
@@ -2546,8 +2561,9 @@ fn run_radare2_thumb(
         })
         .count();
     tracing::info!(
-        "radare2: Thumb execution projections accepted={accepted} quarantined={}",
-        all.len() - accepted
+        "radare2: Thumb execution projections accepted={accepted} quarantined={} regions_skipped={}",
+        all.len() - accepted,
+        skipped.len()
     );
     let wrapped = serde_json::json!({
         "format": "pixel-modem-extractor-thumb-functions-v2",
@@ -2558,6 +2574,100 @@ fn run_radare2_thumb(
         serde_json::to_string_pretty(&wrapped).map_err(|e| Error::Serialize(e.to_string()))?,
     )?;
     Ok(substantial)
+}
+
+/// Analyze one dense Thumb-2 region with radare2 and return its normalized
+/// functions. Carves the region to `thumb_dir/<addr>.bin`, runs
+/// `aaa;aflj;pdfj @@f` under [`limit_r2_address_space`], streams stdout to a
+/// capped `<addr>.stdout`, and normalizes each paired function. Returns `Err` on
+/// any per-region failure — r2 spawn/kill/non-zero exit (the address-space cap
+/// firing lands here), a stdout-cap exceed, malformed output, or a non-conserving
+/// projection; [`run_radare2_thumb`] records those as skips rather than aborting.
+/// An empty region (offset past the image end) yields `Ok` with no functions.
+fn run_radare2_thumb_region(
+    r2: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    len: u32,
+    thumb_dir: &Path,
+) -> Result<Vec<serde_json::Value>> {
+    let off = addr.wrapping_sub(load_addr) as usize;
+    if off >= image.len() {
+        return Ok(Vec::new());
+    }
+    let end = off.saturating_add(len as usize).min(image.len());
+    let bin = thumb_dir.join(format!("{addr:08x}.bin"));
+    std::fs::write(&bin, &image[off..end])?;
+    // Stream r2 stdout to a per-region temp file. The file is kept after parse
+    // for debugging (disk is cheap; --prune drops it with the rest of `thumb/`).
+    // Cap is `R2_STDOUT_CAP_BYTES` (4 GiB) — see the const's doc comment.
+    let mut cmd = std::process::Command::new(r2);
+    cmd.args(["-a", "arm", "-b", "16", "-m"])
+        .arg(format!("0x{addr:x}"))
+        .args(["-q", "-c", "aaa;aflj;pdfj @@f"])
+        .arg(&bin)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped());
+    limit_r2_address_space(&mut cmd);
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stdout_path = thumb_dir.join(format!("{addr:08x}.stdout"));
+    let mut file = std::fs::File::create(&stdout_path)?;
+
+    let cap_err = stream_to_cap(&mut stdout, &mut file, R2_STDOUT_CAP_BYTES);
+    drop(file); // close + flush before any read-back or removal
+    drop(stdout); // drop the pipe handle explicitly
+
+    if let Err(e) = cap_err {
+        // Cap exceeded OR genuine I/O error. Either way: kill, reap, remove the
+        // partial file (no value in keeping truncated output), return Err. The
+        // `ErrorKind::Other` discrimination is the cap-exceed signal from
+        // `stream_to_cap`; a genuine I/O error could in rare cases also surface as
+        // `Other`, but the cleanup path is identical, so a misclassification only
+        // changes the error message.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&stdout_path);
+        if e.kind() == std::io::ErrorKind::Other {
+            return Err(Error::ToolNotFound(format!(
+                "radare2 emitted > {R2_STDOUT_CAP_BYTES} bytes for region {addr:08x}; capped to prevent OOM"
+            )));
+        }
+        // Genuine I/O error during streaming — propagate as Error::Io.
+        return Err(e.into());
+    }
+
+    let status = child.wait()?;
+    check_radare2_thumb_status(status.success(), status.code(), addr)?;
+
+    // Read the streamed file back for parsing. Memory peak here is ~file size
+    // (the parse path holds the bytes + builds JSON Value trees). Acceptable on
+    // research machines; a future streaming-JSON-parser follow-up would reduce
+    // this — see CONTRIBUTING's radare2 invariant.
+    let stdout_bytes = std::fs::read(&stdout_path)?;
+    let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
+    let raw_record_count = parsed.records.len();
+    let mut region_fns: Vec<serde_json::Value> = Vec::with_capacity(raw_record_count);
+    for (f, pdfj) in parsed.records {
+        region_fns.push(normalize_radare2_function_checked(
+            &f,
+            pdfj.as_ref(),
+            image,
+            load_addr,
+            addr,
+        )?);
+    }
+    let projections = region_fns
+        .iter()
+        .map(parse_projection)
+        .collect::<Result<Vec<_>>>()?;
+    if !inventory_count_conserved(raw_record_count, &projections) {
+        return Err(Error::Serialize(format!(
+            "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+        )));
+    }
+    Ok(region_fns)
 }
 
 /// Phase 2: enrich a v1 (or v2 asm-only) `thumb_functions.json` with per-function
@@ -4000,6 +4110,57 @@ mod tests {
         assert_eq!(R2_STDOUT_CAP_BYTES, 4 * 1024 * 1024 * 1024);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn r2_address_space_cap_is_applied_to_child_process() {
+        // `limit_r2_address_space` must set RLIMIT_AS on the spawned child so a
+        // runaway r2 gets ENOMEM (and fails closed) instead of OOM-killing the
+        // host. Observe it through a child `ulimit -v`, which reports the soft
+        // address-space limit in KiB.
+        let mut cmd = std::process::Command::new("bash");
+        cmd.args(["-c", "ulimit -v"]);
+        limit_r2_address_space(&mut cmd);
+        let out = cmd.output().expect("spawn bash for ulimit probe");
+        let printed = String::from_utf8_lossy(&out.stdout);
+        let expected_kib = (R2_ADDRESS_SPACE_CAP_BYTES / 1024).to_string();
+        assert_eq!(printed.trim(), expected_kib);
+    }
+
+    #[test]
+    fn one_failed_thumb_region_does_not_drop_the_others() {
+        // A region whose r2 run fails (spawn/kill/address-space-cap/malformed
+        // output) is recorded and skipped, never aborting the stage: the sibling
+        // regions' functions still reach thumb_functions.json. Regression guard
+        // for the address-space-cap fail-closed path — one runaway region (e.g.
+        // cheetah 01_MAIN 0x42310000) must degrade Thumb coverage locally, not
+        // zero it out.
+        let region_results: Vec<(u32, Result<Vec<serde_json::Value>>)> = vec![
+            (0x40010000, Ok(vec![serde_json::json!({"name": "thumb_a"})])),
+            (
+                0x42310000,
+                Err(Error::Serialize(
+                    "radare2 exited with status 139 for Thumb region 0x42310000".into(),
+                )),
+            ),
+            (
+                0x43a00000,
+                Ok(vec![
+                    serde_json::json!({"name": "thumb_b"}),
+                    serde_json::json!({"name": "thumb_c"}),
+                ]),
+            ),
+        ];
+        let (functions, skipped) = collect_thumb_regions(region_results);
+        assert_eq!(
+            functions.len(),
+            3,
+            "surviving regions' functions must be kept"
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].addr, 0x42310000);
+        assert!(skipped[0].reason.contains("139"));
+    }
+
     #[test]
     fn noisy_radare2_stdout_still_pairs_and_normalizes_pdfj() {
         let stdout = br#"Warning: run r2 with -e bin.cache=true
@@ -4178,7 +4339,7 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
-    fn run_radare2_thumb_rejects_unnormalizable_raw_function() {
+    fn run_radare2_thumb_region_rejects_unnormalizable_raw_function() {
         let dir = std::env::temp_dir().join(format!("pme_r2_bad_normalize_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4206,7 +4367,7 @@ INFO: second pdfj body was noisy and not parseable
         // non-Io failure mode.
         let mut last = None;
         for attempt in 0..5u32 {
-            match run_radare2_thumb(&r2, &[0u8; 16], 0x4000, &[(0x4000, 16)], &out) {
+            match run_radare2_thumb_region(&r2, &[0u8; 16], 0x4000, 0x4000, 16, &out) {
                 Ok(_) => break,
                 Err(e) if matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::ExecutableFileBusy) =>
                 {
@@ -4220,7 +4381,7 @@ INFO: second pdfj body was noisy and not parseable
                 }
             }
         }
-        let err = last.expect("expected an error from run_radare2_thumb");
+        let err = last.expect("expected an error from run_radare2_thumb_region");
 
         assert!(
             matches!(err, Error::Serialize(message) if message.contains("unassignable aflj") && message.contains("0x4000"))
