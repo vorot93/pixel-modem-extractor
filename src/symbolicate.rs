@@ -1041,7 +1041,11 @@ pub(crate) fn build_map(
             .unwrap_or_default();
 
         // Lowest precedence: only when neither `__func__` nor a token fired.
-        let ident_guess = if string_ref_enabled && func_name.is_none() && hits.is_empty() {
+        let ident_guess = if string_ref_enabled
+            && func_name.is_none()
+            && hits.is_empty()
+            && !is_real_name(&f.name)
+        {
             name_guess::string_ref_guess(
                 cand_idents[i].as_deref(),
                 &ident_count,
@@ -1926,6 +1930,46 @@ mod tests {
         let name = symbols[0].name.as_deref().unwrap();
         assert!(name.starts_with("guess_MyMod_DoInit_"), "got {name}");
         assert!(symbols[0].evidence.iter().any(|e| e.kind == "string_ref"));
+    }
+
+    #[test]
+    fn build_map_does_not_string_ref_guess_an_already_real_name() {
+        let root = tmp("pme_sym_stringref_realname");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        // raw image: identifier "MyMod_DoInit" at offset 0x10 -> vaddr 0x40000010
+        let mut img = vec![0u8; 0x40];
+        img[0x10..0x10 + 12].copy_from_slice(b"MyMod_DoInit");
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        // Unlike the FUN_100 case above, this function's name is ALREADY real
+        // (e.g. a Ghidra-FID match) — the string-ref tier must not displace it.
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"MyRealFn","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("globals.json"), r#"{"globals":[]}"#).unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].tier, Tier::None);
+        assert!(
+            symbols[0].name.is_none(),
+            "real name must not be displaced by a string-ref guess"
+        );
     }
 
     #[test]
