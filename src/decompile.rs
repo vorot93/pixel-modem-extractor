@@ -1745,6 +1745,7 @@ fn locate_tools(
     ghidra_home: Option<&Path>,
     env_dir: Option<&Path>,
     path_dirs: &[PathBuf],
+    default_root: Option<&Path>,
 ) -> Option<GhidraInstall> {
     for root in [ghidra_home, env_dir].into_iter().flatten() {
         if let Some(headless) = headless_in_root(root) {
@@ -1776,21 +1777,44 @@ fn locate_tools(
             }
         }
     }
+    // Last resort: a conventional install root (e.g. `/opt/ghidra` on Linux),
+    // probed only after every explicit source misses — so a distro/manual install
+    // is found without an env var or flag.
+    if let Some(root) = default_root
+        && let Some(headless) = headless_in_root(root)
+    {
+        return Some(GhidraInstall {
+            headless,
+            ghidra_run: wrapper_in_root(root),
+        });
+    }
     None
 }
 
+/// Conventional Linux install prefix, probed as a last resort after `--ghidra-home`,
+/// `$GHIDRA_INSTALL_DIR`, and `PATH` all miss — so a distro/manual `/opt/ghidra` install
+/// works with no env var or flag. (The Ghidra-e2e test harness uses the same fallback.)
+const DEFAULT_GHIDRA_ROOT: &str = "/opt/ghidra";
+
 /// Locate the Ghidra headless launcher: `--ghidra-home` → `$GHIDRA_INSTALL_DIR` → `PATH`
-/// (a bare `analyzeHeadless`, or resolved from a `ghidraRun` wrapper). Each root is probed
-/// for both the upstream (`support/`) and Homebrew (`libexec/support/`) layouts.
+/// (a bare `analyzeHeadless`, or resolved from a `ghidraRun` wrapper) → `/opt/ghidra`. Each
+/// root is probed for both the upstream (`support/`) and Homebrew (`libexec/support/`) layouts.
 pub fn find_headless(ghidra_home: Option<&Path>) -> Result<GhidraInstall> {
     let env_dir = std::env::var_os("GHIDRA_INSTALL_DIR").map(PathBuf::from);
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    locate_tools(ghidra_home, env_dir.as_deref(), &path_dirs).ok_or_else(|| {
+    locate_tools(
+        ghidra_home,
+        env_dir.as_deref(),
+        &path_dirs,
+        Some(Path::new(DEFAULT_GHIDRA_ROOT)),
+    )
+    .ok_or_else(|| {
         Error::GhidraNotFound(
-            "tried --ghidra-home, $GHIDRA_INSTALL_DIR, and PATH; if Ghidra was installed via \
-             Homebrew, pass --ghidra-home \"$(brew --prefix ghidra)\" or add its bin to PATH"
+            "tried --ghidra-home, $GHIDRA_INSTALL_DIR, PATH, and /opt/ghidra; if Ghidra was \
+             installed via Homebrew, pass --ghidra-home \"$(brew --prefix ghidra)\" or add its \
+             bin to PATH"
                 .into(),
         )
     })
@@ -4473,14 +4497,14 @@ INFO: second pdfj body was noisy and not parseable
 
         // --ghidra-home wins
         assert_eq!(
-            locate_tools(Some(&home), None, &[])
+            locate_tools(Some(&home), None, &[], None)
                 .map(|g| g.headless)
                 .as_ref(),
             Some(&want)
         );
         // $GHIDRA_INSTALL_DIR used when --ghidra-home is None
         assert_eq!(
-            locate_tools(None, Some(&home), &[])
+            locate_tools(None, Some(&home), &[], None)
                 .map(|g| g.headless)
                 .as_ref(),
             Some(&want)
@@ -4490,11 +4514,50 @@ INFO: second pdfj body was noisy and not parseable
         std::fs::create_dir_all(&pdir).unwrap();
         std::fs::write(pdir.join("analyzeHeadless"), b"#!/bin/sh\n").unwrap();
         assert_eq!(
-            locate_tools(None, None, std::slice::from_ref(&pdir)).map(|g| g.headless),
+            locate_tools(None, None, std::slice::from_ref(&pdir), None).map(|g| g.headless),
             Some(pdir.join("analyzeHeadless"))
         );
         // nothing found -> None
-        assert!(locate_tools(None, None, &[]).is_none());
+        assert!(locate_tools(None, None, &[], None).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn locate_tools_falls_back_to_default_root() {
+        // The conventional /opt/ghidra install is probed only after --ghidra-home,
+        // $GHIDRA_INSTALL_DIR, and PATH all miss. A temp dir is injected as the
+        // default root so the test never touches the real /opt/ghidra.
+        let base = std::env::temp_dir().join(format!("pme_ghidra_default_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let default_root = base.join("opt").join("ghidra");
+        std::fs::create_dir_all(default_root.join("support")).unwrap();
+        std::fs::write(
+            default_root.join("support").join("analyzeHeadless"),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
+        let want = default_root.join("support").join("analyzeHeadless");
+
+        // Nothing from --ghidra-home / env / PATH -> the default root is used.
+        assert_eq!(
+            locate_tools(None, None, &[], Some(&default_root)).map(|g| g.headless),
+            Some(want)
+        );
+
+        // An explicit source still wins over the default: a PATH dir with a bare
+        // analyzeHeadless takes precedence over the /opt/ghidra fallback.
+        let pdir = base.join("pbin");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("analyzeHeadless"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            locate_tools(None, None, std::slice::from_ref(&pdir), Some(&default_root))
+                .map(|g| g.headless),
+            Some(pdir.join("analyzeHeadless"))
+        );
+
+        // No default provided and nothing else -> None (fallback is opt-in).
+        assert!(locate_tools(None, None, &[], None).is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4547,7 +4610,7 @@ INFO: second pdfj body was noisy and not parseable
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::write(root.join("bin").join("ghidraRun"), b"#!/bin/bash\n").unwrap();
 
-        let got = locate_tools(Some(&root), None, &[]).unwrap();
+        let got = locate_tools(Some(&root), None, &[], None).unwrap();
         assert_eq!(
             got.headless,
             root.join("libexec").join("support").join("analyzeHeadless")
@@ -4595,7 +4658,7 @@ INFO: second pdfj body was noisy and not parseable
         std::os::unix::fs::symlink(cellar.join("bin").join("ghidraRun"), pbin.join("ghidraRun"))
             .unwrap();
 
-        let got = locate_tools(None, None, std::slice::from_ref(&pbin)).unwrap();
+        let got = locate_tools(None, None, std::slice::from_ref(&pbin), None).unwrap();
         assert_eq!(
             got.headless,
             std::fs::canonicalize(
