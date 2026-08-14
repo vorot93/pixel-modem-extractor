@@ -21,8 +21,9 @@ radare2.
   return an error rather than emitting silent, plausible-looking garbage. Preserve this —
   much of the recent history is hardening exactly this behavior. This applies to the
   decoder shell-outs too: a truncated `RF_CFG_*` (< 0x90 bytes) returns
-  `Error::SizeMismatch` rather than indexing OOB; radare2 stdout > 4 GiB is rejected
-  rather than OOMing the host.
+  `Error::SizeMismatch` rather than indexing OOB; radare2 stdout > 4 GiB is rejected,
+  and radare2's own analysis memory is capped (`RLIMIT_AS`) so a pathological Thumb
+  region fails closed and is skipped rather than OOMing the host.
 
 ## Build, lint, test
 
@@ -560,6 +561,25 @@ module; when a file outgrows that, split it.
   **radare2 stdout streaming** below). The verified full `decompose` did not
   hit the cap (`thumb_functions` = 117,444; no `thumb_error`) and closed
   Thumb through pass 2 (`thumb_decompiled` = 77,456; globals thumb-majority).
+- **radare2 address-space cap (`RLIMIT_AS`) prevents host OOM; a failed region
+  is skipped, not fatal.** The stdout cap above bounds only the output *we
+  read back*, never r2's own analysis memory — so `aaa` on a pathological
+  dense-Thumb region can still OOM the host. Measured: cheetah `01_MAIN`'s
+  `0x42310000` (a 4 MiB blob) runs `aaa` away to ~93.5 GiB, while every other
+  region on both reference models peaks ≤ ~2.3 GiB *virtual* under the full
+  `aaa;aflj;pdfj` command. `limit_r2_address_space` sets `RLIMIT_AS =
+  R2_ADDRESS_SPACE_CAP_BYTES` (16 GiB, ~7× the measured healthy ceiling) on the
+  r2 child via `pre_exec`, so a runaway region is denied further allocations
+  and exits (`ENOMEM` → fail-closed) instead of exhausting RAM. `run_radare2_thumb`
+  analyzes each region independently (`run_radare2_thumb_region` →
+  `collect_thumb_regions`): a region whose r2 run fails is logged
+  (`regions_skipped`) and skipped, so the surviving regions still populate
+  `thumb_functions.json` — one runaway region degrades Thumb coverage locally
+  instead of zeroing it (previously the whole stage aborted). Unix-only; Windows
+  has no portable per-child address-space limit, so a pathological region there
+  can still OOM — use `--no-thumb-decompile`. Suspected trigger for `0x42310000`:
+  data misclassified as dense Thumb by the `entropy > 6.5` gate in
+  `thumb_regions`; a content refinement there is a possible follow-up.
 - **Phase 3.2: global storage-shape recovery.** Default-on in every
   `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback). The
   stage runs **once**, immediately after the complete symbol route returns
