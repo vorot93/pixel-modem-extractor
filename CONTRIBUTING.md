@@ -623,9 +623,16 @@ hardcoded. Two reference images exercise both models end-to-end:
   `thumb_functions.json` — one runaway region degrades Thumb coverage locally
   instead of zeroing it (previously the whole stage aborted). Unix-only; Windows
   has no portable per-child address-space limit, so a pathological region there
-  can still OOM — use `--no-thumb-decompile`. Suspected trigger for `0x42310000`:
-  data misclassified as dense Thumb by the `entropy > 6.5` gate in
-  `thumb_regions`; a content refinement there is a possible follow-up.
+  can still OOM — use `--no-thumb-decompile`. **Root cause of `0x42310000`
+  (investigated):** it is *not* misclassified data — the region is genuine dense
+  Thumb (entropy ≈ 7.05 and real `bx lr`/`push`/`pop` markers, indistinguishable
+  from the healthy regions). Isolating r2's analysis passes under the cap shows a
+  single culprit: `aac` (recursive call-graph analysis) runs away, while `aa`,
+  `aab`, `aar`, and `aae` all complete. But those lighter passes find only 0–1
+  functions here — the region's functions are *only* discoverable via `aac`'s
+  call-following, which is the very pass that explodes — so no lighter-analysis
+  fallback can recover it. Skipping it fail-closed is therefore the optimal
+  handling; a real fix would live upstream in radare2's `aac`.
 - **Phase 3.2: global storage-shape recovery.** Default-on in every
   `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback). The
   stage runs **once**, immediately after the complete symbol route returns
