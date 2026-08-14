@@ -3,13 +3,20 @@
 //! (the pw_tokenizer DB, `__func__` strings, attributed strings, existing
 //! attribution), then rewrite the artifacts in place + emit `symbols.json`.
 //! Pure-Rust; ARM and Thumb. Fail-closed and tiered: only `__func__` yields a
-//! real rename, only a token yields a marked `guess_…` name, everything else is
-//! a comment.
+//! real (`Recovered`) rename; a token or a uniquely-referenced identifier
+//! string yields a marked `guess_…` name (`Provisional`). Provisional names
+//! are never applied to Ghidra as an authoritative (`USER_DEFINED`) symbol;
+//! string-ref guesses specifically are computed only by the post-globals
+//! finalize rewrite, so they never even appear in Ghidra's pass-2 input.
+//! Everything else is a comment. Precedence: `__func__` > token > string-ref.
+//! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::error::{Error, Result};
 use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+pub mod name_guess;
 
 pub const GUESS_PREFIX: &str = "guess_";
 
@@ -42,6 +49,8 @@ pub struct Evidence {
     pub value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +70,7 @@ pub struct RawEvidence {
     pub tokens: Vec<(u32, String)>, // (token, raw DB string)
     pub file: Option<String>,       // attributed source path
     pub file_strings: Vec<String>,  // that file's attributed_strings
+    pub ident_guess: Option<(String, name_guess::Class)>, // string_ref_guess output
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
@@ -316,6 +326,20 @@ pub fn decide(
         let name = format!("{GUESS_PREFIX}{}_{addr_hex}", slugify(&fmt, dom.as_deref()));
         return (Some(name), Tier::Provisional, ev, ann);
     }
+    if let Some((id, class)) = &raw.ident_guess {
+        ev.push(Evidence {
+            kind: "string_ref",
+            value: Some(id.clone()),
+            class: Some(class.as_str()),
+            ..Default::default()
+        });
+        ann.push(match class {
+            name_guess::Class::TypeLabel => format!("handles-type: {id:?}"),
+            name_guess::Class::FnName => format!("ident-ref: {id:?}"),
+        });
+        let name = format!("{GUESS_PREFIX}{}_{addr_hex}", sanitize_ident(id));
+        return (Some(name), Tier::Provisional, ev, ann);
+    }
     (None, Tier::None, ev, ann)
 }
 
@@ -353,16 +377,6 @@ pub fn build_string_map(image: &[u8], load_addr: u64, min_run: usize) -> HashMap
         .collect()
 }
 
-/// A bare C identifier (3–64 chars), i.e. a plausible `__func__` value.
-fn is_ident(s: &str) -> bool {
-    let n = s.len();
-    (3..=64).contains(&n)
-        && s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Recover a function's `__func__` name: it must reference a `__FILE__`
 /// occurrence vaddr (proving an assert/log site), and exactly one *distinct*
 /// `data_refs` identifier must resolve (unambiguous → fail-closed). Dedup by
@@ -377,17 +391,7 @@ pub fn recover_func_name(
     if !data_refs.iter().any(|r| file_occ.contains(r)) {
         return None;
     }
-    let mut seen: HashSet<&str> = HashSet::new();
-    let idents: Vec<&String> = data_refs
-        .iter()
-        .filter_map(|r| strings.get(r))
-        .filter(|s| is_ident(s))
-        .filter(|s| seen.insert(s.as_str()))
-        .collect();
-    match idents.as_slice() {
-        [only] => Some((*only).clone()),
-        _ => None,
-    }
+    name_guess::unique_ident(data_refs, strings)
 }
 
 fn parse_hex(s: &str) -> Result<u64> {
@@ -898,6 +902,46 @@ pub struct FinalizeOpts {
     pub rewrite_decompiled_c: bool,
 }
 
+/// A function name that is already a real identifier (not a Ghidra/radare2
+/// default nor a marked guess). Used to reject identifiers that name a *known*
+/// function elsewhere in the image.
+fn is_real_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("FUN_")
+        && !name.starts_with("fcn.")
+        && !name.starts_with("thunk")
+        && !name.starts_with(GUESS_PREFIX)
+}
+
+/// Recovered global names from a per-image `globals.json` (`.globals[].name`).
+/// Empty on any read/parse failure — the tier that consumes it is gated on the
+/// file's presence separately.
+fn load_global_names(path: &Path) -> HashSet<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashSet::new();
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return HashSet::new();
+    };
+    v.get("globals")
+        .and_then(|g| g.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| g.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `(cand_idents, ident_count, global_names, fn_names)`: precomputed inputs to
+/// the string-ref guess tier (see `build_map`), gated by `string_ref_enabled`.
+type StringRefPrecompute = (
+    Vec<Option<String>>,
+    HashMap<String, usize>,
+    HashSet<String>,
+    HashSet<String>,
+);
+
 /// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
 pub(crate) fn build_map(
     image_dir: &Path,
@@ -934,8 +978,53 @@ pub(crate) fn build_map(
         }
     };
 
+    // Recovered (`__func__`) names, computed once and reused below.
+    let recovered_names: Vec<Option<String>> = funcs
+        .iter()
+        .map(|f| {
+            if string_map.is_empty() {
+                None
+            } else {
+                recover_func_name(&f.data_refs, &file_occ, &string_map)
+            }
+        })
+        .collect();
+
+    // String-reference guess tier (fail-closed, lowest precedence). Active only
+    // when the raw image (=> non-empty string_map) and globals.json are present.
+    let string_ref_enabled = !string_map.is_empty() && decompiled.join("globals.json").exists();
+    let (cand_idents, ident_count, global_names, fn_names): StringRefPrecompute =
+        if string_ref_enabled {
+            let global_names = load_global_names(&decompiled.join("globals.json"));
+            let cand_idents: Vec<Option<String>> = funcs
+                .iter()
+                .map(|f| name_guess::unique_ident(&f.data_refs, &string_map))
+                .collect();
+            let mut ident_count: HashMap<String, usize> = HashMap::new();
+            for id in cand_idents.iter().flatten() {
+                *ident_count.entry(id.clone()).or_default() += 1;
+            }
+            let mut fn_names: HashSet<String> = HashSet::new();
+            for (i, f) in funcs.iter().enumerate() {
+                if is_real_name(&f.name) {
+                    fn_names.insert(f.name.clone());
+                }
+                if let Some(n) = &recovered_names[i] {
+                    fn_names.insert(n.clone());
+                }
+            }
+            (cand_idents, ident_count, global_names, fn_names)
+        } else {
+            (
+                vec![None; funcs.len()],
+                HashMap::new(),
+                HashSet::new(),
+                HashSet::new(),
+            )
+        };
+
     let mut symbols = Vec::with_capacity(funcs.len());
-    for f in &funcs {
+    for (i, f) in funcs.iter().enumerate() {
         let addr_hex = format!("{:08x}", f.entry);
         let mut imms = reconstruct_immediates(&f.disasm);
         imms.extend(f.data_refs.iter().filter_map(|r| u32::try_from(*r).ok()));
@@ -945,11 +1034,7 @@ pub(crate) fn build_map(
             .collect();
         hits.sort_by_key(|(t, _)| *t);
 
-        let func_name = if string_map.is_empty() {
-            None
-        } else {
-            recover_func_name(&f.data_refs, &file_occ, &string_map)
-        };
+        let func_name = recovered_names[i].clone();
         let file = attribution.get(&(f.tool, f.entry)).cloned();
         let fstrings = file
             .as_ref()
@@ -957,11 +1042,28 @@ pub(crate) fn build_map(
             .cloned()
             .unwrap_or_default();
 
+        // Lowest precedence: only when neither `__func__` nor a token fired.
+        let ident_guess = if string_ref_enabled
+            && func_name.is_none()
+            && hits.is_empty()
+            && !is_real_name(&f.name)
+        {
+            name_guess::string_ref_guess(
+                cand_idents[i].as_deref(),
+                &ident_count,
+                &global_names,
+                &fn_names,
+            )
+        } else {
+            None
+        };
+
         let raw = RawEvidence {
             func_name,
             tokens: hits,
             file,
             file_strings: fstrings,
+            ident_guess,
         };
         let (name, tier, evidence, annotations) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
@@ -1267,6 +1369,7 @@ mod tests {
             tokens: vec![],
             file: None,
             file_strings: vec![],
+            ident_guess: None,
         }
     }
 
@@ -1314,6 +1417,48 @@ mod tests {
         assert_eq!(tier, Tier::None);
         assert!(ann.iter().any(|a| a.starts_with("file: HEDGE/LteRrc.c")));
         assert!(ann.iter().any(|a| a.starts_with("file-strings:")));
+    }
+
+    #[test]
+    fn ident_guess_yields_marked_string_ref_guess() {
+        let r = RawEvidence {
+            ident_guess: Some(("RF_SM_Set_ET_Voltage".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (name, tier, ev, ann) = decide("40e1bff4", &r);
+        let name = name.unwrap();
+        assert!(name.starts_with(GUESS_PREFIX), "not marked: {name}");
+        assert!(name.contains("RF_SM_Set_ET_Voltage"));
+        assert!(name.ends_with("40e1bff4"), "no address: {name}");
+        assert_eq!(tier, Tier::Provisional);
+        let e = ev.iter().find(|e| e.kind == "string_ref").unwrap();
+        assert_eq!(e.class, Some("fn_name"));
+        assert!(ann.iter().any(|a| a.contains("RF_SM_Set_ET_Voltage")));
+    }
+
+    #[test]
+    fn func_name_beats_ident_guess() {
+        let r = RawEvidence {
+            func_name: Some("Real_Name".into()),
+            ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (name, tier, _ev, _ann) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Real_Name"));
+        assert_eq!(tier, Tier::Recovered);
+    }
+
+    #[test]
+    fn token_beats_ident_guess() {
+        let r = RawEvidence {
+            tokens: vec![(0x3c2a, "■format♦hi■domain♦D".into())],
+            ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (_name, tier, ev, _ann) = decide("40e1bff4", &r);
+        assert_eq!(tier, Tier::Provisional);
+        assert!(ev.iter().any(|e| e.kind == "token"));
+        assert!(!ev.iter().any(|e| e.kind == "string_ref"));
     }
 
     #[test]
@@ -1753,6 +1898,116 @@ mod tests {
     }
 
     #[test]
+    fn build_map_emits_string_ref_guess_when_globals_present() {
+        let root = tmp("pme_sym_stringref");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        // raw image: identifier "MyMod_DoInit" at offset 0x10 -> vaddr 0x40000010
+        let mut img = vec![0u8; 0x40];
+        img[0x10..0x10 + 12].copy_from_slice(b"MyMod_DoInit");
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_100","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("globals.json"), r#"{"globals":[]}"#).unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].tier, Tier::Provisional);
+        let name = symbols[0].name.as_deref().unwrap();
+        assert!(name.starts_with("guess_MyMod_DoInit_"), "got {name}");
+        assert!(symbols[0].evidence.iter().any(|e| e.kind == "string_ref"));
+    }
+
+    #[test]
+    fn build_map_does_not_string_ref_guess_an_already_real_name() {
+        let root = tmp("pme_sym_stringref_realname");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        // raw image: identifier "MyMod_DoInit" at offset 0x10 -> vaddr 0x40000010
+        let mut img = vec![0u8; 0x40];
+        img[0x10..0x10 + 12].copy_from_slice(b"MyMod_DoInit");
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        // Unlike the FUN_100 case above, this function's name is ALREADY real
+        // (e.g. a Ghidra-FID match) — the string-ref tier must not displace it.
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"MyRealFn","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("globals.json"), r#"{"globals":[]}"#).unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].tier, Tier::None);
+        assert!(
+            symbols[0].name.is_none(),
+            "real name must not be displaced by a string-ref guess"
+        );
+    }
+
+    #[test]
+    fn build_map_skips_string_ref_without_globals_json() {
+        let root = tmp("pme_sym_stringref_off");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let mut img = vec![0u8; 0x40];
+        img[0x10..0x10 + 12].copy_from_slice(b"MyMod_DoInit");
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_100","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        // no globals.json
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+        assert_eq!(symbols[0].tier, Tier::None);
+        assert!(symbols[0].name.is_none());
+    }
+
+    #[test]
     fn finalize_image_writes_symbols_json_when_given_symbols() {
         let root = tmp("pme_sym_finalize");
         let dec = root.join("images/02_MAIN/decompiled");
@@ -1957,6 +2212,44 @@ mod tests {
         assert!(
             !after.contains("thumb_40e1200(void)"),
             "original name must be gone from body_c after rewrite: {after}"
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement: PME_SYMBOLICATE_MEASURE=1 PME_GOLDEN_DIR=<tree>"]
+    fn string_ref_yield_on_retained_tree() {
+        if std::env::var("PME_SYMBOLICATE_MEASURE").ok().as_deref() != Some("1") {
+            eprintln!("skip: set PME_SYMBOLICATE_MEASURE=1");
+            return;
+        }
+        let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(std::path::PathBuf::from) else {
+            eprintln!("skip: set PME_GOLDEN_DIR");
+            return;
+        };
+        if !dir.exists() {
+            eprintln!("skip: PME_GOLDEN_DIR not found: {}", dir.display());
+            return;
+        }
+        let manifest = dir.join("manifest.json");
+        let image_dir = dir.join("images/02_MAIN");
+        // Empty token map isolates the string-ref tier from token guesses.
+        // build_map does not write, so the retained tree is not mutated.
+        let symbols = build_map(&image_dir, "02_MAIN", &HashMap::new(), &manifest).unwrap();
+        let string_ref = symbols
+            .iter()
+            .filter(|s| s.evidence.iter().any(|e| e.kind == "string_ref"))
+            .count();
+        eprintln!("02_MAIN string_ref guesses: {string_ref}");
+        for s in symbols
+            .iter()
+            .filter(|s| s.evidence.iter().any(|e| e.kind == "string_ref"))
+            .take(15)
+        {
+            eprintln!("  {} {}", s.address, s.name.as_deref().unwrap_or("?"));
+        }
+        assert!(
+            string_ref > 4000,
+            "string-ref yield unexpectedly low: {string_ref}"
         );
     }
 }

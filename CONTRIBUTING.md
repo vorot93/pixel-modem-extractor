@@ -172,6 +172,30 @@ module; when a file outgrows that, split it.
   and is loaded/rewritten whole (~4 s, ~3 GB peak); pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not raw literals, so
   a byte search won't find them).
+- **String-reference name guesses.** Beyond `__func__` (Recovered) and token
+  matches (Provisional `guess_`), `symbolicate` recovers a third, lowest-
+  precedence evidence source: a function's single *distinct* referenced
+  identifier string (`name_guess::unique_ident`), when that identifier is
+  referenced by exactly one function image-wide and is not an all-caps message
+  constant, a recovered global name (`globals.json`), or another function's
+  name. Survivors become marked `guess_<ident>_<addr>` `Provisional` names with
+  a `string_ref` evidence entry (`class`: `fn_name` | `type_label`). They never
+  reach Ghidra's pass-2 output — not because `ApplySymbols.java` skips them
+  (it doesn't: it renames every symbol it's given a `name` for, applying
+  `recovered` as `USER_DEFINED` and everything else, including token-tier
+  guesses, as `ANALYSIS`), but because this tier is computed only at the
+  post-globals `symbolicate_finalize` stage, never at the pre-globals
+  `symbol_map` stage that produces ApplySymbols' input. That gate
+  (`globals.json` and the raw image present) is route-dependent. In the normal
+  `decompose` route, Phase 3.0 writes `globals.json` before
+  `symbolicate_finalize` runs, so the tier is inert at the earlier
+  `symbol_map` stage and active at finalize. Under `--no-symbol-pass`,
+  `symbol_map` is skipped entirely and `symbolicate_finalize` runs *before*
+  the record-only globals stage writes `globals.json`, so on a fresh run the
+  tier is inert there too — it activates only when a `globals.json` from a
+  prior run is already present on disk. Measured on `02_MAIN`: ~8,700
+  string-ref guesses, audited ~53% the function's own name / ~85% useful
+  (see the design spec). Precision knobs live in `name_guess::string_ref_guess`.
 - **`disasm_index::DisasmIndex` (shared infra).** Address-indexed view of a
   `disasm.lst`-format file, O(log L + k) per `slice_for` lookup. Built ONCE
   per image; consumed by `symbolicate::load_functions` (the ARM function
