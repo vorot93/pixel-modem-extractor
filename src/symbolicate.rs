@@ -44,6 +44,8 @@ pub struct Evidence {
     pub value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +65,7 @@ pub struct RawEvidence {
     pub tokens: Vec<(u32, String)>, // (token, raw DB string)
     pub file: Option<String>,       // attributed source path
     pub file_strings: Vec<String>,  // that file's attributed_strings
+    pub ident_guess: Option<(String, name_guess::Class)>, // string_ref_guess output
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
@@ -316,6 +319,20 @@ pub fn decide(
     if let Some((_tok, s)) = raw.tokens.first() {
         let (fmt, dom) = parse_token_string(s);
         let name = format!("{GUESS_PREFIX}{}_{addr_hex}", slugify(&fmt, dom.as_deref()));
+        return (Some(name), Tier::Provisional, ev, ann);
+    }
+    if let Some((id, class)) = &raw.ident_guess {
+        ev.push(Evidence {
+            kind: "string_ref",
+            value: Some(id.clone()),
+            class: Some(class.as_str()),
+            ..Default::default()
+        });
+        ann.push(match class {
+            name_guess::Class::TypeLabel => format!("handles-type: {id:?}"),
+            name_guess::Class::FnName => format!("ident-ref: {id:?}"),
+        });
+        let name = format!("{GUESS_PREFIX}{}_{addr_hex}", sanitize_ident(id));
         return (Some(name), Tier::Provisional, ev, ann);
     }
     (None, Tier::None, ev, ann)
@@ -944,6 +961,7 @@ pub(crate) fn build_map(
             tokens: hits,
             file,
             file_strings: fstrings,
+            ident_guess: None,
         };
         let (name, tier, evidence, annotations) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
@@ -1249,6 +1267,7 @@ mod tests {
             tokens: vec![],
             file: None,
             file_strings: vec![],
+            ident_guess: None,
         }
     }
 
@@ -1296,6 +1315,48 @@ mod tests {
         assert_eq!(tier, Tier::None);
         assert!(ann.iter().any(|a| a.starts_with("file: HEDGE/LteRrc.c")));
         assert!(ann.iter().any(|a| a.starts_with("file-strings:")));
+    }
+
+    #[test]
+    fn ident_guess_yields_marked_string_ref_guess() {
+        let r = RawEvidence {
+            ident_guess: Some(("RF_SM_Set_ET_Voltage".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (name, tier, ev, ann) = decide("40e1bff4", &r);
+        let name = name.unwrap();
+        assert!(name.starts_with(GUESS_PREFIX), "not marked: {name}");
+        assert!(name.contains("RF_SM_Set_ET_Voltage"));
+        assert!(name.ends_with("40e1bff4"), "no address: {name}");
+        assert_eq!(tier, Tier::Provisional);
+        let e = ev.iter().find(|e| e.kind == "string_ref").unwrap();
+        assert_eq!(e.class, Some("fn_name"));
+        assert!(ann.iter().any(|a| a.contains("RF_SM_Set_ET_Voltage")));
+    }
+
+    #[test]
+    fn func_name_beats_ident_guess() {
+        let r = RawEvidence {
+            func_name: Some("Real_Name".into()),
+            ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (name, tier, _ev, _ann) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Real_Name"));
+        assert_eq!(tier, Tier::Recovered);
+    }
+
+    #[test]
+    fn token_beats_ident_guess() {
+        let r = RawEvidence {
+            tokens: vec![(0x3c2a, "■format♦hi■domain♦D".into())],
+            ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (_name, tier, ev, _ann) = decide("40e1bff4", &r);
+        assert_eq!(tier, Tier::Provisional);
+        assert!(ev.iter().any(|e| e.kind == "token"));
+        assert!(!ev.iter().any(|e| e.kind == "string_ref"));
     }
 
     #[test]
