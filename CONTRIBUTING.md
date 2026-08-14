@@ -190,10 +190,13 @@ module; when a file outgrows that, split it.
   `decompose` route, Phase 3.0 writes `globals.json` before
   `symbolicate_finalize` runs, so the tier is inert at the earlier
   `symbol_map` stage and active at finalize. Under `--no-symbol-pass`,
-  `symbol_map` is skipped entirely and `symbolicate_finalize` runs *before*
-  the record-only globals stage writes `globals.json`, so on a fresh run the
-  tier is inert there too — it activates only when a `globals.json` from a
-  prior run is already present on disk. Measured on `02_MAIN`: ~8,700
+  `symbol_map` is skipped and the route runs `symbolicate_finalize` *twice*:
+  first to produce recovered/token names for the record-only globals stage to
+  consume (deferring the `decompiled.c` rewrite so its idempotency sentinel does
+  not block the second pass), then again after that stage has written
+  `globals.json` — the second finalize is where the string-ref tier activates
+  and rewrites `decompiled.c`. So this route produces string-ref guesses too, at
+  the cost of a second `build_map` pass. Measured on `02_MAIN`: ~8,700
   string-ref guesses, audited ~53% the function's own name / ~85% useful
   (see the design spec). Precision knobs live in `name_guess::string_ref_guess`.
 - **`disasm_index::DisasmIndex` (shared infra).** Address-indexed view of a
