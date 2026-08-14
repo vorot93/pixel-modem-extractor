@@ -168,10 +168,11 @@ mod tests {
         };
         let fs = Ext4Fs::open(&gold_ext4).unwrap();
         let sub = fs.images_subdir().unwrap();
-        assert!(
-            crate::model::firmware_prefix(&sub).is_some(),
-            "subdir was {sub}"
-        );
+        // Do NOT assert the subdir name looks like a firmware prefix: on some
+        // models the /images firmware dir is literally named "default"
+        // (cheetah), not "g5300q-…". The real invariant — it contains modem.bin
+        // — is what images_subdir selects on; verify structurally via TOC magic.
+        assert!(!sub.is_empty(), "images_subdir returned an empty name");
         let modem = fs.read_file(&format!("/images/{}/modem.bin", sub)).unwrap();
         assert_eq!(&modem[0..4], b"TOC\0");
     }
