@@ -7,8 +7,8 @@
 use crate::decompile::{self, ImageOutcome};
 use crate::error::{Error, Result};
 use crate::{
-    decode_rf, global_shapes, globals, hwcfg, manifest, pipeline, recover_source, source_tree,
-    symbolicate, tokens,
+    decode_rf, global_shapes, globals, hwcfg, manifest, model, pipeline, recover_source,
+    source_tree, symbolicate, tokens,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -270,6 +270,8 @@ pub struct Report {
     pub tool_version: String,
     pub source_image: String,
     pub source_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modem_generation: Option<String>,
     pub out: String,
     pub ghidra: GhidraTools,
     pub pruned: bool,
@@ -812,12 +814,14 @@ fn finalize(
     headless: &Path,
     r2: &Path,
     stages: Vec<StageReport>,
+    modem_generation: Option<String>,
 ) -> Result<PathBuf> {
     let ok = Report::is_ok(&stages);
     let report = Report {
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         source_image: img.display().to_string(),
         source_sha256: manifest::sha256_file(img).unwrap_or_default(),
+        modem_generation,
         out: out.display().to_string(),
         ghidra: GhidraTools {
             headless: headless.display().to_string(),
@@ -1632,6 +1636,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     )?;
     std::fs::create_dir_all(out)?;
     let mut stages: Vec<StageReport> = Vec::new();
+    let mut modem_label: Option<String> = None;
 
     // 2. Extract.
     let t = Instant::now();
@@ -1643,6 +1648,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 "manifest.json",
                 t.elapsed().as_millis(),
             ));
+            modem_label = manifest::read_fbpk_name(&out.join("manifest.json"))
+                .as_deref()
+                .and_then(model::modem_generation);
         }
         Err(e) => {
             stages.push(StageReport::failed(
@@ -1650,14 +1658,14 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 e.to_string(),
                 t.elapsed().as_millis(),
             ));
-            return finalize(out, img, opts, &headless, &r2, stages); // nothing to analyze
+            return finalize(out, img, opts, &headless, &r2, stages, modem_label.clone()); // nothing to analyze
         }
     }
     let rootfs = match rootfs_image_dir(out) {
         Ok(p) => p,
         Err(e) => {
             stages.push(StageReport::failed("locate_rootfs", e.to_string(), 0));
-            return finalize(out, img, opts, &headless, &r2, stages);
+            return finalize(out, img, opts, &headless, &r2, stages, modem_label.clone());
         }
     };
     let modem_bin = rootfs.join("modem.bin");
@@ -1756,7 +1764,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             gap: 4,
             shared_pct: 0.05,
             min_run: 3,
-            modem_label: None, // Task 4 replaces this with the derived S-generation label
+            modem_label: modem_label.clone(),
         };
         run_stage(
             &mut stages,
@@ -2043,7 +2051,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     {
         stages.push(StageReport::failed("prune", e.to_string(), 0));
     }
-    finalize(out, img, opts, &headless, &r2, stages)
+    finalize(out, img, opts, &headless, &r2, stages, modem_label.clone())
 }
 
 #[cfg(test)]
@@ -3587,6 +3595,7 @@ mod tests {
             tool_version: "1.0.0".into(),
             source_image: "radio.img".into(),
             source_sha256: "abc".into(),
+            modem_generation: None,
             out: "radio.decomposed".into(),
             ghidra: GhidraTools {
                 headless: "/g/analyzeHeadless".into(),

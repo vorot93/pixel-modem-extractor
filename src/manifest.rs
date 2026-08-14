@@ -40,6 +40,14 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     sha256_reader(file)
 }
 
+/// Best-effort read of `fbpk_name` from a written `manifest.json`.
+/// `None` if the file is absent/unreadable or lacks the field.
+pub fn read_fbpk_name(manifest_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(manifest_path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("fbpk_name")?.as_str().map(|s| s.to_owned())
+}
+
 /// TOC image name for a decompose label, e.g. `"02_MAIN"` → `"MAIN"`.
 pub(crate) fn toc_name(image_label: &str) -> &str {
     image_label
@@ -173,6 +181,23 @@ mod tests {
         assert_eq!(v["entries"][0]["path"], "a.bin"); // sorted
         assert_eq!(v["entries"][0]["size"], 1);
         assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reads_fbpk_name_from_manifest_json() {
+        let tmp = std::env::temp_dir().join("pme_manifest_read.json");
+        std::fs::write(
+            &tmp,
+            br#"{"fbpk_name":"g5300q-260317-260505-M-15346003","tool_version":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_fbpk_name(&tmp).as_deref(),
+            Some("g5300q-260317-260505-M-15346003")
+        );
+        let missing = std::env::temp_dir().join("pme_manifest_absent.json");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(read_fbpk_name(&missing), None);
     }
 
     #[test]
