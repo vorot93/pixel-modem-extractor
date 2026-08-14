@@ -313,6 +313,21 @@ fn rootfs_image_dir(out: &Path) -> Result<PathBuf> {
     )))
 }
 
+/// The `images/` subdir holding the modem's MAIN code image. The split names
+/// images `<NN>_<TOCNAME>`, and the index prefix varies by model (mustang:
+/// `02_MAIN`; cheetah: `01_MAIN`) — but the TOC name `MAIN` is stable, so select
+/// the lexicographically-first child whose name ends with `_MAIN`. `None` if absent.
+fn main_image_dir_name(images_dir: &Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(images_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names.into_iter().find(|n| n.ends_with("_MAIN"))
+}
+
 /// Move one image's decompile artifacts into its unified folder:
 ///   `<ghidra>/images/<label>`   (slice file) -> `<images>/<label>/<label>.bin`
 ///   `<ghidra>/export/<label>/`  (export dir)  -> `<images>/<label>/decompiled/`
@@ -1755,52 +1770,60 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         }
     }
 
-    // 4. Source tree — 02_MAIN only.
-    let main_bin = images_dir.join("02_MAIN").join("02_MAIN.bin");
-    if main_bin.exists() {
-        let st_out = images_dir.join("02_MAIN").join("source_tree");
-        let st_opts = source_tree::Opts {
-            no_attribution: false,
-            gap: 4,
-            shared_pct: 0.05,
-            min_run: 3,
-            modem_label: modem_label.clone(),
-        };
-        run_stage(
-            &mut stages,
-            "source_tree",
-            "images/02_MAIN/source_tree",
-            || source_tree::run(&main_bin, &st_out, &st_opts),
-        );
-    } else {
-        stages.push(StageReport::skipped("source_tree", "no 02_MAIN image"));
-    }
+    // 4. Source tree — MAIN image only. The MAIN split-dir name is
+    //    model-dependent ("02_MAIN" on mustang/S5400, "01_MAIN" on cheetah/S5300);
+    //    the TOC name "MAIN" is the stable key, so locate the `*_MAIN` split dir.
+    if let Some(main_name) = main_image_dir_name(&images_dir).as_deref() {
+        let main_img_dir = images_dir.join(main_name);
+        let main_bin = main_img_dir.join(format!("{main_name}.bin"));
+        if main_bin.exists() {
+            let st_out = main_img_dir.join("source_tree");
+            let st_opts = source_tree::Opts {
+                no_attribution: false,
+                gap: 4,
+                shared_pct: 0.05,
+                min_run: 3,
+                modem_label: modem_label.clone(),
+            };
+            run_stage(
+                &mut stages,
+                "source_tree",
+                &format!("images/{main_name}/source_tree"),
+                || source_tree::run(&main_bin, &st_out, &st_opts),
+            );
+        } else {
+            stages.push(StageReport::skipped("source_tree", "no MAIN image binary"));
+        }
 
-    let source_tree_dir = images_dir.join("02_MAIN").join("source_tree");
-    let decompiled_dir = images_dir.join("02_MAIN").join("decompiled");
-    if source_tree_dir.join("manifest.json").exists()
-        && source_tree_dir.join("tree").is_dir()
-        && decompiled_dir.join("functions.json").exists()
-        && decompiled_dir.join("decompiled.c").exists()
-    {
-        run_stage(
-            &mut stages,
-            "source_attribution",
-            "images/02_MAIN/source_tree/recovered_index.json",
-            || {
-                recover_source::run(
-                    &source_tree_dir,
-                    &decompiled_dir,
-                    &source_tree_dir.join("recovered_index.json"),
-                    &recover_source::Opts::default(),
-                )
-            },
-        );
+        let source_tree_dir = main_img_dir.join("source_tree");
+        let decompiled_dir = main_img_dir.join("decompiled");
+        if source_tree_dir.join("manifest.json").exists()
+            && source_tree_dir.join("tree").is_dir()
+            && decompiled_dir.join("functions.json").exists()
+            && decompiled_dir.join("decompiled.c").exists()
+        {
+            run_stage(
+                &mut stages,
+                "source_attribution",
+                &format!("images/{main_name}/source_tree/recovered_index.json"),
+                || {
+                    recover_source::run(
+                        &source_tree_dir,
+                        &decompiled_dir,
+                        &source_tree_dir.join("recovered_index.json"),
+                        &recover_source::Opts::default(),
+                    )
+                },
+            );
+        } else {
+            stages.push(StageReport::skipped(
+                "source_attribution",
+                "no MAIN source tree or decompiler artifacts",
+            ));
+        }
     } else {
-        stages.push(StageReport::skipped(
-            "source_attribution",
-            "no 02_MAIN source tree or decompiler artifacts",
-        ));
+        stages.push(StageReport::skipped("source_tree", "no MAIN image"));
+        stages.push(StageReport::skipped("source_attribution", "no MAIN image"));
     }
 
     // 5. decode_tokens — MOVED EARLIER (Phase 1) so the symbol map can use it.
@@ -4715,6 +4738,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         // <out>/rootfs/images/ doesn't exist at all -> typed NotFound, not a raw Io error
         assert!(matches!(rootfs_image_dir(&out), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn main_image_dir_name_finds_the_MAIN_split() {
+        // cheetah layout: MAIN is 01_MAIN
+        let tmp = std::env::temp_dir().join("pme_main_dir_cheetah");
+        let _ = std::fs::remove_dir_all(&tmp);
+        for d in ["00_BOOT", "01_MAIN", "02_VSS", "03_APM"] {
+            std::fs::create_dir_all(tmp.join(d)).unwrap();
+        }
+        assert_eq!(main_image_dir_name(&tmp).as_deref(), Some("01_MAIN"));
+
+        // mustang layout: MAIN is 02_MAIN
+        let tmp2 = std::env::temp_dir().join("pme_main_dir_mustang");
+        let _ = std::fs::remove_dir_all(&tmp2);
+        for d in ["00_BOOT", "01_PSP", "02_MAIN", "05_DBGCORE"] {
+            std::fs::create_dir_all(tmp2.join(d)).unwrap();
+        }
+        assert_eq!(main_image_dir_name(&tmp2).as_deref(), Some("02_MAIN"));
+
+        // no MAIN image
+        let tmp3 = std::env::temp_dir().join("pme_main_dir_none");
+        let _ = std::fs::remove_dir_all(&tmp3);
+        std::fs::create_dir_all(tmp3.join("00_BOOT")).unwrap();
+        assert_eq!(main_image_dir_name(&tmp3), None);
     }
 
     #[test]
