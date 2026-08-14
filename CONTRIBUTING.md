@@ -131,14 +131,60 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
 
+## Multiple models (model-agnostic design)
+
+The extractor targets the Shannon **S5300 / S5400** family and adds **no per-model code** — the core
+is TOC-driven and structural, and everything model-specific is *derived* from the image, never
+hardcoded. Two reference images exercise both models end-to-end:
+
+- **mustang** — `g5400i`, **S5400**: `…/reference/radio-mustang-g5400i-260317-260429-b-15308590.img`
+- **cheetah** — `g5300q`, **S5300**: `…/reference/radio-cheetah-g5300q-260317-260505-b-15346003.img`
+
+- **Firmware-directory detection is by content, never by name** (`ext4::select_firmware_subdir`): the
+  firmware dir is "the `/images/*` subdir that contains `modem.bin`" (lexicographically-first such
+  entry). Essential, not a nicety — on cheetah that directory is literally named `default`, so no
+  prefix heuristic (`g5300q-…`) could find it. The rest of `extract` is TOC-driven and model-agnostic.
+- **MAIN-image identity is model-dependent.** The MAIN code image's split dir is `02_MAIN` on mustang
+  and `01_MAIN` on cheetah — the index prefix varies, but the TOC name `MAIN` is stable. Decompose's
+  source-tree and source-attribution stages select it via `decompose::main_image_dir_name` by the
+  `_MAIN` suffix; every other analysis stage (decompile, symbolicate, globals, `global_shapes`) is
+  already generic and iterates all images. `source_tree` derives its human-facing image label (README,
+  `summary.md`, per-leaf node comments) from the input filename's stem, so the labels name the real
+  image (`01_MAIN`) rather than a hardcoded `02_MAIN`.
+- **Truthful generation label from the container, never a guess** (`src/model.rs`). `firmware_prefix`
+  returns the leading `g<digits><letter>` of the FBPK/firmware-dir name; `modem_generation` derives
+  the Shannon label from the digits (`g5300q…` → `S5300`, `g5400i…` → `S5400`). The label flows into
+  `report.json` `modem_generation` and the source-tree README, read ad hoc from the FBPK **container**
+  name via `manifest::read_fbpk_name` — which still carries the `g…` prefix even when the internal
+  `/images` dir is `default`. When it cannot be derived, wording stays generic with no number. There
+  is no model registry and no `Manifest` schema field.
+- **Not every model ships every artifact.** cheetah has no `hardware_config.json` and no `RF_CFG_*`
+  blobs, so `decode_rf` and `hardware_config` legitimately report `skipped` (not failed) and `rf/` /
+  `rf_cfg_decompressed/` are empty. A skipped decoder stage here is a model difference, not a regression.
+- **Testing across models.** The env-gated tests (`PME_RADIO_IMG`, `PME_GOLDEN_DIR`) are
+  model-independent — point them at either reference image and both pass. Assertions are structural
+  (the firmware dir contains `modem.bin`; a `*_MAIN` split exists; `firmware_prefix` parses;
+  `modem.size > 0`), never a literal model name or byte size.
+- **cheetah / S5300 as the second reference data point** (verified full `decompose`, ~84 min, exit 0):
+  four images `00_BOOT / 01_MAIN / 02_VSS / 03_APM` (no PSP/DBGCORE), MAIN = `01_MAIN`. Headline
+  `report.json` counts: `functions` = 104,395 (MAIN); `thumb_functions` = 87,026; `thumb_decompiled`
+  = 70,906 (dense-Thumb converged on S5300 — the primary risk); `globals_recovered` = 1,061;
+  `global_shapes` 1046 obs / 274 inferred / 784 `no_evidence` / 3 conflicting. One 4 MiB dense-Thumb
+  region (`0x42310000`) drove radare2's `aaa` toward ~90+ GiB and hit the 16 GiB `RLIMIT_AS` cap, so
+  it was skipped fail-closed (`regions_skipped=1`) while the other six regions decompiled — see the
+  radare2 address-space-cap invariant in the domain map.
+
 ## Domain map & code conventions
 
-- **The six TOC images** are `00_BOOT`, `01_PSP`, `02_MAIN`, `03_APM`, `04_VSS`, and
-  `05_DBGCORE` (parsed in `toc.rs`). `02_MAIN` is the primary code image — `source-tree`
-  reconstruction and recovered-source attribution operate on it; `05_DBGCORE` is the
-  small debug image. **`01_PSP` is encrypted** (uniform entropy ≈ 8.0, no ARM code, no
-  readable strings), so Ghidra reports **0 functions** — expected, not a bug. Detecting and
-  classifying opaque/encrypted images is future work (see the symbolication design spec).
+- **The TOC images** (parsed in `toc.rs`) are model-dependent. mustang/S5400 has six —
+  `00_BOOT`, `01_PSP`, `02_MAIN`, `03_APM`, `04_VSS`, `05_DBGCORE`; cheetah/S5300 has four —
+  `00_BOOT`, `01_MAIN`, `02_VSS`, `03_APM` (no PSP/DBGCORE). **MAIN** is the primary code image —
+  `source-tree` reconstruction and recovered-source attribution operate on it — but its split-dir
+  index varies (`02_MAIN` vs `01_MAIN`); the stable key is the TOC name `MAIN` (see *Multiple
+  models* above). `05_DBGCORE` is the small debug image. On mustang, **`01_PSP` is encrypted**
+  (uniform entropy ≈ 8.0, no ARM code, no readable strings), so Ghidra reports **0 functions** —
+  expected, not a bug. Detecting and classifying opaque/encrypted images is future work (see the
+  symbolication design spec).
 - **TOC CRCs are advisory.** Every image's stored TOC CRC currently mismatches a plain
   CRC-32 over `[offset, size)` (the algorithm/coverage is unconfirmed); `split_to_dir` only
   `warn!`s and still writes, and `manifest.verified` means "checks were attempted," not
