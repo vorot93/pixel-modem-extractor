@@ -1756,6 +1756,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             gap: 4,
             shared_pct: 0.05,
             min_run: 3,
+            modem_label: None, // Task 4 replaces this with the derived S-generation label
         };
         run_stage(
             &mut stages,
