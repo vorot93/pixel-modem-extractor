@@ -2165,4 +2165,42 @@ mod tests {
             "original name must be gone from body_c after rewrite: {after}"
         );
     }
+
+    #[test]
+    #[ignore = "measurement: PME_SYMBOLICATE_MEASURE=1 PME_GOLDEN_DIR=<tree>"]
+    fn string_ref_yield_on_retained_tree() {
+        if std::env::var("PME_SYMBOLICATE_MEASURE").ok().as_deref() != Some("1") {
+            eprintln!("skip: set PME_SYMBOLICATE_MEASURE=1");
+            return;
+        }
+        let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(std::path::PathBuf::from) else {
+            eprintln!("skip: set PME_GOLDEN_DIR");
+            return;
+        };
+        if !dir.exists() {
+            eprintln!("skip: PME_GOLDEN_DIR not found: {}", dir.display());
+            return;
+        }
+        let manifest = dir.join("manifest.json");
+        let image_dir = dir.join("images/02_MAIN");
+        // Empty token map isolates the string-ref tier from token guesses.
+        // build_map does not write, so the retained tree is not mutated.
+        let symbols = build_map(&image_dir, "02_MAIN", &HashMap::new(), &manifest).unwrap();
+        let string_ref = symbols
+            .iter()
+            .filter(|s| s.evidence.iter().any(|e| e.kind == "string_ref"))
+            .count();
+        eprintln!("02_MAIN string_ref guesses: {string_ref}");
+        for s in symbols
+            .iter()
+            .filter(|s| s.evidence.iter().any(|e| e.kind == "string_ref"))
+            .take(15)
+        {
+            eprintln!("  {} {}", s.address, s.name.as_deref().unwrap_or("?"));
+        }
+        assert!(
+            string_ref > 4000,
+            "string-ref yield unexpectedly low: {string_ref}"
+        );
+    }
 }
