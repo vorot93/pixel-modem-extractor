@@ -889,11 +889,23 @@ enum SymbolRouteStep {
 
 fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(SymbolRouteStep)) {
     if no_symbol_pass {
+        // Two finalizes. globals recovery consumes the finalized function names
+        // (LoadFinalizedNames reads them off disk, since this route skips the
+        // in-memory projection the normal route uses), so it must follow a finalize.
+        // But the string-ref tier (inside finalize's build_map) needs globals.json
+        // to exist. So: (1) finalize to produce recovered/token names for globals,
+        // deferring the decompiled.c rewrite so its idempotency sentinel does not
+        // block pass 2; (2) run globals (writes globals.json); (3) finalize again —
+        // now the string-ref tier activates, and this pass rewrites decompiled.c
+        // with the full name set. See CONTRIBUTING (symbolication) for the rationale.
         run_step(SymbolRouteStep::Finalize {
-            rewrite_decompiled_c: true,
+            rewrite_decompiled_c: false,
         });
         run_step(SymbolRouteStep::LoadFinalizedNames);
         run_step(SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly));
+        run_step(SymbolRouteStep::Finalize {
+            rewrite_decompiled_c: true,
+        });
     } else {
         run_step(SymbolRouteStep::PrepareNamesAndProjection);
         run_step(SymbolRouteStep::RunGlobals(
@@ -3318,11 +3330,19 @@ mod tests {
         assert_eq!(
             disabled,
             vec![
+                // First finalize produces recovered/token names for LoadFinalizedNames to
+                // feed globals; it does NOT rewrite decompiled.c (so the idempotency sentinel
+                // does not block the second rewrite). string-ref is inert here (no globals.json).
                 SymbolRouteStep::Finalize {
-                    rewrite_decompiled_c: true,
+                    rewrite_decompiled_c: false,
                 },
                 SymbolRouteStep::LoadFinalizedNames,
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly),
+                // Second finalize runs after globals.json exists, so the string-ref tier
+                // activates; this pass rewrites decompiled.c with the full name set.
+                SymbolRouteStep::Finalize {
+                    rewrite_decompiled_c: true,
+                },
             ]
         );
         assert_eq!(
