@@ -181,11 +181,17 @@ module; when a file outgrows that, split it.
   name. Survivors become marked `guess_<ident>_<addr>` `Provisional` names with
   a `string_ref` evidence entry (`class`: `fn_name` | `type_label`); like all
   Provisional names they are never applied in Ghidra (`ApplySymbols.java`
-  renames only `recovered`). The tier is gated on `globals.json` + the raw image
-  being present, so it is inert at the pre-globals `symbol_map` stage and active
-  at `symbolicate_finalize`. Measured on `02_MAIN`: ~8,700 string-ref guesses,
-  audited ~53% the function's own name / ~85% useful (see the design spec).
-  Precision knobs live in `name_guess::string_ref_guess`.
+  renames only `recovered`). The tier is gated on `globals.json` and the raw
+  image being present, and that gate is route-dependent. In the normal
+  `decompose` route, Phase 3.0 writes `globals.json` before
+  `symbolicate_finalize` runs, so the tier is inert at the earlier
+  `symbol_map` stage and active at finalize. Under `--no-symbol-pass`,
+  `symbol_map` is skipped entirely and `symbolicate_finalize` runs *before*
+  the record-only globals stage writes `globals.json`, so on a fresh run the
+  tier is inert there too — it activates only when a `globals.json` from a
+  prior run is already present on disk. Measured on `02_MAIN`: ~8,700
+  string-ref guesses, audited ~53% the function's own name / ~85% useful
+  (see the design spec). Precision knobs live in `name_guess::string_ref_guess`.
 - **`disasm_index::DisasmIndex` (shared infra).** Address-indexed view of a
   `disasm.lst`-format file, O(log L + k) per `slice_for` lookup. Built ONCE
   per image; consumed by `symbolicate::load_functions` (the ARM function
