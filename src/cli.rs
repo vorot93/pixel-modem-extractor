@@ -47,6 +47,8 @@ pub enum Commands {
         shared_pct: f64,
         #[arg(long, default_value_t = 3)]
         min_run: usize,
+        #[arg(long)]
+        modem: Option<String>,
     },
     /// Decode the RF_CFG calibration databases (structural + numeric)
     DecodeRf {
@@ -185,6 +187,7 @@ pub fn run() -> anyhow::Result<()> {
             gap,
             shared_pct,
             min_run,
+            modem,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = input
@@ -198,6 +201,7 @@ pub fn run() -> anyhow::Result<()> {
                 gap,
                 shared_pct,
                 min_run,
+                modem_label: modem,
             };
             let manifest = crate::source_tree::run(&input, &out, &opts)?;
             println!("source tree -> {}", out.display());

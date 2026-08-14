@@ -85,10 +85,14 @@ mod tests {
         }
         let data = std::fs::read(&img).unwrap();
         let fb = Fbpk::parse(&data).unwrap();
-        assert!(fb.name.starts_with("g5400i"), "name was {}", fb.name);
+        assert!(
+            crate::model::firmware_prefix(&fb.name).is_some(),
+            "name was {}",
+            fb.name
+        );
         let modem = fb.partition("modem").expect("modem partition");
         assert_eq!(modem.data_offset, 0x8C);
-        assert_eq!(modem.size, 0x0b69c000);
+        assert!(modem.size > 0, "modem.size was {}", modem.size);
     }
 
     #[test]

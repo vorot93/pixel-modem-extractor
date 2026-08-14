@@ -13,6 +13,7 @@ pub mod globals;
 pub mod gzip;
 pub mod hwcfg;
 pub mod manifest;
+pub mod model;
 pub mod pipeline;
 pub mod recover_source;
 pub mod source_tree;

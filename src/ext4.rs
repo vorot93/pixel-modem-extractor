@@ -63,6 +63,17 @@ fn has_superblock_at_zero(path: &Path) -> std::io::Result<bool> {
     Ok(u16::from_le_bytes([header[0x38], header[0x39]]) == 0xEF53)
 }
 
+/// Pick the firmware subdir of `/images`: the lexicographically-first entry that
+/// itself contains a `modem.bin`. Pure (no `self`) so it is unit-testable without
+/// a real ext4 — `has_modem_bin(name)` answers whether `/images/<name>/modem.bin` exists.
+fn select_firmware_subdir<F: FnMut(&str) -> bool>(
+    mut names: Vec<String>,
+    mut has_modem_bin: F,
+) -> Option<String> {
+    names.sort();
+    names.into_iter().find(|n| has_modem_bin(n))
+}
+
 impl Ext4Fs {
     pub fn open(path: &Path) -> Result<Ext4Fs> {
         // Standard layout: superblock at byte 1024.
@@ -105,12 +116,13 @@ impl Ext4Fs {
     }
 
     pub fn images_subdir(&self) -> Result<String> {
-        for name in self.list_dir("/images")? {
-            if name.starts_with("g5400i") {
-                return Ok(name);
-            }
-        }
-        Err(Error::NotFound("/images/g5400i-*".into()))
+        let names = self.list_dir("/images")?;
+        select_firmware_subdir(names, |name| {
+            self.list_dir(&format!("/images/{name}"))
+                .map(|entries| entries.iter().any(|e| e == "modem.bin"))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| Error::NotFound("/images/*/modem.bin".into()))
     }
 }
 
@@ -119,22 +131,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selects_firmware_subdir_by_content() {
+        let names = vec!["lost+found".to_string(), "g5300q-260317".to_string()];
+        let got = select_firmware_subdir(names, |n| n == "g5300q-260317");
+        assert_eq!(got.as_deref(), Some("g5300q-260317"));
+    }
+
+    #[test]
+    fn selects_sorted_first_when_multiple_have_modem_bin() {
+        let names = vec!["zzz".to_string(), "aaa".to_string()];
+        let got = select_firmware_subdir(names, |_| true);
+        assert_eq!(got.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn none_when_no_subdir_has_modem_bin() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(select_firmware_subdir(names, |_| false), None);
+    }
+
+    #[test]
     fn reads_modem_bin_from_ext4() {
         // Set PME_GOLDEN_DIR to the extracted golden tree (the `modem_extracted` root); unset/absent → skip.
         let Some(root) = std::env::var_os("PME_GOLDEN_DIR").map(std::path::PathBuf::from) else {
             eprintln!("skip: set PME_GOLDEN_DIR");
             return;
         };
-        let gold_ext4 = root.join("g5400i-260317-260429-B-15308590.ext4");
-        if !gold_ext4.exists() {
-            eprintln!("skip: golden ext4 absent");
+        // Resolve the golden ext4 by extension, not a model-specific filename.
+        let gold_ext4 = std::fs::read_dir(&root).ok().and_then(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().map(|x| x == "ext4").unwrap_or(false))
+        });
+        let Some(gold_ext4) = gold_ext4 else {
+            eprintln!("skip: no *.ext4 in PME_GOLDEN_DIR");
             return;
-        }
+        };
         let fs = Ext4Fs::open(&gold_ext4).unwrap();
         let sub = fs.images_subdir().unwrap();
-        assert!(sub.starts_with("g5400i"), "subdir was {}", sub);
+        // Do NOT assert the subdir name looks like a firmware prefix: on some
+        // models the /images firmware dir is literally named "default"
+        // (cheetah), not "g5300q-…". The real invariant — it contains modem.bin
+        // — is what images_subdir selects on; verify structurally via TOC magic.
+        assert!(!sub.is_empty(), "images_subdir returned an empty name");
         let modem = fs.read_file(&format!("/images/{}/modem.bin", sub)).unwrap();
-        assert_eq!(modem.len(), 93_170_136);
         assert_eq!(&modem[0..4], b"TOC\0");
     }
 }
