@@ -73,6 +73,28 @@ pub fn unique_ident(data_refs: &[u64], strings: &HashMap<u64, String>) -> Option
     }
 }
 
+/// Turn a function's candidate identifier into a fail-closed `guess_` name
+/// candidate, or reject. `ident_count[id]` is the image-wide count of functions
+/// whose `unique_ident` is `id`; `globals` are recovered global names; `fn_names`
+/// are known function names elsewhere in the image. Rejects: not referenced by
+/// exactly one function, an all-caps message constant, a global name, or another
+/// function's name. Survivors carry a descriptive `Class`.
+pub fn string_ref_guess(
+    cand: Option<&str>,
+    ident_count: &HashMap<String, usize>,
+    globals: &HashSet<String>,
+    fn_names: &HashSet<String>,
+) -> Option<(String, Class)> {
+    let id = cand?;
+    if ident_count.get(id).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    if is_all_caps(id) || globals.contains(id) || fn_names.contains(id) {
+        return None;
+    }
+    Some((id.to_string(), classify(id)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +161,45 @@ mod tests {
         assert!(!is_ident("ab")); // too short
         assert!(!is_ident("has space"));
         assert!(!is_ident("dir/file.c")); // path
+    }
+
+    fn ctx() -> (HashMap<String, usize>, HashSet<String>, HashSet<String>) {
+        let mut count = HashMap::new();
+        for id in [
+            "RF_SM_Set_ET_Voltage",
+            "Asn_Foo_r4",
+            "TMU_G",
+            "AliasedName",
+            "NS_REQ",
+        ] {
+            count.insert(id.to_string(), 1);
+        }
+        count.insert("Shared_Api".to_string(), 2); // referenced by two functions
+        let globals: HashSet<String> = ["TMU_G".to_string()].into_iter().collect();
+        let fn_names: HashSet<String> = ["AliasedName".to_string()].into_iter().collect();
+        (count, globals, fn_names)
+    }
+
+    #[test]
+    fn accepts_fn_name_and_type_label() {
+        let (count, g, f) = ctx();
+        assert_eq!(
+            string_ref_guess(Some("RF_SM_Set_ET_Voltage"), &count, &g, &f),
+            Some(("RF_SM_Set_ET_Voltage".to_string(), Class::FnName))
+        );
+        assert_eq!(
+            string_ref_guess(Some("Asn_Foo_r4"), &count, &g, &f),
+            Some(("Asn_Foo_r4".to_string(), Class::TypeLabel))
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_classes() {
+        let (count, g, f) = ctx();
+        assert_eq!(string_ref_guess(None, &count, &g, &f), None); // no candidate
+        assert_eq!(string_ref_guess(Some("NS_REQ"), &count, &g, &f), None); // all-caps const
+        assert_eq!(string_ref_guess(Some("TMU_G"), &count, &g, &f), None); // recovered global
+        assert_eq!(string_ref_guess(Some("AliasedName"), &count, &g, &f), None); // another fn's name
+        assert_eq!(string_ref_guess(Some("Shared_Api"), &count, &g, &f), None); // not 1:1 image-wide
     }
 }
