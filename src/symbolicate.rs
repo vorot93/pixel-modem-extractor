@@ -3,8 +3,11 @@
 //! (the pw_tokenizer DB, `__func__` strings, attributed strings, existing
 //! attribution), then rewrite the artifacts in place + emit `symbols.json`.
 //! Pure-Rust; ARM and Thumb. Fail-closed and tiered: only `__func__` yields a
-//! real rename, only a token yields a marked `guess_…` name, everything else is
-//! a comment.
+//! real (`Recovered`) rename; a token or a uniquely-referenced identifier
+//! string yields a marked `guess_…` name (`Provisional`, never baked into
+//! Ghidra); everything else is a comment. Precedence: `__func__` > token >
+//! string-ref. See `symbolicate/name_guess.rs` for the string-reference
+//! classifier.
 use crate::error::{Error, Result};
 use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
