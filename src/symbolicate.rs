@@ -355,16 +355,6 @@ pub fn build_string_map(image: &[u8], load_addr: u64, min_run: usize) -> HashMap
         .collect()
 }
 
-/// A bare C identifier (3–64 chars), i.e. a plausible `__func__` value.
-fn is_ident(s: &str) -> bool {
-    let n = s.len();
-    (3..=64).contains(&n)
-        && s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Recover a function's `__func__` name: it must reference a `__FILE__`
 /// occurrence vaddr (proving an assert/log site), and exactly one *distinct*
 /// `data_refs` identifier must resolve (unambiguous → fail-closed). Dedup by
@@ -379,17 +369,7 @@ pub fn recover_func_name(
     if !data_refs.iter().any(|r| file_occ.contains(r)) {
         return None;
     }
-    let mut seen: HashSet<&str> = HashSet::new();
-    let idents: Vec<&String> = data_refs
-        .iter()
-        .filter_map(|r| strings.get(r))
-        .filter(|s| is_ident(s))
-        .filter(|s| seen.insert(s.as_str()))
-        .collect();
-    match idents.as_slice() {
-        [only] => Some((*only).clone()),
-        _ => None,
-    }
+    name_guess::unique_ident(data_refs, strings)
 }
 
 fn parse_hex(s: &str) -> Result<u64> {

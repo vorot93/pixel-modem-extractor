@@ -2,6 +2,8 @@
 //! referenced identifier string into a fail-closed `guess_` name candidate.
 //! Pure; see the design spec. Never yields authoritative (`Recovered`) names.
 
+use std::collections::{HashMap, HashSet};
+
 /// What a surviving candidate identifier most likely names. Descriptive
 /// provenance only — both variants are named; it does not gate acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,33 @@ fn has_release_tag(id: &str) -> bool {
         .any(|i| b[i] == b'_' && b[i + 1] == b'r' && b[i + 2].is_ascii_digit())
 }
 
+/// A bare C identifier (3–64 chars), i.e. a plausible `__func__` / symbol name.
+pub fn is_ident(s: &str) -> bool {
+    let n = s.len();
+    (3..=64).contains(&n)
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The single *distinct* `is_ident` string among `data_refs` (dedup by content
+/// first, so a legitimately-repeated `__func__` ref is not treated as
+/// ambiguous). `None` for zero or more than one distinct identifier — fail-closed.
+pub fn unique_ident(data_refs: &[u64], strings: &HashMap<u64, String>) -> Option<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let idents: Vec<&String> = data_refs
+        .iter()
+        .filter_map(|r| strings.get(r))
+        .filter(|s| is_ident(s))
+        .filter(|s| seen.insert(s.as_str()))
+        .collect();
+    match idents.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +100,44 @@ mod tests {
     fn class_str_is_stable() {
         assert_eq!(Class::FnName.as_str(), "fn_name");
         assert_eq!(Class::TypeLabel.as_str(), "type_label");
+    }
+
+    #[test]
+    fn unique_ident_returns_single_distinct_identifier() {
+        let mut s = HashMap::new();
+        s.insert(0x200u64, "LteRrc_Reestab".to_string());
+        assert_eq!(
+            unique_ident(&[0x200], &s),
+            Some("LteRrc_Reestab".to_string())
+        );
+    }
+
+    #[test]
+    fn unique_ident_dedups_repeated_identifier() {
+        // same __func__ referenced twice (two asserts) is not ambiguous
+        let mut s = HashMap::new();
+        s.insert(0x200u64, "Foo_Bar".to_string());
+        s.insert(0x208u64, "Foo_Bar".to_string());
+        assert_eq!(
+            unique_ident(&[0x200, 0x208], &s),
+            Some("Foo_Bar".to_string())
+        );
+    }
+
+    #[test]
+    fn unique_ident_is_none_when_ambiguous_or_absent() {
+        let mut s = HashMap::new();
+        s.insert(0x200u64, "Foo_Bar".to_string());
+        s.insert(0x300u64, "Other_Ident".to_string());
+        assert_eq!(unique_ident(&[0x200, 0x300], &s), None); // two distinct
+        assert_eq!(unique_ident(&[], &s), None); // none
+    }
+
+    #[test]
+    fn is_ident_rejects_paths_and_short_strings() {
+        assert!(is_ident("LteRrc_Reestab"));
+        assert!(!is_ident("ab")); // too short
+        assert!(!is_ident("has space"));
+        assert!(!is_ident("dir/file.c")); // path
     }
 }
