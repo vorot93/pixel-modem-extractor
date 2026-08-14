@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub mod name_guess;
+
 pub const GUESS_PREFIX: &str = "guess_";
 
 pub struct Opts {
