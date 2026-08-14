@@ -179,10 +179,14 @@ module; when a file outgrows that, split it.
   referenced by exactly one function image-wide and is not an all-caps message
   constant, a recovered global name (`globals.json`), or another function's
   name. Survivors become marked `guess_<ident>_<addr>` `Provisional` names with
-  a `string_ref` evidence entry (`class`: `fn_name` | `type_label`); like all
-  Provisional names they are never applied in Ghidra (`ApplySymbols.java`
-  renames only `recovered`). The tier is gated on `globals.json` and the raw
-  image being present, and that gate is route-dependent. In the normal
+  a `string_ref` evidence entry (`class`: `fn_name` | `type_label`). They never
+  reach Ghidra's pass-2 output — not because `ApplySymbols.java` skips them
+  (it doesn't: it renames every symbol it's given a `name` for, applying
+  `recovered` as `USER_DEFINED` and everything else, including token-tier
+  guesses, as `ANALYSIS`), but because this tier is computed only at the
+  post-globals `symbolicate_finalize` stage, never at the pre-globals
+  `symbol_map` stage that produces ApplySymbols' input. That gate
+  (`globals.json` and the raw image present) is route-dependent. In the normal
   `decompose` route, Phase 3.0 writes `globals.json` before
   `symbolicate_finalize` runs, so the tier is inert at the earlier
   `symbol_map` stage and active at finalize. Under `--no-symbol-pass`,

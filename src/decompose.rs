@@ -1523,6 +1523,13 @@ fn record_globals_stage(
 /// can distinguish "no symbols recovered" from "stage errored" — the previous
 /// all-`unwrap_or_default` / `.is_ok()` shape silently swallowed real failures
 /// into a benign-looking `symbol_map: skipped`.
+///
+/// Ordering is load-bearing: this runs at the `symbol_map` stage, before
+/// `globals.json` exists, so `symbolicate::build_map`'s string-ref tier is
+/// inert here and none of its guesses land in this stage's output — which is
+/// exactly what `ApplySymbols.java` (Ghidra pass 2) consumes as input. Moving
+/// this call to after the globals stage would silently start baking
+/// string-ref guesses into Ghidra as `ANALYSIS`-source names.
 fn build_and_write_symbol_maps(
     out: &Path,
     images_dir: &Path,

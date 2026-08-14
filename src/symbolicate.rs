@@ -4,10 +4,12 @@
 //! attribution), then rewrite the artifacts in place + emit `symbols.json`.
 //! Pure-Rust; ARM and Thumb. Fail-closed and tiered: only `__func__` yields a
 //! real (`Recovered`) rename; a token or a uniquely-referenced identifier
-//! string yields a marked `guess_…` name (`Provisional`, never baked into
-//! Ghidra); everything else is a comment. Precedence: `__func__` > token >
-//! string-ref. See `symbolicate/name_guess.rs` for the string-reference
-//! classifier.
+//! string yields a marked `guess_…` name (`Provisional`). Provisional names
+//! are never applied to Ghidra as an authoritative (`USER_DEFINED`) symbol;
+//! string-ref guesses specifically are computed only by the post-globals
+//! finalize rewrite, so they never even appear in Ghidra's pass-2 input.
+//! Everything else is a comment. Precedence: `__func__` > token > string-ref.
+//! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::error::{Error, Result};
 use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
