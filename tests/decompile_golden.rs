@@ -1023,6 +1023,159 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pass-2 global-types end-to-end: proves `ApplyGlobalTypes.java` widens
+/// undefined bytes into an `undefinedN` type against real Ghidra, and that a
+/// span colliding with a defined instruction is skipped rather than applied.
+///
+/// Reuses the exact crafted blob from
+/// `pass2_applies_functions_and_strict_globals_in_one_process` (LDR-from-
+/// data-word + six vector-slot self-branches), whose comment establishes that
+/// address 0x20 is a genuine data word real Ghidra's auto-analysis leaves
+/// undefined — the self-branches keep vector/flow analysis from ever reaching
+/// it, and it is exactly the `DAT_00000020` address that test's `ApplyGlobals`
+/// case renames. That same address is this test's type-application target.
+/// Ghidra additionally recognizes the 8x4-byte lead-in as an ARM exception
+/// vector table (`Reset`, `UndefinedInstruction`, `SupervisorCall`, ...),
+/// which only sharpens the fixture: `Reset` (0x0..0x4) is a real, disassembled
+/// instruction (the LDR) that a second type candidate is aimed at to force a
+/// span collision.
+///
+/// Note on the `decompiled.c` assertion below: Ghidra's decompiler infers
+/// `undefined4` for the `DAT_00000020` read from the LDR's own 4-byte access
+/// size, independent of whatever the Listing's committed data type is — so
+/// `decompiled.c` already reads `undefined4` even in the pass-1-only export,
+/// before `ApplyGlobalTypes.java` ever runs (verified while developing this
+/// test). The authoritative, discriminating proof that real
+/// `DataUtilities.createData` calls actually ran against the Listing is the
+/// parsed `global_types_applied`/`global_types_apply_skipped` counts below,
+/// which can only be `Some(1)`/`Some(1)` if the captured `analyzeHeadless`
+/// stdout contained a conserving `ApplyGlobalTypes: {"image":"00_BOOT",
+/// "status":"ok",...}` line (see `parse_apply_global_types_summary`) — i.e.
+/// one `DataUtilities.createData` call succeeded (0x20, no conflict) and one
+/// threw `CodeUnitInsertionException` (0x0, the live LDR instruction), which
+/// is only possible if `Undefined.getUndefinedDataType`, `DataUtilities.
+/// createData`, `ClearDataMode.CLEAR_ALL_UNDEFINED_CONFLICT_DATA`, and the
+/// `CodeUnitInsertionException` catch all resolved and worked as intended
+/// under the installed Ghidra. The `decompiled.c` check is kept as the
+/// brief's requested supplementary/visible confirmation that the export
+/// reflects the applied type at the right site, not as the primary signal.
+#[test]
+fn pass2_applies_global_types_and_skips_span_collision() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+
+    // ldr r0, [pc, #0x18]; bx lr; six vector-slot self-branches; one data word
+    // at 0x20 — identical to the ApplyGlobals pass-2 test's fixture.
+    let mut arm = vec![0x18u8, 0x00, 0x9f, 0xe5, 0x1e, 0xff, 0x2f, 0xe1];
+    for _ in 0..6 {
+        arm.extend([0xfe, 0xff, 0xff, 0xea]); // b .
+    }
+    arm.extend([0x78, 0x56, 0x34, 0x12]);
+    let modem = craft_modem_bin(&arm);
+
+    let dir = std::env::temp_dir().join(format!("pme_decompile_gtypes_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home),
+        processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+    };
+
+    // Pass 1: analyze. Confirm the fixture still produces the genuine 0x20
+    // data reference this test's type-application target depends on.
+    let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+    let pass1_functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
+            .unwrap();
+    assert!(
+        pass1_functions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|function| function["data_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reference| reference == "0x20")),
+        "fixture did not produce a genuine data reference: {pass1_functions}"
+    );
+
+    // Two candidates: 0x20 (undefined data word -> applies), 0x0 (the live
+    // `Reset` LDR instruction -> its span collides and is skipped).
+    let map_path = out.join("global-types-map.json");
+    let types_map = serde_json::json!({
+        "format": "pixel-modem-extractor-global-types-v1",
+        "image": "00_BOOT",
+        "types": [
+            {"address": "0x20", "width": 4},
+            {"address": "0x0", "width": 4},
+        ],
+    });
+    std::fs::write(&map_path, serde_json::to_string_pretty(&types_map).unwrap()).unwrap();
+
+    let inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: None,
+            global_map: None,
+            global_types_map: Some(prepared_pass2_map(&map_path, 2)),
+        },
+    )]);
+    let pass2 =
+        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
+    assert_eq!(
+        pass2.outcomes["00_BOOT"],
+        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    );
+    let boot = pass2
+        .report
+        .images
+        .iter()
+        .find(|r| r.label == "00_BOOT")
+        .expect("00_BOOT in pass-2 report");
+    // Corresponds to a captured analyzeHeadless stdout line
+    // `ApplyGlobalTypes: {"image":"00_BOOT","status":"ok","candidates":2,
+    // "applied":1,"skipped_outside_memory":0,"skipped_collision":1}` —
+    // verified verbatim against real Ghidra while developing this test.
+    assert_eq!(
+        boot.global_types_applied,
+        Some(1),
+        "global_types_apply_error: {:?}",
+        boot.global_types_apply_error
+    );
+    assert_eq!(
+        boot.global_types_apply_skipped,
+        Some(1),
+        "expected exactly the 0x0/Reset-instruction span collision to be skipped"
+    );
+    assert!(
+        boot.global_types_apply_error.is_none(),
+        "global_types_apply_error: {:?}",
+        boot.global_types_apply_error
+    );
+
+    // The regenerated export reflects the applied undefined4 at the typed
+    // global's reference site (see the doc comment above for why this is
+    // supplementary, not the discriminating, proof).
+    let c = std::fs::read_to_string(out.join("export/00_BOOT/decompiled.c")).unwrap();
+    assert!(
+        c.contains("undefined4 Reset(void)") && c.contains("return DAT_00000020;"),
+        "decompiled.c missing the undefined4 global at its 0x20 reference site:\n{c}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Hand-assembled minimal Thumb-2 function: `push {r7, lr}; movs r0, #0; pop {r7, pc}`.
 /// Used by the Phase-2 mode-dispatch e2e tests below. Under the `ARM:LE:32:v7`
 /// language Ghidra does not auto-switch into Thumb mode for these bytes alone
