@@ -278,6 +278,7 @@ public class ApplySymbols extends GhidraScript {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: Some(prepared_pass2_map(&map, 1)),
             global_map: None,
+            global_types_map: None,
         },
     )]);
     let pass2 =
@@ -382,6 +383,7 @@ public class ApplySymbols extends GhidraScript {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: Some(prepared_pass2_map(&map, 1)),
             global_map: None,
+            global_types_map: None,
         },
     )]);
     let pass2 =
@@ -476,6 +478,7 @@ public class ApplySymbols extends GhidraScript {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: Some(prepared_pass2_map(&map, 1)),
             global_map: None,
+            global_types_map: None,
         },
     )]);
     let _pass2 =
@@ -581,6 +584,7 @@ public class ApplySymbols extends GhidraScript {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: Some(prepared_pass2_map(&map, 1)),
             global_map: None,
+            global_types_map: None,
         },
     )]);
     let pass2 =
@@ -782,6 +786,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: None,
             global_map: Some(prepared_pass2_map(&global_map_path, 2)),
+            global_types_map: None,
         },
     )]);
     let duplicate_run = pixel_modem_extractor::decompile::run_two_pass(
@@ -844,6 +849,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: Some(prepared_pass2_map(&map_path, 1)),
             global_map: Some(prepared_pass2_map(&global_map_path, 2)),
+            global_types_map: None,
         },
     )]);
 
@@ -924,6 +930,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: None,
             global_map: Some(prepared_pass2_map(&global_map_path, 1)),
+            global_types_map: None,
         },
     )]);
     let rep3 = pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &globals_only)
@@ -973,6 +980,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         pixel_modem_extractor::decompile::Pass2Input {
             function_map: Some(prepared_pass2_map(&map_path, 1)),
             global_map: Some(prepared_pass2_map(&global_map_path, 1)),
+            global_types_map: None,
         },
     )]);
     let invalid_run =
