@@ -9,6 +9,7 @@ pub(crate) mod execution_ranges;
 pub mod ext4;
 pub mod fbpk;
 pub mod global_shapes;
+pub mod global_types;
 pub mod globals;
 pub mod gzip;
 pub mod hwcfg;
