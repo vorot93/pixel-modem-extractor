@@ -27,6 +27,7 @@ const EXPORT_DECOMP_JAVA: &str = include_str!("ghidra/ExportDecomp.java");
 const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
 const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
+const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 /// Ghidra project name passed to `analyzeHeadless` (the directory is
@@ -806,16 +807,20 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals}.java
+    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
-    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols
-    //    and ApplyGlobals are staged for pass-2 application.)
+    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols,
+    //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
     std::fs::write(scripts.join("ApplyGlobals.java"), APPLY_GLOBALS_JAVA)?;
+    std::fs::write(
+        scripts.join("ApplyGlobalTypes.java"),
+        APPLY_GLOBAL_TYPES_JAVA,
+    )?;
 
     // 3. machine-readable load spec -> out/ghidra_load.json
     let source_name = modem_bin
