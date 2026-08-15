@@ -951,7 +951,14 @@ hardcoded. Two reference images exercise both models end-to-end:
   `decoder.rs`.
 - **Phase 3.2 type application.** Default-on in every normal-route `decompose`
   (there is no pass 2 on `--no-symbol-pass`, so this never runs there —
-  shapes are still recovered into the sidecar on that route). **Scope is
+  shapes are still recovered into the sidecar on that route). **Fidelity is
+  width-only by design:** we apply `undefined<width>` — asserting only the
+  proven byte width, never signedness or a concrete interpretation, since no
+  evidence supports one (a wrong sign would mis-render every read of the
+  global). Ghidra still coalesces the bytes into one typed slot and the
+  decompiler renders each read as a single value; the type name simply stays
+  "N bytes, interpretation unknown" — the same "assert only what you proved"
+  discipline as the rest of the fail-closed pipeline. **Scope is
   scalar-only by measured evidence:** on the retained cheetah `01_MAIN` tree,
   of 274 `inferred` globals, 270 are `scalar_candidate` (widths skew to
   4-byte: 243, plus 23×1-byte and 4×2-byte), 1 is `array_candidate`, and 3

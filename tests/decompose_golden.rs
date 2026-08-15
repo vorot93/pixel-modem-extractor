@@ -768,13 +768,16 @@ fn global_types_applied_on_retained_tree() {
         applied <= candidates,
         "global_types_applied must not exceed global_types_candidates on 02_MAIN: {main}"
     );
-    // Measured on the retained MAIN tree (task-9-brief.md, Fidelity/scope
-    // decisions): 270 of 274 inferred globals are scalar candidates (1
-    // array, 3 unknown), so a healthy run applies somewhere in the
-    // neighborhood of 120-270 of them — the exact count depends on how many
-    // candidates collide with existing data or fall outside program memory
-    // and are skipped instead. Pin only the non-zero floor here; a tighter
-    // band would make this test babysit Ghidra's analysis nondeterminism.
+    // The 270-of-274-inferred-globals-are-scalar-candidates split (1 array,
+    // 3 unknown; task-9-brief.md, Fidelity/scope decisions) was measured on
+    // the retained CHEETAH `01_MAIN` tree, not this test's MUSTANG `02_MAIN`
+    // target — `02_MAIN` has a different, smaller inferred count (125 per
+    // the Phase 3.2 production baseline in CONTRIBUTING.md) and no
+    // independently measured scalar/array/unknown split of its own, so a
+    // healthy run here applies some unmeasured number up to that ~125
+    // ceiling, not the cheetah figure. Pin only the non-zero floor; a
+    // tighter band would both babysit Ghidra's analysis nondeterminism and
+    // require a `02_MAIN`-specific measurement this test doesn't have.
     assert!(
         applied >= 1,
         "expected at least one recovered global type applied on 02_MAIN, got {applied} \
