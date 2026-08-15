@@ -1594,7 +1594,7 @@ fn parse_apply_global_types_summary(
         .ok_or_else(|| "ApplyGlobalTypes summary image is not a string".to_string())?;
     if image != expected_image {
         return Err(format!(
-            "ApplyGlobalTypes summary image {image} does not match {expected_image}"
+            "ApplyGlobalTypes summary image {image:?} does not match {expected_image:?}"
         ));
     }
     let status = object
@@ -1602,13 +1602,21 @@ fn parse_apply_global_types_summary(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "ApplyGlobalTypes summary status is not a string".to_string())?;
     match status {
-        "error" => Ok(ApplyGlobalTypesSummary::Error {
-            reason: object
+        "error" => {
+            let reason = object
                 .get("error")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("ApplyGlobalTypes reported an error")
-                .to_string(),
-        }),
+                .ok_or_else(|| "ApplyGlobalTypes error summary has no string error".to_string())?;
+            let reason_chars = reason.chars().count();
+            if reason.is_empty() || reason_chars > GLOBALS_APPLY_ERROR_MAX_CHARS {
+                return Err(format!(
+                    "ApplyGlobalTypes error reason length {reason_chars} is outside 1..={GLOBALS_APPLY_ERROR_MAX_CHARS}"
+                ));
+            }
+            Ok(ApplyGlobalTypesSummary::Error {
+                reason: reason.to_string(),
+            })
+        }
         "ok" => {
             let candidates = apply_global_types_count(object, "candidates")?;
             let applied = apply_global_types_count(object, "applied")?;
@@ -1699,6 +1707,7 @@ pub fn run_two_pass(
 
         let applies_functions = input.function_map.is_some();
         let applies_globals = input.global_map.is_some();
+        let applies_global_types = input.global_types_map.is_some();
         if applies_functions {
             ir.pass2_applied = None;
         }
@@ -1706,6 +1715,11 @@ pub fn run_two_pass(
             ir.globals_applied = None;
             ir.globals_apply_skipped = None;
             ir.globals_apply_error = None;
+        }
+        if applies_global_types {
+            ir.global_types_applied = None;
+            ir.global_types_apply_skipped = None;
+            ir.global_types_apply_error = None;
         }
 
         tracing::info!("ghidra: pass 2 application for {}", ir.label);
@@ -1744,9 +1758,6 @@ pub fn run_two_pass(
                     }
                 }
             }
-            ir.global_types_applied = None;
-            ir.global_types_apply_skipped = None;
-            ir.global_types_apply_error = None;
             if input.global_types_map.is_some() {
                 match parse_apply_global_types_summary(&stdout, &ir.label) {
                     Ok(summary) => match summary.applied_and_skipped() {
@@ -3667,6 +3678,46 @@ mod tests {
     fn parse_apply_global_types_summary_rejects_wrong_image() {
         let line = r#"ApplyGlobalTypes: {"image":"OTHER","status":"ok","candidates":0,"applied":0,"skipped_outside_memory":0,"skipped_collision":0}"#;
         assert!(parse_apply_global_types_summary(line, "02_MAIN").is_err());
+    }
+
+    #[test]
+    fn parse_apply_global_types_summary_rejects_error_status_without_string_reason() {
+        for stdout in [
+            r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"error"}"#,
+            r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"error","error":42}"#,
+        ] {
+            assert!(
+                parse_apply_global_types_summary(stdout, "02_MAIN").is_err(),
+                "fail-open error summary unexpectedly accepted: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_apply_global_types_summary_accepts_only_bounded_error_reason() {
+        let summary = parse_apply_global_types_summary(
+            r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"error","error":"bad format"}"#,
+            "02_MAIN",
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            ApplyGlobalTypesSummary::Error {
+                reason: "bad format".to_string()
+            }
+        );
+
+        let max_reason = "🛰".repeat(2_048);
+        let at_limit = format!(
+            "ApplyGlobalTypes: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{max_reason}\"}}"
+        );
+        assert!(parse_apply_global_types_summary(&at_limit, "02_MAIN").is_ok());
+
+        let over_limit = format!(
+            "ApplyGlobalTypes: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{}\"}}",
+            "🛰".repeat(2_049)
+        );
+        assert!(parse_apply_global_types_summary(&over_limit, "02_MAIN").is_err());
     }
 
     #[test]
