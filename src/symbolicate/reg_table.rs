@@ -17,8 +17,6 @@ pub struct RegEntry {
     /// Target function entry, Thumb bit stripped.
     pub fn_addr: u64,
     pub arch: &'static str, // "arm" | "thumb"
-    /// vaddr of the record's first word.
-    pub table_addr: u64,
     /// Bytes per record (always 8 — the two supported layouts are both stride-8).
     pub stride: u8,
 }
@@ -27,9 +25,9 @@ pub struct RegEntry {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RegScan {
     /// The full detected-table inventory, in image order (before 1:1
-    /// resolution). Not consumed by naming — `names` is — but a record of every
-    /// `{name, fn}` record found, and the natural source for a future
-    /// table-level artifact.
+    /// resolution) — every `{name, fn}` record found. `names` is what naming
+    /// consumes; `entries` records what detection alone found (so a table entry
+    /// dropped by the 1:1 rule is still visible here, which the tests rely on).
     pub entries: Vec<RegEntry>,
     /// Fail-closed authoritative names: `fn_addr` (no Thumb bit) → name, only
     /// where both the name and the function map 1:1. This is what `build_map`
@@ -42,8 +40,12 @@ pub struct RegScan {
 /// entry address (no Thumb bit) to its arch and is the acceptance gate: a name
 /// is minted only when the pointer resolves to a known function. `globals` and
 /// `fn_names` are rejected as names (an aliased global / another function's
-/// name). Names that are not 1:1 (a name at >1 function, or a function under >1
-/// distinct name) are dropped from `names` but retained in `entries`.
+/// name) — but only as completely as those sets are populated: the caller
+/// supplies them, and at the pre-globals `symbol_map` stage `globals` is empty
+/// (see `build_map`), so global-alias rejection is best-effort there. Any
+/// residual name collision is handled downstream by `finalize_names`. Names
+/// that are not 1:1 (a name at >1 function, or a function under >1 distinct
+/// name) are dropped from `names` but retained in `entries`.
 pub fn scan(
     image: &[u8],
     load_addr: u64,
@@ -52,16 +54,21 @@ pub fn scan(
     fn_names: &HashSet<String>,
 ) -> RegScan {
     let words = classify_words(image, load_addr, fn_entries);
-    let entries = find_tables(&words, load_addr);
+    let entries = find_tables(&words, image, load_addr);
     let names = resolve_names(&entries, globals, fn_names);
     RegScan { entries, names }
 }
 
-/// A classified 4-aligned image word: a pointer to an identifier string, a
-/// pointer to a known function entry (Thumb bit stripped), or neither.
+/// A classified 4-aligned image word. Both pointer variants carry only the
+/// word's *value* (not a materialized `String`), so classifying a multi-MB
+/// image allocates nothing per word — the name string is read back from the
+/// image only for the handful of words that end up inside a confirmed table.
+#[derive(Clone, Copy)]
 enum Word {
-    Name(String),
-    Fn(u64, &'static str),
+    /// vaddr of an identifier string.
+    Name(u32),
+    /// (function entry with Thumb bit stripped, is_thumb).
+    Fn(u32, bool),
     Other,
 }
 
@@ -78,10 +85,10 @@ fn classify_words(
     for i in 0..nwords {
         let o = i * 4;
         let v = u32::from_le_bytes([image[o], image[o + 1], image[o + 2], image[o + 3]]);
-        let w = if let Some(name) = read_ident_at(image, load_addr, v as u64) {
-            Word::Name(name)
+        let w = if ident_range_at(image, load_addr, v as u64).is_some() {
+            Word::Name(v)
         } else if let Some(&arch) = fn_entries.get(&((v & !1) as u64)) {
-            Word::Fn((v & !1) as u64, arch)
+            Word::Fn(v & !1, arch == "thumb")
         } else {
             Word::Other
         };
@@ -111,10 +118,10 @@ struct Run {
 /// **longest-run-first**. This is what keeps a reversed `{fn, name}` table from
 /// being misread by the forward layout shifted one word in: the true run is
 /// always one record longer than its shifted misread, so it claims the span.
-fn find_tables(words: &[Word], load_addr: u64) -> Vec<RegEntry> {
+fn find_tables(words: &[Word], image: &[u8], load_addr: u64) -> Vec<RegEntry> {
     let nwords = words.len();
     let is_name = |w: &Word| matches!(w, Word::Name(_));
-    let is_fn = |w: &Word| matches!(w, Word::Fn(_, _));
+    let is_fn = |w: &Word| matches!(w, Word::Fn(..));
 
     let mut runs: Vec<Run> = Vec::new();
     for &(stride_w, name_off, fn_off) in LAYOUTS {
@@ -159,20 +166,20 @@ fn find_tables(words: &[Word], load_addr: u64) -> Vec<RegEntry> {
         consumed[r.start..r.start + span].fill(true);
         for k in 0..r.records {
             let base = r.start + k * r.stride_w;
-            if let (Word::Name(name), Word::Fn(fa, arch)) =
-                (&words[base + r.name_off], &words[base + r.fn_off])
+            if let (Word::Name(nv), Word::Fn(fa, is_thumb)) =
+                (words[base + r.name_off], words[base + r.fn_off])
+                && let Some(name) = read_ident_at(image, load_addr, nv as u64)
             {
                 entries.push(RegEntry {
-                    name: name.clone(),
-                    fn_addr: *fa,
-                    arch,
-                    table_addr: load_addr + (base * 4) as u64,
+                    name,
+                    fn_addr: fa as u64,
+                    arch: if is_thumb { "thumb" } else { "arm" },
                     stride: (r.stride_w * 4) as u8,
                 });
             }
         }
     }
-    entries.sort_by_key(|e| e.table_addr);
+    entries.sort_by_key(|e| e.fn_addr);
     entries
 }
 
@@ -210,10 +217,12 @@ fn resolve_names(
     names
 }
 
-/// Read a NUL-terminated printable-ASCII C identifier stored at `vaddr`, or
-/// `None` if the address is out of range, the bytes are not printable, the
-/// string is not NUL-terminated within range, or it is not an `is_ident`.
-pub fn read_ident_at(image: &[u8], load_addr: u64, vaddr: u64) -> Option<String> {
+/// Byte range `[start, end)` of a NUL-terminated printable-ASCII C identifier
+/// stored at `vaddr`, or `None` (out of range / non-printable / unterminated /
+/// not an `is_ident`). The allocation-free core of [`read_ident_at`], so a
+/// whole-image classification pass can test every word without building a
+/// `String` for each candidate.
+fn ident_range_at(image: &[u8], load_addr: u64, vaddr: u64) -> Option<(usize, usize)> {
     let start = vaddr.checked_sub(load_addr)? as usize;
     let mut o = start;
     while o < image.len() && image[o] != 0 && o - start < MAX_NAME {
@@ -226,7 +235,16 @@ pub fn read_ident_at(image: &[u8], load_addr: u64, vaddr: u64) -> Option<String>
         return None; // ran off the end / not NUL-terminated in range
     }
     let s = std::str::from_utf8(&image[start..o]).ok()?;
-    is_ident(s).then(|| s.to_string())
+    is_ident(s).then_some((start, o))
+}
+
+/// Read a NUL-terminated printable-ASCII C identifier stored at `vaddr`, or
+/// `None` if the address is out of range, the bytes are not printable, the
+/// string is not NUL-terminated within range, or it is not an `is_ident`.
+pub fn read_ident_at(image: &[u8], load_addr: u64, vaddr: u64) -> Option<String> {
+    let (start, end) = ident_range_at(image, load_addr, vaddr)?;
+    // `ident_range_at` already validated printable ASCII (=> valid UTF-8).
+    Some(String::from_utf8_lossy(&image[start..end]).into_owned())
 }
 
 /// Upper bound on a scanned name length (keeps the string search cheap and is

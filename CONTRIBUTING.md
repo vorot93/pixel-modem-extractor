@@ -256,7 +256,12 @@ hardcoded. Two reference images exercise both models end-to-end:
   prologue heuristics. Further fail-closed rules: the name must be a clean
   `is_ident`; strict **1:1** (a name at >1 function, or a function under >1
   distinct name, is dropped); a name that aliases a recovered global or another
-  function's name is rejected. **All-caps names are accepted here** (unlike the
+  function's name is rejected; and a table entry never overrides a function's
+  pre-existing *real* (non-`FUN_`) name — it defers, like string-ref. (The
+  recovered-global rejection is best-effort at the `symbol_map` stage since
+  `globals.json` does not exist yet there; any residual collision is handled by
+  `finalize_names`, which suffixes duplicate `Recovered` names with `_<addr>`.)
+  **All-caps names are accepted here** (unlike the
   string-ref tier) — `PICH_HISR` is a real ISR name, and the table structure
   earns that trust. Layout: both stride-8 orders (`{name,fn}` and `{fn,name}`)
   occur and carry comparable yield; detection is **longest-run-first** so a

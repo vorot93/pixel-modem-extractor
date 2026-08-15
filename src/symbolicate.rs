@@ -1107,7 +1107,13 @@ pub(crate) fn build_map(
             file,
             file_strings: fstrings,
             ident_guess,
-            registration: reg_names.get(&f.entry).cloned(),
+            // Authoritative, but must not clobber a pre-existing real (non-FUN_)
+            // name (e.g. a Ghidra FID match) — like the string-ref tier, defer.
+            registration: if is_real_name(&f.name) {
+                None
+            } else {
+                reg_names.get(&f.entry).cloned()
+            },
         };
         let (name, tier, evidence, annotations) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
@@ -2075,6 +2081,67 @@ mod tests {
         assert_eq!(s.name.as_deref(), Some("Handler_One"));
         assert_eq!(s.tier, Tier::Recovered);
         assert!(s.evidence.iter().any(|e| e.kind == "registration"));
+        assert_eq!(by_addr("0x40000280").name.as_deref(), Some("Handler_Three"));
+    }
+
+    #[test]
+    fn build_map_registration_does_not_override_an_existing_real_name() {
+        let root = tmp("pme_sym_regtable_realname");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let mut img = vec![0u8; 0x300];
+        let put_str = |img: &mut [u8], off: usize, s: &str| {
+            img[off..off + s.len()].copy_from_slice(s.as_bytes());
+        };
+        put_str(&mut img, 0x100, "Handler_One");
+        put_str(&mut img, 0x120, "Handler_Two");
+        put_str(&mut img, 0x140, "Handler_Three");
+        let put_u32 = |img: &mut [u8], off: usize, v: u32| {
+            img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        for (k, (na, fa)) in [
+            (0x4000_0100u32, 0x4000_0200u32),
+            (0x4000_0120, 0x4000_0240),
+            (0x4000_0140, 0x4000_0280),
+        ]
+        .iter()
+        .enumerate()
+        {
+            put_u32(&mut img, 0x10 + k * 8, *na);
+            put_u32(&mut img, 0x10 + k * 8 + 4, *fa);
+        }
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        // 0x40000200 ALREADY has a real (non-FUN_) name — a table entry must not
+        // clobber it; the two FUN_ entries are still named.
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"OS_Delete_Semaphore","entry":"0x40000200","end":"0x40000208","data_refs":[]},
+                {"name":"FUN_240","entry":"0x40000240","end":"0x40000248","data_refs":[]},
+                {"name":"FUN_280","entry":"0x40000280","end":"0x40000288","data_refs":[]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x40000200: 4770 bx lr\n").unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+
+        let by_addr = |a: &str| symbols.iter().find(|s| s.address == a).unwrap();
+        let real = by_addr("0x40000200");
+        assert_eq!(real.tier, Tier::None, "real name must not be overridden");
+        assert!(real.name.is_none());
+        assert!(!real.evidence.iter().any(|e| e.kind == "registration"));
+        // the unnamed (FUN_) entries are still recovered
         assert_eq!(by_addr("0x40000280").name.as_deref(), Some("Handler_Three"));
     }
 
