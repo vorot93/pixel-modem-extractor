@@ -7,8 +7,8 @@
 use crate::decompile::{self, ImageOutcome};
 use crate::error::{Error, Result};
 use crate::{
-    decode_rf, global_shapes, globals, hwcfg, manifest, model, pipeline, recover_source,
-    source_tree, symbolicate, tokens,
+    decode_rf, global_shapes, global_types, globals, hwcfg, manifest, model, pipeline,
+    recover_source, source_tree, symbolicate, tokens,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -1054,6 +1054,7 @@ fn take_globals_function_inputs(
 fn prepare_pass2_inputs(
     function_maps: &HashMap<String, PreparedFunctionMap>,
     global_maps: &HashMap<String, PreparedGlobalMap>,
+    global_types_maps: &HashMap<String, decompile::PreparedPass2Map>,
 ) -> HashMap<String, decompile::Pass2Input> {
     let mut inputs = HashMap::new();
     for (label, prepared) in function_maps {
@@ -1071,7 +1072,80 @@ fn prepare_pass2_inputs(
             .or_insert_with(decompile::Pass2Input::default);
         input.global_map = Some(prepared.pass2_map.clone());
     }
+    for (label, map) in global_types_maps {
+        let input = inputs
+            .entry(label.clone())
+            .or_insert_with(decompile::Pass2Input::default);
+        input.global_types_map = Some(map.clone());
+    }
     inputs
+}
+
+/// Read each image's `global_shapes.json`, select apply-worthy scalar types,
+/// and write the strict apply-map under `ghidra_dir/global_types_maps/<label>.json`
+/// (mirroring `ghidra_dir/symbol_maps/<label>.json`). Returns the prepared
+/// maps — only for images with >=1 candidate — keyed by label, plus the
+/// per-label ineligible count for the report.
+///
+/// An image with no `global_shapes.json` never reached the shape stage;
+/// that is normal and is skipped without comment. A shapes file that fails
+/// to parse, or a map that fails to write or validate, is logged and that
+/// image degrades to names-only pass-2 input (fail-closed).
+// TODO(task-6): remove #[allow(dead_code)] when run() calls this
+#[allow(dead_code)]
+fn derive_global_types_maps(
+    images_dir: &Path,
+    ghidra_dir: &Path,
+) -> (
+    HashMap<String, decompile::PreparedPass2Map>,
+    HashMap<String, usize>,
+) {
+    let mut maps = HashMap::new();
+    let mut ineligible = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(images_dir) else {
+        return (maps, ineligible);
+    };
+    for entry in entries.flatten() {
+        let label = entry.file_name().to_string_lossy().into_owned();
+        let shapes = entry.path().join("decompiled").join("global_shapes.json");
+        // No global_shapes.json means this image never reached the shape
+        // stage (e.g. no code image) — expected, so skip quietly.
+        let Ok(bytes) = std::fs::read(&shapes) else {
+            continue;
+        };
+        let sel = match global_types::select_from_shapes_json(&bytes) {
+            Ok(sel) => sel,
+            Err(error) => {
+                tracing::warn!(
+                    "{label}: global_shapes.json unreadable, skipping global-type apply: {error}"
+                );
+                continue;
+            }
+        };
+        ineligible.insert(label.clone(), sel.ineligible);
+        let map_path = ghidra_dir
+            .join("global_types_maps")
+            .join(format!("{label}.json"));
+        match global_types::write_type_map(&map_path, &label, &sel) {
+            Ok(Some(count)) => match decompile::PreparedPass2Map::new(&map_path, count) {
+                Ok(map) => {
+                    maps.insert(label, map);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "{label}: global-types map failed validation, skipping global-type apply: {error}"
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "{label}: failed to write global-types map, skipping global-type apply: {error}"
+                );
+            }
+        }
+    }
+    (maps, ineligible)
 }
 
 fn globals_apply_stage(
@@ -1934,7 +2008,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             }
         }
         SymbolRouteStep::DispatchPass2 => {
-            let inputs = prepare_pass2_inputs(&function_maps, &prepared_global_maps);
+            // TODO(task-6): pass real derived global-type maps
+            let inputs =
+                prepare_pass2_inputs(&function_maps, &prepared_global_maps, &HashMap::new());
             let scheduled_count = inputs.len();
             drop(std::mem::take(&mut function_maps));
 
@@ -2348,7 +2424,7 @@ mod tests {
             ),
         ]);
 
-        let inputs = prepare_pass2_inputs(&function_maps, &global_maps);
+        let inputs = prepare_pass2_inputs(&function_maps, &global_maps, &HashMap::new());
 
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
@@ -2357,6 +2433,22 @@ mod tests {
         assert!(inputs["03_APM"].global_map.is_none());
         assert!(inputs["04_VSS"].function_map.is_none());
         assert_eq!(inputs["04_VSS"].global_map.as_ref().unwrap().count(), 7);
+    }
+
+    #[test]
+    fn prepare_pass2_inputs_threads_global_types_map() {
+        let root = std::env::temp_dir().join(format!("pme_p2t_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let tp = root.join("global_types.json");
+        std::fs::write(&tp, r#"{"format":"pixel-modem-extractor-global-types-v1","image":"02_MAIN","types":[{"address":"0x40010000","width":4}]}"#).unwrap();
+        let mut types = HashMap::new();
+        types.insert(
+            "02_MAIN".to_string(),
+            decompile::PreparedPass2Map::new(&tp, std::num::NonZeroUsize::new(1).unwrap()).unwrap(),
+        );
+        let inputs = prepare_pass2_inputs(&HashMap::new(), &HashMap::new(), &types);
+        assert!(inputs["02_MAIN"].global_types_map.is_some());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2427,6 +2519,7 @@ mod tests {
                 ("02_MAIN".to_string(), valid_main_global),
                 ("03_APM".to_string(), valid_other_global),
             ]),
+            &HashMap::new(),
         );
         assert!(inputs["02_MAIN"].function_map.is_none());
         assert_eq!(inputs["02_MAIN"].global_map.as_ref().unwrap().count(), 1);
@@ -2496,6 +2589,7 @@ mod tests {
                 ("03_APM".to_string(), valid_other_function),
             ]),
             &outcome.maps,
+            &HashMap::new(),
         );
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 1);
         assert!(inputs["02_MAIN"].global_map.is_none());
@@ -2543,7 +2637,7 @@ mod tests {
         assert_eq!(error.matches("04_VSS: zeta failure").count(), 1);
         assert!(!Report::is_ok(&[stage]));
 
-        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new());
+        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new(), &HashMap::new());
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
     }
 
@@ -3203,7 +3297,7 @@ mod tests {
             )
         );
 
-        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
+        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 1);
         assert!(inputs["02_MAIN"].function_map.is_some());
         assert!(inputs["02_MAIN"].global_map.is_none());
@@ -3252,7 +3346,7 @@ mod tests {
             &globals::GlobalsOpts::default(),
             |_, _, _, _, _, _| Err(Error::Serialize("malformed functions.json".into())),
         );
-        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
+        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
         let apply_stage = globals_apply_stage(false, &outcome.maps, Some(&images), 12);
 
         assert_eq!(outcome.stage.status, "failed");
