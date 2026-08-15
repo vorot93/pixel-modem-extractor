@@ -74,8 +74,7 @@ public class ApplyGlobalTypes extends GhidraScript {
                 skippedOutsideMemory++;
                 continue;
             }
-            if (!currentProgram.getMemory().contains(candidate.address)
-                    || !currentProgram.getMemory().contains(end)) {
+            if (!currentProgram.getMemory().contains(candidate.address, end)) {
                 skippedOutsideMemory++;
                 continue;
             }
@@ -138,7 +137,11 @@ public class ApplyGlobalTypes extends GhidraScript {
             }
             JsonObject entry = element.getAsJsonObject();
             long rawAddress = parseHexAddress(requirePrimitive(entry, "address", index).getAsString(), index);
-            int width = requirePrimitive(entry, "width", index).getAsInt();
+            JsonPrimitive widthPrim = requirePrimitive(entry, "width", index);
+            if (!widthPrim.isNumber()) {
+                throw new MapError("type entry " + index + " has a non-numeric width");
+            }
+            int width = widthPrim.getAsInt();
             if (width != 1 && width != 2 && width != 4 && width != 8) {
                 throw new MapError("type entry " + index + " has invalid width " + width);
             }
