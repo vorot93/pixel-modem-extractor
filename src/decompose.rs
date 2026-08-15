@@ -134,8 +134,9 @@ pub struct ImageReport {
     /// Count of recovered shapes this image's `global_shapes.json` held that
     /// were not apply-worthy (not width 1/2/4/8, `no_evidence`, conflicting,
     /// or array) — from `global_types::select_from_shapes_json`'s `Selection`.
-    /// Present whenever the image had a `global_shapes.json`, independent of
-    /// whether application itself ran.
+    /// Present whenever type-map derivation ran (the normal route with type
+    /// application enabled); `None` under `--no-apply-global-types` or
+    /// `--no-symbol-pass`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_types_ineligible: Option<usize>,
     /// Sum of the `ApplyGlobalTypes.java` skip buckets for an executed success.
@@ -1696,7 +1697,7 @@ fn record_global_shapes_failure(image: &mut ImageReport, reason: String) -> Stri
 /// Per-image outcome of a `global_shapes` sweep, retained by
 /// `run_global_shapes_stage_with` across the normal route's later
 /// `DispatchPass2` step. On that route, `RunGlobalShapes` runs *before*
-/// `DispatchPass2` (Task 5's input-safe reorder), and `DispatchPass2`'s own
+/// `DispatchPass2` (the shape-stage reorder), and `DispatchPass2`'s own
 /// `refresh_decompile_stage_images` / `install_decompile_stage_image_snapshot`
 /// calls rebuild `stages[decompile_pos].images` from `decompile::ImageResult`
 /// via `ImageReport::from_result`, which always nulls the nine
@@ -2425,7 +2426,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             // nine `global_shapes_*` fields and the five `global_types_*`
             // fields, so patching either set any earlier would be silently
             // discarded (this exact bug shipped for `global_shapes_*` in
-            // Task 5's reorder — RunGlobalShapes's in-place patch ran before
+            // the shape-stage reorder — RunGlobalShapes's in-place patch ran before
             // DispatchPass2 existed to refresh over it — until this fix;
             // see `GlobalShapesOutcome`'s doc comment). Placing both calls
             // once, unconditionally, here — after every branch above has
@@ -6582,7 +6583,7 @@ mod tests {
     fn global_shapes_outcomes_survive_refresh_decompile_stage_images() {
         // Regression test (plain unit test — no PME_GOLDEN_DIR — so a
         // re-regression fails normal CI, not only the gated golden) for the
-        // Task 5 clobber a code review found: on the normal route,
+        // shape-recovery clobber a code review found: on the normal route,
         // `RunGlobalShapes` patches `global_shapes_*` onto
         // `stages[decompile_pos].images` *before* `DispatchPass2` runs.
         // `DispatchPass2`'s own `refresh_decompile_stage_images` later

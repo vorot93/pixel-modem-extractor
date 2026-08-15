@@ -1012,9 +1012,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   fields instead: `global_types_applied`, `global_types_skipped`,
   `global_types_error`, `global_types_candidates` (`applied + skipped`, the
   `global_types_maps` entry's `count()`), and `global_types_ineligible`
-  (from `derive_global_types_maps`'s `ineligible` map — present whenever the
-  image had a `global_shapes.json`, independent of whether application
-  itself ran; it has no `decompile::ImageResult` counterpart at all).
+  (from `derive_global_types_maps`'s `ineligible` map — present whenever
+  type-map derivation ran; `None` under `--no-apply-global-types` or
+  `--no-symbol-pass`; it has no `decompile::ImageResult` counterpart at all).
   Unlike `globals_applied`, none of the five are copied by
   `ImageReport::from_result` (always `None` there, same as the nine
   `global_shapes_*` fields) — `decompose::global_types_apply_stage` patches
