@@ -903,6 +903,7 @@ enum SymbolRouteStep {
     Finalize { rewrite_decompiled_c: bool },
     LoadFinalizedNames,
     RunGlobals(GlobalsRouteMode),
+    RunGlobalShapes,
     DispatchPass2,
 }
 
@@ -925,11 +926,26 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: true,
         });
+        // This route has no pass 2 to feed (RunGlobalShapes only matters as
+        // pass-2 input on the normal route below), so shape recovery just
+        // needs to run once, after globals.json exists, to produce the
+        // sidecar. Keep it last so its position/timing on this route is
+        // unchanged by the normal-route reorder below.
+        run_step(SymbolRouteStep::RunGlobalShapes);
     } else {
         run_step(SymbolRouteStep::PrepareNamesAndProjection);
         run_step(SymbolRouteStep::RunGlobals(
             GlobalsRouteMode::PrepareApplicationInput,
         ));
+        // Shape recovery runs here — after globals.json exists, before pass 2
+        // — so a later pass-2 script can apply the recovered shapes as types
+        // alongside ApplyGlobals. This is input-safe: the shape stage reads
+        // only the raw image, globals.json, and the pass-1 functions.json /
+        // thumb_functions.json inventory, never decompiled.c; and pass 2 is
+        // `-process -noanalysis`, so it never changes function boundaries —
+        // the pass-1 inventory the shape stage consumes is identical pre/post
+        // pass 2. See CONTRIBUTING (Phase 3.2) for the full rationale.
+        run_step(SymbolRouteStep::RunGlobalShapes);
         run_step(SymbolRouteStep::DispatchPass2);
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
@@ -939,13 +955,11 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostSymbolStep {
-    GlobalShapes,
     DecodeRf,
     HardwareConfig,
 }
 
 fn orchestrate_post_symbol_route(mut run_step: impl FnMut(PostSymbolStep)) {
-    run_step(PostSymbolStep::GlobalShapes);
     run_step(PostSymbolStep::DecodeRf);
     run_step(PostSymbolStep::HardwareConfig);
 }
@@ -2011,6 +2025,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 prepared_global_maps = maps;
             }
         }
+        SymbolRouteStep::RunGlobalShapes => {
+            run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
+        }
         SymbolRouteStep::DispatchPass2 => {
             // TODO(task-6): pass real derived global-type maps
             let inputs =
@@ -2105,8 +2122,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         }
     });
 
-    // Remaining post-symbol stages: global shape recovery, then the RF and
-    // hardware decoders. Both symbol routes share this exact sequence.
+    // Remaining post-symbol stages: the RF and hardware decoders. Global
+    // shape recovery no longer lives here — both symbol routes now run it
+    // via `SymbolRouteStep::RunGlobalShapes` above (before pass 2 on the
+    // normal route, at the end on `--no-symbol-pass`). Both symbol routes
+    // share this exact post-symbol sequence.
     let rf_dir = out.join("rf_cfg_decompressed");
     let hwcfg_path = rootfs.join("hardware_config.json");
     let rf_present = std::fs::read_dir(&rf_dir)
@@ -2114,9 +2134,6 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         .unwrap_or(false);
 
     orchestrate_post_symbol_route(|step| match step {
-        PostSymbolStep::GlobalShapes => {
-            run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
-        }
         PostSymbolStep::DecodeRf => {
             if hwcfg_path.exists() && rf_present {
                 run_stage(&mut stages, "decode_rf", "rf/decoded", || {
@@ -3437,6 +3454,9 @@ mod tests {
             vec![
                 SymbolRouteStep::PrepareNamesAndProjection,
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::PrepareApplicationInput),
+                // Shapes recover before pass 2 (input-safe reorder), so a later
+                // pass-2 script can apply them as types alongside ApplyGlobals.
+                SymbolRouteStep::RunGlobalShapes,
                 SymbolRouteStep::DispatchPass2,
                 SymbolRouteStep::Finalize {
                     rewrite_decompiled_c: false,
@@ -3447,6 +3467,13 @@ mod tests {
             normal
                 .iter()
                 .filter(|step| matches!(step, SymbolRouteStep::RunGlobals(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            normal
+                .iter()
+                .filter(|step| matches!(step, SymbolRouteStep::RunGlobalShapes))
                 .count(),
             1
         );
@@ -3476,12 +3503,23 @@ mod tests {
                 SymbolRouteStep::Finalize {
                     rewrite_decompiled_c: true,
                 },
+                // This route has no pass 2 to feed, so shapes just need to run
+                // once, after globals.json exists — unchanged last-position
+                // timing versus the pre-reorder post-symbol-route placement.
+                SymbolRouteStep::RunGlobalShapes,
             ]
         );
         assert_eq!(
             disabled
                 .iter()
                 .filter(|step| matches!(step, SymbolRouteStep::RunGlobals(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            disabled
+                .iter()
+                .filter(|step| matches!(step, SymbolRouteStep::RunGlobalShapes))
                 .count(),
             1
         );
@@ -3495,40 +3533,44 @@ mod tests {
         orchestrate_post_symbol_route(|step| post.push(step));
         assert_eq!(
             post,
-            vec![
-                PostSymbolStep::GlobalShapes,
-                PostSymbolStep::DecodeRf,
-                PostSymbolStep::HardwareConfig,
-            ]
-        );
-        assert_eq!(
-            post.iter()
-                .filter(|step| matches!(step, PostSymbolStep::GlobalShapes))
-                .count(),
-            1
+            vec![PostSymbolStep::DecodeRf, PostSymbolStep::HardwareConfig]
         );
 
+        // Combined: on the normal route, RunGlobalShapes now precedes
+        // DispatchPass2 (the whole point of the reorder), which precedes the
+        // route's closing Finalize, which precedes the post-symbol RF/hwcfg
+        // stages appended after it.
         let mut combined = Vec::new();
         orchestrate_symbol_route(false, |step| combined.push(format!("{step:?}")));
         orchestrate_post_symbol_route(|step| combined.push(format!("{step:?}")));
+        let shapes = combined
+            .iter()
+            .position(|step| step == "RunGlobalShapes")
+            .expect("normal route runs RunGlobalShapes");
+        let dispatch_pass2 = combined
+            .iter()
+            .position(|step| step == "DispatchPass2")
+            .expect("normal route dispatches pass 2");
         let finalize = combined
             .iter()
             .position(|step| step.starts_with("Finalize"))
             .expect("normal route ends with Finalize");
-        let shapes = combined
-            .iter()
-            .position(|step| step == "GlobalShapes")
-            .expect("post-symbol route starts with GlobalShapes");
         let decode_rf = combined.iter().position(|step| step == "DecodeRf").unwrap();
         let hardware = combined
             .iter()
             .position(|step| step == "HardwareConfig")
             .unwrap();
-        assert!(finalize < shapes && shapes < decode_rf && decode_rf < hardware);
+        assert!(
+            shapes < dispatch_pass2
+                && dispatch_pass2 < finalize
+                && finalize < decode_rf
+                && decode_rf < hardware,
+            "{combined:?}"
+        );
         assert_eq!(
             combined
                 .iter()
-                .filter(|step| step.as_str() == "GlobalShapes")
+                .filter(|step| step.as_str() == "RunGlobalShapes")
                 .count(),
             1
         );
@@ -5831,7 +5873,13 @@ mod tests {
     }
 
     #[test]
-    fn global_shapes_stage_both_routes_enter_wrapper_once_after_terminal_events() {
+    fn global_shapes_stage_both_routes_enter_wrapper_exactly_once() {
+        // Both symbol routes must reach `run_global_shapes_stage_with` exactly
+        // once, but at different points: the normal route now runs it
+        // *before* DispatchPass2 (the input-safe reorder — shapes must be
+        // ready for a later pass-2 apply step); `--no-symbol-pass` has no
+        // pass 2 to feed, so it still runs shapes last, after globals.json
+        // exists (RunGlobals(RecordOnly), the "skip" event below).
         let root = std::env::temp_dir().join(format!(
             "pme_global_shapes_stage_routes_{}",
             std::process::id()
@@ -5850,10 +5898,7 @@ mod tests {
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly) => {
                     events.push("skip".into())
                 }
-                other => events.push(format!("{other:?}")),
-            });
-            orchestrate_post_symbol_route(|step| match step {
-                PostSymbolStep::GlobalShapes => {
+                SymbolRouteStep::RunGlobalShapes => {
                     events.push("global_shapes".into());
                     let mut stages = vec![StageReport::decompile(
                         vec![eligible_shape_image(
@@ -5870,6 +5915,9 @@ mod tests {
                     assert_eq!(last_stage(&stages).status, "ok");
                     assert_nine_shape_counts(&stages[0].images[0], Some(0));
                 }
+                other => events.push(format!("{other:?}")),
+            });
+            orchestrate_post_symbol_route(|step| match step {
                 PostSymbolStep::DecodeRf => events.push("decode_rf".into()),
                 PostSymbolStep::HardwareConfig => events.push("hardware_config".into()),
             });
@@ -5894,10 +5942,18 @@ mod tests {
                 .iter()
                 .position(|event| event == terminal)
                 .unwrap_or_else(|| panic!("{terminal} event missing: {events:?}"));
-            assert!(
-                terminal_pos < shapes,
-                "global_shapes must follow {terminal}: {events:?}"
-            );
+            if no_symbol_pass {
+                assert!(
+                    terminal_pos < shapes,
+                    "on --no-symbol-pass, global_shapes must follow {terminal}: {events:?}"
+                );
+            } else {
+                assert!(
+                    shapes < terminal_pos,
+                    "on the normal route, global_shapes must precede {terminal} \
+                     (input-safe reorder before pass 2): {events:?}"
+                );
+            }
             let decode_rf = events
                 .iter()
                 .position(|event| event == "decode_rf")

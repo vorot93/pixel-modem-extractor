@@ -675,17 +675,29 @@ hardcoded. Two reference images exercise both models end-to-end:
   fallback can recover it. Skipping it fail-closed is therefore the optimal
   handling; a real fix would live upstream in radare2's `aac`.
 - **Phase 3.2: global storage-shape recovery.** Default-on in every
-  `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback). The
-  stage runs **once**, immediately after the complete symbol route returns
-  and before `decode_rf` / `hardware_config`, via one shared
-  `PostSymbolStep::GlobalShapes` call. That placement is binding: pass 2
-  replaces `functions.json`, so an earlier run would bind evidence to an
-  inventory that is no longer on disk. Both routes therefore analyze the
-  **terminal** `images/<label>/<label>.bin`, `globals.json`,
-  `functions.json`, and (when the current decompile result reports a Thumb
-  inventory) `thumb_functions.json`. A valid empty Recovered set still
-  writes a source-hashed empty sidecar; it is not a skipped analysis.
-  `globals.json` is never rewritten. `--prune` retains
+  `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback), via
+  the shared `run_global_shapes_stage` wrapper — but the two symbol routes
+  now reach it at different points in `orchestrate_symbol_route`
+  (`SymbolRouteStep::RunGlobalShapes`), each running it exactly once. On the
+  **normal route** it runs right after `RunGlobals(PrepareApplicationInput)`
+  writes `globals.json` and **before** `DispatchPass2` — i.e. shape recovery
+  now happens ahead of pass 2, not after it, so a pass-2 post-script can
+  apply the recovered shapes as `undefinedN` types alongside `ApplyGlobals`
+  (the type-application wiring itself is a later stage; this stage only
+  produces the sidecar). On **`--no-symbol-pass`** it still runs last, after
+  the route's second `Finalize` — that route has no pass 2 to feed, so its
+  timing is unchanged from before the reorder. This move is input-safe:
+  `global_shapes::run_image` reads only the raw image, `globals.json`, and
+  the pass-1 `functions.json` / `thumb_functions.json` inventory — never
+  `decompiled.c` — and pass 2 is `-process -noanalysis`, so it never changes
+  function boundaries. The pass-1 inventory the shape stage consumes is
+  therefore identical before and after pass 2; only names (and, later,
+  types) differ, and shape recovery is name- and type-independent
+  (previously both routes ran the stage once via a shared
+  `PostSymbolStep::GlobalShapes` call immediately after the whole symbol
+  route returned, i.e. after pass 2 on the normal route). A valid empty
+  Recovered set still writes a source-hashed empty sidecar; it is not a
+  skipped analysis. `globals.json` is never rewritten. `--prune` retains
   `decompiled/global_shapes.json`. Pass-2 refresh still owns only
   `decompiled.c` / `disasm.lst` / `functions.json` and must not touch this
   sidecar.
