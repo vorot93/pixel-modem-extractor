@@ -54,6 +54,7 @@ fn shared_decompose_output() -> Option<PathBuf> {
             globals_provisional: false,
             globals_k_arm: None,
             globals_k_thumb: None,
+            no_apply_global_types: false,
         };
         // Best-effort: some partitions may fail, but report.json and artifacts
         // are still written. Assert the tree, not the exit status.

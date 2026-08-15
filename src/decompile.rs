@@ -27,6 +27,7 @@ const EXPORT_DECOMP_JAVA: &str = include_str!("ghidra/ExportDecomp.java");
 const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
 const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
+const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 /// Ghidra project name passed to `analyzeHeadless` (the directory is
@@ -308,6 +309,14 @@ pub struct ImageResult {
     /// Reason-only global-application failure from a valid error summary or a
     /// missing, duplicate, malformed, wrong-image, or non-conserving summary.
     pub globals_apply_error: Option<String>,
+    /// Count of `undefinedN` types `ApplyGlobalTypes.java` applied. `None` when
+    /// type application did not run for this image; `Some(0)` is executed.
+    pub global_types_applied: Option<usize>,
+    /// Sum of the `ApplyGlobalTypes.java` skip buckets for an executed success.
+    pub global_types_apply_skipped: Option<usize>,
+    /// Reason-only type-application failure (error/missing/duplicate/malformed/
+    /// wrong-image/non-conserving summary).
+    pub global_types_apply_error: Option<String>,
     /// Phase 3.0.1: total tier:"provisional" globals generated for this image
     /// (before any suppression). None when Phase 3.0.1 didn't run for this image.
     pub globals_provisional: Option<usize>,
@@ -798,16 +807,20 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals}.java
+    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
-    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols
-    //    and ApplyGlobals are staged for pass-2 application.)
+    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols,
+    //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
     std::fs::write(scripts.join("ApplyGlobals.java"), APPLY_GLOBALS_JAVA)?;
+    std::fs::write(
+        scripts.join("ApplyGlobalTypes.java"),
+        APPLY_GLOBAL_TYPES_JAVA,
+    )?;
 
     // 3. machine-readable load spec -> out/ghidra_load.json
     let source_name = modem_bin
@@ -1189,6 +1202,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 globals_applied: None,
                 globals_apply_skipped: None,
                 globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             })
@@ -1250,9 +1266,10 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
 
 /// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
 /// `-process` mode on the existing project so there is no re-import and no
-/// re-analysis: the requested `ApplySymbols.java` and `ApplyGlobals.java`
-/// scripts run in that order, then `ExportDecomp.java` regenerates the export
-/// with applied function and global names baked in.
+/// re-analysis: the requested `ApplySymbols.java`, `ApplyGlobals.java`, and
+/// `ApplyGlobalTypes.java` scripts run in that order, then `ExportDecomp.java`
+/// regenerates the export with applied function names, global names, and
+/// global types baked in.
 #[derive(Debug, Clone)]
 pub struct PreparedPass2Map {
     absolute_path: PathBuf,
@@ -1305,6 +1322,7 @@ impl PreparedPass2Map {
 pub struct Pass2Input {
     pub function_map: Option<PreparedPass2Map>,
     pub global_map: Option<PreparedPass2Map>,
+    pub global_types_map: Option<PreparedPass2Map>,
 }
 
 fn headless_process_args(
@@ -1314,7 +1332,8 @@ fn headless_process_args(
 ) -> Result<Option<Vec<String>>> {
     let function_map = input.function_map.as_ref();
     let global_map = input.global_map.as_ref();
-    if function_map.is_none() && global_map.is_none() {
+    let global_types_map = input.global_types_map.as_ref();
+    if function_map.is_none() && global_map.is_none() && global_types_map.is_none() {
         return Ok(None);
     }
 
@@ -1322,6 +1341,9 @@ fn headless_process_args(
         map.validate_for_spawn()?;
     }
     if let Some(map) = global_map {
+        map.validate_for_spawn()?;
+    }
+    if let Some(map) = global_types_map {
         map.validate_for_spawn()?;
     }
 
@@ -1345,6 +1367,13 @@ fn headless_process_args(
         args.extend([
             "-postScript".to_string(),
             "ApplyGlobals.java".to_string(),
+            map.path().to_string_lossy().into_owned(),
+        ]);
+    }
+    if let Some(map) = global_types_map {
+        args.extend([
+            "-postScript".to_string(),
+            "ApplyGlobalTypes.java".to_string(),
             map.path().to_string_lossy().into_owned(),
         ]);
     }
@@ -1505,6 +1534,120 @@ fn parse_apply_globals_summary(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyGlobalTypesSummary {
+    Ok {
+        candidates: usize,
+        applied: usize,
+        skipped_outside_memory: usize,
+        skipped_collision: usize,
+    },
+    Error {
+        reason: String,
+    },
+}
+
+impl ApplyGlobalTypesSummary {
+    fn applied_and_skipped(&self) -> Option<(usize, usize)> {
+        let Self::Ok {
+            applied,
+            skipped_outside_memory,
+            skipped_collision,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let skipped = skipped_outside_memory.checked_add(*skipped_collision)?;
+        Some((*applied, skipped))
+    }
+}
+
+fn apply_global_types_count(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<usize, String> {
+    let count = object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("ApplyGlobalTypes summary {field} is not an unsigned integer"))?;
+    usize::try_from(count)
+        .map_err(|_| format!("ApplyGlobalTypes summary {field} does not fit in usize"))
+}
+
+fn parse_apply_global_types_summary(
+    stdout: &str,
+    expected_image: &str,
+) -> std::result::Result<ApplyGlobalTypesSummary, String> {
+    let mut payloads = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyGlobalTypes: "));
+    let payload = payloads
+        .next()
+        .ok_or_else(|| "missing ApplyGlobalTypes summary".to_string())?;
+    if payloads.next().is_some() {
+        return Err("duplicate ApplyGlobalTypes summaries".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| format!("malformed ApplyGlobalTypes summary: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "ApplyGlobalTypes summary is not an object".to_string())?;
+    let image = object
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyGlobalTypes summary image is not a string".to_string())?;
+    if image != expected_image {
+        return Err(format!(
+            "ApplyGlobalTypes summary image {image:?} does not match {expected_image:?}"
+        ));
+    }
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyGlobalTypes summary status is not a string".to_string())?;
+    match status {
+        "error" => {
+            let reason = object
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "ApplyGlobalTypes error summary has no string error".to_string())?;
+            let reason_chars = reason.chars().count();
+            if reason.is_empty() || reason_chars > GLOBALS_APPLY_ERROR_MAX_CHARS {
+                return Err(format!(
+                    "ApplyGlobalTypes error reason length {reason_chars} is outside 1..={GLOBALS_APPLY_ERROR_MAX_CHARS}"
+                ));
+            }
+            Ok(ApplyGlobalTypesSummary::Error {
+                reason: reason.to_string(),
+            })
+        }
+        "ok" => {
+            let candidates = apply_global_types_count(object, "candidates")?;
+            let applied = apply_global_types_count(object, "applied")?;
+            let skipped_outside_memory =
+                apply_global_types_count(object, "skipped_outside_memory")?;
+            let skipped_collision = apply_global_types_count(object, "skipped_collision")?;
+            let classified = applied
+                .checked_add(skipped_outside_memory)
+                .and_then(|n| n.checked_add(skipped_collision))
+                .ok_or_else(|| "ApplyGlobalTypes counts overflow".to_string())?;
+            if classified != candidates {
+                return Err("ApplyGlobalTypes summary does not conserve candidates".to_string());
+            }
+            Ok(ApplyGlobalTypesSummary::Ok {
+                candidates,
+                applied,
+                skipped_outside_memory,
+                skipped_collision,
+            })
+        }
+        other => Err(format!(
+            "ApplyGlobalTypes summary status {other} is not ok/error"
+        )),
+    }
+}
+
 /// Pass 2 of two-pass decompile. Accepts the pass-1 `report` (callers run pass 1
 /// via `run_report` separately and pass its result here — running pass 1 again
 /// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
@@ -1569,6 +1712,7 @@ pub fn run_two_pass(
 
         let applies_functions = input.function_map.is_some();
         let applies_globals = input.global_map.is_some();
+        let applies_global_types = input.global_types_map.is_some();
         if applies_functions {
             ir.pass2_applied = None;
         }
@@ -1576,6 +1720,11 @@ pub fn run_two_pass(
             ir.globals_applied = None;
             ir.globals_apply_skipped = None;
             ir.globals_apply_error = None;
+        }
+        if applies_global_types {
+            ir.global_types_applied = None;
+            ir.global_types_apply_skipped = None;
+            ir.global_types_apply_error = None;
         }
 
         tracing::info!("ghidra: pass 2 application for {}", ir.label);
@@ -1612,6 +1761,22 @@ pub fn run_two_pass(
                     Ok(ApplyGlobalsSummary::Error { reason }) | Err(reason) => {
                         ir.globals_apply_error = Some(reason);
                     }
+                }
+            }
+            if input.global_types_map.is_some() {
+                match parse_apply_global_types_summary(&stdout, &ir.label) {
+                    Ok(summary) => match summary.applied_and_skipped() {
+                        Some((applied, skipped)) => {
+                            ir.global_types_applied = Some(applied);
+                            ir.global_types_apply_skipped = Some(skipped);
+                        }
+                        None => {
+                            if let ApplyGlobalTypesSummary::Error { reason } = summary {
+                                ir.global_types_apply_error = Some(reason);
+                            }
+                        }
+                    },
+                    Err(reason) => ir.global_types_apply_error = Some(reason),
                 }
             }
             outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::ProcessSucceeded);
@@ -3086,6 +3251,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            global_types_map: None,
         };
         let args = headless_process_args("/out", "02_MAIN", &input)
             .unwrap()
@@ -3160,6 +3326,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                global_types_map: None,
             };
             std::fs::remove_file(root.join(missing_map)).unwrap();
             let mut spawn_called = false;
@@ -3210,6 +3377,12 @@ mod tests {
         relative
     }
 
+    fn pass2_test_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("pme_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        root
+    }
+
     fn pass2_test_map(name: &str, count: usize) -> Option<PreparedPass2Map> {
         let count = NonZeroUsize::new(count)?;
         let dir = PathBuf::from("target").join("pme_task8r_pass2_args");
@@ -3223,6 +3396,7 @@ mod tests {
         Pass2Input {
             function_map: pass2_test_map("functions.json", function_count),
             global_map: pass2_test_map("globals.json", global_count),
+            global_types_map: None,
         }
     }
 
@@ -3333,6 +3507,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pass2_args_insert_apply_global_types_between_globals_and_export() {
+        let root = pass2_test_root("gt_args");
+        let input = Pass2Input {
+            function_map: pass2_test_map("functions.json", 1),
+            global_map: pass2_test_map("globals.json", 1),
+            global_types_map: pass2_test_map("global_types.json", 1),
+        };
+        let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
+            .unwrap()
+            .unwrap();
+        let joined = args.join(" ");
+        let g = joined.find("ApplyGlobals.java").unwrap();
+        let t = joined.find("ApplyGlobalTypes.java").unwrap();
+        let e = joined.find("ExportDecomp.java").unwrap();
+        assert!(
+            g < t && t < e,
+            "order must be ApplyGlobals -> ApplyGlobalTypes -> ExportDecomp"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pass2_args_present_for_types_only_input() {
+        let root = pass2_test_root("gt_only");
+        let input = Pass2Input {
+            function_map: None,
+            global_map: None,
+            global_types_map: pass2_test_map("global_types.json", 1),
+        };
+        assert!(
+            headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -3458,6 +3670,59 @@ mod tests {
         assert!(
             parse_apply_globals_summary(&ok_globals_summary(6, 1, 1, 1, 1, 1), "02_MAIN").is_err()
         );
+    }
+
+    #[test]
+    fn parse_apply_global_types_summary_reads_counts() {
+        let line = r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"ok","candidates":3,"applied":2,"skipped_outside_memory":0,"skipped_collision":1}"#;
+        let s = parse_apply_global_types_summary(line, "02_MAIN").unwrap();
+        assert_eq!(s.applied_and_skipped(), Some((2, 1)));
+    }
+
+    #[test]
+    fn parse_apply_global_types_summary_rejects_wrong_image() {
+        let line = r#"ApplyGlobalTypes: {"image":"OTHER","status":"ok","candidates":0,"applied":0,"skipped_outside_memory":0,"skipped_collision":0}"#;
+        assert!(parse_apply_global_types_summary(line, "02_MAIN").is_err());
+    }
+
+    #[test]
+    fn parse_apply_global_types_summary_rejects_error_status_without_string_reason() {
+        for stdout in [
+            r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"error"}"#,
+            r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"error","error":42}"#,
+        ] {
+            assert!(
+                parse_apply_global_types_summary(stdout, "02_MAIN").is_err(),
+                "fail-open error summary unexpectedly accepted: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_apply_global_types_summary_accepts_only_bounded_error_reason() {
+        let summary = parse_apply_global_types_summary(
+            r#"ApplyGlobalTypes: {"image":"02_MAIN","status":"error","error":"bad format"}"#,
+            "02_MAIN",
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            ApplyGlobalTypesSummary::Error {
+                reason: "bad format".to_string()
+            }
+        );
+
+        let max_reason = "🛰".repeat(2_048);
+        let at_limit = format!(
+            "ApplyGlobalTypes: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{max_reason}\"}}"
+        );
+        assert!(parse_apply_global_types_summary(&at_limit, "02_MAIN").is_ok());
+
+        let over_limit = format!(
+            "ApplyGlobalTypes: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{}\"}}",
+            "🛰".repeat(2_049)
+        );
+        assert!(parse_apply_global_types_summary(&over_limit, "02_MAIN").is_err());
     }
 
     #[test]
@@ -4497,6 +4762,9 @@ INFO: second pdfj body was noisy and not parseable
                 globals_applied: None,
                 globals_apply_skipped: None,
                 globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             }],
@@ -4537,6 +4805,9 @@ INFO: second pdfj body was noisy and not parseable
                 globals_applied: None,
                 globals_apply_skipped: None,
                 globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             }],
@@ -4573,6 +4844,9 @@ INFO: second pdfj body was noisy and not parseable
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: Some(42),
             globals_provisional_suppressed: Some(7),
         };

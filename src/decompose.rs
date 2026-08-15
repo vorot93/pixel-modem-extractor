@@ -7,8 +7,8 @@
 use crate::decompile::{self, ImageOutcome};
 use crate::error::{Error, Result};
 use crate::{
-    decode_rf, global_shapes, globals, hwcfg, manifest, model, pipeline, recover_source,
-    source_tree, symbolicate, tokens,
+    decode_rf, global_shapes, global_types, globals, hwcfg, manifest, model, pipeline,
+    recover_source, source_tree, symbolicate, tokens,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -45,6 +45,13 @@ pub struct Opts {
     /// Phase 3.0.1 test-only: override the Thumb proximity window (`K_THUMB`).
     /// Wired to the hidden `--globals-k-thumb`. `None` -> use `globals::K_THUMB`.
     pub globals_k_thumb: Option<usize>,
+    /// Phase 3.2 type-application escape hatch: when true, `derive_global_types_maps`
+    /// is not called and pass 2 receives no global-type input, so
+    /// `ApplyGlobalTypes.java` does not run. Recovered shapes are still
+    /// written to the `global_shapes.json` sidecar; only the `decompiled.c`
+    /// `undefinedN` application is skipped. Wired to `--no-apply-global-types`.
+    /// Default: apply.
+    pub no_apply_global_types: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,6 +122,30 @@ pub struct ImageReport {
     pub global_shapes_state_barriers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_shapes_error: Option<String>,
+    /// Count of `undefinedN` types `ApplyGlobalTypes.java` applied. `None` means
+    /// type application did not run for this image; `Some(0)` is executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_applied: Option<usize>,
+    /// `global_types_applied + global_types_skipped` — the count of apply-worthy
+    /// scalar shapes offered to pass 2 for this image (the `global_types_maps`
+    /// entry's `count()`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_candidates: Option<usize>,
+    /// Count of recovered shapes this image's `global_shapes.json` held that
+    /// were not apply-worthy (not width 1/2/4/8, `no_evidence`, conflicting,
+    /// or array) — from `global_types::select_from_shapes_json`'s `Selection`.
+    /// Present whenever type-map derivation ran (the normal route with type
+    /// application enabled); `None` under `--no-apply-global-types` or
+    /// `--no-symbol-pass`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_ineligible: Option<usize>,
+    /// Sum of the `ApplyGlobalTypes.java` skip buckets for an executed success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_skipped: Option<usize>,
+    /// Reason-only type-application failure (error/missing/duplicate/malformed/
+    /// wrong-image/non-conserving summary, or a missing pass-2 image result).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_error: Option<String>,
 }
 
 impl ImageReport {
@@ -157,6 +188,11 @@ impl ImageReport {
                 global_shapes_decode_failures: None,
                 global_shapes_state_barriers: None,
                 global_shapes_error: None,
+                global_types_applied: None,
+                global_types_candidates: None,
+                global_types_ineligible: None,
+                global_types_skipped: None,
+                global_types_error: None,
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -191,6 +227,11 @@ impl ImageReport {
                 global_shapes_decode_failures: None,
                 global_shapes_state_barriers: None,
                 global_shapes_error: None,
+                global_types_applied: None,
+                global_types_candidates: None,
+                global_types_ineligible: None,
+                global_types_skipped: None,
+                global_types_error: None,
             },
         }
     }
@@ -735,6 +776,18 @@ fn install_decompile_stage_image_snapshot(stages: &mut [StageReport], images: Ve
     stages[pos].images = images;
 }
 
+/// Borrow the `decompile` stage's per-image entries mutably, or an empty
+/// slice if that stage has not been pushed yet. Used by `global_types_apply_stage`
+/// to patch the `global_types_*` fields onto the already-installed `ImageReport`s
+/// — those fields are never set by `ImageReport::from_result` (see its call
+/// sites), so unlike `globals_applied` they need an explicit post-hoc patch.
+fn decompile_stage_images_mut(stages: &mut [StageReport]) -> &mut [ImageReport] {
+    match stages.iter().rposition(|s| s.stage == "decompile") {
+        Some(pos) => stages[pos].images.as_mut_slice(),
+        None => &mut [],
+    }
+}
+
 /// Phase 3.0 helper: load Phase 1's `symbols.json` and build a lookup map
 /// from function entry address (canonical: lowercase hex, no `0x`, no
 /// leading zeros) to recovered name. Used to enrich `globals::run`'s
@@ -903,6 +956,7 @@ enum SymbolRouteStep {
     Finalize { rewrite_decompiled_c: bool },
     LoadFinalizedNames,
     RunGlobals(GlobalsRouteMode),
+    RunGlobalShapes,
     DispatchPass2,
 }
 
@@ -925,11 +979,26 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: true,
         });
+        // This route has no pass 2 to feed (RunGlobalShapes only matters as
+        // pass-2 input on the normal route below), so shape recovery just
+        // needs to run once, after globals.json exists, to produce the
+        // sidecar. Keep it last so its position/timing on this route is
+        // unchanged by the normal-route reorder below.
+        run_step(SymbolRouteStep::RunGlobalShapes);
     } else {
         run_step(SymbolRouteStep::PrepareNamesAndProjection);
         run_step(SymbolRouteStep::RunGlobals(
             GlobalsRouteMode::PrepareApplicationInput,
         ));
+        // Shape recovery runs here — after globals.json exists, before pass 2
+        // — so a later pass-2 script can apply the recovered shapes as types
+        // alongside ApplyGlobals. This is input-safe: the shape stage reads
+        // only the raw image, globals.json, and the pass-1 functions.json /
+        // thumb_functions.json inventory, never decompiled.c; and pass 2 is
+        // `-process -noanalysis`, so it never changes function boundaries —
+        // the pass-1 inventory the shape stage consumes is identical pre/post
+        // pass 2. See CONTRIBUTING (Phase 3.2) for the full rationale.
+        run_step(SymbolRouteStep::RunGlobalShapes);
         run_step(SymbolRouteStep::DispatchPass2);
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
@@ -939,13 +1008,11 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostSymbolStep {
-    GlobalShapes,
     DecodeRf,
     HardwareConfig,
 }
 
 fn orchestrate_post_symbol_route(mut run_step: impl FnMut(PostSymbolStep)) {
-    run_step(PostSymbolStep::GlobalShapes);
     run_step(PostSymbolStep::DecodeRf);
     run_step(PostSymbolStep::HardwareConfig);
 }
@@ -1054,6 +1121,7 @@ fn take_globals_function_inputs(
 fn prepare_pass2_inputs(
     function_maps: &HashMap<String, PreparedFunctionMap>,
     global_maps: &HashMap<String, PreparedGlobalMap>,
+    global_types_maps: &HashMap<String, decompile::PreparedPass2Map>,
 ) -> HashMap<String, decompile::Pass2Input> {
     let mut inputs = HashMap::new();
     for (label, prepared) in function_maps {
@@ -1071,7 +1139,82 @@ fn prepare_pass2_inputs(
             .or_insert_with(decompile::Pass2Input::default);
         input.global_map = Some(prepared.pass2_map.clone());
     }
+    for (label, map) in global_types_maps {
+        let input = inputs
+            .entry(label.clone())
+            .or_insert_with(decompile::Pass2Input::default);
+        input.global_types_map = Some(map.clone());
+    }
     inputs
+}
+
+/// Read each image's `global_shapes.json`, select apply-worthy scalar types,
+/// and write the strict apply-map under `ghidra_dir/global_types_maps/<label>.json`
+/// (mirroring `ghidra_dir/symbol_maps/<label>.json`). Returns the prepared
+/// maps — only for images with >=1 candidate — keyed by label, plus the
+/// per-label ineligible count for the report.
+///
+/// An image with no `global_shapes.json` never reached the shape stage;
+/// that is normal and is skipped without comment. A shapes file that fails
+/// to parse, or a map that fails to write or validate, is logged and that
+/// image degrades to names-only pass-2 input (fail-closed).
+fn derive_global_types_maps(
+    images_dir: &Path,
+    ghidra_dir: &Path,
+) -> (
+    HashMap<String, decompile::PreparedPass2Map>,
+    HashMap<String, usize>,
+) {
+    let mut maps = HashMap::new();
+    let mut ineligible = HashMap::new();
+    let entries = match std::fs::read_dir(images_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!("images_dir unreadable, no global-type maps derived: {error}");
+            return (maps, ineligible);
+        }
+    };
+    for entry in entries.flatten() {
+        let label = entry.file_name().to_string_lossy().into_owned();
+        let shapes = entry.path().join("decompiled").join("global_shapes.json");
+        // No global_shapes.json means this image never reached the shape
+        // stage (e.g. no code image) — expected, so skip quietly.
+        let Ok(bytes) = std::fs::read(&shapes) else {
+            continue;
+        };
+        let sel = match global_types::select_from_shapes_json(&bytes) {
+            Ok(sel) => sel,
+            Err(error) => {
+                tracing::warn!(
+                    "{label}: global_shapes.json unreadable, skipping global-type apply: {error}"
+                );
+                continue;
+            }
+        };
+        ineligible.insert(label.clone(), sel.ineligible);
+        let map_path = ghidra_dir
+            .join("global_types_maps")
+            .join(format!("{label}.json"));
+        match global_types::write_type_map(&map_path, &label, &sel) {
+            Ok(Some(count)) => match decompile::PreparedPass2Map::new(&map_path, count) {
+                Ok(map) => {
+                    maps.insert(label, map);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "{label}: global-types map failed validation, skipping global-type apply: {error}"
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "{label}: failed to write global-types map, skipping global-type apply: {error}"
+                );
+            }
+        }
+    }
+    (maps, ineligible)
 }
 
 fn globals_apply_stage(
@@ -1157,6 +1300,158 @@ fn globals_apply_stage(
         },
         output: Some(format!(
             "{processed} image(s) processed; {applied_total} globals applied; \
+             {skipped_total} skipped"
+        )),
+        reason: None,
+        error: first_error,
+        images: Vec::new(),
+        duration_ms,
+    }
+}
+
+/// Set `global_types_ineligible` on every matching `report_images` entry.
+/// Runs independent of whether application itself ran or was skipped —
+/// `ineligible` comes from `derive_global_types_maps`, which counts every
+/// image with a `global_shapes.json`, not only the ones apply-worthy enough
+/// to reach pass 2 (see its doc comment).
+fn record_global_types_ineligible(
+    report_images: &mut [ImageReport],
+    ineligible: &HashMap<String, usize>,
+) {
+    for (label, count) in ineligible {
+        if let Some(image) = report_images.iter_mut().find(|image| &image.image == label) {
+            image.global_types_ineligible = Some(*count);
+        }
+    }
+}
+
+fn record_global_types_error(report_images: &mut [ImageReport], label: &str, reason: &str) {
+    if let Some(image) = report_images.iter_mut().find(|image| image.image == label) {
+        image.global_types_error = Some(reason.to_string());
+    }
+}
+
+/// Apply-global-types aggregation, mirroring `globals_apply_stage`'s skip
+/// policy and per-label consistency check (same-shape strict-conservation
+/// loop over `image.global_types_applied` / `global_types_apply_skipped` /
+/// `global_types_apply_error`). Additionally patches `report_images` (the
+/// `decompile` stage's already-installed `ImageReport`s) in place with
+/// `global_types_applied` / `global_types_skipped` / `global_types_error` /
+/// `global_types_candidates`, because — unlike `globals_applied` — those
+/// fields are never copied by `ImageReport::from_result`; `global_types_ineligible`
+/// in particular has no `decompile::ImageResult` counterpart at all, only
+/// `derive_global_types_maps`'s `ineligible` map.
+///
+/// Callers on the normal route MUST pass a `report_images` slice that has
+/// already been through this call's `DispatchPass2` invocation of
+/// `refresh_decompile_stage_images` (i.e. call this function *after* that
+/// refresh, not alongside `globals_apply_stage`). `refresh_decompile_stage_images`
+/// rebuilds `stages[decompile_pos].images` from `decompile::ImageResult` via
+/// `ImageReport::from_result`, which always nulls the five `global_types_*`
+/// fields — a patch applied before that refresh would be silently discarded.
+fn global_types_apply_stage(
+    no_symbol_pass: bool,
+    no_apply_global_types: bool,
+    global_types_maps: &HashMap<String, decompile::PreparedPass2Map>,
+    ineligible: &HashMap<String, usize>,
+    images: Option<&[decompile::ImageResult]>,
+    report_images: &mut [ImageReport],
+    duration_ms: u128,
+) -> StageReport {
+    record_global_types_ineligible(report_images, ineligible);
+
+    if no_symbol_pass {
+        return StageReport::skipped("global_types_apply", "--no-symbol-pass");
+    }
+    if no_apply_global_types {
+        return StageReport::skipped("global_types_apply", "--no-apply-global-types");
+    }
+    if global_types_maps.is_empty() {
+        return StageReport::skipped("global_types_apply", "no recovered scalar shapes");
+    }
+
+    let mut labels: Vec<&str> = global_types_maps.keys().map(String::as_str).collect();
+    labels.sort_unstable();
+    let mut processed = 0usize;
+    let mut applied_total = 0usize;
+    let mut skipped_total = 0usize;
+    let mut first_error = None;
+
+    if let Some(images) = images {
+        for image in images {
+            let Ok(index) = labels.binary_search(&image.label.as_str()) else {
+                continue;
+            };
+            let label = labels.remove(index);
+            if let Some(error) = &image.pass2_error {
+                first_error.get_or_insert_with(|| format!("{label}: {error}"));
+                record_global_types_error(report_images, label, error);
+                continue;
+            }
+            if let Some(error) = &image.global_types_apply_error {
+                first_error.get_or_insert_with(|| format!("{label}: {error}"));
+                record_global_types_error(report_images, label, error);
+                continue;
+            }
+            let (Some(applied), Some(skipped)) =
+                (image.global_types_applied, image.global_types_apply_skipped)
+            else {
+                let reason = "no valid ApplyGlobalTypes success summary";
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, reason);
+                continue;
+            };
+            let Some(classified) = applied.checked_add(skipped) else {
+                let reason = "global-type application counts overflow";
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, reason);
+                continue;
+            };
+            let expected = global_types_maps[label].count();
+            if classified != expected {
+                let reason = format!(
+                    "global-type application counts do not match prepared types: \
+                     {classified} != {expected}"
+                );
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, &reason);
+                continue;
+            }
+            let (Some(next_applied), Some(next_skipped)) = (
+                applied_total.checked_add(applied),
+                skipped_total.checked_add(skipped),
+            ) else {
+                let reason = "global-type application totals overflow";
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, reason);
+                continue;
+            };
+            applied_total = next_applied;
+            skipped_total = next_skipped;
+            processed += 1;
+            if let Some(report_image) = report_images.iter_mut().find(|ri| ri.image == label) {
+                report_image.global_types_applied = Some(applied);
+                report_image.global_types_skipped = Some(skipped);
+                report_image.global_types_candidates = Some(classified);
+                report_image.global_types_error = None;
+            }
+        }
+    }
+    for label in labels {
+        let reason = "missing pass-2 image result";
+        first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+        record_global_types_error(report_images, label, reason);
+    }
+
+    StageReport {
+        stage: "global_types_apply",
+        status: if first_error.is_some() {
+            "failed"
+        } else {
+            "ok"
+        },
+        output: Some(format!(
+            "{processed} image(s) processed; {applied_total} global types applied; \
              {skipped_total} skipped"
         )),
         reason: None,
@@ -1399,6 +1694,54 @@ fn record_global_shapes_failure(image: &mut ImageReport, reason: String) -> Stri
     reason
 }
 
+/// Per-image outcome of a `global_shapes` sweep, retained by
+/// `run_global_shapes_stage_with` across the normal route's later
+/// `DispatchPass2` step. On that route, `RunGlobalShapes` runs *before*
+/// `DispatchPass2` (the shape-stage reorder), and `DispatchPass2`'s own
+/// `refresh_decompile_stage_images` / `install_decompile_stage_image_snapshot`
+/// calls rebuild `stages[decompile_pos].images` from `decompile::ImageResult`
+/// via `ImageReport::from_result`, which always nulls the nine
+/// `global_shapes_*` fields (`ImageResult` has no such fields to preserve
+/// them from — same reason `global_types_apply_stage`'s five fields need the
+/// same treatment). Without re-applying this retained outcome afterward, the
+/// `RunGlobalShapes` patch is silently discarded and `global_shapes_*` never
+/// reaches `report.json` on the normal route. See `reapply_global_shapes_outcomes`.
+enum GlobalShapesOutcome {
+    Success(global_shapes::GlobalShapesReport),
+    Failure(String),
+}
+
+/// Apply one retained outcome to `image`, mirroring exactly what
+/// `run_global_shapes_stage_with`'s loop did the first time (clear, then
+/// either the success counts or the bounded failure reason).
+fn apply_global_shapes_outcome(image: &mut ImageReport, outcome: &GlobalShapesOutcome) {
+    clear_global_shapes_fields(image);
+    match outcome {
+        GlobalShapesOutcome::Success(report) => apply_global_shapes_success(image, report),
+        GlobalShapesOutcome::Failure(reason) => {
+            image.global_shapes_error = Some(reason.clone());
+        }
+    }
+}
+
+/// Re-apply every retained `global_shapes` outcome onto `report_images` by
+/// label. Called from `DispatchPass2` after every point that rebuilds the
+/// `decompile` stage's `ImageReport`s (see `GlobalShapesOutcome`'s doc
+/// comment for why that rebuild otherwise discards this data). A label
+/// absent from `outcomes` (no code image, or the whole stage was skipped) is
+/// left untouched — `report_images` is always a fresh rebuild at the call
+/// site, so its `global_shapes_*` fields are already `None` there.
+fn reapply_global_shapes_outcomes(
+    report_images: &mut [ImageReport],
+    outcomes: &HashMap<String, GlobalShapesOutcome>,
+) {
+    for image in report_images {
+        if let Some(outcome) = outcomes.get(&image.image) {
+            apply_global_shapes_outcome(image, outcome);
+        }
+    }
+}
+
 fn global_shapes_stage_output(
     completed: usize,
     eligible: usize,
@@ -1433,6 +1776,10 @@ fn add_global_shapes_totals(
     totals.state_barriers += report.state_barriers;
 }
 
+/// Runs the `global_shapes` sweep and returns every image's retained
+/// [`GlobalShapesOutcome`] (keyed by label) alongside mutating `stages` in
+/// place, so a normal-route caller can re-apply the report-field patch after
+/// a later rebuild — see `GlobalShapesOutcome` and `reapply_global_shapes_outcomes`.
 fn run_global_shapes_stage_with(
     stages: &mut Vec<StageReport>,
     images_dir: &Path,
@@ -1440,14 +1787,14 @@ fn run_global_shapes_stage_with(
     mut run_image: impl for<'a> FnMut(
         &global_shapes::RunRequest<'a>,
     ) -> Result<global_shapes::GlobalShapesReport>,
-) {
+) -> HashMap<String, GlobalShapesOutcome> {
     let Some(decompile_pos) = stages.iter().rposition(|stage| stage.stage == "decompile") else {
         stages.push(StageReport::skipped("global_shapes", "no code image"));
-        return;
+        return HashMap::new();
     };
     if stages[decompile_pos].images.is_empty() {
         stages.push(StageReport::skipped("global_shapes", "no code image"));
-        return;
+        return HashMap::new();
     }
 
     let started = Instant::now();
@@ -1466,6 +1813,7 @@ fn run_global_shapes_stage_with(
         interprocedural_dropped: 0,
     };
     let mut errors: Vec<(String, String)> = Vec::new();
+    let mut outcomes: HashMap<String, GlobalShapesOutcome> = HashMap::new();
 
     for image in &mut stages[decompile_pos].images {
         clear_global_shapes_fields(image);
@@ -1474,6 +1822,7 @@ fn run_global_shapes_stage_with(
             Ok(current) => current,
             Err(reason) => {
                 let reason = record_global_shapes_failure(image, reason);
+                outcomes.insert(label.clone(), GlobalShapesOutcome::Failure(reason.clone()));
                 errors.push((label, reason));
                 continue;
             }
@@ -1496,9 +1845,11 @@ fn run_global_shapes_stage_with(
                 apply_global_shapes_success(image, &report);
                 add_global_shapes_totals(&mut totals, &report);
                 completed += 1;
+                outcomes.insert(label, GlobalShapesOutcome::Success(report));
             }
             Err(error) => {
                 let reason = record_global_shapes_failure(image, error.to_string());
+                outcomes.insert(label.clone(), GlobalShapesOutcome::Failure(reason.clone()));
                 errors.push((label, reason));
             }
         }
@@ -1524,10 +1875,15 @@ fn run_global_shapes_stage_with(
         images: Vec::new(),
         duration_ms: started.elapsed().as_millis(),
     });
+    outcomes
 }
 
-fn run_global_shapes_stage(stages: &mut Vec<StageReport>, images_dir: &Path, manifest_path: &Path) {
-    run_global_shapes_stage_with(stages, images_dir, manifest_path, global_shapes::run_image);
+fn run_global_shapes_stage(
+    stages: &mut Vec<StageReport>,
+    images_dir: &Path,
+    manifest_path: &Path,
+) -> HashMap<String, GlobalShapesOutcome> {
+    run_global_shapes_stage_with(stages, images_dir, manifest_path, global_shapes::run_image)
 }
 
 /// Record global preparation without exposing a normal-route intermediate
@@ -1863,6 +2219,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 
     let mut function_inputs = None;
     let mut prepared_global_maps = HashMap::new();
+    // Captured from `RunGlobalShapes` (which runs before `DispatchPass2` on
+    // the normal route) and re-applied inside `DispatchPass2` after every
+    // rebuild of the `decompile` stage's `ImageReport`s — see
+    // `GlobalShapesOutcome`'s doc comment for why the rebuild otherwise
+    // discards `RunGlobalShapes`'s report-field patch.
+    let mut global_shapes_outcomes: HashMap<String, GlobalShapesOutcome> = HashMap::new();
     orchestrate_symbol_route(opts.no_symbol_pass, |step| match step {
         SymbolRouteStep::PrepareNamesAndProjection => {
             function_inputs = Some(take_globals_function_inputs(&mut function_maps));
@@ -1925,6 +2287,18 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             if application_uninvoked {
                 stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
                 stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
+                // No pass 2 on this route, so `derive_global_types_maps` never
+                // runs and there is no ineligible map to patch; report_images
+                // is irrelevant since `no_symbol_pass` short-circuits first.
+                stages.push(global_types_apply_stage(
+                    true,
+                    opts.no_apply_global_types,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    None,
+                    &mut [],
+                    0,
+                ));
                 stages.push(StageReport::skipped(
                     "thumb_enrich_post_pass2",
                     "--no-symbol-pass",
@@ -1933,10 +2307,27 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 prepared_global_maps = maps;
             }
         }
+        SymbolRouteStep::RunGlobalShapes => {
+            global_shapes_outcomes =
+                run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
+        }
         SymbolRouteStep::DispatchPass2 => {
-            let inputs = prepare_pass2_inputs(&function_maps, &prepared_global_maps);
+            // Derive the strict `undefinedN` apply-map from `global_shapes.json`
+            // (written by `RunGlobalShapes` above) before pass 2 runs, so
+            // `ApplyGlobalTypes.java` has real input alongside `ApplyGlobals`.
+            let (global_types_maps, global_types_ineligible) = if opts.no_apply_global_types {
+                (HashMap::new(), HashMap::new())
+            } else {
+                derive_global_types_maps(&images_dir, &ghidra_dir)
+            };
+            let inputs =
+                prepare_pass2_inputs(&function_maps, &prepared_global_maps, &global_types_maps);
             let scheduled_count = inputs.len();
             drop(std::mem::take(&mut function_maps));
+            // Mirrors each branch's `globals_apply_stage` duration below;
+            // reused once for `global_types_apply_stage` after the final
+            // refresh (see the comment above that call).
+            let mut pass2_elapsed_ms = 0u128;
 
             if let Some(rep) = pass1_report.take() {
                 let fallback_images: Vec<ImageReport> =
@@ -1960,6 +2351,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                                 |label| refresh_decompiled(&ghidra_dir, &images_dir, label),
                             );
                             let elapsed = pass2_started.elapsed().as_millis();
+                            pass2_elapsed_ms = elapsed;
                             stages.push(decompile_pass2_stage(
                                 scheduled_count,
                                 refreshed_count,
@@ -1976,6 +2368,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         }
                         Err(error) => {
                             let elapsed = pass2_started.elapsed().as_millis();
+                            pass2_elapsed_ms = elapsed;
                             stages.push(decompile_pass2_stage(
                                 scheduled_count,
                                 0,
@@ -2022,11 +2415,54 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 }
                 refresh_decompile_stage_images(&mut stages, &report.images);
             }
+
+            // Both calls below must run after every rebuild of
+            // `stages[decompile_pos].images` above — the final
+            // `refresh_decompile_stage_images` just above, but also the
+            // `Err(error)` branch's earlier `install_decompile_stage_image_snapshot`
+            // (installs `fallback_images`, reached when `pass1_report` stays
+            // `None` and the refresh above never runs). Both rebuilds go
+            // through `ImageReport::from_result`, which always nulls the
+            // nine `global_shapes_*` fields and the five `global_types_*`
+            // fields, so patching either set any earlier would be silently
+            // discarded (this exact bug shipped for `global_shapes_*` in
+            // the shape-stage reorder — RunGlobalShapes's in-place patch ran before
+            // DispatchPass2 existed to refresh over it — until this fix;
+            // see `GlobalShapesOutcome`'s doc comment). Placing both calls
+            // once, unconditionally, here — after every branch above has
+            // run, regardless of which one fired — fixes every rebuild site
+            // in one place instead of duplicating a fix-up per branch.
+            reapply_global_shapes_outcomes(
+                decompile_stage_images_mut(&mut stages),
+                &global_shapes_outcomes,
+            );
+
+            // Reading `pass1_report` here (rather than threading a separate
+            // captured value through each branch above) is deliberate: by
+            // this point `pass1_report` is `Some` in exactly the branches
+            // that passed `Some(&images)` to `globals_apply_stage` above
+            // (scheduled_count==0, and Ok(pass2)), and `None` in exactly the
+            // branches that passed `None` (run_two_pass Err, and no pass-1
+            // report at all) — so it already carries the right value per branch.
+            let post_dispatch_images = pass1_report.as_ref().map(|report| report.images.as_slice());
+            let global_types_stage = global_types_apply_stage(
+                false,
+                opts.no_apply_global_types,
+                &global_types_maps,
+                &global_types_ineligible,
+                post_dispatch_images,
+                decompile_stage_images_mut(&mut stages),
+                pass2_elapsed_ms,
+            );
+            stages.push(global_types_stage);
         }
     });
 
-    // Remaining post-symbol stages: global shape recovery, then the RF and
-    // hardware decoders. Both symbol routes share this exact sequence.
+    // Remaining post-symbol stages: the RF and hardware decoders. Global
+    // shape recovery no longer lives here — both symbol routes now run it
+    // via `SymbolRouteStep::RunGlobalShapes` above (before pass 2 on the
+    // normal route, at the end on `--no-symbol-pass`). Both symbol routes
+    // share this exact post-symbol sequence.
     let rf_dir = out.join("rf_cfg_decompressed");
     let hwcfg_path = rootfs.join("hardware_config.json");
     let rf_present = std::fs::read_dir(&rf_dir)
@@ -2034,9 +2470,6 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         .unwrap_or(false);
 
     orchestrate_post_symbol_route(|step| match step {
-        PostSymbolStep::GlobalShapes => {
-            run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
-        }
         PostSymbolStep::DecodeRf => {
             if hwcfg_path.exists() && rf_present {
                 run_stage(&mut stages, "decode_rf", "rf/decoded", || {
@@ -2120,6 +2553,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }
@@ -2345,7 +2781,7 @@ mod tests {
             ),
         ]);
 
-        let inputs = prepare_pass2_inputs(&function_maps, &global_maps);
+        let inputs = prepare_pass2_inputs(&function_maps, &global_maps, &HashMap::new());
 
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
@@ -2354,6 +2790,22 @@ mod tests {
         assert!(inputs["03_APM"].global_map.is_none());
         assert!(inputs["04_VSS"].function_map.is_none());
         assert_eq!(inputs["04_VSS"].global_map.as_ref().unwrap().count(), 7);
+    }
+
+    #[test]
+    fn prepare_pass2_inputs_threads_global_types_map() {
+        let root = std::env::temp_dir().join(format!("pme_p2t_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let tp = root.join("global_types.json");
+        std::fs::write(&tp, r#"{"format":"pixel-modem-extractor-global-types-v1","image":"02_MAIN","types":[{"address":"0x40010000","width":4}]}"#).unwrap();
+        let mut types = HashMap::new();
+        types.insert(
+            "02_MAIN".to_string(),
+            decompile::PreparedPass2Map::new(&tp, std::num::NonZeroUsize::new(1).unwrap()).unwrap(),
+        );
+        let inputs = prepare_pass2_inputs(&HashMap::new(), &HashMap::new(), &types);
+        assert!(inputs["02_MAIN"].global_types_map.is_some());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2424,6 +2876,7 @@ mod tests {
                 ("02_MAIN".to_string(), valid_main_global),
                 ("03_APM".to_string(), valid_other_global),
             ]),
+            &HashMap::new(),
         );
         assert!(inputs["02_MAIN"].function_map.is_none());
         assert_eq!(inputs["02_MAIN"].global_map.as_ref().unwrap().count(), 1);
@@ -2493,6 +2946,7 @@ mod tests {
                 ("03_APM".to_string(), valid_other_function),
             ]),
             &outcome.maps,
+            &HashMap::new(),
         );
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 1);
         assert!(inputs["02_MAIN"].global_map.is_none());
@@ -2540,7 +2994,7 @@ mod tests {
         assert_eq!(error.matches("04_VSS: zeta failure").count(), 1);
         assert!(!Report::is_ok(&[stage]));
 
-        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new());
+        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new(), &HashMap::new());
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
     }
 
@@ -2944,6 +3398,230 @@ mod tests {
     }
 
     #[test]
+    fn global_types_apply_stage_uses_exact_skip_policies() {
+        // Mirrors globals_apply_stage_uses_exact_skip_policies: this catches
+        // disabled application, the --no-apply-global-types escape hatch, and
+        // the zero-candidate route losing their distinct reasons.
+        let maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            prepared_test_map("skip-types-02_MAIN.json", 1),
+        )]);
+        let images = vec![analyzed_image("02_MAIN")];
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let disabled = global_types_apply_stage(
+            true,
+            false,
+            &maps,
+            &HashMap::new(),
+            Some(&images),
+            &mut report_images,
+            99,
+        );
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "skipped",
+                "reason": "--no-symbol-pass",
+                "duration_ms": 0
+            })
+        );
+
+        let flag_disabled = global_types_apply_stage(
+            false,
+            true,
+            &maps,
+            &HashMap::new(),
+            Some(&images),
+            &mut report_images,
+            99,
+        );
+        assert_eq!(
+            serde_json::to_value(flag_disabled).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "skipped",
+                "reason": "--no-apply-global-types",
+                "duration_ms": 0
+            })
+        );
+
+        let no_recovered = global_types_apply_stage(
+            false,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&images),
+            &mut report_images,
+            99,
+        );
+        assert_eq!(
+            serde_json::to_value(no_recovered).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "skipped",
+                "reason": "no recovered scalar shapes",
+                "duration_ms": 0
+            })
+        );
+    }
+
+    #[test]
+    fn global_types_apply_stage_aggregates_and_patches_report_images() {
+        // This catches the aggregate stage losing headline counts, or the
+        // per-image ImageReport patch (applied/skipped/candidates/ineligible)
+        // going missing — the whole reason this stage exists instead of
+        // relying on ImageReport::from_result like globals_applied does.
+        let maps = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                prepared_test_map("aggregate-types-02_MAIN.json", 5),
+            ),
+            (
+                "03_APM".to_string(),
+                prepared_test_map("aggregate-types-03_APM.json", 2),
+            ),
+        ]);
+        let ineligible = HashMap::from([("02_MAIN".to_string(), 4usize)]);
+        let mut main = analyzed_image("02_MAIN");
+        main.global_types_applied = Some(3);
+        main.global_types_apply_skipped = Some(2);
+        let mut apm = analyzed_image("03_APM");
+        apm.global_types_applied = Some(2);
+        apm.global_types_apply_skipped = Some(0);
+        let images = vec![main, apm];
+        let mut report_images = vec![
+            ImageReport::from_result(&analyzed_image("02_MAIN")),
+            ImageReport::from_result(&analyzed_image("03_APM")),
+        ];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &maps,
+            &ineligible,
+            Some(&images),
+            &mut report_images,
+            17,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&stage).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "ok",
+                "output": "2 image(s) processed; 5 global types applied; 2 skipped",
+                "duration_ms": 17
+            })
+        );
+        assert_eq!(report_images[0].global_types_applied, Some(3));
+        assert_eq!(report_images[0].global_types_skipped, Some(2));
+        assert_eq!(report_images[0].global_types_candidates, Some(5));
+        assert_eq!(report_images[0].global_types_ineligible, Some(4));
+        assert!(report_images[0].global_types_error.is_none());
+        assert_eq!(report_images[1].global_types_applied, Some(2));
+        assert_eq!(report_images[1].global_types_skipped, Some(0));
+        assert_eq!(report_images[1].global_types_candidates, Some(2));
+        assert!(report_images[1].global_types_ineligible.is_none());
+    }
+
+    #[test]
+    fn global_types_apply_stage_records_ineligible_even_when_application_is_skipped() {
+        // A `global_shapes.json` with only ineligible shapes (e.g. all
+        // no_evidence/array/conflicting) produces an empty `maps` but a
+        // non-empty `ineligible` — the stage is skipped, but the per-image
+        // count must still surface for diagnostics.
+        let ineligible = HashMap::from([("02_MAIN".to_string(), 6usize)]);
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &HashMap::new(),
+            &ineligible,
+            None,
+            &mut report_images,
+            0,
+        );
+
+        assert_eq!(stage.status, "skipped");
+        assert_eq!(stage.reason.as_deref(), Some("no recovered scalar shapes"));
+        assert_eq!(report_images[0].global_types_ineligible, Some(6));
+        assert!(report_images[0].global_types_applied.is_none());
+    }
+
+    #[test]
+    fn global_types_apply_stage_fails_closed_and_records_per_image_error() {
+        // Mirrors globals_apply_stage_fails_closed_for_every_invalid_prepared_image_outcome:
+        // a per-image ApplyGlobalTypes contract failure must fail the stage
+        // and land on that image's global_types_error, without fabricating
+        // applied/skipped/candidates.
+        let maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            prepared_test_map("invalid-types-02_MAIN.json", 2),
+        )]);
+        let mut image = analyzed_image("02_MAIN");
+        image.global_types_apply_error = Some("global-type map rejected".into());
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &maps,
+            &HashMap::new(),
+            Some(&[image]),
+            &mut report_images,
+            5,
+        );
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("02_MAIN: global-type map rejected")
+        );
+        assert_eq!(
+            stage.output.as_deref(),
+            Some("0 image(s) processed; 0 global types applied; 0 skipped")
+        );
+        assert_eq!(
+            report_images[0].global_types_error.as_deref(),
+            Some("global-type map rejected")
+        );
+        assert!(report_images[0].global_types_applied.is_none());
+        assert!(report_images[0].global_types_candidates.is_none());
+    }
+
+    #[test]
+    fn global_types_apply_stage_records_missing_pass2_image_result() {
+        let maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            prepared_test_map("missing-types-02_MAIN.json", 1),
+        )]);
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &maps,
+            &HashMap::new(),
+            None,
+            &mut report_images,
+            8,
+        );
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("02_MAIN: missing pass-2 image result")
+        );
+        assert_eq!(
+            report_images[0].global_types_error.as_deref(),
+            Some("missing pass-2 image result")
+        );
+    }
+
+    #[test]
     fn globals_stage_refreshes_only_when_application_is_known_uninvoked() {
         // This catches the normal route installing a pre-application snapshot
         // and relying on a later overwrite. The disabled route may refresh
@@ -3200,7 +3878,7 @@ mod tests {
             )
         );
 
-        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
+        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
         assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 1);
         assert!(inputs["02_MAIN"].function_map.is_some());
         assert!(inputs["02_MAIN"].global_map.is_none());
@@ -3249,7 +3927,7 @@ mod tests {
             &globals::GlobalsOpts::default(),
             |_, _, _, _, _, _| Err(Error::Serialize("malformed functions.json".into())),
         );
-        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps);
+        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
         let apply_stage = globals_apply_stage(false, &outcome.maps, Some(&images), 12);
 
         assert_eq!(outcome.stage.status, "failed");
@@ -3336,6 +4014,9 @@ mod tests {
             vec![
                 SymbolRouteStep::PrepareNamesAndProjection,
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::PrepareApplicationInput),
+                // Shapes recover before pass 2 (input-safe reorder), so a later
+                // pass-2 script can apply them as types alongside ApplyGlobals.
+                SymbolRouteStep::RunGlobalShapes,
                 SymbolRouteStep::DispatchPass2,
                 SymbolRouteStep::Finalize {
                     rewrite_decompiled_c: false,
@@ -3346,6 +4027,13 @@ mod tests {
             normal
                 .iter()
                 .filter(|step| matches!(step, SymbolRouteStep::RunGlobals(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            normal
+                .iter()
+                .filter(|step| matches!(step, SymbolRouteStep::RunGlobalShapes))
                 .count(),
             1
         );
@@ -3375,12 +4063,23 @@ mod tests {
                 SymbolRouteStep::Finalize {
                     rewrite_decompiled_c: true,
                 },
+                // This route has no pass 2 to feed, so shapes just need to run
+                // once, after globals.json exists — unchanged last-position
+                // timing versus the pre-reorder post-symbol-route placement.
+                SymbolRouteStep::RunGlobalShapes,
             ]
         );
         assert_eq!(
             disabled
                 .iter()
                 .filter(|step| matches!(step, SymbolRouteStep::RunGlobals(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            disabled
+                .iter()
+                .filter(|step| matches!(step, SymbolRouteStep::RunGlobalShapes))
                 .count(),
             1
         );
@@ -3394,40 +4093,44 @@ mod tests {
         orchestrate_post_symbol_route(|step| post.push(step));
         assert_eq!(
             post,
-            vec![
-                PostSymbolStep::GlobalShapes,
-                PostSymbolStep::DecodeRf,
-                PostSymbolStep::HardwareConfig,
-            ]
-        );
-        assert_eq!(
-            post.iter()
-                .filter(|step| matches!(step, PostSymbolStep::GlobalShapes))
-                .count(),
-            1
+            vec![PostSymbolStep::DecodeRf, PostSymbolStep::HardwareConfig]
         );
 
+        // Combined: on the normal route, RunGlobalShapes now precedes
+        // DispatchPass2 (the whole point of the reorder), which precedes the
+        // route's closing Finalize, which precedes the post-symbol RF/hwcfg
+        // stages appended after it.
         let mut combined = Vec::new();
         orchestrate_symbol_route(false, |step| combined.push(format!("{step:?}")));
         orchestrate_post_symbol_route(|step| combined.push(format!("{step:?}")));
+        let shapes = combined
+            .iter()
+            .position(|step| step == "RunGlobalShapes")
+            .expect("normal route runs RunGlobalShapes");
+        let dispatch_pass2 = combined
+            .iter()
+            .position(|step| step == "DispatchPass2")
+            .expect("normal route dispatches pass 2");
         let finalize = combined
             .iter()
             .position(|step| step.starts_with("Finalize"))
             .expect("normal route ends with Finalize");
-        let shapes = combined
-            .iter()
-            .position(|step| step == "GlobalShapes")
-            .expect("post-symbol route starts with GlobalShapes");
         let decode_rf = combined.iter().position(|step| step == "DecodeRf").unwrap();
         let hardware = combined
             .iter()
             .position(|step| step == "HardwareConfig")
             .unwrap();
-        assert!(finalize < shapes && shapes < decode_rf && decode_rf < hardware);
+        assert!(
+            shapes < dispatch_pass2
+                && dispatch_pass2 < finalize
+                && finalize < decode_rf
+                && decode_rf < hardware,
+            "{combined:?}"
+        );
         assert_eq!(
             combined
                 .iter()
-                .filter(|step| step.as_str() == "GlobalShapes")
+                .filter(|step| step.as_str() == "RunGlobalShapes")
                 .count(),
             1
         );
@@ -3567,6 +4270,11 @@ mod tests {
                         global_shapes_decode_failures: None,
                         global_shapes_state_barriers: None,
                         global_shapes_error: None,
+                        global_types_applied: None,
+                        global_types_candidates: None,
+                        global_types_ineligible: None,
+                        global_types_skipped: None,
+                        global_types_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -3601,6 +4309,11 @@ mod tests {
                         global_shapes_decode_failures: None,
                         global_shapes_state_barriers: None,
                         global_shapes_error: None,
+                        global_types_applied: None,
+                        global_types_candidates: None,
+                        global_types_ineligible: None,
+                        global_types_skipped: None,
+                        global_types_error: None,
                     },
                 ],
                 10,
@@ -3771,6 +4484,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         });
@@ -3814,6 +4530,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         });
@@ -3912,6 +4631,9 @@ mod tests {
                 globals_applied: None,
                 globals_apply_skipped: None,
                 globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             },
@@ -3936,6 +4658,9 @@ mod tests {
                 globals_applied: None,
                 globals_apply_skipped: None,
                 globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
             },
@@ -3999,6 +4724,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }];
@@ -4072,6 +4800,11 @@ mod tests {
             global_shapes_decode_failures: None,
             global_shapes_state_barriers: None,
             global_shapes_error: None,
+            global_types_applied: None,
+            global_types_candidates: None,
+            global_types_ineligible: None,
+            global_types_skipped: None,
+            global_types_error: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -4097,6 +4830,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }];
@@ -4159,6 +4895,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         }];
@@ -4648,6 +5387,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -4789,6 +5531,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -4823,6 +5568,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -4856,6 +5604,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
         };
@@ -4890,6 +5641,9 @@ mod tests {
             globals_applied: None,
             globals_apply_skipped: None,
             globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
             globals_provisional: Some(50),
             globals_provisional_suppressed: Some(3),
         };
@@ -5113,6 +5867,38 @@ mod tests {
                 "{key} must stay absent on failure"
             );
         }
+    }
+
+    #[test]
+    fn image_report_serializes_global_types_fields() {
+        let mut image = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        image.global_types_applied = Some(120);
+        image.global_types_candidates = Some(123);
+        image.global_types_ineligible = Some(4);
+        image.global_types_skipped = Some(3);
+        let v = serde_json::to_value(&image).unwrap();
+        assert_eq!(v["global_types_applied"], 120);
+        assert_eq!(v["global_types_candidates"], 123);
+        assert_eq!(v["global_types_ineligible"], 4);
+        assert_eq!(v["global_types_skipped"], 3);
+        assert!(v.get("global_types_error").is_none());
+    }
+
+    #[test]
+    fn image_report_serializes_global_types_fields_as_none_when_absent() {
+        let report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        let value = serde_json::to_value(&report).unwrap();
+        for key in [
+            "global_types_applied",
+            "global_types_candidates",
+            "global_types_ineligible",
+            "global_types_skipped",
+            "global_types_error",
+        ] {
+            assert!(value.get(key).is_none(), "{key} must be omitted");
+        }
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("global_types_"));
     }
 
     #[test]
@@ -5694,7 +6480,13 @@ mod tests {
     }
 
     #[test]
-    fn global_shapes_stage_both_routes_enter_wrapper_once_after_terminal_events() {
+    fn global_shapes_stage_both_routes_enter_wrapper_exactly_once() {
+        // Both symbol routes must reach `run_global_shapes_stage_with` exactly
+        // once, but at different points: the normal route now runs it
+        // *before* DispatchPass2 (the input-safe reorder — shapes must be
+        // ready for a later pass-2 apply step); `--no-symbol-pass` has no
+        // pass 2 to feed, so it still runs shapes last, after globals.json
+        // exists (RunGlobals(RecordOnly), the "skip" event below).
         let root = std::env::temp_dir().join(format!(
             "pme_global_shapes_stage_routes_{}",
             std::process::id()
@@ -5713,10 +6505,7 @@ mod tests {
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly) => {
                     events.push("skip".into())
                 }
-                other => events.push(format!("{other:?}")),
-            });
-            orchestrate_post_symbol_route(|step| match step {
-                PostSymbolStep::GlobalShapes => {
+                SymbolRouteStep::RunGlobalShapes => {
                     events.push("global_shapes".into());
                     let mut stages = vec![StageReport::decompile(
                         vec![eligible_shape_image(
@@ -5733,6 +6522,9 @@ mod tests {
                     assert_eq!(last_stage(&stages).status, "ok");
                     assert_nine_shape_counts(&stages[0].images[0], Some(0));
                 }
+                other => events.push(format!("{other:?}")),
+            });
+            orchestrate_post_symbol_route(|step| match step {
                 PostSymbolStep::DecodeRf => events.push("decode_rf".into()),
                 PostSymbolStep::HardwareConfig => events.push("hardware_config".into()),
             });
@@ -5757,10 +6549,18 @@ mod tests {
                 .iter()
                 .position(|event| event == terminal)
                 .unwrap_or_else(|| panic!("{terminal} event missing: {events:?}"));
-            assert!(
-                terminal_pos < shapes,
-                "global_shapes must follow {terminal}: {events:?}"
-            );
+            if no_symbol_pass {
+                assert!(
+                    terminal_pos < shapes,
+                    "on --no-symbol-pass, global_shapes must follow {terminal}: {events:?}"
+                );
+            } else {
+                assert!(
+                    shapes < terminal_pos,
+                    "on the normal route, global_shapes must precede {terminal} \
+                     (input-safe reorder before pass 2): {events:?}"
+                );
+            }
             let decode_rf = events
                 .iter()
                 .position(|event| event == "decode_rf")
@@ -5777,6 +6577,90 @@ mod tests {
         assert!(images_dir.join("02_MAIN/decompiled/globals.json").is_file());
         assert!(!sidecar.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_outcomes_survive_refresh_decompile_stage_images() {
+        // Regression test (plain unit test — no PME_GOLDEN_DIR — so a
+        // re-regression fails normal CI, not only the gated golden) for the
+        // shape-recovery clobber a code review found: on the normal route,
+        // `RunGlobalShapes` patches `global_shapes_*` onto
+        // `stages[decompile_pos].images` *before* `DispatchPass2` runs.
+        // `DispatchPass2`'s own `refresh_decompile_stage_images` later
+        // rebuilds those same `ImageReport`s from `decompile::ImageResult`
+        // via `ImageReport::from_result`, which always nulls
+        // `global_shapes_*` (`ImageResult` has no such fields to preserve
+        // them from) — silently discarding the patch unless
+        // `reapply_global_shapes_outcomes` runs afterward.
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 0),
+                eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+            ],
+            1,
+        )];
+        let outcomes = run_global_shapes_stage_with(
+            &mut stages,
+            Path::new("unused-images-dir"),
+            Path::new("unused-manifest"),
+            |request| {
+                if request.image_label == "02_MAIN" {
+                    Ok(global_shapes::GlobalShapesReport {
+                        inferred: 2,
+                        no_evidence: 1,
+                        conflicting: 0,
+                        observations: 4,
+                        ghidra_quarantined: 0,
+                        thumb_quarantined: 0,
+                        quarantine_errors: 0,
+                        decode_failures: 0,
+                        state_barriers: 0,
+                        interprocedural_dropped: 0,
+                    })
+                } else {
+                    Err(Error::DecomposeIncomplete("boom".into()))
+                }
+            },
+        );
+
+        // Sanity: the initial in-place patch (success + failure) landed.
+        assert_eq!(stages[0].images[0].global_shapes_inferred, Some(2));
+        assert_eq!(stages[0].images[0].global_shape_observations, Some(4));
+        assert_eq!(
+            stages[0].images[1].global_shapes_error.as_deref(),
+            Some("decompose incomplete: boom")
+        );
+
+        // Simulate DispatchPass2's final refresh: rebuild from a fresh
+        // ImageResult slice, exactly like the real pass-2 dispatch does.
+        let post_pass2_images = vec![analyzed_image("02_MAIN"), analyzed_image("03_APM")];
+        refresh_decompile_stage_images(&mut stages, &post_pass2_images);
+
+        // Prove the regression is real: the refresh alone nulls everything,
+        // both the success counts and the failure reason.
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert!(stages[0].images[1].global_shapes_error.is_none());
+
+        // The fix: re-applying the retained outcomes restores both.
+        reapply_global_shapes_outcomes(decompile_stage_images_mut(&mut stages), &outcomes);
+        assert_eq!(stages[0].images[0].global_shapes_inferred, Some(2));
+        assert_eq!(stages[0].images[0].global_shapes_no_evidence, Some(1));
+        assert_eq!(stages[0].images[0].global_shape_observations, Some(4));
+        assert!(stages[0].images[0].global_shapes_error.is_none());
+        assert_eq!(
+            stages[0].images[1].global_shapes_error.as_deref(),
+            Some("decompose incomplete: boom")
+        );
+        assert_nine_shape_counts(&stages[0].images[1], None);
+    }
+
+    #[test]
+    fn reapply_global_shapes_outcomes_leaves_unlisted_images_untouched() {
+        let mut images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+        let outcomes = HashMap::new(); // no retained outcome for 02_MAIN
+        reapply_global_shapes_outcomes(&mut images, &outcomes);
+        assert_nine_shape_counts(&images[0], None);
+        assert!(images[0].global_shapes_error.is_none());
     }
 
     #[test]

@@ -34,6 +34,7 @@ fn decompose_produces_unified_tree() {
         globals_provisional: false,
         globals_k_arm: None,
         globals_k_thumb: None,
+        no_apply_global_types: false,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -396,6 +397,7 @@ fn report_json_includes_phase2_fields() {
         globals_provisional: false,
         globals_k_arm: None,
         globals_k_thumb: None,
+        no_apply_global_types: false,
     };
     let _ = decompose::run(&img, &opts, &out);
 
@@ -452,6 +454,7 @@ fn report_json_includes_globals_field() {
         globals_provisional: false,
         globals_k_arm: None,
         globals_k_thumb: None,
+        no_apply_global_types: false,
     };
     let _ = decompose::run(&img, &opts, &out);
 
@@ -626,8 +629,43 @@ fn report_json_includes_global_shapes_fields() {
         let thumb = names
             .iter()
             .position(|name| *name == "thumb_enrich_post_pass2")
-            .expect("thumb_enrich_post_pass2 must precede global_shapes");
-        assert!(thumb < shapes, "{names:?}");
+            .expect("thumb_enrich_post_pass2 must precede or follow global_shapes");
+        // Route-dependent order: on `--no-symbol-pass`, `global_shapes` still
+        // runs last (after its own, always-"skipped" `thumb_enrich_post_pass2`
+        // stub) exactly as before Task 5's reorder. On the normal route,
+        // Task 5's input-safe reorder moved `global_shapes` to run *before*
+        // `DispatchPass2` (which pushes the real `thumb_enrich_post_pass2`) so
+        // a later pass-2 post-script can apply the recovered shapes as types —
+        // see CONTRIBUTING.md's "Phase 3.2: global storage-shape recovery".
+        // `decompile_pass2`'s stage `reason` is the only route signal already
+        // present in report.json: it is exactly "--no-symbol-pass" on that
+        // route and never on the normal route (previously this assertion only
+        // checked the pre-reorder `--no-symbol-pass` direction unconditionally,
+        // which is wrong for a normal-route tree since the Task 5 reorder —
+        // that gap is exactly how the global_shapes_* report-field regression
+        // below went uncaught).
+        let is_no_symbol_pass_route = stages
+            .iter()
+            .find(|stage| stage["stage"] == "decompile_pass2")
+            .and_then(|stage| stage["reason"].as_str())
+            == Some("--no-symbol-pass");
+        if is_no_symbol_pass_route {
+            assert!(
+                thumb < shapes,
+                "on --no-symbol-pass, global_shapes must follow thumb_enrich_post_pass2: {names:?}"
+            );
+        } else {
+            assert!(
+                shapes < thumb,
+                "on the normal route, global_shapes must precede thumb_enrich_post_pass2 \
+                 (Task 5's input-safe reorder): {names:?}"
+            );
+        }
+        // Unconditional on both routes: `orchestrate_post_symbol_route`
+        // (decode_rf, hardware_config) always runs strictly after the whole
+        // `orchestrate_symbol_route` closure returns, for both routes, so
+        // global_shapes — wherever it lands within that closure — always
+        // precedes both decoders.
         for decoder in ["decode_rf", "hardware_config"] {
             if let Some(pos) = names.iter().position(|name| *name == decoder) {
                 assert!(
@@ -637,6 +675,14 @@ fn report_json_includes_global_shapes_fields() {
             }
         }
     }
+    // Route-agnostic on purpose (covers the normal route, where Task 5's
+    // reorder made `RunGlobalShapes` run before `DispatchPass2`'s
+    // `refresh_decompile_stage_images`, which would otherwise silently null
+    // these nine fields — see `reapply_global_shapes_outcomes` in
+    // decompose.rs and the plain-unit-test regression sentinel
+    // `global_shapes_outcomes_survive_refresh_decompile_stage_images`, which
+    // pins this without needing PME_GOLDEN_DIR — and the `--no-symbol-pass`
+    // route, which was never affected).
     if current_global_shapes_inputs_succeeded(main) && main.get("global_shapes_error").is_none() {
         for key in NINE_GLOBAL_SHAPES_FIELDS {
             assert!(
@@ -645,4 +691,97 @@ fn report_json_includes_global_shapes_fields() {
             );
         }
     }
+}
+
+/// Phase 3.2 type application: on a real `02_MAIN`, the per-image entry in
+/// the `decompile` stage's `images[]` carries all four `global_types_*`
+/// counting fields (`global_types_applied`, `global_types_candidates`,
+/// `global_types_ineligible`, `global_types_skipped`), conserves
+/// `candidates == applied + skipped`, and has actually applied at least one
+/// recovered scalar shape. Their absence means either
+/// `global_types_apply_stage`'s post-`DispatchPass2` patch never ran (the
+/// same wiring-gap class `report_json_includes_phase3_0_1_fields` and
+/// `report_json_includes_global_shapes_fields` guard against for their own
+/// fields) or the retained tree predates this stage and must be regenerated
+/// with a current `decompose` binary. Reads `$PME_GOLDEN_DIR/report.json`
+/// (pre-existing decompose output; never auto-runs decompose — production
+/// verification supplies the env); skips cleanly when the env is unset or
+/// the file is absent.
+///
+/// Idempotency (re-running `decompose` over an already-typed tree and
+/// getting an identical result) is intentionally NOT covered here: a static
+/// `report.json` golden cannot observe a second run. That guarantee comes
+/// from `ApplyGlobalTypes.java` widening only already-undefined bytes
+/// (`CLEAR_ALL_UNDEFINED_CONFLICT_DATA`) plus the DEFAULT-only Ghidra
+/// re-apply and unit-test coverage described in CONTRIBUTING.md's Phase 3.2
+/// type-application notes.
+#[test]
+fn global_types_applied_on_retained_tree() {
+    let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = dir.join("report.json");
+    if !report_path.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report.json readable"))
+            .expect("report.json valid JSON");
+    let main = v["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|s| s["stage"] == "decompile"))
+        .and_then(|s| s["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+
+    for key in [
+        "global_types_applied",
+        "global_types_candidates",
+        "global_types_ineligible",
+        "global_types_skipped",
+    ] {
+        assert!(
+            main.get(key).is_some(),
+            "{key} missing on 02_MAIN — global_types_apply_stage's report patch \
+             is missing, or this tree predates Phase 3.2 type application: {main}"
+        );
+    }
+
+    let applied = main["global_types_applied"]
+        .as_u64()
+        .expect("global_types_applied is a u64");
+    let candidates = main["global_types_candidates"]
+        .as_u64()
+        .expect("global_types_candidates is a u64");
+    let skipped = main["global_types_skipped"]
+        .as_u64()
+        .expect("global_types_skipped is a u64");
+
+    assert_eq!(
+        candidates,
+        applied + skipped,
+        "global_types_candidates must conserve applied + skipped on 02_MAIN: {main}"
+    );
+    assert!(
+        applied <= candidates,
+        "global_types_applied must not exceed global_types_candidates on 02_MAIN: {main}"
+    );
+    // The 270-of-274-inferred-globals-are-scalar-candidates split (1 array,
+    // 3 unknown; task-9-brief.md, Fidelity/scope decisions) was measured on
+    // the retained CHEETAH `01_MAIN` tree, not this test's MUSTANG `02_MAIN`
+    // target — `02_MAIN` has a different, smaller inferred count (125 per
+    // the Phase 3.2 production baseline in CONTRIBUTING.md) and no
+    // independently measured scalar/array/unknown split of its own, so a
+    // healthy run here applies some unmeasured number up to that ~125
+    // ceiling, not the cheetah figure. Pin only the non-zero floor; a
+    // tighter band would both babysit Ghidra's analysis nondeterminism and
+    // require a `02_MAIN`-specific measurement this test doesn't have.
+    assert!(
+        applied >= 1,
+        "expected at least one recovered global type applied on 02_MAIN, got {applied} \
+         (candidates={candidates}, skipped={skipped}): {main}"
+    );
+    eprintln!("02_MAIN global_types: applied={applied} candidates={candidates} skipped={skipped}");
 }
