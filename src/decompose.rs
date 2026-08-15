@@ -45,6 +45,13 @@ pub struct Opts {
     /// Phase 3.0.1 test-only: override the Thumb proximity window (`K_THUMB`).
     /// Wired to the hidden `--globals-k-thumb`. `None` -> use `globals::K_THUMB`.
     pub globals_k_thumb: Option<usize>,
+    /// Phase 3.2 type-application escape hatch: when true, `derive_global_types_maps`
+    /// is not called and pass 2 receives no global-type input, so
+    /// `ApplyGlobalTypes.java` does not run. Recovered shapes are still
+    /// written to the `global_shapes.json` sidecar; only the `decompiled.c`
+    /// `undefinedN` application is skipped. Wired to `--no-apply-global-types`.
+    /// Default: apply.
+    pub no_apply_global_types: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,6 +122,29 @@ pub struct ImageReport {
     pub global_shapes_state_barriers: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_shapes_error: Option<String>,
+    /// Count of `undefinedN` types `ApplyGlobalTypes.java` applied. `None` means
+    /// type application did not run for this image; `Some(0)` is executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_applied: Option<usize>,
+    /// `global_types_applied + global_types_skipped` — the count of apply-worthy
+    /// scalar shapes offered to pass 2 for this image (the `global_types_maps`
+    /// entry's `count()`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_candidates: Option<usize>,
+    /// Count of recovered shapes this image's `global_shapes.json` held that
+    /// were not apply-worthy (not width 1/2/4/8, `no_evidence`, conflicting,
+    /// or array) — from `global_types::select_from_shapes_json`'s `Selection`.
+    /// Present whenever the image had a `global_shapes.json`, independent of
+    /// whether application itself ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_ineligible: Option<usize>,
+    /// Sum of the `ApplyGlobalTypes.java` skip buckets for an executed success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_skipped: Option<usize>,
+    /// Reason-only type-application failure (error/missing/duplicate/malformed/
+    /// wrong-image/non-conserving summary, or a missing pass-2 image result).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_types_error: Option<String>,
 }
 
 impl ImageReport {
@@ -157,6 +187,11 @@ impl ImageReport {
                 global_shapes_decode_failures: None,
                 global_shapes_state_barriers: None,
                 global_shapes_error: None,
+                global_types_applied: None,
+                global_types_candidates: None,
+                global_types_ineligible: None,
+                global_types_skipped: None,
+                global_types_error: None,
             },
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
@@ -191,6 +226,11 @@ impl ImageReport {
                 global_shapes_decode_failures: None,
                 global_shapes_state_barriers: None,
                 global_shapes_error: None,
+                global_types_applied: None,
+                global_types_candidates: None,
+                global_types_ineligible: None,
+                global_types_skipped: None,
+                global_types_error: None,
             },
         }
     }
@@ -735,6 +775,18 @@ fn install_decompile_stage_image_snapshot(stages: &mut [StageReport], images: Ve
     stages[pos].images = images;
 }
 
+/// Borrow the `decompile` stage's per-image entries mutably, or an empty
+/// slice if that stage has not been pushed yet. Used by `global_types_apply_stage`
+/// to patch the `global_types_*` fields onto the already-installed `ImageReport`s
+/// — those fields are never set by `ImageReport::from_result` (see its call
+/// sites), so unlike `globals_applied` they need an explicit post-hoc patch.
+fn decompile_stage_images_mut(stages: &mut [StageReport]) -> &mut [ImageReport] {
+    match stages.iter().rposition(|s| s.stage == "decompile") {
+        Some(pos) => stages[pos].images.as_mut_slice(),
+        None => &mut [],
+    }
+}
+
 /// Phase 3.0 helper: load Phase 1's `symbols.json` and build a lookup map
 /// from function entry address (canonical: lowercase hex, no `0x`, no
 /// leading zeros) to recovered name. Used to enrich `globals::run`'s
@@ -1105,8 +1157,6 @@ fn prepare_pass2_inputs(
 /// that is normal and is skipped without comment. A shapes file that fails
 /// to parse, or a map that fails to write or validate, is logged and that
 /// image degrades to names-only pass-2 input (fail-closed).
-// TODO(task-6): remove #[allow(dead_code)] when run() calls this
-#[allow(dead_code)]
 fn derive_global_types_maps(
     images_dir: &Path,
     ghidra_dir: &Path,
@@ -1249,6 +1299,158 @@ fn globals_apply_stage(
         },
         output: Some(format!(
             "{processed} image(s) processed; {applied_total} globals applied; \
+             {skipped_total} skipped"
+        )),
+        reason: None,
+        error: first_error,
+        images: Vec::new(),
+        duration_ms,
+    }
+}
+
+/// Set `global_types_ineligible` on every matching `report_images` entry.
+/// Runs independent of whether application itself ran or was skipped —
+/// `ineligible` comes from `derive_global_types_maps`, which counts every
+/// image with a `global_shapes.json`, not only the ones apply-worthy enough
+/// to reach pass 2 (see its doc comment).
+fn record_global_types_ineligible(
+    report_images: &mut [ImageReport],
+    ineligible: &HashMap<String, usize>,
+) {
+    for (label, count) in ineligible {
+        if let Some(image) = report_images.iter_mut().find(|image| &image.image == label) {
+            image.global_types_ineligible = Some(*count);
+        }
+    }
+}
+
+fn record_global_types_error(report_images: &mut [ImageReport], label: &str, reason: &str) {
+    if let Some(image) = report_images.iter_mut().find(|image| image.image == label) {
+        image.global_types_error = Some(reason.to_string());
+    }
+}
+
+/// Apply-global-types aggregation, mirroring `globals_apply_stage`'s skip
+/// policy and per-label consistency check (same-shape strict-conservation
+/// loop over `image.global_types_applied` / `global_types_apply_skipped` /
+/// `global_types_apply_error`). Additionally patches `report_images` (the
+/// `decompile` stage's already-installed `ImageReport`s) in place with
+/// `global_types_applied` / `global_types_skipped` / `global_types_error` /
+/// `global_types_candidates`, because — unlike `globals_applied` — those
+/// fields are never copied by `ImageReport::from_result`; `global_types_ineligible`
+/// in particular has no `decompile::ImageResult` counterpart at all, only
+/// `derive_global_types_maps`'s `ineligible` map.
+///
+/// Callers on the normal route MUST pass a `report_images` slice that has
+/// already been through this call's `DispatchPass2` invocation of
+/// `refresh_decompile_stage_images` (i.e. call this function *after* that
+/// refresh, not alongside `globals_apply_stage`). `refresh_decompile_stage_images`
+/// rebuilds `stages[decompile_pos].images` from `decompile::ImageResult` via
+/// `ImageReport::from_result`, which always nulls the five `global_types_*`
+/// fields — a patch applied before that refresh would be silently discarded.
+fn global_types_apply_stage(
+    no_symbol_pass: bool,
+    no_apply_global_types: bool,
+    global_types_maps: &HashMap<String, decompile::PreparedPass2Map>,
+    ineligible: &HashMap<String, usize>,
+    images: Option<&[decompile::ImageResult]>,
+    report_images: &mut [ImageReport],
+    duration_ms: u128,
+) -> StageReport {
+    record_global_types_ineligible(report_images, ineligible);
+
+    if no_symbol_pass {
+        return StageReport::skipped("global_types_apply", "--no-symbol-pass");
+    }
+    if no_apply_global_types {
+        return StageReport::skipped("global_types_apply", "--no-apply-global-types");
+    }
+    if global_types_maps.is_empty() {
+        return StageReport::skipped("global_types_apply", "no recovered scalar shapes");
+    }
+
+    let mut labels: Vec<&str> = global_types_maps.keys().map(String::as_str).collect();
+    labels.sort_unstable();
+    let mut processed = 0usize;
+    let mut applied_total = 0usize;
+    let mut skipped_total = 0usize;
+    let mut first_error = None;
+
+    if let Some(images) = images {
+        for image in images {
+            let Ok(index) = labels.binary_search(&image.label.as_str()) else {
+                continue;
+            };
+            let label = labels.remove(index);
+            if let Some(error) = &image.pass2_error {
+                first_error.get_or_insert_with(|| format!("{label}: {error}"));
+                record_global_types_error(report_images, label, error);
+                continue;
+            }
+            if let Some(error) = &image.global_types_apply_error {
+                first_error.get_or_insert_with(|| format!("{label}: {error}"));
+                record_global_types_error(report_images, label, error);
+                continue;
+            }
+            let (Some(applied), Some(skipped)) =
+                (image.global_types_applied, image.global_types_apply_skipped)
+            else {
+                let reason = "no valid ApplyGlobalTypes success summary";
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, reason);
+                continue;
+            };
+            let Some(classified) = applied.checked_add(skipped) else {
+                let reason = "global-type application counts overflow";
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, reason);
+                continue;
+            };
+            let expected = global_types_maps[label].count();
+            if classified != expected {
+                let reason = format!(
+                    "global-type application counts do not match prepared types: \
+                     {classified} != {expected}"
+                );
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, &reason);
+                continue;
+            }
+            let (Some(next_applied), Some(next_skipped)) = (
+                applied_total.checked_add(applied),
+                skipped_total.checked_add(skipped),
+            ) else {
+                let reason = "global-type application totals overflow";
+                first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+                record_global_types_error(report_images, label, reason);
+                continue;
+            };
+            applied_total = next_applied;
+            skipped_total = next_skipped;
+            processed += 1;
+            if let Some(report_image) = report_images.iter_mut().find(|ri| ri.image == label) {
+                report_image.global_types_applied = Some(applied);
+                report_image.global_types_skipped = Some(skipped);
+                report_image.global_types_candidates = Some(classified);
+                report_image.global_types_error = None;
+            }
+        }
+    }
+    for label in labels {
+        let reason = "missing pass-2 image result";
+        first_error.get_or_insert_with(|| format!("{label}: {reason}"));
+        record_global_types_error(report_images, label, reason);
+    }
+
+    StageReport {
+        stage: "global_types_apply",
+        status: if first_error.is_some() {
+            "failed"
+        } else {
+            "ok"
+        },
+        output: Some(format!(
+            "{processed} image(s) processed; {applied_total} global types applied; \
              {skipped_total} skipped"
         )),
         reason: None,
@@ -2017,6 +2219,18 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             if application_uninvoked {
                 stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
                 stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
+                // No pass 2 on this route, so `derive_global_types_maps` never
+                // runs and there is no ineligible map to patch; report_images
+                // is irrelevant since `no_symbol_pass` short-circuits first.
+                stages.push(global_types_apply_stage(
+                    true,
+                    opts.no_apply_global_types,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    None,
+                    &mut [],
+                    0,
+                ));
                 stages.push(StageReport::skipped(
                     "thumb_enrich_post_pass2",
                     "--no-symbol-pass",
@@ -2029,11 +2243,22 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
         }
         SymbolRouteStep::DispatchPass2 => {
-            // TODO(task-6): pass real derived global-type maps
+            // Derive the strict `undefinedN` apply-map from `global_shapes.json`
+            // (written by `RunGlobalShapes` above) before pass 2 runs, so
+            // `ApplyGlobalTypes.java` has real input alongside `ApplyGlobals`.
+            let (global_types_maps, global_types_ineligible) = if opts.no_apply_global_types {
+                (HashMap::new(), HashMap::new())
+            } else {
+                derive_global_types_maps(&images_dir, &ghidra_dir)
+            };
             let inputs =
-                prepare_pass2_inputs(&function_maps, &prepared_global_maps, &HashMap::new());
+                prepare_pass2_inputs(&function_maps, &prepared_global_maps, &global_types_maps);
             let scheduled_count = inputs.len();
             drop(std::mem::take(&mut function_maps));
+            // Mirrors each branch's `globals_apply_stage` duration below;
+            // reused once for `global_types_apply_stage` after the final
+            // refresh (see the comment above that call).
+            let mut pass2_elapsed_ms = 0u128;
 
             if let Some(rep) = pass1_report.take() {
                 let fallback_images: Vec<ImageReport> =
@@ -2057,6 +2282,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                                 |label| refresh_decompiled(&ghidra_dir, &images_dir, label),
                             );
                             let elapsed = pass2_started.elapsed().as_millis();
+                            pass2_elapsed_ms = elapsed;
                             stages.push(decompile_pass2_stage(
                                 scheduled_count,
                                 refreshed_count,
@@ -2073,6 +2299,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         }
                         Err(error) => {
                             let elapsed = pass2_started.elapsed().as_millis();
+                            pass2_elapsed_ms = elapsed;
                             stages.push(decompile_pass2_stage(
                                 scheduled_count,
                                 0,
@@ -2119,6 +2346,29 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 }
                 refresh_decompile_stage_images(&mut stages, &report.images);
             }
+
+            // Must run after the refresh above: refresh_decompile_stage_images
+            // rebuilds `stages[decompile_pos].images` from `ImageResult` via
+            // `ImageReport::from_result`, which always nulls the five
+            // `global_types_*` fields, so patching before that refresh would
+            // be silently discarded. Reading `pass1_report` here (rather than
+            // threading a separate captured value through each branch above)
+            // is deliberate: by this point `pass1_report` is `Some` in exactly
+            // the branches that passed `Some(&images)` to `globals_apply_stage`
+            // above (scheduled_count==0, and Ok(pass2)), and `None` in exactly
+            // the branches that passed `None` (run_two_pass Err, and no pass-1
+            // report at all) — so it already carries the right value per branch.
+            let post_dispatch_images = pass1_report.as_ref().map(|report| report.images.as_slice());
+            let global_types_stage = global_types_apply_stage(
+                false,
+                opts.no_apply_global_types,
+                &global_types_maps,
+                &global_types_ineligible,
+                post_dispatch_images,
+                decompile_stage_images_mut(&mut stages),
+                pass2_elapsed_ms,
+            );
+            stages.push(global_types_stage);
         }
     });
 
@@ -3062,6 +3312,230 @@ mod tests {
     }
 
     #[test]
+    fn global_types_apply_stage_uses_exact_skip_policies() {
+        // Mirrors globals_apply_stage_uses_exact_skip_policies: this catches
+        // disabled application, the --no-apply-global-types escape hatch, and
+        // the zero-candidate route losing their distinct reasons.
+        let maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            prepared_test_map("skip-types-02_MAIN.json", 1),
+        )]);
+        let images = vec![analyzed_image("02_MAIN")];
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let disabled = global_types_apply_stage(
+            true,
+            false,
+            &maps,
+            &HashMap::new(),
+            Some(&images),
+            &mut report_images,
+            99,
+        );
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "skipped",
+                "reason": "--no-symbol-pass",
+                "duration_ms": 0
+            })
+        );
+
+        let flag_disabled = global_types_apply_stage(
+            false,
+            true,
+            &maps,
+            &HashMap::new(),
+            Some(&images),
+            &mut report_images,
+            99,
+        );
+        assert_eq!(
+            serde_json::to_value(flag_disabled).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "skipped",
+                "reason": "--no-apply-global-types",
+                "duration_ms": 0
+            })
+        );
+
+        let no_recovered = global_types_apply_stage(
+            false,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&images),
+            &mut report_images,
+            99,
+        );
+        assert_eq!(
+            serde_json::to_value(no_recovered).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "skipped",
+                "reason": "no recovered scalar shapes",
+                "duration_ms": 0
+            })
+        );
+    }
+
+    #[test]
+    fn global_types_apply_stage_aggregates_and_patches_report_images() {
+        // This catches the aggregate stage losing headline counts, or the
+        // per-image ImageReport patch (applied/skipped/candidates/ineligible)
+        // going missing — the whole reason this stage exists instead of
+        // relying on ImageReport::from_result like globals_applied does.
+        let maps = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                prepared_test_map("aggregate-types-02_MAIN.json", 5),
+            ),
+            (
+                "03_APM".to_string(),
+                prepared_test_map("aggregate-types-03_APM.json", 2),
+            ),
+        ]);
+        let ineligible = HashMap::from([("02_MAIN".to_string(), 4usize)]);
+        let mut main = analyzed_image("02_MAIN");
+        main.global_types_applied = Some(3);
+        main.global_types_apply_skipped = Some(2);
+        let mut apm = analyzed_image("03_APM");
+        apm.global_types_applied = Some(2);
+        apm.global_types_apply_skipped = Some(0);
+        let images = vec![main, apm];
+        let mut report_images = vec![
+            ImageReport::from_result(&analyzed_image("02_MAIN")),
+            ImageReport::from_result(&analyzed_image("03_APM")),
+        ];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &maps,
+            &ineligible,
+            Some(&images),
+            &mut report_images,
+            17,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&stage).unwrap(),
+            serde_json::json!({
+                "stage": "global_types_apply",
+                "status": "ok",
+                "output": "2 image(s) processed; 5 global types applied; 2 skipped",
+                "duration_ms": 17
+            })
+        );
+        assert_eq!(report_images[0].global_types_applied, Some(3));
+        assert_eq!(report_images[0].global_types_skipped, Some(2));
+        assert_eq!(report_images[0].global_types_candidates, Some(5));
+        assert_eq!(report_images[0].global_types_ineligible, Some(4));
+        assert!(report_images[0].global_types_error.is_none());
+        assert_eq!(report_images[1].global_types_applied, Some(2));
+        assert_eq!(report_images[1].global_types_skipped, Some(0));
+        assert_eq!(report_images[1].global_types_candidates, Some(2));
+        assert!(report_images[1].global_types_ineligible.is_none());
+    }
+
+    #[test]
+    fn global_types_apply_stage_records_ineligible_even_when_application_is_skipped() {
+        // A `global_shapes.json` with only ineligible shapes (e.g. all
+        // no_evidence/array/conflicting) produces an empty `maps` but a
+        // non-empty `ineligible` — the stage is skipped, but the per-image
+        // count must still surface for diagnostics.
+        let ineligible = HashMap::from([("02_MAIN".to_string(), 6usize)]);
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &HashMap::new(),
+            &ineligible,
+            None,
+            &mut report_images,
+            0,
+        );
+
+        assert_eq!(stage.status, "skipped");
+        assert_eq!(stage.reason.as_deref(), Some("no recovered scalar shapes"));
+        assert_eq!(report_images[0].global_types_ineligible, Some(6));
+        assert!(report_images[0].global_types_applied.is_none());
+    }
+
+    #[test]
+    fn global_types_apply_stage_fails_closed_and_records_per_image_error() {
+        // Mirrors globals_apply_stage_fails_closed_for_every_invalid_prepared_image_outcome:
+        // a per-image ApplyGlobalTypes contract failure must fail the stage
+        // and land on that image's global_types_error, without fabricating
+        // applied/skipped/candidates.
+        let maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            prepared_test_map("invalid-types-02_MAIN.json", 2),
+        )]);
+        let mut image = analyzed_image("02_MAIN");
+        image.global_types_apply_error = Some("global-type map rejected".into());
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &maps,
+            &HashMap::new(),
+            Some(&[image]),
+            &mut report_images,
+            5,
+        );
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("02_MAIN: global-type map rejected")
+        );
+        assert_eq!(
+            stage.output.as_deref(),
+            Some("0 image(s) processed; 0 global types applied; 0 skipped")
+        );
+        assert_eq!(
+            report_images[0].global_types_error.as_deref(),
+            Some("global-type map rejected")
+        );
+        assert!(report_images[0].global_types_applied.is_none());
+        assert!(report_images[0].global_types_candidates.is_none());
+    }
+
+    #[test]
+    fn global_types_apply_stage_records_missing_pass2_image_result() {
+        let maps = HashMap::from([(
+            "02_MAIN".to_string(),
+            prepared_test_map("missing-types-02_MAIN.json", 1),
+        )]);
+        let mut report_images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+
+        let stage = global_types_apply_stage(
+            false,
+            false,
+            &maps,
+            &HashMap::new(),
+            None,
+            &mut report_images,
+            8,
+        );
+
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.error.as_deref(),
+            Some("02_MAIN: missing pass-2 image result")
+        );
+        assert_eq!(
+            report_images[0].global_types_error.as_deref(),
+            Some("missing pass-2 image result")
+        );
+    }
+
+    #[test]
     fn globals_stage_refreshes_only_when_application_is_known_uninvoked() {
         // This catches the normal route installing a pre-application snapshot
         // and relying on a later overwrite. The disabled route may refresh
@@ -3710,6 +4184,11 @@ mod tests {
                         global_shapes_decode_failures: None,
                         global_shapes_state_barriers: None,
                         global_shapes_error: None,
+                        global_types_applied: None,
+                        global_types_candidates: None,
+                        global_types_ineligible: None,
+                        global_types_skipped: None,
+                        global_types_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -3744,6 +4223,11 @@ mod tests {
                         global_shapes_decode_failures: None,
                         global_shapes_state_barriers: None,
                         global_shapes_error: None,
+                        global_types_applied: None,
+                        global_types_candidates: None,
+                        global_types_ineligible: None,
+                        global_types_skipped: None,
+                        global_types_error: None,
                     },
                 ],
                 10,
@@ -4230,6 +4714,11 @@ mod tests {
             global_shapes_decode_failures: None,
             global_shapes_state_barriers: None,
             global_shapes_error: None,
+            global_types_applied: None,
+            global_types_candidates: None,
+            global_types_ineligible: None,
+            global_types_skipped: None,
+            global_types_error: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -5292,6 +5781,38 @@ mod tests {
                 "{key} must stay absent on failure"
             );
         }
+    }
+
+    #[test]
+    fn image_report_serializes_global_types_fields() {
+        let mut image = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        image.global_types_applied = Some(120);
+        image.global_types_candidates = Some(123);
+        image.global_types_ineligible = Some(4);
+        image.global_types_skipped = Some(3);
+        let v = serde_json::to_value(&image).unwrap();
+        assert_eq!(v["global_types_applied"], 120);
+        assert_eq!(v["global_types_candidates"], 123);
+        assert_eq!(v["global_types_ineligible"], 4);
+        assert_eq!(v["global_types_skipped"], 3);
+        assert!(v.get("global_types_error").is_none());
+    }
+
+    #[test]
+    fn image_report_serializes_global_types_fields_as_none_when_absent() {
+        let report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        let value = serde_json::to_value(&report).unwrap();
+        for key in [
+            "global_types_applied",
+            "global_types_candidates",
+            "global_types_ineligible",
+            "global_types_skipped",
+            "global_types_error",
+        ] {
+            assert!(value.get(key).is_none(), "{key} must be omitted");
+        }
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("global_types_"));
     }
 
     #[test]

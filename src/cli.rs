@@ -137,6 +137,9 @@ pub enum Commands {
         /// Hidden from `--help`.
         #[arg(long, hide = true)]
         globals_k_thumb: Option<usize>,
+        /// Do not apply recovered global shapes as undefinedN types to decompiled.c.
+        #[arg(long)]
+        no_apply_global_types: bool,
     },
     /// Symbolicate a decompose output tree: recover names + log annotations in place, emit symbols.json
     Symbolicate {
@@ -260,6 +263,7 @@ pub fn run() -> anyhow::Result<()> {
             globals_provisional,
             globals_k_arm,
             globals_k_thumb,
+            no_apply_global_types,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = img
@@ -280,6 +284,7 @@ pub fn run() -> anyhow::Result<()> {
                 globals_provisional,
                 globals_k_arm,
                 globals_k_thumb,
+                no_apply_global_types,
             };
             let report = crate::decompose::run(&img, &opts, &out)?;
             println!("decomposed -> {}", out.display());
@@ -542,6 +547,60 @@ mod tests {
                 assert!(
                     no_thumb_decompile,
                     "--no-thumb-decompile should parse to true when passed"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompose_help_lists_no_apply_global_types_flag() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompose")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--no-apply-global-types"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompose_no_apply_global_types_flag_defaults_false() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "/tmp/radio.img"]).unwrap();
+        match cli.command {
+            Commands::Decompose {
+                no_apply_global_types,
+                ..
+            } => {
+                assert!(
+                    !no_apply_global_types,
+                    "default --no-apply-global-types should be false"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompose_no_apply_global_types_flag_parses_true() {
+        let cli = Cli::try_parse_from([
+            "pme",
+            "decompose",
+            "--no-apply-global-types",
+            "/tmp/radio.img",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Decompose {
+                no_apply_global_types,
+                ..
+            } => {
+                assert!(
+                    no_apply_global_types,
+                    "--no-apply-global-types should parse to true when passed"
                 );
             }
             _ => panic!("wrong subcommand"),

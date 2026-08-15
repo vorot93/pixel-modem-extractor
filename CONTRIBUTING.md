@@ -121,12 +121,13 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `global_shapes/aggregate.rs` | Same-PC agreement/conflict grouping and conservative summaries |
 | `global_shapes/artifact.rs` | Input validation, source hashes, v2 schema, deterministic serialize, atomic replace |
 | `global_shapes/validate.rs` | Shared v2 sidecar checks for goldens and retained-tree replay |
-| `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` route placement and report fields |
+| `global_types.rs` | Selects apply-worthy scalar shapes from `global_shapes.json` (width 1/2/4/8 `inferred` scalars only) and writes the strict `ApplyGlobalTypes.java` apply-map |
+| `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -848,6 +849,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   cargo test execution_ranges::tests -- --nocapture
   cargo test decompose::tests::global_shapes_stage_ -- --nocapture
   cargo test decompose::tests::image_report_serializes_global_shapes -- --nocapture
+  cargo test global_types:: -- --nocapture
+  cargo test decompose::tests::global_types_apply_stage_ -- --nocapture
+  cargo test decompose::tests::image_report_serializes_global_types -- --nocapture
+  cargo test decompile::tests::parse_apply_global_types_summary -- --nocapture
   cargo test decompose::tests::refresh_decompiled_replaces_ghidra_outputs_and_preserves_sidecars -- --nocapture
   cargo test decompose::tests::prune_keeps_only_leaves -- --nocapture
   cargo test --test global_shapes_golden -- --nocapture
@@ -930,6 +935,93 @@ hardcoded. Two reference images exercise both models end-to-end:
   disassembly text, infer ISA from alignment or inventory name, attribute
   an address to the nearest global, or leak decoder-crate enums outside
   `decoder.rs`.
+- **Phase 3.2 type application.** Default-on in every normal-route `decompose`
+  (there is no pass 2 on `--no-symbol-pass`, so this never runs there —
+  shapes are still recovered into the sidecar on that route). After
+  `RunGlobalShapes` writes `decompiled/global_shapes.json` and before pass 2
+  dispatches, `decompose::run`'s `DispatchPass2` handler calls
+  `derive_global_types_maps(images_dir, ghidra_dir)`: for each image with a
+  `global_shapes.json`, `global_types::select_from_shapes_json` selects only
+  `status: "inferred"` entries whose `provisional_shape` is
+  `scalar_candidate` at width 1/2/4/8 (never `array_candidate`, `unknown`,
+  `no_evidence`, or `conflicting`) as `TypeCandidate`s; everything else is
+  counted into `Selection::ineligible`. `write_type_map` writes the strict
+  `pixel-modem-extractor-global-types-v1` map to
+  `ghidra_dir/global_types_maps/<label>.json` (mirroring
+  `ghidra_dir/symbol_maps/<label>.json`) and returns `None` for zero
+  candidates (no map written, no pass-2 input for that image — not an
+  error). `ApplyGlobalTypes.java` preflights the whole map (malformed/
+  duplicate-address/wrong-image/bad-width is a map-level `status: "error"`,
+  zero mutation), then per candidate creates `undefined<width>` at the
+  address, widening **only** already-undefined bytes
+  (`ClearDataMode.CLEAR_ALL_UNDEFINED_CONFLICT_DATA`) — never a committed
+  data type or an instruction. A span outside program memory or a
+  `CodeUnitInsertionException` conflict is skipped and counted
+  (`skipped_outside_memory` / `skipped_collision`, both Ghidra-side
+  categories that sum into `global_types_apply_skipped`); `candidates =
+  applied + skipped_outside_memory + skipped_collision` is enforced with
+  `Math.addExact` before the summary emits. `--no-apply-global-types` skips
+  `derive_global_types_maps` entirely (pass 2 gets no global-type input for
+  any image, so `ApplyGlobalTypes.java` does not run) without disabling
+  shape recovery itself — only the `decompiled.c` `undefinedN` application
+  is skipped. **Test-coverage gap:** unlike `ApplySymbols.java` /
+  `ApplyGlobals.java` (exercised end-to-end against real Ghidra headless in
+  `tests/decompile_golden.rs`'s
+  `pass2_applies_functions_and_strict_globals_in_one_process`, which always
+  passes `global_types_map: None`), `ApplyGlobalTypes.java` currently has no
+  real-Ghidra test at all — only `headless_process_args`'s arg-construction
+  unit tests and `parse_apply_global_types_summary`'s fake-stdout unit tests
+  cover it. The script has never actually been run by Ghidra. Add a
+  `global_types_map: Some(...)` case (mirroring the existing test's shape)
+  before relying on it in production.
+- **Phase 3.2 type-application report surface.** `decompile::ImageResult`
+  carries `global_types_applied` / `global_types_apply_skipped` /
+  `global_types_apply_error`, parsed from `ApplyGlobalTypes: {json}` exactly
+  like `ApplyGlobals.java`'s summary (see **Phase 3.0 failure and reporting
+  contract**). `report.json`'s per-image entry carries five renamed/derived
+  fields instead: `global_types_applied`, `global_types_skipped`,
+  `global_types_error`, `global_types_candidates` (`applied + skipped`, the
+  `global_types_maps` entry's `count()`), and `global_types_ineligible`
+  (from `derive_global_types_maps`'s `ineligible` map — present whenever the
+  image had a `global_shapes.json`, independent of whether application
+  itself ran; it has no `decompile::ImageResult` counterpart at all).
+  Unlike `globals_applied`, none of the five are copied by
+  `ImageReport::from_result` (always `None` there, same as the nine
+  `global_shapes_*` fields) — `decompose::global_types_apply_stage` patches
+  them onto the already-installed `ImageReport`s directly. This patch **must
+  run after** `DispatchPass2`'s final `refresh_decompile_stage_images` call,
+  not alongside the `globals_apply_stage` calls next to
+  `decompile_pass2_stage`: that refresh rebuilds
+  `stages[decompile_pos].images` from `decompile::ImageResult` via
+  `ImageReport::from_result`, which unconditionally nulls all five fields,
+  so a patch applied earlier is silently discarded. `decompose::run` reads
+  `pass1_report` once after that refresh (rather than threading a captured
+  image slice through each pass-2 branch) — by that point `pass1_report` is
+  already `Some` in exactly the branches that passed `Some(&images)` to
+  `globals_apply_stage` (scheduled-zero and successful pass 2) and `None` in
+  exactly the branches that passed `None` (a `run_two_pass` error, or no
+  pass-1 report at all), so it already carries the right value per branch.
+  The aggregate `global_types_apply` stage is skipped for `--no-symbol-pass`,
+  `--no-apply-global-types`, or zero derived candidates (`"no recovered
+  scalar shapes"`), and otherwise mirrors `globals_apply_stage`'s strict
+  per-label conservation check (`applied + skipped` must equal the prepared
+  map's `count()`) and first-actionable-error-in-pipeline-order policy.
+  **Known gap found while wiring this (not introduced by it, not yet
+  fixed):** the normal route's `RunGlobalShapes` step patches
+  `global_shapes_*` fields onto `stages[decompile_pos].images` *before*
+  `DispatchPass2`'s final refresh — since that refresh unconditionally
+  rebuilds the same images via `from_result`, which also nulls
+  `global_shapes_*`, those fields likely do not survive into `report.json`
+  on the normal route (`--no-symbol-pass` is fine: nothing refreshes after
+  its own `RunGlobalShapes`, which runs last on that route). The
+  `report_json_includes_global_shapes_fields` golden test's `thumb < shapes`
+  stage-order assertion is stale from before the Phase 3.2 input-safe
+  reorder (it encodes the pre-reorder ordering) and is env-gated
+  (`PME_GOLDEN_DIR`), so it has not been re-verified against a real tree
+  since. Confirm with a real `PME_GOLDEN_DIR` tree and fix the reorder (or
+  the assertion) before relying on `global_shapes_*` visibility in
+  `report.json` on the normal route; `global_shapes.json` on disk is
+  unaffected either way.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
@@ -1072,11 +1164,21 @@ hardcoded. Two reference images exercise both models end-to-end:
     and on the headless script classpath — use it for JSON in scripts.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
     vectors, all after `<projectDir> <projectName> -process <label> -noanalysis
-    -scriptPath …`, are:
+    -scriptPath …`, are `-postScript ApplySymbols.java <function_map>`,
+    `-postScript ApplyGlobals.java <global_map>`, and
+    `-postScript ApplyGlobalTypes.java <global_types_map>` — each
+    independently optional (`headless_process_args` appends whichever of
+    `Pass2Input.function_map` / `global_map` / `global_types_map` is
+    `Some`, in that fixed order), always followed by
+    `-postScript ExportDecomp.java <out>`. All-three example:
 
-        functions + globals: -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ExportDecomp.java <out>
-        functions only:      -postScript ApplySymbols.java <function_map> -postScript ExportDecomp.java <out>
-        globals only:        -postScript ApplyGlobals.java <global_map> -postScript ExportDecomp.java <out>
+        -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ApplyGlobalTypes.java <global_types_map> -postScript ExportDecomp.java <out>
+
+    At least one of the three typed maps must be `Some` or
+    `headless_process_args` returns `Ok(None)` (nothing scheduled for that
+    image — see `prepare_pass2_inputs`, which only creates a `Pass2Input`
+    entry for a label present in at least one of `function_maps` /
+    `global_maps` / `global_types_maps`).
 
     `-noanalysis` is mandatory — re-running auto-analysis would (a) undo
     `ApplySymbols` renames that aren't `USER_DEFINED`, and (b) re-trigger the

@@ -34,6 +34,7 @@ fn decompose_produces_unified_tree() {
         globals_provisional: false,
         globals_k_arm: None,
         globals_k_thumb: None,
+        no_apply_global_types: false,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -396,6 +397,7 @@ fn report_json_includes_phase2_fields() {
         globals_provisional: false,
         globals_k_arm: None,
         globals_k_thumb: None,
+        no_apply_global_types: false,
     };
     let _ = decompose::run(&img, &opts, &out);
 
@@ -452,6 +454,7 @@ fn report_json_includes_globals_field() {
         globals_provisional: false,
         globals_k_arm: None,
         globals_k_thumb: None,
+        no_apply_global_types: false,
     };
     let _ = decompose::run(&img, &opts, &out);
 
