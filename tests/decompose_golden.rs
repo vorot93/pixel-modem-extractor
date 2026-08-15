@@ -629,8 +629,43 @@ fn report_json_includes_global_shapes_fields() {
         let thumb = names
             .iter()
             .position(|name| *name == "thumb_enrich_post_pass2")
-            .expect("thumb_enrich_post_pass2 must precede global_shapes");
-        assert!(thumb < shapes, "{names:?}");
+            .expect("thumb_enrich_post_pass2 must precede or follow global_shapes");
+        // Route-dependent order: on `--no-symbol-pass`, `global_shapes` still
+        // runs last (after its own, always-"skipped" `thumb_enrich_post_pass2`
+        // stub) exactly as before Task 5's reorder. On the normal route,
+        // Task 5's input-safe reorder moved `global_shapes` to run *before*
+        // `DispatchPass2` (which pushes the real `thumb_enrich_post_pass2`) so
+        // a later pass-2 post-script can apply the recovered shapes as types —
+        // see CONTRIBUTING.md's "Phase 3.2: global storage-shape recovery".
+        // `decompile_pass2`'s stage `reason` is the only route signal already
+        // present in report.json: it is exactly "--no-symbol-pass" on that
+        // route and never on the normal route (previously this assertion only
+        // checked the pre-reorder `--no-symbol-pass` direction unconditionally,
+        // which is wrong for a normal-route tree since the Task 5 reorder —
+        // that gap is exactly how the global_shapes_* report-field regression
+        // below went uncaught).
+        let is_no_symbol_pass_route = stages
+            .iter()
+            .find(|stage| stage["stage"] == "decompile_pass2")
+            .and_then(|stage| stage["reason"].as_str())
+            == Some("--no-symbol-pass");
+        if is_no_symbol_pass_route {
+            assert!(
+                thumb < shapes,
+                "on --no-symbol-pass, global_shapes must follow thumb_enrich_post_pass2: {names:?}"
+            );
+        } else {
+            assert!(
+                shapes < thumb,
+                "on the normal route, global_shapes must precede thumb_enrich_post_pass2 \
+                 (Task 5's input-safe reorder): {names:?}"
+            );
+        }
+        // Unconditional on both routes: `orchestrate_post_symbol_route`
+        // (decode_rf, hardware_config) always runs strictly after the whole
+        // `orchestrate_symbol_route` closure returns, for both routes, so
+        // global_shapes — wherever it lands within that closure — always
+        // precedes both decoders.
         for decoder in ["decode_rf", "hardware_config"] {
             if let Some(pos) = names.iter().position(|name| *name == decoder) {
                 assert!(
@@ -640,6 +675,14 @@ fn report_json_includes_global_shapes_fields() {
             }
         }
     }
+    // Route-agnostic on purpose (covers the normal route, where Task 5's
+    // reorder made `RunGlobalShapes` run before `DispatchPass2`'s
+    // `refresh_decompile_stage_images`, which would otherwise silently null
+    // these nine fields — see `reapply_global_shapes_outcomes` in
+    // decompose.rs and the plain-unit-test regression sentinel
+    // `global_shapes_outcomes_survive_refresh_decompile_stage_images`, which
+    // pins this without needing PME_GOLDEN_DIR — and the `--no-symbol-pass`
+    // route, which was never affected).
     if current_global_shapes_inputs_succeeded(main) && main.get("global_shapes_error").is_none() {
         for key in NINE_GLOBAL_SHAPES_FIELDS {
             assert!(

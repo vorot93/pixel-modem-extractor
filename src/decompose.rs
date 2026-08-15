@@ -1693,6 +1693,54 @@ fn record_global_shapes_failure(image: &mut ImageReport, reason: String) -> Stri
     reason
 }
 
+/// Per-image outcome of a `global_shapes` sweep, retained by
+/// `run_global_shapes_stage_with` across the normal route's later
+/// `DispatchPass2` step. On that route, `RunGlobalShapes` runs *before*
+/// `DispatchPass2` (Task 5's input-safe reorder), and `DispatchPass2`'s own
+/// `refresh_decompile_stage_images` / `install_decompile_stage_image_snapshot`
+/// calls rebuild `stages[decompile_pos].images` from `decompile::ImageResult`
+/// via `ImageReport::from_result`, which always nulls the nine
+/// `global_shapes_*` fields (`ImageResult` has no such fields to preserve
+/// them from — same reason `global_types_apply_stage`'s five fields need the
+/// same treatment). Without re-applying this retained outcome afterward, the
+/// `RunGlobalShapes` patch is silently discarded and `global_shapes_*` never
+/// reaches `report.json` on the normal route. See `reapply_global_shapes_outcomes`.
+enum GlobalShapesOutcome {
+    Success(global_shapes::GlobalShapesReport),
+    Failure(String),
+}
+
+/// Apply one retained outcome to `image`, mirroring exactly what
+/// `run_global_shapes_stage_with`'s loop did the first time (clear, then
+/// either the success counts or the bounded failure reason).
+fn apply_global_shapes_outcome(image: &mut ImageReport, outcome: &GlobalShapesOutcome) {
+    clear_global_shapes_fields(image);
+    match outcome {
+        GlobalShapesOutcome::Success(report) => apply_global_shapes_success(image, report),
+        GlobalShapesOutcome::Failure(reason) => {
+            image.global_shapes_error = Some(reason.clone());
+        }
+    }
+}
+
+/// Re-apply every retained `global_shapes` outcome onto `report_images` by
+/// label. Called from `DispatchPass2` after every point that rebuilds the
+/// `decompile` stage's `ImageReport`s (see `GlobalShapesOutcome`'s doc
+/// comment for why that rebuild otherwise discards this data). A label
+/// absent from `outcomes` (no code image, or the whole stage was skipped) is
+/// left untouched — `report_images` is always a fresh rebuild at the call
+/// site, so its `global_shapes_*` fields are already `None` there.
+fn reapply_global_shapes_outcomes(
+    report_images: &mut [ImageReport],
+    outcomes: &HashMap<String, GlobalShapesOutcome>,
+) {
+    for image in report_images {
+        if let Some(outcome) = outcomes.get(&image.image) {
+            apply_global_shapes_outcome(image, outcome);
+        }
+    }
+}
+
 fn global_shapes_stage_output(
     completed: usize,
     eligible: usize,
@@ -1727,6 +1775,10 @@ fn add_global_shapes_totals(
     totals.state_barriers += report.state_barriers;
 }
 
+/// Runs the `global_shapes` sweep and returns every image's retained
+/// [`GlobalShapesOutcome`] (keyed by label) alongside mutating `stages` in
+/// place, so a normal-route caller can re-apply the report-field patch after
+/// a later rebuild — see `GlobalShapesOutcome` and `reapply_global_shapes_outcomes`.
 fn run_global_shapes_stage_with(
     stages: &mut Vec<StageReport>,
     images_dir: &Path,
@@ -1734,14 +1786,14 @@ fn run_global_shapes_stage_with(
     mut run_image: impl for<'a> FnMut(
         &global_shapes::RunRequest<'a>,
     ) -> Result<global_shapes::GlobalShapesReport>,
-) {
+) -> HashMap<String, GlobalShapesOutcome> {
     let Some(decompile_pos) = stages.iter().rposition(|stage| stage.stage == "decompile") else {
         stages.push(StageReport::skipped("global_shapes", "no code image"));
-        return;
+        return HashMap::new();
     };
     if stages[decompile_pos].images.is_empty() {
         stages.push(StageReport::skipped("global_shapes", "no code image"));
-        return;
+        return HashMap::new();
     }
 
     let started = Instant::now();
@@ -1760,6 +1812,7 @@ fn run_global_shapes_stage_with(
         interprocedural_dropped: 0,
     };
     let mut errors: Vec<(String, String)> = Vec::new();
+    let mut outcomes: HashMap<String, GlobalShapesOutcome> = HashMap::new();
 
     for image in &mut stages[decompile_pos].images {
         clear_global_shapes_fields(image);
@@ -1768,6 +1821,7 @@ fn run_global_shapes_stage_with(
             Ok(current) => current,
             Err(reason) => {
                 let reason = record_global_shapes_failure(image, reason);
+                outcomes.insert(label.clone(), GlobalShapesOutcome::Failure(reason.clone()));
                 errors.push((label, reason));
                 continue;
             }
@@ -1790,9 +1844,11 @@ fn run_global_shapes_stage_with(
                 apply_global_shapes_success(image, &report);
                 add_global_shapes_totals(&mut totals, &report);
                 completed += 1;
+                outcomes.insert(label, GlobalShapesOutcome::Success(report));
             }
             Err(error) => {
                 let reason = record_global_shapes_failure(image, error.to_string());
+                outcomes.insert(label.clone(), GlobalShapesOutcome::Failure(reason.clone()));
                 errors.push((label, reason));
             }
         }
@@ -1818,10 +1874,15 @@ fn run_global_shapes_stage_with(
         images: Vec::new(),
         duration_ms: started.elapsed().as_millis(),
     });
+    outcomes
 }
 
-fn run_global_shapes_stage(stages: &mut Vec<StageReport>, images_dir: &Path, manifest_path: &Path) {
-    run_global_shapes_stage_with(stages, images_dir, manifest_path, global_shapes::run_image);
+fn run_global_shapes_stage(
+    stages: &mut Vec<StageReport>,
+    images_dir: &Path,
+    manifest_path: &Path,
+) -> HashMap<String, GlobalShapesOutcome> {
+    run_global_shapes_stage_with(stages, images_dir, manifest_path, global_shapes::run_image)
 }
 
 /// Record global preparation without exposing a normal-route intermediate
@@ -2157,6 +2218,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 
     let mut function_inputs = None;
     let mut prepared_global_maps = HashMap::new();
+    // Captured from `RunGlobalShapes` (which runs before `DispatchPass2` on
+    // the normal route) and re-applied inside `DispatchPass2` after every
+    // rebuild of the `decompile` stage's `ImageReport`s — see
+    // `GlobalShapesOutcome`'s doc comment for why the rebuild otherwise
+    // discards `RunGlobalShapes`'s report-field patch.
+    let mut global_shapes_outcomes: HashMap<String, GlobalShapesOutcome> = HashMap::new();
     orchestrate_symbol_route(opts.no_symbol_pass, |step| match step {
         SymbolRouteStep::PrepareNamesAndProjection => {
             function_inputs = Some(take_globals_function_inputs(&mut function_maps));
@@ -2240,7 +2307,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             }
         }
         SymbolRouteStep::RunGlobalShapes => {
-            run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
+            global_shapes_outcomes =
+                run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
         }
         SymbolRouteStep::DispatchPass2 => {
             // Derive the strict `undefinedN` apply-map from `global_shapes.json`
@@ -2347,16 +2415,33 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 refresh_decompile_stage_images(&mut stages, &report.images);
             }
 
-            // Must run after the refresh above: refresh_decompile_stage_images
-            // rebuilds `stages[decompile_pos].images` from `ImageResult` via
-            // `ImageReport::from_result`, which always nulls the five
-            // `global_types_*` fields, so patching before that refresh would
-            // be silently discarded. Reading `pass1_report` here (rather than
-            // threading a separate captured value through each branch above)
-            // is deliberate: by this point `pass1_report` is `Some` in exactly
-            // the branches that passed `Some(&images)` to `globals_apply_stage`
-            // above (scheduled_count==0, and Ok(pass2)), and `None` in exactly
-            // the branches that passed `None` (run_two_pass Err, and no pass-1
+            // Both calls below must run after every rebuild of
+            // `stages[decompile_pos].images` above — the final
+            // `refresh_decompile_stage_images` just above, but also the
+            // `Err(error)` branch's earlier `install_decompile_stage_image_snapshot`
+            // (installs `fallback_images`, reached when `pass1_report` stays
+            // `None` and the refresh above never runs). Both rebuilds go
+            // through `ImageReport::from_result`, which always nulls the
+            // nine `global_shapes_*` fields and the five `global_types_*`
+            // fields, so patching either set any earlier would be silently
+            // discarded (this exact bug shipped for `global_shapes_*` in
+            // Task 5's reorder — RunGlobalShapes's in-place patch ran before
+            // DispatchPass2 existed to refresh over it — until this fix;
+            // see `GlobalShapesOutcome`'s doc comment). Placing both calls
+            // once, unconditionally, here — after every branch above has
+            // run, regardless of which one fired — fixes every rebuild site
+            // in one place instead of duplicating a fix-up per branch.
+            reapply_global_shapes_outcomes(
+                decompile_stage_images_mut(&mut stages),
+                &global_shapes_outcomes,
+            );
+
+            // Reading `pass1_report` here (rather than threading a separate
+            // captured value through each branch above) is deliberate: by
+            // this point `pass1_report` is `Some` in exactly the branches
+            // that passed `Some(&images)` to `globals_apply_stage` above
+            // (scheduled_count==0, and Ok(pass2)), and `None` in exactly the
+            // branches that passed `None` (run_two_pass Err, and no pass-1
             // report at all) — so it already carries the right value per branch.
             let post_dispatch_images = pass1_report.as_ref().map(|report| report.images.as_slice());
             let global_types_stage = global_types_apply_stage(
@@ -6491,6 +6576,90 @@ mod tests {
         assert!(images_dir.join("02_MAIN/decompiled/globals.json").is_file());
         assert!(!sidecar.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_outcomes_survive_refresh_decompile_stage_images() {
+        // Regression test (plain unit test — no PME_GOLDEN_DIR — so a
+        // re-regression fails normal CI, not only the gated golden) for the
+        // Task 5 clobber a code review found: on the normal route,
+        // `RunGlobalShapes` patches `global_shapes_*` onto
+        // `stages[decompile_pos].images` *before* `DispatchPass2` runs.
+        // `DispatchPass2`'s own `refresh_decompile_stage_images` later
+        // rebuilds those same `ImageReport`s from `decompile::ImageResult`
+        // via `ImageReport::from_result`, which always nulls
+        // `global_shapes_*` (`ImageResult` has no such fields to preserve
+        // them from) — silently discarding the patch unless
+        // `reapply_global_shapes_outcomes` runs afterward.
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 0),
+                eligible_shape_image("03_APM", 1, 1, 0, None, None, None, 0),
+            ],
+            1,
+        )];
+        let outcomes = run_global_shapes_stage_with(
+            &mut stages,
+            Path::new("unused-images-dir"),
+            Path::new("unused-manifest"),
+            |request| {
+                if request.image_label == "02_MAIN" {
+                    Ok(global_shapes::GlobalShapesReport {
+                        inferred: 2,
+                        no_evidence: 1,
+                        conflicting: 0,
+                        observations: 4,
+                        ghidra_quarantined: 0,
+                        thumb_quarantined: 0,
+                        quarantine_errors: 0,
+                        decode_failures: 0,
+                        state_barriers: 0,
+                        interprocedural_dropped: 0,
+                    })
+                } else {
+                    Err(Error::DecomposeIncomplete("boom".into()))
+                }
+            },
+        );
+
+        // Sanity: the initial in-place patch (success + failure) landed.
+        assert_eq!(stages[0].images[0].global_shapes_inferred, Some(2));
+        assert_eq!(stages[0].images[0].global_shape_observations, Some(4));
+        assert_eq!(
+            stages[0].images[1].global_shapes_error.as_deref(),
+            Some("decompose incomplete: boom")
+        );
+
+        // Simulate DispatchPass2's final refresh: rebuild from a fresh
+        // ImageResult slice, exactly like the real pass-2 dispatch does.
+        let post_pass2_images = vec![analyzed_image("02_MAIN"), analyzed_image("03_APM")];
+        refresh_decompile_stage_images(&mut stages, &post_pass2_images);
+
+        // Prove the regression is real: the refresh alone nulls everything,
+        // both the success counts and the failure reason.
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert!(stages[0].images[1].global_shapes_error.is_none());
+
+        // The fix: re-applying the retained outcomes restores both.
+        reapply_global_shapes_outcomes(decompile_stage_images_mut(&mut stages), &outcomes);
+        assert_eq!(stages[0].images[0].global_shapes_inferred, Some(2));
+        assert_eq!(stages[0].images[0].global_shapes_no_evidence, Some(1));
+        assert_eq!(stages[0].images[0].global_shape_observations, Some(4));
+        assert!(stages[0].images[0].global_shapes_error.is_none());
+        assert_eq!(
+            stages[0].images[1].global_shapes_error.as_deref(),
+            Some("decompose incomplete: boom")
+        );
+        assert_nine_shape_counts(&stages[0].images[1], None);
+    }
+
+    #[test]
+    fn reapply_global_shapes_outcomes_leaves_unlisted_images_untouched() {
+        let mut images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+        let outcomes = HashMap::new(); // no retained outcome for 02_MAIN
+        reapply_global_shapes_outcomes(&mut images, &outcomes);
+        assert_nine_shape_counts(&images[0], None);
+        assert!(images[0].global_shapes_error.is_none());
     }
 
     #[test]

@@ -1006,22 +1006,36 @@ hardcoded. Two reference images exercise both models end-to-end:
   scalar shapes"`), and otherwise mirrors `globals_apply_stage`'s strict
   per-label conservation check (`applied + skipped` must equal the prepared
   map's `count()`) and first-actionable-error-in-pipeline-order policy.
-  **Known gap found while wiring this (not introduced by it, not yet
-  fixed):** the normal route's `RunGlobalShapes` step patches
-  `global_shapes_*` fields onto `stages[decompile_pos].images` *before*
-  `DispatchPass2`'s final refresh — since that refresh unconditionally
-  rebuilds the same images via `from_result`, which also nulls
-  `global_shapes_*`, those fields likely do not survive into `report.json`
-  on the normal route (`--no-symbol-pass` is fine: nothing refreshes after
-  its own `RunGlobalShapes`, which runs last on that route). The
-  `report_json_includes_global_shapes_fields` golden test's `thumb < shapes`
-  stage-order assertion is stale from before the Phase 3.2 input-safe
-  reorder (it encodes the pre-reorder ordering) and is env-gated
-  (`PME_GOLDEN_DIR`), so it has not been re-verified against a real tree
-  since. Confirm with a real `PME_GOLDEN_DIR` tree and fix the reorder (or
-  the assertion) before relying on `global_shapes_*` visibility in
-  `report.json` on the normal route; `global_shapes.json` on disk is
-  unaffected either way.
+  **Fixed regression (found while wiring this, code-review-confirmed, fixed
+  in the same change series):** the normal route's `RunGlobalShapes` step
+  patches `global_shapes_*` fields onto `stages[decompile_pos].images`
+  *before* `DispatchPass2`'s rebuilds (the final `refresh_decompile_stage_images`,
+  and the `Err(error)` branch's earlier `install_decompile_stage_image_snapshot`)
+  — both rebuild the same images via `from_result`, which also nulls
+  `global_shapes_*`, so those fields did not survive into `report.json` on
+  the normal route (`--no-symbol-pass` was never affected: nothing refreshes
+  after its own `RunGlobalShapes`, which runs last on that route). Fixed by
+  retaining each image's outcome from `run_global_shapes_stage_with`
+  (`decompose::GlobalShapesOutcome`, keyed by label) and re-applying it via
+  `reapply_global_shapes_outcomes` once, unconditionally, at the same point
+  `global_types_apply_stage` runs — after every `DispatchPass2` rebuild site,
+  regardless of which branch fired. Sidecar re-reads from disk were
+  considered and rejected: a per-image *failure* never writes a new
+  `global_shapes.json` (an existing sidecar, if any, is left byte-identical
+  per the currentness contract above), so re-reading from disk cannot
+  recover `global_shapes_error` and cannot distinguish "this run failed" from
+  "this file predates any run" — only the in-memory retained outcome can.
+  Regression-pinned by a plain unit test,
+  `global_shapes_outcomes_survive_refresh_decompile_stage_images` (no
+  `PME_GOLDEN_DIR` needed, so a re-regression fails normal CI). The
+  `report_json_includes_global_shapes_fields` golden test's stage-order
+  assertion, which was stale from before the Phase 3.2 input-safe reorder
+  (it only checked the pre-reorder `--no-symbol-pass` direction), is also
+  corrected to be route-aware (using `decompile_pass2`'s stage `reason` as
+  the route signal already present in `report.json`) — that staleness is
+  exactly why the field-loss went uncaught: the assertion would have failed
+  for the wrong reason on a normal-route tree before this fix, masking the
+  real regression underneath it.
 - **Winning TameAnalysis options (Phase 2).** On the smallest dense-Thumb region
   of a real `02_MAIN` (2.06 MiB sample, `N_r2 = 11023`), `TIGHTEN_EXTRA = {}`
   (empty) won — the shared `DISABLE` loop (Aggressive Instruction Finder +
