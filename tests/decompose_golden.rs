@@ -692,3 +692,93 @@ fn report_json_includes_global_shapes_fields() {
         }
     }
 }
+
+/// Phase 3.2 type application: on a real `02_MAIN`, the per-image entry in
+/// the `decompile` stage's `images[]` carries all four `global_types_*`
+/// counting fields (`global_types_applied`, `global_types_candidates`,
+/// `global_types_ineligible`, `global_types_skipped`), conserves
+/// `candidates == applied + skipped`, and has actually applied at least one
+/// recovered scalar shape. Their absence means either
+/// `global_types_apply_stage`'s post-`DispatchPass2` patch never ran (the
+/// same wiring-gap class `report_json_includes_phase3_0_1_fields` and
+/// `report_json_includes_global_shapes_fields` guard against for their own
+/// fields) or the retained tree predates this stage and must be regenerated
+/// with a current `decompose` binary. Reads `$PME_GOLDEN_DIR/report.json`
+/// (pre-existing decompose output; never auto-runs decompose — production
+/// verification supplies the env); skips cleanly when the env is unset or
+/// the file is absent.
+///
+/// Idempotency (re-running `decompose` over an already-typed tree and
+/// getting an identical result) is intentionally NOT covered here: a static
+/// `report.json` golden cannot observe a second run. That guarantee comes
+/// from `ApplyGlobalTypes.java` widening only already-undefined bytes
+/// (`CLEAR_ALL_UNDEFINED_CONFLICT_DATA`) plus the DEFAULT-only Ghidra
+/// re-apply and unit-test coverage described in CONTRIBUTING.md's Phase 3.2
+/// type-application notes.
+#[test]
+fn global_types_applied_on_retained_tree() {
+    let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = dir.join("report.json");
+    if !report_path.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report.json readable"))
+            .expect("report.json valid JSON");
+    let main = v["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|s| s["stage"] == "decompile"))
+        .and_then(|s| s["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+
+    for key in [
+        "global_types_applied",
+        "global_types_candidates",
+        "global_types_ineligible",
+        "global_types_skipped",
+    ] {
+        assert!(
+            main.get(key).is_some(),
+            "{key} missing on 02_MAIN — global_types_apply_stage's report patch \
+             is missing, or this tree predates Phase 3.2 type application: {main}"
+        );
+    }
+
+    let applied = main["global_types_applied"]
+        .as_u64()
+        .expect("global_types_applied is a u64");
+    let candidates = main["global_types_candidates"]
+        .as_u64()
+        .expect("global_types_candidates is a u64");
+    let skipped = main["global_types_skipped"]
+        .as_u64()
+        .expect("global_types_skipped is a u64");
+
+    assert_eq!(
+        candidates,
+        applied + skipped,
+        "global_types_candidates must conserve applied + skipped on 02_MAIN: {main}"
+    );
+    assert!(
+        applied <= candidates,
+        "global_types_applied must not exceed global_types_candidates on 02_MAIN: {main}"
+    );
+    // Measured on the retained MAIN tree (task-9-brief.md, Fidelity/scope
+    // decisions): 270 of 274 inferred globals are scalar candidates (1
+    // array, 3 unknown), so a healthy run applies somewhere in the
+    // neighborhood of 120-270 of them — the exact count depends on how many
+    // candidates collide with existing data or fall outside program memory
+    // and are skipped instead. Pin only the non-zero floor here; a tighter
+    // band would make this test babysit Ghidra's analysis nondeterminism.
+    assert!(
+        applied >= 1,
+        "expected at least one recovered global type applied on 02_MAIN, got {applied} \
+         (candidates={candidates}, skipped={skipped}): {main}"
+    );
+    eprintln!("02_MAIN global_types: applied={applied} candidates={candidates} skipped={skipped}");
+}
