@@ -2,13 +2,17 @@
 //! log/assert/file annotations from evidence the pipeline already produces
 //! (the pw_tokenizer DB, `__func__` strings, attributed strings, existing
 //! attribution), then rewrite the artifacts in place + emit `symbols.json`.
-//! Pure-Rust; ARM and Thumb. Fail-closed and tiered: only `__func__` yields a
-//! real (`Recovered`) rename; a token or a uniquely-referenced identifier
-//! string yields a marked `guess_…` name (`Provisional`). Provisional names
-//! are never applied to Ghidra as an authoritative (`USER_DEFINED`) symbol;
+//! Pure-Rust; ARM and Thumb. Fail-closed and tiered. Two evidence sources yield
+//! a real (`Recovered`) rename: `__func__`, and a `{name, fn}` registration
+//! table whose pointer resolves to a known function entry (see
+//! `symbolicate/reg_table.rs`). A token or a uniquely-referenced identifier
+//! string yields a marked `guess_…` name (`Provisional`). Provisional names are
+//! never applied to Ghidra as an authoritative (`USER_DEFINED`) symbol;
 //! string-ref guesses specifically are computed only by the post-globals
 //! finalize rewrite, so they never even appear in Ghidra's pass-2 input.
-//! Everything else is a comment. Precedence: `__func__` > token > string-ref.
+//! Registration names, being `Recovered`, are computed at the symbol_map stage
+//! and therefore *do* reach Ghidra pass 2. Everything else is a comment.
+//! Precedence: `__func__` > registration > token > string-ref.
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::error::{Error, Result};
 use crate::recover_source::Tool;
@@ -17,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub mod name_guess;
+pub mod reg_table;
 
 pub const GUESS_PREFIX: &str = "guess_";
 
@@ -71,6 +76,9 @@ pub struct RawEvidence {
     pub file: Option<String>,       // attributed source path
     pub file_strings: Vec<String>,  // that file's attributed_strings
     pub ident_guess: Option<(String, name_guess::Class)>, // string_ref_guess output
+    /// Authoritative name recovered from a `{name, fn}` registration table
+    /// (`reg_table::scan`). Outranks tokens and string-ref; only `__func__` wins.
+    pub registration: Option<String>,
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
@@ -310,6 +318,17 @@ pub fn decide(
         ann.push(format!("file-strings: {joined}"));
     }
 
+    // Registration evidence is always recorded (even when `__func__` outranks it
+    // for the name), so the table provenance survives in `symbols.json`.
+    if let Some(reg) = &raw.registration {
+        ev.push(Evidence {
+            kind: "registration",
+            value: Some(reg.clone()),
+            ..Default::default()
+        });
+        ann.push(format!("registration: {reg:?}"));
+    }
+
     if let Some(fname) = &raw.func_name {
         ev.insert(
             0,
@@ -320,6 +339,11 @@ pub fn decide(
             },
         );
         return (Some(sanitize_ident(fname)), Tier::Recovered, ev, ann);
+    }
+    // Authoritative table-recovered name: bare, `Recovered`, below `__func__`
+    // but above every guess tier.
+    if let Some(reg) = &raw.registration {
+        return (Some(sanitize_ident(reg)), Tier::Recovered, ev, ann);
     }
     if let Some((_tok, s)) = raw.tokens.first() {
         let (fmt, dom) = parse_token_string(s);
@@ -933,14 +957,10 @@ fn load_global_names(path: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// `(cand_idents, ident_count, global_names, fn_names)`: precomputed inputs to
-/// the string-ref guess tier (see `build_map`), gated by `string_ref_enabled`.
-type StringRefPrecompute = (
-    Vec<Option<String>>,
-    HashMap<String, usize>,
-    HashSet<String>,
-    HashSet<String>,
-);
+/// `(cand_idents, ident_count)`: the string-ref-specific precompute in
+/// `build_map`, gated by `string_ref_enabled`. `global_names` / `fn_names` are
+/// computed unconditionally above it (the registration tier shares them).
+type StringRefPrecompute = (Vec<Option<String>>, HashMap<String, usize>);
 
 /// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
 pub(crate) fn build_map(
@@ -964,9 +984,12 @@ pub(crate) fn build_map(
     let attribution = load_attribution(&source_tree)?;
 
     let raw_image_path = image_dir.join(format!("{image_label}.bin"));
-    let string_map = match crate::manifest::load_addr_for_image(manifest, image_label)? {
+    let image_and_load: Option<(Vec<u8>, u64)> = match crate::manifest::load_addr_for_image(
+        manifest,
+        image_label,
+    )? {
         Some(load_addr) if raw_image_path.exists() => {
-            build_string_map(&std::fs::read(&raw_image_path)?, load_addr, 3)
+            Some((std::fs::read(&raw_image_path)?, load_addr))
         }
         _ => {
             if !file_occ.is_empty() {
@@ -974,8 +997,12 @@ pub(crate) fn build_map(
                     "symbolicate: {image_label}: raw image or load_addr missing — skipping __func__ recovery"
                 );
             }
-            HashMap::new()
+            None
         }
+    };
+    let string_map = match &image_and_load {
+        Some((img, load_addr)) => build_string_map(img, *load_addr, 3),
+        None => HashMap::new(),
     };
 
     // Recovered (`__func__`) names, computed once and reused below.
@@ -990,38 +1017,54 @@ pub(crate) fn build_map(
         })
         .collect();
 
+    // Known function names (real + `__func__`-recovered) and recovered globals.
+    // Both reject an ambiguous guess/registration name; computed unconditionally
+    // so the registration tier can use them without the string-ref globals gate.
+    // `global_names` is best-effort: the symbol_map stage runs before
+    // `globals.json` exists, so it is empty there (registration still fires).
+    let mut fn_names: HashSet<String> = HashSet::new();
+    for (i, f) in funcs.iter().enumerate() {
+        if is_real_name(&f.name) {
+            fn_names.insert(f.name.clone());
+        }
+        if let Some(n) = &recovered_names[i] {
+            fn_names.insert(n.clone());
+        }
+    }
+    let globals_path = decompiled.join("globals.json");
+    let global_names = if globals_path.exists() {
+        load_global_names(&globals_path)
+    } else {
+        HashSet::new()
+    };
+
+    // Registration-table tier (authoritative). Scans the raw image for
+    // `{name, fn}` tables whose pointer resolves to a known function entry.
+    let reg_names: HashMap<u64, String> = match &image_and_load {
+        Some((img, load_addr)) => {
+            let fn_entries: HashMap<u64, &'static str> =
+                funcs.iter().map(|f| (f.entry, f.arch)).collect();
+            reg_table::scan(img, *load_addr, &fn_entries, &global_names, &fn_names).names
+        }
+        None => HashMap::new(),
+    };
+
     // String-reference guess tier (fail-closed, lowest precedence). Active only
     // when the raw image (=> non-empty string_map) and globals.json are present.
-    let string_ref_enabled = !string_map.is_empty() && decompiled.join("globals.json").exists();
-    let (cand_idents, ident_count, global_names, fn_names): StringRefPrecompute =
-        if string_ref_enabled {
-            let global_names = load_global_names(&decompiled.join("globals.json"));
-            let cand_idents: Vec<Option<String>> = funcs
-                .iter()
-                .map(|f| name_guess::unique_ident(&f.data_refs, &string_map))
-                .collect();
-            let mut ident_count: HashMap<String, usize> = HashMap::new();
-            for id in cand_idents.iter().flatten() {
-                *ident_count.entry(id.clone()).or_default() += 1;
-            }
-            let mut fn_names: HashSet<String> = HashSet::new();
-            for (i, f) in funcs.iter().enumerate() {
-                if is_real_name(&f.name) {
-                    fn_names.insert(f.name.clone());
-                }
-                if let Some(n) = &recovered_names[i] {
-                    fn_names.insert(n.clone());
-                }
-            }
-            (cand_idents, ident_count, global_names, fn_names)
-        } else {
-            (
-                vec![None; funcs.len()],
-                HashMap::new(),
-                HashSet::new(),
-                HashSet::new(),
-            )
-        };
+    let string_ref_enabled = !string_map.is_empty() && globals_path.exists();
+    let (cand_idents, ident_count): StringRefPrecompute = if string_ref_enabled {
+        let cand_idents: Vec<Option<String>> = funcs
+            .iter()
+            .map(|f| name_guess::unique_ident(&f.data_refs, &string_map))
+            .collect();
+        let mut ident_count: HashMap<String, usize> = HashMap::new();
+        for id in cand_idents.iter().flatten() {
+            *ident_count.entry(id.clone()).or_default() += 1;
+        }
+        (cand_idents, ident_count)
+    } else {
+        (vec![None; funcs.len()], HashMap::new())
+    };
 
     let mut symbols = Vec::with_capacity(funcs.len());
     for (i, f) in funcs.iter().enumerate() {
@@ -1064,6 +1107,7 @@ pub(crate) fn build_map(
             file,
             file_strings: fstrings,
             ident_guess,
+            registration: reg_names.get(&f.entry).cloned(),
         };
         let (name, tier, evidence, annotations) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
@@ -1370,6 +1414,7 @@ mod tests {
             file: None,
             file_strings: vec![],
             ident_guess: None,
+            registration: None,
         }
     }
 
@@ -1459,6 +1504,45 @@ mod tests {
         assert_eq!(tier, Tier::Provisional);
         assert!(ev.iter().any(|e| e.kind == "token"));
         assert!(!ev.iter().any(|e| e.kind == "string_ref"));
+    }
+
+    #[test]
+    fn registration_is_a_recovered_bare_name() {
+        let r = RawEvidence {
+            registration: Some("AtiParsePlusCOPS".into()),
+            ..raw()
+        };
+        let (name, tier, ev, _ann) = decide("411b8f04", &r);
+        assert_eq!(name.as_deref(), Some("AtiParsePlusCOPS")); // bare, no guess_ prefix
+        assert_eq!(tier, Tier::Recovered);
+        assert!(ev.iter().any(|e| e.kind == "registration"));
+    }
+
+    #[test]
+    fn func_name_beats_registration() {
+        let r = RawEvidence {
+            func_name: Some("Real_Name".into()),
+            registration: Some("Registered_Name".into()),
+            ..raw()
+        };
+        let (name, tier, ev, _ann) = decide("411b8f04", &r);
+        assert_eq!(name.as_deref(), Some("Real_Name"));
+        assert_eq!(tier, Tier::Recovered);
+        // the registration name is still recorded as evidence
+        assert!(ev.iter().any(|e| e.kind == "registration"));
+    }
+
+    #[test]
+    fn registration_beats_token_and_string_ref() {
+        let r = RawEvidence {
+            registration: Some("PICH_HISR".into()),
+            tokens: vec![(0x3c2a, "■format♦hi■domain♦D".into())],
+            ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+            ..raw()
+        };
+        let (name, tier, _ev, _ann) = decide("437436f0", &r);
+        assert_eq!(name.as_deref(), Some("PICH_HISR")); // bare authoritative name wins
+        assert_eq!(tier, Tier::Recovered);
     }
 
     #[test]
@@ -1935,6 +2019,66 @@ mod tests {
     }
 
     #[test]
+    fn build_map_applies_registration_table_names() {
+        let root = tmp("pme_sym_regtable");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        // Raw image (load 0x40000000): three name strings + a {name,fn} table
+        // at 0x10 pointing at three ARM function entries (0x200/0x240/0x280).
+        let mut img = vec![0u8; 0x300];
+        let put_str = |img: &mut [u8], off: usize, s: &str| {
+            img[off..off + s.len()].copy_from_slice(s.as_bytes());
+        };
+        put_str(&mut img, 0x100, "Handler_One");
+        put_str(&mut img, 0x120, "Handler_Two");
+        put_str(&mut img, 0x140, "Handler_Three");
+        let put_u32 = |img: &mut [u8], off: usize, v: u32| {
+            img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        for (k, (na, fa)) in [
+            (0x4000_0100u32, 0x4000_0200u32),
+            (0x4000_0120, 0x4000_0240),
+            (0x4000_0140, 0x4000_0280),
+        ]
+        .iter()
+        .enumerate()
+        {
+            put_u32(&mut img, 0x10 + k * 8, *na);
+            put_u32(&mut img, 0x10 + k * 8 + 4, *fa);
+        }
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[{"name":"FUN_200","entry":"0x40000200","end":"0x40000208","data_refs":[]},
+                {"name":"FUN_240","entry":"0x40000240","end":"0x40000248","data_refs":[]},
+                {"name":"FUN_280","entry":"0x40000280","end":"0x40000288","data_refs":[]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x40000200: 4770 bx lr\n").unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+
+        let by_addr = |a: &str| symbols.iter().find(|s| s.address == a).unwrap();
+        let s = by_addr("0x40000200");
+        assert_eq!(s.name.as_deref(), Some("Handler_One"));
+        assert_eq!(s.tier, Tier::Recovered);
+        assert!(s.evidence.iter().any(|e| e.kind == "registration"));
+        assert_eq!(by_addr("0x40000280").name.as_deref(), Some("Handler_Three"));
+    }
+
+    #[test]
     fn build_map_does_not_string_ref_guess_an_already_real_name() {
         let root = tmp("pme_sym_stringref_realname");
         let dec = root.join("images/02_MAIN/decompiled");
@@ -2251,5 +2395,49 @@ mod tests {
             string_ref > 4000,
             "string-ref yield unexpectedly low: {string_ref}"
         );
+    }
+
+    #[test]
+    #[ignore = "measurement: PME_SYMBOLICATE_MEASURE=1 PME_GOLDEN_DIR=<tree>"]
+    fn registration_yield_on_retained_tree() {
+        if std::env::var("PME_SYMBOLICATE_MEASURE").ok().as_deref() != Some("1") {
+            eprintln!("skip: set PME_SYMBOLICATE_MEASURE=1");
+            return;
+        }
+        let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(std::path::PathBuf::from) else {
+            eprintln!("skip: set PME_GOLDEN_DIR");
+            return;
+        };
+        // Find the model-dependent MAIN image (02_MAIN mustang / 01_MAIN cheetah).
+        let Some(main) = std::fs::read_dir(dir.join("images"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with("_MAIN"))
+        else {
+            eprintln!("skip: no *_MAIN image under {}", dir.display());
+            return;
+        };
+        let symbols = build_map(
+            &dir.join("images").join(&main),
+            &main,
+            &HashMap::new(),
+            &dir.join("manifest.json"),
+        )
+        .unwrap();
+        let regs: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.evidence.iter().any(|e| e.kind == "registration"))
+            .collect();
+        let named = regs.iter().filter(|s| s.tier == Tier::Recovered).count();
+        eprintln!(
+            "{main} registration names: {} (recovered {named})",
+            regs.len()
+        );
+        for s in regs.iter().take(20) {
+            eprintln!("  {} {}", s.address, s.name.as_deref().unwrap_or("?"));
+        }
+        assert!(named > 50, "registration yield unexpectedly low: {named}");
     }
 }

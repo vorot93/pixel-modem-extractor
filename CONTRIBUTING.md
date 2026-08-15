@@ -246,6 +246,42 @@ hardcoded. Two reference images exercise both models end-to-end:
   the cost of a second `build_map` pass. Measured on `02_MAIN`: ~8,700
   string-ref guesses, audited ~53% the function's own name / ~85% useful
   (see the design spec). Precision knobs live in `name_guess::string_ref_guess`.
+- **Registration-table names (authoritative).** `symbolicate/reg_table.rs`
+  scans the raw split image for contiguous `{name_ptr, fn_ptr}` tables — the
+  AT-command dispatch, ISR, and protocol-handler tables baseband firmware is
+  full of — and mints a **bare `Recovered` name** for each. Precedence:
+  `__func__` > **registration** > token > string-ref. The **fail-closed gate is
+  the function inventory**: the pointer (Thumb bit stripped) must resolve to a
+  known ARM/Thumb entry, so a name is only minted for a confirmed function — no
+  prologue heuristics. Further fail-closed rules: the name must be a clean
+  `is_ident`; strict **1:1** (a name at >1 function, or a function under >1
+  distinct name, is dropped); a name that aliases a recovered global or another
+  function's name is rejected. **All-caps names are accepted here** (unlike the
+  string-ref tier) — `PICH_HISR` is a real ISR name, and the table structure
+  earns that trust. Layout: both stride-8 orders (`{name,fn}` and `{fn,name}`)
+  occur and carry comparable yield; detection is **longest-run-first** so a
+  reversed table is never misread by the forward layout shifted one word in
+  (its true run is one record longer than the shifted misread, so it claims the
+  span — see `scan_detects_reversed_layout_without_mispairing`). Runs must be
+  ≥3 records. Wider strides were measured to contribute nothing and are omitted.
+  **Ordering (why it reaches Ghidra and string-ref does not):** the scan needs
+  only the raw image + the entry sets, *not* `globals.json`, so it runs inside
+  `build_map` at the pre-globals `symbol_map` stage — its `Recovered` names land
+  in ApplySymbols' pass-2 input and are applied as `USER_DEFINED`, baked into
+  the regenerated `decompiled.c`. (Global-alias rejection is therefore
+  best-effort at that stage: `globals.json` does not exist yet, so `global_names`
+  is empty there; the finalize re-run and the standalone `symbolicate` subcommand
+  do have it.) **Measured yield (real end-to-end, gated
+  `registration_yield_on_retained_tree`): ~233 mustang / 101 cheetah, all
+  `Recovered`, ~100% precision** (verified table structure — e.g. cheetah's
+  `AtiParsePlusCUSD`, `AtiQuePlusCPIN`, `AtiRspPlusCMGD`). This is a small,
+  high-value, precision-over-volume lever (contrast string-ref's ~8.7k @ 53%).
+  **Deliberately not built:** call-site `Register(name, fn)` registration
+  (validated yield ~10 — the pointer is rarely materialized into a catchable arg
+  register; see the `2026-08-14-registration-naming` findings). Per-function
+  provenance is the `kind:"registration"` evidence in `symbols.json`; there is no
+  standalone table-level sidecar (the `RegScan::entries` inventory is its natural
+  source if one is ever wanted).
 - **`disasm_index::DisasmIndex` (shared infra).** Address-indexed view of a
   `disasm.lst`-format file, O(log L + k) per `slice_for` lookup. Built ONCE
   per image; consumed by `symbolicate::load_functions` (the ARM function
