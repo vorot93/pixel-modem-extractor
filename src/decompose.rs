@@ -1102,8 +1102,12 @@ fn derive_global_types_maps(
 ) {
     let mut maps = HashMap::new();
     let mut ineligible = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(images_dir) else {
-        return (maps, ineligible);
+    let entries = match std::fs::read_dir(images_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!("images_dir unreadable, no global-type maps derived: {error}");
+            return (maps, ineligible);
+        }
     };
     for entry in entries.flatten() {
         let label = entry.file_name().to_string_lossy().into_owned();
