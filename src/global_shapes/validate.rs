@@ -126,6 +126,17 @@ pub fn validate_artifact_files(
     assert_eq!(require_u64(analysis, "observations"), observation_count);
     assert_eq!(require_u64(analysis, "conflicts"), conflict_count);
 
+    for key in [
+        "cross_block_join_kills",
+        "cross_block_join_facts",
+        "cross_block_entry_facts",
+        "cross_block_propagated_facts",
+        "cross_block_functions",
+        "cross_block_seeded_functions",
+    ] {
+        require_u64(analysis, key);
+    }
+
     let functions_json: Value =
         serde_json::from_slice(&std::fs::read(&functions_path).expect("functions.json readable"))
             .expect("functions.json valid JSON");

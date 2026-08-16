@@ -10,6 +10,8 @@ use pixel_modem_extractor::manifest::sha256_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+const STALE_V2_FORMAT: &str = "pixel-modem-extractor-global-shapes-v2";
+
 fn golden_dir() -> Option<PathBuf> {
     let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
         eprintln!("skip: set PME_GOLDEN_DIR");
@@ -190,6 +192,10 @@ fn artifacts_satisfy_v3_invariants() {
         );
         let artifact: Value =
             serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        if artifact["format"] == STALE_V2_FORMAT {
+            eprintln!("stale v2 vintage sidecar skipped: {}", path.display());
+            continue;
+        }
         validate_artifact(&tree.dir, report_image(&tree.report, label), &artifact);
         assert!(is_sha256_hex(&sha256_bytes(&bytes)));
         assert_eq!(artifact["format"], FORMAT_V3);

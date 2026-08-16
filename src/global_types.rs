@@ -26,6 +26,7 @@ pub struct Selection {
 // Minimal read view of global_shapes.json (see module note).
 #[derive(Deserialize)]
 struct ShapesFile {
+    format: String,
     globals: Vec<ShapeGlobal>,
 }
 
@@ -62,6 +63,12 @@ const VALID_WIDTHS: [u8; 4] = [1, 2, 4, 8];
 pub fn select_from_shapes_json(bytes: &[u8]) -> Result<Selection> {
     let file: ShapesFile =
         serde_json::from_slice(bytes).map_err(|e| Error::Serialize(e.to_string()))?;
+    if file.format != crate::global_shapes::FORMAT_V3 {
+        return Err(Error::Serialize(format!(
+            "global_shapes sidecar is not v3 vintage: {}",
+            file.format
+        )));
+    }
     let mut candidates = Vec::new();
     let mut ineligible = 0usize;
     for g in file.globals {
@@ -128,6 +135,7 @@ mod tests {
     use super::*;
 
     const SHAPES: &str = r#"{
+      "format": "pixel-modem-extractor-global-shapes-v3",
       "globals": [
         {"address":"0x40010000","status":"inferred",
          "summary":{"provisional_shape":{"kind":"scalar_candidate","width":4}}},
@@ -160,6 +168,19 @@ mod tests {
     #[test]
     fn rejects_malformed_json() {
         assert!(select_from_shapes_json(b"{ not json").is_err());
+    }
+
+    #[test]
+    fn rejects_stale_v2_vintage_sidecar() {
+        let stale = SHAPES.replace(
+            "pixel-modem-extractor-global-shapes-v3",
+            "pixel-modem-extractor-global-shapes-v2",
+        );
+        let error = select_from_shapes_json(stale.as_bytes()).unwrap_err();
+        assert!(
+            error.to_string().contains("v3"),
+            "stale v2 sidecar must be rejected, not silently read: {error}"
+        );
     }
 
     #[test]
