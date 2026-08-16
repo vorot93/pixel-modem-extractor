@@ -69,33 +69,50 @@ pub(crate) fn aggregate(
         }
     }
 
-    // One semantic key at a PC is agreement. Two or more is a conflict; every
-    // implicated Recovered target receives the complete alternative group.
-    // Support count and function order never choose a winner. Agreed keys
-    // are retained per (target, isa, pc) so the interprocedural merge below
-    // can tell whether inter evidence agrees with, or must defer to, intra.
-    let mut intra_keys: BTreeMap<(u32, Isa, u32), SemanticKey> = BTreeMap::new();
+    // One agreement subgroup at a PC is agreement; two or more is a
+    // conflict, and every implicated Recovered target receives the
+    // complete alternative group. Support count and function order never
+    // choose a winner.
+    //
+    // A subgroup spans every key sharing (target, conditional, kind,
+    // width) at that PC. One instruction's transfers (LDM/STM/LDRD) all
+    // evaluate against the same register state and share one base
+    // register, so a single instruction can only produce same-target,
+    // same-kind, same-width keys differing by offset — honest array
+    // evidence, one observation per offset. Cross-target, cross-kind, or
+    // cross-width keys at one PC necessarily come from distinct
+    // interpretations and stay conflicts.
+    //
+    // Agreed keys are retained per (target, isa, pc) so the interprocedural
+    // merge below can tell whether inter evidence agrees with, or must
+    // defer to, intra.
+    let mut intra_keys: BTreeMap<(u32, Isa, u32), BTreeSet<SemanticKey>> = BTreeMap::new();
     for ((isa, pc), alternatives) in groups {
-        if alternatives.len() == 1 {
-            let (key, accumulator) = alternatives
-                .into_iter()
-                .next()
-                .ok_or_else(|| invalid("agreed PC group is empty"))?;
-            let slot = per_global
-                .get_mut(&key.target_address)
-                .ok_or_else(|| invalid("agreed target is not recovered"))?;
-            intra_keys.insert((key.target_address, isa, pc), key);
-            slot.observations.push(Observation {
-                isa,
-                pc,
-                conditional: key.conditional,
-                kind: key.kind,
-                width: key.width,
-                offset: key.offset,
-                functions: accumulator.functions,
-                paths: accumulator.paths,
-                via: BTreeSet::new(),
-            });
+        let subgroups: BTreeSet<(u32, bool, AccessKind, u8)> = alternatives
+            .keys()
+            .map(|key| (key.target_address, key.conditional, key.kind, key.width))
+            .collect();
+        if subgroups.len() == 1 {
+            for (key, accumulator) in alternatives {
+                let slot = per_global
+                    .get_mut(&key.target_address)
+                    .ok_or_else(|| invalid("agreed target is not recovered"))?;
+                intra_keys
+                    .entry((key.target_address, isa, pc))
+                    .or_default()
+                    .insert(key);
+                slot.observations.push(Observation {
+                    isa,
+                    pc,
+                    conditional: key.conditional,
+                    kind: key.kind,
+                    width: key.width,
+                    offset: key.offset,
+                    functions: accumulator.functions,
+                    paths: accumulator.paths,
+                    via: BTreeSet::new(),
+                });
+            }
         } else {
             let implicated: BTreeSet<u32> =
                 alternatives.keys().map(|key| key.target_address).collect();
@@ -193,7 +210,7 @@ type InterGroups = BTreeMap<u32, BTreeMap<(Isa, u32), BTreeMap<SemanticKey, Accu
 // global's record.
 fn merge_interprocedural(
     inter: Vec<CandidateObservation>,
-    intra_keys: &BTreeMap<(u32, Isa, u32), SemanticKey>,
+    intra_keys: &BTreeMap<(u32, Isa, u32), BTreeSet<SemanticKey>>,
     per_global: &mut BTreeMap<u32, PerGlobal>,
 ) -> Result<(usize, usize)> {
     let mut inter_groups: InterGroups = BTreeMap::new();
@@ -226,7 +243,7 @@ fn merge_interprocedural(
         for ((isa, pc), keys) in pcs {
             for (key, accumulator) in keys {
                 match intra_keys.get(&(target_address, isa, pc)) {
-                    Some(intra_key) if *intra_key != key => {
+                    Some(group) if !group.contains(&key) => {
                         interprocedural_dropped =
                             add_count(interprocedural_dropped, 1, "interprocedural_dropped")?;
                     }
@@ -234,7 +251,14 @@ fn merge_interprocedural(
                         let existing = slot
                             .observations
                             .iter_mut()
-                            .find(|observation| observation.isa == isa && observation.pc == pc)
+                            .find(|observation| {
+                                observation.isa == isa
+                                    && observation.pc == pc
+                                    && observation.conditional == key.conditional
+                                    && observation.kind == key.kind
+                                    && observation.width == key.width
+                                    && observation.offset == key.offset
+                            })
                             .ok_or_else(|| {
                                 invalid("intra semantic key present without a matching observation")
                             })?;
@@ -949,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn same_pc_disagreement_in_any_semantic_key_field_is_a_conflict() {
+    fn same_pc_disagreement_in_target_conditional_kind_or_width_is_a_conflict() {
         struct Case {
             name: &'static str,
             recovered: Vec<RecoveredGlobal>,
@@ -986,13 +1010,6 @@ mod tests {
                 right: cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 2, 0),
                 implicated: &[G0],
             },
-            Case {
-                name: "offset",
-                recovered: globals(&[G0]),
-                left: cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
-                right: cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 4),
-                implicated: &[G0],
-            },
         ];
         for case in cases {
             let aggregation = run(&case.recovered, vec![case.left.clone(), case.right.clone()]);
@@ -1014,6 +1031,73 @@ mod tests {
                 assert_eq!(global.conflicts[0].alternatives.len(), 2, "{}", case.name);
             }
         }
+    }
+
+    #[test]
+    fn same_target_multi_offset_one_pc_are_observations_not_conflict() {
+        // One LDM at PC0 reading [r0,#0] and [r0,#4] of G0.
+        let recovered = globals(&[G0]);
+        let aggregation = run(
+            &recovered,
+            vec![
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 4),
+            ],
+        );
+        let global = by_addr(&aggregation, G0);
+        assert_eq!(global.status, Status::Inferred);
+        assert!(global.conflicts.is_empty());
+        assert_eq!(global.observations.len(), 2);
+        let summary = global.summary.as_ref().unwrap();
+        assert_eq!(summary.minimum_size, 8);
+        assert!(matches!(
+            summary.provisional_shape,
+            ProvisionalShape::ArrayCandidate {
+                element_width: 4,
+                minimum_elements: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn cross_target_one_pc_still_conflicts_even_with_offset_variants() {
+        // Two interpretations at PC0: &G0 (+0/+4) and &G1 (+0). The whole
+        // PC group must remain a conflict with all three alternatives.
+        let recovered = globals(&[G0, G1]);
+        let aggregation = run(
+            &recovered,
+            vec![
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 4),
+                cand(G1, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
+            ],
+        );
+        for address in [G0, G1] {
+            let global = by_addr(&aggregation, address);
+            assert_eq!(global.status, Status::Conflicting);
+            assert_eq!(global.conflicts[0].alternatives.len(), 3);
+        }
+    }
+
+    #[test]
+    fn differing_kind_or_width_at_one_pc_still_conflicts() {
+        let recovered = globals(&[G0]);
+        let kind = run(
+            &recovered,
+            vec![
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Write, 4, 0),
+            ],
+        );
+        assert_eq!(by_addr(&kind, G0).status, Status::Conflicting);
+        let width = run(
+            &recovered,
+            vec![
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 2, 0),
+            ],
+        );
+        assert_eq!(by_addr(&width, G0).status, Status::Conflicting);
     }
 
     #[test]
@@ -1531,6 +1615,60 @@ mod tests {
         assert!(by_addr(&agg, G0).conflicts.is_empty());
         // the observation carries its via hop
         assert_eq!(by_addr(&agg, G0).observations[0].via.len(), 1);
+    }
+
+    #[test]
+    fn interprocedural_matches_intra_key_across_multi_offset_group() {
+        // Intra LDM at PC0 observes offsets 0 and 4; an inter candidate at
+        // the same PC whose key equals the offset-4 intra key merges into
+        // the offset-4 observation, and one matching no intra key is
+        // dropped.
+        let recovered = globals(&[G0]);
+        let agg = aggregate(
+            &recovered,
+            vec![
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 0),
+                cand(G0, Isa::Arm, PC0, false, AccessKind::Read, 4, 4),
+            ],
+            vec![
+                inter(
+                    G0,
+                    Isa::Arm,
+                    PC0,
+                    AccessKind::Read,
+                    4,
+                    4,
+                    hop(0xA00, 0xA10, 0),
+                ),
+                inter(
+                    G0,
+                    Isa::Arm,
+                    PC0,
+                    AccessKind::Read,
+                    4,
+                    8,
+                    hop(0xB00, 0xB10, 0),
+                ),
+            ],
+        )
+        .unwrap();
+        let g = by_addr(&agg, G0);
+        assert_eq!(g.status, Status::Inferred);
+        assert_eq!(g.observations.len(), 2);
+        let off0 = g
+            .observations
+            .iter()
+            .find(|observation| observation.offset == 0)
+            .unwrap();
+        let off4 = g
+            .observations
+            .iter()
+            .find(|observation| observation.offset == 4)
+            .unwrap();
+        assert!(off0.via.is_empty());
+        assert_eq!(off4.via.len(), 1);
+        assert_eq!(agg.interprocedural_observations, 1);
+        assert_eq!(agg.interprocedural_dropped, 1);
     }
 
     #[test]
