@@ -94,7 +94,7 @@ pub(crate) fn track_function(
                 );
             }
         }
-        for insn in block_instructions(&instructions, *block)? {
+        for insn in block_instructions(&instructions, block)? {
             // Harvested before `apply_instruction` runs the call's effect.
             // `bl` has empty `writes` and `SemanticEffect::None`, so the
             // argument registers are unchanged either way; harvesting first
@@ -268,7 +268,7 @@ fn instruction_map(decoded: &DecodedFunction) -> Result<BTreeMap<u32, &DecodedIn
 
 fn block_instructions<'a>(
     instructions: &BTreeMap<u32, &'a DecodedInstruction>,
-    block: Block,
+    block: &Block,
 ) -> Result<Vec<&'a DecodedInstruction>> {
     if block.end <= block.start {
         return Err(invalid("block span is empty"));
@@ -959,7 +959,12 @@ mod tests {
         let range = DecodeRange { start, end, isa };
         let function = function_at(start, vec![range]);
         let decoded = decoded_from(vec![(range, insns, None)]);
-        let blocks = vec![Block { isa, start, end }];
+        let blocks = vec![Block {
+            isa,
+            start,
+            end,
+            successors: Vec::new(),
+        }];
         (function, decoded, blocks)
     }
 
@@ -2469,6 +2474,7 @@ mod tests {
                 isa: Isa::Arm,
                 start: 0x1000,
                 end: 0x100c,
+                successors: Vec::new(),
             }],
             &[],
             0,

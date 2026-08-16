@@ -219,11 +219,17 @@ pub(crate) struct DecodedFunction {
     pub ranges: Vec<DecodedRange>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Block {
     pub isa: Isa,
     pub start: u32,
     pub end: u32,
+    /// Direct successor block-start PCs of this block's last instruction —
+    /// exactly the edges the reachability walk computes: branch target
+    /// (decoded anywhere in the function) and/or same-range fallthrough.
+    /// No edges across gaps, into undecoded suffixes, or invented for
+    /// calls/returns/indirect transfers.
+    pub successors: Vec<u32>,
 }
 
 pub(crate) fn decode_function(
@@ -337,6 +343,7 @@ pub(crate) fn reachable_blocks(
                 isa: range.range.isa,
                 start,
                 end,
+                successors: Vec::new(),
             });
             index = end_index + 1;
         }
@@ -350,6 +357,27 @@ pub(crate) fn reachable_blocks(
         if window[0].start >= window[0].end || window[1].start >= window[1].end {
             return Err(invalid("block span is empty"));
         }
+    }
+    let starts: BTreeMap<u32, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.start, index))
+        .collect();
+    for block in &mut blocks {
+        let Some((_, range)) = decoded_pcs.get(&block.start) else {
+            return Err(invalid("block start is not a decoded instruction"));
+        };
+        let Some((_, last)) = range.instructions.range(..block.end).next_back() else {
+            return Err(invalid("block has no decoded instructions"));
+        };
+        let mut edges = successors(last, range, &decoded_pcs);
+        edges.dedup();
+        for edge in &edges {
+            if !starts.contains_key(edge) {
+                return Err(invalid("successor is not a reachable block start"));
+            }
+        }
+        block.successors = edges;
     }
     Ok(blocks)
 }
@@ -5496,7 +5524,8 @@ mod tests {
             vec![Block {
                 isa: Isa::Arm,
                 start: 0x1004,
-                end: 0x1008
+                end: 0x1008,
+                successors: vec![]
             }]
         );
     }
@@ -5543,19 +5572,45 @@ mod tests {
                 Block {
                     isa: Isa::Arm,
                     start: 0x1000,
-                    end: 0x1004
+                    end: 0x1004,
+                    successors: vec![0x100c, 0x1004],
                 },
                 Block {
                     isa: Isa::Arm,
                     start: 0x1004,
-                    end: 0x100c
+                    end: 0x100c,
+                    successors: vec![0x100c],
                 },
                 Block {
                     isa: Isa::Arm,
                     start: 0x100c,
-                    end: 0x1010
+                    end: 0x1010,
+                    successors: vec![],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn reachable_blocks_successors_dedup_when_target_equals_fallthrough() {
+        let range = arm_range(0x1000, 0x100c);
+        let function = function(0x1000, vec![range]);
+        let decoded = decoded_from(
+            &function,
+            vec![(
+                range,
+                vec![
+                    flow_at(Isa::Arm, 0x1000, 4, direct(0x1004, true)),
+                    linear_at(Isa::Arm, 0x1004, 4),
+                    linear_at(Isa::Arm, 0x1008, 4),
+                ],
+            )],
+        );
+        let blocks = reachable_blocks(&function, &decoded).expect("target equals fallthrough");
+        assert_eq!(
+            blocks[0].successors,
+            vec![0x1004],
+            "target == fallthrough must yield one edge, not two"
         );
     }
 
@@ -5581,12 +5636,14 @@ mod tests {
                 Block {
                     isa: Isa::Arm,
                     start: 0x1000,
-                    end: 0x1004
+                    end: 0x1004,
+                    successors: vec![0x1008]
                 },
                 Block {
                     isa: Isa::Arm,
                     start: 0x1008,
-                    end: 0x100c
+                    end: 0x100c,
+                    successors: vec![]
                 },
             ]
         );
@@ -5613,12 +5670,14 @@ mod tests {
                 Block {
                     isa: Isa::Arm,
                     start: 0x1000,
-                    end: 0x1004
+                    end: 0x1004,
+                    successors: vec![0x1004]
                 },
                 Block {
                     isa: Isa::Arm,
                     start: 0x1004,
-                    end: 0x1008
+                    end: 0x1008,
+                    successors: vec![]
                 },
             ]
         );
@@ -5644,7 +5703,8 @@ mod tests {
             vec![Block {
                 isa: Isa::Arm,
                 start: 0x1000,
-                end: 0x1004
+                end: 0x1004,
+                successors: vec![]
             }]
         );
     }
@@ -5671,12 +5731,14 @@ mod tests {
                 Block {
                     isa: Isa::Arm,
                     start: 0x1000,
-                    end: 0x1004
+                    end: 0x1004,
+                    successors: vec![0x2000]
                 },
                 Block {
                     isa: Isa::Thumb,
                     start: 0x2000,
-                    end: 0x2002
+                    end: 0x2002,
+                    successors: vec![]
                 },
             ]
         );
@@ -5703,12 +5765,14 @@ mod tests {
                 Block {
                     isa: Isa::Arm,
                     start: 0x1000,
-                    end: 0x1004
+                    end: 0x1004,
+                    successors: vec![0x1004]
                 },
                 Block {
                     isa: Isa::Arm,
                     start: 0x1004,
-                    end: 0x1008
+                    end: 0x1008,
+                    successors: vec![]
                 },
             ]
         );
@@ -5732,7 +5796,8 @@ mod tests {
             vec![Block {
                 isa: Isa::Arm,
                 start: 0x1000,
-                end: 0x1004
+                end: 0x1004,
+                successors: vec![]
             }]
         );
     }
@@ -5755,7 +5820,8 @@ mod tests {
             vec![Block {
                 isa: Isa::Arm,
                 start: 0x1000,
-                end: 0x1004
+                end: 0x1004,
+                successors: vec![]
             }]
         );
     }
@@ -5808,7 +5874,8 @@ mod tests {
             vec![Block {
                 isa: Isa::Arm,
                 start: 0x1000,
-                end: 0x1004
+                end: 0x1004,
+                successors: vec![]
             }]
         );
     }
