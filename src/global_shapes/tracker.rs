@@ -43,11 +43,24 @@ pub(crate) struct CallHop {
     pub arg_register: u8,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct TrackerReport {
     pub candidates: Vec<CandidateObservation>,
     pub call_facts: Vec<CallFact>,
+    /// v3: instruction kill events plus cross-block join kills (each counted
+    /// once). The v2 per-non-entry-block-start +1 is gone.
     pub state_barriers: usize,
+    /// (block, register) join events where ≥1 in-edge held a fact.
+    pub join_facts: usize,
+    /// (block, register) join events where ≥1 in-edge held a fact but the
+    /// join left the register Unknown.
+    pub join_kills: usize,
+    /// (block, register) facts in final in-states of non-entry blocks.
+    pub entry_facts: usize,
+    /// Observations whose provenance reaches outside the observing block.
+    pub propagated_facts: usize,
+    /// Whether any non-entry block holds a fact in its final in-state.
+    pub join_survivor: bool,
 }
 
 /// A depth-1 call-site fact: at `call_pc` inside `caller_entry`, one or more
@@ -74,31 +87,121 @@ pub(crate) fn track_function(
     seed: &BTreeMap<Register, u32>,
 ) -> Result<TrackerReport> {
     let instructions = instruction_map(decoded)?;
-    let mut candidates = Vec::new();
-    let mut call_facts = Vec::new();
-    let mut state_barriers = 0;
-    for block in blocks {
-        if block.start != function.identity.entry {
-            state_barriers += 1;
-        }
-        let mut state = State::new();
-        if block.start == function.identity.entry {
-            for (register, address) in seed {
-                state.insert(
-                    *register,
-                    Fact::Global {
-                        target_address: *address,
-                        displacement: 0,
-                        provenance: Vec::new(),
-                    },
+    let mut sorted: Vec<&Block> = blocks.iter().collect();
+    sorted.sort_by_key(|block| block.start);
+    let program: Vec<(Vec<&DecodedInstruction>, Vec<u32>)> = sorted
+        .iter()
+        .map(|block| {
+            Ok((
+                block_instructions(&instructions, block)?,
+                block.successors.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let index: BTreeMap<u32, usize> = sorted
+        .iter()
+        .enumerate()
+        .map(|(position, block)| (block.start, position))
+        .collect();
+    let entry_index = index.get(&function.identity.entry).copied();
+
+    // Phase 1: worklist fixpoint. in-state None means "no edge has spoken
+    // yet" (⊥); facts only die and provenance only grows, so deterministic
+    // round-robin over address-sorted blocks converges.
+    let mut in_states: Vec<Option<State>> = vec![None; sorted.len()];
+    let mut out_states: Vec<State> = vec![State::default(); sorted.len()];
+    let mut ever_held: Vec<BTreeSet<Register>> = vec![BTreeSet::new(); sorted.len()];
+    let mut dirty = vec![true; sorted.len()];
+    // The depth-1 seed joins like a virtual predecessor at the entry block:
+    // a disagreeing real predecessor kills it; it never wins by fiat.
+    if let Some(entry) = entry_index {
+        in_states[entry] = Some(seed_state(seed));
+    }
+
+    loop {
+        let mut changed = false;
+        for position in 0..sorted.len() {
+            if !dirty[position] {
+                continue;
+            }
+            dirty[position] = false;
+            let Some(mut state) = in_states[position].clone() else {
+                continue;
+            };
+            for insn in &program[position].0 {
+                apply_instruction(
+                    &mut state,
+                    insn,
+                    image,
+                    load_address,
+                    recovered_addresses,
+                    &function.contexts,
                 );
             }
+            out_states[position] = state;
+            for successor in &program[position].1 {
+                let Some(next) = index.get(successor) else {
+                    return Err(invalid("successor is not a block start"));
+                };
+                if join_into(*next, &out_states[position], &mut in_states, &mut ever_held) {
+                    dirty[*next] = true;
+                    changed = true;
+                }
+            }
         }
-        for insn in block_instructions(&instructions, block)? {
+        if !changed {
+            break;
+        }
+    }
+
+    let join_facts: usize = ever_held.iter().map(|held| held.len()).sum();
+    let join_kills: usize = ever_held
+        .iter()
+        .zip(&in_states)
+        .filter(|(held, _)| !held.is_empty())
+        .map(|(held, in_state)| {
+            held.iter()
+                .filter(|register| {
+                    !in_state
+                        .as_ref()
+                        .is_some_and(|state| state.facts.contains_key(*register))
+                })
+                .count()
+        })
+        .sum();
+    let is_non_entry = |position: usize| Some(position) != entry_index;
+    let entry_facts: usize = in_states
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| is_non_entry(*position))
+        .map(|(_, in_state)| {
+            in_state
+                .as_ref()
+                .map(|state| state.facts.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    let join_survivor = in_states
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| is_non_entry(*position))
+        .any(|(_, in_state)| {
+            in_state
+                .as_ref()
+                .is_some_and(|state| !state.facts.is_empty())
+        });
+
+    // Phase 2: harvest. One walk in block-address order replays each
+    // instruction against its block's final in-state; apply_instruction is
+    // deterministic, so each (ISA, PC) executes against exactly one state.
+    let mut candidates = Vec::new();
+    let mut call_facts = Vec::new();
+    let mut instruction_barriers = 0usize;
+    let mut propagated_facts = 0usize;
+    for (position, block) in sorted.iter().enumerate() {
+        let mut state = in_states[position].clone().unwrap_or_default();
+        for insn in &program[position].0 {
             // Harvested before `apply_instruction` runs the call's effect.
-            // `bl` has empty `writes` and `SemanticEffect::None`, so the
-            // argument registers are unchanged either way; harvesting first
-            // just keeps the "state at the call site" framing exact.
             if let ControlFlow::Call {
                 target: Some(target),
             } = insn.flow
@@ -114,9 +217,18 @@ pub(crate) fn track_function(
                 recovered_addresses,
                 &function.contexts,
             );
-            candidates.extend(step.observations);
+            for candidate in step.observations {
+                if candidate
+                    .provenance_path
+                    .iter()
+                    .any(|pc| *pc < block.start || *pc >= block.end)
+                {
+                    propagated_facts += 1;
+                }
+                candidates.push(candidate);
+            }
             if step.barrier {
-                state_barriers += 1;
+                instruction_barriers += 1;
             }
         }
     }
@@ -124,8 +236,80 @@ pub(crate) fn track_function(
     Ok(TrackerReport {
         candidates,
         call_facts,
-        state_barriers,
+        state_barriers: instruction_barriers + join_kills,
+        join_facts,
+        join_kills,
+        entry_facts,
+        propagated_facts,
+        join_survivor,
     })
+}
+
+fn seed_state(seed: &BTreeMap<Register, u32>) -> State {
+    let mut state = State::new();
+    for (register, address) in seed {
+        state.insert(
+            *register,
+            Fact::Global {
+                target_address: *address,
+                displacement: 0,
+                provenance: Vec::new(),
+            },
+        );
+    }
+    state
+}
+
+/// Must-facts join of one predecessor out-state into a block's in-state:
+/// a register keeps its fact only while every in-edge so far agrees on the
+/// payload; provenance unions (dedup, deterministic order). Returns whether
+/// the in-state changed.
+fn join_into(
+    position: usize,
+    out: &State,
+    in_states: &mut [Option<State>],
+    ever_held: &mut [BTreeSet<Register>],
+) -> bool {
+    for register in out.facts.keys() {
+        ever_held[position].insert(*register);
+    }
+    let Some(in_state) = &mut in_states[position] else {
+        in_states[position] = Some(out.clone());
+        return true;
+    };
+    let mut changed = false;
+    let registers: Vec<Register> = in_state.facts.keys().copied().collect();
+    for register in registers {
+        let Some(incoming) = out.facts.get(&register) else {
+            in_state.facts.remove(&register);
+            changed = true;
+            continue;
+        };
+        let held = in_state.facts[&register].clone();
+        if !held.same_payload(incoming) {
+            in_state.facts.remove(&register);
+            changed = true;
+            continue;
+        }
+        let merged = merge_provenance(held.provenance(), incoming.provenance());
+        if merged != held.provenance() {
+            in_state
+                .facts
+                .insert(register, held.with_provenance(merged));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn merge_provenance(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut merged = left.to_vec();
+    for pc in right {
+        if !merged.contains(pc) {
+            merged.push(*pc);
+        }
+    }
+    merged
 }
 
 // Only the AAPCS integer argument registers (r0-r3) are in scope for depth-1
@@ -193,6 +377,20 @@ impl Fact {
         self
     }
 
+    fn with_provenance(mut self, provenance: Vec<u32>) -> Self {
+        match &mut self {
+            Self::Exact {
+                provenance: slot, ..
+            }
+            | Self::Global {
+                provenance: slot, ..
+            } => {
+                *slot = provenance;
+            }
+        }
+        self
+    }
+
     fn same_payload(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Exact { value: left, .. }, Self::Exact { value: right, .. }) => left == right,
@@ -213,7 +411,7 @@ impl Fact {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct State {
     facts: BTreeMap<Register, Fact>,
 }
@@ -1990,63 +2188,55 @@ mod tests {
         (function, decoded)
     }
 
+    fn breq(pc: u32, target: u32) -> DecodedInstruction {
+        insn(
+            Isa::Arm,
+            pc,
+            4,
+            true,
+            [],
+            SemanticEffect::None,
+            ControlFlow::DirectBranch {
+                target,
+                has_fallthrough: true,
+            },
+        )
+    }
+
+    fn b(pc: u32, target: u32) -> DecodedInstruction {
+        insn(
+            Isa::Arm,
+            pc,
+            4,
+            false,
+            [],
+            SemanticEffect::None,
+            ControlFlow::DirectBranch {
+                target,
+                has_fallthrough: false,
+            },
+        )
+    }
+
     #[test]
-    fn block_facts_do_not_cross_conditional_edge() {
+    fn facts_cross_conditional_edges_into_both_arms() {
         let (function, decoded) = branch_function(
             vec![
                 mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
-                insn(
-                    Isa::Arm,
-                    0x1004,
-                    4,
-                    true,
-                    [],
-                    SemanticEffect::None,
-                    ControlFlow::DirectBranch {
-                        target: 0x100c,
-                        has_fallthrough: true,
-                    },
-                ),
+                breq(0x1004, 0x100c),
                 load(0x1008, R1, R0, 0, 4),
                 load(0x100c, R2, R0, 0, 4),
             ],
             0x1010,
         );
         let report = track_reachable(function, decoded, &[GLOBAL]);
-        assert!(
-            report.candidates.is_empty(),
-            "facts must not cross the conditional edge: {report:?}"
-        );
+        let pcs: Vec<u32> = report.candidates.iter().map(|c| c.pc).collect();
+        assert_eq!(pcs, vec![0x1008, 0x100c]);
+        assert_eq!(report.propagated_facts, 2);
     }
 
     #[test]
-    fn block_facts_do_not_cross_unconditional_edge() {
-        let (function, decoded) = branch_function(
-            vec![
-                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
-                insn(
-                    Isa::Arm,
-                    0x1004,
-                    4,
-                    false,
-                    [],
-                    SemanticEffect::None,
-                    ControlFlow::DirectBranch {
-                        target: 0x100c,
-                        has_fallthrough: false,
-                    },
-                ),
-                load(0x1008, R1, R0, 0, 4),
-                load(0x100c, R2, R0, 0, 4),
-            ],
-            0x1010,
-        );
-        let report = track_reachable(function, decoded, &[GLOBAL]);
-        assert!(report.candidates.is_empty(), "{report:?}");
-    }
-
-    #[test]
-    fn block_facts_do_not_cross_call_fallthrough() {
+    fn facts_cross_a_call_fallthrough() {
         let (function, decoded) = branch_function(
             vec![
                 mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
@@ -2064,11 +2254,201 @@ mod tests {
             0x100c,
         );
         let report = track_reachable(function, decoded, &[GLOBAL]);
-        assert!(report.candidates.is_empty(), "{report:?}");
+        assert_eq!(
+            report.candidates,
+            vec![obs(GLOBAL, 0x1008, AccessKind::Read, 0, &[0x1000])]
+        );
+        assert_eq!(report.propagated_facts, 1);
     }
 
     #[test]
-    fn block_facts_do_not_cross_join() {
+    fn join_agreement_carries_fact_across_a_diamond() {
+        // entry: mov r0,GLOBAL ; breq → 0x100c (ft 0x1008)
+        // left:  mov r0,GLOBAL            (0x1008..0x100c)
+        // join:  load r1,[r0]             (0x100c)
+        let (function, decoded) = branch_function(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                breq(0x1004, 0x100c),
+                mov_imm(Isa::Arm, 0x1008, R0, GLOBAL),
+                load(0x100c, R1, R0, 0, 4),
+            ],
+            0x1010,
+        );
+        let report = track_reachable(function, decoded, &[GLOBAL]);
+        assert_eq!(
+            report.candidates,
+            vec![obs(GLOBAL, 0x100c, AccessKind::Read, 0, &[0x1000, 0x1008])]
+        );
+        assert!(report.join_survivor);
+        assert_eq!(report.join_kills, 0);
+        assert_eq!(report.join_facts, 2); // r0 arrives at 0x1008 and at 0x100c
+        assert_eq!(report.entry_facts, 2); // r0 live at 0x1008 and 0x100c entries
+        assert_eq!(report.propagated_facts, 1); // the 0x100c use
+        assert_eq!(report.state_barriers, 0);
+    }
+
+    #[test]
+    fn join_disagreement_kills_fact_and_counts_a_barrier() {
+        let (function, decoded) = branch_function(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                breq(0x1004, 0x100c),
+                mov_imm(Isa::Arm, 0x1008, R0, OTHER),
+                load(0x100c, R1, R0, 0, 4),
+            ],
+            0x1010,
+        );
+        let report = track_reachable(function, decoded, &[GLOBAL, OTHER]);
+        assert!(
+            report.candidates.is_empty(),
+            "disagreeing arms must not carry either fact: {report:?}"
+        );
+        assert_eq!(report.join_kills, 1);
+        assert_eq!(report.state_barriers, 1); // the join kill, no instruction kill
+        // r0 provably holds GLOBAL along the fallthrough arm's single
+        // in-edge, so that block's entry state keeps the fact (must-join
+        // only kills at the 0x100c join where the arms disagree).
+        assert!(report.join_survivor);
+        assert_eq!(report.entry_facts, 1);
+    }
+
+    #[test]
+    fn fact_survives_a_loop_back_edge() {
+        // 0x1000: mov r0,GLOBAL ; 0x1004: b → 0x1008
+        // 0x1008: load r1,[r0] ; 0x100c: b → 0x1008
+        let (function, decoded) = branch_function(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                b(0x1004, 0x1008),
+                load(0x1008, R1, R0, 0, 4),
+                b(0x100c, 0x1008),
+            ],
+            0x1010,
+        );
+        let report = track_reachable(function, decoded, &[GLOBAL]);
+        assert_eq!(
+            report.candidates,
+            vec![obs(GLOBAL, 0x1008, AccessKind::Read, 0, &[0x1000])]
+        );
+        assert!(report.join_survivor);
+        assert_eq!(report.join_kills, 0);
+    }
+
+    #[test]
+    fn seed_killed_by_disagreeing_predecessor() {
+        // Loop back into the seeded entry: the predecessor's out-state
+        // disagrees with the seed, so the seed must not win by fiat.
+        let (function, decoded) = branch_function(
+            vec![
+                insn(
+                    Isa::Arm,
+                    0x1000,
+                    4,
+                    false,
+                    [R1],
+                    write(R1, ValueExpr::Immediate(0x9999)),
+                    ControlFlow::Linear,
+                ),
+                b(0x1004, 0x1008),
+                load(0x1008, R2, R1, 0, 4),
+                b(0x100c, 0x1000),
+            ],
+            0x1010,
+        );
+        let blocks = reachable_blocks(&function, &decoded).expect("reachable blocks");
+        let report = track_function(
+            &function,
+            &decoded,
+            &blocks,
+            &[],
+            0,
+            &BTreeSet::from([GLOBAL]),
+            &BTreeMap::from([(R1, GLOBAL)]),
+        )
+        .expect("seeded loop track");
+        assert!(report.candidates.is_empty(), "{report:?}");
+        assert_eq!(
+            report.join_kills, 1,
+            "the seed r1 must die at the entry join"
+        );
+    }
+
+    #[test]
+    fn seeded_fact_flows_beyond_the_entry_block() {
+        // Entry contains only a branch; the seeded dereference sits in the
+        // successor block (the callee-side cross-block case the v1 engine lost).
+        let (function, decoded) =
+            branch_function(vec![b(0x1000, 0x1004), load(0x1004, R1, R1, 4, 4)], 0x1008);
+        let blocks = reachable_blocks(&function, &decoded).expect("reachable blocks");
+        let report = track_function(
+            &function,
+            &decoded,
+            &blocks,
+            &[],
+            0,
+            &BTreeSet::from([GLOBAL]),
+            &BTreeMap::from([(R1, GLOBAL)]),
+        )
+        .expect("seeded track");
+        assert_eq!(
+            report.candidates,
+            vec![obs(GLOBAL, 0x1004, AccessKind::Read, 4, &[])]
+        );
+        assert!(report.join_survivor);
+        assert_eq!(
+            report.propagated_facts, 0,
+            "empty-provenance seed is not a propagated fact"
+        );
+    }
+
+    #[test]
+    fn tracking_is_deterministic() {
+        let (function, decoded) = branch_function(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                breq(0x1004, 0x100c),
+                mov_imm(Isa::Arm, 0x1008, R0, GLOBAL),
+                load(0x100c, R1, R0, 0, 4),
+                b(0x1010, 0x1008),
+            ],
+            0x1014,
+        );
+        let (function2, decoded2) = branch_function(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                breq(0x1004, 0x100c),
+                mov_imm(Isa::Arm, 0x1008, R0, GLOBAL),
+                load(0x100c, R1, R0, 0, 4),
+                b(0x1010, 0x1008),
+            ],
+            0x1014,
+        );
+        let first = track_reachable(function, decoded, &[GLOBAL]);
+        let second = track_reachable(function2, decoded2, &[GLOBAL]);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn facts_cross_an_unconditional_edge() {
+        let (function, decoded) = branch_function(
+            vec![
+                mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
+                b(0x1004, 0x100c),
+                load(0x1008, R1, R0, 0, 4), // unreachable: no block, no observation
+                load(0x100c, R2, R0, 0, 4),
+            ],
+            0x1010,
+        );
+        let report = track_reachable(function, decoded, &[GLOBAL]);
+        assert_eq!(
+            report.candidates,
+            vec![obs(GLOBAL, 0x100c, AccessKind::Read, 0, &[0x1000])]
+        );
+    }
+
+    #[test]
+    fn join_disagreement_between_predecessors_kills_fact() {
         let (function, decoded) = branch_function(
             vec![
                 insn(
@@ -2102,6 +2482,8 @@ mod tests {
         );
         let report = track_reachable(function, decoded, &[GLOBAL]);
         assert!(report.candidates.is_empty(), "{report:?}");
+        assert_eq!(report.join_kills, 1);
+        assert_eq!(report.state_barriers, 1);
     }
 
     #[test]
@@ -2284,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn barrier_non_entry_block_reset() {
+    fn barrier_v3_drops_per_block_start_count() {
         let (function, decoded) = branch_function(
             vec![
                 insn(
@@ -2305,7 +2687,8 @@ mod tests {
             0x100c,
         );
         let report = track_reachable(function, decoded, &[]);
-        assert_eq!(report.state_barriers, 1);
+        assert_eq!(report.state_barriers, 0);
+        assert_eq!(report.join_kills, 0);
     }
 
     #[test]

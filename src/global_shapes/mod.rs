@@ -1303,7 +1303,7 @@ mod tests {
                 quarantine_errors: 1,
                 instructions_decoded: 14,
                 decode_failures: 0,
-                state_barriers: 1,
+                state_barriers: 0,
                 observations: 3,
                 conflicts: 0,
                 direct_calls_resolved: 0,
@@ -1409,7 +1409,7 @@ mod tests {
                 thumb_quarantined: 0,
                 quarantine_errors: 1,
                 decode_failures: 0,
-                state_barriers: 1,
+                state_barriers: 0,
                 interprocedural_dropped: 0,
             }
         );
