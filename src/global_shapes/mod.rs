@@ -2082,6 +2082,14 @@ mod tests {
             eprintln!("skip: PME_GOLDEN_DIR not found: {}", dir.display());
             return;
         }
+        // Recorded v2-era status split on mustang 02_MAIN (CONTRIBUTING
+        // "Phase 3.2 production baselines"). The v3 engine is monotone vs
+        // v2: `inferred` may only grow out of `no_evidence`; `conflicting`
+        // must not increase.
+        const MUSTANG_MAIN: &str = "02_MAIN";
+        const V2_INFERRED: usize = 125;
+        const V2_NO_EVIDENCE: usize = 787;
+        const V2_CONFLICTING: usize = 3;
         let report: Value = serde_json::from_slice(
             &fs::read(dir.join("report.json")).expect("report.json readable"),
         )
@@ -2126,11 +2134,34 @@ mod tests {
                 "{} report drifted",
                 bound.label
             );
+            if bound.label == MUSTANG_MAIN {
+                assert!(
+                    first_report.inferred >= V2_INFERRED,
+                    "{}: monotonicity violated: inferred {} < v2's {}",
+                    bound.label,
+                    first_report.inferred,
+                    V2_INFERRED
+                );
+                assert!(
+                    first_report.no_evidence <= V2_NO_EVIDENCE,
+                    "{}: monotonicity violated: no_evidence {} > v2's {}",
+                    bound.label,
+                    first_report.no_evidence,
+                    V2_NO_EVIDENCE
+                );
+                assert!(
+                    first_report.conflicting <= V2_CONFLICTING,
+                    "{}: conflicting must not increase: {} > v2's {}",
+                    bound.label,
+                    first_report.conflicting,
+                    V2_CONFLICTING
+                );
+            }
             let artifact: Value = serde_json::from_slice(&first).expect("artifact JSON");
             validate_artifact(&dir, image, &artifact);
             let file = artifact;
             println!(
-                "global_shapes replay {}: wall={:?} sha256={} accepted_identities={}/{} ghidra_quarantined={} thumb_quarantined={} quarantine_errors={} instructions_decoded={} decode_failures={} state_barriers={}",
+                "global_shapes replay {}: wall={:?} sha256={} accepted_identities={}/{} ghidra_quarantined={} thumb_quarantined={} quarantine_errors={} instructions_decoded={} decode_failures={} state_barriers={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
                 bound.label,
                 first_elapsed,
                 sha256_bytes(&first),
@@ -2142,6 +2173,12 @@ mod tests {
                 file["analysis"]["instructions_decoded"],
                 first_report.decode_failures,
                 first_report.state_barriers,
+                file["analysis"]["cross_block_join_kills"],
+                file["analysis"]["cross_block_join_facts"],
+                file["analysis"]["cross_block_entry_facts"],
+                file["analysis"]["cross_block_propagated_facts"],
+                file["analysis"]["cross_block_functions"],
+                file["analysis"]["cross_block_seeded_functions"],
             );
         }
         assert_eq!(
@@ -2238,7 +2275,7 @@ mod tests {
         let artifact: Value = serde_json::from_slice(&first).expect("artifact JSON");
         let analysis = &artifact["analysis"];
         println!(
-            "global_shapes interprocedural yield {LABEL}: wall={:?} sha256={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={}",
+            "global_shapes interprocedural yield {LABEL}: wall={:?} sha256={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
             first_elapsed,
             sha256_bytes(&first),
             first_report.inferred,
@@ -2250,6 +2287,12 @@ mod tests {
             analysis["seed_vectors"],
             analysis["interprocedural_observations"],
             analysis["interprocedural_dropped"],
+            analysis["cross_block_join_kills"],
+            analysis["cross_block_join_facts"],
+            analysis["cross_block_entry_facts"],
+            analysis["cross_block_propagated_facts"],
+            analysis["cross_block_functions"],
+            analysis["cross_block_seeded_functions"],
         );
     }
 }
