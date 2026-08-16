@@ -1,6 +1,6 @@
-//! Shared v2 artifact checks for env-gated goldens and retained-tree replay.
+//! Shared v3 artifact checks for env-gated goldens and retained-tree replay.
 
-use super::FORMAT_V2;
+use super::FORMAT_V3;
 use crate::manifest::sha256_file;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -26,7 +26,7 @@ pub fn validate_artifact_files(
     artifact: &Value,
 ) {
     let label = require_str(report_image, "image");
-    assert_eq!(require_str(artifact, "format"), FORMAT_V2);
+    assert_eq!(require_str(artifact, "format"), FORMAT_V3);
     assert_eq!(require_str(artifact, "image"), label);
 
     let manifest: Value =

@@ -1,4 +1,4 @@
-// Input validation, source hashes, v2 schema, and atomic sidecar commit.
+// Input validation, source hashes, v3 schema, and atomic sidecar commit.
 
 use super::{
     FunctionContext, FunctionExecution, RecoveredGlobal, RunRequest, SourceProjectionCounts,
@@ -17,8 +17,8 @@ use std::io::Write;
 use std::path::Path;
 
 const GLOBALS_FORMAT: &str = "pixel-modem-extractor-globals-v1";
-const THUMB_FORMAT_V1: &str = "pixel-modem-extractor-thumb-functions-v1";
-const THUMB_FORMAT_V2: &str = "pixel-modem-extractor-thumb-functions-v2";
+const THUMB_V1_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v1";
+const THUMB_V2_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputHashes {
@@ -289,7 +289,7 @@ fn parse_thumb_inventory(
         .get("format")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("thumb_functions format must be a string"))?;
-    if format != THUMB_FORMAT_V1 && format != THUMB_FORMAT_V2 {
+    if format != THUMB_V1_FORMAT && format != THUMB_V2_FORMAT {
         return Err(invalid("unsupported thumb_functions format"));
     }
     let records = object
@@ -466,6 +466,12 @@ pub(crate) struct AnalysisWire {
     pub seed_vectors: usize,
     pub interprocedural_observations: usize,
     pub interprocedural_dropped: usize,
+    pub cross_block_join_kills: usize,
+    pub cross_block_join_facts: usize,
+    pub cross_block_entry_facts: usize,
+    pub cross_block_propagated_facts: usize,
+    pub cross_block_functions: usize,
+    pub cross_block_seeded_functions: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -612,7 +618,7 @@ mod tests {
     use crate::global_shapes::decoder::AccessKind;
     use crate::global_shapes::tracker::CandidateObservation;
     use crate::global_shapes::{
-        FORMAT_V2, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
+        FORMAT_V3, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
     };
     use crate::manifest::sha256_bytes;
     use serde_json::{Value, json};
@@ -1711,7 +1717,7 @@ mod tests {
         let aggregation =
             aggregate(&recovered, candidates, Vec::new()).expect("golden aggregation");
         GlobalShapesFile {
-            format: FORMAT_V2,
+            format: FORMAT_V3,
             image: LABEL.into(),
             load_address: "0x40000000".into(),
             inputs: InputHashesWire {
@@ -1744,13 +1750,19 @@ mod tests {
                 seed_vectors: 0,
                 interprocedural_observations: 0,
                 interprocedural_dropped: 0,
+                cross_block_join_kills: 7,
+                cross_block_join_facts: 11,
+                cross_block_entry_facts: 13,
+                cross_block_propagated_facts: 5,
+                cross_block_functions: 2,
+                cross_block_seeded_functions: 1,
             },
             globals: aggregation.globals,
         }
     }
 
-    const V2_WIRE_GOLDEN: &str = r#"{
-  "format": "pixel-modem-extractor-global-shapes-v2",
+    const V3_WIRE_GOLDEN: &str = r#"{
+  "format": "pixel-modem-extractor-global-shapes-v3",
   "image": "02_MAIN",
   "load_address": "0x40000000",
   "inputs": {
@@ -1779,7 +1791,13 @@ mod tests {
     "seeded_callees": 0,
     "seed_vectors": 0,
     "interprocedural_observations": 0,
-    "interprocedural_dropped": 0
+    "interprocedural_dropped": 0,
+    "cross_block_join_kills": 7,
+    "cross_block_join_facts": 11,
+    "cross_block_entry_facts": 13,
+    "cross_block_propagated_facts": 5,
+    "cross_block_functions": 2,
+    "cross_block_seeded_functions": 1
   },
   "globals": [
     {
@@ -1969,9 +1987,9 @@ mod tests {
 }"#;
 
     #[test]
-    fn v2_wire_bytes_are_exact() {
+    fn v3_wire_bytes_are_exact() {
         let bytes = serialize(&golden_file()).unwrap();
-        assert_eq!(bytes, V2_WIRE_GOLDEN.as_bytes());
+        assert_eq!(bytes, V3_WIRE_GOLDEN.as_bytes());
         assert!(!bytes.ends_with(b"\n"));
     }
 

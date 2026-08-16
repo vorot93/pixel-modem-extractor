@@ -21,7 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use tracker::{CallFact, CallHop, CandidateObservation};
 
-pub const FORMAT_V2: &str = "pixel-modem-extractor-global-shapes-v2";
+pub const FORMAT_V3: &str = "pixel-modem-extractor-global-shapes-v3";
 pub use validate::{validate_artifact, validate_artifact_files};
 
 #[derive(Debug)]
@@ -195,6 +195,12 @@ fn analyze_loaded_inputs(
     let mut call_facts_unresolved = 0usize;
     let mut seeded_callees = 0usize;
     let mut seed_vectors = 0usize;
+    let mut cross_block_join_kills = 0usize;
+    let mut cross_block_join_facts = 0usize;
+    let mut cross_block_entry_facts = 0usize;
+    let mut cross_block_propagated_facts = 0usize;
+    let mut cross_block_functions: BTreeSet<u32> = BTreeSet::new();
+    let mut cross_block_seeded_functions: BTreeSet<u32> = BTreeSet::new();
 
     if !inputs.globals.is_empty() {
         let recovered: BTreeSet<u32> = inputs.globals.iter().map(|global| global.address).collect();
@@ -242,6 +248,29 @@ fn analyze_loaded_inputs(
                 &BTreeMap::new(),
             )?;
             state_barriers = add_count(state_barriers, tracked.state_barriers, "state_barriers")?;
+            cross_block_join_kills = add_count(
+                cross_block_join_kills,
+                tracked.join_kills,
+                "cross_block_join_kills",
+            )?;
+            cross_block_join_facts = add_count(
+                cross_block_join_facts,
+                tracked.join_facts,
+                "cross_block_join_facts",
+            )?;
+            cross_block_entry_facts = add_count(
+                cross_block_entry_facts,
+                tracked.entry_facts,
+                "cross_block_entry_facts",
+            )?;
+            cross_block_propagated_facts = add_count(
+                cross_block_propagated_facts,
+                tracked.propagated_facts,
+                "cross_block_propagated_facts",
+            )?;
+            if tracked.join_survivor {
+                cross_block_functions.insert(function.identity.entry);
+            }
             intra.extend(tracked.candidates);
             call_facts.extend(tracked.call_facts);
         }
@@ -308,6 +337,32 @@ fn analyze_loaded_inputs(
                 &recovered,
                 &group.seed,
             )?;
+            cross_block_join_kills = add_count(
+                cross_block_join_kills,
+                tracked.join_kills,
+                "cross_block_join_kills",
+            )?;
+            cross_block_join_facts = add_count(
+                cross_block_join_facts,
+                tracked.join_facts,
+                "cross_block_join_facts",
+            )?;
+            cross_block_entry_facts = add_count(
+                cross_block_entry_facts,
+                tracked.entry_facts,
+                "cross_block_entry_facts",
+            )?;
+            cross_block_propagated_facts = add_count(
+                cross_block_propagated_facts,
+                tracked.propagated_facts,
+                "cross_block_propagated_facts",
+            )?;
+            if tracked.join_survivor {
+                cross_block_functions.insert(group.callee.identity.entry);
+                if !group.seed.is_empty() {
+                    cross_block_seeded_functions.insert(group.callee.identity.entry);
+                }
+            }
             for mut candidate in tracked.candidates {
                 let Some(hops) = group.hops_by_address.get(&candidate.target_address) else {
                     continue;
@@ -321,7 +376,7 @@ fn analyze_loaded_inputs(
 
     let aggregation = aggregate_fn(&inputs.globals, intra, inter_candidates)?;
     let file = GlobalShapesFile {
-        format: FORMAT_V2,
+        format: FORMAT_V3,
         image: image_label.to_owned(),
         load_address: hex(inputs.load_address),
         inputs: InputHashesWire {
@@ -351,6 +406,12 @@ fn analyze_loaded_inputs(
             seed_vectors,
             interprocedural_observations: aggregation.interprocedural_observations,
             interprocedural_dropped: aggregation.interprocedural_dropped,
+            cross_block_join_kills,
+            cross_block_join_facts,
+            cross_block_entry_facts,
+            cross_block_propagated_facts,
+            cross_block_functions: cross_block_functions.len(),
+            cross_block_seeded_functions: cross_block_seeded_functions.len(),
         },
         globals: aggregation.globals,
     };
@@ -386,8 +447,8 @@ fn revalidate(
     inputs: &LoadedInputs,
     report: &GlobalShapesReport,
 ) -> Result<()> {
-    if file.format != FORMAT_V2 {
-        return Err(invalid("artifact format is not v2"));
+    if file.format != FORMAT_V3 {
+        return Err(invalid("artifact format is not v3"));
     }
     if file.globals.len() != inputs.globals.len() {
         return Err(invalid(
@@ -519,7 +580,13 @@ fn revalidate(
             || file.analysis.seeded_callees != 0
             || file.analysis.seed_vectors != 0
             || file.analysis.interprocedural_observations != 0
-            || file.analysis.interprocedural_dropped != 0)
+            || file.analysis.interprocedural_dropped != 0
+            || file.analysis.cross_block_join_kills != 0
+            || file.analysis.cross_block_join_facts != 0
+            || file.analysis.cross_block_entry_facts != 0
+            || file.analysis.cross_block_propagated_facts != 0
+            || file.analysis.cross_block_functions != 0
+            || file.analysis.cross_block_seeded_functions != 0)
     {
         return Err(invalid("empty recovered set must not analyze identities"));
     }
@@ -630,7 +697,7 @@ mod tests {
         DecodedInstruction, DecoderIdentity, InstructionDecoder, MemoryEffect, MemoryTransfer,
         PureRustDecoder, Register, SemanticEffect, ValueExpr, decode_function,
     };
-    use crate::global_shapes::{FORMAT_V2, FunctionContext, FunctionExecution};
+    use crate::global_shapes::{FORMAT_V3, FunctionContext, FunctionExecution};
     use crate::manifest::sha256_bytes;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1282,7 +1349,7 @@ mod tests {
     fn expected_synthetic_file(fixture: &Fixture) -> GlobalShapesFile {
         let (image_sha256, globals_sha256, functions_sha256, thumb_sha256) = fixture.hash_sources();
         GlobalShapesFile {
-            format: FORMAT_V2,
+            format: FORMAT_V3,
             image: LABEL.into(),
             load_address: hex(LOAD_ADDR),
             inputs: InputHashesWire {
@@ -1312,6 +1379,12 @@ mod tests {
                 seed_vectors: 0,
                 interprocedural_observations: 0,
                 interprocedural_dropped: 0,
+                cross_block_join_kills: 0,
+                cross_block_join_facts: 0,
+                cross_block_entry_facts: 0,
+                cross_block_propagated_facts: 0,
+                cross_block_functions: 0,
+                cross_block_seeded_functions: 0,
             },
             globals: vec![
                 GlobalWire {
@@ -1393,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_image_writes_complete_v2_sidecar() {
+    fn synthetic_image_writes_complete_v3_sidecar() {
         let fixture = Fixture::new("synthetic");
         let bound = synthetic_bound(&fixture, 3);
         let report = run_image_with_decoder(&bound.get(), &MapDecoder::fixture())
@@ -1750,7 +1823,7 @@ mod tests {
         let path = root.join("global_shapes.json");
         fs::write(&path, OLD_SIDECAR).unwrap();
         let file = GlobalShapesFile {
-            format: FORMAT_V2,
+            format: FORMAT_V3,
             image: LABEL.into(),
             load_address: hex(LOAD_ADDR),
             inputs: InputHashesWire {
@@ -1780,6 +1853,12 @@ mod tests {
                 seed_vectors: 0,
                 interprocedural_observations: 0,
                 interprocedural_dropped: 0,
+                cross_block_join_kills: 0,
+                cross_block_join_facts: 0,
+                cross_block_entry_facts: 0,
+                cross_block_propagated_facts: 0,
+                cross_block_functions: 0,
+                cross_block_seeded_functions: 0,
             },
             globals: vec![],
         };
@@ -1815,7 +1894,7 @@ mod tests {
         assert_eq!(fixture.hash_sources(), before);
         assert!(!first.ends_with(b"\n"));
         let file: Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(file["format"], FORMAT_V2);
+        assert_eq!(file["format"], FORMAT_V3);
         assert_eq!(file["globals"].as_array().unwrap().len(), 3);
         let mut report_image = json!({
             "image": LABEL,
