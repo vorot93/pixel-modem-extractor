@@ -953,11 +953,21 @@ enum GlobalsRouteMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SymbolRouteStep {
     PrepareNamesAndProjection,
-    Finalize { rewrite_decompiled_c: bool },
+    Finalize {
+        rewrite_decompiled_c: bool,
+    },
     LoadFinalizedNames,
     RunGlobals(GlobalsRouteMode),
     RunGlobalShapes,
     DispatchPass2,
+    /// Normal-route only: re-run the `global_shapes` stage after
+    /// `DispatchPass2`'s input rewrites and re-commit the sidecar over the
+    /// tree's FINAL inputs. See `orchestrate_symbol_route`.
+    RefreshGlobalShapes,
+    /// Normal-route only: record the `global_types_apply` stage from the
+    /// pass-2 outcomes. Must follow `RefreshGlobalShapes` so the sidecar's
+    /// final re-commit is never interleaved after type-application reporting.
+    ApplyGlobalTypes,
 }
 
 fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(SymbolRouteStep)) {
@@ -983,23 +993,38 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // pass-2 input on the normal route below), so shape recovery just
         // needs to run once, after globals.json exists, to produce the
         // sidecar. Keep it last so its position/timing on this route is
-        // unchanged by the normal-route reorder below.
+        // unchanged by the normal-route reorder below. No input is rewritten
+        // after this point, so — unlike the normal route — there is nothing
+        // to re-commit and no RefreshGlobalShapes/ApplyGlobalTypes steps.
         run_step(SymbolRouteStep::RunGlobalShapes);
     } else {
         run_step(SymbolRouteStep::PrepareNamesAndProjection);
         run_step(SymbolRouteStep::RunGlobals(
             GlobalsRouteMode::PrepareApplicationInput,
         ));
-        // Shape recovery runs here — after globals.json exists, before pass 2
-        // — so a later pass-2 script can apply the recovered shapes as types
-        // alongside ApplyGlobals. This is input-safe: the shape stage reads
-        // only the raw image, globals.json, and the pass-1 functions.json /
-        // thumb_functions.json inventory, never decompiled.c; and pass 2 is
-        // `-process -noanalysis`, so it never changes function boundaries —
-        // the pass-1 inventory the shape stage consumes is identical pre/post
-        // pass 2. See CONTRIBUTING (Phase 3.2) for the full rationale.
+        // First shape sweep — after globals.json exists, before pass 2 — so
+        // DispatchPass2 can derive the strict `undefinedN` apply-map from
+        // global_shapes.json and a later pass-2 script can apply the
+        // recovered shapes as types alongside ApplyGlobals. This is
+        // input-safe: the shape stage reads only the raw image, globals.json,
+        // and the pass-1 functions.json / thumb_functions.json inventory,
+        // never decompiled.c; and pass 2 is `-process -noanalysis`, so it
+        // never changes function boundaries — the pass-1 inventory the shape
+        // stage consumes is identical pre/post pass 2. See CONTRIBUTING
+        // (Phase 3.2) for the full rationale.
         run_step(SymbolRouteStep::RunGlobalShapes);
         run_step(SymbolRouteStep::DispatchPass2);
+        // The first sweep's committed sidecar is born stale: inside
+        // DispatchPass2, pass 2's ownership-aware refresh rewrites
+        // functions.json and thumb_enrich_post_pass2 rewrites
+        // thumb_functions.json — the very files the sidecar hashes. Re-run
+        // the stage once more, after the last input rewrite, so the
+        // committed sidecar (and the single stage entry, replaced in place)
+        // reflects the tree's FINAL inputs. Idempotent by the reorder's
+        // safety argument above: identical inventories → identical decode
+        // inputs → byte-identical artifact except the input hashes.
+        run_step(SymbolRouteStep::RefreshGlobalShapes);
+        run_step(SymbolRouteStep::ApplyGlobalTypes);
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
         });
@@ -1783,10 +1808,31 @@ fn add_global_shapes_totals(
     totals.state_barriers += report.state_barriers;
 }
 
+/// Record `report` as the single `global_shapes` stage entry: replace any
+/// earlier entry from a previous sweep in place (keeping its list position),
+/// or push when none exists. The normal route runs the stage twice — the
+/// first sweep (pre-pass-2, feeding `derive_global_types_maps`) and the final
+/// re-commit after pass 2 / `thumb_enrich_post_pass2` rewrite the sidecar's
+/// hashed inputs — and the report must carry exactly one entry reflecting the
+/// FINAL sweep's totals.
+fn record_global_shapes_stage(stages: &mut Vec<StageReport>, report: StageReport) {
+    match stages
+        .iter()
+        .rposition(|stage| stage.stage == "global_shapes")
+    {
+        Some(pos) => stages[pos] = report,
+        None => stages.push(report),
+    }
+}
+
 /// Runs the `global_shapes` sweep and returns every image's retained
-/// [`GlobalShapesOutcome`] (keyed by label) alongside mutating `stages` in
-/// place, so a normal-route caller can re-apply the report-field patch after
-/// a later rebuild — see `GlobalShapesOutcome` and `reapply_global_shapes_outcomes`.
+/// [`GlobalShapesOutcome`] (keyed by label) alongside recording the sweep's
+/// stage report in `stages` — replacing any earlier `global_shapes` entry in
+/// place, so a normal-route caller may re-run the stage after a later input
+/// rewrite and the final sweep's numbers become the committed truth (see
+/// `record_global_shapes_stage`). The retained outcomes let a caller
+/// re-apply the report-field patch after a later rebuild — see
+/// `GlobalShapesOutcome` and `reapply_global_shapes_outcomes`.
 fn run_global_shapes_stage_with(
     stages: &mut Vec<StageReport>,
     images_dir: &Path,
@@ -1797,11 +1843,17 @@ fn run_global_shapes_stage_with(
     ) -> Result<global_shapes::GlobalShapesReport>,
 ) -> HashMap<String, GlobalShapesOutcome> {
     let Some(decompile_pos) = stages.iter().rposition(|stage| stage.stage == "decompile") else {
-        stages.push(StageReport::skipped("global_shapes", "no code image"));
+        record_global_shapes_stage(
+            stages,
+            StageReport::skipped("global_shapes", "no code image"),
+        );
         return HashMap::new();
     };
     if stages[decompile_pos].images.is_empty() {
-        stages.push(StageReport::skipped("global_shapes", "no code image"));
+        record_global_shapes_stage(
+            stages,
+            StageReport::skipped("global_shapes", "no code image"),
+        );
         return HashMap::new();
     }
 
@@ -1888,15 +1940,18 @@ fn run_global_shapes_stage_with(
                 .join("; "),
         )
     };
-    stages.push(StageReport {
-        stage: "global_shapes",
-        status: if error.is_some() { "failed" } else { "ok" },
-        output: Some(global_shapes_stage_output(completed, eligible, &totals)),
-        reason: None,
-        error,
-        images: Vec::new(),
-        duration_ms: started.elapsed().as_millis(),
-    });
+    record_global_shapes_stage(
+        stages,
+        StageReport {
+            stage: "global_shapes",
+            status: if error.is_some() { "failed" } else { "ok" },
+            output: Some(global_shapes_stage_output(completed, eligible, &totals)),
+            reason: None,
+            error,
+            images: Vec::new(),
+            duration_ms: started.elapsed().as_millis(),
+        },
+    );
     outcomes
 }
 
@@ -2252,8 +2307,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     // the normal route) and re-applied inside `DispatchPass2` after every
     // rebuild of the `decompile` stage's `ImageReport`s — see
     // `GlobalShapesOutcome`'s doc comment for why the rebuild otherwise
-    // discards `RunGlobalShapes`'s report-field patch.
+    // discards `RunGlobalShapes`'s report-field patch. On the normal route
+    // the later `RefreshGlobalShapes` step replaces this map wholesale with
+    // the FINAL sweep's outcomes.
     let mut global_shapes_outcomes: HashMap<String, GlobalShapesOutcome> = HashMap::new();
+    // Threading from `DispatchPass2` to the follow-on `ApplyGlobalTypes`
+    // step: the pre-pass-2 derived type maps / ineligible counts, and the
+    // pass-2 duration (mirrored into each branch's `globals_apply_stage`
+    // entry, then reused by `global_types_apply_stage`).
+    let mut global_types_maps: HashMap<String, decompile::PreparedPass2Map> = HashMap::new();
+    let mut global_types_ineligible: HashMap<String, usize> = HashMap::new();
+    let mut pass2_elapsed_ms = 0u128;
     orchestrate_symbol_route(opts.no_symbol_pass, |step| match step {
         SymbolRouteStep::PrepareNamesAndProjection => {
             function_inputs = Some(take_globals_function_inputs(&mut function_maps));
@@ -2352,7 +2416,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             // Derive the strict `undefinedN` apply-map from `global_shapes.json`
             // (written by `RunGlobalShapes` above) before pass 2 runs, so
             // `ApplyGlobalTypes.java` has real input alongside `ApplyGlobals`.
-            let (global_types_maps, global_types_ineligible) = if opts.no_apply_global_types {
+            (global_types_maps, global_types_ineligible) = if opts.no_apply_global_types {
                 (HashMap::new(), HashMap::new())
             } else {
                 derive_global_types_maps(&images_dir, &ghidra_dir)
@@ -2361,10 +2425,6 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 prepare_pass2_inputs(&function_maps, &prepared_global_maps, &global_types_maps);
             let scheduled_count = inputs.len();
             drop(std::mem::take(&mut function_maps));
-            // Mirrors each branch's `globals_apply_stage` duration below;
-            // reused once for `global_types_apply_stage` after the final
-            // refresh (see the comment above that call).
-            let mut pass2_elapsed_ms = 0u128;
 
             if let Some(rep) = pass1_report.take() {
                 let fallback_images: Vec<ImageReport> =
@@ -2453,34 +2513,62 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 refresh_decompile_stage_images(&mut stages, &report.images);
             }
 
-            // Both calls below must run after every rebuild of
+            // This call must run after every rebuild of
             // `stages[decompile_pos].images` above — the final
             // `refresh_decompile_stage_images` just above, but also the
             // `Err(error)` branch's earlier `install_decompile_stage_image_snapshot`
             // (installs `fallback_images`, reached when `pass1_report` stays
             // `None` and the refresh above never runs). Both rebuilds go
             // through `ImageReport::from_result`, which always nulls the
-            // nine `global_shapes_*` fields and the five `global_types_*`
-            // fields, so patching either set any earlier would be silently
-            // discarded (this exact bug shipped for `global_shapes_*` in
-            // the shape-stage reorder — RunGlobalShapes's in-place patch ran before
-            // DispatchPass2 existed to refresh over it — until this fix;
-            // see `GlobalShapesOutcome`'s doc comment). Placing both calls
-            // once, unconditionally, here — after every branch above has
-            // run, regardless of which one fired — fixes every rebuild site
-            // in one place instead of duplicating a fix-up per branch.
+            // nine `global_shapes_*` fields, so patching them any earlier
+            // would be silently discarded (this exact bug shipped for
+            // `global_shapes_*` in the shape-stage reorder — RunGlobalShapes's
+            // in-place patch ran before DispatchPass2 existed to refresh over
+            // it — until this fix; see `GlobalShapesOutcome`'s doc comment).
+            // Placing it once, unconditionally, here — after every branch
+            // above has run, regardless of which one fired — fixes every
+            // rebuild site in one place instead of duplicating a fix-up per
+            // branch. The five `global_types_*` fields get the same treatment
+            // one step later, in `ApplyGlobalTypes`.
             reapply_global_shapes_outcomes(
                 decompile_stage_images_mut(&mut stages),
                 &global_shapes_outcomes,
             );
-
+        }
+        SymbolRouteStep::RefreshGlobalShapes => {
+            // Re-run the stage after the last rewrite of the sidecar's hashed
+            // inputs — inside `DispatchPass2` just above, pass 2's
+            // ownership-aware refresh rewrote functions.json and
+            // thumb_enrich_post_pass2 rewrote thumb_functions.json — so the
+            // re-committed sidecar (and the single stage entry, replaced in
+            // place) hashes the tree's FINAL inputs. Currentness binds from
+            // the post-dispatch `ImageResult`s, and the returned outcome map
+            // replaces the first sweep's so the report fields reflect this
+            // FINAL run. Skipped when pass 2 never dispatched (its infra
+            // failed before any image was processed, `pass1_report` is
+            // `None`): zero images processed means zero input rewrites, so
+            // the first sweep's commit is still current and its entry and
+            // outcomes — re-applied just above — remain the truth.
+            if let Some(report) = pass1_report.as_ref() {
+                global_shapes_outcomes = run_global_shapes_stage(
+                    &mut stages,
+                    &images_dir,
+                    &out.join("manifest.json"),
+                    &report.images,
+                );
+            }
+        }
+        SymbolRouteStep::ApplyGlobalTypes => {
             // Reading `pass1_report` here (rather than threading a separate
-            // captured value through each branch above) is deliberate: by
-            // this point `pass1_report` is `Some` in exactly the branches
-            // that passed `Some(&images)` to `globals_apply_stage` above
-            // (scheduled_count==0, and Ok(pass2)), and `None` in exactly the
-            // branches that passed `None` (run_two_pass Err, and no pass-1
-            // report at all) — so it already carries the right value per branch.
+            // captured value through each branch above) is deliberate: it is
+            // `Some` in exactly the DispatchPass2 branches that passed
+            // `Some(&images)` to `globals_apply_stage` (scheduled_count==0,
+            // and Ok(pass2)), and `None` in exactly the branches that passed
+            // `None` (run_two_pass Err, and no pass-1 report at all) — so it
+            // already carries the right value per branch. Must run after
+            // `RefreshGlobalShapes` and after every DispatchPass2 rebuild of
+            // the decompile stage's `ImageReport`s: those rebuilds null the
+            // five `global_types_*` fields this stage patches back in.
             let post_dispatch_images = pass1_report.as_ref().map(|report| report.images.as_slice());
             let global_types_stage = global_types_apply_stage(
                 false,
@@ -4051,36 +4139,37 @@ mod tests {
             vec![
                 SymbolRouteStep::PrepareNamesAndProjection,
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::PrepareApplicationInput),
-                // Shapes recover before pass 2 (input-safe reorder), so a later
-                // pass-2 script can apply them as types alongside ApplyGlobals.
+                // First shapes sweep runs before pass 2 (input-safe reorder),
+                // so DispatchPass2 can derive the global-types apply-map from
+                // global_shapes.json and a later pass-2 script can apply them
+                // as types alongside ApplyGlobals.
                 SymbolRouteStep::RunGlobalShapes,
                 SymbolRouteStep::DispatchPass2,
+                // Pass 2's ownership-aware functions.json refresh and
+                // thumb_enrich_post_pass2's thumb_functions.json rewrite both
+                // happen inside DispatchPass2 — the first sweep's sidecar is
+                // born stale, so the FINAL sweep re-commits it after the last
+                // input rewrite, and only then is type application reported.
+                SymbolRouteStep::RefreshGlobalShapes,
+                SymbolRouteStep::ApplyGlobalTypes,
                 SymbolRouteStep::Finalize {
                     rewrite_decompiled_c: false,
                 },
             ]
         );
-        assert_eq!(
-            normal
-                .iter()
-                .filter(|step| matches!(step, SymbolRouteStep::RunGlobals(_)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            normal
-                .iter()
-                .filter(|step| matches!(step, SymbolRouteStep::RunGlobalShapes))
-                .count(),
-            1
-        );
-        assert_eq!(
-            normal
-                .iter()
-                .filter(|step| matches!(step, SymbolRouteStep::DispatchPass2))
-                .count(),
-            1
-        );
+        for step in [
+            SymbolRouteStep::RunGlobals(GlobalsRouteMode::PrepareApplicationInput),
+            SymbolRouteStep::RunGlobalShapes,
+            SymbolRouteStep::DispatchPass2,
+            SymbolRouteStep::RefreshGlobalShapes,
+            SymbolRouteStep::ApplyGlobalTypes,
+        ] {
+            assert_eq!(
+                normal.iter().filter(|visited| **visited == step).count(),
+                1,
+                "{step:?} must run exactly once on the normal route"
+            );
+        }
 
         let mut disabled = Vec::new();
         orchestrate_symbol_route(true, |step| disabled.push(step));
@@ -4103,6 +4192,8 @@ mod tests {
                 // This route has no pass 2 to feed, so shapes just need to run
                 // once, after globals.json exists — unchanged last-position
                 // timing versus the pre-reorder post-symbol-route placement.
+                // Nothing rewrites the sidecar's inputs after this point, so
+                // there is no re-commit step on this route.
                 SymbolRouteStep::RunGlobalShapes,
             ]
         );
@@ -4124,6 +4215,8 @@ mod tests {
             step,
             SymbolRouteStep::RunGlobals(GlobalsRouteMode::PrepareApplicationInput)
                 | SymbolRouteStep::DispatchPass2
+                | SymbolRouteStep::RefreshGlobalShapes
+                | SymbolRouteStep::ApplyGlobalTypes
         )));
 
         let mut post = Vec::new();
@@ -4133,10 +4226,11 @@ mod tests {
             vec![PostSymbolStep::DecodeRf, PostSymbolStep::HardwareConfig]
         );
 
-        // Combined: on the normal route, RunGlobalShapes now precedes
-        // DispatchPass2 (the whole point of the reorder), which precedes the
-        // route's closing Finalize, which precedes the post-symbol RF/hwcfg
-        // stages appended after it.
+        // Combined: on the normal route, RunGlobalShapes precedes
+        // DispatchPass2 (the whole point of the reorder), whose input
+        // rewrites are then re-committed by RefreshGlobalShapes before
+        // ApplyGlobalTypes reports type application; the route's closing
+        // Finalize precedes the post-symbol RF/hwcfg stages appended after it.
         let mut combined = Vec::new();
         orchestrate_symbol_route(false, |step| combined.push(format!("{step:?}")));
         orchestrate_post_symbol_route(|step| combined.push(format!("{step:?}")));
@@ -4148,6 +4242,14 @@ mod tests {
             .iter()
             .position(|step| step == "DispatchPass2")
             .expect("normal route dispatches pass 2");
+        let refresh_shapes = combined
+            .iter()
+            .position(|step| step == "RefreshGlobalShapes")
+            .expect("normal route re-commits global_shapes after pass 2");
+        let apply_types = combined
+            .iter()
+            .position(|step| step == "ApplyGlobalTypes")
+            .expect("normal route reports global-types application");
         let finalize = combined
             .iter()
             .position(|step| step.starts_with("Finalize"))
@@ -4159,7 +4261,9 @@ mod tests {
             .unwrap();
         assert!(
             shapes < dispatch_pass2
-                && dispatch_pass2 < finalize
+                && dispatch_pass2 < refresh_shapes
+                && refresh_shapes < apply_types
+                && apply_types < finalize
                 && finalize < decode_rf
                 && decode_rf < hardware,
             "{combined:?}"
@@ -4168,6 +4272,13 @@ mod tests {
             combined
                 .iter()
                 .filter(|step| step.as_str() == "RunGlobalShapes")
+                .count(),
+            1
+        );
+        assert_eq!(
+            combined
+                .iter()
+                .filter(|step| step.as_str() == "RefreshGlobalShapes")
                 .count(),
             1
         );
@@ -6057,6 +6168,157 @@ mod tests {
         assert_eq!(stages[1].images[1].global_shapes_inferred, Some(0));
         assert_eq!(stages[1].status, "ok");
         assert_eq!(stages[1].images[0].status, "analyzed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_final_rerun_recommits_sidecar_over_rewritten_inputs() {
+        // Task 6c-2 regression: the normal route's first sweep runs before
+        // DispatchPass2, but pass 2's ownership-aware refresh rewrites
+        // functions.json and thumb_enrich_post_pass2 rewrites
+        // thumb_functions.json — so the first sweep's committed sidecar hashes
+        // inputs that are stale by the time the route finishes (every
+        // normal-route tree was born failing validate_artifact on
+        // functions_sha256). The route answer — re-run the REAL stage after
+        // the last input rewrite — is modeled here by calling the stage
+        // wrapper twice over a fixture, rewriting both hashed inputs in
+        // between exactly as pass 2 / thumb_enrich do (same inventory, same
+        // counts, different bytes), and asserting the tree ends with exactly
+        // one global_shapes stage entry whose committed sidecar hashes the
+        // FINAL files.
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_final_rerun_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest_path = root.join("manifest.json");
+        std::fs::create_dir_all(&images_dir).unwrap();
+        write_shape_manifest(&manifest_path, &["02_MAIN"]);
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        let decompiled = images_dir.join("02_MAIN").join("decompiled");
+        let functions_path = decompiled.join("functions.json");
+        let thumb_path = decompiled.join("thumb_functions.json");
+        std::fs::write(&thumb_path, tagged_thumb_functions()).unwrap();
+
+        let current = [eligible_shape_result(
+            "02_MAIN",
+            1,
+            1,
+            0,
+            Some(1),
+            Some(1),
+            Some(0),
+            0,
+        )];
+        let mut stages = vec![StageReport::decompile(
+            vec![eligible_shape_image(
+                "02_MAIN",
+                1,
+                1,
+                0,
+                Some(1),
+                Some(1),
+                Some(0),
+                0,
+            )],
+            10,
+        )];
+
+        let pass1_functions = std::fs::read(&functions_path).unwrap();
+        let pass1_thumb = std::fs::read(&thumb_path).unwrap();
+        let first_outcomes =
+            run_global_shapes_stage(&mut stages, &images_dir, &manifest_path, &current);
+        assert_eq!(first_outcomes.len(), 1);
+        let sidecar = decompiled.join("global_shapes.json");
+        let first_sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            first_sidecar["inputs"]["functions_sha256"],
+            serde_json::Value::String(manifest::sha256_bytes(&pass1_functions))
+        );
+        assert_eq!(
+            first_sidecar["inputs"]["thumb_functions_sha256"],
+            serde_json::Value::String(manifest::sha256_bytes(&pass1_thumb))
+        );
+
+        // Simulate the route's post-first-sweep input rewrites: pass 2's
+        // ownership-aware refresh rewrites functions.json (recovered names,
+        // same inventory) and thumb_enrich_post_pass2 rewrites
+        // thumb_functions.json (body_c populated, same counts).
+        let pass2_functions = tagged_functions("recovered_4000");
+        std::fs::write(&functions_path, &pass2_functions).unwrap();
+        let rewritten_thumb = {
+            let mut value: serde_json::Value = serde_json::from_slice(&pass1_thumb).unwrap();
+            value["functions"][0]["body_c"] = "movs r0, r0".into();
+            serde_json::to_vec(&value).unwrap()
+        };
+        std::fs::write(&thumb_path, &rewritten_thumb).unwrap();
+
+        // The final re-run (the route's RefreshGlobalShapes step): same
+        // current inventories — pass 2 is -noanalysis, so function boundaries
+        // never move between the sweeps.
+        let final_outcomes =
+            run_global_shapes_stage(&mut stages, &images_dir, &manifest_path, &current);
+
+        // Exactly one global_shapes entry: the re-run replaced the first
+        // sweep's entry in place (stages stays [decompile, global_shapes]).
+        let shapes_positions: Vec<usize> = stages
+            .iter()
+            .enumerate()
+            .filter(|(_, stage)| stage.stage == "global_shapes")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            shapes_positions,
+            vec![1],
+            "the re-run must replace the first sweep's entry in place: {shapes_positions:?}"
+        );
+        assert_eq!(stages[1].status, "ok");
+        assert_eq!(
+            stages[1].output.as_deref(),
+            Some(
+                "images/*/decompiled/global_shapes.json (completed=1/1, inferred=0, no_evidence=0, conflicting=0, observations=0, ghidra_quarantined=0, thumb_quarantined=0, quarantine_errors=0, decode_failures=0, state_barriers=0)"
+            )
+        );
+
+        // The committed sidecar hashes the FINAL files, not the pass-1 ones.
+        let final_sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            final_sidecar["inputs"]["functions_sha256"],
+            serde_json::Value::String(manifest::sha256_bytes(&pass2_functions))
+        );
+        assert_ne!(
+            final_sidecar["inputs"]["functions_sha256"],
+            first_sidecar["inputs"]["functions_sha256"]
+        );
+        assert_eq!(
+            final_sidecar["inputs"]["thumb_functions_sha256"],
+            serde_json::Value::String(manifest::sha256_bytes(&rewritten_thumb))
+        );
+        assert_ne!(
+            final_sidecar["inputs"]["thumb_functions_sha256"],
+            first_sidecar["inputs"]["thumb_functions_sha256"]
+        );
+        // Un-rewritten inputs keep their hashes.
+        assert_eq!(
+            final_sidecar["inputs"]["image_sha256"],
+            first_sidecar["inputs"]["image_sha256"]
+        );
+        assert_eq!(
+            final_sidecar["inputs"]["globals_sha256"],
+            first_sidecar["inputs"]["globals_sha256"]
+        );
+
+        // The retained outcome map reflects the FINAL run and the decompile
+        // stage image keeps its nine report fields after the in-place re-patch.
+        assert!(matches!(
+            final_outcomes.get("02_MAIN"),
+            Some(GlobalShapesOutcome::Success(_))
+        ));
+        assert_eq!(final_outcomes.len(), 1);
+        assert_nine_shape_counts(&stages[0].images[0], Some(0));
         let _ = std::fs::remove_dir_all(&root);
     }
 

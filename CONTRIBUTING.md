@@ -684,15 +684,25 @@ hardcoded. Two reference images exercise both models end-to-end:
   `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback), via
   the shared `run_global_shapes_stage` wrapper — but the two symbol routes
   now reach it at different points in `orchestrate_symbol_route`
-  (`SymbolRouteStep::RunGlobalShapes`), each running it exactly once. On the
-  **normal route** it runs right after `RunGlobals(PrepareApplicationInput)`
+  (`SymbolRouteStep::RunGlobalShapes`). On the **normal route** it runs
+  right after `RunGlobals(PrepareApplicationInput)`
   writes `globals.json` and **before** `DispatchPass2` — i.e. shape recovery
   now happens ahead of pass 2, not after it, so the same pass-2 process can
   apply the recovered shapes as `undefinedN` types via `ApplyGlobalTypes.java`
   alongside `ApplyGlobals` (see **Phase 3.2 type application** below; this
-  stage itself only produces the sidecar). On **`--no-symbol-pass`** it still
-  runs last, after the route's second `Finalize` — that route has no pass 2 to
-  feed, so its timing is unchanged from before the reorder. This move is
+  stage itself only produces the sidecar) — and then **once more** via
+  `SymbolRouteStep::RefreshGlobalShapes`, after `DispatchPass2`, because pass
+  2's ownership-aware refresh rewrites `functions.json` and
+  `thumb_enrich_post_pass2` rewrites `thumb_functions.json` — the very files
+  the sidecar hashes — so the first sweep's commit is born stale and the
+  FINAL sweep's re-commit is the tree's truth. The re-run is idempotent
+  (identical inventories → identical decode inputs; only the input hashes
+  differ) and replaces the single `global_shapes` stage entry in place
+  (`record_global_shapes_stage`) so the report carries exactly one entry
+  with the final sweep's totals. On **`--no-symbol-pass`** it still
+  runs last, after the route's second `Finalize`, exactly once — that route
+  has no pass 2 to feed and nothing rewrites the sidecar's inputs after it,
+  so its timing is unchanged from before the reorder. The pre-pass-2 move is
   input-safe: `global_shapes::run_image` reads only the raw image,
   `globals.json`, and the pass-1 `functions.json` / `thumb_functions.json`
   inventory — never `decompiled.c` — and pass 2 is `-process -noanalysis`, so
@@ -706,13 +716,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   not a skipped analysis. `globals.json` is never rewritten. `--prune` retains
   `decompiled/global_shapes.json`. Pass-2 refresh still owns only
   `decompiled.c` / `disasm.lst` / `functions.json` and must not touch this
-  sidecar. **Provenance consequence of the reorder:** `global_shapes.json`'s
-  recorded `functions_sha256` now hashes the pass-1 `functions.json`
-  (`FUN_<addr>` names, pre-rename) instead of the pass-2-regenerated one
-  (recovered names) it hashed before this reorder — the recovered/counted
-  shape set is unaffected (the decoder never reads names), but the hash
-  *value* itself changed for any given tree. Re-baseline any golden or
-  fixture that pins a literal `functions_sha256` string.
+  sidecar. **Provenance consequence of the reorder + re-commit:** the
+  committed sidecar's `functions_sha256` / `thumb_functions_sha256` hash the
+  FINAL post-pass-2 files (recovered names, post-enrich Thumb), exactly as
+  pre-reorder trees did — trees produced between the reorder and the
+  re-commit fix carry pass-1-era hashes and are born failing
+  `validate_artifact`; re-run `decompose` to regenerate them. The
+  recovered/counted shape set is unaffected either way (the decoder never
+  reads names). Re-baseline any golden or fixture that pins a literal
+  `functions_sha256` string.
 - **Phase 3.2 currentness.** The stage does not infer readiness from file
   existence. `current_global_shapes_run` copies the current decompile
   snapshot: raw Ghidra `functions` plus both Ghidra projection counters

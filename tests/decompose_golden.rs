@@ -192,14 +192,35 @@ fn decompose_produces_unified_tree() {
         1,
         "expected exactly one global_shapes stage: {stage_names:?}"
     );
+    // This test always runs the normal route. The single entry is pushed by
+    // the route's FIRST sweep (after `globals`, before `decompile_pass2`) and
+    // the final re-commit sweep — which runs after pass 2 /
+    // thumb_enrich_post_pass2 rewrite the sidecar's hashed inputs — replaces
+    // that entry in place, so the position pins to the first sweep's slot.
     let shapes = shapes_positions[0];
+    let globals = stage_names
+        .iter()
+        .position(|name| name == "globals")
+        .expect("globals stage");
+    assert!(
+        globals < shapes,
+        "global_shapes must follow globals: {stage_names:?}"
+    );
+    let pass2 = stage_names
+        .iter()
+        .position(|name| name == "decompile_pass2")
+        .expect("decompile_pass2 stage");
+    assert!(
+        shapes < pass2,
+        "global_shapes must precede decompile_pass2: {stage_names:?}"
+    );
     let thumb_post = stage_names
         .iter()
         .position(|name| name == "thumb_enrich_post_pass2")
         .unwrap();
     assert!(
-        thumb_post < shapes,
-        "global_shapes must follow thumb_enrich_post_pass2: {stage_names:?}"
+        pass2 < thumb_post,
+        "thumb_enrich_post_pass2 must follow decompile_pass2: {stage_names:?}"
     );
     for decoder in ["decode_rf", "hardware_config"] {
         if let Some(pos) = stage_names.iter().position(|name| name == decoder) {

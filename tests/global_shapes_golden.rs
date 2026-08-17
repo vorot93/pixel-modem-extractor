@@ -130,14 +130,45 @@ fn assert_stage_order(report: &Value) {
         1,
         "exactly one global_shapes stage: {names:?}"
     );
-    let thumb = names
+    // The entry is pushed by the route's FIRST sweep (right after `globals`,
+    // before pass 2 on the normal route) and the final re-commit sweep —
+    // which runs after pass 2 / thumb_enrich_post_pass2 rewrite the sidecar's
+    // hashed inputs — replaces that entry in place, so the position always
+    // pins to the first sweep's slot.
+    let globals = names
         .iter()
-        .position(|name| *name == "thumb_enrich_post_pass2")
-        .expect("thumb_enrich_post_pass2 must precede global_shapes");
+        .position(|name| *name == "globals")
+        .expect("globals must precede global_shapes");
     assert!(
-        thumb < shapes,
-        "global_shapes must follow thumb_enrich_post_pass2: {names:?}"
+        globals < shapes,
+        "global_shapes must follow globals: {names:?}"
     );
+    if let Some(thumb_pass1) = names.iter().position(|name| *name == "thumb_enrich") {
+        assert!(
+            thumb_pass1 < shapes,
+            "global_shapes must follow the pass-1 thumb_enrich: {names:?}"
+        );
+    }
+    // `decompile_pass2` is real only on the normal route; on
+    // `--no-symbol-pass` it is an always-skipped stub pushed BEFORE
+    // global_shapes (that route runs the stage last, once), so only the
+    // normal route pins shapes before it. The stub is identifiable by its
+    // `reason`, exactly as in tests/decompose_golden.rs.
+    let no_symbol_route = stages(report)
+        .iter()
+        .find(|stage| stage["stage"] == "decompile_pass2")
+        .and_then(|stage| stage["reason"].as_str())
+        == Some("--no-symbol-pass");
+    if !no_symbol_route {
+        let pass2 = names
+            .iter()
+            .position(|name| *name == "decompile_pass2")
+            .expect("normal route must run decompile_pass2");
+        assert!(
+            shapes < pass2,
+            "global_shapes must precede decompile_pass2: {names:?}"
+        );
+    }
     for decoder in ["decode_rf", "hardware_config"] {
         if let Some(pos) = names.iter().position(|name| *name == decoder) {
             assert!(
