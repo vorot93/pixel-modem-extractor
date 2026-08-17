@@ -119,10 +119,10 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by the Ghidra and radare2 producers and `global_shapes` |
 | `global_shapes/mod.rs` | Phase 3.2 per-image coordinator: one-function decode/track/aggregate, panic containment, atomic sidecar commit |
 | `global_shapes/decoder.rs` | Pure-Rust adapter over `scaleservers-arm32-assembly` 1.0.0; project-owned instructions only |
-| `global_shapes/tracker.rs` | Conservative per-block fact tracking and Recovered-global access observations |
+| `global_shapes/tracker.rs` | Sound cross-block must-facts dataflow over direct CFG edges (worklist join), Recovered-global access observations, v3 barriers, cross-block counters |
 | `global_shapes/aggregate.rs` | Same-PC agreement/conflict grouping and conservative summaries |
-| `global_shapes/artifact.rs` | Input validation, source hashes, v2 schema, deterministic serialize, atomic replace |
-| `global_shapes/validate.rs` | Shared v2 sidecar checks for goldens and retained-tree replay |
+| `global_shapes/artifact.rs` | Input validation, source hashes, v3 schema, deterministic serialize, atomic replace |
+| `global_shapes/validate.rs` | Shared v3 sidecar checks for goldens and retained-tree replay |
 | `global_types.rs` | Selects apply-worthy scalar shapes from `global_shapes.json` (width 1/2/4/8 `inferred` scalars only) and writes the strict `ApplyGlobalTypes.java` apply-map |
 | `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `sha256` helpers |
@@ -172,7 +172,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   four images `00_BOOT / 01_MAIN / 02_VSS / 03_APM` (no PSP/DBGCORE), MAIN = `01_MAIN`. Headline
   `report.json` counts: `functions` = 104,395 (MAIN); `thumb_functions` = 87,026; `thumb_decompiled`
   = 70,906 (dense-Thumb converged on S5300 — the primary risk); `globals_recovered` = 1,061;
-  `global_shapes` 1046 obs / 274 inferred / 784 `no_evidence` / 3 conflicting. One 4 MiB dense-Thumb
+  `global_shapes` 1046 obs / 274 inferred / 784 `no_evidence` / 3 conflicting (that tree's
+  retained sidecar is v2-vintage by design; the v3 in-memory split is 295/766/0). One 4 MiB dense-Thumb
   region (`0x42310000`) drove radare2's `aaa` toward ~90+ GiB and hit the 16 GiB `RLIMIT_AS` cap, so
   it was skipped fail-closed (`regions_skipped=1`) while the other six regions decompiled — see the
   radare2 address-space-cap invariant in the domain map.
@@ -726,13 +727,21 @@ hardcoded. Two reference images exercise both models end-to-end:
   reads names). Re-baseline any golden or fixture that pins a literal
   `functions_sha256` string.
 - **Phase 3.2 currentness.** The stage does not infer readiness from file
-  existence. `current_global_shapes_run` copies the current decompile
-  snapshot: raw Ghidra `functions` plus both Ghidra projection counters
-  (their sum must equal `functions`); Thumb substantial / accepted /
-  quarantined either all absent or all present; `thumb_error` absent;
-  `globals_error` absent; `globals_recovered: Some` (zero is invoked, not
-  skipped). Missing current-run markers, a stale `globals.json` from an
-  earlier failed rerun, or a count mismatch is a per-image hard failure:
+  existence. Currentness binds from the post-globals
+  `decompile::ImageResult`s — `run_global_shapes_stage` matches them by
+  label — never from the stage-report `ImageReport`s: the stage report
+  deliberately withholds the globals-preparation fields until pass 2's
+  outcome, so a stage-report read at the normal route's pre-pass-2
+  position failed every e2e run before that binding fix (a stage-report
+  image with no matching `ImageResult` still fails closed, "missing
+  current image result"). `current_global_shapes_run` copies the current
+  decompile snapshot: raw Ghidra `functions` plus both Ghidra projection
+  counters (their sum must equal `functions`); Thumb substantial /
+  accepted / quarantined either all absent or all present;
+  `thumb_error` absent; `globals_error` absent; `globals_recovered:
+  Some` (zero is invoked, not skipped). Missing current-run markers, a
+  stale `globals.json` from an earlier failed rerun, or a count mismatch
+  is a per-image hard failure:
   the analyzer is not called, an existing sidecar is left byte-identical,
   later images continue, and the aggregate `global_shapes` stage is
   `failed`. **Absent versus stale Thumb:** no current Thumb inventory plus
@@ -785,14 +794,25 @@ hardcoded. Two reference images exercise both models end-to-end:
   decoded instruction map and releases it before the next. Blocks are
   **direct-only**: boundaries are the function entry, every valid direct
   branch target that is an instruction PC in the same map, and the
-  fallthrough after a control transfer when that PC exists. Traversal
-  starts only at the entry. No edge is invented across a gap, into an
-  undecoded suffix, or for a call / return / indirect transfer. A call's
-  fallthrough block may be visited but begins unknown; the callee is not
-  entered. Every reachable block starts with all registers unknown; no
-  fact crosses an edge. `state_barriers` counts a non-entry block start
-  plus every instruction that kills at least one known fact or clears
-  unbounded state.
+  fallthrough after a control transfer when that PC exists; each block
+  exposes its `successors` edges. Traversal starts only at the entry. No
+  edge is invented across a gap, into an undecoded suffix, or for a call /
+  return / indirect transfer. A call's fallthrough block may be visited
+  but begins unknown; the callee is not entered. Facts cross these direct
+  edges by a **must-facts join**: every incoming edge must agree on the
+  fact — `(target_address, displacement)` for a Global fact, exact
+  `value` for an Exact fact — and a fact absent on any in-edge leaves
+  that register Unknown at the block entry. There is no per-block reset
+  (the v2 "every block starts empty" model is gone); only an unreached
+  block or a fully-killed/joined-out fact is empty. Provenance unions
+  across agreeing edges, deduped at the join. The depth-1 seed (below)
+  joins as a **virtual predecessor** of the entry block: a disagreeing
+  real predecessor kills it; it never wins by fiat. The solver is a
+  deterministic round-robin worklist over address-sorted blocks; facts
+  only die and provenance only grows, so the fixpoint terminates
+  monotonically. `state_barriers` (v3 semantics) counts instruction kills
+  plus join kills — each `(block, register)` join that ever killed a
+  fact, counted once; v2's per-non-entry-block-start +1 is gone.
 - **Phase 3.2 anchoring.** A fact becomes a Recovered global only when an
   exact 32-bit value equals a Recovered address. There is no
   nearest-global attribution. Once anchored, copy/arithmetic keep that
@@ -803,9 +823,19 @@ hardcoded. Two reference images exercise both models end-to-end:
   writeback and leftover destinations are applied afterwards. Negative
   offsets, overflowing `offset + width`, and u32 address wrap kill the
   fact and do not observe.
-- **Phase 3.2 aggregation and artifact.** Observations that agree at one
-  `(ISA, PC)` union contexts and provenance. Two or more semantic
-  alternatives at that PC are a conflict; every implicated Recovered
+- **Phase 3.2 aggregation and artifact.** Format string is
+  `pixel-modem-extractor-global-shapes-v3`; validators and loaders gate
+  on it, and a v2 sidecar is stale-vintage — regenerate it, never
+  silently read it. Observations that agree at one `(ISA, PC)` union
+  contexts and provenance; an agreement subgroup spans every key sharing
+  `(target, conditional, kind, width)` at that PC. Same-instruction
+  multi-offset accesses are **observations, not conflicts**: one
+  instruction's transfers (LDM/STM/LDRD) all evaluate against the same
+  register state and share one base register, so a single instruction
+  can only produce same-target, same-kind, same-width keys differing by
+  offset — honest array evidence, one observation per offset. Two or
+  more subgroups at that PC — disagreement on target, conditional,
+  kind, or width — are a conflict; every implicated Recovered
   target receives the complete alternative group. Support count and
   function order never choose a winner. Distinct cross-ISA PCs never
   collapse because their byte intervals overlap. Status invariants:
@@ -816,7 +846,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   checked `offset + width`. Provisional labels are
   `scalar_candidate { width }`, `array_candidate { element_width,
   minimum_elements }`, or `unknown` — never an allocation size or C type.
-  Wire field order is the struct declaration order. Serialization is
+  The `analysis` block appends six cross-block counters (units in
+  parentheses): `cross_block_join_kills` ((block, register) joins where
+  some in-edge held a fact but the join left it Unknown),
+  `cross_block_join_facts` ((block, register) joins that ever held a
+  fact), `cross_block_entry_facts` (facts in final non-entry in-states),
+  `cross_block_propagated_facts` (observations whose provenance crosses
+  a block boundary), `cross_block_functions` (functions with a join
+  survivor), and `cross_block_seeded_functions` (pass-2 seeded callees
+  with a survivor). Wire field order is the struct declaration order. Serialization is
   `serde_json` pretty (two-space) with **no trailing newline**. Addresses
   are canonical lowercase `0x…`; SHA-256 values are lowercase 64-hex.
   The complete byte vector is serialized before the destination is opened,
@@ -847,9 +885,12 @@ hardcoded. Two reference images exercise both models end-to-end:
   identity's first decode-range ISA matching the call's resolved ISA; zero or
   more than one surviving match is unresolved and counted into
   `call_facts_unresolved`, never guessed.
-  (4) **Entry-block-only seeding.** The seed is installed only into the
-  callee's entry-block state; every other block still starts empty, matching
-  the existing per-block model.
+  (4) **Seeds propagate by the same must-join.** The seed joins as a
+  virtual predecessor of the callee's entry block (see the state model
+  above); from there the v3 cross-block engine carries it past the entry
+  block exactly like any other fact — every path to a later block must
+  agree, or the join kills it. The v2 entry-block-only seeding (and the
+  per-block reset it matched) is gone.
   (5) **Attribution, not conflict.** An interprocedural observation is
   attributed directly to the global that seeded it and never enters the
   cross-global same-`(ISA, PC)` conflict pool intra evidence uses — a shared
@@ -888,6 +929,7 @@ hardcoded. Two reference images exercise both models end-to-end:
     global_shapes::tests::retained_tree_replay_is_deterministic_and_non_mutating \
     -- --ignored --nocapture
   PME_GLOBAL_SHAPES_MEASURE=1 PME_GOLDEN_DIR=/path/to/unpruned/decompose \
+    PME_GLOBAL_SHAPES_MEASURE_LABEL=<image> \
     cargo test --release -p pixel-modem-extractor --lib \
     global_shapes::tests::interprocedural_yield_on_retained_tree \
     -- --ignored --nocapture
@@ -895,11 +937,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   Goldens skip when `$PME_GOLDEN_DIR` is unset. Replay also needs the raw
   image slices and does not write. The interprocedural yield measurement
   reuses the same replay machinery (two in-memory
-  `analyze_to_bytes_without_commit` passes, no write) and only `println!`s
-  the status split plus the six new `analysis` counters — see **Phase 3.2
+  `analyze_to_bytes_without_commit` passes, no write), selects the image
+  by `PME_GLOBAL_SHAPES_MEASURE_LABEL` (default `02_MAIN`; e.g. `01_MAIN`
+  on cheetah), and only `println!`s the status split plus the six
+  depth-1 and six cross-block `analysis` counters — see **Phase 3.2
   interprocedural measured reality** below for the recorded numbers.
-- **Phase 3.2 production baselines (verified full `decompose`, ~1 h 37 m,
-  exit 0).** Decoder `scaleservers-arm32-assembly` 1.0.0. Recovered shapes
+- **Phase 3.2 production baselines, v2 engine (verified full `decompose`,
+  ~1 h 37 m, exit 0; superseded by the v3 row below — kept as the
+  monotonicity baseline, do not cite as current).** Decoder
+  `scaleservers-arm32-assembly` 1.0.0. Recovered shapes
   915 MAIN / 921 total; MAIN observations 32 ARM + 907 Thumb; 125 inferred
   / 787 `no_evidence` / 3 conflicting; MAIN `decode_failures` = 37,629
   (recoverable; the image still succeeds). Producer conservation on MAIN:
@@ -909,51 +955,92 @@ hardcoded. Two reference images exercise both models end-to-end:
   `thumb_decompiled` = 77,456, `globals_recovered` = 915. `globals.json`
   is unchanged by the new stage. `--prune` keeps the sidecar. Do not cite
   `thumb_decompiled` = 10,965 as current HEAD.
-- **Phase 3.2 interprocedural measured reality.** The depth-1 pass above is
-  correct, deterministic, and fail-closed, but its measured net yield on the
-  same production `02_MAIN` tree as the baselines above is **zero**.
-  `inferred`/`no_evidence`/`conflicting` held at 125/787/3 — identical to the
-  intra-only baseline — even though the pass did real work:
-  `direct_calls_resolved` 191, `call_facts_unresolved` 287, `seeded_callees`
-  52, `seed_vectors` 60, `interprocedural_observations` 3,
-  `interprocedural_dropped` 0. All 3 interprocedural observations
+- **Phase 3.2 production baselines, v3 cross-block engine (fresh mustang
+  `02_MAIN` tree, engine + multi-offset aggregation fix; measured with
+  the replay/measurement commands above).** **154 inferred / 761
+  `no_evidence` / 0 conflicting** — net **+29** recovered shapes over
+  v2's 125/787/3: +25 from the sound cross-block engine, +4 from the
+  same-instruction multi-offset aggregation fix (v2's three conflicts
+  were the same artifact). The move is monotone: `inferred` grew 125→154
+  only out of `no_evidence`, and `conflicting` fell 3→0. Replay wall
+  ~13 s (MAIN; deterministic, non-mutating) vs ~8.7 s at the v2
+  baseline. Cross-block funnel (MAIN): `join_facts` 3,903,434 /
+  `join_kills` 898,225 / `entry_facts` 3,005,209 /
+  `propagated_facts` 1,063 / `functions` 99,693 / `seeded_functions` 40.
+  Depth-1: `direct_calls_resolved` 315, `call_facts_unresolved` 403,
+  `seeded_callees` 98, `seed_vectors` 119,
+  `interprocedural_observations` 58, dropped 0 (v2-era: 191/287/52/60/3/0
+  — the v3 engine's in-callee propagation absorbed the old "callee-side
+  cross-block ≤ 3" ceiling; interprocedural evidence grew 3→58).
+  `state_barriers` (v3 semantics) 1,523,364; `decode_failures` 37,629
+  (unchanged); `instructions_decoded` 11,254,219. `global_types_apply`
+  now applies on MAIN: 94 applied / 42 skipped of 136 candidates — v3's
+  extra inferred scalars fed it. Opportunistic cheetah `01_MAIN`
+  (same measurement, in-memory; that tree's retained sidecar is
+  stale-vintage v2 by design): 295 inferred / 766 `no_evidence` /
+  0 conflicting (v2-era 274/784/3), wall ~12.4 s.
+- **Phase 3.2 interprocedural measured reality.** Under the v2 per-block
+  model the depth-1 pass above was correct, deterministic, and
+  fail-closed, but its measured net yield on the same production
+  `02_MAIN` tree as the v2 baseline was **zero**.
+  `inferred`/`no_evidence`/`conflicting` held at 125/787/3 — identical
+  to the intra-only baseline — even though the pass did real work:
+  `direct_calls_resolved` 191, `call_facts_unresolved` 287,
+  `seeded_callees` 52, `seed_vectors` 60, `interprocedural_observations`
+  3, `interprocedural_dropped` 0. All 3 interprocedural observations
   corroborated globals that were already `inferred` from intra-procedural
-  evidence; none converted a `no_evidence` global. Two compounding v1
-  limitations explain the zero: (1) **store-not-dereference** — the
+  evidence; none converted a `no_evidence` global. Two compounding
+  limitations explained the zero: (1) **store-not-dereference** — the
   pass-by-reference call sites this pass targets are registration/logging
-  tables, and the callee typically *stores* `&global` into the table rather
-  than dereferencing it, so the evidence it reveals is the table's shape, not
-  the global's; the dereferences that would reveal the global's own shape
-  happen later, through the stored pointer (pointer/alias following — a v1
-  non-goal); (2) **entry-block-only seeding** — a dereference after the
-  callee's first branch is invisible to the seed (callee-side cross-block
-  seeding — also a v1 non-goal). Meaningful yield on this firmware needs one
-  or both of those, both larger efforts than depth-1 argument propagation;
-  the call-fact primitive and the six counters above are the foundation for
-  them, not a finished win by themselves. Corollary for whoever picks this up:
-  because the barrier is store-not-dereference (not call depth), **deeper
-  (depth-K) argument propagation would not help** — and neither would the
-  targeted pointer/alias analysis this note once proposed as the successor
-  lever. A 2026-08-13 ceiling spike (throwaway instrumentation of the real
-  decoder/tracker over production r2, funnel over the `&global` → store → slot
-  → load → dereference chain) measured that lever at **≤ 1 recoverable global
-  on `02_MAIN`**: of 787 stuck globals only 80 store `&global` as a value at
-  all, 27 reach a static (constant-address) slot (53 use dynamic `[table,
-  rIndex]` slots), and just 1 of the 26 static slots is ever read back. An
-  unsound "seed every callee block" upper bound leaves that funnel unchanged,
-  so it is a true ceiling, not a seeding artifact; the other deferred lever,
-  callee-side cross-block, is ≤ 3. **Treat interprocedural shape recovery as
-  closed at ~0 for this firmware and do not build it** — the only lever with
-  measured yield is the sound *intra*-procedural cross-block dataflow pass
-  (~+5%, ~41 globals). Do not cite this pass as recovering shapes on production
-  `02_MAIN` — cite it as correct, additive-only, and honestly measured at zero.
+  tables, and the callee typically *stores* `&global` into the table
+  rather than dereferencing it, so the evidence it reveals is the
+  table's shape, not the global's; the dereferences that would reveal
+  the global's own shape happen later, through the stored pointer
+  (pointer/alias following — still closed, ceiling below); (2)
+  **entry-block-only seeding** — a dereference after the callee's first
+  branch was invisible to the v2 seed. Limitation (2) is what the v3
+  engine fixed: seeds now propagate in-callee by the same must-facts
+  join, the old "callee-side cross-block ≤ 3" ceiling is absorbed, and
+  interprocedural evidence grew 3→58 observations (v3 depth-1 counters:
+  315 resolved / 403 unresolved / 98 seeded / 119 vectors / 58
+  observations / 0 dropped). Outcome: the lever that note left as the
+  only one with measured yield — the sound *intra*-procedural cross-block
+  dataflow pass (~+5%, ~41 globals) — **shipped as the v3 cross-block
+  engine, measured at +25 sound (ceiling was 41); with the
+  multi-offset aggregation fix the net is +29** (see the v3 baseline
+  row above). Still closed, with measured ceilings: pointer/alias
+  tracking and deeper (depth-K) argument propagation. Because the
+  remaining barrier is store-not-dereference (not call depth),
+  **depth-K would not help**. A 2026-08-13 ceiling spike (throwaway
+  instrumentation of the real decoder/tracker over production r2,
+  funnel over the `&global` → store → slot → load → dereference chain)
+  measured the pointer lever at **≤ 1 recoverable global on `02_MAIN`**:
+  of 787 then-stuck globals only 80 store `&global` as a value at all,
+  27 reach a static (constant-address) slot (53 use dynamic `[table,
+  rIndex]` slots), and just 1 of the 26 static slots is ever read back.
+  An unsound "seed every callee block" upper bound leaves that funnel
+  unchanged, so it is a true ceiling, not a seeding artifact. Cite the
+  depth-1 pass as correct, additive-only, and — since v3 — a real
+  contributor through the engine's in-callee seed propagation.
   Full design: `2026-08-13-interprocedural-global-shapes-design.md`;
   interprocedural root-cause: `2026-08-13-no-evidence-dominance-findings.md`;
   pointer-tracking ceiling: `2026-08-13-pointer-tracking-ceiling-findings.md`
   (all process artifacts under `~/.superpowers/pixel-modem-extractor/`, not
   part of this repo).
 - **Phase 3.2 environment traps.** Currentness comes from the current-run
-  markers, not leftover files. A Ghidra 12 output root must stay
+  markers, not leftover files. A retained `global_shapes.json` that fails
+  hash validation is not necessarily corrupt: trees produced between the
+  pre-pass-2 reorder and the `RefreshGlobalShapes` re-commit fix are born
+  hash-stale by construction (pass 2 and `thumb_enrich_post_pass2` rewrote
+  the hashed inputs after the first commit; the final re-commit after the
+  last rewrite is the tree's truth, and the report carries exactly one
+  `global_shapes` stage entry with its totals) — re-run `decompose` to
+  regenerate rather than debug (see the stage-placement bullet above).
+  A retained v2 `global_shapes.json` (e.g. the cheetah reference tree,
+  stale-vintage by design) is rejected by the v3 validators — measure
+  current behavior in-memory with
+  `PME_GLOBAL_SHAPES_MEASURE_LABEL=01_MAIN`, do not read the sidecar.
+  A Ghidra 12 output root must stay
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
   goldens need a complete unpruned tree; a pruned golden has no raw
   `.bin` slices. The dense-Thumb memory envelope (~56 GiB RSS) still
@@ -971,12 +1058,16 @@ hardcoded. Two reference images exercise both models end-to-end:
   decompiler renders each read as a single value; the type name simply stays
   "N bytes, interpretation unknown" — the same "assert only what you proved"
   discipline as the rest of the fail-closed pipeline. **Scope is
-  scalar-only by measured evidence:** on the retained cheetah `01_MAIN` tree,
-  of 274 `inferred` globals, 270 are `scalar_candidate` (widths skew to
-  4-byte: 243, plus 23×1-byte and 4×2-byte), 1 is `array_candidate`, and 3
-  are `unknown` — arrays are statistically negligible, so v1 defers the
-  array-application span-overlap machinery rather than build it for one
-  record. After `RunGlobalShapes` writes `decompiled/global_shapes.json` and before pass 2
+  scalar-only by measured evidence:** on the retained cheetah `01_MAIN`
+  tree (v2-vintage sidecar — stale-vintage for validation, still valid
+  as a distribution sample; the v3 in-memory split there is
+  295/766/0), of 274 `inferred` globals, 270 are `scalar_candidate`
+  (widths skew to 4-byte: 243, plus 23×1-byte and 4×2-byte), 1 is
+  `array_candidate`, and 3 are `unknown` — arrays are statistically
+  negligible, so v1 defers the array-application span-overlap machinery
+  rather than build it for one record. Measured on the v3 mustang MAIN
+  tree, `global_types_apply` applies 94 / skips 42 of 136 candidates —
+  v3's extra inferred scalars fed the apply map. After `RunGlobalShapes` writes `decompiled/global_shapes.json` and before pass 2
   dispatches, `decompose::run`'s `DispatchPass2` handler calls
   `derive_global_types_maps(images_dir, ghidra_dir)`: for each image with a
   `global_shapes.json`, `global_types::select_from_shapes_json` selects only

@@ -2194,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "measurement: PME_GLOBAL_SHAPES_MEASURE=1 PME_GOLDEN_DIR=<tree>"]
+    #[ignore = "measurement: PME_GLOBAL_SHAPES_MEASURE=1 PME_GOLDEN_DIR=<tree> PME_GLOBAL_SHAPES_MEASURE_LABEL=<image>"]
     fn interprocedural_yield_on_retained_tree() {
         if std::env::var("PME_GLOBAL_SHAPES_MEASURE").ok().as_deref() != Some("1") {
             eprintln!("skip: set PME_GLOBAL_SHAPES_MEASURE=1");
@@ -2208,6 +2208,8 @@ mod tests {
             eprintln!("skip: PME_GOLDEN_DIR not found: {}", dir.display());
             return;
         }
+        let label =
+            std::env::var("PME_GLOBAL_SHAPES_MEASURE_LABEL").unwrap_or_else(|_| LABEL.to_owned());
         let report: Value = serde_json::from_slice(
             &fs::read(dir.join("report.json")).expect("report.json readable"),
         )
@@ -2221,12 +2223,12 @@ mod tests {
                     .and_then(|stage| stage["images"].as_array())
             })
             .expect("decompile images");
-        let Some(image) = images.iter().find(|image| image["image"] == LABEL) else {
-            eprintln!("skip: {LABEL} not present in report.json decompile images");
+        let Some(image) = images.iter().find(|image| image["image"] == label.as_str()) else {
+            eprintln!("skip: {label} not present in report.json decompile images");
             return;
         };
         let Some(bound) = replay_eligible(image) else {
-            eprintln!("skip: {LABEL} not replay-eligible");
+            eprintln!("skip: {label} not replay-eligible");
             return;
         };
         let image_dir = dir.join("images").join(&bound.label);
@@ -2242,20 +2244,20 @@ mod tests {
 
         let started = std::time::Instant::now();
         let (first, first_report) = analyze_to_bytes_without_commit(&request)
-            .unwrap_or_else(|e| panic!("{LABEL} first analyze: {e}"));
+            .unwrap_or_else(|e| panic!("{label} first analyze: {e}"));
         let first_elapsed = started.elapsed();
         let (second, second_report) = analyze_to_bytes_without_commit(&request)
-            .unwrap_or_else(|e| panic!("{LABEL} second analyze: {e}"));
+            .unwrap_or_else(|e| panic!("{label} second analyze: {e}"));
 
-        assert_eq!(first, second, "{LABEL} artifact bytes drifted between runs");
+        assert_eq!(first, second, "{label} artifact bytes drifted between runs");
         assert_eq!(
             sha256_bytes(&first),
             sha256_bytes(&second),
-            "{LABEL} artifact hash drifted between runs"
+            "{label} artifact hash drifted between runs"
         );
         assert_eq!(
             first_report, second_report,
-            "{LABEL} report drifted between runs"
+            "{label} report drifted between runs"
         );
 
         // Non-mutation: analyze_to_bytes_without_commit writes nothing, so the
@@ -2275,7 +2277,7 @@ mod tests {
         let artifact: Value = serde_json::from_slice(&first).expect("artifact JSON");
         let analysis = &artifact["analysis"];
         println!(
-            "global_shapes interprocedural yield {LABEL}: wall={:?} sha256={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
+            "global_shapes interprocedural yield {label}: wall={:?} sha256={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
             first_elapsed,
             sha256_bytes(&first),
             first_report.inferred,
