@@ -1637,15 +1637,22 @@ fn apply_global_shapes_success(
     image.global_shapes_error = None;
 }
 
+/// Currentness check for the `global_shapes` stage. Binds from the
+/// post-globals `decompile::ImageResult`s — never from the decompile
+/// stage-report `ImageReport`s: on the normal route, `RunGlobalShapes` runs
+/// before `DispatchPass2`, and the stage report deliberately withholds the
+/// globals preparation fields until pass 2's outcome ("no pre-application
+/// snapshot"), so the report is always stale for exactly the fields checked
+/// last here.
 fn current_global_shapes_run(
-    image: &ImageReport,
+    result: &decompile::ImageResult,
 ) -> std::result::Result<GlobalShapesCurrentRun, String> {
-    let Some(ghidra_records) = image.functions else {
+    let ImageOutcome::Analyzed(ghidra_records) = result.outcome else {
         return Err("missing current ARM inventory".into());
     };
     let (Some(ghidra_accepted), Some(ghidra_quarantined)) = (
-        image.ghidra_execution_accepted,
-        image.ghidra_execution_quarantined,
+        result.ghidra_execution_accepted,
+        result.ghidra_execution_quarantined,
     ) else {
         return Err("missing current ARM inventory".into());
     };
@@ -1655,13 +1662,13 @@ fn current_global_shapes_run(
             return Err("ghidra execution counts do not equal functions".into());
         }
     }
-    if image.thumb_error.is_some() {
+    if result.thumb_error.is_some() {
         return Err("current Thumb inventory failed".into());
     }
     let (thumb_substantial, thumb_accepted, thumb_quarantined) = match (
-        image.thumb_functions,
-        image.thumb_execution_accepted,
-        image.thumb_execution_quarantined,
+        result.thumb_functions,
+        result.thumb_execution_accepted,
+        result.thumb_execution_quarantined,
     ) {
         (None, None, None) => (None, None, None),
         (Some(substantial), Some(accepted), Some(quarantined)) => {
@@ -1671,10 +1678,10 @@ fn current_global_shapes_run(
             return Err("thumb inventory fields must be all present or all absent".into());
         }
     };
-    if image.globals_error.is_some() {
+    if result.globals_error.is_some() {
         return Err("current globals failed".into());
     }
-    let Some(recovered) = image.globals_recovered else {
+    let Some(recovered) = result.globals_recovered else {
         return Err("missing current recovered globals".into());
     };
     Ok(GlobalShapesCurrentRun {
@@ -1784,6 +1791,7 @@ fn run_global_shapes_stage_with(
     stages: &mut Vec<StageReport>,
     images_dir: &Path,
     manifest_path: &Path,
+    current_results: &[decompile::ImageResult],
     mut run_image: impl for<'a> FnMut(
         &global_shapes::RunRequest<'a>,
     ) -> Result<global_shapes::GlobalShapesReport>,
@@ -1799,6 +1807,14 @@ fn run_global_shapes_stage_with(
 
     let started = Instant::now();
     let eligible = stages[decompile_pos].images.len();
+    // Currentness binds from these post-globals ImageResults by label — see
+    // `current_global_shapes_run`'s doc comment for why the stage-report
+    // ImageReports cannot serve. A stage-report image with no matching
+    // ImageResult fails closed below ("missing current image result").
+    let current_by_label: HashMap<&str, &decompile::ImageResult> = current_results
+        .iter()
+        .map(|result| (result.label.as_str(), result))
+        .collect();
     let mut completed = 0usize;
     let mut totals = global_shapes::GlobalShapesReport {
         inferred: 0,
@@ -1818,7 +1834,13 @@ fn run_global_shapes_stage_with(
     for image in &mut stages[decompile_pos].images {
         clear_global_shapes_fields(image);
         let label = image.image.clone();
-        let current = match current_global_shapes_run(image) {
+        let Some(result) = current_by_label.get(label.as_str()) else {
+            let reason = record_global_shapes_failure(image, "missing current image result".into());
+            outcomes.insert(label.clone(), GlobalShapesOutcome::Failure(reason.clone()));
+            errors.push((label, reason));
+            continue;
+        };
+        let current = match current_global_shapes_run(result) {
             Ok(current) => current,
             Err(reason) => {
                 let reason = record_global_shapes_failure(image, reason);
@@ -1882,8 +1904,15 @@ fn run_global_shapes_stage(
     stages: &mut Vec<StageReport>,
     images_dir: &Path,
     manifest_path: &Path,
+    current_results: &[decompile::ImageResult],
 ) -> HashMap<String, GlobalShapesOutcome> {
-    run_global_shapes_stage_with(stages, images_dir, manifest_path, global_shapes::run_image)
+    run_global_shapes_stage_with(
+        stages,
+        images_dir,
+        manifest_path,
+        current_results,
+        global_shapes::run_image,
+    )
 }
 
 /// Record global preparation without exposing a normal-route intermediate
@@ -2308,8 +2337,16 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             }
         }
         SymbolRouteStep::RunGlobalShapes => {
-            global_shapes_outcomes =
-                run_global_shapes_stage(&mut stages, &images_dir, &out.join("manifest.json"));
+            let current_results = pass1_report
+                .as_ref()
+                .map(|report| report.images.as_slice())
+                .unwrap_or(&[]);
+            global_shapes_outcomes = run_global_shapes_stage(
+                &mut stages,
+                &images_dir,
+                &out.join("manifest.json"),
+                current_results,
+            );
         }
         SymbolRouteStep::DispatchPass2 => {
             // Derive the strict `undefinedN` apply-map from `global_shapes.json`
@@ -5703,6 +5740,28 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn eligible_shape_result(
+        label: &str,
+        functions: usize,
+        accepted: usize,
+        quarantined: usize,
+        thumb_functions: Option<usize>,
+        thumb_accepted: Option<usize>,
+        thumb_quarantined: Option<usize>,
+        recovered: usize,
+    ) -> decompile::ImageResult {
+        let mut result = analyzed_image(label);
+        result.outcome = ImageOutcome::Analyzed(functions);
+        result.ghidra_execution_accepted = Some(accepted);
+        result.ghidra_execution_quarantined = Some(quarantined);
+        result.thumb_functions = thumb_functions;
+        result.thumb_execution_accepted = thumb_accepted;
+        result.thumb_execution_quarantined = thumb_quarantined;
+        result.globals_recovered = Some(recovered);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn eligible_shape_image(
         label: &str,
         functions: usize,
@@ -5713,15 +5772,16 @@ mod tests {
         thumb_quarantined: Option<usize>,
         recovered: usize,
     ) -> ImageReport {
-        let mut image = ImageReport::from_result(&analyzed_image(label));
-        image.functions = Some(functions);
-        image.ghidra_execution_accepted = Some(accepted);
-        image.ghidra_execution_quarantined = Some(quarantined);
-        image.thumb_functions = thumb_functions;
-        image.thumb_execution_accepted = thumb_accepted;
-        image.thumb_execution_quarantined = thumb_quarantined;
-        image.globals_recovered = Some(recovered);
-        image
+        ImageReport::from_result(&eligible_shape_result(
+            label,
+            functions,
+            accepted,
+            quarantined,
+            thumb_functions,
+            thumb_accepted,
+            thumb_quarantined,
+            recovered,
+        ))
     }
 
     fn empty_globals_json(label: &str) -> String {
@@ -5921,7 +5981,11 @@ mod tests {
             ),
         ];
         let mut calls = Vec::new();
-        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+        let current = [
+            eligible_shape_result("02_MAIN", 2, 1, 1, Some(1), Some(1), Some(0), 3),
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, &current, |request| {
             calls.push((
                 request.image_label.to_string(),
                 request.image_dir.to_path_buf(),
@@ -6031,7 +6095,26 @@ mod tests {
             4,
         )];
         let mut calls = Vec::new();
-        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+        let mut missing_arm_current =
+            eligible_shape_result("00_BOOT", 1, 1, 0, None, None, None, 0);
+        missing_arm_current.outcome = ImageOutcome::Failed(-1);
+        let mut thumb_failed_current =
+            eligible_shape_result("01_PSP", 1, 1, 0, None, None, None, 0);
+        thumb_failed_current.thumb_error = Some("radare2 failed".into());
+        let mut missing_globals_current =
+            eligible_shape_result("04_VSS", 1, 1, 0, None, None, None, 0);
+        missing_globals_current.globals_recovered = None;
+        let mut globals_failed_current =
+            eligible_shape_result("05_DBGCORE", 1, 1, 0, None, None, None, 4);
+        globals_failed_current.globals_error = Some("old globals stale".into());
+        let current = [
+            missing_arm_current,
+            thumb_failed_current,
+            missing_globals_current,
+            globals_failed_current,
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, &current, |request| {
             calls.push(request.image_label.to_string());
             assert_eq!(request.expected_recovered_globals, 0);
             Ok(zero_shapes_report())
@@ -6094,7 +6177,11 @@ mod tests {
             ],
             6,
         )];
-        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+        let current = [
+            eligible_shape_result("02_MAIN", 1, 1, 0, None, None, None, 1),
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, &current, |request| {
             if request.image_label == "02_MAIN" {
                 return Err(Error::Serialize("é".repeat(3_000)));
             }
@@ -6143,7 +6230,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut empty = vec![StageReport::decompile(Vec::new(), 2)];
         let mut called = false;
-        run_global_shapes_stage_with(&mut empty, &root, &root.join("manifest.json"), |_| {
+        run_global_shapes_stage_with(&mut empty, &root, &root.join("manifest.json"), &[], |_| {
             called = true;
             Ok(zero_shapes_report())
         });
@@ -6156,10 +6243,16 @@ mod tests {
         assert!(empty[1].images.is_empty());
 
         let mut missing = vec![StageReport::ok("extract", "manifest.json", 1)];
-        run_global_shapes_stage_with(&mut missing, &root, &root.join("manifest.json"), |_| {
-            called = true;
-            Ok(zero_shapes_report())
-        });
+        run_global_shapes_stage_with(
+            &mut missing,
+            &root,
+            &root.join("manifest.json"),
+            &[],
+            |_| {
+                called = true;
+                Ok(zero_shapes_report())
+            },
+        );
         assert!(!called);
         assert_eq!(missing[1].status, "skipped");
         assert_eq!(missing[1].reason.as_deref(), Some("no code image"));
@@ -6175,10 +6268,14 @@ mod tests {
             1,
         )];
         let mut called = false;
+        let current = [eligible_shape_result(
+            "02_MAIN", 2, 1, 0, None, None, None, 0,
+        )];
         run_global_shapes_stage_with(
             &mut stages,
             Path::new("/tmp"),
             Path::new("/tmp/manifest.json"),
+            &current,
             |_| {
                 called = true;
                 Ok(zero_shapes_report())
@@ -6199,10 +6296,21 @@ mod tests {
         mixed.ghidra_execution_accepted = Some(1);
         let mut stages = vec![StageReport::decompile(vec![mixed], 1)];
         let mut called = false;
+        let current = [eligible_shape_result(
+            "02_MAIN",
+            1,
+            1,
+            0,
+            Some(1),
+            None,
+            None,
+            0,
+        )];
         run_global_shapes_stage_with(
             &mut stages,
             Path::new("/tmp"),
             Path::new("/tmp/manifest.json"),
+            &current,
             |_| {
                 called = true;
                 Ok(zero_shapes_report())
@@ -6248,7 +6356,7 @@ mod tests {
             StageReport::failed("decompile_pass2", "process failed".into(), 5),
         ];
         install_decompile_stage_image_snapshot(&mut stages, fallback);
-        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest, &[raw, later]);
 
         assert_eq!(stages[0].images[0].globals_recovered, Some(0));
         assert_nine_shape_counts(&stages[0].images[0], Some(0));
@@ -6289,7 +6397,11 @@ mod tests {
             ],
             8,
         )];
-        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+        let current = [
+            eligible_shape_result("02_MAIN", 1, 1, 0, None, None, None, 0),
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest, &current);
 
         assert!(stages[0].images[0].global_shapes_error.is_some());
         assert_nine_shape_counts(&stages[0].images[0], None);
@@ -6353,7 +6465,13 @@ mod tests {
             ],
             3,
         )];
-        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
+        let mut failed_current = eligible_shape_result("02_MAIN", 1, 1, 0, None, None, None, 4);
+        failed_current.globals_error = Some("globals stage failed".into());
+        let current = [
+            failed_current,
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
+        run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, &current, |request| {
             called.push(request.image_label.to_string());
             global_shapes::run_image(request)
         });
@@ -6408,7 +6526,12 @@ mod tests {
             ],
             9,
         )];
-        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+        let current = [
+            eligible_shape_result("02_MAIN", 1, 1, 0, None, None, None, 0),
+            eligible_shape_result("04_VSS", 1, 1, 0, Some(0), Some(0), Some(0), 0),
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest, &current);
 
         assert!(
             stages[0].images[0]
@@ -6462,7 +6585,10 @@ mod tests {
             )],
             2,
         )];
-        run_global_shapes_stage(&mut stages, &images_dir, &manifest);
+        let current = [eligible_shape_result(
+            "02_MAIN", 1, 1, 0, None, None, None, 0,
+        )];
+        run_global_shapes_stage(&mut stages, &images_dir, &manifest, &current);
 
         assert_eq!(last_stage(&stages).status, "ok");
         assert_nine_shape_counts(&stages[0].images[0], Some(0));
@@ -6500,6 +6626,9 @@ mod tests {
         for no_symbol_pass in [false, true] {
             let mut events = Vec::new();
             let mut wrapper_calls = 0usize;
+            let current = [eligible_shape_result(
+                "02_MAIN", 1, 1, 0, None, None, None, 0,
+            )];
             orchestrate_symbol_route(no_symbol_pass, |step| match step {
                 SymbolRouteStep::DispatchPass2 => events.push("refresh".into()),
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly) => {
@@ -6513,11 +6642,17 @@ mod tests {
                         )],
                         1,
                     )];
-                    run_global_shapes_stage_with(&mut stages, &images_dir, &manifest, |request| {
-                        wrapper_calls += 1;
-                        assert_eq!(request.image_label, "02_MAIN");
-                        global_shapes::run_image(request)
-                    });
+                    run_global_shapes_stage_with(
+                        &mut stages,
+                        &images_dir,
+                        &manifest,
+                        &current,
+                        |request| {
+                            wrapper_calls += 1;
+                            assert_eq!(request.image_label, "02_MAIN");
+                            global_shapes::run_image(request)
+                        },
+                    );
                     assert_eq!(last_stage(&stages).stage, "global_shapes");
                     assert_eq!(last_stage(&stages).status, "ok");
                     assert_nine_shape_counts(&stages[0].images[0], Some(0));
@@ -6599,10 +6734,15 @@ mod tests {
             ],
             1,
         )];
+        let current = [
+            eligible_shape_result("02_MAIN", 1, 1, 0, None, None, None, 0),
+            eligible_shape_result("03_APM", 1, 1, 0, None, None, None, 0),
+        ];
         let outcomes = run_global_shapes_stage_with(
             &mut stages,
             Path::new("unused-images-dir"),
             Path::new("unused-manifest"),
+            &current,
             |request| {
                 if request.image_label == "02_MAIN" {
                     Ok(global_shapes::GlobalShapesReport {
@@ -6661,6 +6801,98 @@ mod tests {
         reapply_global_shapes_outcomes(&mut images, &outcomes);
         assert_nine_shape_counts(&images[0], None);
         assert!(images[0].global_shapes_error.is_none());
+    }
+
+    #[test]
+    fn global_shapes_stage_binds_currentness_from_image_results_before_pass2() {
+        // The exact e2e shape that failed live: on the normal route,
+        // RunGlobalShapes runs right after the globals stage and before
+        // DispatchPass2, and the decompile stage report deliberately withholds
+        // globals fields until pass 2's outcome ("no pre-application snapshot"
+        // — see globals_stage_refreshes_only_when_application_is_known_uninvoked).
+        // Currentness must therefore bind from the post-globals
+        // decompile::ImageResults (mutated in place by the globals stage), not
+        // from the stage-report ImageReports.
+        let root = std::env::temp_dir().join(format!(
+            "pme_global_shapes_currentness_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let manifest = root.join("manifest.json");
+        write_empty_shape_image(&images_dir, "02_MAIN");
+        write_shape_manifest(&manifest, &["02_MAIN"]);
+
+        // Stage-report image: the normal-route shape — inventory counts
+        // present, globals fields withheld (None).
+        let mut withheld = eligible_shape_image("02_MAIN", 1, 1, 0, None, None, None, 0);
+        withheld.globals_recovered = None;
+        assert!(
+            withheld.globals_recovered.is_none(),
+            "fixture must reproduce the withheld normal-route snapshot"
+        );
+        let mut stages = vec![StageReport::decompile(vec![withheld], 2)];
+
+        // Post-globals ImageResult: globals_recovered set, as the globals
+        // stage does in place (image.globals_recovered = Some(...)).
+        let mut raw = analyzed_image("02_MAIN");
+        raw.ghidra_execution_accepted = Some(1);
+        raw.ghidra_execution_quarantined = Some(0);
+        raw.globals_recovered = Some(0);
+        assert_eq!(raw.globals_recovered, Some(0));
+
+        run_global_shapes_stage(
+            &mut stages,
+            &images_dir,
+            &manifest,
+            std::slice::from_ref(&raw),
+        );
+
+        assert_eq!(
+            last_stage(&stages).status,
+            "ok",
+            "stage must not fail: {stages:?}"
+        );
+        assert!(stages[0].images[0].global_shapes_error.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_shapes_stage_fails_closed_when_image_result_is_missing() {
+        // A stage-report image with no matching current ImageResult must fail
+        // closed per-image — this also pins the handler wiring's
+        // `unwrap_or(&[])` fallback: whenever pass-1 results are absent, the
+        // decompile stage has no images and the stage skips ("no code image"),
+        // so this per-image miss is the only way the empty slice can be
+        // observed, and it must be an explicit failure, never a silent skip.
+        let mut stages = vec![StageReport::decompile(
+            vec![eligible_shape_image(
+                "02_MAIN", 1, 1, 0, None, None, None, 0,
+            )],
+            1,
+        )];
+        let mut called = false;
+        run_global_shapes_stage_with(
+            &mut stages,
+            Path::new("/tmp"),
+            Path::new("/tmp/manifest.json"),
+            &[],
+            |_| {
+                called = true;
+                Ok(zero_shapes_report())
+            },
+        );
+        assert!(!called);
+        assert_eq!(
+            stages[0].images[0].global_shapes_error.as_deref(),
+            Some("missing current image result")
+        );
+        assert_nine_shape_counts(&stages[0].images[0], None);
+        assert_eq!(last_stage(&stages).status, "failed");
+        assert_eq!(
+            last_stage(&stages).error.as_deref(),
+            Some("02_MAIN: missing current image result")
+        );
     }
 
     #[test]
