@@ -149,8 +149,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `global_shapes/decoder.rs` | Pure-Rust adapter over `scaleservers-arm32-assembly` 1.0.0; project-owned instructions only |
 | `global_shapes/tracker.rs` | Sound cross-block must-facts dataflow over direct CFG edges (worklist join), Recovered-global access observations, v3 barriers, cross-block counters |
 | `global_shapes/aggregate.rs` | Same-PC agreement/conflict grouping and conservative summaries |
-| `global_shapes/artifact.rs` | Input validation, source hashes, v3 schema, deterministic serialize, atomic replace |
-| `global_shapes/validate.rs` | Shared v3 sidecar checks for goldens and retained-tree replay |
+| `global_shapes/artifact.rs` | Input validation, source hashes, v4 schema, deterministic serialize, atomic replace |
+| `global_shapes/validate.rs` | Shared v4 sidecar checks for goldens and retained-tree replay |
 | `global_types.rs` | Selects apply-worthy scalar shapes from `global_shapes.json` (width 1/2/4/8 `inferred` scalars only) and writes the strict `ApplyGlobalTypes.java` apply-map |
 | `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `blake3` helpers |
@@ -1077,7 +1077,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   `decompose` to regenerate rather than debug (see the stage-placement
   bullet above).
   A retained v2 `global_shapes.json` (e.g. the cheetah reference tree,
-  stale-vintage by design) is rejected by the v3 validators — measure
+  stale-vintage by design) is rejected by the v4 validators — measure
   current behavior in-memory with
   `PME_GLOBAL_SHAPES_MEASURE_LABEL=01_MAIN`, do not read the sidecar.
   A Ghidra 12 output root must stay
