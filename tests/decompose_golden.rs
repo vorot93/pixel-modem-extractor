@@ -806,3 +806,89 @@ fn global_types_applied_on_retained_tree() {
     );
     eprintln!("02_MAIN global_types: applied={applied} candidates={candidates} skipped={skipped}");
 }
+
+/// pme-paq-v1 equality of every pinned deterministic surface against a
+/// reference (re-baselined) decomposed tree (`PME_DECOMPOSED_GOLDEN_DIR`).
+/// Pinned surfaces: by-construction deterministic ones. report.json
+/// (durations) and ghidra_project/ residue are unpinned by design — see
+/// CONTRIBUTING. `manifest.json` is a single file, and pme-paq-v1 only hashes
+/// directories, so that surface is pinned by blake3 content instead.
+#[test]
+fn decompose_pinned_surfaces_match_reference() {
+    let Some(img) = std::env::var_os("PME_RADIO_IMG").map(PathBuf::from) else {
+        eprintln!("skip: set PME_RADIO_IMG");
+        return;
+    };
+    if !img.exists() {
+        eprintln!("skip: PME_RADIO_IMG not found");
+        return;
+    }
+    let Some(gold) = std::env::var_os("PME_DECOMPOSED_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_DECOMPOSED_GOLDEN_DIR");
+        return;
+    };
+    if !gold.is_dir() {
+        eprintln!("skip: PME_DECOMPOSED_GOLDEN_DIR not found");
+        return;
+    }
+    if decompile::find_headless(None).is_err() || decompile::find_radare2().is_none() {
+        eprintln!("skip: Ghidra and/or radare2 not available on this host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("pme_paq_golden_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let opts = decompose::Opts {
+        no_verify: false,
+        prune: false,
+        ghidra_home: None,
+        processor: "ARM:LE:32:v7".to_string(),
+        no_symbol_pass: false,
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+        globals_provisional: false,
+        globals_k_arm: None,
+        globals_k_thumb: None,
+        no_apply_global_types: false,
+    };
+    decompose::run(&img, &opts, &out).expect("decompose");
+    let surfaces = [
+        "manifest.json",
+        "tokens",
+        "rf",
+        "ghidra/symbol_maps",
+        "ghidra/global_types_maps",
+    ];
+    for rel in surfaces {
+        let ours = out.join(rel);
+        let theirs = gold.join(rel);
+        if !theirs.exists() {
+            continue; // model-dependent (e.g. rf/ absent on cheetah)
+        }
+        if ours.is_dir() {
+            assert!(
+                pixel_modem_extractor::tree_hash::pme_paq_v1(&ours).unwrap()
+                    == pixel_modem_extractor::tree_hash::pme_paq_v1(&theirs).unwrap(),
+                "pinned surface {rel} must reproduce the reference pme-paq-v1"
+            );
+        } else {
+            assert_eq!(
+                pixel_modem_extractor::manifest::blake3_bytes(&std::fs::read(&ours).unwrap()),
+                pixel_modem_extractor::manifest::blake3_bytes(&std::fs::read(&theirs).unwrap()),
+                "pinned surface {rel} must reproduce the reference bytes"
+            );
+        }
+    }
+    for entry in std::fs::read_dir(out.join("images")).unwrap().flatten() {
+        let label = entry.file_name();
+        let st = entry.path().join("source_tree");
+        let gold_st = gold.join("images").join(&label).join("source_tree");
+        if st.is_dir() && gold_st.is_dir() {
+            assert_eq!(
+                pixel_modem_extractor::tree_hash::pme_paq_v1(&st).unwrap(),
+                pixel_modem_extractor::tree_hash::pme_paq_v1(&gold_st).unwrap(),
+                "source_tree of {label:?} must reproduce"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&out);
+}

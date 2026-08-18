@@ -57,3 +57,31 @@ fn extract_matches_golden() {
         );
     }
 }
+
+/// Whole-tree pin: a fresh extract must reproduce the golden tree's
+/// pme-paq-v1 — not just the individual leaves `extract_matches_golden`
+/// checks. Same env vars and skip conditions as that test.
+#[test]
+fn extract_tree_matches_golden_paqs() {
+    let (Some(img), Some(root)) = (
+        std::env::var_os("PME_RADIO_IMG").map(PathBuf::from),
+        std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from),
+    ) else {
+        eprintln!("skip: set PME_RADIO_IMG and PME_GOLDEN_DIR");
+        return;
+    };
+    let gold_split = root.join(FW).join("modem.bin.split");
+    if !img.exists() || !gold_split.exists() {
+        eprintln!("skip: golden inputs absent");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("pme_paq_golden_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    pixel_modem_extractor::pipeline::extract(&img, &out, true).unwrap();
+    let ours = pixel_modem_extractor::tree_hash::pme_paq_v1(&out).expect("hash fresh");
+    let gold = pixel_modem_extractor::tree_hash::pme_paq_v1(&root).expect("hash golden");
+    assert_eq!(
+        ours, gold,
+        "extract output tree must reproduce the golden pme-paq-v1"
+    );
+}
