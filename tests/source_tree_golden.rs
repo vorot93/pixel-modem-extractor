@@ -1,4 +1,4 @@
-use pixel_modem_extractor::manifest::sha256_bytes as sha;
+use pixel_modem_extractor::manifest::blake3_bytes as digest;
 use std::path::{Path, PathBuf};
 
 // Set PME_GOLDEN_DIR to the extracted golden tree (the `modem_extracted` root).
@@ -46,8 +46,8 @@ fn source_tree_matches_golden() {
         let op = out.join("tree").join(rel);
         assert!(op.exists(), "missing our leaf {}", rel.display());
         assert_eq!(
-            sha(&std::fs::read(&op).unwrap()),
-            sha(&std::fs::read(&gp).unwrap()),
+            digest(&std::fs::read(&op).unwrap()),
+            digest(&std::fs::read(&gp).unwrap()),
             "leaf differs: {}",
             rel.display()
         );
@@ -60,8 +60,8 @@ fn source_tree_matches_golden() {
     // 2. text reports byte-match (README intentionally excluded)
     for f in ["tree.txt", "summary.md", "other_paths.txt"] {
         assert_eq!(
-            sha(&std::fs::read(out.join(f)).unwrap()),
-            sha(&std::fs::read(gold_st.join(f)).unwrap()),
+            digest(&std::fs::read(out.join(f)).unwrap()),
+            digest(&std::fs::read(gold_st.join(f)).unwrap()),
             "{f} differs"
         );
     }

@@ -1,6 +1,6 @@
 [package]
 name = "pixel-modem-extractor"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
 license = "Apache-2.0"
@@ -27,7 +27,6 @@ regex = "1"
 scaleservers-arm32-assembly = "1.0.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.11"
 tar = "0.4"
 thiserror = "2"
 tracing = "0.1"

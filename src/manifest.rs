@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 
@@ -27,42 +26,6 @@ fn blake3_reader(mut reader: impl Read) -> Result<String> {
 pub fn blake3_file(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path)?;
     blake3_reader(file)
-}
-
-fn hex_digest(h: Sha256) -> String {
-    let result = h.finalize();
-    let mut s = String::with_capacity(64);
-    for byte in result.iter() {
-        use std::fmt::Write;
-        write!(s, "{:02x}", byte).unwrap();
-    }
-    s
-}
-
-pub fn sha256_bytes(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    hex_digest(h)
-}
-
-/// Stream a reader into a SHA-256 hex digest. Handles short reads (any
-/// `read` returning 0..=buf.len()) without requiring a full-buffer fill.
-fn sha256_reader(mut reader: impl Read) -> Result<String> {
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(hex_digest(h))
-}
-
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let file = std::fs::File::open(path)?;
-    sha256_reader(file)
 }
 
 /// Best-effort read of `fbpk_name` from a written `manifest.json`.

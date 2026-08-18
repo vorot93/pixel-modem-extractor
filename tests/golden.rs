@@ -1,4 +1,4 @@
-use pixel_modem_extractor::manifest::sha256_bytes as sha;
+use pixel_modem_extractor::manifest::blake3_bytes as digest;
 use std::path::PathBuf;
 
 // Golden inputs live outside the repo. Point the test at them with env vars:
@@ -31,8 +31,8 @@ fn extract_matches_golden() {
         let ours = std::fs::read(out.join("modem.bin.split").join(n)).unwrap();
         let gold = std::fs::read(gold_split.join(n)).unwrap();
         assert_eq!(
-            sha(&ours),
-            sha(&gold),
+            digest(&ours),
+            digest(&gold),
             "{n} differs (len ours={} gold={})",
             ours.len(),
             gold.len()
@@ -43,16 +43,16 @@ fn extract_matches_golden() {
     let gold = std::fs::read(gold_split.join("05_DBGCORE")).unwrap();
     assert_eq!(ours.len(), 5520);
     assert_eq!(
-        sha(&ours),
-        sha(&gold[..5520]),
+        digest(&ours),
+        digest(&gold[..5520]),
         "05_DBGCORE first-5520 differs"
     );
 
     // ext4 byte-matches the golden ext4
     if gold_ext4.exists() {
         assert_eq!(
-            sha(&std::fs::read(out.join("modem.ext4")).unwrap()),
-            sha(&std::fs::read(&gold_ext4).unwrap()),
+            digest(&std::fs::read(out.join("modem.ext4")).unwrap()),
+            digest(&std::fs::read(&gold_ext4).unwrap()),
             "modem.ext4 differs"
         );
     }
