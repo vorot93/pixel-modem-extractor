@@ -115,16 +115,34 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   `decompiled/` trees are not currently pinned; determinism was not measured —
   measure two fresh runs before ever adding them (pe-decompose saw Ghidra
   nondeterminism on 2 of 3 corpora).
-- **Re-baselining goldens** (required once after the sha256→blake3 format
-  break): run `extract` + `decompose` on a real radio image into the golden
-  reference location with the new binary; then `pixel-modem-extractor
-  tree-hash <dir>` each pinned surface/tree and record the values; set
-  `PME_GOLDEN_DIR`/`PME_DECOMPOSED_GOLDEN_DIR`/`PME_RADIO_IMG` and run
-  `cargo test` to confirm the paq assertions pass. Use the same `PME_RADIO_IMG`
-  path *spelling* (e.g. one fixed absolute path) for the re-baseline and every
-  verification run — `manifest.json` embeds the path string as passed
-  (`pipeline.rs` `source_image`), so a relative-vs-absolute difference shifts
-  the pinned hashes. Old goldens embed sha256/v3 fields and cannot be reused.
+- **Re-baselining goldens** (last done 2026-08-18, after the sha256→blake3
+  format break): run `extract` + `decompose` on a real radio image with the
+  current binary, then `pixel-modem-extractor tree-hash <dir>` each pinned
+  surface/tree and record the values. `PME_GOLDEN_DIR` is dual-mode and the
+  golden lives in **two trees**, so verification is two invocations:
+
+  1. `radio-mustang-extracted` — a pristine fresh `extract` output. It must
+     contain *nothing beyond* what `extract` writes (the whole-tree paq pin
+     hashes every leaf). Verify with
+     `PME_GOLDEN_DIR=…/radio-mustang-extracted PME_RADIO_IMG=… cargo test --test golden`.
+  2. `radio-mustang-decomposed` — a fresh full `decompose` output. Verify with
+     `PME_GOLDEN_DIR=PME_DECOMPOSED_GOLDEN_DIR=…/radio-mustang-decomposed
+     PME_RADIO_IMG=… cargo test --release --test decompose_golden
+     decompose_pinned_surfaces_match_reference` plus the read-only
+     decompose-layout legs (`global_shapes_golden`, the `PME_GOLDEN_DIR` legs
+     of `globals_golden`). `tests/symbolicate_golden.rs` rewrites its tree in
+     place — point `PME_DECOMPOSED_DIR` at a disposable copy, never the golden.
+
+  Use the same `PME_RADIO_IMG` path *spelling* (e.g. one fixed absolute path)
+  for the re-baseline and every verification run — `manifest.json` embeds the
+  path string as passed (`pipeline.rs` `source_image`), so a
+  relative-vs-absolute difference shifts the pinned hashes. Old goldens embed
+  sha256/v3 fields and cannot be reused (the pre-blake3 decompose tree is kept
+  as `radio-mustang-decomposed.pre-blake3`). The legacy `PIXELMODEM_rootfs/…`
+  extract-layout legs (`extract_matches_golden` per-file compares, and the
+  source-tree/hwcfg/decode-rf/decode-tokens goldens' input paths) refer to a
+  pre-modern layout no golden carries — they skip cleanly; the whole-tree paq
+  pin supersedes the per-file extract compare.
 
 ## Repository layout
 
