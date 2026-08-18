@@ -310,7 +310,7 @@ pub struct GhidraTools {
 pub struct Report {
     pub tool_version: String,
     pub source_image: String,
-    pub source_sha256: String,
+    pub source_blake3: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modem_generation: Option<String>,
     pub out: String,
@@ -888,7 +888,7 @@ fn finalize(
     let report = Report {
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         source_image: img.display().to_string(),
-        source_sha256: manifest::sha256_file(img).unwrap_or_default(),
+        source_blake3: manifest::blake3_file(img).unwrap_or_default(),
         modem_generation,
         out: out.display().to_string(),
         ghidra: GhidraTools {
@@ -2059,13 +2059,13 @@ fn build_and_write_symbol_maps(
         if !dir.join("decompiled").join("functions.json").exists() {
             continue;
         }
-        let funcs_sha = std::fs::read(dir.join("decompiled").join("functions.json"))
+        let funcs_blake3 = std::fs::read(dir.join("decompiled").join("functions.json"))
             .ok()
-            .map(|b| crate::manifest::sha256_bytes(&b))
+            .map(|b| crate::manifest::blake3_bytes(&b))
             .unwrap_or_default();
-        let image_sha = std::fs::read(dir.join(format!("{label}.bin")))
+        let image_blake3 = std::fs::read(dir.join(format!("{label}.bin")))
             .ok()
-            .map(|b| crate::manifest::sha256_bytes(&b))
+            .map(|b| crate::manifest::blake3_bytes(&b))
             .unwrap_or_default();
         let symbols = match symbolicate::build_map(&dir, &label, &tokens, manifest) {
             Ok(s) => s,
@@ -2076,7 +2076,7 @@ fn build_and_write_symbol_maps(
         };
         let map_path = maps_dir.join(format!("{label}.json"));
         if let Err(e) =
-            symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_sha, &funcs_sha)
+            symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_blake3, &funcs_blake3)
         {
             errors.push((label.clone(), format!("write_symbol_map: {e}")));
             continue;
@@ -4514,7 +4514,7 @@ mod tests {
         let report = Report {
             tool_version: "1.0.0".into(),
             source_image: "radio.img".into(),
-            source_sha256: "abc".into(),
+            source_blake3: "abc".into(),
             modem_generation: None,
             out: "radio.decomposed".into(),
             ghidra: GhidraTools {

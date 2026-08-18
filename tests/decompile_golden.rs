@@ -735,8 +735,8 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let symbol_map = serde_json::json!({
         "tool_version": "test",
         "image": "00_BOOT",
-        "source_sha256": "0",
-        "functions_sha256": "0",
+        "source_blake3": "0",
+        "functions_blake3": "0",
         "symbols": [
             {
                 "entry": "0x0",

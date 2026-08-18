@@ -677,8 +677,8 @@ fn write_symbols_json(
 struct SymbolMapFile<'a> {
     tool_version: &'static str,
     image: &'a str,
-    source_sha256: &'a str,
-    functions_sha256: &'a str,
+    source_blake3: &'a str,
+    functions_blake3: &'a str,
     symbols: Vec<SymbolMapEntry<'a>>,
 }
 
@@ -698,8 +698,8 @@ pub fn write_symbol_map(
     out_path: &Path,
     image_label: &str,
     symbols: &[Symbol],
-    source_sha256: &str,
-    functions_sha256: &str,
+    source_blake3: &str,
+    functions_blake3: &str,
 ) -> Result<PathBuf> {
     let entries: Vec<SymbolMapEntry<'_>> = symbols
         .iter()
@@ -715,8 +715,8 @@ pub fn write_symbol_map(
     let file = SymbolMapFile {
         tool_version: env!("CARGO_PKG_VERSION"),
         image: image_label,
-        source_sha256,
-        functions_sha256,
+        source_blake3,
+        functions_blake3,
         symbols: entries,
     };
     let json = serde_json::to_string_pretty(&file).map_err(|e| Error::Serialize(e.to_string()))?;
@@ -1146,8 +1146,8 @@ fn finalize_image(
     let mut inputs = HashMap::new();
     if let Ok(b) = std::fs::read(decompiled.join("functions.json")) {
         inputs.insert(
-            "functions_json_sha256".into(),
-            crate::manifest::sha256_bytes(&b),
+            "functions_json_blake3".into(),
+            crate::manifest::blake3_bytes(&b),
         );
     }
 
@@ -2284,8 +2284,8 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["tool_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed["image"], "02_MAIN");
-        assert_eq!(parsed["source_sha256"], "abc");
-        assert_eq!(parsed["functions_sha256"], "def");
+        assert_eq!(parsed["source_blake3"], "abc");
+        assert_eq!(parsed["functions_blake3"], "def");
         let syms = parsed["symbols"].as_array().unwrap();
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[0]["entry"], "0x40e1bff4");
