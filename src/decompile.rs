@@ -57,7 +57,7 @@ pub struct Opts {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct SourceRef {
     pub path: String,
-    pub sha256: String,
+    pub blake3: String,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -67,7 +67,7 @@ pub struct ImageSpec {
     pub size: u32,
     pub base_addr: String,
     pub entry_point: String,
-    pub sha256: String,
+    pub blake3: String,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -108,7 +108,7 @@ pub fn build_load_spec(
                 size: e.size,
                 base_addr: format!("0x{:08x}", e.load_addr),
                 entry_point: format!("0x{:08x}", e.load_addr),
-                sha256: crate::manifest::sha256_bytes(&data[start..end]),
+                blake3: crate::manifest::blake3_bytes(&data[start..end]),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -116,7 +116,7 @@ pub fn build_load_spec(
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         source: SourceRef {
             path: source_name.to_string(),
-            sha256: crate::manifest::sha256_bytes(data),
+            blake3: crate::manifest::blake3_bytes(data),
         },
         processor: processor.to_string(),
         images,
@@ -5121,20 +5121,20 @@ INFO: second pdfj body was noisy and not parseable
         let spec = build_load_spec(&toc, &buf, "modem.bin", "ARM:LE:32:v7").unwrap();
         assert_eq!(spec.processor, "ARM:LE:32:v7");
         assert_eq!(spec.source.path, "modem.bin");
-        assert_eq!(spec.source.sha256.len(), 64);
+        assert_eq!(spec.source.blake3.len(), 64);
         assert_eq!(spec.images.len(), 2);
         assert_eq!(spec.images[0].name, "00_BOOT");
         assert_eq!(spec.images[0].file, "images/00_BOOT");
         assert_eq!(spec.images[0].base_addr, "0x00000000");
         assert_eq!(spec.images[0].entry_point, "0x00000000");
         assert_eq!(spec.images[0].size, 4);
-        assert_eq!(spec.images[0].sha256.len(), 64);
+        assert_eq!(spec.images[0].blake3.len(), 64);
         assert_eq!(spec.images[1].name, "02_MAIN");
         assert_eq!(spec.images[1].file, "images/02_MAIN");
         assert_eq!(spec.images[1].base_addr, "0x40010000");
         assert_eq!(spec.images[1].entry_point, "0x40010000");
         assert_eq!(spec.images[1].size, 8);
-        assert_eq!(spec.images[1].sha256.len(), 64);
+        assert_eq!(spec.images[1].blake3.len(), 64);
     }
 
     #[test]
