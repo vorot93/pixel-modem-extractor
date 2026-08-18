@@ -724,7 +724,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   `decompiled/global_shapes.json`. Pass-2 refresh still owns only
   `decompiled.c` / `disasm.lst` / `functions.json` and must not touch this
   sidecar. **Provenance consequence of the reorder + re-commit:** the
-  committed sidecar's `functions_sha256` / `thumb_functions_sha256` hash the
+  committed sidecar's `functions_blake3` / `thumb_functions_blake3` hash the
   FINAL post-finalize files (recovered names, post-enrich Thumb,
   finalize-stamped), exactly as pre-reorder trees did — trees produced
   between the reorder and the re-commit fix, or by the re-commit's first
@@ -733,7 +733,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   them. The
   recovered/counted shape set is unaffected either way (the decoder never
   reads names). Re-baseline any golden or fixture that pins a literal
-  `functions_sha256` string.
+  `functions_blake3` string.
 - **Phase 3.2 currentness.** The stage does not infer readiness from file
   existence. Currentness binds from the post-globals
   `decompile::ImageResult`s — `run_global_shapes_stage` matches them by
@@ -753,7 +753,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   the analyzer is not called, an existing sidecar is left byte-identical,
   later images continue, and the aggregate `global_shapes` stage is
   `failed`. **Absent versus stale Thumb:** no current Thumb inventory plus
-  no file is valid (`thumb_functions_sha256` is JSON `null`). No current
+  no file is valid (`thumb_functions_blake3` is JSON `null`). No current
   Thumb inventory plus an unexpected old `thumb_functions.json` is a hard
   currentness error. A reported Thumb count requires a present, valid file
   whose substantial / accepted / quarantined counts match the current
@@ -832,7 +832,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   offsets, overflowing `offset + width`, and u32 address wrap kill the
   fact and do not observe.
 - **Phase 3.2 aggregation and artifact.** Format string is
-  `pixel-modem-extractor-global-shapes-v3`; validators and loaders gate
+  `pixel-modem-extractor-global-shapes-v4`; validators and loaders gate
   on it, and a v2 sidecar is stale-vintage — regenerate it, never
   silently read it. Observations that agree at one `(ISA, PC)` union
   contexts and provenance; an agreement subgroup spans every key sharing

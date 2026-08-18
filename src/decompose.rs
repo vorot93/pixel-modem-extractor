@@ -6273,12 +6273,12 @@ mod tests {
         let first_sidecar: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
         assert_eq!(
-            first_sidecar["inputs"]["functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&pass1_functions))
+            first_sidecar["inputs"]["functions_blake3"],
+            serde_json::Value::String(manifest::blake3_bytes(&pass1_functions))
         );
         assert_eq!(
-            first_sidecar["inputs"]["thumb_functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&pass1_thumb))
+            first_sidecar["inputs"]["thumb_functions_blake3"],
+            serde_json::Value::String(manifest::blake3_bytes(&pass1_thumb))
         );
 
         // Simulate the route's post-first-sweep input rewrites in execution
@@ -6352,39 +6352,39 @@ mod tests {
         let final_sidecar: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
         assert_eq!(
-            final_sidecar["inputs"]["functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&final_functions))
+            final_sidecar["inputs"]["functions_blake3"],
+            serde_json::Value::String(manifest::blake3_bytes(&final_functions))
         );
         assert_ne!(
-            final_sidecar["inputs"]["functions_sha256"],
-            first_sidecar["inputs"]["functions_sha256"]
+            final_sidecar["inputs"]["functions_blake3"],
+            first_sidecar["inputs"]["functions_blake3"]
         );
         assert_ne!(
-            final_sidecar["inputs"]["functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&pass2_functions)),
+            final_sidecar["inputs"]["functions_blake3"],
+            serde_json::Value::String(manifest::blake3_bytes(&pass2_functions)),
             "the final commit must reflect the finalize rewrite, not stop at pass 2's"
         );
         assert_eq!(
-            final_sidecar["inputs"]["thumb_functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&final_thumb))
+            final_sidecar["inputs"]["thumb_functions_blake3"],
+            serde_json::Value::String(manifest::blake3_bytes(&final_thumb))
         );
         assert_ne!(
-            final_sidecar["inputs"]["thumb_functions_sha256"],
-            first_sidecar["inputs"]["thumb_functions_sha256"]
+            final_sidecar["inputs"]["thumb_functions_blake3"],
+            first_sidecar["inputs"]["thumb_functions_blake3"]
         );
         assert_ne!(
-            final_sidecar["inputs"]["thumb_functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&rewritten_thumb)),
+            final_sidecar["inputs"]["thumb_functions_blake3"],
+            serde_json::Value::String(manifest::blake3_bytes(&rewritten_thumb)),
             "the final commit must reflect the finalize rewrite, not stop at thumb_enrich's"
         );
         // Un-rewritten inputs keep their hashes.
         assert_eq!(
-            final_sidecar["inputs"]["image_sha256"],
-            first_sidecar["inputs"]["image_sha256"]
+            final_sidecar["inputs"]["image_blake3"],
+            first_sidecar["inputs"]["image_blake3"]
         );
         assert_eq!(
-            final_sidecar["inputs"]["globals_sha256"],
-            first_sidecar["inputs"]["globals_sha256"]
+            final_sidecar["inputs"]["globals_blake3"],
+            first_sidecar["inputs"]["globals_blake3"]
         );
 
         // The retained outcome map reflects the FINAL run and the decompile
@@ -6934,7 +6934,7 @@ mod tests {
             std::fs::read_to_string(images_dir.join("02_MAIN/decompiled/global_shapes.json"))
                 .unwrap();
         let value: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
-        assert_eq!(value["format"], "pixel-modem-extractor-global-shapes-v3");
+        assert_eq!(value["format"], "pixel-modem-extractor-global-shapes-v4");
         assert_eq!(value["globals"], serde_json::json!([]));
         assert_eq!(
             std::fs::read(images_dir.join("02_MAIN/decompiled/globals.json")).unwrap(),

@@ -1,4 +1,4 @@
-// Input validation, source hashes, v3 schema, and atomic sidecar commit.
+// Input validation, source hashes, v4 schema, and atomic sidecar commit.
 
 use super::{
     FunctionContext, FunctionExecution, RecoveredGlobal, RunRequest, SourceProjectionCounts,
@@ -8,7 +8,7 @@ use crate::execution_ranges::{
     ExecutionIdentity, ExecutionProjection, execution_identity, parse_projection,
     validate_inventory_projection,
 };
-use crate::manifest::{load_addr_for_image, sha256_bytes};
+use crate::manifest::{blake3_bytes, load_addr_for_image};
 use atomic_write_file::AtomicWriteFile;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -22,10 +22,10 @@ const THUMB_V2_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputHashes {
-    pub image_sha256: String,
-    pub globals_sha256: String,
-    pub functions_sha256: String,
-    pub thumb_functions_sha256: Option<String>,
+    pub image_blake3: String,
+    pub globals_blake3: String,
+    pub functions_blake3: String,
+    pub thumb_functions_blake3: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,18 +71,18 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
     let thumb_path = decompiled.join("thumb_functions.json");
 
     let image = std::fs::read(&image_path)?;
-    let image_sha256 = sha256_bytes(&image);
+    let image_blake3 = blake3_bytes(&image);
     let image_len = mapped_image_len(load_address, image.len())?;
 
-    let (globals_sha256, globals_json) = read_json(&globals_path)?;
+    let (globals_blake3, globals_json) = read_json(&globals_path)?;
     let globals = parse_globals(&globals_json, request)?;
     drop(globals_json);
 
-    let (functions_sha256, functions_json) = read_json(&functions_path)?;
+    let (functions_blake3, functions_json) = read_json(&functions_path)?;
     let ghidra = parse_ghidra_inventory(&functions_json, request, load_address, image_len)?;
     drop(functions_json);
 
-    let (thumb_functions_sha256, thumb) = match thumb_expected {
+    let (thumb_functions_blake3, thumb) = match thumb_expected {
         None => {
             if thumb_path.exists() {
                 return Err(invalid("unexpected thumb_functions.json"));
@@ -114,10 +114,10 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
         image,
         load_address,
         hashes: InputHashes {
-            image_sha256,
-            globals_sha256,
-            functions_sha256,
-            thumb_functions_sha256,
+            image_blake3,
+            globals_blake3,
+            functions_blake3,
+            thumb_functions_blake3,
         },
         globals,
         functions: identities
@@ -169,7 +169,7 @@ fn mapped_image_len(load_address: u32, image_len: usize) -> Result<u32> {
 
 fn read_json(path: &Path) -> Result<(String, Value)> {
     let bytes = std::fs::read(path)?;
-    let hash = sha256_bytes(&bytes);
+    let hash = blake3_bytes(&bytes);
     let value = serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
     Ok((hash, value))
 }
@@ -435,10 +435,10 @@ pub(crate) struct GlobalShapesFile {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InputHashesWire {
-    pub image_sha256: String,
-    pub globals_sha256: String,
-    pub functions_sha256: String,
-    pub thumb_functions_sha256: Option<String>,
+    pub image_blake3: String,
+    pub globals_blake3: String,
+    pub functions_blake3: String,
+    pub thumb_functions_blake3: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -618,9 +618,9 @@ mod tests {
     use crate::global_shapes::decoder::AccessKind;
     use crate::global_shapes::tracker::CandidateObservation;
     use crate::global_shapes::{
-        FORMAT_V3, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
+        FORMAT_V4, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,
     };
-    use crate::manifest::sha256_bytes;
+    use crate::manifest::blake3_bytes;
     use serde_json::{Value, json};
     use std::collections::{BTreeSet, HashMap};
     use std::fs;
@@ -918,7 +918,7 @@ mod tests {
                 quarantine_errors: 0,
             }
         );
-        assert_eq!(loaded.hashes.thumb_functions_sha256, None);
+        assert_eq!(loaded.hashes.thumb_functions_blake3, None);
     }
 
     #[test]
@@ -947,7 +947,7 @@ mod tests {
             DecodeIsa::Thumb
         );
         assert_eq!(loaded.source_counts.thumb_accepted, 1);
-        assert!(loaded.hashes.thumb_functions_sha256.is_some());
+        assert!(loaded.hashes.thumb_functions_blake3.is_some());
     }
 
     #[test]
@@ -1054,16 +1054,16 @@ mod tests {
         let bound = BoundRequest::from_fixture(&fixture, 1, 1, 0, None, None, None, 0);
         let loaded = load_ok(&bound.get());
         assert!(loaded.globals.is_empty());
-        assert_eq!(loaded.hashes.image_sha256, sha256_bytes(&image));
+        assert_eq!(loaded.hashes.image_blake3, blake3_bytes(&image));
         assert_eq!(
-            loaded.hashes.globals_sha256,
-            sha256_bytes(globals.to_string().as_bytes())
+            loaded.hashes.globals_blake3,
+            blake3_bytes(globals.to_string().as_bytes())
         );
         assert_eq!(
-            loaded.hashes.functions_sha256,
-            sha256_bytes(functions.to_string().as_bytes())
+            loaded.hashes.functions_blake3,
+            blake3_bytes(functions.to_string().as_bytes())
         );
-        assert_eq!(loaded.hashes.thumb_functions_sha256, None);
+        assert_eq!(loaded.hashes.thumb_functions_blake3, None);
     }
 
     #[test]
@@ -1601,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_lowercase_sha256_to_exact_bytes_with_explicit_null_thumb_hash() {
+    fn binds_lowercase_blake3_to_exact_bytes_with_explicit_null_thumb_hash() {
         let fixture = Fixture::new("hashes");
         fixture.write_manifest(u64::from(LOAD_ADDR));
         let image = b"raw-image-bytes\n".to_vec();
@@ -1613,26 +1613,26 @@ mod tests {
         fixture.write_functions_bytes(functions);
         let bound = BoundRequest::from_fixture(&fixture, 0, 0, 0, None, None, None, 0);
         let loaded = load_ok(&bound.get());
-        assert_eq!(loaded.hashes.image_sha256, sha256_bytes(&image));
-        assert_eq!(loaded.hashes.globals_sha256, sha256_bytes(globals));
-        assert_eq!(loaded.hashes.functions_sha256, sha256_bytes(functions));
-        assert_eq!(loaded.hashes.thumb_functions_sha256, None);
+        assert_eq!(loaded.hashes.image_blake3, blake3_bytes(&image));
+        assert_eq!(loaded.hashes.globals_blake3, blake3_bytes(globals));
+        assert_eq!(loaded.hashes.functions_blake3, blake3_bytes(functions));
+        assert_eq!(loaded.hashes.thumb_functions_blake3, None);
         assert!(
             loaded
                 .hashes
-                .image_sha256
+                .image_blake3
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         );
-        assert_eq!(loaded.hashes.image_sha256.len(), 64);
+        assert_eq!(loaded.hashes.image_blake3.len(), 64);
 
         let thumb = br#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#;
         fixture.write_thumb_bytes(thumb);
         let bound = BoundRequest::from_fixture(&fixture, 0, 0, 0, Some(0), Some(0), Some(0), 0);
         let loaded = load_ok(&bound.get());
         assert_eq!(
-            loaded.hashes.thumb_functions_sha256.as_deref(),
-            Some(sha256_bytes(thumb).as_str())
+            loaded.hashes.thumb_functions_blake3.as_deref(),
+            Some(blake3_bytes(thumb).as_str())
         );
     }
 
@@ -1717,17 +1717,17 @@ mod tests {
         let aggregation =
             aggregate(&recovered, candidates, Vec::new()).expect("golden aggregation");
         GlobalShapesFile {
-            format: FORMAT_V3,
+            format: FORMAT_V4,
             image: LABEL.into(),
             load_address: "0x40000000".into(),
             inputs: InputHashesWire {
-                image_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                image_blake3: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                     .into(),
-                globals_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                globals_blake3: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .into(),
-                functions_sha256:
+                functions_blake3:
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                thumb_functions_sha256: None,
+                thumb_functions_blake3: None,
             },
             decoder: DecoderWire {
                 crate_name: "scaleservers-arm32-assembly".into(),
@@ -1761,15 +1761,15 @@ mod tests {
         }
     }
 
-    const V3_WIRE_GOLDEN: &str = r#"{
-  "format": "pixel-modem-extractor-global-shapes-v3",
+    const V4_WIRE_GOLDEN: &str = r#"{
+  "format": "pixel-modem-extractor-global-shapes-v4",
   "image": "02_MAIN",
   "load_address": "0x40000000",
   "inputs": {
-    "image_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "globals_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "functions_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "thumb_functions_sha256": null
+    "image_blake3": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "globals_blake3": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "functions_blake3": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "thumb_functions_blake3": null
   },
   "decoder": {
     "crate": "scaleservers-arm32-assembly",
@@ -1987,9 +1987,9 @@ mod tests {
 }"#;
 
     #[test]
-    fn v3_wire_bytes_are_exact() {
+    fn v4_wire_bytes_are_exact() {
         let bytes = serialize(&golden_file()).unwrap();
-        assert_eq!(bytes, V3_WIRE_GOLDEN.as_bytes());
+        assert_eq!(bytes, V4_WIRE_GOLDEN.as_bytes());
         assert!(!bytes.ends_with(b"\n"));
     }
 

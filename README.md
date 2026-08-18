@@ -146,7 +146,7 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   and a top-level `provisional_suppressed` count (set whenever any Provisional
   globals were generated, regardless of `--globals-provisional`; absent only
   when none were generated).
-- **global_shapes.json** — `pixel-modem-extractor-global-shapes-v3`; record-only
+- **global_shapes.json** — `pixel-modem-extractor-global-shapes-v4`; record-only
   storage-shape evidence for Recovered globals, written by the default-on
   `global_shapes` stage (on the normal route, before pass 2; on
   `--no-symbol-pass`, last — see Phase 3.2 above). Facts cross direct CFG

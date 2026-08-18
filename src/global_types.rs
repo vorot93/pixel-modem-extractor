@@ -63,9 +63,9 @@ const VALID_WIDTHS: [u8; 4] = [1, 2, 4, 8];
 pub fn select_from_shapes_json(bytes: &[u8]) -> Result<Selection> {
     let file: ShapesFile =
         serde_json::from_slice(bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    if file.format != crate::global_shapes::FORMAT_V3 {
+    if file.format != crate::global_shapes::FORMAT_V4 {
         return Err(Error::Serialize(format!(
-            "global_shapes sidecar is not v3 vintage: {}",
+            "global_shapes sidecar is not v4 vintage: {}",
             file.format
         )));
     }
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     const SHAPES: &str = r#"{
-      "format": "pixel-modem-extractor-global-shapes-v3",
+      "format": "pixel-modem-extractor-global-shapes-v4",
       "globals": [
         {"address":"0x40010000","status":"inferred",
          "summary":{"provisional_shape":{"kind":"scalar_candidate","width":4}}},
@@ -173,12 +173,12 @@ mod tests {
     #[test]
     fn rejects_stale_v2_vintage_sidecar() {
         let stale = SHAPES.replace(
-            "pixel-modem-extractor-global-shapes-v3",
+            "pixel-modem-extractor-global-shapes-v4",
             "pixel-modem-extractor-global-shapes-v2",
         );
         let error = select_from_shapes_json(stale.as_bytes()).unwrap_err();
         assert!(
-            error.to_string().contains("v3"),
+            error.to_string().contains("v4"),
             "stale v2 sidecar must be rejected, not silently read: {error}"
         );
     }

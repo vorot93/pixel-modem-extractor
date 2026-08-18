@@ -5,8 +5,8 @@
 //! sidecars (a pre-`global_shapes` corpus). The validator does not hardcode
 //! a yield percentage.
 
-use pixel_modem_extractor::global_shapes::{FORMAT_V3, validate_artifact};
-use pixel_modem_extractor::manifest::sha256_bytes;
+use pixel_modem_extractor::global_shapes::{FORMAT_V4, validate_artifact};
+use pixel_modem_extractor::manifest::blake3_bytes;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -99,7 +99,7 @@ fn shapes_tree() -> Option<ShapesTree> {
     })
 }
 
-fn is_sha256_hex(value: &str) -> bool {
+fn is_blake3_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -210,7 +210,7 @@ fn parse_stage_totals(output: &str) -> [u64; 9] {
 }
 
 #[test]
-fn artifacts_satisfy_v3_invariants() {
+fn artifacts_satisfy_v4_invariants() {
     let Some(tree) = shapes_tree() else {
         return;
     };
@@ -228,8 +228,8 @@ fn artifacts_satisfy_v3_invariants() {
             continue;
         }
         validate_artifact(&tree.dir, report_image(&tree.report, label), &artifact);
-        assert!(is_sha256_hex(&sha256_bytes(&bytes)));
-        assert_eq!(artifact["format"], FORMAT_V3);
+        assert!(is_blake3_hex(&blake3_bytes(&bytes)));
+        assert_eq!(artifact["format"], FORMAT_V4);
     }
 }
 

@@ -21,7 +21,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use tracker::{CallFact, CallHop, CandidateObservation};
 
-pub const FORMAT_V3: &str = "pixel-modem-extractor-global-shapes-v3";
+pub const FORMAT_V4: &str = "pixel-modem-extractor-global-shapes-v4";
 pub use validate::{validate_artifact, validate_artifact_files};
 
 #[derive(Debug)]
@@ -376,14 +376,14 @@ fn analyze_loaded_inputs(
 
     let aggregation = aggregate_fn(&inputs.globals, intra, inter_candidates)?;
     let file = GlobalShapesFile {
-        format: FORMAT_V3,
+        format: FORMAT_V4,
         image: image_label.to_owned(),
         load_address: hex(inputs.load_address),
         inputs: InputHashesWire {
-            image_sha256: inputs.hashes.image_sha256.clone(),
-            globals_sha256: inputs.hashes.globals_sha256.clone(),
-            functions_sha256: inputs.hashes.functions_sha256.clone(),
-            thumb_functions_sha256: inputs.hashes.thumb_functions_sha256.clone(),
+            image_blake3: inputs.hashes.image_blake3.clone(),
+            globals_blake3: inputs.hashes.globals_blake3.clone(),
+            functions_blake3: inputs.hashes.functions_blake3.clone(),
+            thumb_functions_blake3: inputs.hashes.thumb_functions_blake3.clone(),
         },
         decoder: DecoderWire {
             crate_name: identity.crate_name.to_owned(),
@@ -447,8 +447,8 @@ fn revalidate(
     inputs: &LoadedInputs,
     report: &GlobalShapesReport,
 ) -> Result<()> {
-    if file.format != FORMAT_V3 {
-        return Err(invalid("artifact format is not v3"));
+    if file.format != FORMAT_V4 {
+        return Err(invalid("artifact format is not v4"));
     }
     if file.globals.len() != inputs.globals.len() {
         return Err(invalid(
@@ -697,8 +697,8 @@ mod tests {
         DecodedInstruction, DecoderIdentity, InstructionDecoder, MemoryEffect, MemoryTransfer,
         PureRustDecoder, Register, SemanticEffect, ValueExpr, decode_function,
     };
-    use crate::global_shapes::{FORMAT_V3, FunctionContext, FunctionExecution};
-    use crate::manifest::sha256_bytes;
+    use crate::global_shapes::{FORMAT_V4, FunctionContext, FunctionExecution};
+    use crate::manifest::blake3_bytes;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -785,10 +785,10 @@ mod tests {
 
         fn hash_sources(&self) -> (String, String, String, String) {
             (
-                sha256_bytes(&fs::read(self.image_dir().join(format!("{LABEL}.bin"))).unwrap()),
-                sha256_bytes(&fs::read(self.decompiled().join("globals.json")).unwrap()),
-                sha256_bytes(&fs::read(self.decompiled().join("functions.json")).unwrap()),
-                sha256_bytes(&fs::read(self.decompiled().join("thumb_functions.json")).unwrap()),
+                blake3_bytes(&fs::read(self.image_dir().join(format!("{LABEL}.bin"))).unwrap()),
+                blake3_bytes(&fs::read(self.decompiled().join("globals.json")).unwrap()),
+                blake3_bytes(&fs::read(self.decompiled().join("functions.json")).unwrap()),
+                blake3_bytes(&fs::read(self.decompiled().join("thumb_functions.json")).unwrap()),
             )
         }
     }
@@ -1359,16 +1359,16 @@ mod tests {
     }
 
     fn expected_synthetic_file(fixture: &Fixture) -> GlobalShapesFile {
-        let (image_sha256, globals_sha256, functions_sha256, thumb_sha256) = fixture.hash_sources();
+        let (image_blake3, globals_blake3, functions_blake3, thumb_blake3) = fixture.hash_sources();
         GlobalShapesFile {
-            format: FORMAT_V3,
+            format: FORMAT_V4,
             image: LABEL.into(),
             load_address: hex(LOAD_ADDR),
             inputs: InputHashesWire {
-                image_sha256,
-                globals_sha256,
-                functions_sha256,
-                thumb_functions_sha256: Some(thumb_sha256),
+                image_blake3,
+                globals_blake3,
+                functions_blake3,
+                thumb_functions_blake3: Some(thumb_blake3),
             },
             decoder: DecoderWire {
                 crate_name: "test-decoder".into(),
@@ -1478,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_image_writes_complete_v3_sidecar() {
+    fn synthetic_image_writes_complete_v4_sidecar() {
         let fixture = Fixture::new("synthetic");
         let bound = synthetic_bound(&fixture, 3);
         let report = run_image_with_decoder(&bound.get(), &MapDecoder::fixture())
@@ -1849,14 +1849,14 @@ mod tests {
         let path = root.join("global_shapes.json");
         fs::write(&path, OLD_SIDECAR).unwrap();
         let file = GlobalShapesFile {
-            format: FORMAT_V3,
+            format: FORMAT_V4,
             image: LABEL.into(),
             load_address: hex(LOAD_ADDR),
             inputs: InputHashesWire {
-                image_sha256: "aa".into(),
-                globals_sha256: "bb".into(),
-                functions_sha256: "cc".into(),
-                thumb_functions_sha256: None,
+                image_blake3: "aa".into(),
+                globals_blake3: "bb".into(),
+                functions_blake3: "cc".into(),
+                thumb_functions_blake3: None,
             },
             decoder: DecoderWire {
                 crate_name: "test".into(),
@@ -1914,13 +1914,13 @@ mod tests {
         let (second, second_report) =
             analyze_to_bytes_without_commit(&bound.get()).expect("second analyze");
         assert_eq!(first, second);
-        assert_eq!(sha256_bytes(&first), sha256_bytes(&second));
+        assert_eq!(blake3_bytes(&first), blake3_bytes(&second));
         assert_eq!(first_report, second_report);
         assert_eq!(fs::read(fixture.sidecar()).unwrap(), old);
         assert_eq!(fixture.hash_sources(), before);
         assert!(!first.ends_with(b"\n"));
         let file: Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(file["format"], FORMAT_V3);
+        assert_eq!(file["format"], FORMAT_V4);
         assert_eq!(file["globals"].as_array().unwrap().len(), 3);
         let mut report_image = json!({
             "image": LABEL,
@@ -2008,7 +2008,7 @@ mod tests {
         let mut hashes = BTreeMap::new();
         walk_files(root, &mut |path, entry| {
             if entry.file_name() != "global_shapes.json" {
-                hashes.insert(path.to_path_buf(), sha256_bytes(&fs::read(path).unwrap()));
+                hashes.insert(path.to_path_buf(), blake3_bytes(&fs::read(path).unwrap()));
             }
         });
         hashes
@@ -2109,8 +2109,8 @@ mod tests {
             return;
         }
         // Recorded v2-era status split on mustang 02_MAIN (CONTRIBUTING
-        // "Phase 3.2 production baselines"). The v3 engine is monotone vs
-        // v2: `inferred` may only grow out of `no_evidence`; `conflicting`
+        // "Phase 3.2 production baselines"). The current engine is monotone
+        // vs v2: `inferred` may only grow out of `no_evidence`; `conflicting`
         // must not increase.
         const MUSTANG_MAIN: &str = "02_MAIN";
         const V2_INFERRED: usize = 125;
@@ -2150,8 +2150,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} second analyze: {e}", bound.label));
             assert_eq!(first, second, "{} artifact bytes drifted", bound.label);
             assert_eq!(
-                sha256_bytes(&first),
-                sha256_bytes(&second),
+                blake3_bytes(&first),
+                blake3_bytes(&second),
                 "{} artifact hash drifted",
                 bound.label
             );
@@ -2187,10 +2187,10 @@ mod tests {
             validate_artifact(&dir, image, &artifact);
             let file = artifact;
             println!(
-                "global_shapes replay {}: wall={:?} sha256={} accepted_identities={}/{} ghidra_quarantined={} thumb_quarantined={} quarantine_errors={} instructions_decoded={} decode_failures={} state_barriers={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
+                "global_shapes replay {}: wall={:?} blake3={} accepted_identities={}/{} ghidra_quarantined={} thumb_quarantined={} quarantine_errors={} instructions_decoded={} decode_failures={} state_barriers={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
                 bound.label,
                 first_elapsed,
-                sha256_bytes(&first),
+                blake3_bytes(&first),
                 file["analysis"]["arm_functions"],
                 file["analysis"]["thumb_functions"],
                 first_report.ghidra_quarantined,
@@ -2277,8 +2277,8 @@ mod tests {
 
         assert_eq!(first, second, "{label} artifact bytes drifted between runs");
         assert_eq!(
-            sha256_bytes(&first),
-            sha256_bytes(&second),
+            blake3_bytes(&first),
+            blake3_bytes(&second),
             "{label} artifact hash drifted between runs"
         );
         assert_eq!(
@@ -2303,9 +2303,9 @@ mod tests {
         let artifact: Value = serde_json::from_slice(&first).expect("artifact JSON");
         let analysis = &artifact["analysis"];
         println!(
-            "global_shapes interprocedural yield {label}: wall={:?} sha256={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
+            "global_shapes interprocedural yield {label}: wall={:?} blake3={} inferred={} no_evidence={} conflicting={} direct_calls_resolved={} call_facts_unresolved={} seeded_callees={} seed_vectors={} interprocedural_observations={} interprocedural_dropped={} cross_block_join_kills={} cross_block_join_facts={} cross_block_entry_facts={} cross_block_propagated_facts={} cross_block_functions={} cross_block_seeded_functions={}",
             first_elapsed,
-            sha256_bytes(&first),
+            blake3_bytes(&first),
             first_report.inferred,
             first_report.no_evidence,
             first_report.conflicting,

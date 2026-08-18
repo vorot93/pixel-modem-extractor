@@ -1,7 +1,7 @@
-//! Shared v3 artifact checks for env-gated goldens and retained-tree replay.
+//! Shared v4 artifact checks for env-gated goldens and retained-tree replay.
 
-use super::FORMAT_V3;
-use crate::manifest::sha256_file;
+use super::FORMAT_V4;
+use crate::manifest::blake3_file;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -26,7 +26,7 @@ pub fn validate_artifact_files(
     artifact: &Value,
 ) {
     let label = require_str(report_image, "image");
-    assert_eq!(require_str(artifact, "format"), FORMAT_V3);
+    assert_eq!(require_str(artifact, "format"), FORMAT_V4);
     assert_eq!(require_str(artifact, "image"), label);
 
     let manifest: Value =
@@ -44,24 +44,24 @@ pub fn validate_artifact_files(
     let image_len = u32::try_from(std::fs::metadata(&image_path).unwrap().len())
         .expect("image length fits u32");
     let inputs = &artifact["inputs"];
-    assert!(is_sha256_hex(require_str(inputs, "image_sha256")));
-    assert!(is_sha256_hex(require_str(inputs, "globals_sha256")));
-    assert!(is_sha256_hex(require_str(inputs, "functions_sha256")));
+    assert!(is_blake3_hex(require_str(inputs, "image_blake3")));
+    assert!(is_blake3_hex(require_str(inputs, "globals_blake3")));
+    assert!(is_blake3_hex(require_str(inputs, "functions_blake3")));
     assert_eq!(
-        require_str(inputs, "image_sha256"),
-        sha256_file(&image_path).unwrap()
+        require_str(inputs, "image_blake3"),
+        blake3_file(&image_path).unwrap()
     );
     assert_eq!(
-        require_str(inputs, "globals_sha256"),
-        sha256_file(&globals_path).unwrap()
+        require_str(inputs, "globals_blake3"),
+        blake3_file(&globals_path).unwrap()
     );
     assert_eq!(
-        require_str(inputs, "functions_sha256"),
-        sha256_file(&functions_path).unwrap()
+        require_str(inputs, "functions_blake3"),
+        blake3_file(&functions_path).unwrap()
     );
 
     let report_has_thumb = report_image.get("thumb_functions").is_some();
-    match inputs.get("thumb_functions_sha256") {
+    match inputs.get("thumb_functions_blake3") {
         Some(Value::Null) | None => {
             assert!(
                 !report_has_thumb,
@@ -77,10 +77,10 @@ pub fn validate_artifact_files(
                 report_has_thumb,
                 "{label}: thumb hash is present but report has no Thumb inventory"
             );
-            assert!(is_sha256_hex(hash));
-            assert_eq!(hash, &sha256_file(&thumb_path).unwrap());
+            assert!(is_blake3_hex(hash));
+            assert_eq!(hash, &blake3_file(&thumb_path).unwrap());
         }
-        other => panic!("{label}: thumb_functions_sha256 has unexpected value {other:?}"),
+        other => panic!("{label}: thumb_functions_blake3 has unexpected value {other:?}"),
     }
 
     let globals_json: Value =
@@ -273,7 +273,7 @@ fn is_canonical_hex(value: &str) -> bool {
         .is_some_and(|parsed| format!("0x{parsed:x}") == value)
 }
 
-fn is_sha256_hex(value: &str) -> bool {
+fn is_blake3_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
