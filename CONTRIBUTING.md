@@ -701,9 +701,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   BOTH files. A re-commit placed anywhere before `Finalize` is re-staled by
   finalize's writes, so the FINAL sweep's re-commit (after `Finalize`,
   before the post-symbol RF/hwcfg stages, which write no hashed input) is
-  the tree's truth. The re-run is idempotent
-  (identical inventories → identical decode inputs; only the input hashes
-  differ) and replaces the single `global_shapes` stage entry in place
+   the tree's truth. The re-run is idempotent (identical inventories →
+   identical decode inputs and totals; the input hashes and the observation
+   context names — `functions.json` names rewritten by pass 2 / finalize —
+   may differ) and replaces the single `global_shapes` stage entry in place
   (`record_global_shapes_stage`) so the report carries exactly one entry
   with the final sweep's totals. On **`--no-symbol-pass`** it still
   runs last, after the route's second `Finalize`, exactly once — that route

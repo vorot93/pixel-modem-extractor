@@ -1033,7 +1033,9 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // inputs. Nothing after this point rewrites a hashed input:
         // decode_rf/hardware_config write only under rf/. Idempotent by the
         // reorder's safety argument above: identical inventories → identical
-        // decode inputs → byte-identical artifact except the input hashes.
+        // decode inputs and totals; the input hashes and the observation
+        // context names (functions.json names rewritten by pass 2 / finalize)
+        // may differ.
         run_step(SymbolRouteStep::RefreshGlobalShapes);
     }
 }
@@ -2331,7 +2333,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     // still rewrites the sidecar's hashed inputs, so `RefreshGlobalShapes`
     // must still re-run — binding currentness from these, since the pass-1
     // inventories remain the current truth when pass 2 never touched an
-    // image. Empty on every other branch (unused there).
+    // image. The clone precedes the `run_two_pass` match, so the `Ok(pass2)`
+    // arm populates it too (unused there); it stays empty only when there is
+    // no pass-1 report or pass 2 scheduled zero images.
     let mut retained_pass1_images: Vec<decompile::ImageResult> = Vec::new();
     orchestrate_symbol_route(opts.no_symbol_pass, |step| match step {
         SymbolRouteStep::PrepareNamesAndProjection => {

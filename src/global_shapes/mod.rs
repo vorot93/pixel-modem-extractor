@@ -1059,7 +1059,7 @@ mod tests {
             32,
             vec![thumb_range(
                 &hex(INTERPROC_CALLEE_ENTRY),
-                &hex(INTERPROC_CALLEE_ENTRY + 2),
+                &hex(INTERPROC_CALLEE_ENTRY + 4),
             )],
         )]));
     }
@@ -1221,8 +1221,11 @@ mod tests {
 
         /// A dedicated (non-`fixture`-derived) decoder for the depth-1
         /// interprocedural coordinator test: an ARM caller does
-        /// `mov r0, &g_scalar` then a direct `bl` into a Thumb callee, which
-        /// dereferences the seeded `r0` with `str [r0, #0]`.
+        /// `mov r0, &g_scalar` then a direct `bl` into a Thumb callee. The
+        /// callee's entry block holds only an unconditional branch; the
+        /// seeded `str [r0, #0]` sits in the successor block (mirroring
+        /// `seeded_fact_flows_beyond_the_entry_block`), so the seeded fact
+        /// must cross a block edge to reach its dereference.
         fn with_interproc_call() -> Self {
             let mut decoder = Self {
                 crate_name: "test-decoder",
@@ -1253,9 +1256,18 @@ mod tests {
             );
             decoder.insns.insert(
                 (Isa::Thumb, INTERPROC_CALLEE_ENTRY),
-                mem(
+                branch(
                     Isa::Thumb,
                     INTERPROC_CALLEE_ENTRY,
+                    2,
+                    INTERPROC_CALLEE_ENTRY + 2,
+                ),
+            );
+            decoder.insns.insert(
+                (Isa::Thumb, INTERPROC_CALLEE_ENTRY + 2),
+                mem(
+                    Isa::Thumb,
+                    INTERPROC_CALLEE_ENTRY + 2,
                     2,
                     R0,
                     0,
@@ -1519,6 +1531,20 @@ mod tests {
                 >= 1
         );
         assert_eq!(file["analysis"]["interprocedural_dropped"], 0);
+        // Cross-block counters, derived from the fixture's CFG (see
+        // `with_interproc_call`): the only (block, register) arrival is the
+        // seeded r0 joining the callee's second block (join_facts 1, and it
+        // survives the single-edge join so join_kills 0); that same non-entry
+        // block's final in-state holds the one fact (entry_facts 1,
+        // join_survivor → cross_block_functions 1, seed non-empty →
+        // cross_block_seeded_functions 1); the store's provenance is the
+        // empty seed path, so nothing propagates (propagated_facts 0).
+        assert_eq!(file["analysis"]["cross_block_join_kills"], 0);
+        assert_eq!(file["analysis"]["cross_block_join_facts"], 1);
+        assert_eq!(file["analysis"]["cross_block_entry_facts"], 1);
+        assert_eq!(file["analysis"]["cross_block_propagated_facts"], 0);
+        assert_eq!(file["analysis"]["cross_block_functions"], 1);
+        assert_eq!(file["analysis"]["cross_block_seeded_functions"], 1);
         assert!(report.inferred >= 1);
     }
 
