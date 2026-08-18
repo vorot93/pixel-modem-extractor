@@ -705,7 +705,7 @@ pub fn run(input: &Path, out: &Path, opts: &Opts) -> Result<PathBuf> {
         .unwrap_or("MAIN")
         .to_string();
     let data = std::fs::read(input)?;
-    let sha = crate::manifest::sha256_bytes(&data);
+    let blake3 = crate::manifest::blake3_bytes(&data);
     let strings = extract_strings(&data, opts.min_run);
     let occ = detect_occurrences(&strings);
     let (attributed, confidence) = if opts.no_attribution {
@@ -724,7 +724,7 @@ pub fn run(input: &Path, out: &Path, opts: &Opts) -> Result<PathBuf> {
     let (_written, collisions) = materialize_tree(&tree, out, &image_name)?;
     let meta = serde_json::json!({
         "source_image": input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        "sha256": sha,
+        "blake3": blake3,
         "base": format!("0x{BASE:x}"),
         "size": data.len(),
         "params": {"gap": opts.gap, "shared_pct": opts.shared_pct, "min_run": opts.min_run, "attribution": !opts.no_attribution},
@@ -1050,7 +1050,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         write_manifest(
             &tmp,
-            serde_json::json!({"sha256": "deadbeef"}),
+            serde_json::json!({"blake3": "deadbeef"}),
             &tree,
             &bare,
             &["a/b".to_string()],
