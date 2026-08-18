@@ -147,6 +147,8 @@ pub enum Commands {
         #[arg(long)]
         token_db: Option<PathBuf>,
     },
+    /// Print the whole-tree pme-paq-v1 hash of <dir> (one 64-hex value); writes nothing
+    TreeHash { dir: PathBuf },
 }
 
 fn default_out(img: &Path) -> PathBuf {
@@ -297,6 +299,10 @@ pub fn run() -> anyhow::Result<()> {
             };
             let root = crate::symbolicate::run(&path, &opts)?;
             println!("symbolicated -> {}", root.display());
+        }
+        Commands::TreeHash { dir } => {
+            let hash = crate::tree_hash::pme_paq_v1(&dir)?;
+            println!("{hash}");
         }
     }
     Ok(())
@@ -761,5 +767,28 @@ mod tests {
             !help.contains("--globals-k-thumb"),
             "hidden test-only flag should not appear in help:\n{help}"
         );
+    }
+
+    #[test]
+    fn parses_tree_hash() {
+        let cli = Cli::try_parse_from(["pme", "tree-hash", "/tmp/some_tree"]).unwrap();
+        match cli.command {
+            Commands::TreeHash { dir } => {
+                assert_eq!(dir, PathBuf::from("/tmp/some_tree"));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn tree_hash_help_mentions_the_scheme() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tree-hash")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("pme-paq-v1"), "help:\n{help}");
     }
 }
