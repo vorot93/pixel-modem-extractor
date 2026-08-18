@@ -1,8 +1,33 @@
 use crate::error::{Error, Result};
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
+
+pub fn blake3_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Stream a reader into a blake3 hex digest. Handles short reads (any
+/// `read` returning 0..=buf.len()) without requiring a full-buffer fill.
+fn blake3_reader(mut reader: impl Read) -> Result<String> {
+    let mut h = Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
+pub fn blake3_file(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path)?;
+    blake3_reader(file)
+}
 
 fn hex_digest(h: Sha256) -> String {
     let result = h.finalize();
@@ -264,6 +289,31 @@ mod tests {
             self.next_n = if self.next_n >= 3 { 1 } else { self.next_n + 1 };
             Ok(n)
         }
+    }
+
+    #[test]
+    fn blake3_bytes_pins_empty_input_vector_and_lowercase_hex() {
+        let h = blake3_bytes(b"");
+        assert_eq!(
+            h,
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_eq!(h.len(), 64);
+        assert!(
+            h.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn blake3_file_matches_blake3_bytes_via_streaming() {
+        let dir = std::env::temp_dir().join(format!("pme_blake3_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input.bin");
+        let payload = vec![0xA5u8; 200_000]; // > one 64 KiB buffer to exercise short-read streaming
+        std::fs::write(&path, &payload).unwrap();
+        assert_eq!(blake3_file(&path).unwrap(), blake3_bytes(&payload));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -17,10 +17,12 @@ path = "src/bin/main.rs"
 [dependencies]
 anyhow = "1"
 atomic-write-file = "0.3.1"
+blake3 = "1.8.6"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1.5"
 ext4-view = { version = "0.9", features = ["std"] }
 flate2 = "1"
+paq = "1.4.1"
 regex = "1"
 scaleservers-arm32-assembly = "1.0.0"
 serde = { version = "1", features = ["derive"] }
