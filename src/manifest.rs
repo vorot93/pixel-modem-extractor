@@ -117,7 +117,7 @@ pub(crate) fn load_addr_for_image(manifest_path: &Path, image_label: &str) -> Re
 pub struct ManifestEntry {
     pub path: String,
     pub size: u64,
-    pub sha256: String,
+    pub blake3: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,7 +137,7 @@ pub struct TocImageInfo {
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub source_image: String,
-    pub source_sha256: String,
+    pub source_blake3: String,
     pub fbpk_name: String,
     pub tool_version: String,
     pub verified: bool,
@@ -152,7 +152,7 @@ impl Manifest {
         self.entries.push(ManifestEntry {
             path: rel.to_string_lossy().replace('\\', "/"),
             size: meta.len(),
-            sha256: sha256_file(file)?,
+            blake3: blake3_file(file)?,
         });
         Ok(())
     }
@@ -160,7 +160,7 @@ impl Manifest {
     pub fn write(&self, path: &Path) -> Result<()> {
         let mut view = Manifest {
             source_image: self.source_image.clone(),
-            source_sha256: self.source_sha256.clone(),
+            source_blake3: self.source_blake3.clone(),
             fbpk_name: self.fbpk_name.clone(),
             tool_version: self.tool_version.clone(),
             verified: self.verified,
@@ -190,7 +190,7 @@ mod tests {
         std::fs::write(dir.join("a.bin"), b"a").unwrap();
         let mut m = Manifest {
             source_image: "x.img".into(),
-            source_sha256: "deadbeef".into(),
+            source_blake3: "deadbeef".into(),
             fbpk_name: "g5400i".into(),
             tool_version: "0".into(),
             verified: false,
@@ -203,8 +203,10 @@ mod tests {
         m.write(&out).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["source_blake3"], "deadbeef");
         assert_eq!(v["entries"][0]["path"], "a.bin"); // sorted
         assert_eq!(v["entries"][0]["size"], 1);
+        assert_eq!(v["entries"][0]["blake3"], blake3_bytes(b"a"));
         assert_eq!(v["entries"].as_array().unwrap().len(), 2);
     }
 
@@ -319,13 +321,13 @@ mod tests {
     #[test]
     fn hash_reader_handles_short_reads_across_chunk_boundaries() {
         let payload: Vec<u8> = (0u8..=255).cycle().take(10_000).collect();
-        let expected = sha256_bytes(&payload);
+        let expected = blake3_bytes(&payload);
         let short = ShortRead {
             data: &payload,
             pos: 0,
             next_n: 1,
         };
-        let got = sha256_reader(short).unwrap();
+        let got = blake3_reader(short).unwrap();
         assert_eq!(got, expected);
     }
 }

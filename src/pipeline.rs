@@ -3,7 +3,7 @@ use crate::{
     ext4::Ext4Fs,
     fbpk::Fbpk,
     gzip,
-    manifest::{Manifest, TocImageInfo, sha256_bytes},
+    manifest::{Manifest, TocImageInfo, blake3_bytes},
     toc::Toc,
 };
 use std::path::{Path, PathBuf};
@@ -98,7 +98,7 @@ pub fn extract(img_path: &Path, out_dir: &Path, verify: bool) -> Result<PathBuf>
         .collect();
     let mut m = Manifest {
         source_image: img_path.display().to_string(),
-        source_sha256: sha256_bytes(&img),
+        source_blake3: blake3_bytes(&img),
         fbpk_name: fb.name.clone(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         verified: verify,
