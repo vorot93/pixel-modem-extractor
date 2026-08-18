@@ -147,14 +147,14 @@ pub fn write_csv(db: &Database) -> String {
 pub struct Summary {
     format: &'static str,
     input: String,
-    input_sha256: String,
+    input_blake3: String,
     entry_count: usize,
     unique_entries: usize,
     exact_duplicates: usize,
     colliding_tokens: usize,
     entries_with_removal_date: usize,
     csv: String,
-    csv_sha256: String,
+    csv_blake3: String,
 }
 
 pub fn build_summary(
@@ -189,14 +189,14 @@ pub fn build_summary(
     Summary {
         format: "Pigweed pw_tokenizer token database (TOKENS)",
         input: input_name.to_string(),
-        input_sha256: crate::manifest::sha256_bytes(input_bytes),
+        input_blake3: crate::manifest::blake3_bytes(input_bytes),
         entry_count,
         unique_entries,
         exact_duplicates: entry_count - unique_entries,
         colliding_tokens,
         entries_with_removal_date,
         csv: csv_name.to_string(),
-        csv_sha256: crate::manifest::sha256_bytes(csv.as_bytes()),
+        csv_blake3: crate::manifest::blake3_bytes(csv.as_bytes()),
     }
 }
 
@@ -321,8 +321,8 @@ mod tests {
         assert_eq!(s.exact_duplicates, 1);
         assert_eq!(s.colliding_tokens, 0);
         assert_eq!(s.entries_with_removal_date, 1);
-        assert_eq!(s.input_sha256.len(), 64);
-        assert_eq!(s.csv_sha256, crate::manifest::sha256_bytes(csv.as_bytes()));
+        assert_eq!(s.input_blake3.len(), 64);
+        assert_eq!(s.csv_blake3, crate::manifest::blake3_bytes(csv.as_bytes()));
     }
 
     #[test]

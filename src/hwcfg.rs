@@ -130,7 +130,7 @@ pub struct ConfigSummary {
 pub struct Summary {
     pub format: &'static str,
     pub input: String,
-    pub input_sha256: String,
+    pub input_blake3: String,
     pub num_configurations: usize,
     pub num_config_entries: usize,
     pub distinct_platform_product: usize,
@@ -174,7 +174,7 @@ pub fn build_summary(
     Summary {
         format: "Pixel modem hardware_config summary",
         input: input_name.to_string(),
-        input_sha256: crate::manifest::sha256_bytes(input_bytes),
+        input_blake3: crate::manifest::blake3_bytes(input_bytes),
         num_configurations: configs.len(),
         num_config_entries,
         distinct_platform_product,
@@ -310,7 +310,7 @@ mod tests {
             vec!["aaa".to_string(), "bbb".to_string()]
         ); // distinct, sorted
         assert_eq!(s.configurations[1].rf_cfg_shas, vec!["ccc".to_string()]);
-        assert_eq!(s.input_sha256.len(), 64);
+        assert_eq!(s.input_blake3.len(), 64);
         assert!(s.coverage.is_none());
 
         let present = BTreeSet::from(["aaa".to_string()]);
