@@ -21,3 +21,4 @@ pub mod source_tree;
 pub mod symbolicate;
 pub mod toc;
 pub mod tokens;
+pub mod tree_hash;

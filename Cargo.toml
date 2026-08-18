@@ -37,3 +37,6 @@ tracing-subscriber = "0.3"
 # (`analyzeHeadless` bash launcher + its Java grandchild) via `kill(-pgid, SIGKILL)`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.188"
+
+[dev-dependencies]
+tempfile = "3.27.0"
