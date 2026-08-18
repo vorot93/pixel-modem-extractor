@@ -248,15 +248,17 @@ fn image_matches(want: Option<&str>, label: &str, name: &str) -> bool {
 /// One image's `--run` result: either analyzed (with the function count ExportDecomp
 /// recorded) or `analyzeHeadless` exited non-zero. Recorded per image so a full run
 /// reports every partition instead of aborting on the first failure.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ImageOutcome {
     Analyzed(usize),
     Failed(i32),
 }
 
 /// One image's structured `--run` outcome, surfaced for callers that orchestrate
-/// (e.g. `decompose`) rather than just print.
-#[derive(Debug)]
+/// (e.g. `decompose`) rather than just print. `Clone` because the normal
+/// symbol route retains the pass-1 results across pass 2's by-value
+/// consumption of the report (see `retained_pass1_images` in `decompose`).
+#[derive(Debug, Clone)]
 pub struct ImageResult {
     pub label: String,
     pub outcome: ImageOutcome,

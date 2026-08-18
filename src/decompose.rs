@@ -960,14 +960,16 @@ enum SymbolRouteStep {
     RunGlobals(GlobalsRouteMode),
     RunGlobalShapes,
     DispatchPass2,
-    /// Normal-route only: re-run the `global_shapes` stage after
-    /// `DispatchPass2`'s input rewrites and re-commit the sidecar over the
-    /// tree's FINAL inputs. See `orchestrate_symbol_route`.
-    RefreshGlobalShapes,
-    /// Normal-route only: record the `global_types_apply` stage from the
-    /// pass-2 outcomes. Must follow `RefreshGlobalShapes` so the sidecar's
-    /// final re-commit is never interleaved after type-application reporting.
+    /// Records the `global_types_apply` stage from the pass-2 outcomes.
+    /// Pure reporting — runs no script, writes no file — so it sits between
+    /// `DispatchPass2` (whose rebuilds null the five `global_types_*` fields
+    /// it patches back in) and `Finalize`.
     ApplyGlobalTypes,
+    /// Normal-route only: re-run the `global_shapes` stage after the route's
+    /// LAST input rewrite — `Finalize`'s symbolicate pass stamps both
+    /// functions.json and thumb_functions.json — and re-commit the sidecar
+    /// over the tree's FINAL inputs. See `orchestrate_symbol_route`.
+    RefreshGlobalShapes,
 }
 
 fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(SymbolRouteStep)) {
@@ -1014,20 +1016,25 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // (Phase 3.2) for the full rationale.
         run_step(SymbolRouteStep::RunGlobalShapes);
         run_step(SymbolRouteStep::DispatchPass2);
-        // The first sweep's committed sidecar is born stale: inside
-        // DispatchPass2, pass 2's ownership-aware refresh rewrites
-        // functions.json and thumb_enrich_post_pass2 rewrites
-        // thumb_functions.json — the very files the sidecar hashes. Re-run
-        // the stage once more, after the last input rewrite, so the
-        // committed sidecar (and the single stage entry, replaced in place)
-        // reflects the tree's FINAL inputs. Idempotent by the reorder's
-        // safety argument above: identical inventories → identical decode
-        // inputs → byte-identical artifact except the input hashes.
-        run_step(SymbolRouteStep::RefreshGlobalShapes);
         run_step(SymbolRouteStep::ApplyGlobalTypes);
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
         });
+        // The first sweep's committed sidecar is born stale — twice over.
+        // Inside DispatchPass2, pass 2's ownership-aware refresh rewrites
+        // functions.json and thumb_enrich_post_pass2 rewrites
+        // thumb_functions.json; then Finalize — the route's LAST input
+        // rewriter — stamps name/original_name/annotations into BOTH files
+        // via symbolicate's rewrite_functions_json (measured e2e: those
+        // writes land after the earlier rewrites, so a re-commit placed
+        // between DispatchPass2 and Finalize is re-staled). Re-run the stage
+        // once more, after Finalize, so the committed sidecar (and the
+        // single stage entry, replaced in place) hashes the tree's FINAL
+        // inputs. Nothing after this point rewrites a hashed input:
+        // decode_rf/hardware_config write only under rf/. Idempotent by the
+        // reorder's safety argument above: identical inventories → identical
+        // decode inputs → byte-identical artifact except the input hashes.
+        run_step(SymbolRouteStep::RefreshGlobalShapes);
     }
 }
 
@@ -1812,9 +1819,9 @@ fn add_global_shapes_totals(
 /// earlier entry from a previous sweep in place (keeping its list position),
 /// or push when none exists. The normal route runs the stage twice — the
 /// first sweep (pre-pass-2, feeding `derive_global_types_maps`) and the final
-/// re-commit after pass 2 / `thumb_enrich_post_pass2` rewrite the sidecar's
-/// hashed inputs — and the report must carry exactly one entry reflecting the
-/// FINAL sweep's totals.
+/// re-commit after pass 2 / `thumb_enrich_post_pass2` / `symbolicate_finalize`
+/// rewrite the sidecar's hashed inputs — and the report must carry exactly
+/// one entry reflecting the FINAL sweep's totals.
 fn record_global_shapes_stage(stages: &mut Vec<StageReport>, report: StageReport) {
     match stages
         .iter()
@@ -2318,6 +2325,14 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let mut global_types_maps: HashMap<String, decompile::PreparedPass2Map> = HashMap::new();
     let mut global_types_ineligible: HashMap<String, usize> = HashMap::new();
     let mut pass2_elapsed_ms = 0u128;
+    // Pass-1 ImageResults retained across `run_two_pass`'s by-value
+    // consumption of `rep`: on the infrastructure-Err branch (pass 2
+    // processed zero images) `pass1_report` ends up `None`, but Finalize
+    // still rewrites the sidecar's hashed inputs, so `RefreshGlobalShapes`
+    // must still re-run — binding currentness from these, since the pass-1
+    // inventories remain the current truth when pass 2 never touched an
+    // image. Empty on every other branch (unused there).
+    let mut retained_pass1_images: Vec<decompile::ImageResult> = Vec::new();
     orchestrate_symbol_route(opts.no_symbol_pass, |step| match step {
         SymbolRouteStep::PrepareNamesAndProjection => {
             function_inputs = Some(take_globals_function_inputs(&mut function_maps));
@@ -2440,6 +2455,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     ));
                     pass1_report = Some(rep);
                 } else {
+                    // Retain before `run_two_pass` consumes `rep` by value —
+                    // see `retained_pass1_images`'s declaration for why the
+                    // Err branch below still needs these.
+                    retained_pass1_images = rep.images.clone();
                     match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &inputs) {
                         Ok(mut pass2) => {
                             let (refreshed_count, errors) = refresh_pass2_outputs_with(
@@ -2536,27 +2555,31 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             );
         }
         SymbolRouteStep::RefreshGlobalShapes => {
-            // Re-run the stage after the last rewrite of the sidecar's hashed
-            // inputs — inside `DispatchPass2` just above, pass 2's
-            // ownership-aware refresh rewrote functions.json and
-            // thumb_enrich_post_pass2 rewrote thumb_functions.json — so the
-            // re-committed sidecar (and the single stage entry, replaced in
-            // place) hashes the tree's FINAL inputs. Currentness binds from
-            // the post-dispatch `ImageResult`s, and the returned outcome map
-            // replaces the first sweep's so the report fields reflect this
-            // FINAL run. Skipped when pass 2 never dispatched (its infra
-            // failed before any image was processed, `pass1_report` is
-            // `None`): zero images processed means zero input rewrites, so
-            // the first sweep's commit is still current and its entry and
-            // outcomes — re-applied just above — remain the truth.
-            if let Some(report) = pass1_report.as_ref() {
-                global_shapes_outcomes = run_global_shapes_stage(
-                    &mut stages,
-                    &images_dir,
-                    &out.join("manifest.json"),
-                    &report.images,
-                );
-            }
+            // Re-run the stage after the route's LAST rewrite of the
+            // sidecar's hashed inputs — Finalize's symbolicate pass just
+            // stamped both functions.json and thumb_functions.json (on top
+            // of DispatchPass2's earlier pass-2 refresh and
+            // thumb_enrich_post_pass2 rewrites) — so the re-committed
+            // sidecar (and the single stage entry, replaced in place)
+            // hashes the tree's FINAL inputs; nothing after this point
+            // writes a hashed input (decode_rf/hardware_config write only
+            // under rf/). Always runs: Finalize rewrites inputs on every
+            // normal-route branch, including the pass-2 infrastructure
+            // failure where `pass1_report` is `None` — currentness binds
+            // there from the pass-1 ImageResults retained by DispatchPass2
+            // (pass 2 processed zero images, so the pass-1 inventories are
+            // still the current truth). The returned outcome map replaces
+            // the first sweep's so the report fields reflect this FINAL run.
+            let current_results = pass1_report
+                .as_ref()
+                .map(|report| report.images.as_slice())
+                .unwrap_or(&retained_pass1_images);
+            global_shapes_outcomes = run_global_shapes_stage(
+                &mut stages,
+                &images_dir,
+                &out.join("manifest.json"),
+                current_results,
+            );
         }
         SymbolRouteStep::ApplyGlobalTypes => {
             // Reading `pass1_report` here (rather than threading a separate
@@ -2566,9 +2589,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             // and Ok(pass2)), and `None` in exactly the branches that passed
             // `None` (run_two_pass Err, and no pass-1 report at all) — so it
             // already carries the right value per branch. Must run after
-            // `RefreshGlobalShapes` and after every DispatchPass2 rebuild of
-            // the decompile stage's `ImageReport`s: those rebuilds null the
-            // five `global_types_*` fields this stage patches back in.
+            // every DispatchPass2 rebuild of the decompile stage's
+            // `ImageReport`s: those rebuilds null the five `global_types_*`
+            // fields this stage patches back in. Pure reporting — it writes
+            // no file, so the later `RefreshGlobalShapes` re-commit (whose
+            // in-place patch touches only the nine disjoint
+            // `global_shapes_*` fields) cannot disturb it.
             let post_dispatch_images = pass1_report.as_ref().map(|report| report.images.as_slice());
             let global_types_stage = global_types_apply_stage(
                 false,
@@ -4145,16 +4171,20 @@ mod tests {
                 // as types alongside ApplyGlobals.
                 SymbolRouteStep::RunGlobalShapes,
                 SymbolRouteStep::DispatchPass2,
-                // Pass 2's ownership-aware functions.json refresh and
-                // thumb_enrich_post_pass2's thumb_functions.json rewrite both
-                // happen inside DispatchPass2 — the first sweep's sidecar is
-                // born stale, so the FINAL sweep re-commits it after the last
-                // input rewrite, and only then is type application reported.
-                SymbolRouteStep::RefreshGlobalShapes,
                 SymbolRouteStep::ApplyGlobalTypes,
+                // Finalize is the LAST rewriter of the sidecar's hashed
+                // inputs: symbolicate_finalize's rewrite_functions_json
+                // stamps name/original_name/annotations into BOTH
+                // functions.json and thumb_functions.json (its Ghidra-export
+                // refresh and thumb enrichment touch the same two files), so
+                // the FINAL shapes sweep must re-commit the sidecar after it —
+                // not merely after DispatchPass2's earlier rewrites. Measured
+                // e2e: finalize's writes land ~1 minute after the
+                // DispatchPass2-era re-commit, re-staling every sidecar.
                 SymbolRouteStep::Finalize {
                     rewrite_decompiled_c: false,
                 },
+                SymbolRouteStep::RefreshGlobalShapes,
             ]
         );
         for step in [
@@ -4227,10 +4257,12 @@ mod tests {
         );
 
         // Combined: on the normal route, RunGlobalShapes precedes
-        // DispatchPass2 (the whole point of the reorder), whose input
-        // rewrites are then re-committed by RefreshGlobalShapes before
-        // ApplyGlobalTypes reports type application; the route's closing
-        // Finalize precedes the post-symbol RF/hwcfg stages appended after it.
+        // DispatchPass2 (the whole point of the reorder); ApplyGlobalTypes
+        // reports type application off the pass-2 outcomes; the closing
+        // Finalize is the last input rewriter, and RefreshGlobalShapes
+        // re-commits the sidecar over the tree's FINAL inputs strictly after
+        // it — before the post-symbol RF/hwcfg stages (which rewrite no
+        // hashed input).
         let mut combined = Vec::new();
         orchestrate_symbol_route(false, |step| combined.push(format!("{step:?}")));
         orchestrate_post_symbol_route(|step| combined.push(format!("{step:?}")));
@@ -4242,10 +4274,6 @@ mod tests {
             .iter()
             .position(|step| step == "DispatchPass2")
             .expect("normal route dispatches pass 2");
-        let refresh_shapes = combined
-            .iter()
-            .position(|step| step == "RefreshGlobalShapes")
-            .expect("normal route re-commits global_shapes after pass 2");
         let apply_types = combined
             .iter()
             .position(|step| step == "ApplyGlobalTypes")
@@ -4254,6 +4282,10 @@ mod tests {
             .iter()
             .position(|step| step.starts_with("Finalize"))
             .expect("normal route ends with Finalize");
+        let refresh_shapes = combined
+            .iter()
+            .position(|step| step == "RefreshGlobalShapes")
+            .expect("normal route re-commits global_shapes after symbolicate_finalize");
         let decode_rf = combined.iter().position(|step| step == "DecodeRf").unwrap();
         let hardware = combined
             .iter()
@@ -4261,10 +4293,10 @@ mod tests {
             .unwrap();
         assert!(
             shapes < dispatch_pass2
-                && dispatch_pass2 < refresh_shapes
-                && refresh_shapes < apply_types
+                && dispatch_pass2 < apply_types
                 && apply_types < finalize
-                && finalize < decode_rf
+                && finalize < refresh_shapes
+                && refresh_shapes < decode_rf
                 && decode_rf < hardware,
             "{combined:?}"
         );
@@ -6173,19 +6205,22 @@ mod tests {
 
     #[test]
     fn global_shapes_final_rerun_recommits_sidecar_over_rewritten_inputs() {
-        // Task 6c-2 regression: the normal route's first sweep runs before
-        // DispatchPass2, but pass 2's ownership-aware refresh rewrites
-        // functions.json and thumb_enrich_post_pass2 rewrites
-        // thumb_functions.json — so the first sweep's committed sidecar hashes
-        // inputs that are stale by the time the route finishes (every
-        // normal-route tree was born failing validate_artifact on
-        // functions_sha256). The route answer — re-run the REAL stage after
-        // the last input rewrite — is modeled here by calling the stage
-        // wrapper twice over a fixture, rewriting both hashed inputs in
-        // between exactly as pass 2 / thumb_enrich do (same inventory, same
-        // counts, different bytes), and asserting the tree ends with exactly
-        // one global_shapes stage entry whose committed sidecar hashes the
-        // FINAL files.
+        // Task 6c-2 regression (fix round 1): the normal route's first sweep
+        // runs before DispatchPass2, but three later steps rewrite the
+        // sidecar's hashed inputs — pass 2's ownership-aware refresh
+        // (functions.json), thumb_enrich_post_pass2 (thumb_functions.json),
+        // and symbolicate_finalize (BOTH files: name/original_name/
+        // annotations stamps) — so any commit earlier than after Finalize is
+        // born stale (the first implementation re-committed after
+        // thumb_enrich_post_pass2 and was re-staled by finalize's writes;
+        // measured e2e mtimes: finalize rewrites both files ~1 minute after
+        // that re-commit). The route answer — re-run the REAL stage after the
+        // last input rewriter — is modeled here by calling the stage wrapper
+        // twice over a fixture, replaying all three rewrites in order between
+        // the sweeps (the finalize one through the real
+        // symbolicate::rewrite_functions_json), and asserting the tree ends
+        // with exactly one global_shapes stage entry whose committed sidecar
+        // hashes the FINAL files.
         let root = std::env::temp_dir().join(format!(
             "pme_global_shapes_final_rerun_{}",
             std::process::id()
@@ -6242,10 +6277,16 @@ mod tests {
             serde_json::Value::String(manifest::sha256_bytes(&pass1_thumb))
         );
 
-        // Simulate the route's post-first-sweep input rewrites: pass 2's
-        // ownership-aware refresh rewrites functions.json (recovered names,
-        // same inventory) and thumb_enrich_post_pass2 rewrites
-        // thumb_functions.json (body_c populated, same counts).
+        // Simulate the route's post-first-sweep input rewrites in execution
+        // order: (1) pass 2's ownership-aware refresh rewrites functions.json
+        // (recovered names, same inventory); (2) thumb_enrich_post_pass2
+        // rewrites thumb_functions.json (body_c populated, same counts);
+        // (3) symbolicate_finalize rewrites BOTH files again —
+        // rewrite_functions_json stamps name/original_name/annotations into
+        // every entry matched by address, and it runs AFTER the old
+        // RefreshGlobalShapes slot (between ApplyGlobalTypes and the route's
+        // end), which is exactly why the re-commit must follow Finalize.
+        // Drive the REAL finalize rewriter, not a byte simulation.
         let pass2_functions = tagged_functions("recovered_4000");
         std::fs::write(&functions_path, &pass2_functions).unwrap();
         let rewritten_thumb = {
@@ -6254,10 +6295,30 @@ mod tests {
             serde_json::to_vec(&value).unwrap()
         };
         std::fs::write(&thumb_path, &rewritten_thumb).unwrap();
+        symbolicate::rewrite_functions_json(
+            &decompiled,
+            &[test_symbol(
+                "0x4000",
+                "arm",
+                Some("Recovered_4000"),
+                symbolicate::Tier::Recovered,
+            )],
+        )
+        .unwrap();
+        let final_functions = std::fs::read(&functions_path).unwrap();
+        let final_thumb = std::fs::read(&thumb_path).unwrap();
+        assert_ne!(
+            final_functions, pass2_functions,
+            "the finalize stamp must change functions.json bytes"
+        );
+        assert_ne!(
+            final_thumb, rewritten_thumb,
+            "the finalize stamp must change thumb_functions.json bytes"
+        );
 
-        // The final re-run (the route's RefreshGlobalShapes step): same
-        // current inventories — pass 2 is -noanalysis, so function boundaries
-        // never move between the sweeps.
+        // The final re-run (the route's RefreshGlobalShapes step, after
+        // Finalize): same current inventories — pass 2 is -noanalysis, so
+        // function boundaries never move between the sweeps.
         let final_outcomes =
             run_global_shapes_stage(&mut stages, &images_dir, &manifest_path, &current);
 
@@ -6282,24 +6343,35 @@ mod tests {
             )
         );
 
-        // The committed sidecar hashes the FINAL files, not the pass-1 ones.
+        // The committed sidecar hashes the FINAL files — post-finalize bytes,
+        // not the pass-1 or even the pass-2/thumb-era ones.
         let final_sidecar: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
         assert_eq!(
             final_sidecar["inputs"]["functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&pass2_functions))
+            serde_json::Value::String(manifest::sha256_bytes(&final_functions))
         );
         assert_ne!(
             final_sidecar["inputs"]["functions_sha256"],
             first_sidecar["inputs"]["functions_sha256"]
         );
+        assert_ne!(
+            final_sidecar["inputs"]["functions_sha256"],
+            serde_json::Value::String(manifest::sha256_bytes(&pass2_functions)),
+            "the final commit must reflect the finalize rewrite, not stop at pass 2's"
+        );
         assert_eq!(
             final_sidecar["inputs"]["thumb_functions_sha256"],
-            serde_json::Value::String(manifest::sha256_bytes(&rewritten_thumb))
+            serde_json::Value::String(manifest::sha256_bytes(&final_thumb))
         );
         assert_ne!(
             final_sidecar["inputs"]["thumb_functions_sha256"],
             first_sidecar["inputs"]["thumb_functions_sha256"]
+        );
+        assert_ne!(
+            final_sidecar["inputs"]["thumb_functions_sha256"],
+            serde_json::Value::String(manifest::sha256_bytes(&rewritten_thumb)),
+            "the final commit must reflect the finalize rewrite, not stop at thumb_enrich's"
         );
         // Un-rewritten inputs keep their hashes.
         assert_eq!(
@@ -6869,12 +6941,16 @@ mod tests {
 
     #[test]
     fn global_shapes_stage_both_routes_enter_wrapper_exactly_once() {
-        // Both symbol routes must reach `run_global_shapes_stage_with` exactly
-        // once, but at different points: the normal route now runs it
-        // *before* DispatchPass2 (the input-safe reorder — shapes must be
-        // ready for a later pass-2 apply step); `--no-symbol-pass` has no
-        // pass 2 to feed, so it still runs shapes last, after globals.json
-        // exists (RunGlobals(RecordOnly), the "skip" event below).
+        // Both symbol routes must reach `run_global_shapes_stage_with` from
+        // the `RunGlobalShapes` step, but at different points: the normal
+        // route runs the first sweep *before* DispatchPass2 (the input-safe
+        // reorder — shapes must be ready for a later pass-2 apply step; the
+        // route's second, re-committing entry after Finalize is pinned by
+        // `direct_symbol_routes_preserve_exact_once_order` and exercised by
+        // `global_shapes_final_rerun_recommits_sidecar_over_rewritten_inputs`);
+        // `--no-symbol-pass` has no pass 2 to feed, so it runs shapes once,
+        // last, after globals.json exists (RunGlobals(RecordOnly), the "skip"
+        // event below).
         let root = std::env::temp_dir().join(format!(
             "pme_global_shapes_stage_routes_{}",
             std::process::id()

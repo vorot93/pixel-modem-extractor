@@ -782,7 +782,9 @@ fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
 /// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
 /// and `thumb_functions.json` (matched by entry address), preserving all other
 /// fields. Operates on `serde_json::Value` to avoid a lossy round-trip.
-fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
+/// `pub(crate)` so `decompose`'s route tests can drive the real finalize
+/// rewriter when modeling the symbol-route input-rewrite sequence.
+pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
     // entry vaddr -> symbol (numeric, so "0x10" and "0x00000010" match).
     let by_addr: HashMap<u64, &Symbol> = symbols
         .iter()

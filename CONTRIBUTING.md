@@ -692,11 +692,16 @@ hardcoded. Two reference images exercise both models end-to-end:
   apply the recovered shapes as `undefinedN` types via `ApplyGlobalTypes.java`
   alongside `ApplyGlobals` (see **Phase 3.2 type application** below; this
   stage itself only produces the sidecar) — and then **once more** via
-  `SymbolRouteStep::RefreshGlobalShapes`, after `DispatchPass2`, because pass
-  2's ownership-aware refresh rewrites `functions.json` and
-  `thumb_enrich_post_pass2` rewrites `thumb_functions.json` — the very files
-  the sidecar hashes — so the first sweep's commit is born stale and the
-  FINAL sweep's re-commit is the tree's truth. The re-run is idempotent
+  `SymbolRouteStep::RefreshGlobalShapes`, after the route's closing
+  `Finalize`, because three later steps rewrite the files the sidecar
+  hashes: pass 2's ownership-aware refresh (`functions.json`),
+  `thumb_enrich_post_pass2` (`thumb_functions.json`), and — the last of
+  them, measured e2e — `symbolicate_finalize`, whose
+  `rewrite_functions_json` stamps `name`/`original_name`/`annotations` into
+  BOTH files. A re-commit placed anywhere before `Finalize` is re-staled by
+  finalize's writes, so the FINAL sweep's re-commit (after `Finalize`,
+  before the post-symbol RF/hwcfg stages, which write no hashed input) is
+  the tree's truth. The re-run is idempotent
   (identical inventories → identical decode inputs; only the input hashes
   differ) and replaces the single `global_shapes` stage entry in place
   (`record_global_shapes_stage`) so the report carries exactly one entry
@@ -719,10 +724,12 @@ hardcoded. Two reference images exercise both models end-to-end:
   `decompiled.c` / `disasm.lst` / `functions.json` and must not touch this
   sidecar. **Provenance consequence of the reorder + re-commit:** the
   committed sidecar's `functions_sha256` / `thumb_functions_sha256` hash the
-  FINAL post-pass-2 files (recovered names, post-enrich Thumb), exactly as
-  pre-reorder trees did — trees produced between the reorder and the
-  re-commit fix carry pass-1-era hashes and are born failing
-  `validate_artifact`; re-run `decompose` to regenerate them. The
+  FINAL post-finalize files (recovered names, post-enrich Thumb,
+  finalize-stamped), exactly as pre-reorder trees did — trees produced
+  between the reorder and the re-commit fix, or by the re-commit's first
+  version (which ran before `symbolicate_finalize`), carry stale hashes and
+  are born failing `validate_artifact`; re-run `decompose` to regenerate
+  them. The
   recovered/counted shape set is unaffected either way (the decoder never
   reads names). Re-baseline any golden or fixture that pins a literal
   `functions_sha256` string.
@@ -1030,12 +1037,15 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **Phase 3.2 environment traps.** Currentness comes from the current-run
   markers, not leftover files. A retained `global_shapes.json` that fails
   hash validation is not necessarily corrupt: trees produced between the
-  pre-pass-2 reorder and the `RefreshGlobalShapes` re-commit fix are born
-  hash-stale by construction (pass 2 and `thumb_enrich_post_pass2` rewrote
-  the hashed inputs after the first commit; the final re-commit after the
-  last rewrite is the tree's truth, and the report carries exactly one
-  `global_shapes` stage entry with its totals) — re-run `decompose` to
-  regenerate rather than debug (see the stage-placement bullet above).
+  pre-pass-2 reorder and the `RefreshGlobalShapes` re-commit fix (or by the
+  first version of that fix, which re-committed after
+  `thumb_enrich_post_pass2` but before `symbolicate_finalize`) are born
+  hash-stale by construction (pass 2, `thumb_enrich_post_pass2`, and
+  `symbolicate_finalize` rewrote the hashed inputs after those commits; the
+  final re-commit after the last rewrite is the tree's truth, and the report
+  carries exactly one `global_shapes` stage entry with its totals) — re-run
+  `decompose` to regenerate rather than debug (see the stage-placement
+  bullet above).
   A retained v2 `global_shapes.json` (e.g. the cheetah reference tree,
   stale-vintage by design) is rejected by the v3 validators — measure
   current behavior in-memory with
