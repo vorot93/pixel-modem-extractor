@@ -60,7 +60,10 @@ fn extract_matches_golden() {
 
 /// Whole-tree pin: a fresh extract must reproduce the golden tree's
 /// pme-paq-v1 — not just the individual leaves `extract_matches_golden`
-/// checks. Same env vars and skip conditions as that test.
+/// checks. Same env vars as that test; unlike it, the golden root here is a
+/// **modern-layout** pristine `extract` output (`modem.bin.split/` at the
+/// root) — the whole tree is hashed, so the root must contain nothing
+/// beyond what `extract` writes.
 #[test]
 fn extract_tree_matches_golden_paqs() {
     let (Some(img), Some(root)) = (
@@ -70,7 +73,7 @@ fn extract_tree_matches_golden_paqs() {
         eprintln!("skip: set PME_RADIO_IMG and PME_GOLDEN_DIR");
         return;
     };
-    let gold_split = root.join(FW).join("modem.bin.split");
+    let gold_split = root.join("modem.bin.split");
     if !img.exists() || !gold_split.exists() {
         eprintln!("skip: golden inputs absent");
         return;
