@@ -120,8 +120,11 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   reference location with the new binary; then `pixel-modem-extractor
   tree-hash <dir>` each pinned surface/tree and record the values; set
   `PME_GOLDEN_DIR`/`PME_DECOMPOSED_GOLDEN_DIR`/`PME_RADIO_IMG` and run
-  `cargo test` to confirm the paq assertions pass. Old goldens embed sha256/v3
-  fields and cannot be reused.
+  `cargo test` to confirm the paq assertions pass. Use the same `PME_RADIO_IMG`
+  path *spelling* (e.g. one fixed absolute path) for the re-baseline and every
+  verification run — `manifest.json` embeds the path string as passed
+  (`pipeline.rs` `source_image`), so a relative-vs-absolute difference shifts
+  the pinned hashes. Old goldens embed sha256/v3 fields and cannot be reused.
 
 ## Repository layout
 
