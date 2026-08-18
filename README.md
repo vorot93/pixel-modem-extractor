@@ -85,6 +85,7 @@ its full set of flags.
 | `hardware-config <hardware_config.json>` | Structural stats + RF_CFG-coverage summary. `--rf-dir` cross-checks which calibration blobs are actually present. Default out `./hwcfg_summary/`. |
 | `decompile <modem.bin>` | Write a Ghidra import kit for all code images at their load addresses (the image set is model-dependent — six on mustang, four on cheetah). `--run` drives `analyzeHeadless` (needs a local Ghidra) to export decompiled C, a disassembly listing, and a function inventory; selected images with dense Thumb regions also use radare2 (`r2`) and fail if those regions cannot be analyzed. `--image`, `--ghidra-home`, `--processor` (default `ARM:LE:32:v7`). `--no-thumb-decompile` reverts Phase-2 Thumb decompilation to Phase-1 datamark behavior. |
 | `symbolicate <decomposed_dir>` | Recover function names + inline log/assert/file annotations from evidence already produced (pw_tokenizer DB, `__func__`, attributed strings), rewriting `decompiled.c`/`disasm.lst`/`functions.json`/`thumb_functions.json` **in place** and emitting `symbols.json`. Tiered + fail-closed (precedence `__func__` > registration > token > string-ref): `__func__` and `{name,fn}` **registration-table** matches yield authoritative (`Recovered`) renames; token matches become marked `guess_…` names; strings/files are comments. `--token-db` gives the raw `pw_token_db` (TOKENS); without it, token evidence is skipped. Registration names come from scanning the raw image for handler/dispatch tables (AT-command, ISR, protocol) whose pointer resolves to a known function entry — the crown-jewel names (e.g. `AtiParsePlusCOPS`, `PICH_HISR`), ~100% precision but a small set (~233 mustang / 101 cheetah). Also derives lowest-precedence `guess_*` names from a function's uniquely-referenced identifier string (fail-closed: dropped if all-caps, a recovered global, or another function's name), recorded as `string_ref` evidence. It also runs automatically as a `decompose` stage. |
+| `tree-hash <dir>` | Print the whole-tree `pme-paq-v1` hash of `<dir>` — one lowercase 64-hex value — and write nothing. Fails closed with no hash printed if the target is missing, not a directory, contains a symlink, or has any non-UTF-8 path component. No external tools. |
 | `unpack-fbpk <radio.img>` | Lower-level: emit `modem.ext4` (a partial-pipeline shortcut — currently runs the full `extract` under the hood). |
 | `split-toc <modem.bin>` | Lower-level: split a `modem.bin` into its TOC images (stage 5 of `extract`). |
 
@@ -101,7 +102,7 @@ its full set of flags.
     ├── modem.bin.split/         # TOC images; set is model-dependent:
     │                            #   mustang: 00_BOOT 01_PSP 02_MAIN 03_APM 04_VSS 05_DBGCORE
     │                            #   cheetah: 00_BOOT 01_MAIN 02_VSS 03_APM   (MAIN is *_MAIN)
-    └── manifest.json            # input/output sizes, SHA-256, and the TOC image table
+    └── manifest.json            # input/output sizes, blake3 digests, and the TOC image table
 
 `decompose` writes (default `./<img>.decomposed/`; `--prune` keeps only these leaf artifacts):
 
@@ -183,6 +184,9 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   skips only that application step); this sidecar's own content reflects
   shape evidence only and is unaffected either way — see the `decompose` row
   above.
+- **pme-paq-v1** — blake3 leaf-set (root-relative path + file bytes) over an entire tree, hidden
+  entries included, no exclusion list; produced by the `tree-hash` subcommand and used for golden
+  reproducibility pinning.
 
 ## Contributing
 

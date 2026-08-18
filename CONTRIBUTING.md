@@ -95,6 +95,34 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   (`analyzeHeadless`) and radare2 (`r2`); both are probed up front.
 - Write the failing test first (TDD), then the minimal code to pass it.
 
+### Hashing and golden identity
+
+- Per-file/per-bytes digests are **blake3** (`manifest::blake3_bytes` /
+  `blake3_file`), serialized as `*_blake3` JSON fields. The `sha2` crate is
+  gone. Exception: `hwcfg`'s `present_shas`/`referenced_shas`/`entries[].sha`
+  are RF_CFG blob identifiers (corpus nomenclature), not digests.
+- Whole-tree identity is **`pme-paq-v1`** (`src/tree_hash.rs`): `paq::hash_source`
+  blake3 leaf-set, hidden entries included, zero exclusions, fail-closed
+  (missing/non-dir/symlink/non-UTF-8 → `Error::BadTree`, no hash). Pinned test
+  vector locks the scheme; any `paq` crate bump that moves it requires a named
+  `pme-paq-v2` revision plus fresh goldens.
+- Golden pinning: the `extract` output tree is pinned whole-tree
+  (`extract_tree_matches_golden_paqs`); `decompose` pins only its
+  by-construction deterministic surfaces (`manifest.json`, `tokens/`, `rf/`,
+  `images/*/source_tree/`, `ghidra/{symbol_maps,global_types_maps}/`) —
+  `report.json` embeds wall-clock `duration_ms` and `ghidra/` retains project
+  residue, so the whole decompose tree is unpinnable by design. Ghidra-produced
+  `decompiled/` trees are not currently pinned; determinism was not measured —
+  measure two fresh runs before ever adding them (pe-decompose saw Ghidra
+  nondeterminism on 2 of 3 corpora).
+- **Re-baselining goldens** (required once after the sha256→blake3 format
+  break): run `extract` + `decompose` on a real radio image into the golden
+  reference location with the new binary; then `pixel-modem-extractor
+  tree-hash <dir>` each pinned surface/tree and record the values; set
+  `PME_GOLDEN_DIR`/`PME_DECOMPOSED_GOLDEN_DIR`/`PME_RADIO_IMG` and run
+  `cargo test` to confirm the paq assertions pass. Old goldens embed sha256/v3
+  fields and cannot be reused.
+
 ## Repository layout
 
 `src/*.rs` is a flat set of focused modules — one concern each:
@@ -125,7 +153,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `global_shapes/validate.rs` | Shared v3 sidecar checks for goldens and retained-tree replay |
 | `global_types.rs` | Selects apply-worthy scalar shapes from `global_shapes.json` (width 1/2/4/8 `inferred` scalars only) and writes the strict `ApplyGlobalTypes.java` apply-map |
 | `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
-| `manifest.rs` | `manifest.json` writing + `sha256` helpers |
+| `manifest.rs` | `manifest.json` writing + `blake3` helpers |
+| `tree_hash.rs` | `pme-paq-v1` whole-tree hash behind the `tree-hash` subcommand (fail-closed tree validation) |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
@@ -864,7 +893,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   survivor), and `cross_block_seeded_functions` (pass-2 seeded callees
   with a survivor). Wire field order is the struct declaration order. Serialization is
   `serde_json` pretty (two-space) with **no trailing newline**. Addresses
-  are canonical lowercase `0x…`; SHA-256 values are lowercase 64-hex.
+  are canonical lowercase `0x…`; blake3 values are lowercase 64-hex.
   The complete byte vector is serialized before the destination is opened,
   then atomically replaced. A decoder/adapter panic is caught, bounded to
   2,048 Unicode characters, fails that image, and does not prevent later
