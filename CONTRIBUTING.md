@@ -113,13 +113,18 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   `pme-paq-v2` revision plus fresh goldens.
 - Golden pinning: the `extract` output tree is pinned whole-tree
   (`extract_tree_matches_golden_paqs`); `decompose` pins only its
-  by-construction deterministic surfaces (`manifest.json`, `tokens/`, `rf/`,
-  `images/*/source_tree/`, `ghidra/{symbol_maps,global_types_maps}/`) —
-  `report.json` embeds wall-clock `duration_ms` and `ghidra/` retains project
-  residue, so the whole decompose tree is unpinnable by design. Ghidra-produced
-  `decompiled/` trees are not currently pinned; determinism was not measured —
-  measure two fresh runs before ever adding them (pe-decompose saw Ghidra
-  nondeterminism on 2 of 3 corpora).
+  **measured-deterministic** surfaces (two fresh mustang runs, 2026-08-18):
+  `manifest.json` (blake3 content — pme-paq-v1 is directory-only), `tokens/`,
+  `rf/`, and `ghidra/global_types_maps/`. Unpinned, with the measured reason:
+  `report.json` (wall-clock `duration_ms`), `ghidra/` project residue,
+  `ghidra/symbol_maps/` (embeds the pass-1 `functions.json` digest, whose
+  content carries Ghidra run-to-run jitter — ~8 lines in 00_BOOT's
+  `functions.json` between two runs; the symbol arrays themselves reproduced
+  byte-identically), `images/*/source_tree/` (recovered-code enrichment
+  derives from the same jittery Ghidra evidence), and everything under
+  `images/*/decompiled/`. Mustang thus joins pe-decompose's SC4/XWA corpora
+  with measured Ghidra decompile nondeterminism; BEA-style byte-stable
+  Ghidra output was **not** observed here.
 - **Re-baselining goldens** (last done 2026-08-18, after the sha256→blake3
   format break): run `extract` + `decompose` on a real radio image with the
   current binary, then `pixel-modem-extractor tree-hash <dir>` each pinned

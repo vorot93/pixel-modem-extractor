@@ -809,10 +809,17 @@ fn global_types_applied_on_retained_tree() {
 
 /// pme-paq-v1 equality of every pinned deterministic surface against a
 /// reference (re-baselined) decomposed tree (`PME_DECOMPOSED_GOLDEN_DIR`).
-/// Pinned surfaces: by-construction deterministic ones. report.json
-/// (durations) and ghidra_project/ residue are unpinned by design — see
-/// CONTRIBUTING. `manifest.json` is a single file, and pme-paq-v1 only hashes
-/// directories, so that surface is pinned by blake3 content instead.
+/// Pinned surfaces are the **measured-deterministic** set (two fresh mustang
+/// runs, 2026-08-18): `manifest.json` (pinned by blake3 content — pme-paq-v1
+/// only hashes directories), `tokens/`, `rf/`, and
+/// `ghidra/global_types_maps/`. Unpinned, with the measured reason:
+/// `report.json` (wall-clock durations), `ghidra/` project residue,
+/// `ghidra/symbol_maps/` (embeds the pass-1 `functions.json` digest, whose
+/// content carries Ghidra run-to-run jitter — the symbol arrays themselves
+/// reproduced byte-identically), `images/*/source_tree/` (recovered-code
+/// enrichment derives from the same jittery Ghidra evidence), and everything
+/// under `images/*/decompiled/`. See CONTRIBUTING "Hashing and golden
+/// identity".
 #[test]
 fn decompose_pinned_surfaces_match_reference() {
     let Some(img) = std::env::var_os("PME_RADIO_IMG").map(PathBuf::from) else {
@@ -851,13 +858,7 @@ fn decompose_pinned_surfaces_match_reference() {
         no_apply_global_types: false,
     };
     decompose::run(&img, &opts, &out).expect("decompose");
-    let surfaces = [
-        "manifest.json",
-        "tokens",
-        "rf",
-        "ghidra/symbol_maps",
-        "ghidra/global_types_maps",
-    ];
+    let surfaces = ["manifest.json", "tokens", "rf", "ghidra/global_types_maps"];
     for rel in surfaces {
         let ours = out.join(rel);
         let theirs = gold.join(rel);
@@ -875,18 +876,6 @@ fn decompose_pinned_surfaces_match_reference() {
                 pixel_modem_extractor::manifest::blake3_bytes(&std::fs::read(&ours).unwrap()),
                 pixel_modem_extractor::manifest::blake3_bytes(&std::fs::read(&theirs).unwrap()),
                 "pinned surface {rel} must reproduce the reference bytes"
-            );
-        }
-    }
-    for entry in std::fs::read_dir(out.join("images")).unwrap().flatten() {
-        let label = entry.file_name();
-        let st = entry.path().join("source_tree");
-        let gold_st = gold.join("images").join(&label).join("source_tree");
-        if st.is_dir() && gold_st.is_dir() {
-            assert_eq!(
-                pixel_modem_extractor::tree_hash::pme_paq_v1(&st).unwrap(),
-                pixel_modem_extractor::tree_hash::pme_paq_v1(&gold_st).unwrap(),
-                "source_tree of {label:?} must reproduce"
             );
         }
     }
