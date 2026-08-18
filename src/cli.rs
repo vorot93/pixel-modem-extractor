@@ -222,7 +222,14 @@ pub fn run() -> anyhow::Result<()> {
         }
         Commands::HardwareConfig { input, rf_dir, out } => {
             let out = out.unwrap_or_else(|| PathBuf::from("./hwcfg_summary"));
-            crate::hwcfg::run(&input, rf_dir.as_deref(), &out)?; // run() prints the console report
+            // Standalone: record the user's path spelling verbatim as coverage provenance.
+            let summary = if let Some(rf_path) = rf_dir.as_deref() {
+                let label = rf_path.display().to_string();
+                crate::hwcfg::run(&input, Some((rf_path, &label)), &out)
+            } else {
+                crate::hwcfg::run(&input, None, &out)
+            };
+            summary?; // run() prints the console report
         }
         Commands::Decompile {
             modem_bin,

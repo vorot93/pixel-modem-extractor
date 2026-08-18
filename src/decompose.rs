@@ -2639,11 +2639,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         }
         PostSymbolStep::HardwareConfig => {
             if hwcfg_path.exists() {
-                let rf_arg = rf_present.then(|| rf_dir.clone());
+                let rf_arg = rf_present.then(|| (rf_dir.clone(), "rf_cfg_decompressed"));
                 run_stage(&mut stages, "hardware_config", "rf/hwcfg_summary", || {
                     hwcfg::run(
                         &hwcfg_path,
-                        rf_arg.as_deref(),
+                        rf_arg.as_ref().map(|(p, l)| (p.as_path(), *l)),
                         &out.join("rf").join("hwcfg_summary"),
                     )
                 });

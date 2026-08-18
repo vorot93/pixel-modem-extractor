@@ -184,19 +184,21 @@ pub fn build_summary(
     }
 }
 
-pub fn run(input: &Path, rf_dir: Option<&Path>, out: &Path) -> Result<PathBuf> {
+/// Summarize `hardware_config.json` into `out/summary.json`. `rf_dir` is the
+/// RF directory to compute blob coverage against, as a `(read_path, label)`
+/// pair: the label is what `coverage.rf_dir` records. Decompose passes a
+/// location-independent label (`"rf_cfg_decompressed"`, relative to its tree
+/// root) so its output tree carries no absolute build-machine paths; the
+/// standalone subcommand passes the user's path spelling verbatim.
+pub fn run(input: &Path, rf_dir: Option<(&Path, &str)>, out: &Path) -> Result<PathBuf> {
     let bytes = std::fs::read(input)?;
     let hwcfg: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
     let configs = parse(&hwcfg);
     let coverage = match rf_dir {
-        Some(dir) => {
+        Some((dir, label)) => {
             let present = present_shas(dir)?;
-            Some(compute_coverage(
-                &configs,
-                &present,
-                &dir.display().to_string(),
-            ))
+            Some(compute_coverage(&configs, &present, label))
         }
         None => None,
     };
@@ -293,6 +295,26 @@ mod tests {
         assert_eq!(cov.present, 2);
         assert_eq!(cov.orphans, vec!["bbb".to_string(), "ccc".to_string()]); // referenced - present, sorted
         assert_eq!(cov.unused, vec!["ddd".to_string()]); // present - referenced
+    }
+
+    /// The coverage `rf_dir` records the *label* the caller passed, not the
+    /// read path — decompose pins its output tree by content and must not
+    /// embed the absolute output location.
+    #[test]
+    fn run_records_coverage_label_verbatim() {
+        let base = std::env::temp_dir().join("pme_hwcfg_label_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let rf = base.join("deep/nested/rf_cfg_decompressed");
+        std::fs::create_dir_all(&rf).unwrap();
+        std::fs::write(rf.join("RF_CFG_aaa"), b"x").unwrap();
+        let hw = base.join("hardware_config.json");
+        std::fs::write(&hw, fixture().to_string().as_bytes()).unwrap();
+        let out = base.join("summary_out");
+        let path = run(&hw, Some((&rf, "rf_cfg_decompressed")), &out).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["coverage"]["rf_dir"], "rf_cfg_decompressed");
+        assert_eq!(v["coverage"]["present"], 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

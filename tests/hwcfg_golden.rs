@@ -34,10 +34,12 @@ fn hwcfg_matches_golden() {
     assert_eq!(cov.orphans.len(), 29, "orphans");
     assert!(cov.unused.is_empty(), "unused");
 
-    // run() writes summary.json with matching stats
+    // run() writes summary.json with matching stats (label = as-passed path here)
     let out = std::env::temp_dir().join(format!("pme_hwcfg_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
-    pixel_modem_extractor::hwcfg::run(&hw, Some(rf_dir.as_path()), &out).unwrap();
+    let rf_label = rf_dir.display().to_string();
+    pixel_modem_extractor::hwcfg::run(&hw, Some((rf_dir.as_path(), rf_label.as_str())), &out)
+        .unwrap();
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
     assert_eq!(summary["num_configurations"], 20);

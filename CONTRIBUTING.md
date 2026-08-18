@@ -100,7 +100,12 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 - Per-file/per-bytes digests are **blake3** (`manifest::blake3_bytes` /
   `blake3_file`), serialized as `*_blake3` JSON fields. The `sha2` crate is
   gone. Exception: `hwcfg`'s `present_shas`/`referenced_shas`/`entries[].sha`
-  are RF_CFG blob identifiers (corpus nomenclature), not digests.
+  are RF_CFG blob identifiers (corpus nomenclature), not digests. Related
+  provenance rule: `coverage.rf_dir` in `rf/hwcfg_summary/summary.json` is
+  recorded as `"rf_cfg_decompressed"` (tree-relative) when produced by
+  `decompose`, so the pinned `rf/` surface carries no absolute output path;
+  the standalone `hardware-config` subcommand records the user's path
+  spelling verbatim.
 - Whole-tree identity is **`pme-paq-v1`** (`src/tree_hash.rs`): `paq::hash_source`
   blake3 leaf-set, hidden entries included, zero exclusions, fail-closed
   (missing/non-dir/symlink/non-UTF-8 → `Error::BadTree`, no hash). Pinned test
