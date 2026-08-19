@@ -125,9 +125,10 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   `images/*/decompiled/`. Mustang thus joins pe-decompose's SC4/XWA corpora
   with measured Ghidra decompile nondeterminism; BEA-style byte-stable
   Ghidra output was **not** observed here.
-- **Re-baselining goldens** (last done 2026-08-18, after the sha256→blake3
-  format break): run `extract` + `decompose` on a real radio image with the
-  current binary, then `pixel-modem-extractor tree-hash <dir>` each pinned
+- **Re-baselining goldens** (last done 2026-08-19, for the opaque-image
+  battery — the manifest `battery` fields and the skipped-PSP report row
+  changed both trees' shape): run `extract` + `decompose` on a real radio
+  image with the current binary, then `pixel-modem-extractor tree-hash <dir>` each pinned
   surface/tree and record the values. `PME_GOLDEN_DIR` is dual-mode and the
   golden lives in **two trees**, so verification is two invocations:
 
@@ -135,11 +136,14 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
      contain *nothing beyond* what `extract` writes (the whole-tree paq pin
      hashes every leaf). Verify with
      `PME_GOLDEN_DIR=…/radio-mustang-extracted-v3 PME_RADIO_IMG=… cargo test --test golden`.
-     (`radio-mustang-extracted` is one vintage behind — pre-battery manifest —
-     and still feeds the classify corpus test until retirement.)
+     (`radio-mustang-extracted` is archived as `radio-mustang-extracted.pre-opaque`
+     — pre-battery manifest; the classify corpus test reads this v3 tree's
+     `modem.bin.split`.)
   2. `radio-mustang-decomposed-v3` — a fresh full `decompose` output (the current
-     re-baseline tree, in flight: the manifest `battery` fields shifted the pinned
-     `manifest.json` hash, superseding `radio-mustang-decomposed`). Verify with
+     re-baseline tree: the manifest `battery` fields and the skipped-PSP
+     report row shifted the pinned `manifest.json` hash and report shape,
+     superseding `radio-mustang-decomposed`, archived as
+     `radio-mustang-decomposed.pre-opaque`). Verify with
       `PME_GOLDEN_DIR=PME_DECOMPOSED_GOLDEN_DIR=…/radio-mustang-decomposed-v3
       PME_RADIO_IMG=… cargo test --release --test decompose_golden
       decompose_pinned_surfaces_match_reference` plus the read-only
