@@ -252,7 +252,10 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **TOC CRCs are advisory.** Every image's stored TOC CRC currently mismatches a plain
   CRC-32 over `[offset, size)` (the algorithm/coverage is unconfirmed); `split_to_dir` only
   `warn!`s and still writes, and `manifest.verified` means "checks were attempted," not
-  "CRCs matched." Don't read `verified: true` as CRC validation.
+  "CRCs matched." Don't read `verified: true` as CRC validation. A 2026-08-19 spike
+  (32 CRC-32 variants × 6 coverage windows × both reference models: zero matches) plus RE
+  showing no code in any image ever reads the field confirms the values are offline
+  build-tool output — treat the field as opaque (findings under `~/.superpowers`).
 - **CLI dispatch is thin.** `cli.rs` only parses args and resolves the `--out` default,
   then delegates to a module-level `run(...)`. Put new logic in the module, not in
   `cli.rs`. The decoder subcommands' `run()` prints its own console report; the pipeline
