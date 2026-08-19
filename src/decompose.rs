@@ -64,9 +64,10 @@ pub struct Opts {
 pub struct ImageReport {
     pub image: String,
     pub status: &'static str, // "analyzed" | "failed" | "skipped"
-    /// Opaque-battery classification: "opaque" for skipped images, "not_opaque"
-    /// for analyzed ones. Failed images omit it (the battery never decided —
-    /// the Ghidra run itself failed).
+    /// Battery verdict for the image bytes ("opaque"/"not_opaque"), consistent
+    /// with manifest.json's `battery.label` for the same image — including on
+    /// `--no-skip-opaque` runs, where an analyzed row can still be "opaque".
+    /// Failed rows omit it (the Ghidra run itself is the headline for those).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<&'static str>,
     /// Why a skipped image was skipped: "opaque" (unanimous battery verdict;
@@ -173,7 +174,7 @@ impl ImageReport {
                 } else {
                     "analyzed"
                 },
-                classification: Some("not_opaque"),
+                classification: r.classification,
                 skipped_reason: None,
                 functions: Some(n),
                 thumb_functions: r.thumb_functions,
@@ -2766,6 +2767,7 @@ mod tests {
         decompile::ImageResult {
             label: label.into(),
             outcome: ImageOutcome::Analyzed(1),
+            classification: Some("not_opaque"),
             thumb_functions: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -2811,12 +2813,27 @@ mod tests {
         image.outcome = ImageOutcome::SkippedOpaque(crate::classify::classify(
             &crate::classify::test_uniform_blob(256 * 1024),
         ));
+        image.classification = Some("opaque");
         let json = serde_json::to_value(ImageReport::from_result(&image)).unwrap();
         assert_eq!(json["status"], "skipped");
         assert_eq!(json["classification"], "opaque");
         assert_eq!(json["skipped_reason"], "opaque");
         assert!(json.get("functions").is_none());
         assert!(json.get("exit").is_none());
+    }
+
+    #[test]
+    fn image_report_serializes_analyzed_opaque_classification() {
+        // The escape hatch ran Ghidra anyway (--no-skip-opaque) on a
+        // unanimously-opaque image: the row is analyzed but still labeled by
+        // the battery verdict — the same measurement manifest.json records.
+        let mut image = analyzed_image("01_PSP");
+        image.outcome = ImageOutcome::Analyzed(0);
+        image.classification = Some("opaque");
+        let json = serde_json::to_value(ImageReport::from_result(&image)).unwrap();
+        assert_eq!(json["status"], "analyzed");
+        assert_eq!(json["classification"], "opaque");
+        assert!(json.get("skipped_reason").is_none());
     }
 
     #[test]
@@ -4757,6 +4774,7 @@ mod tests {
         let image = ImageReport::from_result(&decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(42),
+            classification: Some("not_opaque"),
             thumb_functions: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -4803,6 +4821,7 @@ mod tests {
         let image = ImageReport::from_result(&decompile::ImageResult {
             label: "01_BOOT".into(),
             outcome: ImageOutcome::Analyzed(7),
+            classification: Some("not_opaque"),
             thumb_functions: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -4904,6 +4923,7 @@ mod tests {
             decompile::ImageResult {
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(10),
+                classification: Some("not_opaque"),
                 thumb_functions: Some(1),
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
@@ -4931,6 +4951,7 @@ mod tests {
             decompile::ImageResult {
                 label: "01_BOOT".into(),
                 outcome: ImageOutcome::Analyzed(3),
+                classification: Some("not_opaque"),
                 thumb_functions: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
@@ -4996,6 +5017,7 @@ mod tests {
         let mut images = vec![decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(10),
+            classification: Some("not_opaque"),
             // In-memory result says radare2 produced Thumb output.
             thumb_functions: Some(5),
             ghidra_execution_accepted: None,
@@ -5105,6 +5127,7 @@ mod tests {
         let post_enrich_images = vec![decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(107_955),
+            classification: Some("not_opaque"),
             thumb_functions: Some(117_444),
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -5170,6 +5193,7 @@ mod tests {
         let mut images = vec![decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(0),
+            classification: Some("not_opaque"),
             thumb_functions: Some(0),
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -5662,6 +5686,7 @@ mod tests {
         let image = decompile::ImageResult {
             label: label.into(),
             outcome: ImageOutcome::Analyzed(1),
+            classification: Some("not_opaque"),
             thumb_functions: None,
             ghidra_execution_accepted: Some(1),
             ghidra_execution_quarantined: Some(0),
@@ -5806,6 +5831,7 @@ mod tests {
         let r = decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
+            classification: Some("not_opaque"),
             thumb_functions: Some(5),
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -5843,6 +5869,7 @@ mod tests {
         let r = decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
+            classification: Some("not_opaque"),
             thumb_functions: Some(5),
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -5879,6 +5906,7 @@ mod tests {
         let r = decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
+            classification: Some("not_opaque"),
             thumb_functions: Some(5),
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
@@ -5916,6 +5944,7 @@ mod tests {
         let r = decompile::ImageResult {
             label: "02_MAIN".into(),
             outcome: decompile::ImageOutcome::Analyzed(10),
+            classification: Some("not_opaque"),
             thumb_functions: Some(5),
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,

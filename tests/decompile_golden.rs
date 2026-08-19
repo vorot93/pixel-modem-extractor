@@ -1386,3 +1386,88 @@ fn no_thumb_decompile_flag_falls_back_to_datamark() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Uniform pseudo-random blob (xorshift64*, top byte — the same generator as
+/// classify.rs's cfg(test) helper, replicated here because integration tests
+/// cannot reach pub(crate) cfg(test) items). 256 KiB = 4 full 64-KiB windows,
+/// so every battery gate (including the window tests) engages unanimously.
+fn uniform_test_blob(len: usize) -> Vec<u8> {
+    struct Xorshift64Star(u64);
+
+    impl Xorshift64Star {
+        fn byte(&mut self) -> u8 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            (x.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8
+        }
+    }
+
+    let mut rng = Xorshift64Star(0x9E3779B97F4A7C15);
+    (0..len).map(|_| rng.byte()).collect()
+}
+
+/// Pins the opaque-skip WIRING at the real seam: `run_report` with `--run`
+/// and a located Ghidra install, over a TOC whose only image is unanimously
+/// opaque. The skip branch must fire before any Ghidra work, so no
+/// `analyzeHeadless` process is ever spawned — observable as no `export/`
+/// directory (only ExportDecomp.java creates it) and an empty
+/// `ghidra_project/` (a real run writes `pixel-modem.rep` into it). If the
+/// skip branch were deleted, Ghidra would import + analyze the blob and every
+/// assertion below fails (outcome becomes `Analyzed(0)` with a populated
+/// export/project). The battery verdict must also label the row "opaque",
+/// agreeing with what manifest.json would record for the same bytes.
+#[test]
+fn run_report_skips_opaque_image_without_spawning_ghidra() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pme_opaque_skip_wiring_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, craft_modem_bin(&uniform_test_blob(256 * 1024))).unwrap();
+    let out = dir.join("out");
+
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home),
+        processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
+        tighten_wall_clock_budget_override: None,
+        no_skip_opaque: false,
+    };
+    let report =
+        pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).expect("run_report");
+
+    assert_eq!(report.images.len(), 1, "the sole image must be selected");
+    let image = &report.images[0];
+    assert!(
+        matches!(
+            image.outcome,
+            pixel_modem_extractor::decompile::ImageOutcome::SkippedOpaque(_)
+        ),
+        "uniform-blob image must be SkippedOpaque, got {:?}",
+        image.outcome
+    );
+    assert_eq!(image.classification, Some("opaque"));
+
+    assert!(
+        !out.join("export").exists(),
+        "skip must not create export/ (only ExportDecomp.java does)"
+    );
+    let project_entries: Vec<_> = std::fs::read_dir(out.join("ghidra_project"))
+        .expect("run_report pre-creates ghidra_project")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        project_entries.is_empty(),
+        "no analyzeHeadless run may touch the project dir; found {project_entries:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

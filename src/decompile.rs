@@ -282,6 +282,12 @@ pub enum ImageOutcome {
 pub struct ImageResult {
     pub label: String,
     pub outcome: ImageOutcome,
+    /// Battery verdict for the image bytes ("opaque"/"not_opaque"), measured
+    /// by the `--run` loop before any Ghidra work — consistent with
+    /// manifest.json's `battery.label` for the same image (including under
+    /// `--no-skip-opaque`). `None` only where no battery ran (test
+    /// construction); failed rows omit it in report.json.
+    pub classification: Option<&'static str>,
     pub thumb_functions: Option<usize>,
     /// Current Ghidra source records with a validated accepted projection.
     pub ghidra_execution_accepted: Option<usize>,
@@ -886,6 +892,11 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         struct RunResult {
             label: String,
             outcome: ImageOutcome,
+            /// Battery verdict for the image bytes ("opaque"/"not_opaque"),
+            /// measured before any Ghidra work regardless of `no_skip_opaque`
+            /// — so report.json's `classification` agrees with manifest.json's
+            /// `battery.label` even on escape-hatch runs.
+            classification: &'static str,
             thumb_functions: Option<usize>,
             terminal_inventory: Option<TerminalInventorySummary>,
             image_start: u32,
@@ -907,6 +918,16 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             let start = (e.offset as usize).min(data.len());
             let end = (e.offset as usize + e.size as usize).min(data.len());
             let img = &data[start..end];
+            // Battery verdict for the image bytes — computed for EVERY selected
+            // image, before any Ghidra work and regardless of `no_skip_opaque`,
+            // so the per-image classification carried into report.json is the
+            // same measurement manifest.json's `battery.label` records.
+            let opaque_stats = opaque_skip(img);
+            let classification: &'static str = if opaque_stats.is_some() {
+                "opaque"
+            } else {
+                "not_opaque"
+            };
             // Opaque-image gate, BEFORE any Ghidra project work: a unanimous
             // battery verdict means there is no code to recover, so bypass the
             // entire per-image Ghidra + radare2 block (no import, no tighten
@@ -914,7 +935,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             // RunResult — `--image 01_PSP` stays a successful non-empty run.
             // `--no-skip-opaque` restores run-everything behavior.
             if !opts.no_skip_opaque
-                && let Some(stats) = opaque_skip(img)
+                && let Some(stats) = opaque_stats
             {
                 tracing::warn!(
                     "{label}: unanimously opaque battery — skipping Ghidra (H={:.4}, χ²/df={:.4}, SCC={:.4}, wmin={:.4}, frac={:.4}); --no-skip-opaque forces a run",
@@ -927,6 +948,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 results.push(RunResult {
                     label,
                     outcome: ImageOutcome::SkippedOpaque(stats),
+                    classification,
                     thumb_functions: None,
                     terminal_inventory: None,
                     image_start: e.load_addr,
@@ -1182,6 +1204,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             results.push(RunResult {
                 label,
                 outcome,
+                classification,
                 thumb_functions,
                 terminal_inventory,
                 image_start: e.load_addr,
@@ -1197,9 +1220,13 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 None => "no embedded images found in TOC".to_string(),
             }));
         }
+        let skipped_opaque = results
+            .iter()
+            .filter(|r| matches!(r.outcome, ImageOutcome::SkippedOpaque(_)))
+            .count();
         println!(
-            "ghidra: analyzed {} image(s) -> {}",
-            results.len(),
+            "ghidra: analyzed {} image(s), skipped {skipped_opaque} opaque (--no-skip-opaque to force) -> {}",
+            results.len() - skipped_opaque,
             out.join("export").display()
         );
         for r in &results {
@@ -1235,6 +1262,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             .map(|r| ImageResult {
                 label: r.label,
                 outcome: r.outcome,
+                classification: Some(r.classification),
                 thumb_functions: r.thumb_functions,
                 ghidra_execution_accepted: r
                     .terminal_inventory
@@ -4808,6 +4836,7 @@ INFO: second pdfj body was noisy and not parseable
             images: vec![ImageResult {
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(12),
+                classification: Some("not_opaque"),
                 thumb_functions: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
@@ -4880,6 +4909,7 @@ INFO: second pdfj body was noisy and not parseable
                 outcome: ImageOutcome::SkippedOpaque(crate::classify::classify(
                     &crate::classify::test_uniform_blob(256 * 1024),
                 )),
+                classification: Some("opaque"),
                 thumb_functions: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
@@ -4915,6 +4945,7 @@ INFO: second pdfj body was noisy and not parseable
             images: vec![ImageResult {
                 label: "02_MAIN".into(),
                 outcome: ImageOutcome::Analyzed(12),
+                classification: Some("not_opaque"),
                 thumb_functions: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
@@ -4957,6 +4988,7 @@ INFO: second pdfj body was noisy and not parseable
         let r = ImageResult {
             label: "02_MAIN".into(),
             outcome: ImageOutcome::Analyzed(10),
+            classification: Some("not_opaque"),
             thumb_functions: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
