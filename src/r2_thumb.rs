@@ -405,6 +405,123 @@ fn scan_for_inventory<R: std::io::Read>(
     Ok((values, None))
 }
 
+/// Render one normalized function `Value` as its bytes inside the final
+/// document's `functions` array (depth 2: every pretty-printed line gets a
+/// 4-space prefix). Byte-identity with `to_string_pretty` of the wrapped
+/// document relies on serde_json's `Map` being a `BTreeMap` (sorted keys, no
+/// `preserve_order` feature) and on pretty output being pure indentation —
+/// pinned by tests.
+#[cfg(test)]
+fn render_fragment(value: &serde_json::Value) -> Result<String> {
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| Error::Serialize(e.to_string()))?;
+    Ok(pretty
+        .split('\n')
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// One spilled fragment's location; the stream slot is
+/// `[u32 LE fn_idx][u32 LE len][fragment bytes]`.
+#[cfg(test)]
+struct FragmentSlot {
+    fn_idx: u32,
+    offset: u64,
+    len: u32,
+}
+
+/// Append-only per-region fragment spill at `thumb/<addr:08x>.frags`. Only
+/// the `(fn_idx, offset, len)` index stays in memory (~16 B/function);
+/// fragment text lives on disk until assembly.
+#[cfg(test)]
+struct SpillWriter {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    offset: u64,
+    slots: Vec<FragmentSlot>,
+}
+
+#[cfg(test)]
+impl SpillWriter {
+    fn create(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = std::fs::File::create(&path)?;
+        Ok(Self {
+            path,
+            file,
+            offset: 0,
+            slots: Vec::new(),
+        })
+    }
+
+    fn push(&mut self, fn_idx: u32, fragment: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let bytes = fragment.as_bytes();
+        assert!(
+            bytes.len() <= u32::MAX as usize,
+            "fragment length overflows u32"
+        );
+        self.file.write_all(&fn_idx.to_le_bytes())?;
+        self.file.write_all(&(bytes.len() as u32).to_le_bytes())?;
+        self.file.write_all(bytes)?;
+        self.slots.push(FragmentSlot {
+            fn_idx,
+            offset: self.offset + 8,
+            len: bytes.len() as u32,
+        });
+        self.offset += 8 + bytes.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<Spill> {
+        use std::io::Write;
+        self.file.flush()?;
+        let mut slots = self.slots;
+        slots.sort_unstable_by_key(|slot| slot.fn_idx);
+        Ok(Spill {
+            path: self.path,
+            slots,
+        })
+    }
+}
+
+/// A finished, readable spill: fragments stream back in `fn_idx` order (=
+/// aflj order = the legacy emission order).
+#[cfg(test)]
+struct Spill {
+    path: std::path::PathBuf,
+    slots: Vec<FragmentSlot>,
+}
+
+#[cfg(test)]
+impl Spill {
+    fn emit_slot<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        slot: &FragmentSlot,
+    ) -> std::io::Result<()> {
+        use std::io::{Read, Seek};
+        let mut file = std::fs::File::open(&self.path)?;
+        file.seek(std::io::SeekFrom::Start(slot.offset))?;
+        let mut remaining = slot.len as usize;
+        let mut buffer = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let n = buffer.len().min(remaining);
+            file.read_exact(&mut buffer[..n])?;
+            writer.write_all(&buffer[..n])?;
+            remaining -= n;
+        }
+        Ok(())
+    }
+
+    fn emit<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        for slot in &self.slots {
+            self.emit_slot(writer, slot)?;
+        }
+        Ok(())
+    }
+}
+
 fn pdfj_values_from_radare2_output(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut pdfjs = Vec::new();
     let start = values
@@ -1065,6 +1182,7 @@ fn run_radare2_thumb_region(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use std::io::Read;
 
     use super::*;
@@ -1801,5 +1919,53 @@ INFO: second pdfj body was noisy and not parseable
                 name: None
             }
         );
+    }
+
+    #[test]
+    fn fragment_render_matches_whole_document_pretty_slices() {
+        let fns = vec![
+            json!({"name":"thumb_a","entry":"0x100","end":"0x120","size":32,"body_kind":"thumb_disassembly","body":"","data_refs":[],"decode_ranges":[{"isa":"thumb","start":"0x100","end":"0x120"}],"decode_range_errors":[]}),
+            json!({"name":"b","entry":"0x200","end":"0x208","size":8,"body_kind":"thumb_disassembly","body":"0x00000200      b5f0      push {r4, lr}\n","data_refs":["0x9000"],"decode_ranges":[],"decode_range_errors":[{"kind":"missing_operation_body","address":"0x200","end":null}]}),
+        ];
+        let whole = serde_json::to_string_pretty(&json!({
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": fns.clone(),
+        }))
+        .unwrap();
+        let joined = fns
+            .iter()
+            .map(|f| render_fragment(f).unwrap())
+            .collect::<Vec<_>>()
+            .join(",\n");
+        assert_eq!(
+            format!(
+                "{{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": [\n{joined}\n  ]\n}}"
+            ),
+            whole
+        );
+    }
+
+    #[test]
+    fn fragment_render_handles_empty_containers_and_escapes() {
+        let f = json!({"a": [], "b": {}, "s": "quote\" back\\slash\nnewline"});
+        let rendered = render_fragment(&f).unwrap();
+        let whole = serde_json::to_string_pretty(&json!({"functions": [f]})).unwrap();
+        let inner = whole
+            .trim_start_matches("{\n  \"functions\": [\n")
+            .trim_end_matches("\n  ]\n}");
+        assert_eq!(rendered, inner);
+    }
+
+    #[test]
+    fn spill_roundtrip_preserves_fragments_in_fn_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SpillWriter::create(dir.path().join("t.frags")).unwrap();
+        writer.push(2, "frag-two").unwrap();
+        writer.push(0, "frag-zero").unwrap();
+        writer.push(1, "frag-one").unwrap();
+        let spill = writer.finish().unwrap();
+        let mut out = Vec::new();
+        spill.emit(&mut out).unwrap();
+        assert_eq!(out, b"frag-zerofrag-onefrag-two");
     }
 }
