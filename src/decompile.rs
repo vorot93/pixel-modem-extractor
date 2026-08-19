@@ -419,45 +419,12 @@ pub(crate) fn validate_terminal_inventory_pair(
             (None, None, Vec::new())
         }
         Some(expected_substantial) => {
-            let thumb_json = read_json(thumb_functions_path, "Thumb functions inventory")?;
-            let object = thumb_json.as_object().ok_or_else(|| {
-                Error::Serialize("Thumb functions inventory must be an object".into())
-            })?;
-            if object.get("format").and_then(serde_json::Value::as_str)
-                != Some("pixel-modem-extractor-thumb-functions-v2")
-            {
-                return Err(Error::Serialize(
-                    "unsupported Thumb functions inventory format".into(),
-                ));
-            }
-            let records = object
-                .get("functions")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    Error::Serialize("Thumb functions inventory lacks functions array".into())
-                })?;
-            let substantial = records.iter().try_fold(0usize, |count, record| {
-                let size = record
-                    .get("size")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| {
-                        Error::Serialize("Thumb function size must be an unsigned integer".into())
-                    })?;
-                if size >= 32 {
-                    count
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Serialize("Thumb substantial count overflow".into()))
-                } else {
-                    Ok(count)
-                }
-            })?;
-            if substantial != expected_substantial {
-                return Err(Error::Serialize(format!(
-                    "Thumb substantial count mismatch: expected {expected_substantial}, found {substantial}"
-                )));
-            }
-            let inventory =
-                validate_inventory_records(records, records.len(), image_start, image_len)?;
+            let (inventory, substantial) = crate::r2_thumb::validate_thumb_inventory_streaming(
+                thumb_functions_path,
+                image_start,
+                image_len,
+                expected_substantial,
+            )?;
             accepted_identities.extend(inventory.accepted_identities.iter().cloned());
             (
                 Some(inventory_counts(&inventory)),
