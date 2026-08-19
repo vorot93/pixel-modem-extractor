@@ -313,6 +313,98 @@ impl<R: std::io::Read> ValueScanner<R> {
     }
 }
 
+/// Compact per-function record from the aflj inventory — the only fields
+/// `normalize_radare2_function_checked` consumes from the raw element.
+/// Rebuilding a raw element from these fields reproduces the original
+/// normalization byte-for-byte: both `json_u64` paths (number or numeric
+/// string) resolve to the same u64, and a non-string `name` resolves to the
+/// same default.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+struct FnRec {
+    entry: Option<u64>,
+    size: u64,
+    name: Option<String>,
+}
+
+#[cfg(test)]
+fn fn_rec_from_value(raw: &serde_json::Value) -> FnRec {
+    FnRec {
+        entry: radare2_function_entry(raw),
+        size: raw.get("size").and_then(json_u64).unwrap_or(0),
+        name: raw
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// Sentinel aborting a seq probe when an element disqualifies the array as
+/// the aflj inventory (non-object element, or an object carrying `ops`).
+#[cfg(test)]
+const NOT_INVENTORY: &str = "\u{0}pme-not-inventory";
+
+#[cfg(test)]
+fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FnRec>> {
+    use serde::Deserializer;
+
+    let text = String::from_utf8_lossy(bytes);
+    let mut de = serde_json::Deserializer::from_str(&text);
+    match de.deserialize_seq(InventoryProbe) {
+        Ok(records) if !records.is_empty() => Some(records),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+struct InventoryProbe;
+
+#[cfg(test)]
+impl<'de> serde::de::Visitor<'de> for InventoryProbe {
+    type Value = Vec<FnRec>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("aflj function inventory array")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        let mut records = Vec::new();
+        while let Some(element) = seq.next_element::<serde_json::Value>()? {
+            let disqualified = match element.as_object() {
+                None => true,
+                Some(object) => object.contains_key("ops"),
+            };
+            if disqualified {
+                return Err(serde::de::Error::custom(NOT_INVENTORY));
+            }
+            records.push(fn_rec_from_value(&element));
+        }
+        Ok(records)
+    }
+}
+
+/// Stream values until the first aflj inventory; returns the count of values
+/// seen and the compact records. Leaves the scanner positioned after the
+/// inventory value. The count matches legacy `values.len()` for the zero
+/// check because a found inventory implies >= 1 and an unfound one exhausts
+/// the stream.
+#[cfg(test)]
+fn scan_for_inventory<R: std::io::Read>(
+    scanner: &mut ValueScanner<R>,
+) -> std::io::Result<(usize, Option<Vec<FnRec>>)> {
+    let mut values = 0usize;
+    while let Some(bytes) = scanner.next_value()? {
+        values += 1;
+        if let Some(records) = parse_inventory_value(bytes) {
+            return Ok((values, Some(records)));
+        }
+    }
+    Ok((values, None))
+}
+
 fn pdfj_values_from_radare2_output(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut pdfjs = Vec::new();
     let start = values
@@ -1594,7 +1686,7 @@ INFO: second pdfj body was noisy and not parseable
         let mut scanner = ValueScanner::new(std::io::Cursor::new(stdout.to_vec()));
         let mut out = Vec::new();
         while let Some(bytes) = scanner.next_value().unwrap() {
-            out.push(serde_json::from_slice(bytes).unwrap());
+            out.push(serde_json::from_str(&String::from_utf8_lossy(bytes)).unwrap());
         }
         out
     }
@@ -1613,6 +1705,7 @@ INFO: second pdfj body was noisy and not parseable
             b"[\"scalar\"]\n42\n\"str\"",
             b"[{\"deep\":[{\"deeper\":[1,2,{\"ops\":[]}]}]}]",
             b"{\"unicode\": \"\xc3\xa9\xf0\x9f\x98\x80\"} [\"after\"]",
+            b"[{\"name\": \"caf\xc3\xa9\xed\xa0\x80\"}] [\"tail\"]",
             b"[{\"a\":1}}[{\"b\":2}]",
         ];
         for (i, fixture) in fixtures.iter().enumerate() {
@@ -1622,6 +1715,11 @@ INFO: second pdfj body was noisy and not parseable
                 "fixture {i}: {fixture:?}"
             );
         }
+        assert_eq!(
+            scanner_values(fixtures[2]).len(),
+            1,
+            "differential must be non-vacuous"
+        );
     }
 
     #[test]
@@ -1649,5 +1747,59 @@ INFO: second pdfj body was noisy and not parseable
         let second = scanner.next_value().unwrap().unwrap().to_vec();
         assert_eq!(first, b"[{\"a\":1}]");
         assert_eq!(second, b"{\"b\":2}");
+    }
+
+    fn inventory_of(stdout: &[u8]) -> (usize, Option<Vec<FnRec>>) {
+        let mut scanner = ValueScanner::new(std::io::Cursor::new(stdout.to_vec()));
+        scan_for_inventory(&mut scanner).unwrap()
+    }
+
+    #[test]
+    fn inventory_scan_agrees_with_legacy_detection() {
+        let fixtures: Vec<&[u8]> = vec![
+            b"Warning: prelude\n[{\"name\":\"f0\",\"offset\":16384,\"size\":64},{\"name\":\"f1\",\"offset\":16448}]",
+            b"[]",
+            b"[\"scalar\"]",
+            b"[{\"ops\":[]}]",
+            b"{\"ops\":[]}\n[{\"name\":\"f\",\"offset\":1}]",
+            b"no json",
+            b"[{\"name\":\"f\",\"offset\":\"0x100\",\"size\":\"32\"}]",
+        ];
+        for (i, fixture) in fixtures.iter().enumerate() {
+            let legacy_values = radare2_json_values(fixture);
+            let legacy = legacy_values.iter().find(|v| is_aflj_function_inventory(v));
+            let (count, records) = inventory_of(fixture);
+            match (&legacy, &records) {
+                (None, None) => {}
+                (Some(l), Some(recs)) => {
+                    assert_eq!(recs.len(), l.as_array().unwrap().len(), "fixture {i}")
+                }
+                other => panic!("fixture {i}: legacy vs streaming mismatch: {other:?}"),
+            }
+            assert_eq!(count, legacy_values.len(), "fixture {i} value count");
+        }
+    }
+
+    #[test]
+    fn fn_rec_fields_match_normalize_inputs() {
+        let (_, records) =
+            inventory_of(b"[{\"name\":\"f0\",\"offset\":16384,\"size\":64},{\"offset\":\"0x40\"}]");
+        let records = records.unwrap();
+        assert_eq!(
+            records[0],
+            FnRec {
+                entry: Some(16384),
+                size: 64,
+                name: Some("f0".to_string())
+            }
+        );
+        assert_eq!(
+            records[1],
+            FnRec {
+                entry: Some(0x40),
+                size: 0,
+                name: None
+            }
+        );
     }
 }
