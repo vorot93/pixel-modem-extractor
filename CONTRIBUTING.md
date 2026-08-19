@@ -131,10 +131,12 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   surface/tree and record the values. `PME_GOLDEN_DIR` is dual-mode and the
   golden lives in **two trees**, so verification is two invocations:
 
-  1. `radio-mustang-extracted` — a pristine fresh `extract` output. It must
+  1. `radio-mustang-extracted-v3` — a pristine fresh `extract` output. It must
      contain *nothing beyond* what `extract` writes (the whole-tree paq pin
      hashes every leaf). Verify with
-     `PME_GOLDEN_DIR=…/radio-mustang-extracted PME_RADIO_IMG=… cargo test --test golden`.
+     `PME_GOLDEN_DIR=…/radio-mustang-extracted-v3 PME_RADIO_IMG=… cargo test --test golden`.
+     (`radio-mustang-extracted` is one vintage behind — pre-battery manifest —
+     and still feeds the classify corpus test until retirement.)
   2. `radio-mustang-decomposed-v3` — a fresh full `decompose` output (the current
      re-baseline tree, in flight: the manifest `battery` fields shifted the pinned
      `manifest.json` hash, superseding `radio-mustang-decomposed`). Verify with

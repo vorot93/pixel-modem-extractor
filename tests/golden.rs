@@ -64,6 +64,12 @@ fn extract_matches_golden() {
 /// **modern-layout** pristine `extract` output (`modem.bin.split/` at the
 /// root) — the whole tree is hashed, so the root must contain nothing
 /// beyond what `extract` writes.
+///
+/// Current baseline (2026-08-19): `radio-mustang-extracted-v3`, whole-tree
+/// pme-paq-v1 `743df948d7aed9e9fdd62aa30f517da8d1bb3e0d17dcaf2b50d98a4b58d0259a`
+/// (the per-image opaque `battery` in `manifest.json` shifted it from the
+/// pre-battery tree). Drift check: `tree-hash $PME_GOLDEN_DIR` must reproduce
+/// this value.
 #[test]
 fn extract_tree_matches_golden_paqs() {
     let (Some(img), Some(root)) = (
