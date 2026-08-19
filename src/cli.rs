@@ -97,6 +97,12 @@ pub enum Commands {
         /// `--no-thumb-decompile` instead.
         #[arg(long, hide = true)]
         tighten_wall_clock_budget_sec: Option<u64>,
+        /// Run Ghidra + radare2 even for unanimously-opaque images (the statistical
+        /// battery that e.g. Pixel `01_PSP` fails on every test). Research escape
+        /// hatch; by default such images are skipped — nothing is recoverable from
+        /// them under the standard import.
+        #[arg(long)]
+        no_skip_opaque: bool,
     },
     /// Exhaustive pipeline: extract, Ghidra/radare2 decompile, recovered attribution, and decoders
     Decompose {
@@ -140,6 +146,12 @@ pub enum Commands {
         /// Do not apply recovered global shapes as undefinedN types to decompiled.c.
         #[arg(long)]
         no_apply_global_types: bool,
+        /// Run Ghidra + radare2 even for unanimously-opaque images (the statistical
+        /// battery that e.g. Pixel `01_PSP` fails on every test). Research escape
+        /// hatch; by default such images are skipped — nothing is recoverable from
+        /// them under the standard import.
+        #[arg(long)]
+        no_skip_opaque: bool,
     },
     /// Symbolicate a decompose output tree: recover names + log annotations in place, emit symbols.json
     Symbolicate {
@@ -240,6 +252,7 @@ pub fn run() -> anyhow::Result<()> {
             processor,
             no_thumb_decompile,
             tighten_wall_clock_budget_sec,
+            no_skip_opaque,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = modem_bin
@@ -256,6 +269,7 @@ pub fn run() -> anyhow::Result<()> {
                 no_thumb_decompile,
                 tighten_wall_clock_budget_override: tighten_wall_clock_budget_sec
                     .map(std::time::Duration::from_secs),
+                no_skip_opaque,
             };
             crate::decompile::run(&modem_bin, &opts, &out)?; // run() prints the console report
         }
@@ -273,6 +287,7 @@ pub fn run() -> anyhow::Result<()> {
             globals_k_arm,
             globals_k_thumb,
             no_apply_global_types,
+            no_skip_opaque,
         } => {
             let out = out.unwrap_or_else(|| {
                 let stem = img
@@ -294,6 +309,7 @@ pub fn run() -> anyhow::Result<()> {
                 globals_k_arm,
                 globals_k_thumb,
                 no_apply_global_types,
+                no_skip_opaque,
             };
             let report = crate::decompose::run(&img, &opts, &out)?;
             println!("decomposed -> {}", out.display());
@@ -516,6 +532,86 @@ mod tests {
             .to_string();
 
         assert!(help.contains("--no-thumb-decompile"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompose_help_lists_no_skip_opaque_flag() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompose")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--no-skip-opaque"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompile_help_lists_no_skip_opaque_flag() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("decompile")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("--no-skip-opaque"), "help:\n{help}");
+    }
+
+    #[test]
+    fn decompose_no_skip_opaque_flag_defaults_false() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "/tmp/radio.img"]).unwrap();
+        match cli.command {
+            Commands::Decompose { no_skip_opaque, .. } => {
+                assert!(!no_skip_opaque, "default --no-skip-opaque should be false");
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompose_no_skip_opaque_flag_parses_true() {
+        let cli = Cli::try_parse_from(["pme", "decompose", "--no-skip-opaque", "/tmp/radio.img"])
+            .unwrap();
+        match cli.command {
+            Commands::Decompose { no_skip_opaque, .. } => {
+                assert!(
+                    no_skip_opaque,
+                    "--no-skip-opaque should parse to true when passed"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompile_no_skip_opaque_flag_defaults_false() {
+        let cli = Cli::try_parse_from(["pme", "decompile", "/tmp/modem.bin"]).unwrap();
+        match cli.command {
+            Commands::Decompile { no_skip_opaque, .. } => {
+                assert!(!no_skip_opaque, "default --no-skip-opaque should be false");
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn decompile_no_skip_opaque_flag_parses_true() {
+        let cli = Cli::try_parse_from(["pme", "decompile", "--no-skip-opaque", "/tmp/modem.bin"])
+            .unwrap();
+        match cli.command {
+            Commands::Decompile { no_skip_opaque, .. } => {
+                assert!(
+                    no_skip_opaque,
+                    "--no-skip-opaque should parse to true when passed"
+                );
+            }
+            _ => panic!("wrong subcommand"),
+        }
     }
 
     #[test]

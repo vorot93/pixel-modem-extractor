@@ -52,6 +52,11 @@ pub struct Opts {
     /// `--tighten-wall-clock-budget-sec` flag (Section 7 verification).
     /// Production callers leave this `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
+    /// Opaque-image escape hatch: when true, images whose battery is
+    /// unanimously opaque still run Ghidra + radare2 exactly as before
+    /// (run-everything behavior, for research). Default false (skip —
+    /// nothing is recoverable from those bytes under the standard import).
+    pub no_skip_opaque: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -245,13 +250,28 @@ fn image_matches(want: Option<&str>, label: &str, name: &str) -> bool {
     want.is_none() || want == Some(label) || want == Some(name)
 }
 
-/// One image's `--run` result: either analyzed (with the function count ExportDecomp
-/// recorded) or `analyzeHeadless` exited non-zero. Recorded per image so a full run
-/// reports every partition instead of aborting on the first failure.
+/// The `--run` skip decision (pure — no process spawn, no I/O): `Some(stats)`
+/// iff `classify`'s battery is unanimously opaque, meaning Ghidra's standard
+/// import recovers nothing (0 functions, 0-byte exports; measured on mustang
+/// `01_PSP` — see the spike capture in CONTRIBUTING). `None` sends the image
+/// to Ghidra exactly as today; a partially-encrypted image is never skipped
+/// (any single test refusal fails closed to `not_opaque`).
+fn opaque_skip(bytes: &[u8]) -> Option<crate::classify::BatteryStats> {
+    let stats = crate::classify::classify(bytes);
+    stats.opaque.then_some(stats)
+}
+
+/// One image's `--run` result: analyzed (with the function count ExportDecomp
+/// recorded), `analyzeHeadless` exited non-zero, or skipped because the opaque
+/// battery was unanimously opaque (no Ghidra/radare2 process was ever spawned;
+/// the carried stats are what the skip decision measured). Recorded per image
+/// so a full run reports every partition instead of aborting on the first
+/// failure.
 #[derive(Debug, Clone)]
 pub enum ImageOutcome {
     Analyzed(usize),
     Failed(i32),
+    SkippedOpaque(crate::classify::BatteryStats),
 }
 
 /// One image's structured `--run` outcome, surfaced for callers that orchestrate
@@ -483,6 +503,11 @@ pub(crate) fn validate_image_terminal_inventory(
         ImageOutcome::Failed(_) => {
             return Err(Error::Serialize(
                 "failed image has no current terminal inventory".into(),
+            ));
+        }
+        ImageOutcome::SkippedOpaque(_) => {
+            return Err(Error::Serialize(
+                "skipped image has no current terminal inventory".into(),
             ));
         }
     };
@@ -882,6 +907,36 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             let start = (e.offset as usize).min(data.len());
             let end = (e.offset as usize + e.size as usize).min(data.len());
             let img = &data[start..end];
+            // Opaque-image gate, BEFORE any Ghidra project work: a unanimous
+            // battery verdict means there is no code to recover, so bypass the
+            // entire per-image Ghidra + radare2 block (no import, no tighten
+            // watch, no export, no Thumb analysis) but still record a
+            // RunResult — `--image 01_PSP` stays a successful non-empty run.
+            // `--no-skip-opaque` restores run-everything behavior.
+            if !opts.no_skip_opaque
+                && let Some(stats) = opaque_skip(img)
+            {
+                tracing::warn!(
+                    "{label}: unanimously opaque battery — skipping Ghidra (H={:.4}, χ²/df={:.4}, SCC={:.4}, wmin={:.4}, frac={:.4}); --no-skip-opaque forces a run",
+                    stats.entropy_bits,
+                    stats.chi2_per_df,
+                    stats.serial_correlation,
+                    stats.window_min,
+                    stats.frac_windows_high
+                );
+                results.push(RunResult {
+                    label,
+                    outcome: ImageOutcome::SkippedOpaque(stats),
+                    thumb_functions: None,
+                    terminal_inventory: None,
+                    image_start: e.load_addr,
+                    image_len: e.size,
+                    thumb_error: None,
+                    tighten_error: None,
+                    thumb_decompiled: None,
+                });
+                continue;
+            }
             let regions = thumb_regions(img, e.load_addr);
             let mode = mode_from_opts(opts);
             tracing::info!(
@@ -1167,6 +1222,12 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 ImageOutcome::Failed(code) => {
                     println!("  {:<11} FAILED (exit {code}){t}{k}", r.label)
                 }
+                ImageOutcome::SkippedOpaque(_) => {
+                    println!(
+                        "  {:<11} SKIPPED (unanimously opaque battery; --no-skip-opaque forces a run)",
+                        r.label
+                    )
+                }
             }
         }
         image_results = results
@@ -1234,7 +1295,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
 fn report_failure(report: &DecompileReport) -> Option<Error> {
     if let Some(code) = report.images.iter().find_map(|r| match r.outcome {
         ImageOutcome::Failed(c) => Some(c),
-        ImageOutcome::Analyzed(_) => None,
+        ImageOutcome::Analyzed(_) | ImageOutcome::SkippedOpaque(_) => None,
     }) {
         let failed: Vec<&str> = report
             .images
@@ -4731,6 +4792,7 @@ INFO: second pdfj body was noisy and not parseable
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
             tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
         };
 
         let rep = run_report(&modem, &opts, &dir.join("out")).unwrap();
@@ -4778,6 +4840,73 @@ INFO: second pdfj body was noisy and not parseable
             err.to_string(),
             "decompose incomplete: radare2 failed on 02_MAIN: radare2 parser rejected empty stdout"
         );
+    }
+
+    /// Low-entropy ARM-ish pattern half for the partial-encryption guard
+    /// (mirrors classify.rs's test pattern: 16 distinct bytes).
+    fn arm_ish_pattern_blob(len: usize) -> Vec<u8> {
+        const PATTERN: [u8; 16] = [
+            0x00, 0xBF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+            0xDD, 0xEE,
+        ];
+        (0..len).map(|i| PATTERN[i % 16]).collect()
+    }
+
+    #[test]
+    fn opaque_skip_decision_is_the_pure_gate() {
+        // A uniform blob is unanimously opaque -> Some(stats), the pure
+        // decision path that returns before any process spawn.
+        let stats = opaque_skip(&crate::classify::test_uniform_blob(256 * 1024))
+            .expect("uniform blob is unanimously opaque");
+        assert!(stats.opaque);
+
+        // Half-and-half (uniform half + code half): window_min and
+        // frac_windows_high refuse -> None -> the image goes to Ghidra.
+        let mut half_and_half = crate::classify::test_uniform_blob(128 * 1024);
+        half_and_half.extend(arm_ish_pattern_blob(128 * 1024));
+        assert!(opaque_skip(&half_and_half).is_none());
+    }
+
+    #[test]
+    fn skipped_opaque_result_is_not_a_failure_and_expects_no_export() {
+        // A SkippedOpaque RunResult is a successful outcome: report_failure
+        // must return None, so `decompile --run --image 01_PSP` exits 0 and
+        // no export/<label>/ expectations are validated for it (the skip
+        // branch returns before any Ghidra/radare2 spawn; exhaustive match
+        // sites are enforced by compiling).
+        let report = DecompileReport {
+            images: vec![ImageResult {
+                label: "01_PSP".into(),
+                outcome: ImageOutcome::SkippedOpaque(crate::classify::classify(
+                    &crate::classify::test_uniform_blob(256 * 1024),
+                )),
+                thumb_functions: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
+                thumb_error: None,
+                pass2_applied: None,
+                pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
+            }],
+            spec_path: PathBuf::from("ghidra_load.json"),
+        };
+        assert!(report_failure(&report).is_none());
     }
 
     #[test]
@@ -4875,6 +5004,7 @@ INFO: second pdfj body was noisy and not parseable
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
             tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
         };
         run(&modem, &opts, &out).unwrap();
 

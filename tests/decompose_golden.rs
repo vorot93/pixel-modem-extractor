@@ -35,6 +35,7 @@ fn decompose_produces_unified_tree() {
         globals_k_arm: None,
         globals_k_thumb: None,
         no_apply_global_types: false,
+        no_skip_opaque: false,
     };
 
     // Best-effort: some partitions may fail Ghidra analysis, which makes `run` return
@@ -419,6 +420,7 @@ fn report_json_includes_phase2_fields() {
         globals_k_arm: None,
         globals_k_thumb: None,
         no_apply_global_types: false,
+        no_skip_opaque: false,
     };
     let _ = decompose::run(&img, &opts, &out);
 
@@ -476,6 +478,7 @@ fn report_json_includes_globals_field() {
         globals_k_arm: None,
         globals_k_thumb: None,
         no_apply_global_types: false,
+        no_skip_opaque: false,
     };
     let _ = decompose::run(&img, &opts, &out);
 
@@ -856,6 +859,7 @@ fn decompose_pinned_surfaces_match_reference() {
         globals_k_arm: None,
         globals_k_thumb: None,
         no_apply_global_types: false,
+        no_skip_opaque: false,
     };
     decompose::run(&img, &opts, &out).expect("decompose");
     let surfaces = ["manifest.json", "tokens", "rf", "ghidra/global_types_maps"];

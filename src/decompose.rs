@@ -52,12 +52,27 @@ pub struct Opts {
     /// `undefinedN` application is skipped. Wired to `--no-apply-global-types`.
     /// Default: apply.
     pub no_apply_global_types: bool,
+    /// Opaque-image escape hatch: when true, images whose battery is
+    /// unanimously opaque still run Ghidra + radare2 exactly as before
+    /// (run-everything behavior, for research). Default false (skip —
+    /// nothing is recoverable from those bytes under the standard import).
+    /// Wired to `--no-skip-opaque`.
+    pub no_skip_opaque: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ImageReport {
     pub image: String,
-    pub status: &'static str, // "analyzed" | "failed"
+    pub status: &'static str, // "analyzed" | "failed" | "skipped"
+    /// Opaque-battery classification: "opaque" for skipped images, "not_opaque"
+    /// for analyzed ones. Failed images omit it (the battery never decided —
+    /// the Ghidra run itself failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<&'static str>,
+    /// Why a skipped image was skipped: "opaque" (unanimous battery verdict;
+    /// no Ghidra/radare2 ran, no decompiled/ sidecars exist).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub functions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +173,8 @@ impl ImageReport {
                 } else {
                     "analyzed"
                 },
+                classification: Some("not_opaque"),
+                skipped_reason: None,
                 functions: Some(n),
                 thumb_functions: r.thumb_functions,
                 ghidra_execution_accepted: r.ghidra_execution_accepted,
@@ -197,6 +214,8 @@ impl ImageReport {
             ImageOutcome::Failed(code) => ImageReport {
                 image: r.label.clone(),
                 status: "failed",
+                classification: None,
+                skipped_reason: None,
                 functions: None,
                 thumb_functions: r.thumb_functions,
                 ghidra_execution_accepted: r.ghidra_execution_accepted,
@@ -205,6 +224,50 @@ impl ImageReport {
                 thumb_execution_quarantined: r.thumb_execution_quarantined,
                 thumb_error: r.thumb_error.clone(),
                 exit: Some(code),
+                pass2_applied: r.pass2_applied,
+                pass2_error: r.pass2_error.clone(),
+                globals_applied: r.globals_applied,
+                globals_apply_skipped: r.globals_apply_skipped,
+                globals_apply_error: r.globals_apply_error.clone(),
+                thumb_decompiled: r.thumb_decompiled,
+                thumb_tighten_error: r.thumb_tighten_error.clone(),
+                thumb_enrich_error: r.thumb_enrich_error.clone(),
+                globals_error: r.globals_error.clone(),
+                globals_recovered: r.globals_recovered,
+                globals_provisional: r.globals_provisional,
+                globals_provisional_suppressed: r.globals_provisional_suppressed,
+                global_shapes_inferred: None,
+                global_shapes_no_evidence: None,
+                global_shapes_conflicting: None,
+                global_shape_observations: None,
+                global_shapes_ghidra_quarantined: None,
+                global_shapes_thumb_quarantined: None,
+                global_shapes_quarantine_errors: None,
+                global_shapes_decode_failures: None,
+                global_shapes_state_barriers: None,
+                global_shapes_error: None,
+                global_types_applied: None,
+                global_types_candidates: None,
+                global_types_ineligible: None,
+                global_types_skipped: None,
+                global_types_error: None,
+            },
+            // Unanimously-opaque image: Ghidra and radare2 never ran, so there
+            // is no export to count, no exit code, and no Thumb inventory —
+            // only the battery verdict that caused the skip.
+            ImageOutcome::SkippedOpaque(_) => ImageReport {
+                image: r.label.clone(),
+                status: "skipped",
+                classification: Some("opaque"),
+                skipped_reason: Some("opaque"),
+                functions: None,
+                thumb_functions: r.thumb_functions,
+                ghidra_execution_accepted: r.ghidra_execution_accepted,
+                ghidra_execution_quarantined: r.ghidra_execution_quarantined,
+                thumb_execution_accepted: r.thumb_execution_accepted,
+                thumb_execution_quarantined: r.thumb_execution_quarantined,
+                thumb_error: r.thumb_error.clone(),
+                exit: None,
                 pass2_applied: r.pass2_applied,
                 pass2_error: r.pass2_error.clone(),
                 globals_applied: r.globals_applied,
@@ -1543,6 +1606,12 @@ where
 
     for image in images {
         let label = image.label.clone();
+        // Unanimously-opaque images never ran Ghidra: no `decompiled/`
+        // sidecars exist, so there is nothing to recover and no directory
+        // to write `globals.json` into — skip like a missing `.bin`.
+        if matches!(image.outcome, ImageOutcome::SkippedOpaque(_)) {
+            continue;
+        }
         let image_dir = images_dir.join(&label);
         if !image_dir.join(format!("{label}.bin")).exists() {
             continue;
@@ -1901,6 +1970,12 @@ fn run_global_shapes_stage_with(
             errors.push((label, reason));
             continue;
         };
+        // Unanimously-opaque images never ran Ghidra: no inventory, no
+        // `globals.json`, no sidecar to commit. The fields were just cleared
+        // above; skip quietly (nothing was recovered, nothing is stale).
+        if matches!(result.outcome, ImageOutcome::SkippedOpaque(_)) {
+            continue;
+        }
         let current = match current_global_shapes_run(result) {
             Ok(current) => current,
             Err(reason) => {
@@ -2146,6 +2221,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         processor: opts.processor.clone(),
         no_thumb_decompile: opts.no_thumb_decompile,
         tighten_wall_clock_budget_override: opts.tighten_wall_clock_budget_override,
+        no_skip_opaque: opts.no_skip_opaque,
     };
     let mut pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
         Ok(rep) => {
@@ -2727,6 +2803,30 @@ mod tests {
             "data_refs": []
         }]))
         .unwrap()
+    }
+
+    #[test]
+    fn image_report_serializes_skipped_opaque_outcome() {
+        let mut image = analyzed_image("01_PSP");
+        image.outcome = ImageOutcome::SkippedOpaque(crate::classify::classify(
+            &crate::classify::test_uniform_blob(256 * 1024),
+        ));
+        let json = serde_json::to_value(ImageReport::from_result(&image)).unwrap();
+        assert_eq!(json["status"], "skipped");
+        assert_eq!(json["classification"], "opaque");
+        assert_eq!(json["skipped_reason"], "opaque");
+        assert!(json.get("functions").is_none());
+        assert!(json.get("exit").is_none());
+    }
+
+    #[test]
+    fn image_report_serializes_analyzed_classification() {
+        let json =
+            serde_json::to_value(ImageReport::from_result(&analyzed_image("02_MAIN"))).unwrap();
+        assert_eq!(json["status"], "analyzed");
+        assert_eq!(json["classification"], "not_opaque");
+        assert!(json.get("skipped_reason").is_none());
+        assert!(json["functions"].is_u64());
     }
 
     fn tagged_thumb_functions() -> Vec<u8> {
@@ -4424,6 +4524,8 @@ mod tests {
                     ImageReport {
                         image: "02_MAIN".into(),
                         status: "analyzed",
+                        classification: Some("not_opaque"),
+                        skipped_reason: None,
                         functions: Some(3),
                         thumb_functions: Some(1),
                         ghidra_execution_accepted: None,
@@ -4463,6 +4565,8 @@ mod tests {
                     ImageReport {
                         image: "04_VSS".into(),
                         status: "failed",
+                        classification: None,
+                        skipped_reason: None,
                         functions: None,
                         thumb_functions: None,
                         ghidra_execution_accepted: None,
@@ -4608,6 +4712,7 @@ mod tests {
             serde_json::json!({
                 "image": "02_MAIN",
                 "status": "analyzed",
+                "classification": "not_opaque",
                 "functions": 1,
                 "pass2_applied": 3
             })
@@ -4624,6 +4729,7 @@ mod tests {
             serde_json::json!({
                 "image": "03_APM",
                 "status": "analyzed",
+                "classification": "not_opaque",
                 "functions": 1,
                 "pass2_applied": 2,
                 "globals_applied": 0,
@@ -4639,6 +4745,7 @@ mod tests {
             serde_json::json!({
                 "image": "04_VSS",
                 "status": "analyzed",
+                "classification": "not_opaque",
                 "functions": 1,
                 "globals_apply_error": "missing ApplyGlobals summary"
             })
@@ -4954,6 +5061,8 @@ mod tests {
         let pre_enrich_images = vec![ImageReport {
             image: "02_MAIN".into(),
             status: "analyzed",
+            classification: Some("not_opaque"),
+            skipped_reason: None,
             functions: Some(107_955),
             thumb_functions: Some(117_444),
             ghidra_execution_accepted: None,
@@ -5985,6 +6094,7 @@ mod tests {
             serde_json::json!({
                 "image": "02_MAIN",
                 "status": "analyzed",
+                "classification": "not_opaque",
                 "functions": 1
             })
         );
@@ -6006,6 +6116,7 @@ mod tests {
             serde_json::json!({
                 "image": "02_MAIN",
                 "status": "analyzed",
+                "classification": "not_opaque",
                 "functions": 1,
                 "global_shapes_inferred": 0,
                 "global_shapes_no_evidence": 0,
