@@ -150,6 +150,12 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
      decompose-layout legs (`global_shapes_golden`, the `PME_GOLDEN_DIR` legs
      of `globals_golden`). `tests/symbolicate_golden.rs` rewrites its tree in
      place — point `PME_DECOMPOSED_DIR` at a disposable copy, never the golden.
+     Running the full `--test decompose_golden` suite (not just the named
+     pinned-surfaces test) makes its three e2e legs each stage a full decompose
+     output under `std::env::temp_dir()` (~7G apiece); on a host whose `/tmp`
+     is a small tmpfs that exhausts it and every leg fails fast with ENOSPC
+     ("No space left on device") — set `TMPDIR` to a disk-backed directory
+     before running them.
 
   Use the same `PME_RADIO_IMG` path *spelling* (e.g. one fixed absolute path)
   for the re-baseline and every verification run — `manifest.json` embeds the
