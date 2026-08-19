@@ -191,6 +191,128 @@ fn radare2_json_values(stdout: &[u8]) -> Vec<serde_json::Value> {
     values
 }
 
+/// Streaming, noise-tolerant scanner for radare2 stdout: yields one
+/// top-level JSON value's bytes at a time, byte-for-byte equivalent to the
+/// legacy in-memory `radare2_json_values`/`balanced_json_end` pair (kept as
+/// the `#[cfg(test)]` oracle). Memory is bounded by the largest single
+/// top-level value plus one read chunk.
+#[cfg(test)]
+pub(super) struct ValueScanner<R> {
+    reader: R,
+    buf: Vec<u8>,
+    eof: bool,
+    out: Vec<u8>,
+}
+
+#[cfg(test)]
+const SCANNER_CHUNK_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+impl<R: std::io::Read> ValueScanner<R> {
+    pub(super) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            eof: false,
+            out: Vec::new(),
+        }
+    }
+
+    fn fill(&mut self) -> std::io::Result<bool> {
+        if self.eof {
+            return Ok(false);
+        }
+        let start = self.buf.len();
+        self.buf.resize(start + SCANNER_CHUNK_BYTES, 0);
+        loop {
+            match self.reader.read(&mut self.buf[start..]) {
+                Ok(0) => {
+                    self.buf.truncate(start);
+                    self.eof = true;
+                    return Ok(false);
+                }
+                Ok(n) => {
+                    self.buf.truncate(start + n);
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.buf.truncate(start);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Next parseable top-level value's bytes, or `None` at EOF. The borrow
+    /// is valid until the next call.
+    pub(super) fn next_value(&mut self) -> std::io::Result<Option<&[u8]>> {
+        loop {
+            if self.buf.is_empty() && !self.fill()? {
+                return Ok(None);
+            }
+            let noise = self
+                .buf
+                .iter()
+                .position(|&b| b == b'{' || b == b'[')
+                .unwrap_or(self.buf.len());
+            if noise == self.buf.len() {
+                self.buf.clear();
+                if !self.fill()? {
+                    return Ok(None);
+                }
+                continue;
+            }
+            if noise > 0 {
+                self.buf.drain(..noise);
+            }
+            let mut stack: Vec<u8> = Vec::new();
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut end = None;
+            for (i, &byte) in self.buf.iter().enumerate() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' => stack.push(b'}'),
+                    b'[' => stack.push(b']'),
+                    b'}' | b']' => {
+                        stack.pop();
+                        if stack.is_empty() {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                if !self.fill()? {
+                    self.buf.drain(..1);
+                }
+                continue;
+            };
+            let text = String::from_utf8_lossy(&self.buf[..=end]);
+            if serde_json::from_str::<serde::de::IgnoredAny>(&text).is_ok() {
+                self.out.clear();
+                self.out.extend_from_slice(&self.buf[..=end]);
+                self.buf.drain(..=end);
+                return Ok(Some(&self.out));
+            }
+            self.buf.drain(..1);
+        }
+    }
+}
+
 fn pdfj_values_from_radare2_output(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut pdfjs = Vec::new();
     let start = values
@@ -851,6 +973,8 @@ fn run_radare2_thumb_region(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     #[test]
@@ -1464,5 +1588,66 @@ INFO: second pdfj body was noisy and not parseable
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scanner_values(stdout: &[u8]) -> Vec<serde_json::Value> {
+        let mut scanner = ValueScanner::new(std::io::Cursor::new(stdout.to_vec()));
+        let mut out = Vec::new();
+        while let Some(bytes) = scanner.next_value().unwrap() {
+            out.push(serde_json::from_slice(bytes).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn scanner_matches_legacy_values_on_all_fixtures() {
+        let fixtures: Vec<&[u8]> = vec![
+            b"",
+            b"Warning: noisy prelude\n[{\"name\":\"f\",\"offset\":1,\"size\":2}]\nINFO: tail\n",
+            b"[{\"name\":\"f\",\"offset\":1,\"size\":2}]",
+            b"[{ \"ops\": [] }]  [ { \"ops\": [ { \"offset\": 1 } ] } ]",
+            b"{\"a\": \"has } ] { brackets [ inside \"} trailing",
+            b"{\"a\": \"esc \\\" ] quote\"}[1,2,3]",
+            b"[]not json at all[{\"x\":1}",
+            b"[unbalanced {\"a\":1",
+            b"[\"scalar\"]\n42\n\"str\"",
+            b"[{\"deep\":[{\"deeper\":[1,2,{\"ops\":[]}]}]}]",
+            b"{\"unicode\": \"\xc3\xa9\xf0\x9f\x98\x80\"} [\"after\"]",
+            b"[{\"a\":1}}[{\"b\":2}]",
+        ];
+        for (i, fixture) in fixtures.iter().enumerate() {
+            assert_eq!(
+                scanner_values(fixture),
+                radare2_json_values(fixture),
+                "fixture {i}: {fixture:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_survives_value_split_across_read_boundary() {
+        struct ByteAtATime<R: Read>(R);
+        impl<R: Read> Read for ByteAtATime<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(&mut buf[..1])
+            }
+        }
+        let payload = b"noise[{\"a\":[1,2,3,{\"b\":\"}\\\"]\"}]}]noise{\"c\":1}";
+        let mut scanner = ValueScanner::new(ByteAtATime(std::io::Cursor::new(payload.to_vec())));
+        let mut values = Vec::new();
+        while let Some(bytes) = scanner.next_value().unwrap() {
+            values.push(serde_json::from_slice::<serde_json::Value>(bytes).unwrap());
+        }
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn scanner_borrows_stay_stable_until_next_call() {
+        let payload = b"[{\"a\":1}] {\"b\":2}";
+        let mut scanner = ValueScanner::new(std::io::Cursor::new(payload.to_vec()));
+        let first = scanner.next_value().unwrap().unwrap().to_vec();
+        let second = scanner.next_value().unwrap().unwrap().to_vec();
+        assert_eq!(first, b"[{\"a\":1}]");
+        assert_eq!(second, b"{\"b\":2}");
     }
 }
