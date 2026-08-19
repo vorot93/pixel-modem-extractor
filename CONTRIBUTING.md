@@ -770,8 +770,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   R2_ADDRESS_SPACE_CAP_BYTES` (16 GiB, ~7× the measured healthy ceiling) on the
   r2 child via `pre_exec`, so a runaway region is denied further allocations
   and exits (`ENOMEM` → fail-closed) instead of exhausting RAM. `run_radare2_thumb`
-  analyzes each region independently (`run_radare2_thumb_region` →
-  `collect_thumb_regions`): a region whose r2 run fails is logged
+  analyzes each region independently (`run_radare2_thumb_region`, with the
+  per-region fold inline in `run_radare2_thumb`): a region whose r2 run
+  fails is logged
   (`regions_skipped`) and skipped, so the surviving regions still populate
   `thumb_functions.json` — one runaway region degrades Thumb coverage locally
   instead of zeroing it (previously the whole stage aborted). Unix-only; Windows
@@ -1159,8 +1160,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   A Ghidra 12 output root must stay
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
   goldens need a complete unpruned tree; a pruned golden has no raw
-  `.bin` slices. The dense-Thumb memory envelope (~56 GiB RSS) still
-  applies — shape recovery is not the peak. Do not parse Ghidra/radare2
+  `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
+  former whole-buffer r2 path) is still the conservative planning number —
+  keep that headroom until the streaming pipeline's full-`decompose` peak is
+  re-measured. Do not parse Ghidra/radare2
   disassembly text, infer ISA from alignment or inventory name, attribute
   an address to the nearest global, or leak decoder-crate enums outside
   `decoder.rs`.
@@ -1362,20 +1365,21 @@ hardcoded. Two reference images exercise both models end-to-end:
   `thumb/` tree.
 - **Why streaming-to-disk.** Three reasons: (1) decouples r2's write
   rate from Rust's read rate (no pipe-stall during slow parse); (2)
-  persistent artifact for post-hoc inspection; (3) sets up future
-  streaming-parse optionality. Raw `.stdout` captures remain on disk.
-  **Memory profile is NOT reduced** — `run_radare2_thumb` reads and parses the
-  current capture while retaining the normalized `serde_json::Value` function
-  collection accumulated from completed regions. A full dense-Thumb
-  `decompose` can therefore peak around 56 GiB RSS. The 4 GiB cap limits each
-  raw capture, not the accumulated normalized collection plus the current
-  capture's read/parse allocations. Plan for at least 64 GiB RAM plus swap or
-  other headroom; smaller images without dense Thumb regions stay under 1 GiB.
-  `--no-thumb-decompile` only selects Ghidra `datamark` mode and skips both
-  `body_c` enrichment sweeps; it still invokes the dense-region radare2
-  capture/read/parse loop and therefore does not avoid the full dense-Thumb
-  memory envelope. Reducing memory requires streaming parsing plus bounded
-  normalized accumulation (deferred follow-up).
+  persistent artifact for post-hoc inspection; (3) the streaming parse
+  consumes it (Stage 1 of the memory-envelope lever). Raw `.stdout`
+  captures remain on disk.
+  **Memory profile is bounded per value, not per capture** — the streaming
+  region pipeline (`process_region_streaming`) parses each capture with
+  `ValueScanner` (peak = largest single top-level JSON value + one 64 KiB
+  read chunk), spills normalized fragments to `thumb/<addr:08x>.frags`, and
+  `assemble_into` streams the spills into `thumb_functions.json`; only the
+  per-fragment `(fn_idx, offset, len)` slot index (~16 B/function) stays
+  resident. The ~56 GiB dense-Thumb RSS peak quoted in older notes was
+  measured under the former whole-buffer path — re-measure a full dense-Thumb
+  `decompose` before tightening the "plan 64 GiB RAM" headroom guidance, and
+  keep that guidance until then. `--no-thumb-decompile` only selects Ghidra
+  `datamark` mode and skips both `body_c` enrichment sweeps; it still invokes
+  the dense-region radare2 capture/parse loop.
 - **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
   into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
   so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,

@@ -34,20 +34,21 @@ Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PA
 supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
 to launch the headless analyzer unless you set your own `JAVA_HOME`.
 
-**Memory:** a full dense-Thumb `decompose` can peak around 56 GiB RSS. Raw
-per-region radare2 JSON captures remain on disk; normalized function values
-from completed regions accumulate in memory while the current capture is read
-and parsed. Plan for at least 64 GiB RAM plus swap or other headroom. The 4 GiB
-radare2 stdout cap applies per capture and does not cap aggregate process
-memory. radare2's *own* analysis memory is separately bounded to 16 GiB
+**Memory:** the radare2 Thumb stage streams: each per-region capture is parsed
+value-by-value (peak bounded by the largest single top-level JSON value),
+normalized fragments spill to disk, and `thumb_functions.json` is assembled
+from the spills. The historical ~56 GiB dense-Thumb peak was measured under
+the former whole-buffer path; keep planning for at least 64 GiB RAM plus swap
+or other headroom until a full `decompose` is re-measured under the streaming
+pipeline. The 4 GiB radare2 stdout cap applies per capture. radare2's *own*
+analysis memory is separately bounded to 16 GiB
 (`RLIMIT_AS`) per dense-Thumb region: a pathological region whose `aaa` would
 otherwise run away (seen on one 4 MiB region of cheetah's MAIN, ~90+ GiB) fails
 closed and is skipped, so the rest of the image's Thumb still decompiles instead
 of the host OOM-ing. Smaller images without dense Thumb regions (`00_BOOT`,
 `01_PSP`, etc.) stay under 1 GiB. `--no-thumb-decompile` switches Ghidra to `datamark` mode and
 skips `body_c` enrichment, but it still runs the dense-region radare2
-capture/read/parse path and therefore does not avoid the full dense-Thumb
-memory envelope.
+capture/parse path.
 
 **Project path:** `pixel-modem-extractor` canonicalizes its output root before
 constructing the Ghidra headless project path. Ghidra 12 rejects any

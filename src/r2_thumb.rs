@@ -6,10 +6,11 @@
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
     DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionProjection, canonicalize_errors,
-    canonicalize_instruction_extents, error, inventory_count_conserved, parse_projection,
-    projection_to_json,
+    canonicalize_instruction_extents, error, projection_to_json,
 };
-use std::path::Path;
+use serde_json::json;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 fn json_hex(v: u64) -> String {
     format!("0x{v:x}")
@@ -127,6 +128,8 @@ fn pdfj_entry(pdfj: &serde_json::Value) -> Option<u64> {
         })
 }
 
+/// Legacy in-memory oracle for `balanced_json_end`; test-only.
+#[cfg(test)]
 fn balanced_json_end(text: &str, start: usize) -> Option<usize> {
     let mut stack = Vec::new();
     let mut in_string = false;
@@ -163,6 +166,8 @@ fn balanced_json_end(text: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Legacy in-memory oracle for `ValueScanner`; test-only.
+#[cfg(test)]
 fn radare2_json_values(stdout: &[u8]) -> Vec<serde_json::Value> {
     let text = String::from_utf8_lossy(stdout);
     let mut values = Vec::new();
@@ -196,7 +201,6 @@ fn radare2_json_values(stdout: &[u8]) -> Vec<serde_json::Value> {
 /// legacy in-memory `radare2_json_values`/`balanced_json_end` pair (kept as
 /// the `#[cfg(test)]` oracle). Memory is bounded by the largest single
 /// top-level value plus one read chunk.
-#[cfg(test)]
 pub(super) struct ValueScanner<R> {
     reader: R,
     buf: Vec<u8>,
@@ -204,11 +208,9 @@ pub(super) struct ValueScanner<R> {
     out: Vec<u8>,
 }
 
-#[cfg(test)]
 const SCANNER_CHUNK_BYTES: usize = 64 * 1024;
 
-#[cfg(test)]
-impl<R: std::io::Read> ValueScanner<R> {
+impl<R: Read> ValueScanner<R> {
     pub(super) fn new(reader: R) -> Self {
         Self {
             reader,
@@ -319,7 +321,6 @@ impl<R: std::io::Read> ValueScanner<R> {
 /// normalization byte-for-byte: both `json_u64` paths (number or numeric
 /// string) resolve to the same u64, and a non-string `name` resolves to the
 /// same default.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 struct FnRec {
     entry: Option<u64>,
@@ -327,7 +328,6 @@ struct FnRec {
     name: Option<String>,
 }
 
-#[cfg(test)]
 fn fn_rec_from_value(raw: &serde_json::Value) -> FnRec {
     FnRec {
         entry: radare2_function_entry(raw),
@@ -341,10 +341,8 @@ fn fn_rec_from_value(raw: &serde_json::Value) -> FnRec {
 
 /// Sentinel aborting a seq probe when an element disqualifies the array as
 /// the aflj inventory (non-object element, or an object carrying `ops`).
-#[cfg(test)]
 const NOT_INVENTORY: &str = "\u{0}pme-not-inventory";
 
-#[cfg(test)]
 fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FnRec>> {
     use serde::Deserializer;
 
@@ -356,10 +354,8 @@ fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FnRec>> {
     }
 }
 
-#[cfg(test)]
 struct InventoryProbe;
 
-#[cfg(test)]
 impl<'de> serde::de::Visitor<'de> for InventoryProbe {
     type Value = Vec<FnRec>;
 
@@ -391,8 +387,7 @@ impl<'de> serde::de::Visitor<'de> for InventoryProbe {
 /// inventory value. The count matches legacy `values.len()` for the zero
 /// check because a found inventory implies >= 1 and an unfound one exhausts
 /// the stream.
-#[cfg(test)]
-fn scan_for_inventory<R: std::io::Read>(
+fn scan_for_inventory<R: Read>(
     scanner: &mut ValueScanner<R>,
 ) -> std::io::Result<(usize, Option<Vec<FnRec>>)> {
     let mut values = 0usize;
@@ -411,7 +406,6 @@ fn scan_for_inventory<R: std::io::Read>(
 /// document relies on serde_json's `Map` being a `BTreeMap` (sorted keys, no
 /// `preserve_order` feature) and on pretty output being pure indentation —
 /// pinned by tests.
-#[cfg(test)]
 fn render_fragment(value: &serde_json::Value) -> Result<String> {
     let pretty =
         serde_json::to_string_pretty(value).map_err(|e| Error::Serialize(e.to_string()))?;
@@ -424,7 +418,6 @@ fn render_fragment(value: &serde_json::Value) -> Result<String> {
 
 /// One spilled fragment's location; the stream slot is
 /// `[u32 LE fn_idx][u32 LE len][fragment bytes]`.
-#[cfg(test)]
 struct FragmentSlot {
     fn_idx: u32,
     offset: u64,
@@ -434,17 +427,15 @@ struct FragmentSlot {
 /// Append-only per-region fragment spill at `thumb/<addr:08x>.frags`. Only
 /// the `(fn_idx, offset, len)` index stays in memory (~16 B/function);
 /// fragment text lives on disk until assembly.
-#[cfg(test)]
 struct SpillWriter {
-    path: std::path::PathBuf,
+    path: PathBuf,
     file: std::fs::File,
     offset: u64,
     slots: Vec<FragmentSlot>,
 }
 
-#[cfg(test)]
 impl SpillWriter {
-    fn create(path: std::path::PathBuf) -> std::io::Result<Self> {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
         let file = std::fs::File::create(&path)?;
         Ok(Self {
             path,
@@ -455,7 +446,6 @@ impl SpillWriter {
     }
 
     fn push(&mut self, fn_idx: u32, fragment: &str) -> std::io::Result<()> {
-        use std::io::Write;
         let bytes = fragment.as_bytes();
         assert!(
             bytes.len() <= u32::MAX as usize,
@@ -474,7 +464,6 @@ impl SpillWriter {
     }
 
     fn finish(mut self) -> std::io::Result<Spill> {
-        use std::io::Write;
         self.file.flush()?;
         let mut slots = self.slots;
         slots.sort_unstable_by_key(|slot| slot.fn_idx);
@@ -487,20 +476,14 @@ impl SpillWriter {
 
 /// A finished, readable spill: fragments stream back in `fn_idx` order (=
 /// aflj order = the legacy emission order).
-#[cfg(test)]
 struct Spill {
-    path: std::path::PathBuf,
+    path: PathBuf,
     slots: Vec<FragmentSlot>,
 }
 
-#[cfg(test)]
 impl Spill {
-    fn emit_slot<W: std::io::Write>(
-        &self,
-        writer: &mut W,
-        slot: &FragmentSlot,
-    ) -> std::io::Result<()> {
-        use std::io::{Read, Seek};
+    fn emit_slot<W: Write>(&self, writer: &mut W, slot: &FragmentSlot) -> std::io::Result<()> {
+        use std::io::Seek;
         let mut file = std::fs::File::open(&self.path)?;
         file.seek(std::io::SeekFrom::Start(slot.offset))?;
         let mut remaining = slot.len as usize;
@@ -514,7 +497,8 @@ impl Spill {
         Ok(())
     }
 
-    fn emit<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    #[cfg(test)]
+    fn emit<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         for slot in &self.slots {
             self.emit_slot(writer, slot)?;
         }
@@ -522,6 +506,320 @@ impl Spill {
     }
 }
 
+/// Per-region counters maintained incrementally during streaming.
+struct RegionStats {
+    raw: usize,
+    substantial: usize,
+    accepted: usize,
+}
+
+/// One region's finished spill plus its stats.
+struct RegionOutcome {
+    spill: Spill,
+    stats: RegionStats,
+}
+
+/// Carries io and callback errors out of `for_each_pdfj_position`'s read loop.
+enum RegionIterError {
+    Io(std::io::Error),
+    Region(Error),
+}
+
+impl From<std::io::Error> for RegionIterError {
+    fn from(e: std::io::Error) -> Self {
+        RegionIterError::Io(e)
+    }
+}
+
+fn region_iter_err(e: RegionIterError) -> Error {
+    match e {
+        RegionIterError::Io(e) => e.into(),
+        RegionIterError::Region(e) => e,
+    }
+}
+
+/// Iterate pdfj positions from a scanner positioned after the inventory: a
+/// top-level object with an `ops` array is a pdfj; a top-level array
+/// contributes its ops-object elements in order (the legacy nested shape);
+/// everything else is skipped. Positions count accepted pdfjs in arrival
+/// order — the order `pdfj_values_from_radare2_output` produced.
+fn for_each_pdfj_position<R, F>(
+    scanner: &mut ValueScanner<R>,
+    mut on_pdfj: F,
+) -> std::result::Result<(), RegionIterError>
+where
+    R: Read,
+    F: FnMut(usize, serde_json::Value) -> Result<()>,
+{
+    let mut position = 0usize;
+    while let Some(bytes) = scanner.next_value()? {
+        let text = String::from_utf8_lossy(bytes);
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if value
+            .get("ops")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+        {
+            on_pdfj(position, value).map_err(RegionIterError::Region)?;
+            position += 1;
+        } else if let Some(elements) = value.as_array() {
+            for element in elements {
+                if element
+                    .get("ops")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some()
+                {
+                    on_pdfj(position, element.clone()).map_err(RegionIterError::Region)?;
+                    position += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Process one captured `.stdout` with bounded memory: stream the inventory
+/// into `FnRec`s (A), entry-match arriving pdfjs normalizing and spilling
+/// immediately (B1), positional-fallback re-stream (B2), normalize the
+/// never-paired remainder with `pdfj = None` (C), then the verdicts in the
+/// legacy precedence order — no-JSON, unassignable, orphan, u32-domain,
+/// conserving. Any `Err` removes the partial spill.
+fn process_region_streaming(
+    stdout_path: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    thumb_dir: &Path,
+) -> Result<RegionOutcome> {
+    let spill_path = thumb_dir.join(format!("{addr:08x}.frags"));
+    match process_region_inner(stdout_path, image, load_addr, addr, &spill_path) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            let _ = std::fs::remove_file(&spill_path);
+            Err(error)
+        }
+    }
+}
+
+fn process_region_inner(
+    stdout_path: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    spill_path: &Path,
+) -> Result<RegionOutcome> {
+    let file = std::fs::File::open(stdout_path)?;
+    let mut scanner = ValueScanner::new(std::io::BufReader::new(file));
+
+    // Pass A — compact inventory, then the legacy verdicts known up front.
+    let (value_count, inventory) = scan_for_inventory(&mut scanner)?;
+    if value_count == 0 {
+        return Err(Error::Serialize(format!(
+            "radare2 produced no parseable JSON for Thumb region 0x{addr:x}"
+        )));
+    }
+    let Some(fns) = inventory else {
+        return Err(Error::Serialize(format!(
+            "radare2 produced parseable JSON but no aflj function inventory for Thumb region 0x{addr:x}"
+        )));
+    };
+    let unassignable = fns.iter().filter(|f| f.entry.is_none()).count();
+    if unassignable > 0 {
+        return Err(Error::Serialize(format!(
+            "radare2 reported {unassignable} unassignable aflj function {} for Thumb region 0x{addr:x}",
+            if unassignable == 1 {
+                "record"
+            } else {
+                "records"
+            }
+        )));
+    }
+    // Deferred u32-domain verdict: overflow fns still pair (legacy pairing
+    // runs before its normalize loop) but never normalize here; the error
+    // fires after the orphan check, exactly where the legacy loop hit it.
+    let overflow: Vec<bool> = fns
+        .iter()
+        .map(|f| u32::try_from(f.entry.expect("unassignable rejected")).is_err())
+        .collect();
+    let mut paired = vec![false; fns.len()];
+    let mut pdfj_used: Vec<bool> = Vec::new();
+    let mut spill = SpillWriter::create(spill_path.to_path_buf())?;
+    let mut stats = RegionStats {
+        raw: fns.len(),
+        substantial: fns.iter().filter(|f| f.size >= 32).count(),
+        accepted: 0,
+    };
+
+    // B1 — entry-matching on the same scanner. Greedy first-unpaired-fn
+    // assignment is equivalent to the legacy fn-outer scan: per entry key
+    // both orderings pair the i-th fn of the key with the i-th pdfj of the
+    // key; different keys never compete.
+    for_each_pdfj_position(&mut scanner, |position, pdfj| {
+        pdfj_used.push(false);
+        let Some(entry) = pdfj_entry(&pdfj) else {
+            return Ok(());
+        };
+        let Some(fn_idx) = (0..fns.len()).find(|&i| !paired[i] && fns[i].entry == Some(entry))
+        else {
+            return Ok(());
+        };
+        paired[fn_idx] = true;
+        pdfj_used[position] = true;
+        if !overflow[fn_idx] {
+            normalize_and_spill(
+                &mut spill,
+                &mut stats,
+                fn_idx,
+                &fns[fn_idx],
+                Some(&pdfj),
+                image,
+                load_addr,
+                addr,
+            )?;
+        }
+        Ok(())
+    })
+    .map_err(region_iter_err)?;
+
+    // B2 — positional fallback over a fresh stream of the same capture.
+    let file = std::fs::File::open(stdout_path)?;
+    let mut scanner = ValueScanner::new(std::io::BufReader::new(file));
+    scan_for_inventory(&mut scanner)?; // deterministic re-detection; discard
+    for_each_pdfj_position(&mut scanner, |position, pdfj| {
+        if pdfj_used.get(position).copied().unwrap_or(false) {
+            return Ok(());
+        }
+        let Some(rec) = fns.get(position) else {
+            return Ok(());
+        };
+        if paired[position] {
+            return Ok(());
+        }
+        let candidate = pdfj_entry(&pdfj);
+        if candidate.is_some_and(|entry| rec.entry != Some(entry)) {
+            return Ok(());
+        }
+        pdfj_used[position] = true;
+        paired[position] = true;
+        if !overflow[position] {
+            normalize_and_spill(
+                &mut spill,
+                &mut stats,
+                position,
+                rec,
+                Some(&pdfj),
+                image,
+                load_addr,
+                addr,
+            )?;
+        }
+        Ok(())
+    })
+    .map_err(region_iter_err)?;
+
+    // Verdicts in legacy precedence: orphan before u32-domain.
+    let orphan = pdfj_used.iter().filter(|used| !**used).count();
+    if orphan > 0 {
+        return Err(Error::Serialize(format!(
+            "radare2 produced {orphan} orphan pdfj {} for Thumb region 0x{addr:x}",
+            if orphan == 1 { "body" } else { "bodies" }
+        )));
+    }
+    if overflow.contains(&true) {
+        return Err(Error::Serialize(format!(
+            "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{addr:x}"
+        )));
+    }
+
+    // Pass C — never-paired functions normalize with pdfj = None.
+    for (fn_idx, rec) in fns.iter().enumerate() {
+        if !paired[fn_idx] {
+            normalize_and_spill(
+                &mut spill, &mut stats, fn_idx, rec, None, image, load_addr, addr,
+            )?;
+        }
+    }
+
+    let quarantined = stats.raw - stats.accepted;
+    if stats.accepted + quarantined != stats.raw {
+        return Err(Error::Serialize(format!(
+            "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+        )));
+    }
+    let spill = spill.finish()?;
+    Ok(RegionOutcome { spill, stats })
+}
+
+/// Rebuild the minimal raw aflj element `normalize_radare2_function_checked`
+/// consumes, normalize it, classify the projection from the emitted JSON
+/// (exactly how `run_radare2_thumb` classified accepted), and spill the
+/// fragment. `rec.entry` must be `Some` (unassignable rejected upstream).
+#[allow(clippy::too_many_arguments)]
+fn normalize_and_spill(
+    spill: &mut SpillWriter,
+    stats: &mut RegionStats,
+    fn_idx: usize,
+    rec: &FnRec,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+) -> Result<()> {
+    let entry = rec.entry.expect("unassignable rejected upstream");
+    let mut raw = serde_json::Map::new();
+    raw.insert("offset".to_string(), json!(entry));
+    raw.insert("size".to_string(), json!(rec.size));
+    if let Some(name) = &rec.name {
+        raw.insert("name".to_string(), json!(name));
+    }
+    let raw = serde_json::Value::Object(raw);
+    let normalized = normalize_radare2_function_checked(&raw, pdfj, image, load_addr, addr)?;
+    if normalized
+        .get("decode_ranges")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|ranges| !ranges.is_empty())
+    {
+        stats.accepted += 1;
+    }
+    let fragment = render_fragment(&normalized)?;
+    spill.push(fn_idx as u32, &fragment)?;
+    Ok(())
+}
+
+/// Stream header, fragments (spills in region order, slots in fn order,
+/// comma-newline joined), and footer into `writer`. Zero total fragments
+/// renders the empty `functions` array inline, exactly as `to_string_pretty`.
+fn assemble_into<W: Write>(writer: &mut W, spills: &[&Spill]) -> Result<()> {
+    let total: usize = spills.iter().map(|spill| spill.slots.len()).sum();
+    if total == 0 {
+        writer
+            .write_all(b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": []\n}")
+            .map_err(Error::from)?;
+        return Ok(());
+    }
+    writer
+        .write_all(
+            b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": [\n",
+        )
+        .map_err(Error::from)?;
+    let mut first = true;
+    for spill in spills {
+        for slot in &spill.slots {
+            if !first {
+                writer.write_all(b",\n").map_err(Error::from)?;
+            }
+            first = false;
+            spill.emit_slot(writer, slot).map_err(Error::from)?;
+        }
+    }
+    writer.write_all(b"\n  ]\n}").map_err(Error::from)?;
+    Ok(())
+}
+
+/// Legacy in-memory oracle for `for_each_pdfj_position`'s flattening; test-only.
+#[cfg(test)]
 fn pdfj_values_from_radare2_output(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut pdfjs = Vec::new();
     let start = values
@@ -553,6 +851,8 @@ fn pdfj_values_from_radare2_output(values: &[serde_json::Value]) -> Vec<serde_js
     pdfjs
 }
 
+/// Legacy in-memory oracle for `scan_for_inventory`'s detection; test-only.
+#[cfg(test)]
 fn is_aflj_function_inventory(value: &serde_json::Value) -> bool {
     let Some(values) = value.as_array() else {
         return false;
@@ -566,6 +866,8 @@ fn is_aflj_function_inventory(value: &serde_json::Value) -> bool {
         })
 }
 
+/// Legacy whole-buffer parse result; oracle for the streaming pipeline, test-only.
+#[cfg(test)]
 #[derive(Debug)]
 struct Radare2ThumbOutput {
     json_value_count: usize,
@@ -575,6 +877,8 @@ struct Radare2ThumbOutput {
     orphan_pdfj_count: usize,
 }
 
+/// Legacy whole-buffer pairing oracle; test-only.
+#[cfg(test)]
 fn parse_radare2_thumb_output(stdout: &[u8]) -> Radare2ThumbOutput {
     let values = radare2_json_values(stdout);
     let Some(fns) = values
@@ -647,6 +951,8 @@ fn radare2_thumb_function_pdfjs(stdout: &[u8]) -> Vec<(serde_json::Value, serde_
         .collect()
 }
 
+/// Legacy whole-buffer verdict oracle (error strings are the pinned invariant); test-only.
+#[cfg(test)]
 fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare2ThumbOutput> {
     let parsed = parse_radare2_thumb_output(stdout);
     if parsed.json_value_count == 0 {
@@ -986,42 +1292,12 @@ fn limit_r2_address_space(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn limit_r2_address_space(_cmd: &mut std::process::Command) {}
 
-/// A Thumb region whose radare2 analysis failed and was skipped so the rest of
-/// the image's regions still produce output. `reason` is the underlying error
-/// text (r2 spawn/kill/non-zero exit — including the address-space cap firing on
-/// a pathological blob — a stdout-cap exceed, or malformed output).
-struct SkippedRegion {
-    addr: u32,
-    reason: String,
-}
-
-/// Fold per-region radare2 outcomes into the surviving functions plus the list of
-/// skipped regions. A region's `Err` is recorded, never propagated, so one
-/// runaway or malformed region degrades Thumb coverage locally instead of
-/// aborting the whole stage and zeroing `thumb_functions.json`.
-fn collect_thumb_regions(
-    region_results: Vec<(u32, Result<Vec<serde_json::Value>>)>,
-) -> (Vec<serde_json::Value>, Vec<SkippedRegion>) {
-    let mut all = Vec::new();
-    let mut skipped = Vec::new();
-    for (addr, result) in region_results {
-        match result {
-            Ok(functions) => all.extend(functions),
-            Err(e) => skipped.push(SkippedRegion {
-                addr,
-                reason: e.to_string(),
-            }),
-        }
-    }
-    (all, skipped)
-}
-
 /// Analyze an image's dense Thumb-2 regions with radare2. Each region is carved out,
 /// analyzed as ARM/Thumb (`-a arm -b 16`) based at its load address, and its
-/// `aflj`/`pdfj` function output merged into `out_dir/thumb_functions.json` (the carved
-/// blobs are kept under `out_dir/thumb/` for follow-up). Returns the count of substantial
-/// (>= 32-byte) functions recovered. Per-region failures are tolerated (see
-/// [`collect_thumb_regions`]): one runaway region does not zero the others.
+/// `aflj`/`pdfj` function output assembled into `out_dir/thumb_functions.json` from
+/// the per-region fragment spills (the carved blobs are kept under `out_dir/thumb/`
+/// for follow-up). Returns the count of substantial (>= 32-byte) functions recovered.
+/// Per-region failures are tolerated: one runaway region does not zero the others.
 pub fn run_radare2_thumb(
     r2: &Path,
     image: &[u8],
@@ -1035,7 +1311,7 @@ pub fn run_radare2_thumb(
     // whose r2 run fails — most consequentially the address-space cap firing on a
     // pathological blob — is recorded and skipped so the remaining regions still
     // populate thumb_functions.json instead of the whole stage aborting.
-    let region_results: Vec<(u32, Result<Vec<serde_json::Value>>)> = regions
+    let region_results: Vec<(u32, Result<Option<RegionOutcome>>)> = regions
         .iter()
         .map(|&(addr, len)| {
             (
@@ -1044,56 +1320,53 @@ pub fn run_radare2_thumb(
             )
         })
         .collect();
-    let (all, skipped) = collect_thumb_regions(region_results);
-    for region in &skipped {
+    let mut spills = Vec::new();
+    let mut skipped = Vec::new();
+    let mut substantial = 0usize;
+    let mut accepted = 0usize;
+    let mut raw = 0usize;
+    for (addr, result) in region_results {
+        match result {
+            Ok(Some(outcome)) => {
+                substantial += outcome.stats.substantial;
+                accepted += outcome.stats.accepted;
+                raw += outcome.stats.raw;
+                spills.push(outcome.spill);
+            }
+            Ok(None) => {}
+            Err(e) => skipped.push((addr, e.to_string())),
+        }
+    }
+    for (addr, reason) in &skipped {
         tracing::warn!(
             "radare2: Thumb region 0x{:x} skipped (analysis failed, fail-closed): {}",
-            region.addr,
-            region.reason
+            addr,
+            reason
         );
     }
-    let substantial = all
-        .iter()
-        .filter(|f| {
-            f.get("size")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                >= 32
-        })
-        .count();
-    let accepted = all
-        .iter()
-        .filter(|function| {
-            function
-                .get("decode_ranges")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|ranges| !ranges.is_empty())
-        })
-        .count();
     tracing::info!(
         "radare2: Thumb execution projections accepted={accepted} quarantined={} regions_skipped={}",
-        all.len() - accepted,
+        raw - accepted,
         skipped.len()
     );
-    let wrapped = serde_json::json!({
-        "format": "pixel-modem-extractor-thumb-functions-v2",
-        "functions": all,
-    });
-    std::fs::write(
-        out_dir.join("thumb_functions.json"),
-        serde_json::to_string_pretty(&wrapped).map_err(|e| Error::Serialize(e.to_string()))?,
-    )?;
+    let spill_refs: Vec<&Spill> = spills.iter().collect();
+    let file = std::fs::File::create(out_dir.join("thumb_functions.json"))?;
+    let mut writer = std::io::BufWriter::new(file);
+    assemble_into(&mut writer, &spill_refs)?;
+    writer.flush()?;
     Ok(substantial)
 }
 
-/// Analyze one dense Thumb-2 region with radare2 and return its normalized
-/// functions. Carves the region to `thumb_dir/<addr>.bin`, runs
-/// `aaa;aflj;pdfj @@f` under [`limit_r2_address_space`], streams stdout to a
-/// capped `<addr>.stdout`, and normalizes each paired function. Returns `Err` on
-/// any per-region failure — r2 spawn/kill/non-zero exit (the address-space cap
-/// firing lands here), a stdout-cap exceed, malformed output, or a non-conserving
-/// projection; [`run_radare2_thumb`] records those as skips rather than aborting.
-/// An empty region (offset past the image end) yields `Ok` with no functions.
+/// Analyze one dense Thumb-2 region with radare2 and return its finished
+/// fragment spill plus per-region stats. Carves the region to
+/// `thumb_dir/<addr>.bin`, runs `aaa;aflj;pdfj @@f` under
+/// [`limit_r2_address_space`], streams stdout to a capped `<addr>.stdout`,
+/// then processes that capture via [`process_region_streaming`]. Returns
+/// `Err` on any per-region failure — r2 spawn/kill/non-zero exit (the
+/// address-space cap firing lands here), a stdout-cap exceed, malformed
+/// output, or a non-conserving projection; [`run_radare2_thumb`] records
+/// those as skips rather than aborting. An empty region (offset past the
+/// image end) yields `Ok(None)`.
 fn run_radare2_thumb_region(
     r2: &Path,
     image: &[u8],
@@ -1101,10 +1374,10 @@ fn run_radare2_thumb_region(
     addr: u32,
     len: u32,
     thumb_dir: &Path,
-) -> Result<Vec<serde_json::Value>> {
+) -> Result<Option<RegionOutcome>> {
     let off = addr.wrapping_sub(load_addr) as usize;
     if off >= image.len() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let end = off.saturating_add(len as usize).min(image.len());
     let bin = thumb_dir.join(format!("{addr:08x}.bin"));
@@ -1151,40 +1424,11 @@ fn run_radare2_thumb_region(
     let status = child.wait()?;
     check_radare2_thumb_status(status.success(), status.code(), addr)?;
 
-    // Read the streamed file back for parsing. Memory peak here is ~file size
-    // (the parse path holds the bytes + builds JSON Value trees). Acceptable on
-    // research machines; a future streaming-JSON-parser follow-up would reduce
-    // this — see CONTRIBUTING's radare2 invariant.
-    let stdout_bytes = std::fs::read(&stdout_path)?;
-    let parsed = parse_checked_radare2_thumb_output(&stdout_bytes, addr)?;
-    let raw_record_count = parsed.records.len();
-    let mut region_fns: Vec<serde_json::Value> = Vec::with_capacity(raw_record_count);
-    for (f, pdfj) in parsed.records {
-        region_fns.push(normalize_radare2_function_checked(
-            &f,
-            pdfj.as_ref(),
-            image,
-            load_addr,
-            addr,
-        )?);
-    }
-    let projections = region_fns
-        .iter()
-        .map(parse_projection)
-        .collect::<Result<Vec<_>>>()?;
-    if !inventory_count_conserved(raw_record_count, &projections) {
-        return Err(Error::Serialize(format!(
-            "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
-        )));
-    }
-    Ok(region_fns)
+    process_region_streaming(&stdout_path, image, load_addr, addr, thumb_dir).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-    use std::io::Read;
-
     use super::*;
 
     #[test]
@@ -1448,32 +1692,42 @@ mod tests {
         // regions' functions still reach thumb_functions.json. Regression guard
         // for the address-space-cap fail-closed path — one runaway region (e.g.
         // cheetah 01_MAIN 0x42310000) must degrade Thumb coverage locally, not
-        // zero it out.
-        let region_results: Vec<(u32, Result<Vec<serde_json::Value>>)> = vec![
-            (0x40010000, Ok(vec![serde_json::json!({"name": "thumb_a"})])),
-            (
-                0x42310000,
-                Err(Error::Serialize(
-                    "radare2 exited with status 139 for Thumb region 0x42310000".into(),
-                )),
-            ),
-            (
-                0x43a00000,
-                Ok(vec![
-                    serde_json::json!({"name": "thumb_b"}),
-                    serde_json::json!({"name": "thumb_c"}),
-                ]),
-            ),
-        ];
-        let (functions, skipped) = collect_thumb_regions(region_results);
-        assert_eq!(
-            functions.len(),
-            3,
-            "surviving regions' functions must be kept"
-        );
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].addr, 0x42310000);
-        assert!(skipped[0].reason.contains("139"));
+        // zero it out. Exercises the production fold in `run_radare2_thumb`
+        // through a stub r2 that fails exactly one region by its -m address.
+        let dir = std::env::temp_dir().join(format!("pme_r2_skip_one_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r2 = dir.join("r2");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            &r2,
+            "#!/usr/bin/env sh\ncase \" $* \" in\n  *\" -m 0x4120 \"*) exit 139;;\n  *) printf '%s\\n' '[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":64}]' '{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}';;\nesac\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&r2).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&r2, perm).unwrap();
+        }
+
+        let count = run_radare2_thumb(
+            &r2,
+            &[0u8; 0x180],
+            0x4000,
+            &[(0x4100, 0x20), (0x4120, 0x20), (0x4140, 0x20)],
+            &out,
+        )
+        .unwrap();
+
+        assert_eq!(count, 2, "surviving regions' functions must be kept");
+        let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let functions = doc["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1967,5 +2221,130 @@ INFO: second pdfj body was noisy and not parseable
         let mut out = Vec::new();
         spill.emit(&mut out).unwrap();
         assert_eq!(out, b"frag-zerofrag-onefrag-two");
+    }
+
+    fn legacy_region_document(
+        stdout: &[u8],
+        image: &[u8],
+        load_addr: u32,
+        addr: u32,
+    ) -> Result<Vec<u8>> {
+        let parsed = parse_checked_radare2_thumb_output(stdout, addr)?;
+        let mut all = Vec::new();
+        for (f, pdfj) in &parsed.records {
+            all.push(normalize_radare2_function_checked(
+                f,
+                pdfj.as_ref(),
+                image,
+                load_addr,
+                addr,
+            )?);
+        }
+        let wrapped = json!({
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": all,
+        });
+        Ok(serde_json::to_string_pretty(&wrapped).unwrap().into_bytes())
+    }
+
+    fn streaming_region_document(
+        stdout: &[u8],
+        image: &[u8],
+        load_addr: u32,
+        addr: u32,
+    ) -> Result<Vec<u8>> {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("capture.stdout");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let outcome = process_region_streaming(&stdout_path, image, load_addr, addr, dir.path())?;
+        let spills = [outcome.spill];
+        let refs: Vec<&Spill> = spills.iter().collect();
+        let mut out = Vec::new();
+        assemble_into(&mut out, &refs)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn streaming_region_matches_legacy_oracle_on_all_fixtures() {
+        let fixtures: Vec<&[u8]> = vec![
+            // normal pair
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            // positional fallback: entry-less pdfj pairs by position
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\n{\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n",
+            // pdfjs nested in an array after the inventory
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n[{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]},{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}]\n",
+            // duplicate entries: two fns and two pdfjs share one entry
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.a2\",\"offset\":16384,\"size\":32}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]}\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            // never-paired fn quarantines with empty body/data_refs
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            // leading + trailing noise
+            b"Warning: noisy prelude\n[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\nINFO: tail\n",
+            // entry-matched pdfj is NOT reused as positional fallback (pinned case)
+            b"[{\"name\":\"sym.first\",\"offset\":16384,\"size\":64},{\"name\":\"sym.second\",\"offset\":16448,\"size\":64}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+        ];
+        for (i, stdout) in fixtures.iter().enumerate() {
+            let mut image = vec![0u8; 0x1_0000];
+            for (_, pdfj) in radare2_thumb_function_pdfjs(stdout) {
+                populate_test_image_from_pdfj(&mut image, &pdfj);
+            }
+            let legacy = legacy_region_document(stdout, &image, 0, 0x4000)
+                .unwrap_or_else(|e| panic!("fixture {i} legacy: {e}"));
+            let streaming = streaming_region_document(stdout, &image, 0, 0x4000)
+                .unwrap_or_else(|e| panic!("fixture {i} streaming: {e}"));
+            assert_eq!(legacy, streaming, "fixture {i} must be byte-identical");
+        }
+    }
+
+    #[test]
+    fn streaming_region_error_messages_match_legacy() {
+        let fixtures: Vec<&[u8]> = vec![
+            b"",
+            b"only noise\nand more noise",
+            b"\"scalar\" 42",
+            b"[{\"name\":\"x\",\"size\":8}]",
+            b"[{\"name\":\"f\",\"offset\":16384,\"size\":64}]\n{\"addr\":20480,\"ops\":[{\"offset\":20480,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}\n",
+            b"[{\"name\":\"f\",\"offset\":8589934592,\"size\":64}]",
+            // nested-array pdfjs where one element never pairs: orphan verdict
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\n[{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]},{\"addr\":9999,\"ops\":[]}]\n",
+        ];
+        for (i, stdout) in fixtures.iter().enumerate() {
+            let image = vec![0u8; 0x1_0000];
+            let legacy = legacy_region_document(stdout, &image, 0, 0x4000)
+                .unwrap_err()
+                .to_string();
+            let streaming = streaming_region_document(stdout, &image, 0, 0x4000)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(legacy, streaming, "fixture {i} error strings must match");
+        }
+    }
+
+    #[test]
+    fn streaming_region_stats_match_document_derived_counts() {
+        let stdout = b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":16}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n";
+        let mut image = vec![0u8; 0x1_0000];
+        for (_, pdfj) in radare2_thumb_function_pdfjs(stdout) {
+            populate_test_image_from_pdfj(&mut image, &pdfj);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("capture.stdout");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let outcome =
+            process_region_streaming(&stdout_path, &image, 0, 0x4000, dir.path()).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&streaming_region_document(stdout, &image, 0, 0x4000).unwrap())
+                .unwrap();
+        let functions = doc["functions"].as_array().unwrap();
+        let substantial = functions
+            .iter()
+            .filter(|f| f["size"].as_u64().unwrap_or(0) >= 32)
+            .count();
+        let accepted = functions
+            .iter()
+            .filter(|f| !f["decode_ranges"].as_array().unwrap().is_empty())
+            .count();
+        assert_eq!(outcome.stats.raw, functions.len());
+        assert_eq!(outcome.stats.substantial, substantial);
+        assert_eq!(outcome.stats.accepted, accepted);
     }
 }
