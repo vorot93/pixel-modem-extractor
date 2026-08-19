@@ -1,3 +1,4 @@
+use crate::classify::{BatteryStats, WINDOW_SIZE};
 use crate::error::{Error, Result};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,45 @@ pub struct ManifestEntry {
     pub blake3: String,
 }
 
+/// Manifest record of the opaque-image battery for one TOC image:
+/// [`BatteryStats`] rounded to 4 decimals, the verdict as a label, and the
+/// fixed window size the per-window stats were computed over.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct BatteryInfo {
+    /// `"opaque"` or `"not_opaque"`.
+    pub label: &'static str,
+    pub entropy_bits: f64,
+    pub chi2_per_df: f64,
+    pub serial_correlation: f64,
+    pub window_min: f64,
+    pub window_mean: f64,
+    pub window_max: f64,
+    pub frac_windows_high: f64,
+    pub window_count: usize,
+    pub window_size: usize,
+}
+
+fn round4(x: f64) -> f64 {
+    (x * 10_000.0).round() / 10_000.0
+}
+
+impl BatteryInfo {
+    pub fn from_stats(s: &BatteryStats) -> Self {
+        BatteryInfo {
+            label: if s.opaque { "opaque" } else { "not_opaque" },
+            entropy_bits: round4(s.entropy_bits),
+            chi2_per_df: round4(s.chi2_per_df),
+            serial_correlation: round4(s.serial_correlation),
+            window_min: round4(s.window_min),
+            window_mean: round4(s.window_mean),
+            window_max: round4(s.window_max),
+            frac_windows_high: round4(s.frac_windows_high),
+            window_count: s.window_count,
+            window_size: WINDOW_SIZE,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TocImageInfo {
     pub name: String,
@@ -95,6 +135,10 @@ pub struct TocImageInfo {
     pub computed_crc32: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crc_match: Option<bool>,
+    /// Opaque-image battery record; filled for every embedded TOC image whose
+    /// byte range lies inside modem.bin, regardless of `verify`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery: Option<BatteryInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,8 +185,91 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::BatteryStats;
+    use crate::classify::test_uniform_blob;
     use crate::error::Error;
     use std::io::Read;
+
+    fn toc_image_info(battery: Option<BatteryInfo>) -> TocImageInfo {
+        TocImageInfo {
+            name: "01_PSP".into(),
+            index: 1,
+            offset: 0,
+            size: 256 * 1024,
+            load_addr: 0,
+            toc_crc: 0,
+            computed_crc32: None,
+            crc_match: None,
+            battery,
+        }
+    }
+
+    #[test]
+    fn battery_serializes_the_exact_key_set_with_opaque_label() {
+        let stats = crate::classify::classify(&test_uniform_blob(256 * 1024));
+        let info = toc_image_info(Some(BatteryInfo::from_stats(&stats)));
+
+        let json = serde_json::to_string(&info).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let battery = v["battery"].as_object().expect("battery object");
+
+        let mut keys: Vec<&str> = battery.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "chi2_per_df",
+                "entropy_bits",
+                "frac_windows_high",
+                "label",
+                "serial_correlation",
+                "window_count",
+                "window_max",
+                "window_mean",
+                "window_min",
+                "window_size",
+            ]
+        );
+        assert_eq!(battery["label"], "opaque");
+        assert_eq!(battery["window_count"], 4);
+        assert_eq!(battery["window_size"], crate::classify::WINDOW_SIZE);
+    }
+
+    #[test]
+    fn battery_none_omits_the_key() {
+        let json = serde_json::to_string(&toc_image_info(None)).unwrap();
+        assert!(!json.contains("battery"));
+    }
+
+    #[test]
+    fn battery_info_from_stats_rounds_floats_to_4_decimals_and_labels() {
+        let opaque = BatteryStats {
+            opaque: true,
+            entropy_bits: 7.991849,
+            chi2_per_df: 16.801749,
+            serial_correlation: 0.019649,
+            window_min: 7.913549,
+            window_mean: 7.976249,
+            window_max: 7.997349,
+            frac_windows_high: 0.999949,
+            window_count: 4,
+        };
+        let b = BatteryInfo::from_stats(&opaque);
+        assert_eq!(b.label, "opaque");
+        assert_eq!(b.entropy_bits, 7.9918);
+        assert_eq!(b.chi2_per_df, 16.8017);
+        assert_eq!(b.serial_correlation, 0.0196);
+        assert_eq!(b.window_min, 7.9135);
+        assert_eq!(b.window_mean, 7.9762);
+        assert_eq!(b.window_max, 7.9973);
+        assert_eq!(b.frac_windows_high, 0.9999);
+        assert_eq!(b.window_count, 4);
+        assert_eq!(b.window_size, crate::classify::WINDOW_SIZE);
+
+        let mut not_opaque = opaque;
+        not_opaque.opaque = false;
+        assert_eq!(BatteryInfo::from_stats(&not_opaque).label, "not_opaque");
+    }
 
     #[test]
     fn records_and_writes() {

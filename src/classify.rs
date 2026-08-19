@@ -163,19 +163,13 @@ pub fn classify(bytes: &[u8]) -> BatteryStats {
     }
 }
 
+/// Uniform pseudo-random test blob: xorshift64* (Vigna) emitting the top byte
+/// of each 64-bit output — the well-mixed end of the word.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// xorshift64* (Vigna) emitting the top byte of each 64-bit output — the
-    /// well-mixed end of the word.
+pub(crate) fn test_uniform_blob(len: usize) -> Vec<u8> {
     struct Xorshift64Star(u64);
 
     impl Xorshift64Star {
-        fn seeded() -> Self {
-            Self(0x9E3779B97F4A7C15)
-        }
-
         fn byte(&mut self) -> u8 {
             let mut x = self.0;
             x ^= x >> 12;
@@ -186,10 +180,13 @@ mod tests {
         }
     }
 
-    fn uniform_blob(len: usize) -> Vec<u8> {
-        let mut rng = Xorshift64Star::seeded();
-        (0..len).map(|_| rng.byte()).collect()
-    }
+    let mut rng = Xorshift64Star(0x9E3779B97F4A7C15);
+    (0..len).map(|_| rng.byte()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     const PATTERN: [u8; 16] = [
         0x00, 0xBF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
@@ -202,7 +199,7 @@ mod tests {
 
     #[test]
     fn uniform_blob_is_opaque() {
-        let stats = classify(&uniform_blob(256 * 1024));
+        let stats = classify(&test_uniform_blob(256 * 1024));
         assert!(stats.opaque);
         assert!(stats.entropy_bits >= ENTROPY_MIN);
         assert!(stats.chi2_per_df <= CHI2_PER_DF_MAX);
@@ -222,7 +219,7 @@ mod tests {
 
     #[test]
     fn half_encrypted_blob_is_not_opaque() {
-        let mut blob = uniform_blob(128 * 1024);
+        let mut blob = test_uniform_blob(128 * 1024);
         blob.extend(pattern_blob(128 * 1024));
         let stats = classify(&blob);
         assert!(!stats.opaque);
@@ -233,7 +230,7 @@ mod tests {
 
     #[test]
     fn tiny_blob_has_no_windows() {
-        let stats = classify(&uniform_blob(4095));
+        let stats = classify(&test_uniform_blob(4095));
         assert_eq!(stats.window_count, 0);
         assert!(!stats.opaque);
     }

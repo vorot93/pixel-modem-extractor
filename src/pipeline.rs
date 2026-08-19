@@ -1,9 +1,10 @@
 use crate::{
+    classify::classify,
     error::Result,
     ext4::Ext4Fs,
     fbpk::Fbpk,
     gzip,
-    manifest::{Manifest, TocImageInfo, blake3_bytes},
+    manifest::{BatteryInfo, Manifest, TocImageInfo, blake3_bytes},
     toc::Toc,
 };
 use std::path::{Path, PathBuf};
@@ -72,17 +73,21 @@ pub fn extract(img_path: &Path, out_dir: &Path, verify: bool) -> Result<PathBuf>
         .embedded()
         .iter()
         .map(|e| {
-            let (computed_crc32, crc_match) = if verify {
-                let s = e.offset as usize;
-                let en = s + e.size as usize;
-                if en <= modem_bin.len() {
-                    let c = crc32fast::hash(&modem_bin[s..en]);
-                    (Some(c), Some(c == e.crc))
-                } else {
-                    (None, None)
-                }
+            let s = e.offset as usize;
+            let en = s + e.size as usize;
+            let in_range = en <= modem_bin.len();
+            let (computed_crc32, crc_match) = if verify && in_range {
+                let c = crc32fast::hash(&modem_bin[s..en]);
+                (Some(c), Some(c == e.crc))
             } else {
                 (None, None)
+            };
+            // The battery is a record, not a check: computed for every embedded
+            // image regardless of `verify` (`verified` semantics untouched).
+            let battery = if in_range {
+                Some(BatteryInfo::from_stats(&classify(&modem_bin[s..en])))
+            } else {
+                None
             };
             TocImageInfo {
                 name: e.name.clone(),
@@ -93,6 +98,7 @@ pub fn extract(img_path: &Path, out_dir: &Path, verify: bool) -> Result<PathBuf>
                 toc_crc: e.crc,
                 computed_crc32,
                 crc_match,
+                battery,
             }
         })
         .collect();
