@@ -234,4 +234,50 @@ mod tests {
         assert_eq!(stats.window_count, 0);
         assert!(!stats.opaque);
     }
+
+    // Calibration values pinned from the mustang reference tree (spec:
+    // 2026-08-19-opaque-image-classification-design.md). Tolerance ±0.0002 covers
+    // only the 4-decimal pinning, never an arithmetic drift.
+    #[test]
+    fn mustang_corpus_pins_classify() {
+        // Set PME_GOLDEN_DIR to the extracted golden tree; unset/absent → skip.
+        let Some(root) = std::env::var_os("PME_GOLDEN_DIR").map(std::path::PathBuf::from) else {
+            eprintln!("skip: set PME_GOLDEN_DIR to the extracted golden tree");
+            return;
+        };
+        let split = root.join("modem.bin.split");
+        if !split.is_dir() {
+            eprintln!(
+                "skip: PME_GOLDEN_DIR has no modem.bin.split: {}",
+                root.display()
+            );
+            return;
+        }
+
+        let psp = std::fs::read(split.join("01_PSP")).unwrap();
+        let stats = classify(&psp);
+        assert!(stats.opaque, "01_PSP must be opaque: {stats:?}");
+        let pinned = [
+            ("entropy_bits", stats.entropy_bits, 7.9918),
+            ("chi2_per_df", stats.chi2_per_df, 16.7987),
+            ("serial_correlation", stats.serial_correlation, 0.0196),
+            ("window_min", stats.window_min, 7.9135),
+            ("window_mean", stats.window_mean, 7.9762),
+            ("window_max", stats.window_max, 7.9973),
+            ("frac_windows_high", stats.frac_windows_high, 1.0),
+        ];
+        for (name, actual, expected) in pinned {
+            assert!(
+                (actual - expected).abs() <= 0.0002,
+                "01_PSP {name}: {actual} vs pinned {expected} (±0.0002)"
+            );
+        }
+        assert_eq!(stats.window_count, 4);
+
+        for leg in ["00_BOOT", "04_VSS"] {
+            let bytes = std::fs::read(split.join(leg)).unwrap();
+            let stats = classify(&bytes);
+            assert!(!stats.opaque, "{leg} must not be opaque: {stats:?}");
+        }
+    }
 }
