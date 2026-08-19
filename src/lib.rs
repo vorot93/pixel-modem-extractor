@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod classify;
 pub mod cli;
 pub mod decode_rf;
 pub mod decompile;
