@@ -519,6 +519,12 @@ struct RegionOutcome {
     stats: RegionStats,
 }
 
+/// A region whose r2 run failed and was skipped fail-closed.
+struct SkippedRegion {
+    addr: u32,
+    reason: String,
+}
+
 /// Carries io and callback errors out of `for_each_pdfj_position`'s read loop.
 enum RegionIterError {
     Io(std::io::Error),
@@ -584,8 +590,8 @@ where
 /// into `FnRec`s (A), entry-match arriving pdfjs normalizing and spilling
 /// immediately (B1), positional-fallback re-stream (B2), normalize the
 /// never-paired remainder with `pdfj = None` (C), then the verdicts in the
-/// legacy precedence order — no-JSON, unassignable, orphan, u32-domain,
-/// conserving. Any `Err` removes the partial spill.
+/// legacy precedence order — no-JSON, unassignable, orphan, u32-domain.
+/// Any `Err` removes the partial spill.
 fn process_region_streaming(
     stdout_path: &Path,
     image: &[u8],
@@ -742,12 +748,10 @@ fn process_region_inner(
         }
     }
 
-    let quarantined = stats.raw - stats.accepted;
-    if stats.accepted + quarantined != stats.raw {
-        return Err(Error::Serialize(format!(
-            "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
-        )));
-    }
+    assert!(
+        stats.accepted <= stats.raw,
+        "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+    );
     let spill = spill.finish()?;
     Ok(RegionOutcome { spill, stats })
 }
@@ -1292,12 +1296,17 @@ fn limit_r2_address_space(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn limit_r2_address_space(_cmd: &mut std::process::Command) {}
 
-/// Analyze an image's dense Thumb-2 regions with radare2. Each region is carved out,
-/// analyzed as ARM/Thumb (`-a arm -b 16`) based at its load address, and its
-/// `aflj`/`pdfj` function output assembled into `out_dir/thumb_functions.json` from
-/// the per-region fragment spills (the carved blobs are kept under `out_dir/thumb/`
-/// for follow-up). Returns the count of substantial (>= 32-byte) functions recovered.
-/// Per-region failures are tolerated: one runaway region does not zero the others.
+/// Analyze an image's dense Thumb-2 regions with radare2, streaming. Each
+/// region is carved out, analyzed as ARM/Thumb (`-a arm -b 16`) based at
+/// its load address, and its normalized functions spill to
+/// `thumb/<addr:08x>.frags`; the final `thumb_functions.json` is assembled
+/// atomically (complete-old-or-complete-new) from the spills in region
+/// order / fn order — byte-identical to the former whole-`Value` rendering,
+/// with peak memory O(largest single JSON value + one fragment) instead of
+/// O(all functions). The carved blobs and `.stdout` captures are kept under
+/// `out_dir/thumb/` for follow-up. Returns the count of substantial
+/// (>= 32-byte) functions recovered. Per-region failures are tolerated:
+/// one runaway region does not zero the others.
 pub fn run_radare2_thumb(
     r2: &Path,
     image: &[u8],
@@ -1307,54 +1316,54 @@ pub fn run_radare2_thumb(
 ) -> Result<usize> {
     let thumb_dir = out_dir.join("thumb");
     std::fs::create_dir_all(&thumb_dir)?;
-    // Analyze each region independently and tolerate per-region failure: a region
-    // whose r2 run fails — most consequentially the address-space cap firing on a
-    // pathological blob — is recorded and skipped so the remaining regions still
-    // populate thumb_functions.json instead of the whole stage aborting.
-    let region_results: Vec<(u32, Result<Option<RegionOutcome>>)> = regions
-        .iter()
-        .map(|&(addr, len)| {
-            (
-                addr,
-                run_radare2_thumb_region(r2, image, load_addr, addr, len, &thumb_dir),
-            )
-        })
-        .collect();
-    let mut spills = Vec::new();
-    let mut skipped = Vec::new();
+    let mut spills: Vec<Spill> = Vec::new();
+    let mut skipped: Vec<SkippedRegion> = Vec::new();
     let mut substantial = 0usize;
     let mut accepted = 0usize;
-    let mut raw = 0usize;
-    for (addr, result) in region_results {
-        match result {
+    let mut total = 0usize;
+    for &(addr, len) in regions {
+        match run_radare2_thumb_region(r2, image, load_addr, addr, len, &thumb_dir) {
             Ok(Some(outcome)) => {
                 substantial += outcome.stats.substantial;
                 accepted += outcome.stats.accepted;
-                raw += outcome.stats.raw;
+                total += outcome.stats.raw;
                 spills.push(outcome.spill);
             }
             Ok(None) => {}
-            Err(e) => skipped.push((addr, e.to_string())),
+            Err(reason) => skipped.push(SkippedRegion {
+                addr,
+                reason: reason.to_string(),
+            }),
         }
     }
-    for (addr, reason) in &skipped {
+    for region in &skipped {
         tracing::warn!(
             "radare2: Thumb region 0x{:x} skipped (analysis failed, fail-closed): {}",
-            addr,
-            reason
+            region.addr,
+            region.reason
         );
     }
     tracing::info!(
         "radare2: Thumb execution projections accepted={accepted} quarantined={} regions_skipped={}",
-        raw - accepted,
+        total - accepted,
         skipped.len()
     );
-    let spill_refs: Vec<&Spill> = spills.iter().collect();
-    let file = std::fs::File::create(out_dir.join("thumb_functions.json"))?;
-    let mut writer = std::io::BufWriter::new(file);
-    assemble_into(&mut writer, &spill_refs)?;
-    writer.flush()?;
+    assemble_thumb_functions_json(&out_dir.join("thumb_functions.json"), &spills)?;
     Ok(substantial)
+}
+
+/// Atomically stream header → spills → footer into `thumb_functions.json`,
+/// then delete the spills. A failure before `commit` leaves any prior file
+/// intact.
+fn assemble_thumb_functions_json(out_path: &Path, spills: &[Spill]) -> Result<()> {
+    let refs: Vec<&Spill> = spills.iter().collect();
+    let mut file = atomic_write_file::AtomicWriteFile::open(out_path)?;
+    assemble_into(&mut file, &refs)?;
+    file.commit()?;
+    for spill in spills {
+        let _ = std::fs::remove_file(&spill.path);
+    }
+    Ok(())
 }
 
 /// Analyze one dense Thumb-2 region with radare2 and return its finished
@@ -2054,6 +2063,88 @@ INFO: second pdfj body was noisy and not parseable
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn run_radare2_thumb_multi_region_is_legacy_order_and_cleans_spills() {
+        let dir = tempfile::tempdir().unwrap();
+        let r2 = dir.path().join("r2");
+        // Regions carve to thumb/<addr:08x>.bin, so the stub dispatches on the
+        // carved blob name in its last argument.
+        std::fs::write(
+            &r2,
+            "#!/usr/bin/env sh\ncase \"$*\" in *00004000.bin*) cat <<'EOF'\n[{\"name\":\"sym.a1\",\"offset\":16384,\"size\":64},{\"name\":\"sym.a2\",\"offset\":16448,\"size\":16}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n;; *) cat <<'EOF'\n[{\"name\":\"sym.b1\",\"offset\":32768,\"size\":64}]\n{\"addr\":32768,\"ops\":[{\"offset\":32768,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n;; esac\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&r2).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&r2, perm).unwrap();
+        }
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let pdfj_a =
+            json!({"addr":16384,"ops":[{"offset":16384,"bytes":"b5f0","disasm":"push {r4, lr}"}]});
+        let pdfj_b =
+            json!({"addr":32768,"ops":[{"offset":32768,"bytes":"b5f0","disasm":"push {r4, lr}"}]});
+        let mut image = vec![0u8; 0x1_0000];
+        populate_test_image_from_pdfj(&mut image, &pdfj_a);
+        populate_test_image_from_pdfj(&mut image, &pdfj_b);
+        let substantial =
+            run_radare2_thumb(&r2, &image, 0, &[(0x4000, 0x100), (0x8000, 0x100)], &out).unwrap();
+        let written = std::fs::read(out.join("thumb_functions.json")).unwrap();
+        let expected = {
+            let fns = vec![
+                normalize_radare2_function_checked(
+                    &json!({"name":"sym.a1","offset":16384,"size":64}),
+                    Some(&pdfj_a),
+                    &image,
+                    0,
+                    0x4000,
+                )
+                .unwrap(),
+                normalize_radare2_function_checked(
+                    &json!({"name":"sym.a2","offset":16448,"size":16}),
+                    None,
+                    &image,
+                    0,
+                    0x4000,
+                )
+                .unwrap(),
+                normalize_radare2_function_checked(
+                    &json!({"name":"sym.b1","offset":32768,"size":64}),
+                    Some(&pdfj_b),
+                    &image,
+                    0,
+                    0x8000,
+                )
+                .unwrap(),
+            ];
+            serde_json::to_string_pretty(&json!({
+                "format": "pixel-modem-extractor-thumb-functions-v2",
+                "functions": fns,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            substantial, 2,
+            "a1 (64) and b1 (64); a2 (16) is not substantial"
+        );
+        assert_eq!(written, expected.as_bytes());
+        let thumb = out.join("thumb");
+        assert!(thumb.join("00004000.stdout").exists());
+        assert!(thumb.join("00008000.stdout").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&thumb)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".frags"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "spill files must be removed after assembly"
+        );
+    }
+
     fn scanner_values(stdout: &[u8]) -> Vec<serde_json::Value> {
         let mut scanner = ValueScanner::new(std::io::Cursor::new(stdout.to_vec()));
         let mut out = Vec::new();
@@ -2208,6 +2299,18 @@ INFO: second pdfj body was noisy and not parseable
             .trim_start_matches("{\n  \"functions\": [\n")
             .trim_end_matches("\n  ]\n}");
         assert_eq!(rendered, inner);
+    }
+
+    #[test]
+    fn assemble_into_empty_renders_inline_empty_functions() {
+        let mut out = Vec::new();
+        assemble_into(&mut out, &[]).unwrap();
+        let expected = serde_json::to_string_pretty(&json!({
+            "format": "pixel-modem-extractor-thumb-functions-v2",
+            "functions": [],
+        }))
+        .unwrap();
+        assert_eq!(out, expected.as_bytes());
     }
 
     #[test]
