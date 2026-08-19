@@ -135,10 +135,12 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
      contain *nothing beyond* what `extract` writes (the whole-tree paq pin
      hashes every leaf). Verify with
      `PME_GOLDEN_DIR=…/radio-mustang-extracted PME_RADIO_IMG=… cargo test --test golden`.
-  2. `radio-mustang-decomposed` — a fresh full `decompose` output. Verify with
-     `PME_GOLDEN_DIR=PME_DECOMPOSED_GOLDEN_DIR=…/radio-mustang-decomposed
-     PME_RADIO_IMG=… cargo test --release --test decompose_golden
-     decompose_pinned_surfaces_match_reference` plus the read-only
+  2. `radio-mustang-decomposed-v3` — a fresh full `decompose` output (the current
+     re-baseline tree, in flight: the manifest `battery` fields shifted the pinned
+     `manifest.json` hash, superseding `radio-mustang-decomposed`). Verify with
+      `PME_GOLDEN_DIR=PME_DECOMPOSED_GOLDEN_DIR=…/radio-mustang-decomposed-v3
+      PME_RADIO_IMG=… cargo test --release --test decompose_golden
+      decompose_pinned_surfaces_match_reference` plus the read-only
      decompose-layout legs (`global_shapes_golden`, the `PME_GOLDEN_DIR` legs
      of `globals_golden`). `tests/symbolicate_golden.rs` rewrites its tree in
      place — point `PME_DECOMPOSED_DIR` at a disposable copy, never the golden.
@@ -166,6 +168,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `archive.rs` | `ustar`/tar handling around the ext4 payload |
 | `gzip.rs` | Gunzip the `RF_CFG_*` calibration blobs |
 | `toc.rs` | `modem.bin` TOC parse + split into the six images |
+| `classify.rs` | 5-test opaque battery — whole-image H, χ²/df, serial correlation, 64-KiB window entropies; unanimous fail-closed verdict |
 | `source_tree.rs` | Reconstruct the source-tree layout from `__FILE__` strings |
 | `recover_source.rs` | Attribute recovered Ghidra/radare2 functions to source paths |
 | `decode_rf.rs` | Decode the RF_CFG calibration databases |
@@ -245,10 +248,37 @@ hardcoded. Two reference images exercise both models end-to-end:
   `00_BOOT`, `01_MAIN`, `02_VSS`, `03_APM` (no PSP/DBGCORE). **MAIN** is the primary code image —
   `source-tree` reconstruction and recovered-source attribution operate on it — but its split-dir
   index varies (`02_MAIN` vs `01_MAIN`); the stable key is the TOC name `MAIN` (see *Multiple
-  models* above). `05_DBGCORE` is the small debug image. On mustang, **`01_PSP` is encrypted**
-  (uniform entropy ≈ 8.0, no ARM code, no readable strings), so Ghidra reports **0 functions** —
-  expected, not a bug. Detecting and classifying opaque/encrypted images is future work (see the
-  symbolication design spec).
+  models* above). `05_DBGCORE` is the small debug image. On mustang, **`01_PSP` is opaque** (uniform
+  entropy ≈ 8.0, no ARM code, no readable strings — consistent with encryption), so Ghidra
+  reports **0 functions** — expected, not a bug. This is now measured, not assumed:
+  `classify.rs` runs a 5-test battery per TOC image — whole-image Shannon entropy `H`,
+  χ²/df, serial correlation, and 64-KiB window entropies (`window_min` plus
+  `frac_windows_high`, the fraction of windows with H > 7.5) — under a unanimous,
+  fail-closed verdict: `opaque` iff H ≥ 7.5 ∧ χ²/df ≤ 64.0 ∧ |SCC| ≤ 0.10 ∧
+  window_min ≥ 7.7 ∧ frac_windows_high ≥ 0.99; any single refusal (including zero
+  windows) yields `not_opaque`. On the reference corpus, mustang `01_PSP` is the only
+  opaque image on both models (H = 7.9918, χ²/df = 16.7987, SCC = 0.0196,
+  window_min = 7.9135, frac = 1.0); the other nine images are `not_opaque`, separating
+  from PSP on every test with worst-case headroom of 1.26 entropy bits. `decompile --run`
+  and `decompose` therefore skip unanimously-opaque images before any Ghidra work
+  (`--no-skip-opaque` restores run-everything). Confirmed by a 2026-08-19 Ghidra spike:
+  a direct run on `01_PSP` produced 0-byte `decompiled.c`/`disasm.lst` and an empty
+  `functions.json` (~90 s) — nothing recovers.
+- **Opaque-skip invariant.** Ghidra is skipped for an image only on a **unanimous** battery
+  verdict; a single test refusal fails closed to `not_opaque` and the image is analyzed
+  exactly as today — a partially-encrypted image is never skipped. The verdict is measured
+  before any Ghidra work regardless of `--no-skip-opaque`, so `report.json`'s per-image
+  `classification` always agrees with `manifest.json`'s `battery.label`, and a skipped row
+  also carries `skipped_reason: "opaque"`. The pure gate is `decompile::opaque_skip`; the
+  wiring tests `opaque_skip_decision_is_the_pure_gate` and
+  `skipped_opaque_result_is_not_a_failure_and_expects_no_export` pin it.
+- **Battery determinism.** `classify::classify` is single-threaded over a fixed window order
+  (64-KiB chunks; a trailing window counts iff ≥ 4 KiB), and the stats are full-precision
+  internally — rounding to 4 decimals happens only at manifest serialization
+  (`manifest::BatteryInfo::from_stats`). The env-gated `mustang_corpus_pins_classify`
+  (`PME_GOLDEN_DIR`) pins the rounded corpus values, so a change that moves a 4th decimal
+  is a wire-level `manifest.json` change: re-pin deliberately and re-baseline the pinned
+  manifest hash.
 - **TOC CRCs are advisory.** Every image's stored TOC CRC currently mismatches a plain
   CRC-32 over `[offset, size)` (the algorithm/coverage is unconfirmed); `split_to_dir` only
   `warn!`s and still writes, and `manifest.verified` means "checks were attempted," not
