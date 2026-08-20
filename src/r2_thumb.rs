@@ -2008,6 +2008,283 @@ impl<'de, 'a, 'b> Visitor<'de> for FunctionsEnrichSeq<'a, 'b> {
     }
 }
 
+/// Streaming element-wise rewrite of a canonical thumb-functions document:
+/// each `functions` element is materialized one at a time, handed to
+/// `on_element`, rendered, and written through an `AtomicWriteFile` —
+/// byte-identical to reading the whole file into a `Value`, mutating the
+/// array, and `to_string_pretty`-ing it back, with memory bounded by the
+/// largest single element. The `format` value passes through verbatim (it
+/// must be a string; the rewriter never bumps it), the file is always
+/// rewritten when it exists and parses (matching the whole-file rewriter's
+/// unconditional write), and a document outside the canonical shape — an
+/// object with exactly the keys `format` then `functions` (an array) —
+/// fails closed with the original untouched.
+pub(crate) fn stream_rewrite_thumb_functions<F>(path: &Path, mut on_element: F) -> Result<()>
+where
+    F: FnMut(&mut serde_json::Value),
+{
+    let file = std::fs::File::open(path)?;
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let mut scan = DocRewriteScan {
+        on_element: &mut on_element,
+        out: atomic_write_file::AtomicWriteFile::open(path)?,
+        format: None,
+        failure: None,
+        saw_functions: false,
+        wrote_open: false,
+    };
+    let parsed = de
+        .deserialize_any(DocRewriteVisitor { scan: &mut scan })
+        .and_then(|()| de.end());
+    match parsed {
+        Ok(()) => scan.finish_document()?,
+        Err(error) => {
+            return Err(scan.failure.take().unwrap_or_else(|| {
+                Error::Serialize(format!("parse {}: {error}", path.display()))
+            }));
+        }
+    }
+    scan.out.commit().map_err(Error::from)
+}
+
+/// Abort sentinel for io failures inside a rewrite stream: the real, typed
+/// error is stashed in `DocRewriteScan::failure` and this serde-channel copy
+/// is never surfaced.
+const REWRITE_STREAM_ABORT: &str = "\u{0}pme-rewrite-stream-abort";
+
+struct DocRewriteScan<'a, F> {
+    on_element: &'a mut F,
+    out: atomic_write_file::AtomicWriteFile,
+    format: Option<String>,
+    failure: Option<Error>,
+    saw_functions: bool,
+    wrote_open: bool,
+}
+
+impl<'a, F: FnMut(&mut serde_json::Value)> DocRewriteScan<'a, F> {
+    fn rewrite_element(&mut self, mut element: serde_json::Value) -> Result<()> {
+        (self.on_element)(&mut element);
+        let fragment = render_fragment(&element)?;
+        if self.wrote_open {
+            self.out
+                .write_all(THUMB_DOC_FRAGMENT_SEP)
+                .map_err(Error::from)?;
+        } else {
+            let format = self
+                .format
+                .as_deref()
+                .expect("canonical visitor captures format before functions");
+            let encoded = serde_json::to_string(&serde_json::Value::String(format.to_string()))
+                .map_err(|e| Error::Serialize(e.to_string()))?;
+            self.out
+                .write_all(format!("{{\n  \"format\": {encoded},\n  \"functions\": [\n").as_bytes())
+                .map_err(Error::from)?;
+            self.wrote_open = true;
+        }
+        self.out
+            .write_all(fragment.as_bytes())
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> std::io::Result<()> {
+        if self.wrote_open {
+            self.out.write_all(THUMB_DOC_CLOSE)
+        } else {
+            let format = self
+                .format
+                .as_deref()
+                .expect("canonical visitor captures format before functions");
+            let encoded = serde_json::to_string(&serde_json::Value::String(format.to_string()))
+                .map_err(|e| Error::Serialize(e.to_string()))
+                .expect("string encoding is infallible");
+            self.out.write_all(
+                format!("{{\n  \"format\": {encoded},\n  \"functions\": []\n}}").as_bytes(),
+            )
+        }
+    }
+}
+
+struct DocRewriteVisitor<'a, 'b, F> {
+    scan: &'b mut DocRewriteScan<'a, F>,
+}
+
+impl<'de, 'a, 'b, F: FnMut(&mut serde_json::Value)> Visitor<'de> for DocRewriteVisitor<'a, 'b, F> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a canonical thumb functions document")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut saw_format = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "format" if !saw_format && !self.scan.saw_functions => {
+                    self.scan.format = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde::de::Error::custom(NON_CANONICAL_THUMB_DOC))?,
+                    );
+                    saw_format = true;
+                }
+                "functions" if saw_format && !self.scan.saw_functions => {
+                    self.scan.saw_functions = true;
+                    map.next_value_seed(DocRewriteSeq {
+                        scan: &mut *self.scan,
+                    })?;
+                }
+                _ => return Err(serde::de::Error::custom(NON_CANONICAL_THUMB_DOC)),
+            }
+        }
+        if !self.scan.saw_functions {
+            return Err(serde::de::Error::custom(NON_CANONICAL_THUMB_DOC));
+        }
+        Ok(())
+    }
+}
+
+struct DocRewriteSeq<'a, 'b, F> {
+    scan: &'b mut DocRewriteScan<'a, F>,
+}
+
+impl<'de, 'a, 'b, F: FnMut(&mut serde_json::Value)> DeserializeSeed<'de>
+    for DocRewriteSeq<'a, 'b, F>
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, 'a, 'b, F: FnMut(&mut serde_json::Value)> Visitor<'de> for DocRewriteSeq<'a, 'b, F> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a thumb functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(element) = seq.next_element::<serde_json::Value>()? {
+            if let Err(error) = self.scan.rewrite_element(element) {
+                self.scan.failure = Some(error);
+                return Err(serde::de::Error::custom(REWRITE_STREAM_ABORT));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Streaming element-wise rewrite of a top-level JSON array file (e.g.
+/// Ghidra's `functions.json`): each element is materialized one at a time,
+/// handed to `on_element`, rendered at depth 1, and written through an
+/// `AtomicWriteFile` — byte-identical to reading the whole file into a
+/// `Value`, mutating the array, and `to_string_pretty`-ing it back, with
+/// memory bounded by the largest single element. The file is always
+/// rewritten when it exists and parses; invalid JSON or a non-array top
+/// level fails closed with the original untouched.
+pub(crate) fn stream_rewrite_json_array<F>(path: &Path, mut on_element: F) -> Result<()>
+where
+    F: FnMut(&mut serde_json::Value),
+{
+    let file = std::fs::File::open(path)?;
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let mut scan = ArrayRewriteScan {
+        on_element: &mut on_element,
+        out: atomic_write_file::AtomicWriteFile::open(path)?,
+        failure: None,
+        wrote_open: false,
+    };
+    let parsed = de
+        .deserialize_seq(ArrayRewriteVisitor { scan: &mut scan })
+        .and_then(|()| de.end());
+    match parsed {
+        Ok(()) => scan.finish_document()?,
+        Err(error) => {
+            return Err(scan.failure.take().unwrap_or_else(|| {
+                Error::Serialize(format!("parse {}: {error}", path.display()))
+            }));
+        }
+    }
+    scan.out.commit().map_err(Error::from)
+}
+
+struct ArrayRewriteScan<'a, F> {
+    on_element: &'a mut F,
+    out: atomic_write_file::AtomicWriteFile,
+    failure: Option<Error>,
+    wrote_open: bool,
+}
+
+impl<'a, F: FnMut(&mut serde_json::Value)> ArrayRewriteScan<'a, F> {
+    fn rewrite_element(&mut self, mut element: serde_json::Value) -> Result<()> {
+        (self.on_element)(&mut element);
+        let pretty =
+            serde_json::to_string_pretty(&element).map_err(|e| Error::Serialize(e.to_string()))?;
+        let fragment = pretty
+            .split('\n')
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.wrote_open {
+            self.out
+                .write_all(THUMB_DOC_FRAGMENT_SEP)
+                .map_err(Error::from)?;
+        } else {
+            self.out.write_all(b"[\n").map_err(Error::from)?;
+            self.wrote_open = true;
+        }
+        self.out
+            .write_all(fragment.as_bytes())
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> std::io::Result<()> {
+        if self.wrote_open {
+            self.out.write_all(b"\n]")
+        } else {
+            self.out.write_all(b"[]")
+        }
+    }
+}
+
+struct ArrayRewriteVisitor<'a, 'b, F> {
+    scan: &'b mut ArrayRewriteScan<'a, F>,
+}
+
+impl<'de, 'a, 'b, F: FnMut(&mut serde_json::Value)> Visitor<'de>
+    for ArrayRewriteVisitor<'a, 'b, F>
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(element) = seq.next_element::<serde_json::Value>()? {
+            if let Err(error) = self.scan.rewrite_element(element) {
+                self.scan.failure = Some(error);
+                return Err(serde::de::Error::custom(REWRITE_STREAM_ABORT));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Retired whole-file `thumb_enrich`, kept verbatim as the differential oracle
 /// for the streaming rewrite; test-only.
 #[cfg(test)]
@@ -2427,6 +2704,150 @@ impl BodyScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn thumb_doc(format: &str, functions: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "format": format, "functions": functions })
+    }
+
+    fn sample_functions() -> serde_json::Value {
+        serde_json::json!([
+            {"name": "thumb_100", "entry": "0x100", "end": "0x110", "size": 16,
+             "body_kind": "thumb_disassembly", "body": "b1\n", "data_refs": [],
+             "decode_ranges": [], "decode_range_errors": []},
+            {"name": "thumb_200", "entry": "0x200", "end": "0x210", "size": 16,
+             "body_kind": "thumb_disassembly", "body": "b2\n", "data_refs": [],
+             "decode_ranges": [], "decode_range_errors": [],
+             "body_c": "void thumb_200(void)\n{\n}\n", "annotations": [], "original_name": "thumb_200"}
+        ])
+    }
+
+    fn stamp_entry_100(item: &mut serde_json::Value) {
+        if item.get("entry").and_then(serde_json::Value::as_str) == Some("0x100") {
+            item.as_object_mut().unwrap().insert(
+                "original_name".into(),
+                serde_json::Value::String("thumb_100".into()),
+            );
+        }
+    }
+
+    #[test]
+    fn stream_rewrite_thumb_functions_matches_whole_value_rewrite() {
+        for format in [
+            "pixel-modem-extractor-thumb-functions-v2",
+            "pixel-modem-extractor-thumb-functions-v1",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("thumb_functions.json");
+            let doc = thumb_doc(format, sample_functions());
+            std::fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+            stream_rewrite_thumb_functions(&path, stamp_entry_100).unwrap();
+            let mut expected = doc;
+            for item in expected["functions"].as_array_mut().unwrap() {
+                stamp_entry_100(item);
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                serde_json::to_vec_pretty(&expected).unwrap(),
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_rewrite_thumb_functions_empty_functions_renders_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb_functions.json");
+        let doc = thumb_doc(
+            "pixel-modem-extractor-thumb-functions-v2",
+            serde_json::json!([]),
+        );
+        std::fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+        stream_rewrite_thumb_functions(&path, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&doc).unwrap()
+        );
+    }
+
+    #[test]
+    fn stream_rewrite_thumb_functions_rejects_non_canonical_documents() {
+        // `json!`/`to_vec_pretty` always emits BTreeMap-sorted keys, so the
+        // functions-before-format order (and the non-string format) need
+        // hand-built bytes rather than a Value round-trip.
+        let hand_built: Vec<(&[u8], &str)> = vec![
+            (
+                b"{\n  \"functions\": [],\n  \"format\": \"x\"\n}",
+                "functions before format",
+            ),
+            (
+                b"{\n  \"format\": 7,\n  \"functions\": []\n}",
+                "non-string format",
+            ),
+        ];
+        for (i, (bytes, why)) in hand_built.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("thumb_functions.json");
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                stream_rewrite_thumb_functions(&path, |_| {}).is_err(),
+                "hand-built case {i} must fail closed ({why})"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes.to_vec());
+        }
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({"functions": []}),
+            serde_json::json!({"format": "x"}),
+            serde_json::json!({"format": "x", "functions": [], "extra": 1}),
+            serde_json::json!([1, 2]),
+        ];
+        for (i, doc) in cases.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("thumb_functions.json");
+            let bytes = serde_json::to_vec_pretty(doc).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                stream_rewrite_thumb_functions(&path, |_| {}).is_err(),
+                "case {i} must fail closed: {doc}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "case {i} untouched");
+        }
+    }
+
+    #[test]
+    fn stream_rewrite_json_array_matches_whole_value_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        let doc = sample_functions();
+        std::fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+        stream_rewrite_json_array(&path, stamp_entry_100).unwrap();
+        let mut expected = doc;
+        for item in expected.as_array_mut().unwrap() {
+            stamp_entry_100(item);
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn stream_rewrite_json_array_empty_and_invalid_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.json");
+        std::fs::write(&empty, b"[]").unwrap();
+        stream_rewrite_json_array(&empty, |_| {}).unwrap();
+        assert_eq!(std::fs::read(&empty).unwrap(), b"[]");
+
+        let not_array = dir.path().join("obj.json");
+        let bytes = b"{\"a\": 1}";
+        std::fs::write(&not_array, bytes).unwrap();
+        assert!(stream_rewrite_json_array(&not_array, |_| {}).is_err());
+        assert_eq!(std::fs::read(&not_array).unwrap(), bytes);
+
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, b"[{").unwrap();
+        assert!(stream_rewrite_json_array(&broken, |_| {}).is_err());
+    }
 
     #[test]
     fn normalize_radare2_function_records_body_and_refs() {
