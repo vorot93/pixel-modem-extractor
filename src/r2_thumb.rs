@@ -3653,22 +3653,20 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     /// Invert, in place, the finalize post-processing stamped into a retained
-    /// golden `thumb_functions.json`: symbolicate's `annotations` +
-    /// `original_name` stamps (restoring `name` from `original_name`) always,
-    /// and thumb_enrich's `body_c` when `strip_body_c`. Re-serializing an
-    /// inverted document is exact because `serde_json`'s `Map` is a sorted
-    /// `BTreeMap` (no `preserve_order` feature), so removal and insertion
-    /// cannot disturb key order.
-    fn invert_golden_records(value: &mut serde_json::Value, strip_body_c: bool) {
+    /// golden `thumb_functions.json` — thumb_enrich's `body_c` and
+    /// symbolicate's `annotations` + `original_name` stamps (restoring
+    /// `name` from `original_name`) — to reconstruct the producer surface.
+    /// Re-serializing an inverted document is exact because `serde_json`'s
+    /// `Map` is a sorted `BTreeMap` (no `preserve_order` feature), so
+    /// removal and insertion cannot disturb key order.
+    fn invert_golden_records(value: &mut serde_json::Value) {
         for record in value
             .get_mut("functions")
             .and_then(serde_json::Value::as_array_mut)
             .expect("golden functions array")
         {
             let record = record.as_object_mut().expect("function record object");
-            if strip_body_c {
-                record.remove("body_c");
-            }
+            record.remove("body_c");
             record.remove("annotations");
             if let Some(original_name) = record.remove("original_name") {
                 record.insert("name".into(), original_name);
@@ -3709,7 +3707,7 @@ INFO: second pdfj body was noisy and not parseable
                 .expect("open retained thumb_functions.json"),
         )
         .expect("retained thumb_functions.json parses");
-        invert_golden_records(&mut golden, true);
+        invert_golden_records(&mut golden);
         let expected = serde_json::to_string_pretty(&golden)
             .expect("invert golden post-processing")
             .into_bytes();
@@ -3775,7 +3773,7 @@ INFO: second pdfj body was noisy and not parseable
     /// asserts the two outputs are byte-for-byte identical with equal
     /// `populated` counts. The input is the producer surface: the golden
     /// `thumb_functions.json` with both finalize post-processing layers
-    /// inverted (`invert_golden_records(…, true)`, the same inversion the
+    /// inverted (`invert_golden_records`, the same inversion the
     /// Stage-1 replay verifies against), written to two temp copies enriched
     /// in place; `decompiled.c` is the tree's retained final file, read-only.
     /// The golden file itself cannot serve as the expected side of this
@@ -3802,7 +3800,7 @@ INFO: second pdfj body was noisy and not parseable
         let work = tempfile::tempdir().unwrap();
         let mut doc: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&golden_json).unwrap()).unwrap();
-        invert_golden_records(&mut doc, true);
+        invert_golden_records(&mut doc);
         let input = serde_json::to_vec_pretty(&doc).unwrap();
         drop(doc);
         let oracle_json = work.path().join("oracle_thumb_functions.json");
@@ -4186,6 +4184,13 @@ INFO: second pdfj body was noisy and not parseable
             format!("{}[]}}", V2_HEADER.replace("functions", "other")), // wrong second key
             "[1,2]".to_string(),              // not an object
             format!("{V2_HEADER}{{}}}}"),     // functions not an array
+            // canonical shape but `functions` before `format`: key order is
+            // part of canonicality, so this must fail closed too
+            r#"{
+  "functions": [],
+  "format": "pixel-modem-extractor-thumb-functions-v2"
+}"#
+            .to_string(),
         ]
         .into_iter()
         .enumerate()
