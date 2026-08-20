@@ -34,20 +34,29 @@ Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PA
 supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
 to launch the headless analyzer unless you set your own `JAVA_HOME`.
 
-**Memory:** the radare2 dense-Thumb producer is fully streaming (Stage 1 of the
-memory-envelope lever): each region's r2 stdout capture is parsed value-by-value
-from disk, functions are normalized and spilled one at a time, and
-`thumb_functions.json` is assembled atomically from the spills — byte-identical
-to the previous whole-buffer rendering (env-gated replay of mustang `02_MAIN`'s
-five retained captures: ~3.65 GiB of r2 stdout → 151,411 functions,
-582,543,970 output bytes, ~248 s wall, ~2.8 GB peak RSS for the replay+compare)
-while the producer's peak RSS is bounded by the largest single JSON value
-(~tens of MiB) instead of the whole image. This is the path that previously
-contributed to a ~56 GiB whole-`decompose` peak. Whole-file consumers
-(`thumb_enrich`, `symbolicate`) still load `thumb_functions.json` whole
-(~3 GB peaks each) pending Stage 2, and Ghidra's JVM plus the in-memory image
-slices still dominate a full `decompose` — plan for Ghidra's needs plus several
-GiB, no longer 64 GiB for the Thumb path. The 4 GiB radare2 stdout cap applies
+**Memory:** the dense-Thumb Rust path is fully streaming (Stages 1–2 of the
+memory-envelope lever). Each region's radare2 stdout capture is parsed
+value-by-value from disk, functions are normalized and spilled one at a time,
+and `thumb_functions.json` is assembled atomically from the spills —
+byte-identical to the previous whole-buffer rendering (env-gated replay of
+mustang `02_MAIN`'s five retained captures: ~3.65 GiB of r2 stdout → 151,411
+functions, 582,543,970 output bytes, ~248 s wall, ~2.8 GB peak RSS for the
+replay+compare; the producer itself measured ~0.3 GB during the captures) —
+and `thumb_enrich` now rewrites `thumb_functions.json` through a JSON stream
+visitor into an atomic-replace temp file, bounded by the ~86 MB
+`decompiled.c` bodies map plus one function record: byte-identical to the
+retired whole-file rewriter on the real production inputs (632 MB
+`thumb_functions.json` + 86 MB `decompiled.c`: 130 s, 2.29 GB peak RSS in
+the streaming-vs-oracle A/B). Those two whole-file enrich sweeps were what
+held the previous ~24.9 GB full-`decompose` peak (the 632 MB JSON parsed to
+a ~20+ GB in-memory tree, twice — itself down from ~56 GiB when the r2
+parse was also whole-buffer); the dense-Thumb Rust stages no longer hold
+multi-GB trees, so the peak is now the Ghidra floor — ~7.75 GB, as measured
+during Ghidra's own analyze/export by the 2026-08-20 memory probe. The
+largest remaining whole-file Rust-side consumer is `symbolicate` (~3 GB
+peak, below that floor; a Stage 3 candidate, unneeded for the envelope) —
+plan for Ghidra's needs plus modest Rust-side headroom, no longer tens of
+GiB for the Thumb path. The 4 GiB radare2 stdout cap applies
 per capture. radare2's *own* analysis memory is separately bounded to 16 GiB
 (`RLIMIT_AS`) per dense-Thumb region: a pathological region whose `aaa` would
 otherwise run away (seen on one 4 MiB region of cheetah's MAIN, ~90+ GiB) fails

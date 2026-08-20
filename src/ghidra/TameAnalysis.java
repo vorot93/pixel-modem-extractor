@@ -7,7 +7,7 @@
 //     `Non-Returning Functions - Discovered` — see CONTRIBUTING.md § Winning
 //     TameAnalysis options). Does NOT data-mark regions; Ghidra attempts Thumb
 //     function discovery and decompilation. Per-function convergence failures
-//     fall through to radare2 in the Rust host (see decompile::thumb_enrich).
+//     fall through to radare2 in the Rust host (see r2_thumb::thumb_enrich).
 //
 //   arg[0] = "datamark" (today's Phase-1 behavior; also used by --no-thumb-decompile):
 //     additionally mark each remaining arg "addrHex:lenHex" as DATA so Ghidra's

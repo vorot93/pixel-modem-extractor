@@ -209,7 +209,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
 | `decompile.rs` | Ghidra import kit + `--run` orchestration (the radare2 Thumb producer lives in `r2_thumb.rs`) |
-| `r2_thumb.rs` | Streaming radare2 Thumb producer: scanner, pairing passes, fragment spill, atomic assembler, streaming thumb-leg validation |
+| `r2_thumb.rs` | Streaming radare2 Thumb producer: scanner, pairing passes, fragment spill, atomic assembler, streaming thumb-leg validation; owns the streaming `thumb_enrich` (`body_c` enrichment, Stage 2 of the memory-envelope lever, moved out of `decompile.rs`) |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
@@ -423,8 +423,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   entry must not win over a live one for the same token); recover_func_name dedups
   `data_refs` by string content before the "exactly one identifier" check so a repeated
   `__func__` reference doesn't look ambiguous.
-  Scale note: `02_MAIN`'s `thumb_functions.json` is large (~600 MB, ~141k Thumb functions)
-  and is loaded/rewritten whole (~4 s, ~3 GB peak); pw_tokenizer strings are structured
+  Scale note: `02_MAIN`'s `thumb_functions.json` is large (632 MB with
+  `body_c`, ~141k Thumb functions). `thumb_enrich` no longer loads/rewrites
+  it whole — the Stage-2 streaming rewrite is bounded by the ~86 MB
+  `decompiled.c` bodies map plus one function record (measured production
+  A/B on the real inputs: 130 s, 2.29 GB peak, byte-identical to the
+  whole-file oracle; see the radare2 streaming bullets) — but `symbolicate`
+  still loads and rewrites it whole (~4 s, ~3 GB peak), the largest
+  remaining whole-file Rust-side consumer (below the Ghidra floor; a Stage 3
+  candidate, unneeded for the envelope); pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not raw literals, so
   a byte search won't find them).
 - **String-reference name guesses.** Beyond `__func__` (Recovered) and token
@@ -1258,11 +1265,13 @@ hardcoded. Two reference images exercise both models end-to-end:
   `PME_GLOBAL_SHAPES_MEASURE_LABEL=01_MAIN`, do not read the sidecar.
   A Ghidra 12 output root must stay
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
-  goldens need a complete unpruned tree; a pruned golden has no raw
+  goldens need a complete unpruned tree;   a pruned golden has no raw
   `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
-  former whole-buffer r2 path) is gone — the producer streams (see the
-  radare2 streaming bullets below); plan per the README's memory note, and
-  re-measure the full-`decompose` peak when Stage 2 lands. Do not parse
+  former whole-buffer r2 path) is gone — the producer and `thumb_enrich`
+  both stream now (see the radare2 streaming bullets below); plan per the
+  README's memory note — the full-`decompose` peak sits at the Ghidra floor
+  (~7.75 GB, measured during Ghidra analyze/export by the 2026-08-20
+  probe). Do not parse
   Ghidra/radare2
   disassembly text, infer ISA from alignment or inventory name, attribute
   an address to the nearest global, or leak decoder-crate enums outside
@@ -1498,11 +1507,51 @@ hardcoded. Two reference images exercise both models end-to-end:
   deterministic edits (drops `body_c`/`annotations`, restores `name` from
   `original_name`) to reconstruct the producer surface; re-baselining
   goldens or touching symbolicate's rewrite shape must revisit that
-  inversion. Downstream whole-file consumers (`thumb_enrich`,
-  `symbolicate`, ~3 GB peaks) remain — that is Stage 2.
+  inversion. Stage 2 (landed) moved `thumb_enrich` onto the same streaming
+  footing — see the next bullet; `symbolicate` (~3 GB, whole-file) remains
+  the largest Rust-side consumer, below the Ghidra floor — a Stage 3
+  candidate, unneeded for the envelope.
   `--no-thumb-decompile` still selects Ghidra `datamark` mode and skips both
   `body_c` enrichment sweeps; the dense-region radare2 capture/parse loop it
   still invokes is the same streaming path.
+- **`thumb_enrich` is streaming, atomic, and bounded (Stage 2 of the
+  memory-envelope lever).** `r2_thumb::thumb_enrich` (moved out of
+  `decompile.rs` by pure motion) collects `decompiled.c` bodies via the
+  streaming `collect_decompiled_c_bodies` pass (~86 MB map on `02_MAIN`) and
+  rewrites `thumb_functions.json` through a `serde_json` stream visitor into
+  an `atomic-write-file` temp — peak RSS is bounded by the bodies map plus
+  one function record, never a whole-document `Value` tree. Measured
+  production A/B on the real inputs (632 MB golden
+  `thumb_functions.json` + 86 MB `decompiled.c`): 130 s, 2.29 GB peak,
+  byte-identical bytes and equal `populated` counts vs the whole-file
+  oracle. Pre-Stage-2, the two whole-file enrich sweeps held the ~24.9 GB
+  full-`decompose` peak (the 632 MB JSON parsed to a ~20+ GB `Value` tree,
+  twice). Contract invariants, pinned by the differential oracle plus the
+  env-gated production replay: (1) **canonical input required, fail-closed**
+  — `thumb_functions.json` must be an object with exactly the keys `format`
+  then `functions` (an array); anything else returns `Err`. This is a
+  deliberate change from the old silent `Ok(0)` fail-open, where a
+  non-canonical document masqueraded as "nothing to enrich". (2)
+  **`populated == 0` ⇒ no write** — the uncommitted temp is dropped and the
+  on-disk file stays byte-identical. (3) **v2 bump on write** — `format`
+  moves to v2 iff at least one `body_c` was populated. (4) **Atomic
+  replace** via `AtomicWriteFile`: a reader sees the complete old file or
+  the complete new file, never a truncate-in-progress. The retired
+  whole-file rewriter (`thumb_enrich_whole`) and the legacy
+  `decompiled.c` body parser
+  (`parse_decompiled_c_function_bodies_by_addr`) stay in-tree as
+  `#[cfg(test)]` differential oracles — do not delete them; the env-gated
+  `streaming_enrich_ab_matches_oracle_on_production_inputs` test is the
+  production-scale pin.
+- **Golden/production `body_c` embeds TWO enrich generations.** A completed
+  tree's `thumb_functions.json` carries pass-1 residue (addresses whose
+  bodies left the final `decompiled.c` when pass 2 overwrote it) plus the
+  post-pass-2 bodies — so no single-sweep enrich over any reconstructible
+  input can byte-match a completed tree's file. Verification of enrich
+  changes is therefore the in-test oracle A/B on real inputs
+  (`streaming_enrich_ab_matches_oracle_on_production_inputs`), not a golden
+  byte-compare. Anyone re-baselining goldens or writing enrich tests must
+  know this, or they will chase a phantom mismatch.
 - **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
   into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
   so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,
