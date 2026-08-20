@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 pub(crate) use artifact::{
     AttemptRecord, AttemptStatus, CaptureRecord, FunctionRunRecord, OwnedFunctionRef,
     ParsedThumbArtifact, RegionRecord, THUMB_V1_FORMAT, THUMB_V2_FORMAT, THUMB_V3_FORMAT,
-    ThumbFormat, assemble_v3_atomic, assemble_v3_into, parse_thumb_artifact, read_thumb_artifact,
+    ThumbFormat, ThumbTerminalMetadata, ValidatedThumbInventory, assemble_v3_atomic,
+    assemble_v3_into, parse_thumb_artifact, read_thumb_artifact,
     validate_thumb_inventory_streaming,
 };
 pub use radare2::discover_radare2;

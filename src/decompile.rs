@@ -407,6 +407,7 @@ pub(crate) struct TerminalInventorySummary {
     pub ghidra: ExecutionInventoryCounts,
     pub thumb: Option<ExecutionInventoryCounts>,
     pub thumb_substantial: Option<usize>,
+    pub(crate) thumb_metadata: Option<crate::thumb_analysis::ThumbTerminalMetadata>,
     pub accepted_identities: Vec<ExecutionIdentity>,
     pub ghidra_records: Vec<TaggedExecutionRecord>,
     pub thumb_records: Vec<TaggedExecutionRecord>,
@@ -428,28 +429,138 @@ fn inventory_counts(
     }
 }
 
-fn validate_thumb_analysis_summary(
+fn validate_thumb_analysis_currentness(
     terminal: &TerminalInventorySummary,
+    expected_radare2: &crate::thumb_analysis::ProducerIdentity,
+    expected_region_requests: &[(u32, u32)],
     expected: &crate::thumb_analysis::ThumbAnalysisSummary,
 ) -> Result<()> {
-    let thumb = terminal.thumb.ok_or_else(|| {
+    terminal.thumb.ok_or_else(|| {
         Error::Serialize("current Thumb analysis lacks a terminal inventory".into())
     })?;
-    let observed = (
-        thumb.raw,
-        terminal.thumb_substantial,
-        thumb.accepted,
-        thumb.quarantined,
-    );
-    let expected = (
-        expected.raw,
-        Some(expected.substantial),
-        expected.accepted,
-        expected.quarantined,
-    );
-    if observed != expected {
+    let metadata = terminal.thumb_metadata.as_ref().ok_or_else(|| {
+        Error::Serialize("current Thumb analysis lacks terminal provenance metadata".into())
+    })?;
+    if metadata.format != crate::thumb_analysis::ThumbFormat::V3 {
         return Err(Error::Serialize(format!(
-            "terminal Thumb counters do not match current producer summary: expected {expected:?}, found {observed:?}"
+            "current Thumb artifact format mismatch: expected {}, found {}",
+            crate::thumb_analysis::THUMB_V3_FORMAT,
+            metadata.format.as_str(),
+        )));
+    }
+    if metadata.producers.len() != 1
+        || metadata.producers[0].producer != crate::thumb_analysis::ThumbProducer::Radare2
+    {
+        let found = metadata
+            .producers
+            .iter()
+            .map(|producer| producer.producer.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Serialize(format!(
+            "current Thumb producer configuration mismatch: expected exactly [radare2], found [{found}]"
+        )));
+    }
+    let observed_radare2 = &metadata.producers[0];
+    if observed_radare2.producer != expected_radare2.producer {
+        return Err(Error::Serialize(format!(
+            "current Thumb producer identity mismatch: expected {}, found {}",
+            expected_radare2.producer.as_str(),
+            observed_radare2.producer.as_str(),
+        )));
+    }
+    if observed_radare2.executable != expected_radare2.executable {
+        return Err(Error::Serialize(format!(
+            "current Thumb radare2 executable mismatch: expected {}, found {}",
+            expected_radare2.executable.display(),
+            observed_radare2.executable.display(),
+        )));
+    }
+    if observed_radare2.version != expected_radare2.version {
+        return Err(Error::Serialize(format!(
+            "current Thumb radare2 version mismatch: expected {:?}, found {:?}",
+            expected_radare2.version, observed_radare2.version,
+        )));
+    }
+    if observed_radare2.command != expected_radare2.command {
+        return Err(Error::Serialize(format!(
+            "current Thumb radare2 command mismatch: expected {:?}, found {:?}",
+            expected_radare2.command, observed_radare2.command,
+        )));
+    }
+    for (field, expected, observed) in [
+        (
+            "regions_requested",
+            expected.regions_requested,
+            metadata.summary.regions_requested,
+        ),
+        (
+            "regions_succeeded",
+            expected.regions_succeeded,
+            metadata.summary.regions_succeeded,
+        ),
+        (
+            "regions_failed",
+            expected.regions_failed,
+            metadata.summary.regions_failed,
+        ),
+        (
+            "radare2_runs",
+            expected.radare2_runs,
+            metadata.summary.radare2_runs,
+        ),
+        (
+            "rizin_runs",
+            expected.rizin_runs,
+            metadata.summary.rizin_runs,
+        ),
+        ("raw", expected.raw, metadata.summary.raw),
+        (
+            "substantial",
+            expected.substantial,
+            metadata.summary.substantial,
+        ),
+        ("accepted", expected.accepted, metadata.summary.accepted),
+        (
+            "quarantined",
+            expected.quarantined,
+            metadata.summary.quarantined,
+        ),
+    ] {
+        if observed != expected {
+            return Err(Error::Serialize(format!(
+                "current Thumb {field} mismatch: expected {expected}, found {observed}"
+            )));
+        }
+    }
+    let expected_regions = expected_region_requests
+        .iter()
+        .map(|&(start, len)| {
+            start
+                .checked_add(len)
+                .map(|end| (start, end))
+                .ok_or_else(|| {
+                    Error::Serialize(format!(
+                        "current Thumb region 0x{start:x} length 0x{len:x} overflows u32"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if metadata.regions != expected_regions {
+        let render = |regions: &[(u32, u32)]| {
+            format!(
+                "[{}]",
+                regions
+                    .iter()
+                    .map(|(start, end)| format!("(0x{start:x}, 0x{end:x})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(Error::Serialize(format!(
+            "current Thumb region ledger mismatch: expected {}, found {}",
+            render(&expected_regions),
+            render(&metadata.regions),
         )));
     }
     Ok(())
@@ -475,27 +586,30 @@ pub(crate) fn validate_terminal_inventory_pair(
     let mut accepted_identities: BTreeSet<ExecutionIdentity> =
         ghidra.accepted_identities.iter().cloned().collect();
 
-    let (thumb, thumb_substantial, thumb_records) = match expected_thumb_substantial {
+    let (thumb, thumb_substantial, thumb_metadata, thumb_records) = match expected_thumb_substantial
+    {
         None => {
             if thumb_functions_path.exists() {
                 return Err(Error::Serialize(
                     "unexpected Thumb inventory without a current producer result".into(),
                 ));
             }
-            (None, None, Vec::new())
+            (None, None, None, Vec::new())
         }
         Some(expected_substantial) => {
-            let (inventory, substantial) =
-                crate::thumb_analysis::validate_thumb_inventory_streaming(
-                    thumb_functions_path,
-                    image_start,
-                    image_len,
-                    expected_substantial,
-                )?;
+            let validated = crate::thumb_analysis::validate_thumb_inventory_streaming(
+                thumb_functions_path,
+                image_start,
+                image_len,
+                expected_substantial,
+            )?;
+            let inventory = validated.inventory;
+            let metadata = validated.metadata;
             accepted_identities.extend(inventory.accepted_identities.iter().cloned());
             (
                 Some(inventory_counts(&inventory)),
-                Some(substantial),
+                Some(metadata.summary.substantial),
+                Some(metadata),
                 inventory.records,
             )
         }
@@ -505,6 +619,7 @@ pub(crate) fn validate_terminal_inventory_pair(
         ghidra: inventory_counts(&ghidra),
         thumb,
         thumb_substantial,
+        thumb_metadata,
         accepted_identities: accepted_identities.into_iter().collect(),
         ghidra_records: ghidra.records,
         thumb_records,
@@ -1474,7 +1589,17 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 )
                 .and_then(|summary| {
                     if let Some(expected) = &thumb_summary {
-                        validate_thumb_analysis_summary(&summary, expected)?;
+                        let expected_radare2 = radare2.as_ref().map_err(|error| {
+                            Error::Serialize(format!(
+                                "current Thumb analysis lost its radare2 identity: {error}"
+                            ))
+                        })?;
+                        validate_thumb_analysis_currentness(
+                            &summary,
+                            expected_radare2,
+                            &regions,
+                            expected,
+                        )?;
                     }
                     Ok(summary)
                 });
@@ -3849,13 +3974,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn terminal_inventory_v3_validates_provenance_runs_and_current_summary() {
-        let root = tempfile::tempdir().unwrap();
-        let ghidra = root.path().join("functions.json");
-        let thumb = root.path().join("thumb_functions.json");
-        std::fs::write(&ghidra, b"[]").unwrap();
-        let artifact = r#"{
+    const TERMINAL_V3_ARTIFACT: &str = r#"{
   "format": "pixel-modem-extractor-thumb-functions-v3",
   "producers": [
     {
@@ -3913,11 +4032,41 @@ mod tests {
     }
   ]
 }"#;
-        std::fs::write(&thumb, artifact).unwrap();
 
-        let terminal =
-            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x20, Some(0), None).unwrap();
-        let expected = crate::thumb_analysis::ThumbAnalysisSummary {
+    const TERMINAL_V2_ARTIFACT: &str = r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v2",
+  "functions": [
+    {
+      "body": "0x00004000      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [
+        {
+          "end": "0x4002",
+          "isa": "thumb",
+          "start": "0x4000"
+        }
+      ],
+      "end": "0x4002",
+      "entry": "0x4000",
+      "name": "sym.thumb",
+      "size": 2
+    }
+  ]
+}"#;
+
+    fn terminal_radare2_identity() -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Radare2,
+            executable: "/usr/bin/r2".into(),
+            version: "radare2 test 1.0".into(),
+            command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+        }
+    }
+
+    fn terminal_thumb_summary() -> crate::thumb_analysis::ThumbAnalysisSummary {
+        crate::thumb_analysis::ThumbAnalysisSummary {
             regions_requested: 1,
             regions_succeeded: 1,
             regions_failed: 0,
@@ -3927,22 +4076,196 @@ mod tests {
             substantial: 0,
             accepted: 1,
             quarantined: 0,
-        };
-        validate_thumb_analysis_summary(&terminal, &expected).unwrap();
+        }
+    }
 
-        let mut wrong_summary = expected;
-        wrong_summary.accepted = 0;
-        wrong_summary.quarantined = 1;
-        assert!(validate_thumb_analysis_summary(&terminal, &wrong_summary).is_err());
+    fn terminal_inventory_for_artifact(artifact: &str) -> TerminalInventorySummary {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("functions.json");
+        let thumb = root.path().join("thumb_functions.json");
+        std::fs::write(&ghidra, b"[]").unwrap();
+        std::fs::write(&thumb, artifact).unwrap();
+        validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x20, Some(0), None).unwrap()
+    }
 
-        std::fs::write(
-            &thumb,
-            artifact.replacen("\"accepted\": 1", "\"accepted\": 0", 1),
+    fn currentness_error(
+        artifact: &str,
+        identity: &crate::thumb_analysis::ProducerIdentity,
+        summary: &crate::thumb_analysis::ThumbAnalysisSummary,
+    ) -> String {
+        currentness_error_for_terminal(
+            &terminal_inventory_for_artifact(artifact),
+            identity,
+            &[(0x4000, 0x10)],
+            summary,
+        )
+    }
+
+    fn currentness_error_for_terminal(
+        terminal: &TerminalInventorySummary,
+        identity: &crate::thumb_analysis::ProducerIdentity,
+        regions: &[(u32, u32)],
+        summary: &crate::thumb_analysis::ThumbAnalysisSummary,
+    ) -> String {
+        validate_thumb_analysis_currentness(terminal, identity, regions, summary)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_matching_v2_when_current_run_requires_v3() {
+        assert_eq!(
+            currentness_error(
+                TERMINAL_V2_ARTIFACT,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb artifact format mismatch: expected pixel-modem-extractor-thumb-functions-v3, found pixel-modem-extractor-thumb-functions-v2"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_compares_complete_radare2_identity() {
+        let expected = terminal_radare2_identity();
+        let summary = terminal_thumb_summary();
+        let cases = [
+            (
+                TERMINAL_V3_ARTIFACT.to_owned(),
+                crate::thumb_analysis::ProducerIdentity {
+                    producer: crate::thumb_analysis::ThumbProducer::Rizin,
+                    ..expected.clone()
+                },
+                "serialize: current Thumb producer identity mismatch: expected rizin, found radare2",
+            ),
+            (
+                TERMINAL_V3_ARTIFACT.replacen("/usr/bin/r2", "/opt/r2", 1),
+                expected.clone(),
+                "serialize: current Thumb radare2 executable mismatch: expected /usr/bin/r2, found /opt/r2",
+            ),
+            (
+                TERMINAL_V3_ARTIFACT.replacen("radare2 test 1.0", "radare2 stale 0.9", 1),
+                expected.clone(),
+                "serialize: current Thumb radare2 version mismatch: expected \"radare2 test 1.0\", found \"radare2 stale 0.9\"",
+            ),
+            (
+                TERMINAL_V3_ARTIFACT.to_owned(),
+                crate::thumb_analysis::ProducerIdentity {
+                    command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
+                    ..expected
+                },
+                "serialize: current Thumb radare2 command mismatch: expected \"aaa;aflj;pdfj @@F;axlj\", found \"aaa;aflj;pdfj @@f\"",
+            ),
+        ];
+
+        for (artifact, expected, message) in cases {
+            assert_eq!(currentness_error(&artifact, &expected, &summary), message);
+        }
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_compares_every_thumb_summary_field() {
+        let expected = terminal_thumb_summary();
+        let cases = [
+            ("regions_requested", 1, 2),
+            ("regions_succeeded", 1, 0),
+            ("regions_failed", 0, 1),
+            ("radare2_runs", 1, 0),
+            ("rizin_runs", 0, 1),
+            ("raw", 1, 2),
+            ("substantial", 0, 1),
+            ("accepted", 1, 0),
+            ("quarantined", 0, 1),
+        ];
+
+        for (field, expected_value, found_value) in cases {
+            let mut terminal = terminal_inventory_for_artifact(TERMINAL_V3_ARTIFACT);
+            let observed = &mut terminal.thumb_metadata.as_mut().unwrap().summary;
+            match field {
+                "regions_requested" => observed.regions_requested = found_value,
+                "regions_succeeded" => observed.regions_succeeded = found_value,
+                "regions_failed" => observed.regions_failed = found_value,
+                "radare2_runs" => observed.radare2_runs = found_value,
+                "rizin_runs" => observed.rizin_runs = found_value,
+                "raw" => observed.raw = found_value,
+                "substantial" => observed.substantial = found_value,
+                "accepted" => observed.accepted = found_value,
+                "quarantined" => observed.quarantined = found_value,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                currentness_error_for_terminal(
+                    &terminal,
+                    &terminal_radare2_identity(),
+                    &[(0x4000, 0x10)],
+                    &expected
+                ),
+                format!(
+                    "serialize: current Thumb {field} mismatch: expected {expected_value}, found {found_value}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_stale_region_counts_and_ledger_shape() {
+        let extra_failed_region = TERMINAL_V3_ARTIFACT.replacen(
+            "      ]\n    }\n  ],\n  \"functions\"",
+            "      ]\n    },\n    {\n      \"start\": \"0x4010\",\n      \"end\": \"0x4020\",\n      \"attempts\": [\n        {\n          \"producer\": \"radare2\",\n          \"status\": \"failed\",\n          \"stdout\": null,\n          \"error\": \"stale failed attempt\"\n        }\n      ],\n      \"function_runs\": []\n    }\n  ],\n  \"functions\"",
+            1,
+        );
+        assert_eq!(
+            currentness_error(
+                &extra_failed_region,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb regions_requested mismatch: expected 1, found 2"
+        );
+
+        let changed_region =
+            TERMINAL_V3_ARTIFACT.replacen("\"end\": \"0x4010\"", "\"end\": \"0x4018\"", 1);
+        assert_eq!(
+            currentness_error(
+                &changed_region,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb region ledger mismatch: expected [(0x4000, 0x4010)], found [(0x4000, 0x4018)]"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_rizin_configuration_with_matching_totals() {
+        let with_rizin = TERMINAL_V3_ARTIFACT
+            .replacen(
+                "    }\n  ],\n  \"regions\"",
+                "    },\n    {\n      \"id\": \"rizin\",\n      \"executable\": \"/usr/bin/rizin\",\n      \"version\": \"rizin test 1.0\",\n      \"command\": \"aaa;aflj;pdfj @@F;axlj\"\n    }\n  ],\n  \"regions\"",
+                1,
+            )
+            .replacen(
+                "          \"error\": null\n        }\n      ],",
+                "          \"error\": null\n        },\n        {\n          \"producer\": \"rizin\",\n          \"status\": \"failed\",\n          \"stdout\": null,\n          \"error\": \"stale fallback attempt\"\n        }\n      ],",
+                1,
+            );
+        assert_eq!(
+            currentness_error(
+                &with_rizin,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb producer configuration mismatch: expected exactly [radare2], found [radare2, rizin]"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_accepts_matching_v3_provenance_and_summary() {
+        validate_thumb_analysis_currentness(
+            &terminal_inventory_for_artifact(TERMINAL_V3_ARTIFACT),
+            &terminal_radare2_identity(),
+            &[(0x4000, 0x10)],
+            &terminal_thumb_summary(),
         )
         .unwrap();
-        assert!(
-            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x20, Some(0), None).is_err()
-        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Shared Thumb sidecar parsing, provenance validation, bounded fragment
 //! assembly, terminal scanning, and atomic function-local mutation.
 
-use super::{ProducerIdentity, ThumbProducer};
+use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
     ExecutionIdentity, ExecutionProjection, TaggedExecutionRecord, ValidatedInventory,
@@ -36,13 +36,27 @@ impl ThumbFormat {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::V1 => THUMB_V1_FORMAT,
             Self::V2 => THUMB_V2_FORMAT,
             Self::V3 => THUMB_V3_FORMAT,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThumbTerminalMetadata {
+    pub format: ThumbFormat,
+    pub producers: Vec<ProducerIdentity>,
+    pub regions: Vec<(u32, u32)>,
+    pub summary: ThumbAnalysisSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedThumbInventory {
+    pub inventory: ValidatedInventory,
+    pub metadata: ThumbTerminalMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -966,7 +980,7 @@ pub(crate) fn validate_thumb_inventory_streaming(
     image_start: u32,
     image_len: u32,
     expected_substantial: usize,
-) -> Result<(ValidatedInventory, usize)> {
+) -> Result<ValidatedThumbInventory> {
     let file = std::fs::File::open(path)?;
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
     let mut scan = ThumbScan::new(image_start, image_len);
@@ -1000,6 +1014,7 @@ struct ThumbScan {
     saw_regions: bool,
     saw_functions: bool,
     v3_producers: Option<Vec<ProducerIdentity>>,
+    v3_regions: Option<Vec<RegionRecord>>,
     v3_layout: Option<V3Layout>,
     v3_observed: Vec<RunCounts>,
     shape_error: Option<Error>,
@@ -1023,6 +1038,7 @@ impl ThumbScan {
             saw_regions: false,
             saw_functions: false,
             v3_producers: None,
+            v3_regions: None,
             v3_layout: None,
             v3_observed: Vec::new(),
             shape_error: None,
@@ -1067,6 +1083,7 @@ impl ThumbScan {
         match validate_v3_metadata(producers, &regions) {
             Ok(layout) => {
                 self.v3_observed = vec![RunCounts::default(); layout.runs.len()];
+                self.v3_regions = Some(regions);
                 self.v3_layout = Some(layout);
             }
             Err(error) => self.artifact_invalid(error),
@@ -1157,7 +1174,7 @@ impl ThumbScan {
         }
     }
 
-    fn finish(self, expected_substantial: usize) -> Result<(ValidatedInventory, usize)> {
+    fn finish(mut self, expected_substantial: usize) -> Result<ValidatedThumbInventory> {
         if let Some(error) = self.shape_error {
             return Err(error);
         }
@@ -1168,7 +1185,7 @@ impl ThumbScan {
             if let Some(error) = self.validation_error {
                 return Err(error);
             }
-            let layout = self.v3_layout.ok_or_else(|| {
+            let layout = self.v3_layout.as_ref().ok_or_else(|| {
                 invalid_artifact("v3 artifact lacks validated producer and region metadata")
             })?;
             if self.raw_count != layout.function_count {
@@ -1206,16 +1223,61 @@ impl ThumbScan {
                 "raw inventory count does not equal accepted plus quarantined",
             ));
         }
-        Ok((
-            ValidatedInventory {
+        let format = self.format.ok_or_else(|| {
+            Error::Serialize("unsupported Thumb functions inventory format".into())
+        })?;
+        let mut summary = ThumbAnalysisSummary {
+            raw: self.raw_count,
+            substantial: self.substantial,
+            accepted: self.accepted,
+            quarantined: self.quarantined,
+            ..ThumbAnalysisSummary::default()
+        };
+        let (producers, regions) =
+            if format == ThumbFormat::V3 {
+                let producers = self.v3_producers.take().ok_or_else(|| {
+                    invalid_artifact("v3 artifact lacks validated producer metadata")
+                })?;
+                let region_records = self.v3_regions.take().ok_or_else(|| {
+                    invalid_artifact("v3 artifact lacks validated region metadata")
+                })?;
+                summary.regions_requested = region_records.len();
+                for region in &region_records {
+                    if region.function_runs.is_empty() {
+                        summary.regions_failed += 1;
+                    } else {
+                        summary.regions_succeeded += 1;
+                    }
+                    for run in &region.function_runs {
+                        match run.producer {
+                            ThumbProducer::Radare2 => summary.radare2_runs += 1,
+                            ThumbProducer::Rizin => summary.rizin_runs += 1,
+                        }
+                    }
+                }
+                let regions = region_records
+                    .into_iter()
+                    .map(|region| (region.start, region.end))
+                    .collect();
+                (producers, regions)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        Ok(ValidatedThumbInventory {
+            inventory: ValidatedInventory {
                 raw_count: self.raw_count,
                 accepted: self.accepted,
                 quarantined: self.quarantined,
                 accepted_identities: self.accepted_identities.into_iter().collect(),
                 records: self.records,
             },
-            self.substantial,
-        ))
+            metadata: ThumbTerminalMetadata {
+                format,
+                producers,
+                regions,
+                summary,
+            },
+        })
     }
 }
 
@@ -2749,13 +2811,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&valid_v3())).unwrap();
-        let (inventory, substantial) =
-            validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
-        assert_eq!(substantial, 1);
-        assert_eq!(inventory.raw_count, 2);
-        assert_eq!(inventory.accepted, 2);
-        assert_eq!(inventory.quarantined, 0);
-        assert_eq!(inventory.records.len(), 2);
+        let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        assert_eq!(validated.metadata.format, ThumbFormat::V3);
+        assert_eq!(
+            validated
+                .metadata
+                .producers
+                .iter()
+                .map(|producer| producer.producer)
+                .collect::<Vec<_>>(),
+            [ThumbProducer::Radare2, ThumbProducer::Rizin]
+        );
+        assert_eq!(
+            validated.metadata.regions,
+            [(0x1000, 0x1100), (0x2000, 0x2100)]
+        );
+        assert_eq!(
+            validated.metadata.summary,
+            ThumbAnalysisSummary {
+                regions_requested: 2,
+                regions_succeeded: 2,
+                regions_failed: 0,
+                radare2_runs: 1,
+                rizin_runs: 1,
+                raw: 2,
+                substantial: 1,
+                accepted: 2,
+                quarantined: 0,
+            }
+        );
+        assert_eq!(validated.inventory.raw_count, 2);
+        assert_eq!(validated.inventory.accepted, 2);
+        assert_eq!(validated.inventory.quarantined, 0);
+        assert_eq!(validated.inventory.records.len(), 2);
     }
 
     #[test]
@@ -2778,9 +2866,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&document)).unwrap();
-        let (inventory, substantial) =
-            validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
-        assert_eq!((inventory.raw_count, substantial), (2, 1));
+        let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        assert_eq!(validated.inventory.raw_count, 2);
+        assert_eq!(validated.metadata.summary.substantial, 1);
+        assert_eq!(validated.metadata.summary.regions_requested, 1);
+        assert_eq!(validated.metadata.summary.regions_succeeded, 1);
+        assert_eq!(validated.metadata.summary.radare2_runs, 1);
+        assert_eq!(validated.metadata.summary.rizin_runs, 1);
     }
 
     #[test]
@@ -2905,9 +2997,14 @@ mod tests {
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&document)).unwrap();
 
-        let (inventory, substantial) =
-            validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
-        assert_eq!((inventory.accepted, substantial), (2, 1));
+        let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        assert_eq!(
+            (
+                validated.inventory.accepted,
+                validated.metadata.summary.substantial
+            ),
+            (2, 1)
+        );
     }
 
     #[test]
@@ -2921,11 +3018,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("thumb_functions.json");
             std::fs::write(&path, document).unwrap();
-            let (inventory, substantial) =
-                validate_thumb_inventory_streaming(&path, 0x1000, 0x100, 0).unwrap();
-            assert_eq!(substantial, 0);
-            assert_eq!(inventory.raw_count, 1);
-            assert_eq!(inventory.accepted, 1);
+            let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x100, 0).unwrap();
+            assert_eq!(validated.metadata.format.as_str(), format);
+            assert!(validated.metadata.producers.is_empty());
+            assert!(validated.metadata.regions.is_empty());
+            assert_eq!(validated.metadata.summary.substantial, 0);
+            assert_eq!(validated.inventory.raw_count, 1);
+            assert_eq!(validated.inventory.accepted, 1);
         }
     }
 
@@ -2946,12 +3045,11 @@ mod tests {
   ]
 }"#;
         let path = write_thumb_doc(dir.path(), document);
-        let (inventory, substantial) =
-            validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 1).unwrap();
-        assert_eq!(substantial, 1);
-        assert_eq!(inventory.raw_count, 2);
-        assert_eq!(inventory.accepted, 1);
-        assert_eq!(inventory.quarantined, 1);
+        let validated = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 1).unwrap();
+        assert_eq!(validated.metadata.summary.substantial, 1);
+        assert_eq!(validated.inventory.raw_count, 2);
+        assert_eq!(validated.inventory.accepted, 1);
+        assert_eq!(validated.inventory.quarantined, 1);
     }
 
     #[test]
@@ -3073,7 +3171,9 @@ mod tests {
 }"#;
         let path = write_thumb_doc(dir.path(), valid);
         let whole = legacy_whole_file_validation(&path, 0x4000, 0x2000, 1).unwrap();
-        let streaming = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 1).unwrap();
+        let streaming = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 1)
+            .map(|validated| (validated.inventory, validated.metadata.summary.substantial))
+            .unwrap();
         assert_eq!(whole, streaming);
 
         let format = THUMB_V2_FORMAT;
@@ -3100,6 +3200,7 @@ mod tests {
             let whole = legacy_whole_file_validation(&path, 0x4000, 0x2000, *expected)
                 .map_err(|error| error.to_string());
             let streaming = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, *expected)
+                .map(|validated| (validated.inventory, validated.metadata.summary.substantial))
                 .map_err(|error| error.to_string());
             assert_eq!(whole, streaming, "case {index}");
         }
