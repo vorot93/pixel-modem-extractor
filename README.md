@@ -34,20 +34,29 @@ Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PA
 supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
 to launch the headless analyzer unless you set your own `JAVA_HOME`.
 
-**Memory:** a full dense-Thumb `decompose` can peak around 56 GiB RSS. Raw
-per-region radare2 JSON captures remain on disk; normalized function values
-from completed regions accumulate in memory while the current capture is read
-and parsed. Plan for at least 64 GiB RAM plus swap or other headroom. The 4 GiB
-radare2 stdout cap applies per capture and does not cap aggregate process
-memory. radare2's *own* analysis memory is separately bounded to 16 GiB
+**Memory:** the radare2 dense-Thumb producer is fully streaming (Stage 1 of the
+memory-envelope lever): each region's r2 stdout capture is parsed value-by-value
+from disk, functions are normalized and spilled one at a time, and
+`thumb_functions.json` is assembled atomically from the spills — byte-identical
+to the previous whole-buffer rendering (env-gated replay of mustang `02_MAIN`'s
+five retained captures: ~3.65 GiB of r2 stdout → 151,411 functions,
+582,543,970 output bytes, ~248 s wall, ~2.8 GB peak RSS for the replay+compare)
+while the producer's peak RSS is bounded by the largest single JSON value
+(~tens of MiB) instead of the whole image. This is the path that previously
+contributed to a ~56 GiB whole-`decompose` peak. Whole-file consumers
+(`thumb_enrich`, `symbolicate`) still load `thumb_functions.json` whole
+(~3 GB peaks each) pending Stage 2, and Ghidra's JVM plus the in-memory image
+slices still dominate a full `decompose` — plan for Ghidra's needs plus several
+GiB, no longer 64 GiB for the Thumb path. The 4 GiB radare2 stdout cap applies
+per capture. radare2's *own* analysis memory is separately bounded to 16 GiB
 (`RLIMIT_AS`) per dense-Thumb region: a pathological region whose `aaa` would
 otherwise run away (seen on one 4 MiB region of cheetah's MAIN, ~90+ GiB) fails
 closed and is skipped, so the rest of the image's Thumb still decompiles instead
 of the host OOM-ing. Smaller images without dense Thumb regions (`00_BOOT`,
-`01_PSP`, etc.) stay under 1 GiB. `--no-thumb-decompile` switches Ghidra to `datamark` mode and
-skips `body_c` enrichment, but it still runs the dense-region radare2
-capture/read/parse path and therefore does not avoid the full dense-Thumb
-memory envelope.
+`01_PSP`, etc.) stay under 1 GiB. `--no-thumb-decompile` switches Ghidra to
+`datamark` mode and skips `body_c` enrichment, but it still runs the
+(now-streaming) dense-region radare2 capture/parse path — without the old
+dense-Thumb memory envelope.
 
 **Project path:** `pixel-modem-extractor` canonicalizes its output root before
 constructing the Ghidra headless project path. Ghidra 12 rejects any

@@ -309,6 +309,35 @@ pub(crate) fn inventory_count_conserved(
         == Some(raw_count)
 }
 
+/// Validate one inventory record: object shape, canonical `entry`, the exact
+/// projection representation, and the derived identity. Shared by the
+/// whole-record and streaming Thumb validators so verdicts cannot drift.
+pub(crate) fn validate_inventory_record(
+    record: &Value,
+    image_start: u32,
+    image_len: u32,
+) -> Result<(
+    TaggedExecutionRecord,
+    ExecutionProjection,
+    Option<ExecutionIdentity>,
+)> {
+    let object = record
+        .as_object()
+        .ok_or_else(|| invalid("inventory record must be an object"))?;
+    let entry = parse_hex(required_string(object, "entry")?)?;
+    let projection = parse_projection(record)?;
+    validate_inventory_projection(entry, &projection, image_start, image_len)?;
+    let identity = execution_identity(entry, &projection)?;
+    Ok((
+        TaggedExecutionRecord {
+            entry,
+            projection: projection.clone(),
+        },
+        projection,
+        identity,
+    ))
+}
+
 pub(crate) fn validate_inventory_records(
     records: &[Value],
     expected_raw_count: usize,
@@ -321,13 +350,9 @@ pub(crate) fn validate_inventory_records(
     let mut quarantined = 0usize;
     let mut tagged_records = Vec::with_capacity(records.len());
     for record in records {
-        let object = record
-            .as_object()
-            .ok_or_else(|| invalid("inventory record must be an object"))?;
-        let entry = parse_hex(required_string(object, "entry")?)?;
-        let projection = parse_projection(record)?;
-        validate_inventory_projection(entry, &projection, image_start, image_len)?;
-        if let Some(identity) = execution_identity(entry, &projection)? {
+        let (tagged, projection, identity) =
+            validate_inventory_record(record, image_start, image_len)?;
+        if let Some(identity) = identity {
             accepted = accepted
                 .checked_add(1)
                 .ok_or_else(|| invalid("accepted inventory count overflow"))?;
@@ -337,10 +362,7 @@ pub(crate) fn validate_inventory_records(
                 .checked_add(1)
                 .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
         }
-        tagged_records.push(TaggedExecutionRecord {
-            entry,
-            projection: projection.clone(),
-        });
+        tagged_records.push(tagged);
         projections.push(projection);
     }
     if !inventory_count_conserved(expected_raw_count, &projections)
@@ -501,7 +523,7 @@ fn parse_error_kind(value: &str) -> Option<DecodeRangeErrorKind> {
     })
 }
 
-fn invalid(message: &str) -> Error {
+pub(crate) fn invalid(message: &str) -> Error {
     Error::Serialize(message.to_owned())
 }
 
