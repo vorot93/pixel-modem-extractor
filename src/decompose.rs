@@ -783,7 +783,7 @@ fn decompile_pass2_stage(
     }
 }
 
-/// Phase 2: run `decompile::thumb_enrich` against each image's
+/// Phase 2: run `r2_thumb::thumb_enrich` (streaming) against each image's
 /// `images/<label>/decompiled/{decompiled.c,thumb_functions.json}`. Mutates each
 /// `ImageResult.thumb_decompiled` (count) or `thumb_enrich_error` (failure text)
 /// in place. Returns the per-image outcome so the caller can build a StageReport.
@@ -817,7 +817,7 @@ fn run_thumb_enrich_per_image(
             }
             continue;
         }
-        match decompile::thumb_enrich(&decompiled_c, &thumb_json) {
+        match crate::r2_thumb::thumb_enrich(&decompiled_c, &thumb_json) {
             Ok(n) => {
                 ir.thumb_decompiled = Some(n);
                 outcome.counts.push((label.clone(), n));
