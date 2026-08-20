@@ -366,12 +366,26 @@ impl<R: Read + Seek> ValueScanner<R> {
     /// Seeking lets Rizin distinguish diagnostic brackets from the final axlj
     /// array without feeding that array to the whole-value accumulator.
     pub(super) fn next_streamed_value(&mut self) -> Result<Option<StreamedJsonValue>> {
+        self.next_streamed_value_inner(false)
+    }
+
+    /// Include standalone scalar records when checking that axlj is the final
+    /// JSON value. Scalar-looking fragments on diagnostic records stay noise.
+    pub(super) fn next_streamed_any_value(&mut self) -> Result<Option<StreamedJsonValue>> {
+        self.next_streamed_value_inner(true)
+    }
+
+    fn next_streamed_value_inner(
+        &mut self,
+        include_scalars: bool,
+    ) -> Result<Option<StreamedJsonValue>> {
         self.reader.seek(SeekFrom::Start(self.consumed))?;
         self.buf.clear();
         self.out.clear();
         self.eof = false;
 
         let mut position = self.consumed;
+        let mut scalar_record_start = include_scalars;
         let mut byte = [0u8; 1];
         loop {
             if self.reader.read(&mut byte)? == 0 {
@@ -384,23 +398,29 @@ impl<R: Read + Seek> ValueScanner<R> {
                 .checked_add(1)
                 .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
             self.consumed = position;
-            if !matches!(byte[0], b'{' | b'[') {
+            if matches!(byte[0], b'\n' | b'\r') {
+                scalar_record_start = include_scalars;
+                continue;
+            }
+            if byte[0].is_ascii_whitespace() {
                 continue;
             }
 
-            self.reader.seek(SeekFrom::Start(start))?;
-            let mut stream = serde_json::Deserializer::from_reader(&mut self.reader)
-                .into_iter::<serde::de::IgnoredAny>();
-            let parsed = stream.next();
-            let consumed = stream.byte_offset();
-            drop(stream);
-            if matches!(parsed, Some(Ok(_))) {
-                let consumed = u64::try_from(consumed).map_err(|_| {
-                    Error::Serialize("Rizin capture offset exceeds u64".to_string())
-                })?;
-                let end = start
-                    .checked_add(consumed)
-                    .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
+            let container = matches!(byte[0], b'{' | b'[');
+            let scalar = include_scalars
+                && scalar_record_start
+                && matches!(byte[0], b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n');
+            if !container && !scalar {
+                scalar_record_start = false;
+                continue;
+            }
+
+            let end = if scalar {
+                self.standalone_scalar_end(start)?
+            } else {
+                self.streamed_value_end(start)?
+            };
+            if let Some(end) = end {
                 self.reader.seek(SeekFrom::Start(end))?;
                 self.consumed = end;
                 return Ok(Some(StreamedJsonValue {
@@ -409,20 +429,86 @@ impl<R: Read + Seek> ValueScanner<R> {
                     opener: byte[0],
                 }));
             }
-            if let Some(Err(error)) = parsed
-                && error.is_io()
-            {
-                return Err(Error::Serialize(format!(
-                    "scan Rizin capture JSON: {error}"
-                )));
-            }
 
+            scalar_record_start = false;
             position = start
                 .checked_add(1)
                 .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
             self.reader.seek(SeekFrom::Start(position))?;
             self.consumed = position;
         }
+    }
+
+    fn streamed_value_end(&mut self, start: u64) -> Result<Option<u64>> {
+        self.reader.seek(SeekFrom::Start(start))?;
+        let mut stream = serde_json::Deserializer::from_reader(&mut self.reader)
+            .into_iter::<serde::de::IgnoredAny>();
+        let parsed = stream.next();
+        let consumed = stream.byte_offset();
+        drop(stream);
+        match parsed {
+            Some(Ok(_)) => {
+                let consumed = u64::try_from(consumed).map_err(|_| {
+                    Error::Serialize("Rizin capture offset exceeds u64".to_string())
+                })?;
+                start
+                    .checked_add(consumed)
+                    .map(Some)
+                    .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))
+            }
+            Some(Err(error)) if error.is_io() => Err(Error::Serialize(format!(
+                "scan Rizin capture JSON: {error}"
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    fn standalone_scalar_end(&mut self, start: u64) -> Result<Option<u64>> {
+        // A diagnostic may begin with a scalar prefix. It is standalone JSON
+        // only when the complete physical record is a valid JSON value stream.
+        self.reader.seek(SeekFrom::Start(start))?;
+        let mut record_end = start;
+        let mut byte = [0u8; 1];
+        while self.reader.read(&mut byte)? != 0 {
+            if matches!(byte[0], b'\n' | b'\r') {
+                break;
+            }
+            record_end = record_end
+                .checked_add(1)
+                .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
+        }
+
+        self.reader.seek(SeekFrom::Start(start))?;
+        let record_len = record_end.checked_sub(start).ok_or_else(|| {
+            Error::Serialize("Rizin capture value has invalid offsets".to_string())
+        })?;
+        let mut stream = serde_json::Deserializer::from_reader((&mut self.reader).take(record_len))
+            .into_iter::<serde::de::IgnoredAny>();
+        let mut first_end = None;
+        while let Some(parsed) = stream.next() {
+            match parsed {
+                Ok(_) => {
+                    if first_end.is_none() {
+                        first_end = Some(stream.byte_offset());
+                    }
+                }
+                Err(error) if error.is_io() => {
+                    return Err(Error::Serialize(format!(
+                        "scan Rizin capture JSON: {error}"
+                    )));
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+        let Some(first_end) = first_end else {
+            return Ok(None);
+        };
+        let first_end = u64::try_from(first_end)
+            .map_err(|_| Error::Serialize("Rizin capture offset exceeds u64".to_string()))?;
+        start
+            .checked_add(first_end)
+            .map(Some)
+            .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))
     }
 
     pub(super) fn read_streamed_value(&mut self, value: StreamedJsonValue) -> Result<&[u8]> {

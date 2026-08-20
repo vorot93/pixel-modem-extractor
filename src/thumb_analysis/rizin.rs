@@ -87,7 +87,7 @@ fn read_trailing_xrefs(
         .map_err(|error| Error::Serialize(format!("parse trailing Rizin axlj: {error}")))?;
     drop(deserializer);
 
-    if scanner.next_streamed_value()?.is_some() {
+    if scanner.next_streamed_any_value()?.is_some() {
         return Err(Error::Serialize(
             "Rizin capture contains JSON after the trailing axlj array".to_string(),
         ));
@@ -300,6 +300,103 @@ DEBUG: [false diagnostic] collecting outgoing references
                 from: 0x1000,
                 to: 0x2000,
             }]
+        );
+    }
+
+    #[test]
+    fn axlj_distinguishes_same_line_scalars_from_diagnostic_fragments() {
+        let diagnostics = [
+            ("string suffix", " \"extra\" suffix"),
+            ("unterminated string", " \"unterminated"),
+            ("number suffix", " 42ms"),
+            ("boolean suffix", " true-ish"),
+            ("null suffix", " null pointer"),
+            ("incomplete boolean", " tru"),
+            ("incomplete number", " -"),
+            ("embedded scalar", " diagnostic=true"),
+            ("bracketed keyword diagnostic", " [true diagnostic]"),
+            ("whitespace", " \t  "),
+        ];
+        for (case, suffix) in diagnostics {
+            let contents = format!("[{{\"offset\":4096}}]\n{{\"ops\":[]}}\n[]{suffix}");
+            let (_dir, path) = capture(&contents);
+            assert!(
+                read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).is_ok(),
+                "{case} must remain diagnostic noise"
+            );
+        }
+
+        let scalars = [
+            ("string", " \"extra\""),
+            ("number", " 42"),
+            ("true", " true"),
+            ("false", " false"),
+            ("null", " null"),
+            ("scalar sequence", " true false"),
+        ];
+        let accepted = scalars
+            .into_iter()
+            .filter_map(|(case, suffix)| {
+                let contents = format!("[{{\"offset\":4096}}]\n{{\"ops\":[]}}\n[]{suffix}");
+                let (_dir, path) = capture(&contents);
+                read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP)
+                    .is_ok()
+                    .then_some(case)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            accepted.is_empty(),
+            "accepted same-line trailing scalars: {}",
+            accepted.join(", ")
+        );
+    }
+
+    #[test]
+    fn axlj_distinguishes_newline_scalars_from_diagnostic_fragments() {
+        let diagnostics = [
+            ("string suffix", "\n\"extra\" suffix\n"),
+            ("unterminated string", "\n\"unterminated\n"),
+            ("number suffix", "\n-42 percent\n"),
+            ("boolean suffix", "\nfalse-positive\n"),
+            ("null suffix", "\nnullability unknown\n"),
+            ("incomplete boolean", "\nfal\n"),
+            ("embedded scalar", "\nDEBUG true\n"),
+            (
+                "whitespace and bracketed noise",
+                "\n \t\r\nDEBUG: [true diagnostic]\nINFO: complete\n",
+            ),
+        ];
+        for (case, suffix) in diagnostics {
+            let contents = format!("[{{\"offset\":4096}}]\n{{\"ops\":[]}}\n[]{suffix}");
+            let (_dir, path) = capture(&contents);
+            assert!(
+                read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).is_ok(),
+                "{case} must remain diagnostic noise"
+            );
+        }
+
+        let scalars = [
+            ("string", "\n\"extra\"\n"),
+            ("number", "\n-42\n"),
+            ("true", "\ntrue\n"),
+            ("false", "\nfalse\n"),
+            ("null", "\nnull\n"),
+            ("scalar before later noise", "\ntrue\nDEBUG: complete\n"),
+        ];
+        let accepted = scalars
+            .into_iter()
+            .filter_map(|(case, suffix)| {
+                let contents = format!("[{{\"offset\":4096}}]\n{{\"ops\":[]}}\n[]{suffix}");
+                let (_dir, path) = capture(&contents);
+                read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP)
+                    .is_ok()
+                    .then_some(case)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            accepted.is_empty(),
+            "accepted newline trailing scalars: {}",
+            accepted.join(", ")
         );
     }
 
