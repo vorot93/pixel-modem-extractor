@@ -13,8 +13,8 @@ use crate::execution_ranges::{
 use serde::Deserializer as _;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap};
-use std::io::{Read, Write};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 const THUMB_FUNCTIONS_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v2";
@@ -2052,6 +2052,171 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
     out
 }
 
+/// Streaming Pass-1 body collector for `thumb_enrich`: implements the exact
+/// grammar of [`parse_decompiled_c_function_bodies_by_addr`] (the
+/// whole-string oracle; the differential fixtures pin the equivalence) but
+/// reads `decompiled.c` line-by-line through `BufReader` — never whole-file —
+/// so memory is bounded by the largest single body plus an 8-line lookahead
+/// window. Any io failure (missing file, non-UTF-8 input) propagates as
+/// `Err` (same failure class as the oracle-side `read_to_string?`).
+#[cfg_attr(not(test), allow(dead_code))]
+fn collect_decompiled_c_bodies(path: &Path) -> Result<HashMap<String, String>> {
+    let file = std::fs::File::open(path)?;
+    let mut source = LineSource::new(std::io::BufReader::new(file));
+    let mut out = HashMap::new();
+    while let Some(line) = source.next_line()? {
+        let Some(addr_str) = decompiled_c_header_addr(&line) else {
+            continue;
+        };
+        let mut window: VecDeque<String> = VecDeque::with_capacity(8);
+        let mut opens_brace = false;
+        while window.len() < 8 {
+            let Some(next) = source.next_line()? else {
+                break;
+            };
+            opens_brace |= next.contains('{');
+            window.push_back(next);
+            if opens_brace {
+                break;
+            }
+        }
+        if !opens_brace {
+            source.push_front_all(window);
+            continue;
+        }
+        let mut scan = BodyScan::default();
+        let mut body = String::new();
+        let mut closed = scan.push_line(&line, &mut body);
+        while !closed {
+            let next = window
+                .pop_front()
+                .map_or_else(|| source.next_line(), |line| Ok(Some(line)));
+            let Some(next) = next? else { break };
+            closed = scan.push_line(&next, &mut body);
+        }
+        source.push_front_all(window);
+        if let Some(canonical) = normalize_thumb_addr(addr_str) {
+            out.insert(canonical, body);
+        }
+    }
+    Ok(out)
+}
+
+/// ExportDecomp.java header shape, as the oracle matches it: a trimmed line
+/// starting `//`, the last ` @ ` occurrence as separator, and a non-empty
+/// trimmed address tail.
+fn decompiled_c_header_addr(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("//")
+        .and_then(|rest| rest.rsplit_once(" @ "))
+        .map(|(_, addr)| addr.trim())
+        .filter(|addr| !addr.is_empty())
+}
+
+/// Line reader with a pushback queue: lines consumed while probing a
+/// lookahead window can be re-scanned as headers, mirroring the oracle's
+/// resume rule (a header without `{` in its window restarts at the very
+/// next line).
+struct LineSource<B: BufRead> {
+    lines: std::io::Lines<B>,
+    pushback: VecDeque<String>,
+}
+
+impl<B: BufRead> LineSource<B> {
+    fn new(reader: B) -> Self {
+        Self {
+            lines: reader.lines(),
+            pushback: VecDeque::new(),
+        }
+    }
+
+    fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        if let Some(line) = self.pushback.pop_front() {
+            return Ok(Some(line));
+        }
+        self.lines.next().transpose()
+    }
+
+    fn push_front_all(&mut self, lines: VecDeque<String>) {
+        for line in lines.into_iter().rev() {
+            self.pushback.push_front(line);
+        }
+    }
+}
+
+/// Per-body brace scanner: a line closes the body iff an opening brace was
+/// seen and brace depth — counted string-, char-, and comment-aware over the
+/// whole line — is <= 0. Scan state persists across a body's lines; each
+/// body starts from a fresh scan.
+#[derive(Default)]
+struct BodyScan {
+    depth: i32,
+    saw_brace: bool,
+    in_string: bool,
+    in_char: bool,
+    escaped: bool,
+    in_block_comment: bool,
+}
+
+impl BodyScan {
+    /// Scan `line`, append it (plus '\n') to `body`, and report whether the
+    /// body is complete after it.
+    fn push_line(&mut self, line: &str, body: &mut String) -> bool {
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if self.in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    self.in_block_comment = false;
+                }
+                continue;
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            if self.in_char {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '\'' {
+                    self.in_char = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => self.in_string = true,
+                '\'' => self.in_char = true,
+                '/' => {
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    } else if chars.peek() == Some(&'*') {
+                        chars.next();
+                        self.in_block_comment = true;
+                    }
+                }
+                '{' => {
+                    self.depth += 1;
+                    self.saw_brace = true;
+                }
+                '}' => self.depth -= 1,
+                _ => {}
+            }
+        }
+        body.push_str(line);
+        body.push('\n');
+        self.saw_brace && self.depth <= 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3681,5 +3846,44 @@ void FUN_10(void)\n\
             body.ends_with("}\n") || body.trim_end().ends_with('}'),
             "{body}"
         );
+    }
+
+    fn bodies_fixtures() -> Vec<String> {
+        vec![
+            // offset-4: single-line signature between two blank lines
+            "\n\n// FUN_100 @ 0x100\nvoid FUN_100(void)\n{\n  return;\n}\n\n".into(),
+            // offset-6: two-line signature
+            "\n\n// FUN_200 @ 0x200\nvoid FUN_200(\n    int a)\n{\n  a;\n}\n".into(),
+            // T-bit set on the header address
+            "// f @ 40e1201\nvoid f(void)\n{\n  x;\n}\n".into(),
+            // header with 0x + leading zeros; body with braces in strings
+            "// f @ 0x00040e1200\nint f(void)\n{\n  return \"}{\"[0];\n}\n".into(),
+            // header never followed by { within 8 lines -> not captured
+            "// g @ 0x300\nvoid g(void);\n\n\n\n\n\n\n\n\n{\n}\n".into(),
+            // two functions back to back; second header inside first capture window
+            "// a @ 0x10\nvoid a(void)\n{\n}\n// b @ 0x20\nvoid b(void)\n{\n}\n".into(),
+            // 8-line boundary: { on exactly the 8th line after header -> captured
+            "// h @ 0x40\nvoid h(\n   int a,\n   int b,\n   int c,\n   int d,\n   int e)\n{\n}\n"
+                .into(),
+            String::new(),
+        ]
+    }
+
+    #[test]
+    fn streaming_bodies_match_oracle_on_all_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, text) in bodies_fixtures().iter().enumerate() {
+            let path = dir.path().join(format!("f{i}.c"));
+            std::fs::write(&path, text).unwrap();
+            let streamed = collect_decompiled_c_bodies(&path).unwrap();
+            let oracle = parse_decompiled_c_function_bodies_by_addr(text);
+            assert_eq!(streamed, oracle, "fixture {i}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_bodies_missing_file_is_io_error() {
+        let err = collect_decompiled_c_bodies(Path::new("/nonexistent/x.c")).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Io(_)));
     }
 }
