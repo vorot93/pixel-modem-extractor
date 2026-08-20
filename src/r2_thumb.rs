@@ -3010,10 +3010,18 @@ INFO: second pdfj body was noisy and not parseable
 
     /// Env-gated production replay: reprocesses a retained golden mustang
     /// decompose tree's real r2 captures through the streaming pipeline and
-    /// asserts byte-identity with the retained production
-    /// `thumb_functions.json` — the ultimate A/B proof on production data,
-    /// no Ghidra or radare2 involved. Skips cleanly (passes trivially)
-    /// unless `PME_GOLDEN_DIR` names an unpruned mustang tree with retained
+    /// asserts byte-identity with the producer surface reconstructed from the
+    /// retained `thumb_functions.json`. That file is not the raw r2-stage
+    /// output: after the thumb stage, decompose's finalize passes rewrite it
+    /// in place — symbolicate stamps `annotations` and `original_name` (plus
+    /// a recovered `name`) into every record, and thumb_enrich adds a
+    /// Ghidra-derived `body_c`. The test inverts that deterministic
+    /// post-processing — drops `body_c` and `annotations`, restores `name`
+    /// from `original_name` — and re-serializes, so byte-identity of the
+    /// replay with the inverted golden is byte-identity of the streaming
+    /// producer with the legacy producer on this production data (validated
+    /// in the Stage-1 spike). Skips cleanly (passes trivially) unless
+    /// `PME_GOLDEN_DIR` names an unpruned mustang tree with retained
     /// `thumb/*.stdout`; a cheetah layout, pruned tree, or missing captures
     /// are skips, not failures.
     #[test]
@@ -3028,6 +3036,27 @@ INFO: second pdfj body was noisy and not parseable
         if !thumb_dir.is_dir() || !image_path.is_file() {
             return;
         }
+        let mut golden: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(main_dir.join("thumb_functions.json"))
+                .expect("open retained thumb_functions.json"),
+        )
+        .expect("retained thumb_functions.json parses");
+        for record in golden
+            .get_mut("functions")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("golden functions array")
+        {
+            let record = record.as_object_mut().expect("function record object");
+            record.remove("body_c");
+            record.remove("annotations");
+            if let Some(original_name) = record.remove("original_name") {
+                record.insert("name".into(), original_name);
+            }
+        }
+        let expected = serde_json::to_string_pretty(&golden)
+            .expect("invert golden post-processing")
+            .into_bytes();
+        drop(golden);
         let image = std::fs::read(&image_path).expect("read retained 02_MAIN.bin");
         let load_addr =
             crate::manifest::load_addr_for_image(&decomposed.join("manifest.json"), "02_MAIN")
@@ -3060,12 +3089,25 @@ INFO: second pdfj body was noisy and not parseable
         }
         let assembled = work.path().join("thumb_functions.json");
         assemble_thumb_functions_json(&assembled, &spills).unwrap();
-        let expected = std::fs::read(main_dir.join("thumb_functions.json"))
-            .expect("retained thumb_functions.json");
         let got = std::fs::read(&assembled).unwrap();
-        assert_eq!(
-            got, expected,
-            "streaming assembly must be byte-identical to the retained production file"
-        );
+        if got != expected {
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "replay byte count differs from inverted golden"
+            );
+            let index = got
+                .iter()
+                .zip(&expected)
+                .position(|(a, b)| a != b)
+                .expect("equal-length buffers differ at some byte");
+            let lo = index.saturating_sub(60);
+            let hi = (lo + 120).min(got.len());
+            panic!(
+                "first differing byte at {index}: replay {:?} vs inverted golden {:?}",
+                String::from_utf8_lossy(&got[lo..hi]),
+                String::from_utf8_lossy(&expected[lo..hi])
+            );
+        }
     }
 }
