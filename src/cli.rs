@@ -91,6 +91,11 @@ pub enum Commands {
         /// your firmware version.
         #[arg(long)]
         no_thumb_decompile: bool,
+        /// Enable failure-only Rizin fallback for dense Thumb regions. radare2
+        /// remains the primary backend; Rizin runs only after a radare2 attempt
+        /// fails.
+        #[arg(long, requires = "run")]
+        rizin_fallback: bool,
         /// Test-only override: supply an absolute wall-clock budget (seconds) for the
         /// tighten-watch kill decision, bypassing the default `baseline * multiplier`
         /// heuristic. Hidden from `--help` — production users should reach for
@@ -125,6 +130,11 @@ pub enum Commands {
         /// asm-only (no `body_c`).
         #[arg(long)]
         no_thumb_decompile: bool,
+        /// Enable failure-only Rizin fallback for dense Thumb regions. radare2
+        /// remains the primary backend; Rizin runs only after a radare2 attempt
+        /// fails.
+        #[arg(long)]
+        rizin_fallback: bool,
         /// Test-only override: supply an absolute wall-clock budget (seconds) for the
         /// tighten-watch kill decision, bypassing the default `baseline * multiplier`
         /// heuristic. Hidden from `--help` — production users should reach for
@@ -251,6 +261,7 @@ pub fn run() -> anyhow::Result<()> {
             ghidra_home,
             processor,
             no_thumb_decompile,
+            rizin_fallback,
             tighten_wall_clock_budget_sec,
             no_skip_opaque,
         } => {
@@ -267,6 +278,7 @@ pub fn run() -> anyhow::Result<()> {
                 ghidra_home,
                 processor,
                 no_thumb_decompile,
+                rizin_fallback,
                 tighten_wall_clock_budget_override: tighten_wall_clock_budget_sec
                     .map(std::time::Duration::from_secs),
                 no_skip_opaque,
@@ -282,6 +294,7 @@ pub fn run() -> anyhow::Result<()> {
             ghidra_home,
             processor,
             no_thumb_decompile,
+            rizin_fallback,
             tighten_wall_clock_budget_sec,
             globals_provisional,
             globals_k_arm,
@@ -303,6 +316,7 @@ pub fn run() -> anyhow::Result<()> {
                 processor,
                 no_symbol_pass,
                 no_thumb_decompile,
+                rizin_fallback,
                 tighten_wall_clock_budget_override: tighten_wall_clock_budget_sec
                     .map(std::time::Duration::from_secs),
                 globals_provisional,
@@ -409,6 +423,63 @@ mod tests {
     }
 
     #[test]
+    fn decompile_rizin_fallback_requires_run() {
+        assert!(
+            Cli::try_parse_from([
+                "pixel-modem-extractor",
+                "decompile",
+                "modem.bin",
+                "--rizin-fallback",
+            ])
+            .is_err()
+        );
+
+        let cli = Cli::try_parse_from([
+            "pixel-modem-extractor",
+            "decompile",
+            "modem.bin",
+            "--run",
+            "--rizin-fallback",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Decompile {
+                rizin_fallback: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decompose_accepts_rizin_fallback() {
+        let default =
+            Cli::try_parse_from(["pixel-modem-extractor", "decompose", "radio.img"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Commands::Decompose {
+                rizin_fallback: false,
+                ..
+            }
+        ));
+
+        let enabled = Cli::try_parse_from([
+            "pixel-modem-extractor",
+            "decompose",
+            "radio.img",
+            "--rizin-fallback",
+        ])
+        .unwrap();
+        assert!(matches!(
+            enabled.command,
+            Commands::Decompose {
+                rizin_fallback: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn decompile_help_mentions_radare2_thumb_regions() {
         use clap::CommandFactory;
 
@@ -421,6 +492,14 @@ mod tests {
 
         assert!(help.contains("radare2"), "help:\n{help}");
         assert!(help.contains("Thumb"), "help:\n{help}");
+        assert!(
+            help.contains("radare2 remains the primary"),
+            "help:\n{help}"
+        );
+        assert!(
+            help.contains("Rizin runs only after a radare2 attempt fails"),
+            "help:\n{help}"
+        );
     }
 
     #[test]
@@ -437,6 +516,14 @@ mod tests {
         assert!(help.contains("recovered"), "help:\n{help}");
         assert!(help.contains("Ghidra"), "help:\n{help}");
         assert!(help.contains("radare2"), "help:\n{help}");
+        assert!(
+            help.contains("radare2 remains the primary"),
+            "help:\n{help}"
+        );
+        assert!(
+            help.contains("Rizin runs only after a radare2 attempt fails"),
+            "help:\n{help}"
+        );
     }
 
     #[test]

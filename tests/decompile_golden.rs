@@ -290,6 +290,7 @@ fn generate_scatter_kit(home: &std::path::Path, case: &str) -> (PathBuf, PathBuf
             ghidra_home: Some(home.to_path_buf()),
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -414,6 +415,7 @@ fn run_drives_ghidra_end_to_end() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -489,6 +491,7 @@ fn scatter_load_map_is_applied_before_analysis() {
             ghidra_home: Some(home.clone()),
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -797,6 +800,7 @@ fn direct_run_rejects_stale_valid_inventory_when_invalidation_fails() {
             ghidra_home: Some(home),
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -871,6 +875,7 @@ printf 'pixel-modem-extractor-ghidra-export-v1\n\n' > "$export_dir.complete"
             ghidra_home: None,
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -927,6 +932,7 @@ fn exporter_quarantines_instruction_when_tmode_register_is_missing() {
             ghidra_home: Some(home),
             processor: "x86:LE:32:default".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         },
@@ -980,6 +986,7 @@ fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1092,6 +1099,7 @@ fn saved_program_quarantines_when_same_isa_merge_makes_entry_interior() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1190,6 +1198,7 @@ fn saved_program_rejects_instruction_free_body_range_outside_u32() {
         ghidra_home: Some(home),
         processor: "x86:LE:64:default".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1296,6 +1305,7 @@ fn saved_program_quarantines_complete_defective_records_and_continues() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1449,6 +1459,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1866,6 +1877,7 @@ fn pass2_applies_global_types_and_skips_span_collision() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -2023,6 +2035,7 @@ fn tightened_tame_analysis_dispatchs_tighten_mode() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -2137,6 +2150,7 @@ fn no_thumb_decompile_flag_falls_back_to_datamark() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: true,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -2217,6 +2231,7 @@ fn run_report_skips_opaque_image_without_spawning_ghidra() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };

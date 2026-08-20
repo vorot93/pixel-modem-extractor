@@ -45,6 +45,9 @@ pub struct Opts {
     /// handles them, no `thumb_enrich` runs, and `thumb_functions.json` remains
     /// assembly-only). Default false (tighten mode).
     pub no_thumb_decompile: bool,
+    /// Enable Rizin as a failure-only fallback for dense Thumb regions.
+    /// radare2 remains required and is always attempted first. Default false.
+    pub rizin_fallback: bool,
     /// Phase 2 / Surface B: test-only override that bypasses
     /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
     /// budget for the tighten-watch kill decision. Wired to the hidden
@@ -301,6 +304,16 @@ pub struct ImageResult {
     /// construction); failed rows omit it in report.json.
     pub classification: Option<&'static str>,
     pub thumb_functions: Option<usize>,
+    /// Dense Thumb regions requested from the configured analysis backends.
+    pub thumb_regions_requested: Option<usize>,
+    /// Requested Thumb regions with a successful terminal attempt.
+    pub thumb_regions_succeeded: Option<usize>,
+    /// Requested Thumb regions for which every configured attempt failed.
+    pub thumb_regions_failed: Option<usize>,
+    /// Number of radare2 region attempts made by this run.
+    pub thumb_radare2_runs: Option<usize>,
+    /// Number of Rizin fallback attempts made by this run.
+    pub thumb_rizin_runs: Option<usize>,
     /// Current Ghidra source records with a validated accepted projection.
     pub ghidra_execution_accepted: Option<usize>,
     /// Current Ghidra source records retained as whole-record quarantines.
@@ -1167,6 +1180,8 @@ fn materialize_runtime_load_maps(toc: &Toc, data: &[u8], out: &Path) -> Result<R
 /// Unlike [`run`], this never errors on a per-image analysis failure: every partition is
 /// attempted and recorded, so an orchestrator (e.g. `decompose`) decides what a failure means.
 pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<DecompileReport> {
+    let rizin =
+        discover_configured_rizin(opts.rizin_fallback, crate::thumb_analysis::discover_rizin)?;
     let data = std::fs::read(modem_bin)?;
     let toc = Toc::parse(&data)?;
     std::fs::create_dir_all(out)?;
@@ -1242,6 +1257,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             /// `battery.label` even on escape-hatch runs.
             classification: &'static str,
             thumb_functions: Option<usize>,
+            thumb_summary: Option<crate::thumb_analysis::ThumbAnalysisSummary>,
             terminal_inventory: Option<TerminalInventorySummary>,
             image_start: u32,
             image_len: u32,
@@ -1284,6 +1300,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                         outcome: ImageOutcome::Failed(-1),
                         classification,
                         thumb_functions: None,
+                        thumb_summary: None,
                         terminal_inventory: None,
                         image_start: e.load_addr,
                         image_len: e.size,
@@ -1316,6 +1333,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     outcome: ImageOutcome::SkippedOpaque(stats),
                     classification,
                     thumb_functions: None,
+                    thumb_summary: None,
                     terminal_inventory: None,
                     image_start: e.load_addr,
                     image_len: e.size,
@@ -1335,7 +1353,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             // message would be misleading.
             if mode == "datamark" && !regions.is_empty() {
                 tracing::info!(
-                    "ghidra: {label} has {} dense Thumb-2 region(s) — marked as data (radare2 handles them)",
+                    "ghidra: {label} has {} dense Thumb-2 region(s) — marked as data (Thumb analysis handles them)",
                     regions.len()
                 );
             }
@@ -1540,7 +1558,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 match crate::thumb_analysis::run_thumb_analysis(
                     &crate::thumb_analysis::ThumbTools {
                         radare2: radare2.clone(),
-                        rizin: None,
+                        rizin: rizin.clone(),
                     },
                     img,
                     e.load_addr,
@@ -1632,6 +1650,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 outcome,
                 classification,
                 thumb_functions,
+                thumb_summary,
                 terminal_inventory,
                 image_start: e.load_addr,
                 image_len: e.size,
@@ -1695,6 +1714,15 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     outcome: r.outcome,
                     classification: Some(r.classification),
                     thumb_functions: r.thumb_functions,
+                    thumb_regions_requested: r
+                        .thumb_summary
+                        .map(|summary| summary.regions_requested),
+                    thumb_regions_succeeded: r
+                        .thumb_summary
+                        .map(|summary| summary.regions_succeeded),
+                    thumb_regions_failed: r.thumb_summary.map(|summary| summary.regions_failed),
+                    thumb_radare2_runs: r.thumb_summary.map(|summary| summary.radare2_runs),
+                    thumb_rizin_runs: r.thumb_summary.map(|summary| summary.rizin_runs),
                     ghidra_execution_accepted: r
                         .terminal_inventory
                         .as_ref()
@@ -1782,11 +1810,22 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
         .collect();
     if !thumb_failed.is_empty() {
         return Some(Error::DecomposeIncomplete(format!(
-            "radare2 failed on {}",
+            "Thumb analysis failed on {}",
             thumb_failed.join(", ")
         )));
     }
     None
+}
+
+pub(crate) fn discover_configured_rizin(
+    enabled: bool,
+    discover: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+) -> Result<Option<crate::thumb_analysis::ProducerIdentity>> {
+    if enabled {
+        discover().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
@@ -2909,6 +2948,7 @@ mod tests {
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         }
@@ -4262,6 +4302,7 @@ mod tests {
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         };
@@ -4423,6 +4464,11 @@ mod tests {
                 outcome: ImageOutcome::Analyzed(12),
                 classification: Some("not_opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -4454,7 +4500,29 @@ mod tests {
         let err = report_failure(&report).expect("thumb error should fail standalone run");
         assert_eq!(
             err.to_string(),
-            "decompose incomplete: radare2 failed on 02_MAIN: radare2 parser rejected empty stdout"
+            "decompose incomplete: Thumb analysis failed on 02_MAIN: radare2 parser rejected empty stdout"
+        );
+    }
+
+    #[test]
+    fn disabled_rizin_fallback_skips_discovery() {
+        let identity = discover_configured_rizin(false, || -> Result<_> {
+            panic!("disabled Rizin fallback must not run discovery")
+        })
+        .unwrap();
+
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn enabled_rizin_fallback_propagates_discovery_failure() {
+        let error = discover_configured_rizin(true, || {
+            Err(Error::ToolNotFound("configured Rizin is unusable".into()))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, Error::ToolNotFound(reason) if reason == "configured Rizin is unusable")
         );
     }
 
@@ -4498,6 +4566,11 @@ mod tests {
                 )),
                 classification: Some("opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -4536,6 +4609,11 @@ mod tests {
                 outcome: ImageOutcome::Analyzed(12),
                 classification: Some("not_opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -4570,7 +4648,7 @@ mod tests {
         let err = report_failure(&report).expect("thumb error should fail standalone run");
         assert_eq!(
             err.to_string(),
-            "decompose incomplete: radare2 failed on 02_MAIN: 1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
+            "decompose incomplete: Thumb analysis failed on 02_MAIN: 1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
         );
     }
 
@@ -4581,6 +4659,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(10),
             classification: Some("not_opaque"),
             thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -4626,6 +4709,7 @@ mod tests {
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         };

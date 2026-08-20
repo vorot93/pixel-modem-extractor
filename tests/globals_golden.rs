@@ -50,6 +50,7 @@ fn shared_decompose_output() -> Option<PathBuf> {
             processor: "ARM:LE:32:v7".to_string(),
             no_symbol_pass: true, // pass 1 only — Phase 3.0 doesn't need pass 2
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             globals_provisional: false,
             globals_k_arm: None,
