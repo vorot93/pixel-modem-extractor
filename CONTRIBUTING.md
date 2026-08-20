@@ -186,7 +186,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `decode_rf.rs` | Decode the RF_CFG calibration databases |
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
-| `decompile.rs` | Ghidra import kit + `--run` (analyzeHeadless) + radare2 Thumb |
+| `decompile.rs` | Ghidra import kit + `--run` orchestration (the radare2 Thumb producer lives in `r2_thumb.rs`) |
+| `r2_thumb.rs` | Streaming radare2 Thumb producer: scanner, pairing passes, fragment spill, atomic assembler, streaming thumb-leg validation |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
@@ -1368,18 +1369,41 @@ hardcoded. Two reference images exercise both models end-to-end:
   persistent artifact for post-hoc inspection; (3) the streaming parse
   consumes it (Stage 1 of the memory-envelope lever). Raw `.stdout`
   captures remain on disk.
-  **Memory profile is bounded per value, not per capture** — the streaming
-  region pipeline (`process_region_streaming`) parses each capture with
-  `ValueScanner` (peak = largest single top-level JSON value + one 64 KiB
-  read chunk), spills normalized fragments to `thumb/<addr:08x>.frags`, and
-  `assemble_into` streams the spills into `thumb_functions.json`; only the
-  per-fragment `(fn_idx, offset, len)` slot index (~16 B/function) stays
-  resident. The ~56 GiB dense-Thumb RSS peak quoted in older notes was
-  measured under the former whole-buffer path — re-measure a full dense-Thumb
-  `decompose` before tightening the "plan 64 GiB RAM" headroom guidance, and
-  keep that guidance until then. `--no-thumb-decompile` only selects Ghidra
-  `datamark` mode and skips both `body_c` enrichment sweeps; it still invokes
-  the dense-region radare2 capture/parse loop.
+  **Memory profile is now streaming (Stage 1).** `run_radare2_thumb` parses
+  each capture with `ValueScanner` (noise-tolerant top-level value scanner,
+  differentially-tested against the legacy `radare2_json_values` oracle),
+  pairs pdfjs in two streaming passes (entry-match, then positional
+  fallback — the greedy orderings are provably equivalent), normalizes and
+  spills one fragment per function to `thumb/<addr:08x>.frags`
+  (`[u32 LE fn_idx][u32 LE len][bytes]`), and assembles
+  `thumb_functions.json` atomically from the spills. Producer peak RSS is
+  bounded by the largest single JSON value, not the image. Invariants a
+  future change must not break: (1) a fragment is `to_string_pretty` of the
+  function `Value` with every line prefixed by 4 spaces — byte-identity
+  with the whole-document rendering relies on serde_json's `Map` being a
+  `BTreeMap` (no `preserve_order` feature); (2) region order then fn order
+  is the emission order; (3) the verdict precedence is no-JSON →
+  unassignable → orphan → u32-domain → conserving; (4) the terminal
+  thumb-leg validation streams too and requires `format` before
+  `functions` (our writer guarantees it); (5) the legacy parse chain stays
+  as the `#[cfg(test)]` differential oracle — do not delete it. The
+  env-gated `streaming_replays_retained_production_thumb_captures_byte_identically`
+  test replays a retained golden tree's captures and asserts byte-identity
+  with the producer surface reconstructed from the production
+  `thumb_functions.json` (measured on mustang `02_MAIN`'s five retained
+  captures: ~3.65 GiB stdout, 151,411 functions, 582,543,970 B output,
+  ~248 s wall, ~2.8 GB peak RSS for the replay+compare). **Golden
+  provenance:** that retained `thumb_functions.json` is a *post-processed*
+  artifact — symbolicate stamps `name`/`original_name`/`annotations` on
+  every record and thumb_enrich adds `body_c` — and the test inverts those
+  deterministic edits (drops `body_c`/`annotations`, restores `name` from
+  `original_name`) to reconstruct the producer surface; re-baselining
+  goldens or touching symbolicate's rewrite shape must revisit that
+  inversion with it. Downstream whole-file consumers (`thumb_enrich`,
+  `symbolicate`, ~3 GB peaks) remain — that is Stage 2.
+  `--no-thumb-decompile` still selects Ghidra `datamark` mode and skips both
+  `body_c` enrichment sweeps; the dense-region radare2 capture/parse loop it
+  still invokes is the same streaming path.
 - **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
   into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
   so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,

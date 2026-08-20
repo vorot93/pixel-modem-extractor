@@ -2244,7 +2244,7 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
         // Capture from this line through the matching closing brace at depth 0.
         // State machine tracks string/char literals + line/block comments so a `}`
         // inside `"expected }"`, `'}'`, or `// close }` doesn't truncate the body.
-        // Mirrors the string-aware pattern already used by `balanced_json_end`.
+        // Mirrors the string-aware pattern already used by `r2_thumb::balanced_json_end`.
         let mut depth = 0i32;
         let mut saw_brace = false;
         let mut body = String::new();

@@ -1278,7 +1278,7 @@ const R2_ADDRESS_SPACE_CAP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// runaway radare2 is denied further allocations by the kernel and exits instead
 /// of OOM-killing the host. Unix-only; a no-op elsewhere (Windows has no portable
 /// per-child address-space limit — the same platform gap documented on
-/// [`spawn_in_own_process_group`]).
+/// `spawn_in_own_process_group` in `decompile.rs`).
 #[cfg(unix)]
 fn limit_r2_address_space(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
