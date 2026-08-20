@@ -3652,6 +3652,30 @@ INFO: second pdfj body was noisy and not parseable
         );
     }
 
+    /// Invert, in place, the finalize post-processing stamped into a retained
+    /// golden `thumb_functions.json`: symbolicate's `annotations` +
+    /// `original_name` stamps (restoring `name` from `original_name`) always,
+    /// and thumb_enrich's `body_c` when `strip_body_c`. Re-serializing an
+    /// inverted document is exact because `serde_json`'s `Map` is a sorted
+    /// `BTreeMap` (no `preserve_order` feature), so removal and insertion
+    /// cannot disturb key order.
+    fn invert_golden_records(value: &mut serde_json::Value, strip_body_c: bool) {
+        for record in value
+            .get_mut("functions")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("golden functions array")
+        {
+            let record = record.as_object_mut().expect("function record object");
+            if strip_body_c {
+                record.remove("body_c");
+            }
+            record.remove("annotations");
+            if let Some(original_name) = record.remove("original_name") {
+                record.insert("name".into(), original_name);
+            }
+        }
+    }
+
     /// Env-gated production replay: reprocesses a retained golden mustang
     /// decompose tree's real r2 captures through the streaming pipeline and
     /// asserts byte-identity with the producer surface reconstructed from the
@@ -3685,18 +3709,7 @@ INFO: second pdfj body was noisy and not parseable
                 .expect("open retained thumb_functions.json"),
         )
         .expect("retained thumb_functions.json parses");
-        for record in golden
-            .get_mut("functions")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("golden functions array")
-        {
-            let record = record.as_object_mut().expect("function record object");
-            record.remove("body_c");
-            record.remove("annotations");
-            if let Some(original_name) = record.remove("original_name") {
-                record.insert("name".into(), original_name);
-            }
-        }
+        invert_golden_records(&mut golden, true);
         let expected = serde_json::to_string_pretty(&golden)
             .expect("invert golden post-processing")
             .into_bytes();
@@ -3751,6 +3764,81 @@ INFO: second pdfj body was noisy and not parseable
                 "first differing byte at {index}: replay {:?} vs inverted golden {:?}",
                 String::from_utf8_lossy(&got[lo..hi]),
                 String::from_utf8_lossy(&expected[lo..hi])
+            );
+        }
+    }
+
+    /// Env-gated production A/B: enriches the real 02_MAIN production inputs
+    /// from a retained golden mustang tree with BOTH enrichers — the streaming
+    /// `thumb_enrich` and `thumb_enrich_whole` (the `#[cfg(test)]` oracle kept
+    /// verbatim from the whole-file implementation Stage 2 replaced) — and
+    /// asserts the two outputs are byte-for-byte identical with equal
+    /// `populated` counts. The input is the producer surface: the golden
+    /// `thumb_functions.json` with both finalize post-processing layers
+    /// inverted (`invert_golden_records(…, true)`, the same inversion the
+    /// Stage-1 replay verifies against), written to two temp copies enriched
+    /// in place; `decompiled.c` is the tree's retained final file, read-only.
+    /// The golden file itself cannot serve as the expected side of this
+    /// comparison: its embedded `body_c` carries two enrich generations —
+    /// pass-1 residue from a `decompiled.c` that pass 2 overwrote, plus the
+    /// post-pass-2 bodies — so it is not the output of any single enrich run
+    /// over any reconstructible input. Byte-identity of the two sides here is
+    /// byte-identity of the streaming enricher with the whole-file
+    /// implementation that produced the golden, on the real 632 MB production
+    /// input. Skips cleanly (passes trivially) unless `PME_GOLDEN_DIR` names
+    /// an unpruned mustang tree retaining both files; a cheetah layout or
+    /// pruned tree is a skip, not a failure.
+    #[test]
+    fn streaming_enrich_ab_matches_oracle_on_production_inputs() {
+        let Ok(root) = std::env::var("PME_GOLDEN_DIR") else {
+            return;
+        };
+        let main_dir = std::path::Path::new(&root).join("images/02_MAIN/decompiled");
+        let golden_c = main_dir.join("decompiled.c");
+        let golden_json = main_dir.join("thumb_functions.json");
+        if !golden_c.is_file() || !golden_json.is_file() {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&golden_json).unwrap()).unwrap();
+        invert_golden_records(&mut doc, true);
+        let input = serde_json::to_vec_pretty(&doc).unwrap();
+        drop(doc);
+        let oracle_json = work.path().join("oracle_thumb_functions.json");
+        let streaming_json = work.path().join("streaming_thumb_functions.json");
+        std::fs::write(&oracle_json, &input).unwrap();
+        std::fs::write(&streaming_json, &input).unwrap();
+        drop(input);
+        let oracle = thumb_enrich_whole(&golden_c, &oracle_json).unwrap();
+        let streaming = thumb_enrich(&golden_c, &streaming_json).unwrap();
+        assert_eq!(
+            oracle, streaming,
+            "populated counts differ: whole-file oracle vs streaming"
+        );
+        assert!(
+            streaming > 77_000,
+            "expected ~77-81k populated body_c entries, got {streaming}"
+        );
+        let oracle_out = std::fs::read(&oracle_json).unwrap();
+        let streaming_out = std::fs::read(&streaming_json).unwrap();
+        assert_eq!(
+            oracle_out.len(),
+            streaming_out.len(),
+            "enrich A/B byte count differs: whole-file oracle vs streaming"
+        );
+        if oracle_out != streaming_out {
+            let index = oracle_out
+                .iter()
+                .zip(&streaming_out)
+                .position(|(a, b)| a != b)
+                .expect("equal-length buffers differ at some byte");
+            let lo = index.saturating_sub(60);
+            let hi = (lo + 120).min(oracle_out.len());
+            panic!(
+                "enrich A/B diverges at {index}: oracle {:?} vs streaming {:?}",
+                String::from_utf8_lossy(&oracle_out[lo..hi]),
+                String::from_utf8_lossy(&streaming_out[lo..hi])
             );
         }
     }
