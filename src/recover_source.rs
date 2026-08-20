@@ -171,6 +171,7 @@ pub struct RecoveredFunction {
     pub name: String,
     pub entry: u64,
     pub end: u64,
+    pub decode_ranges: Option<Vec<(u64, u64)>>,
     pub size: u64,
     pub body_kind: String,
     pub body: String,
@@ -324,12 +325,6 @@ fn is_meaningful_ghidra_body_line(line: &str) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
-struct ThumbFunctionFile {
-    #[serde(default)]
-    functions: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ThumbFunctionJson {
     name: String,
     entry: String,
@@ -339,6 +334,14 @@ struct ThumbFunctionJson {
     body: String,
     #[serde(default)]
     data_refs: Vec<String>,
+    #[serde(default)]
+    decode_ranges: Vec<ThumbDecodeRangeJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThumbDecodeRangeJson {
+    start: String,
+    end: String,
 }
 
 fn parse_data_refs(raw: &[String]) -> Result<Vec<u64>> {
@@ -382,15 +385,17 @@ impl RecoveredFunctions {
 
         let thumb_path = dir.join("thumb_functions.json");
         if thumb_path.exists() {
-            let thumb_file: ThumbFunctionFile =
-                serde_json::from_value(load_json_file(&thumb_path)?)
-                    .map_err(|e| Error::Serialize(e.to_string()))?;
-            for value in thumb_file.functions {
-                let Ok(f) = serde_json::from_value::<ThumbFunctionJson>(value) else {
+            let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path)?;
+            for owned in thumb_artifact.functions() {
+                let Ok(f) = serde_json::from_value::<ThumbFunctionJson>(owned.value.clone()) else {
                     skipped += 1;
                     continue;
                 };
-                let Some(function) = recovered_thumb_function(f) else {
+                let Some(function) = recovered_thumb_function(
+                    f,
+                    owned.producer.into(),
+                    owned.legacy_range_semantics,
+                ) else {
                     skipped += 1;
                     continue;
                 };
@@ -422,6 +427,7 @@ fn recovered_ghidra_function(
         name: f.name,
         entry,
         end,
+        decode_ranges: None,
         size: f.size,
         body_kind: "decompiled_c".to_string(),
         body,
@@ -430,16 +436,32 @@ fn recovered_ghidra_function(
     })
 }
 
-fn recovered_thumb_function(f: ThumbFunctionJson) -> Option<RecoveredFunction> {
+fn recovered_thumb_function(
+    f: ThumbFunctionJson,
+    tool: Tool,
+    legacy_range_semantics: bool,
+) -> Option<RecoveredFunction> {
     let entry = parse_hex_addr(&f.entry).ok()?;
     let end = parse_hex_addr(&f.end).ok()?;
     let data_refs = parse_data_refs(&f.data_refs).ok()?;
+    let decode_ranges = if legacy_range_semantics {
+        None
+    } else {
+        Some(
+            f.decode_ranges
+                .iter()
+                .map(|range| Ok((parse_hex_addr(&range.start)?, parse_hex_addr(&range.end)?)))
+                .collect::<Result<Vec<_>>>()
+                .ok()?,
+        )
+    };
 
     Some(RecoveredFunction {
-        tool: Tool::Radare2,
+        tool,
         name: f.name,
         entry,
         end,
+        decode_ranges,
         size: f.size,
         body_kind: f.body_kind,
         body: f.body,
@@ -461,10 +483,18 @@ fn direct_match(source: &SourceEntry, function: &RecoveredFunction) -> Option<St
 
 fn range_match(source: &SourceEntry, function: &RecoveredFunction) -> Option<String> {
     source.occurrences.iter().find_map(|occ| {
-        (occ.vaddr >= function.entry && occ.vaddr < function.end).then(|| {
+        let matching_range = match &function.decode_ranges {
+            Some(ranges) => ranges
+                .iter()
+                .copied()
+                .find(|(start, end)| occ.vaddr >= *start && occ.vaddr < *end),
+            None => (occ.vaddr >= function.entry && occ.vaddr < function.end)
+                .then_some((function.entry, function.end)),
+        };
+        matching_range.map(|(start, end)| {
             format!(
                 "function range 0x{:x}-0x{:x} contains source-path string at 0x{:x}",
-                function.entry, function.end, occ.vaddr
+                start, end, occ.vaddr
             )
         })
     })
@@ -1086,6 +1116,7 @@ mod tests {
         assert_eq!(funcs.functions[0].body_kind, "thumb_disassembly");
         assert!(funcs.functions[0].body.contains("push"));
         assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
+        assert_eq!(funcs.functions[0].decode_ranges, None);
     }
 
     #[test]
@@ -1125,6 +1156,63 @@ mod tests {
         assert_eq!(funcs.functions[0].body_kind, "thumb_disassembly");
         assert!(funcs.functions[0].body.contains("push"));
         assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
+        assert_eq!(funcs.functions[0].decode_ranges, None);
+
+        let sources = vec![source_entry("foo/legacy.cc", 0x4140, 0x100)];
+        let map = attribute(&sources, &funcs.functions, &Opts::default());
+        assert_eq!(map["foo/legacy.cc"][0].confidence, Confidence::Proximity);
+    }
+
+    #[test]
+    fn loads_v3_thumb_producer_ownership() {
+        let root = temp_dir("recover_thumb_v3_owners");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap();
+
+        let funcs = RecoveredFunctions::load(&root).unwrap();
+
+        assert_eq!(funcs.functions.len(), 2);
+        assert_eq!(funcs.functions[0].entry, 0x1000);
+        assert_eq!(funcs.functions[1].entry, 0x1000);
+        assert_eq!(funcs.functions[0].tool, Tool::Radare2);
+        assert_eq!(funcs.functions[1].tool, Tool::Rizin);
+        assert_eq!(
+            funcs.functions[1].decode_ranges,
+            Some(vec![(0x1000, 0x1010), (0x1080, 0x1090)])
+        );
+    }
+
+    #[test]
+    fn v3_range_matching_uses_decode_ranges() {
+        let root = temp_dir("recover_thumb_v3_decode_ranges");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap();
+        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let rizin = funcs
+            .functions
+            .into_iter()
+            .find(|function| function.tool == Tool::Rizin)
+            .unwrap();
+        let sources = vec![
+            source_entry("foo/gap.cc", 0x1040, 0x100),
+            source_entry("foo/covered.cc", 0x1084, 0x120),
+        ];
+
+        let map = attribute(&sources, &[rizin], &Opts::default());
+
+        assert!(!map.contains_key("foo/gap.cc"));
+        assert_eq!(map["foo/covered.cc"][0].confidence, Confidence::Proximity);
+        assert!(map["foo/covered.cc"][0].reason.contains("0x1080-0x1090"));
     }
 
     fn source_entry(path: &str, vaddr: u64, offset: usize) -> SourceEntry {
@@ -1141,6 +1229,7 @@ mod tests {
             name: name.to_string(),
             entry,
             end,
+            decode_ranges: None,
             size: end - entry,
             body_kind: "decompiled_c".to_string(),
             body: format!("int {name}(void) {{\n    return 1;\n}}"),
@@ -1349,6 +1438,7 @@ mod tests {
                 name: "FUN_40001000".into(),
                 entry: 0x40001000,
                 end: 0x40001100,
+                decode_ranges: None,
                 size: 0x100,
                 body_kind: "c".into(),
                 body: "int FUN_40001000(void) { return 1; }\n".into(),
@@ -1380,6 +1470,7 @@ mod tests {
                 name: "thumb_40e1200".into(),
                 entry: 0x40e1200,
                 end: 0x40e1300,
+                decode_ranges: None,
                 size: 0x100,
                 body_kind: "thumb_disassembly".into(),
                 body: "push {r7}\n".into(),

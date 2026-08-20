@@ -90,7 +90,7 @@ pub struct FuncRec {
     pub data_refs: Vec<u64>,
     pub disasm: String, // ARM: disasm.lst lines in range; Thumb: the `body`
     /// Which recovery tool produced this function record. ARM/`functions.json`
-    /// is Ghidra; Thumb/`thumb_functions.json` is radare2. Used to look up
+    /// is Ghidra; each Thumb record retains its artifact run owner. Used to look up
     /// source attribution keyed by `(tool, entry)`.
     pub tool: Tool,
 }
@@ -98,7 +98,7 @@ pub struct FuncRec {
 /// 32-bit constants materialized by `movw`/`movt` (and lone `movw`) in a block
 /// of disassembly text. Tracks the last `movw #imm` per destination register; a
 /// later `movt` on the same register combines to a full value. Register- and
-/// format-agnostic across Ghidra (`movw r0,#0x..`) and radare2 (`movw r0, 0x..`),
+/// format-agnostic across Ghidra (`movw r0,#0x..`) and Thumb backends (`movw r0, 0x..`),
 /// tolerating condition suffixes (`movweq`/`movtne`). Emits noise (every lone
 /// `movw` value); harmless — callers only keep values that match a token.
 pub fn reconstruct_immediates(disasm: &str) -> BTreeSet<u32> {
@@ -126,7 +126,7 @@ pub struct LoadEvent {
 }
 
 /// PC-tagged sibling of `reconstruct_immediates`. Same register-aware
-/// movw/movt tracker, same Ghidra/radare2 format-agnosticism. Emits a
+/// movw/movt tracker, same Ghidra/Thumb-backend format-agnosticism. Emits a
 /// `LoadEvent` for every value `reconstruct_immediates` would emit, plus
 /// the PC at which the value became complete (the `movt` PC for a pair; the
 /// `movw` PC for a lone `movw` with high bits zero).
@@ -404,7 +404,7 @@ pub fn build_string_map(image: &[u8], load_addr: u64, min_run: usize) -> HashMap
 /// Recover a function's `__func__` name: it must reference a `__FILE__`
 /// occurrence vaddr (proving an assert/log site), and exactly one *distinct*
 /// `data_refs` identifier must resolve (unambiguous → fail-closed). Dedup by
-/// string content first: Ghidra/radare2 can emit the same `__func__` ref twice
+/// string content first: analysis backends can emit the same `__func__` ref twice
 /// (e.g. two asserts in one function) and that legitimate duplicate must not
 /// make a single identifier look ambiguous.
 pub fn recover_func_name(
@@ -432,12 +432,6 @@ struct ArmFnJson {
     end: String,
     #[serde(default)]
     data_refs: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct ThumbFileJson {
-    #[serde(default)]
-    functions: Vec<ThumbFnJson>,
 }
 
 #[derive(Deserialize)]
@@ -487,11 +481,11 @@ fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let bytes = std::fs::read(&path)?;
-    let file: ThumbFileJson =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    let mut out = Vec::with_capacity(file.functions.len());
-    for f in file.functions {
+    let artifact = crate::thumb_analysis::read_thumb_artifact(&path)?;
+    let mut out = Vec::with_capacity(artifact.functions().len());
+    for owned in artifact.functions() {
+        let f: ThumbFnJson = serde_json::from_value(owned.value.clone())
+            .map_err(|e| Error::Serialize(e.to_string()))?;
         let entry = parse_hex(&f.entry)?;
         let end = if f.end.is_empty() {
             entry
@@ -510,7 +504,7 @@ fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
             end,
             data_refs,
             disasm: f.body,
-            tool: Tool::Radare2,
+            tool: owned.producer.into(),
         });
     }
     Ok(out)
@@ -929,7 +923,7 @@ pub struct FinalizeOpts {
     pub rewrite_decompiled_c: bool,
 }
 
-/// A function name that is already a real identifier (not a Ghidra/radare2
+/// A function name that is already a real identifier (not an analysis-backend
 /// default nor a marked guess). Used to reject identifiers that name a *known*
 /// function elsewhere in the image.
 fn is_real_name(name: &str) -> bool {
@@ -1694,6 +1688,45 @@ mod tests {
             attr.get(&(crate::recover_source::Tool::Radare2, 0x10))
                 .map(String::as_str),
             Some("r2/b.c")
+        );
+    }
+
+    #[test]
+    fn v3_thumb_producers_keep_distinct_attribution_keys() {
+        let dir = tmp("pme_sym_v3_thumb_producer_keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("thumb_functions.json"),
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{
+              "r2/a.c":{"functions":[{"tool":"radare2","entry":"0x1000"}]},
+              "rizin/b.c":{"functions":[{"tool":"rizin","entry":"0x1000"}]}
+            }}"#,
+        )
+        .unwrap();
+
+        let funcs = load_thumb_functions(&dir).unwrap();
+        let attribution = load_attribution(&dir).unwrap();
+
+        assert_eq!(funcs.len(), 2);
+        assert_eq!(funcs[0].entry, funcs[1].entry);
+        assert_eq!(funcs[0].tool, Tool::Radare2);
+        assert_eq!(funcs[1].tool, Tool::Rizin);
+        assert_eq!(
+            attribution
+                .get(&(funcs[0].tool, funcs[0].entry))
+                .map(String::as_str),
+            Some("r2/a.c")
+        );
+        assert_eq!(
+            attribution
+                .get(&(funcs[1].tool, funcs[1].entry))
+                .map(String::as_str),
+            Some("rizin/b.c")
         );
     }
 

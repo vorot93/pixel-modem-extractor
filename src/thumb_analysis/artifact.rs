@@ -993,6 +993,48 @@ pub(crate) fn validate_thumb_inventory_streaming(
     }
 }
 
+#[cfg(test)]
+impl ParsedThumbArtifact {
+    pub(crate) fn future_multi_run_v3_fixture() -> &'static [u8] {
+        br#"{
+          "format": "pixel-modem-extractor-thumb-functions-v3",
+          "producers": [
+            {"id":"radare2","executable":"/usr/bin/r2","version":"radare2 6.1.4","command":"aaa;aflj;pdfj @@f"},
+            {"id":"rizin","executable":"/usr/bin/rizin","version":"rizin 0.8.2","command":"aaa;aflj;pdfj @@F;axlj"}
+          ],
+          "regions": [{
+            "start": "0x1000",
+            "end": "0x1100",
+            "attempts": [
+              {"producer":"radare2","status":"succeeded","stdout":{"path":"thumb/00001000.radare2.stdout","bytes":2,"blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"error":null},
+              {"producer":"rizin","status":"succeeded","stdout":{"path":"thumb/00001000.rizin.stdout","bytes":256,"blake3":"1111111111111111111111111111111111111111111111111111111111111111"},"error":null}
+            ],
+            "function_runs": [
+              {"producer":"radare2","first_function":0,"function_count":1,"substantial":0,"accepted":1,"quarantined":0},
+              {"producer":"rizin","first_function":1,"function_count":1,"substantial":1,"accepted":1,"quarantined":0}
+            ]
+          }],
+          "functions": [
+            {
+              "name":"r2_same_entry","entry":"0x1000","end":"0x1002","size":2,
+              "body_kind":"thumb_disassembly","body":"0x1000 bx lr\n","data_refs":[],
+              "decode_ranges":[{"end":"0x1002","isa":"thumb","start":"0x1000"}],
+              "decode_range_errors":[]
+            },
+            {
+              "name":"rizin_same_entry","entry":"0x1000","end":"0x1100","size":256,
+              "body_kind":"thumb_disassembly","body":"0x1000 push {lr}\n0x1080 bx lr\n","data_refs":[],
+              "decode_ranges":[
+                {"end":"0x1010","isa":"thumb","start":"0x1000"},
+                {"end":"0x1090","isa":"thumb","start":"0x1080"}
+              ],
+              "decode_range_errors":[]
+            }
+          ]
+        }"#
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RunCounts {
     substantial: usize,
