@@ -3007,4 +3007,65 @@ INFO: second pdfj body was noisy and not parseable
             "serialize: unsupported Thumb functions inventory format"
         );
     }
+
+    /// Env-gated production replay: reprocesses a retained golden mustang
+    /// decompose tree's real r2 captures through the streaming pipeline and
+    /// asserts byte-identity with the retained production
+    /// `thumb_functions.json` — the ultimate A/B proof on production data,
+    /// no Ghidra or radare2 involved. Skips cleanly (passes trivially)
+    /// unless `PME_GOLDEN_DIR` names an unpruned mustang tree with retained
+    /// `thumb/*.stdout`; a cheetah layout, pruned tree, or missing captures
+    /// are skips, not failures.
+    #[test]
+    fn streaming_replays_retained_production_thumb_captures_byte_identically() {
+        let Ok(root) = std::env::var("PME_GOLDEN_DIR") else {
+            return;
+        };
+        let decomposed = std::path::Path::new(&root);
+        let main_dir = decomposed.join("images/02_MAIN/decompiled");
+        let thumb_dir = main_dir.join("thumb");
+        let image_path = decomposed.join("images/02_MAIN/02_MAIN.bin");
+        if !thumb_dir.is_dir() || !image_path.is_file() {
+            return;
+        }
+        let image = std::fs::read(&image_path).expect("read retained 02_MAIN.bin");
+        let load_addr =
+            crate::manifest::load_addr_for_image(&decomposed.join("manifest.json"), "02_MAIN")
+                .expect("manifest parses")
+                .expect("MAIN load addr present") as u32;
+        let mut addrs: Vec<u32> = std::fs::read_dir(&thumb_dir)
+            .expect("read thumb dir")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                let (stem, ext) = name.split_once('.')?;
+                (ext == "stdout").then_some(u32::from_str_radix(stem, 16).ok())?
+            })
+            .collect();
+        addrs.sort_unstable();
+        assert!(!addrs.is_empty(), "retained tree carries thumb captures");
+        let work = tempfile::tempdir().expect("tempdir");
+        let mut spills = Vec::new();
+        for addr in addrs {
+            let outcome = process_region_streaming(
+                &thumb_dir.join(format!("{addr:08x}.stdout")),
+                &image,
+                load_addr,
+                addr,
+                work.path(),
+            )
+            .unwrap_or_else(|e| panic!("region 0x{addr:08x} replays: {e}"));
+            spills.push(outcome.spill);
+        }
+        let assembled = work.path().join("thumb_functions.json");
+        assemble_thumb_functions_json(&assembled, &spills).unwrap();
+        let expected = std::fs::read(main_dir.join("thumb_functions.json"))
+            .expect("retained thumb_functions.json");
+        let got = std::fs::read(&assembled).unwrap();
+        assert_eq!(
+            got, expected,
+            "streaming assembly must be byte-identical to the retained production file"
+        );
+    }
 }
