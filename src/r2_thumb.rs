@@ -799,33 +799,41 @@ fn normalize_and_spill(
     Ok(())
 }
 
+/// Byte-exact framing of an assembled thumb-functions document, shared by the
+/// streaming producer (`assemble_into`) and the streaming enricher:
+/// `serde_json::to_string_pretty` of `{"format": ..., "functions": [...]}` with
+/// a BTreeMap top level renders exactly these bytes (pinned by the
+/// fragment-render tests).
+const THUMB_DOC_OPEN: &[u8] =
+    b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": [\n";
+const THUMB_DOC_CLOSE: &[u8] = b"\n  ]\n}";
+const THUMB_DOC_EMPTY: &[u8] =
+    b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": []\n}";
+const THUMB_DOC_FRAGMENT_SEP: &[u8] = b",\n";
+
 /// Stream header, fragments (spills in region order, slots in fn order,
 /// comma-newline joined), and footer into `writer`. Zero total fragments
 /// renders the empty `functions` array inline, exactly as `to_string_pretty`.
 fn assemble_into<W: Write>(writer: &mut W, spills: &[&Spill]) -> Result<()> {
     let total: usize = spills.iter().map(|spill| spill.slots.len()).sum();
     if total == 0 {
-        writer
-            .write_all(b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": []\n}")
-            .map_err(Error::from)?;
+        writer.write_all(THUMB_DOC_EMPTY).map_err(Error::from)?;
         return Ok(());
     }
-    writer
-        .write_all(
-            b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": [\n",
-        )
-        .map_err(Error::from)?;
+    writer.write_all(THUMB_DOC_OPEN).map_err(Error::from)?;
     let mut first = true;
     for spill in spills {
         for slot in &spill.slots {
             if !first {
-                writer.write_all(b",\n").map_err(Error::from)?;
+                writer
+                    .write_all(THUMB_DOC_FRAGMENT_SEP)
+                    .map_err(Error::from)?;
             }
             first = false;
             spill.emit_slot(writer, slot).map_err(Error::from)?;
         }
     }
-    writer.write_all(b"\n  ]\n}").map_err(Error::from)?;
+    writer.write_all(THUMB_DOC_CLOSE).map_err(Error::from)?;
     Ok(())
 }
 
@@ -1784,7 +1792,9 @@ impl<'de, 'a> Visitor<'de> for FunctionsSeq<'a> {
 
 /// Phase 2: enrich a v1 (or v2 asm-only) `thumb_functions.json` with per-function
 /// `body_c` sourced from a `decompiled.c`. Bumps `format` to v2 iff at least one
-/// `body_c` is populated; otherwise leaves the file byte-identical. Idempotent.
+/// `body_c` is populated; otherwise leaves the file untouched. Idempotent;
+/// returns the count of functions whose `body_c` was populated (including
+/// re-population on an idempotent re-run).
 ///
 /// `decompiled.c` is parsed by scanning for ExportDecomp.java's per-function
 /// header line
@@ -1802,12 +1812,206 @@ impl<'de, 'a> Visitor<'de> for FunctionsSeq<'a> {
 /// agree). Matching against `thumb_functions.json` is likewise by the normalized
 /// `entry` field — Phase 2.1 switched this from name-based to address-based
 /// matching because radare2's `thumb_<addr>` names never align with Ghidra's
-/// `FUN_<addr>`/recovered names. Returns the count of functions whose `body_c`
-/// was populated.
+/// `FUN_<addr>`/recovered names.
 ///
-/// Fail-closed: a malformed `decompiled.c` (read or parse failure) returns `Err`;
-/// the on-disk `thumb_functions.json` is unchanged.
+/// Streaming, atomic, bounded: `decompiled.c` streams through
+/// `collect_decompiled_c_bodies` and the JSON is rewritten through a
+/// `serde_json` stream visitor into an `AtomicWriteFile` on the target path —
+/// memory is bounded by the largest single body or function record, and the
+/// output is byte-identical to the retired whole-file rewriter (kept test-only
+/// as `thumb_enrich_whole`, the differential oracle). `populated == 0` discards
+/// the uncommitted temp (`Drop` removes it) and leaves the original
+/// byte-identical.
+///
+/// Fail-closed: a malformed `decompiled.c`, an unreadable or invalid-JSON
+/// `thumb_functions.json`, or a document outside the canonical shape — an
+/// object with exactly the keys `format` then `functions` (an array) — returns
+/// `Err` with the on-disk file unchanged.
 pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    let bodies = collect_decompiled_c_bodies(decompiled_c_path)?;
+    let file = std::fs::File::open(thumb_functions_json_path)?;
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let mut scan = EnrichScan::new(
+        &bodies,
+        atomic_write_file::AtomicWriteFile::open(thumb_functions_json_path)?,
+    );
+    let parsed = de
+        .deserialize_any(ThumbEnrichVisitor { scan: &mut scan })
+        .and_then(|()| de.end());
+    match parsed {
+        Ok(()) => scan.finish_document()?,
+        Err(error) => {
+            return Err(scan.failure.take().unwrap_or_else(|| {
+                Error::Serialize(format!(
+                    "parse {}: {error}",
+                    thumb_functions_json_path.display()
+                ))
+            }));
+        }
+    }
+    let EnrichScan { out, populated, .. } = scan;
+    if populated == 0 {
+        return Ok(0);
+    }
+    out.commit()?;
+    Ok(populated)
+}
+
+/// Abort sentinel for callback failures inside the enrich stream: the real,
+/// typed error is stashed in `EnrichScan::failure` and this serde-channel copy
+/// is never surfaced.
+const ENRICH_STREAM_ABORT: &str = "\u{0}pme-enrich-stream-abort";
+
+/// Rejects documents outside the canonical shape (an object with exactly the
+/// keys `format` then `functions`, the latter an array); replaces the legacy
+/// silent `Ok(0)` fail-open.
+const NON_CANONICAL_THUMB_DOC: &str = "thumb functions document is not canonical: expected an object with exactly the keys format then functions";
+
+/// Streaming rewrite state: enriches each `functions` element in arrival order
+/// and frames the output document incrementally (open-list header before the
+/// first fragment, footer at finish), so memory stays bounded by the largest
+/// single element. The `AtomicWriteFile` temp is committed by the caller only
+/// when at least one `body_c` was populated.
+struct EnrichScan<'a> {
+    bodies: &'a HashMap<String, String>,
+    out: atomic_write_file::AtomicWriteFile,
+    populated: usize,
+    failure: Option<Error>,
+    saw_format: bool,
+    saw_functions: bool,
+    wrote_open: bool,
+}
+
+impl<'a> EnrichScan<'a> {
+    fn new(bodies: &'a HashMap<String, String>, out: atomic_write_file::AtomicWriteFile) -> Self {
+        Self {
+            bodies,
+            out,
+            populated: 0,
+            failure: None,
+            saw_format: false,
+            saw_functions: false,
+            wrote_open: false,
+        }
+    }
+
+    /// Enrich one element exactly as the whole-file oracle did — match the
+    /// `entry` field through `normalize_thumb_addr`, insert `body_c` on a hit,
+    /// count it — then render and stream the fragment.
+    fn enrich_element(&mut self, mut element: serde_json::Value) -> Result<()> {
+        let mut enriched = false;
+        if let Some(entry) = element.get("entry").and_then(serde_json::Value::as_str)
+            && let Some(canonical) = normalize_thumb_addr(entry)
+            && let Some(body) = self.bodies.get(&canonical)
+        {
+            element.as_object_mut().unwrap().insert(
+                "body_c".to_string(),
+                serde_json::Value::String(body.clone()),
+            );
+            enriched = true;
+        }
+        let fragment = render_fragment(&element)?;
+        self.populated += usize::from(enriched);
+        if self.wrote_open {
+            self.out
+                .write_all(THUMB_DOC_FRAGMENT_SEP)
+                .map_err(Error::from)?;
+        } else {
+            self.out.write_all(THUMB_DOC_OPEN).map_err(Error::from)?;
+            self.wrote_open = true;
+        }
+        self.out
+            .write_all(fragment.as_bytes())
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    fn finish_document(&mut self) -> std::io::Result<()> {
+        if self.wrote_open {
+            self.out.write_all(THUMB_DOC_CLOSE)
+        } else {
+            self.out.write_all(THUMB_DOC_EMPTY)
+        }
+    }
+}
+
+struct ThumbEnrichVisitor<'a, 'b> {
+    scan: &'b mut EnrichScan<'a>,
+}
+
+impl<'de, 'a, 'b> Visitor<'de> for ThumbEnrichVisitor<'a, 'b> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a canonical thumb functions document")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "format" if !self.scan.saw_format && !self.scan.saw_functions => {
+                    self.scan.saw_format = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                "functions" if self.scan.saw_format && !self.scan.saw_functions => {
+                    self.scan.saw_functions = true;
+                    map.next_value_seed(FunctionsEnrichSeq {
+                        scan: &mut *self.scan,
+                    })?;
+                }
+                _ => return Err(serde::de::Error::custom(NON_CANONICAL_THUMB_DOC)),
+            }
+        }
+        if !self.scan.saw_functions {
+            return Err(serde::de::Error::custom(NON_CANONICAL_THUMB_DOC));
+        }
+        Ok(())
+    }
+}
+
+struct FunctionsEnrichSeq<'a, 'b> {
+    scan: &'b mut EnrichScan<'a>,
+}
+
+impl<'de, 'a, 'b> DeserializeSeed<'de> for FunctionsEnrichSeq<'a, 'b> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, 'a, 'b> Visitor<'de> for FunctionsEnrichSeq<'a, 'b> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a thumb functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(element) = seq.next_element::<serde_json::Value>()? {
+            if let Err(error) = self.scan.enrich_element(element) {
+                self.scan.failure = Some(error);
+                return Err(serde::de::Error::custom(ENRICH_STREAM_ABORT));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Retired whole-file `thumb_enrich`, kept verbatim as the differential oracle
+/// for the streaming rewrite; test-only.
+#[cfg(test)]
+fn thumb_enrich_whole(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
     // std::io::Error auto-converts via Error::Io(#[from]) — `?` propagates directly.
     let c_text = std::fs::read_to_string(decompiled_c_path)?;
 
@@ -1940,7 +2144,10 @@ mod normalize_thumb_addr_tests {
 /// `normalize_thumb_addr` clears it so the canonical key matches radare2's
 /// even-form `entry` field. Functions whose header lacks ` @ <addr>` are
 /// silently skipped (no key to insert under) — same fail-soft posture as the
-/// prior name-based parser.
+/// prior name-based parser. Retired from production by
+/// `collect_decompiled_c_bodies`; kept as the whole-string differential
+/// oracle, test-only.
+#[cfg(test)]
 fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let lines: Vec<&str> = c_text.lines().collect();
@@ -2053,13 +2260,13 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
 }
 
 /// Streaming Pass-1 body collector for `thumb_enrich`: implements the exact
-/// grammar of [`parse_decompiled_c_function_bodies_by_addr`] (the
-/// whole-string oracle; the differential fixtures pin the equivalence) but
-/// reads `decompiled.c` line-by-line through `BufReader` — never whole-file —
-/// so memory is bounded by the largest single body plus an 8-line lookahead
-/// window. Any io failure (missing file, non-UTF-8 input) propagates as
-/// `Err` (same failure class as the oracle-side `read_to_string?`).
-#[cfg_attr(not(test), allow(dead_code))]
+/// grammar of the whole-string oracle
+/// `parse_decompiled_c_function_bodies_by_addr` (the differential fixtures pin
+/// the equivalence) but reads `decompiled.c` line-by-line through `BufReader` —
+/// never whole-file — so memory is bounded by the largest single body plus an
+/// 8-line lookahead window. Any io failure (missing file, non-UTF-8 input)
+/// propagates as `Err` (same failure class as the oracle-side
+/// `read_to_string?`).
 fn collect_decompiled_c_bodies(path: &Path) -> Result<HashMap<String, String>> {
     let file = std::fs::File::open(path)?;
     let mut source = LineSource::new(std::io::BufReader::new(file));
@@ -3805,6 +4012,110 @@ INFO: second pdfj body was noisy and not parseable
             "body_c was truncated by an in-string/comment brace:\n{body_c}"
         );
         assert!(body_c.contains("expected } close"));
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn enrich_case(
+        c_text: &str,
+        thumb_json: &str,
+    ) -> (
+        Result<usize>,
+        Result<usize>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("a.c");
+        std::fs::write(&c, c_text).unwrap();
+        let (p1, p2) = (dir.path().join("1.json"), dir.path().join("2.json"));
+        std::fs::write(&p1, thumb_json).unwrap();
+        std::fs::write(&p2, thumb_json).unwrap();
+        let r1 = thumb_enrich(&c, &p1);
+        let r2 = thumb_enrich_whole(&c, &p2);
+        let b1 = std::fs::read(&p1).ok();
+        let b2 = std::fs::read(&p2).ok();
+        (r1, r2, b1, b2)
+    }
+
+    const V1_HEADER: &str = "{\"format\":\"pixel-modem-extractor-thumb-functions\",\"functions\":";
+    const V2_HEADER: &str =
+        "{\"format\":\"pixel-modem-extractor-thumb-functions-v2\",\"functions\":";
+
+    #[test]
+    fn streaming_enrich_matches_oracle_on_canonical_inputs() {
+        let body = "\n\n// thumb_100 @ 0x100\nvoid f(void)\n{\n  a;\n}\n";
+        let e0 = "{\"name\":\"thumb_100\",\"entry\":\"0x100\",\"end\":\"0x108\",\"size\":8,\"body_kind\":\"thumb_disassembly\",\"body\":\"\",\"data_refs\":[],\"decode_ranges\":[],\"decode_range_errors\":[]}";
+        let e1 = "{\"name\":\"x\",\"entry\":\"0x104\",\"end\":\"0x10c\",\"size\":8,\"body_kind\":\"thumb_disassembly\",\"body\":\"d\",\"data_refs\":[],\"decode_ranges\":[],\"decode_range_errors\":[]}";
+        let cases: Vec<(String, String, usize)> = vec![
+            (body.into(), format!("{V2_HEADER}[{e0}]}}"), 1), // match, v2 stays v2
+            (body.into(), format!("{V1_HEADER}[{e0}]}}"), 1), // v1 bumped to v2
+            (body.into(), format!("{V2_HEADER}[{e1}]}}"), 0), // no match -> untouched, Ok(0)
+            (body.into(), format!("{V2_HEADER}[]}}"), 0),     // empty functions
+            (body.into(), format!("{V2_HEADER}[{e0},{e1}]}}"), 1), // partial match
+        ];
+        for (i, (c, j, _)) in cases.iter().enumerate() {
+            let (r1, r2, b1, b2) = enrich_case(c, j);
+            assert_eq!(r1.unwrap(), r2.unwrap(), "counts fixture {i}");
+            assert_eq!(b1, b2, "bytes fixture {i}");
+        }
+        // T-bit: header 0x101 matches entry 0x100
+        let (r1, r2, b1, b2) = enrich_case(
+            "\n\n// f @ 0x101\nvoid f(void)\n{\n  a;\n}\n",
+            &format!("{V2_HEADER}[{e0}]}}"),
+        );
+        let (n1, n2) = (r1.unwrap(), r2.unwrap());
+        assert_eq!(n1, 1);
+        assert_eq!((n1, b1), (n2, b2));
+    }
+
+    #[test]
+    fn streaming_enrich_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("a.c");
+        std::fs::write(&c, "\n\n// thumb_100 @ 0x100\nvoid f(void)\n{\n  a;\n}\n").unwrap();
+        let p = dir.path().join("t.json");
+        std::fs::write(
+            &p,
+            format!("{V2_HEADER}[{{\"name\":\"thumb_100\",\"entry\":\"0x100\",\"size\":8}}]}}"),
+        )
+        .unwrap();
+        let n1 = thumb_enrich(&c, &p).unwrap();
+        let bytes1 = std::fs::read(&p).unwrap();
+        let n2 = thumb_enrich(&c, &p).unwrap();
+        let bytes2 = std::fs::read(&p).unwrap();
+        assert_eq!((n1, n2), (1, 1));
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn streaming_enrich_rejects_non_canonical_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("a.c");
+        std::fs::write(&c, "x").unwrap();
+        for (i, doc) in [
+            format!("{V2_HEADER}[]}}"),       // canonical control -> Ok
+            "{\"functions\":[]}".to_string(), // missing format key
+            format!("{}[]}}", V2_HEADER.replace("functions", "other")), // wrong second key
+            "[1,2]".to_string(),              // not an object
+            format!("{V2_HEADER}{{}}}}"),     // functions not an array
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let p = dir.path().join(format!("t{i}.json"));
+            std::fs::write(&p, &doc).unwrap();
+            let res = thumb_enrich(&c, &p);
+            if i == 0 {
+                assert!(res.is_ok(), "canonical control must pass");
+            } else {
+                assert!(res.is_err(), "doc {i} must fail closed: {doc}");
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    doc.as_bytes(),
+                    "no write on error"
+                );
+            }
+        }
     }
 
     #[test]
