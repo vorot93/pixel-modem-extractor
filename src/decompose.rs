@@ -2941,7 +2941,7 @@ mod tests {
         image.thumb_regions_requested = Some(3);
         image.thumb_regions_succeeded = Some(2);
         image.thumb_regions_failed = Some(1);
-        image.thumb_radare2_runs = Some(3);
+        image.thumb_radare2_runs = Some(1);
         image.thumb_rizin_runs = Some(1);
 
         let json = serde_json::to_value(ImageReport::from_result(&image)).unwrap();
@@ -2957,7 +2957,7 @@ mod tests {
                 "thumb_regions_requested": 3,
                 "thumb_regions_succeeded": 2,
                 "thumb_regions_failed": 1,
-                "thumb_radare2_runs": 3,
+                "thumb_radare2_runs": 1,
                 "thumb_rizin_runs": 1
             })
         );

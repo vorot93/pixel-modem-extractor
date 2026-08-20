@@ -1,8 +1,5 @@
-//! Pure Rizin inventory, capture-shape, and outgoing-xref adaptation.
-//!
-//! Execution remains coordinator-owned, so these crate-internal seams are
-//! intentionally available before they are reachable from the public runner.
-#![allow(dead_code)]
+//! Rizin inventory, capture-shape, and outgoing-xref adaptation for the
+//! coordinator's failure-only fallback.
 
 use super::radare2::FunctionRecord;
 use super::stream::{ValueScanner, read_rizin_pdfj_value, scan_rizin_inventory};
@@ -145,6 +142,7 @@ impl<'de> Visitor<'de> for XrefSequence {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_rizin_xrefs(capture: &Path, cap: usize) -> Result<Vec<RizinXref>> {
     read_rizin_xrefs_inner(capture, cap, usize::MAX)
 }

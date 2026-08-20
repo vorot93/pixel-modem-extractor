@@ -1,6 +1,5 @@
-//! Streaming Thumb backend adaptation and radare2 coordinator: capture
-//! identity, strict normalization, bounded fragment spills, and atomic v3
-//! assembly.
+//! Streaming Thumb backend adaptation and coordination: capture identity,
+//! strict normalization, bounded fragment spills, and atomic v3 assembly.
 
 #[cfg(test)]
 use super::artifact::render_fragment;
@@ -23,6 +22,7 @@ use crate::execution_ranges::{
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::Duration;
 
 fn json_hex(v: u64) -> String {
     format!("0x{v:x}")
@@ -793,7 +793,6 @@ fn process_region_streaming(
     )
 }
 
-#[allow(dead_code)]
 fn process_rizin_region_streaming(
     stdout_path: &Path,
     image: &[u8],
@@ -1037,10 +1036,11 @@ fn process_region_inner(
         }
     }
 
-    assert!(
-        stats.accepted <= stats.raw,
-        "{producer_name} Thumb projection count is not conserving for region 0x{addr:x}"
-    );
+    if stats.accepted > stats.raw || stats.substantial > stats.raw {
+        return Err(Error::Serialize(format!(
+            "{producer_name} Thumb function counts are not conserving for region 0x{addr:x}"
+        )));
+    }
     let spill = spill.finish()?;
     Ok(RegionOutcome { spill, stats })
 }
@@ -1272,7 +1272,12 @@ fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare
     Ok(parsed)
 }
 
-fn check_radare2_thumb_status(success: bool, code: Option<i32>, addr: u32) -> Result<()> {
+fn check_thumb_backend_status(
+    producer: ThumbProducer,
+    success: bool,
+    code: Option<i32>,
+    addr: u32,
+) -> Result<()> {
     if success {
         return Ok(());
     }
@@ -1280,7 +1285,8 @@ fn check_radare2_thumb_status(success: bool, code: Option<i32>, addr: u32) -> Re
         .map(|code| format!("status {code}"))
         .unwrap_or_else(|| "unknown status".to_string());
     Err(Error::Serialize(format!(
-        "radare2 exited with {status} for Thumb region 0x{addr:x}"
+        "{} exited with {status} for Thumb region 0x{addr:x}",
+        producer.as_str()
     )))
 }
 
@@ -1615,16 +1621,18 @@ fn populate_test_image_from_pdfj(image: &mut [u8], pdfj: &serde_json::Value) {
     }
 }
 
-/// Defensive upper bound on a single Thumb region's r2 stdout. Grounded in
+/// Defensive upper bound on a single Thumb analyzer's region stdout. Grounded in
 /// production: 02_MAIN's largest dense-Thumb region (`410b0000`, ~20 MiB
 /// carved .bin, ~71 k functions) emits ~1.82 GiB of `aflj;pdfj @@f` JSON
 /// (~25 KiB/function). 4 GiB is ~2× that peak, with headroom for r2 version
 /// differences and slightly larger images. Exceeding it indicates genuine
 /// r2 pathology (infinite loop, corrupt input triggering verbose output) —
 /// fail-closed rather than OOM the host.
-const R2_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const ANALYZER_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Rizin alone gets the measured per-region cutoff; radare2 retains no wall deadline.
+const RIZIN_REGION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Chunk size for `stream_to_cap`. Smaller than the typical Linux pipe
+/// Chunk size for `capture_to_cap`. Smaller than the typical Linux pipe
 /// buffer (64 KiB since 2.6.11), so size checks fire promptly when r2 emits
 /// fast; large enough that per-chunk write overhead is negligible.
 const STREAM_CHUNK_BYTES: usize = 8 * 1024;
@@ -1637,7 +1645,7 @@ const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 ///
 /// Pure I/O — no child-process coupling, no filesystem assumptions. Testable
 /// with `Cursor<Vec<u8>>` readers and `Vec<u8>` writers.
-fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
+fn capture_to_cap<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     cap: usize,
@@ -1663,7 +1671,7 @@ fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
             writer.write_all(&chunk[..allowed])?;
             hasher.update(&chunk[..allowed]);
             return Err(std::io::Error::other(format!(
-                "stream_to_cap: input exceeded {cap} bytes"
+                "capture_to_cap: input exceeded {cap} bytes"
             )));
         }
         writer.write_all(&chunk[..n])?;
@@ -1672,8 +1680,8 @@ fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
     }
 }
 
-/// Cap on radare2's own virtual address space (`RLIMIT_AS`) while it analyzes one
-/// Thumb region. Grounded in measurement: healthy `aaa` on the densest real
+/// Cap on an analyzer's own virtual address space (`RLIMIT_AS`) while it analyzes
+/// one Thumb region. Grounded in measurement: healthy radare2 `aaa` on the densest real
 /// regions peaks ~1.5 GiB RSS (mustang `02_MAIN`'s 19 MiB region) and completes,
 /// while a pathological region — cheetah `01_MAIN`'s `0x42310000`, only 4 MiB —
 /// runs away to 90+ GiB and OOM-kills the host. 16 GiB is ~10x the measured
@@ -1683,26 +1691,28 @@ fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
 /// producer is streaming now), so a
 /// runaway region hits the limit and fails closed (r2 gets `ENOMEM` and exits)
 /// rather than exhausting host memory. Same "fail-closed rather than OOM the host"
-/// intent as [`R2_STDOUT_CAP_BYTES`], but for r2's *own* memory rather than the
+/// intent as [`ANALYZER_STDOUT_CAP_BYTES`], but for the analyzer's own memory rather than the
 /// stdout we read back from it.
-const R2_ADDRESS_SPACE_CAP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-
-/// Apply [`R2_ADDRESS_SPACE_CAP_BYTES`] to `cmd` as a soft+hard `RLIMIT_AS`, so a
-/// runaway radare2 is denied further allocations by the kernel and exits instead
-/// of OOM-killing the host. Unix-only; a no-op elsewhere (Windows has no portable
-/// per-child address-space limit — the same platform gap documented on
-/// `spawn_in_own_process_group` in `decompile.rs`).
 #[cfg(unix)]
-fn limit_r2_address_space(cmd: &mut std::process::Command) {
+const ANALYZER_ADDRESS_SPACE_CAP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Put the analyzer in its own process group and apply
+/// [`ANALYZER_ADDRESS_SPACE_CAP_BYTES`] as a soft+hard `RLIMIT_AS`. Unix-only;
+/// other platforms have no shared portable equivalents.
+#[cfg(unix)]
+fn configure_analyzer_process(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: the closure runs in the forked child between `fork(2)` and
-    // `execvp(2)`. It calls only `setrlimit` (async-signal-safe) and reads a
-    // `const`; it touches no shared state and allocates nothing.
+    // `execvp(2)`. It calls only async-signal-safe libc functions, reads a
+    // `const`, touches no shared state, and allocates nothing.
     unsafe {
         cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             let limit = libc::rlimit {
-                rlim_cur: R2_ADDRESS_SPACE_CAP_BYTES as libc::rlim_t,
-                rlim_max: R2_ADDRESS_SPACE_CAP_BYTES as libc::rlim_t,
+                rlim_cur: ANALYZER_ADDRESS_SPACE_CAP_BYTES as libc::rlim_t,
+                rlim_max: ANALYZER_ADDRESS_SPACE_CAP_BYTES as libc::rlim_t,
             };
             if libc::setrlimit(libc::RLIMIT_AS, &limit) == 0 {
                 Ok(())
@@ -1714,7 +1724,164 @@ fn limit_r2_address_space(cmd: &mut std::process::Command) {
 }
 
 #[cfg(not(unix))]
-fn limit_r2_address_space(_cmd: &mut std::process::Command) {}
+fn configure_analyzer_process(_cmd: &mut std::process::Command) {}
+
+const ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Give a waiting shell time to reap its terminated descendants before SIGKILL.
+const ANALYZER_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+
+struct AnalyzerProcess {
+    child: std::process::Child,
+    #[cfg(unix)]
+    pid: u32,
+    status: Option<std::process::ExitStatus>,
+    drain: Option<std::thread::JoinHandle<std::io::Result<CaptureRecord>>>,
+}
+
+impl AnalyzerProcess {
+    fn new(child: std::process::Child) -> Self {
+        #[cfg(unix)]
+        let pid = child.id();
+        Self {
+            child,
+            #[cfg(unix)]
+            pid,
+            status: None,
+            drain: None,
+        }
+    }
+
+    fn poll_status(&mut self) -> std::io::Result<bool> {
+        if self.status.is_some() {
+            return Ok(true);
+        }
+        if let Some(status) = self.child.try_wait()? {
+            self.status = Some(status);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn drain_finished(&self) -> bool {
+        self.drain
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    fn join_drain(&mut self) -> std::io::Result<CaptureRecord> {
+        self.drain
+            .take()
+            .expect("analyzer stdout drain is present")
+            .join()
+            .map_err(|_| std::io::Error::other("analyzer stdout drain thread panicked"))?
+    }
+
+    #[cfg(windows)]
+    fn interrupt_drain(&self) {
+        use std::os::windows::io::AsRawHandle;
+
+        if let Some(drain) = &self.drain {
+            // SAFETY: `drain` owns a live Windows thread handle. Repeated
+            // cancellation covers the race where no synchronous read is
+            // pending during one call.
+            unsafe {
+                let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
+                    drain.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+                );
+            }
+        }
+    }
+
+    fn terminate_and_reap(&mut self) -> std::io::Result<()> {
+        let mut first_error = None;
+
+        #[cfg(unix)]
+        if let Err(error) = signal_process_group(self.pid, libc::SIGTERM) {
+            first_error = Some(error);
+        }
+        #[cfg(not(unix))]
+        if self.status.is_none()
+            && let Err(error) = self.child.kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            first_error = Some(error);
+        }
+
+        let grace_started = std::time::Instant::now();
+        while self.status.is_none() && grace_started.elapsed() < ANALYZER_TERMINATION_GRACE {
+            match self.poll_status() {
+                Ok(true) => break,
+                Ok(false) => std::thread::sleep(ANALYZER_POLL_INTERVAL),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    break;
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        if let Err(error) = signal_process_group(self.pid, libc::SIGKILL)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if self.status.is_none() {
+            if let Err(error) = self.child.kill()
+                && error.kind() != std::io::ErrorKind::InvalidInput
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            match self.child.wait() {
+                Ok(status) => self.status = Some(status),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+
+        #[cfg(windows)]
+        while self
+            .drain
+            .as_ref()
+            .is_some_and(|drain| !drain.is_finished())
+        {
+            self.interrupt_drain();
+            std::thread::sleep(ANALYZER_POLL_INTERVAL);
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for AnalyzerProcess {
+    fn drop(&mut self) {
+        if self.status.is_none() || self.drain.is_some() {
+            let _ = self.terminate_and_reap();
+            if self.drain.is_some() {
+                let _ = self.join_drain();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::other("analyzer pid exceeds the Unix pid_t domain"))?;
+    // SAFETY: a negative pid addresses the child-owned process group and no
+    // Rust-managed memory is accessed.
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
 
 fn validate_thumb_region_requests(
     image: &[u8],
@@ -1764,41 +1931,44 @@ fn validate_thumb_region_requests(
 }
 
 fn validate_thumb_tools(tools: &ThumbTools) -> Result<()> {
-    if tools.rizin.is_some() {
-        return Err(Error::Serialize(
-            "Rizin is unsupported by the current Thumb analysis coordinator".into(),
-        ));
+    validate_producer_identity(&tools.radare2, ThumbProducer::Radare2)?;
+    if let Some(rizin) = &tools.rizin {
+        validate_producer_identity(rizin, ThumbProducer::Rizin)?;
     }
-    let radare2 = &tools.radare2;
-    if radare2.producer != ThumbProducer::Radare2 {
-        return Err(Error::Serialize(
-            "Thumb primary producer identity must be radare2".into(),
-        ));
+    Ok(())
+}
+
+fn validate_producer_identity(identity: &ProducerIdentity, expected: ThumbProducer) -> Result<()> {
+    let producer = expected.as_str();
+    if identity.producer != expected {
+        return Err(Error::Serialize(format!(
+            "Thumb {producer} producer identity has the wrong backend"
+        )));
     }
-    if radare2.command != ThumbProducer::Radare2.command() {
-        return Err(Error::Serialize(
-            "radare2 producer command does not match the v3 schema".into(),
-        ));
+    if identity.command != expected.command() {
+        return Err(Error::Serialize(format!(
+            "{producer} producer command does not match the v3 schema"
+        )));
     }
-    if radare2.version.is_empty()
-        || radare2.version.trim() != radare2.version
-        || radare2.version.contains(['\r', '\n'])
+    if identity.version.is_empty()
+        || identity.version.trim() != identity.version
+        || identity.version.contains(['\r', '\n'])
     {
-        return Err(Error::Serialize(
-            "radare2 producer version is not normalized".into(),
-        ));
+        return Err(Error::Serialize(format!(
+            "{producer} producer version is not normalized"
+        )));
     }
-    if !radare2.executable.is_absolute()
-        || radare2.executable.components().any(|component| {
+    if !identity.executable.is_absolute()
+        || identity.executable.components().any(|component| {
             matches!(
                 component,
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
         })
     {
-        return Err(Error::Serialize(
-            "radare2 producer executable must be a canonical absolute path".into(),
-        ));
+        return Err(Error::Serialize(format!(
+            "{producer} producer executable must be a canonical absolute path"
+        )));
     }
     Ok(())
 }
@@ -1810,16 +1980,46 @@ fn add_count(total: &mut usize, value: usize, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Analyze validated dense-Thumb regions with the configured backend policy.
-/// Stage 2 supports radare2 only and writes a provenance-complete v3 sidecar.
-/// Per-region failures remain durable when another region succeeds; an
-/// all-region failure leaves any prior sidecar untouched.
+#[derive(Clone, Copy)]
+struct RunnerLimits {
+    stdout_cap: usize,
+    rizin_timeout: Duration,
+}
+
+impl RunnerLimits {
+    const PRODUCTION: Self = Self {
+        stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
+        rizin_timeout: RIZIN_REGION_TIMEOUT,
+    };
+}
+
+/// Analyze validated dense-Thumb regions with radare2 primary and an optional
+/// per-region Rizin fallback. Per-region failures remain durable when another
+/// region succeeds; an all-region failure leaves any prior sidecar untouched.
 pub fn run_thumb_analysis(
     tools: &ThumbTools,
     image: &[u8],
     load_addr: u32,
     regions: &[(u32, u32)],
     out_dir: &Path,
+) -> Result<ThumbAnalysisSummary> {
+    run_thumb_analysis_with_limits(
+        tools,
+        image,
+        load_addr,
+        regions,
+        out_dir,
+        RunnerLimits::PRODUCTION,
+    )
+}
+
+fn run_thumb_analysis_with_limits(
+    tools: &ThumbTools,
+    image: &[u8],
+    load_addr: u32,
+    regions: &[(u32, u32)],
+    out_dir: &Path,
+    limits: RunnerLimits,
 ) -> Result<ThumbAnalysisSummary> {
     validate_thumb_tools(tools)?;
     let regions = validate_thumb_region_requests(image, load_addr, regions)?;
@@ -1834,73 +2034,105 @@ pub fn run_thumb_analysis(
     std::fs::create_dir_all(&thumb_dir)?;
     let mut spills: Vec<Spill> = Vec::new();
     let mut region_records = Vec::with_capacity(regions.len());
-    let mut failures = Vec::new();
+    let mut failures: Vec<(u32, Vec<String>)> = Vec::new();
+    let mut rizin_attempted = false;
 
     for &(addr, end) in &regions {
         let len = end - addr;
-        match run_radare2_region(&tools.radare2, image, load_addr, addr, len, &thumb_dir) {
-            Ok(success) => {
-                let stats = &success.outcome.stats;
-                let quarantined = stats.raw.checked_sub(stats.accepted).ok_or_else(|| {
-                    Error::Serialize(format!(
-                        "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
-                    ))
-                })?;
-                let run = FunctionRunRecord {
-                    producer: ThumbProducer::Radare2,
-                    first_function: summary.raw,
-                    function_count: stats.raw,
-                    substantial: stats.substantial,
-                    accepted: stats.accepted,
-                    quarantined,
-                };
-                add_count(&mut summary.regions_succeeded, 1, "succeeded region")?;
-                add_count(&mut summary.radare2_runs, 1, "radare2 run")?;
-                add_count(&mut summary.raw, stats.raw, "raw function")?;
-                add_count(
-                    &mut summary.substantial,
-                    stats.substantial,
-                    "substantial function",
-                )?;
-                add_count(&mut summary.accepted, stats.accepted, "accepted function")?;
-                add_count(
-                    &mut summary.quarantined,
-                    quarantined,
-                    "quarantined function",
-                )?;
-                region_records.push(RegionRecord {
-                    start: addr,
-                    end,
-                    attempts: vec![AttemptRecord {
-                        producer: ThumbProducer::Radare2,
+        let bin = match carve_thumb_region(image, load_addr, addr, len, &thumb_dir) {
+            Ok(bin) => bin,
+            Err(error) => {
+                for spill in &spills {
+                    let _ = std::fs::remove_file(&spill.path);
+                }
+                return Err(error);
+            }
+        };
+        let mut attempts = Vec::with_capacity(usize::from(tools.rizin.is_some()) + 1);
+        let mut region_failures = Vec::with_capacity(attempts.capacity());
+        let mut selected = None;
+
+        for identity in std::iter::once(&tools.radare2).chain(tools.rizin.iter()) {
+            if identity.producer == ThumbProducer::Rizin {
+                rizin_attempted = true;
+            }
+            match run_backend_region(identity, &bin, image, load_addr, addr, &thumb_dir, limits) {
+                Ok(success) => {
+                    attempts.push(AttemptRecord {
+                        producer: identity.producer,
                         status: AttemptStatus::Succeeded,
                         stdout: Some(success.capture),
                         error: None,
-                    }],
-                    function_runs: vec![run],
-                });
-                spills.push(success.outcome.spill);
-            }
-            Err(failure) => {
-                add_count(&mut summary.regions_failed, 1, "failed region")?;
-                let reason = failure.error.to_string();
-                tracing::warn!(
-                    "Thumb region 0x{addr:x} radare2 attempt failed (fail-closed): {}",
-                    reason
-                );
-                failures.push((addr, reason.clone()));
-                region_records.push(RegionRecord {
-                    start: addr,
-                    end,
-                    attempts: vec![AttemptRecord {
-                        producer: ThumbProducer::Radare2,
+                    });
+                    selected = Some((identity.producer, success.outcome));
+                    break;
+                }
+                Err(failure) => {
+                    let reason = failure.error.to_string();
+                    tracing::warn!(
+                        "Thumb region 0x{addr:x} {} attempt failed (fail-closed): {reason}",
+                        identity.producer.as_str()
+                    );
+                    attempts.push(AttemptRecord {
+                        producer: identity.producer,
                         status: AttemptStatus::Failed,
                         stdout: failure.capture,
-                        error: Some(reason),
-                    }],
-                    function_runs: Vec::new(),
-                });
+                        error: Some(reason.clone()),
+                    });
+                    region_failures.push(reason);
+                }
             }
+        }
+
+        if let Some((producer, outcome)) = selected {
+            let stats = &outcome.stats;
+            let quarantined = stats.raw.checked_sub(stats.accepted).ok_or_else(|| {
+                Error::Serialize(format!(
+                    "{} Thumb projection count is not conserving for region 0x{addr:x}",
+                    producer.as_str()
+                ))
+            })?;
+            let run = FunctionRunRecord {
+                producer,
+                first_function: summary.raw,
+                function_count: stats.raw,
+                substantial: stats.substantial,
+                accepted: stats.accepted,
+                quarantined,
+            };
+            add_count(&mut summary.regions_succeeded, 1, "succeeded region")?;
+            match producer {
+                ThumbProducer::Radare2 => add_count(&mut summary.radare2_runs, 1, "radare2 run")?,
+                ThumbProducer::Rizin => add_count(&mut summary.rizin_runs, 1, "rizin run")?,
+            }
+            add_count(&mut summary.raw, stats.raw, "raw function")?;
+            add_count(
+                &mut summary.substantial,
+                stats.substantial,
+                "substantial function",
+            )?;
+            add_count(&mut summary.accepted, stats.accepted, "accepted function")?;
+            add_count(
+                &mut summary.quarantined,
+                quarantined,
+                "quarantined function",
+            )?;
+            region_records.push(RegionRecord {
+                start: addr,
+                end,
+                attempts,
+                function_runs: vec![run],
+            });
+            spills.push(outcome.spill);
+        } else {
+            add_count(&mut summary.regions_failed, 1, "failed region")?;
+            failures.push((addr, region_failures));
+            region_records.push(RegionRecord {
+                start: addr,
+                end,
+                attempts,
+                function_runs: Vec::new(),
+            });
         }
     }
 
@@ -1909,6 +2141,8 @@ pub fn run_thumb_analysis(
         .checked_add(summary.regions_failed)
         != Some(summary.regions_requested)
         || summary.accepted.checked_add(summary.quarantined) != Some(summary.raw)
+        || summary.radare2_runs.checked_add(summary.rizin_runs) != Some(summary.regions_succeeded)
+        || summary.raw.checked_sub(summary.substantial).is_none()
     {
         return Err(Error::Serialize(
             "Thumb analysis summary is not conserving".into(),
@@ -1917,7 +2151,7 @@ pub fn run_thumb_analysis(
     if summary.regions_succeeded == 0 {
         let reasons = failures
             .iter()
-            .map(|(addr, reason)| format!("0x{addr:x} radare2: {reason}"))
+            .map(|(addr, reasons)| format!("0x{addr:x}: {}", reasons.join("; ")))
             .collect::<Vec<_>>()
             .join("; ");
         return Err(Error::Serialize(format!(
@@ -1925,9 +2159,18 @@ pub fn run_thumb_analysis(
         )));
     }
 
+    let mut attempted_producers = vec![tools.radare2.clone()];
+    if rizin_attempted {
+        attempted_producers.push(
+            tools
+                .rizin
+                .clone()
+                .expect("Rizin can be attempted only when configured"),
+        );
+    }
     if let Err(error) = assemble_v3_atomic(
         &out_dir.join("thumb_functions.json"),
-        std::slice::from_ref(&tools.radare2),
+        &attempted_producers,
         &region_records,
         &spills,
     ) {
@@ -1939,102 +2182,264 @@ pub fn run_thumb_analysis(
     Ok(summary)
 }
 
-fn run_radare2_region(
-    radare2: &ProducerIdentity,
+fn carve_thumb_region(
     image: &[u8],
     load_addr: u32,
     addr: u32,
     len: u32,
     thumb_dir: &Path,
-) -> std::result::Result<SuccessfulRegion, FailedRegion> {
+) -> Result<std::path::PathBuf> {
     let off = (addr - load_addr) as usize;
     let end = off + len as usize;
     let bin = thumb_dir.join(format!("{addr:08x}.bin"));
-    if let Err(error) = std::fs::write(&bin, &image[off..end]) {
-        return Err(FailedRegion {
-            capture: None,
-            error: error.into(),
-        });
-    }
-    let mut cmd = std::process::Command::new(&radare2.executable);
-    cmd.args(["-a", "arm", "-b", "16", "-m"])
-        .arg(format!("0x{addr:x}"))
-        .args(["-q", "-c", radare2.command])
-        .arg(&bin)
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped());
-    limit_r2_address_space(&mut cmd);
-    let mut child = cmd.spawn().map_err(|error| FailedRegion {
-        capture: None,
-        error: error.into(),
+    std::fs::write(&bin, &image[off..end]).map_err(|error| {
+        Error::Serialize(format!(
+            "carve Thumb region 0x{addr:x} to {}: {error}",
+            bin.display()
+        ))
     })?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let stdout_path = thumb_dir.join(format!("{addr:08x}.radare2.stdout"));
-    let mut file = match std::fs::File::create(&stdout_path) {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(FailedRegion {
-                capture: None,
-                error: error.into(),
-            });
-        }
-    };
-    let sidecar_path = format!("thumb/{addr:08x}.radare2.stdout");
+    Ok(bin)
+}
 
-    let capture = stream_to_cap(&mut stdout, &mut file, R2_STDOUT_CAP_BYTES, &sidecar_path)
-        .and_then(|capture| {
-            file.flush()?;
-            Ok(capture)
-        });
-    drop(file);
-    drop(stdout);
+type RegionParser = fn(&Path, &[u8], u32, u32, &Path) -> Result<RegionOutcome>;
 
-    let capture = match capture {
-        Ok(capture) => capture,
-        Err(error) => {
-            let kind = error.kind();
-            let error = if kind == std::io::ErrorKind::Other {
-                Error::ToolNotFound(format!(
-                    "radare2 emitted > {R2_STDOUT_CAP_BYTES} bytes for region {addr:08x}; capped to prevent OOM"
-                ))
-            } else {
-                error.into()
-            };
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&stdout_path);
-            return Err(FailedRegion {
-                capture: None,
-                error,
-            });
-        }
+fn run_backend_region(
+    identity: &ProducerIdentity,
+    bin: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    thumb_dir: &Path,
+    limits: RunnerLimits,
+) -> std::result::Result<SuccessfulRegion, FailedRegion> {
+    let producer = identity.producer;
+    let producer_name = producer.as_str();
+    let stdout_path = thumb_dir.join(format!("{addr:08x}.{producer_name}.stdout"));
+    let parser: RegionParser = match producer {
+        ThumbProducer::Radare2 => process_region_streaming,
+        ThumbProducer::Rizin => process_rizin_region_streaming,
     };
-
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(FailedRegion {
-                capture: Some(capture),
-                error: error.into(),
-            });
-        }
-    };
-    if let Err(error) = check_radare2_thumb_status(status.success(), status.code(), addr) {
-        return Err(FailedRegion {
-            capture: Some(capture),
-            error,
-        });
-    }
-    match process_region_streaming(&stdout_path, image, load_addr, addr, thumb_dir) {
+    let deadline = (producer == ThumbProducer::Rizin).then_some(limits.rizin_timeout);
+    let capture = run_backend_capture(
+        identity,
+        bin,
+        addr,
+        &stdout_path,
+        limits.stdout_cap,
+        deadline,
+    )?;
+    match parser(&stdout_path, image, load_addr, addr, thumb_dir) {
         Ok(outcome) => Ok(SuccessfulRegion { outcome, capture }),
         Err(error) => Err(FailedRegion {
             capture: Some(capture),
-            error,
+            error: Error::Serialize(format!(
+                "{producer_name} output validation failed for Thumb region 0x{addr:x}: {error}"
+            )),
         }),
+    }
+}
+
+fn run_backend_capture(
+    identity: &ProducerIdentity,
+    bin: &Path,
+    addr: u32,
+    stdout_path: &Path,
+    stdout_cap: usize,
+    deadline: Option<Duration>,
+) -> std::result::Result<CaptureRecord, FailedRegion> {
+    let producer = identity.producer;
+    let producer_name = producer.as_str();
+    let started = std::time::Instant::now();
+    let mut cmd = std::process::Command::new(&identity.executable);
+    cmd.args(["-a", "arm", "-b", "16", "-m"])
+        .arg(format!("0x{addr:x}"))
+        .args(["-q", "-c", identity.command])
+        .arg(bin)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped());
+    configure_analyzer_process(&mut cmd);
+    let mut child = cmd.spawn().map_err(|error| FailedRegion {
+        capture: None,
+        error: Error::Serialize(format!(
+            "{producer_name} failed to spawn for Thumb region 0x{addr:x}: {error}"
+        )),
+    })?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut process = AnalyzerProcess::new(child);
+    let file = match std::fs::File::create(stdout_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(FailedRegion {
+                capture: None,
+                error: Error::Serialize(format!(
+                    "{producer_name} could not create stdout capture for Thumb region 0x{addr:x}: {error}"
+                )),
+            });
+        }
+    };
+    let sidecar_path = format!("thumb/{addr:08x}.{producer_name}.stdout");
+    let drain = std::thread::Builder::new()
+        .name(format!("thumb-{producer_name}-{addr:08x}-stdout"))
+        .spawn(move || {
+            let mut stdout = stdout;
+            let mut file = file;
+            let capture = capture_to_cap(&mut stdout, &mut file, stdout_cap, &sidecar_path)?;
+            file.flush()?;
+            Ok(capture)
+        });
+    process.drain = match drain {
+        Ok(drain) => Some(drain),
+        Err(error) => {
+            let _ = std::fs::remove_file(stdout_path);
+            return Err(FailedRegion {
+                capture: None,
+                error: Error::Serialize(format!(
+                    "{producer_name} could not start stdout capture for Thumb region 0x{addr:x}: {error}"
+                )),
+            });
+        }
+    };
+
+    let mut capture = None;
+    #[cfg(unix)]
+    let mut closed_descendant_pipes = false;
+    loop {
+        if capture.is_none() && process.drain_finished() {
+            match process.join_drain() {
+                Ok(finalized) => capture = Some(finalized),
+                Err(error) => {
+                    let cleanup = process.terminate_and_reap().err();
+                    let _ = std::fs::remove_file(stdout_path);
+                    return Err(FailedRegion {
+                        capture: None,
+                        error: capture_failure_error(
+                            producer,
+                            addr,
+                            stdout_cap,
+                            error,
+                            cleanup.as_ref(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Err(error) = process.poll_status() {
+            let cleanup = process.terminate_and_reap().err();
+            let (retained, finalize_error) =
+                finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+            let mut detail = format!(
+                "{producer_name} process supervision failed for Thumb region 0x{addr:x}: {error}"
+            );
+            if let Some(error) = cleanup {
+                detail.push_str(&format!("; cleanup failed: {error}"));
+            }
+            if let Some(error) = finalize_error {
+                detail.push_str(&format!("; stdout finalization failed: {error}"));
+            }
+            return Err(FailedRegion {
+                capture: retained,
+                error: Error::Serialize(detail),
+            });
+        }
+
+        if capture.is_some() && process.status.is_some() {
+            break;
+        }
+
+        if deadline.is_some_and(|deadline| started.elapsed() >= deadline) {
+            let cleanup = process.terminate_and_reap().err();
+            let (retained, finalize_error) =
+                finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+            let mut detail = format!(
+                "{producer_name} timed out after {} ms for Thumb region 0x{addr:x}",
+                deadline.expect("elapsed deadline is present").as_millis()
+            );
+            if let Some(error) = cleanup {
+                detail.push_str(&format!("; cleanup failed: {error}"));
+            }
+            if let Some(error) = finalize_error {
+                detail.push_str(&format!("; partial stdout finalization failed: {error}"));
+            }
+            return Err(FailedRegion {
+                capture: retained,
+                error: Error::Serialize(detail),
+            });
+        }
+
+        #[cfg(unix)]
+        if process.status.is_some() && capture.is_none() && !closed_descendant_pipes {
+            // A descendant may have inherited stdout after the immediate child
+            // exited. Closing the remaining group prevents a drain-thread deadlock.
+            let _ = signal_process_group(process.pid, libc::SIGKILL);
+            closed_descendant_pipes = true;
+        }
+
+        let sleep = deadline
+            .map(|deadline| ANALYZER_POLL_INTERVAL.min(deadline.saturating_sub(started.elapsed())))
+            .unwrap_or(ANALYZER_POLL_INTERVAL);
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
+
+    let capture = capture.expect("completed analyzer capture is finalized");
+    let status = process
+        .status
+        .as_ref()
+        .expect("completed analyzer process is reaped");
+    if let Err(error) = check_thumb_backend_status(producer, status.success(), status.code(), addr)
+    {
+        return Err(FailedRegion {
+            capture: Some(capture),
+            error,
+        });
+    }
+
+    Ok(capture)
+}
+
+fn finalize_stopped_capture(
+    process: &mut AnalyzerProcess,
+    capture: Option<CaptureRecord>,
+    stdout_path: &Path,
+) -> (Option<CaptureRecord>, Option<std::io::Error>) {
+    if let Some(capture) = capture {
+        return (Some(capture), None);
+    }
+    match process.join_drain() {
+        Ok(capture) => (Some(capture), None),
+        Err(error) => {
+            let _ = std::fs::remove_file(stdout_path);
+            (None, Some(error))
+        }
+    }
+}
+
+fn capture_failure_error(
+    producer: ThumbProducer,
+    addr: u32,
+    cap: usize,
+    error: std::io::Error,
+    cleanup: Option<&std::io::Error>,
+) -> Error {
+    let producer = producer.as_str();
+    let cleanup = cleanup
+        .map(|error| format!("; process cleanup failed: {error}"))
+        .unwrap_or_default();
+    if error.kind() == std::io::ErrorKind::Other
+        && error
+            .to_string()
+            .starts_with("capture_to_cap: input exceeded")
+    {
+        Error::Serialize(format!(
+            "{producer} emitted more than {cap} stdout bytes for Thumb region 0x{addr:x}; capped to prevent OOM{cleanup}"
+        ))
+    } else {
+        Error::Serialize(format!(
+            "{producer} stdout capture failed for Thumb region 0x{addr:x}: {error}{cleanup}"
+        ))
     }
 }
 
@@ -2057,13 +2462,15 @@ fn run_radare2_thumb_region(
     len: u32,
     thumb_dir: &Path,
 ) -> Result<Option<RegionOutcome>> {
-    match run_radare2_region(
+    let bin = carve_thumb_region(image, load_addr, addr, len, thumb_dir)?;
+    match run_backend_region(
         &test_radare2_identity(radare2)?,
+        &bin,
         image,
         load_addr,
         addr,
-        len,
         thumb_dir,
+        RunnerLimits::PRODUCTION,
     ) {
         Ok(success) => Ok(Some(success.outcome)),
         Err(failure) => Err(failure.error),
@@ -2077,13 +2484,21 @@ mod tests {
     #[cfg(unix)]
     fn thumb_tools(radare2: &Path) -> crate::thumb_analysis::ThumbTools {
         crate::thumb_analysis::ThumbTools {
-            radare2: crate::thumb_analysis::ProducerIdentity {
-                producer: crate::thumb_analysis::ThumbProducer::Radare2,
-                executable: std::fs::canonicalize(radare2).unwrap(),
-                version: "radare2 test 1.0".to_string(),
-                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
-            },
+            radare2: test_identity(crate::thumb_analysis::ThumbProducer::Radare2, radare2),
             rizin: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_identity(
+        producer: crate::thumb_analysis::ThumbProducer,
+        executable: &Path,
+    ) -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer,
+            executable: std::fs::canonicalize(executable).unwrap(),
+            version: format!("{} test 1.0", producer.as_str()),
+            command: producer.command(),
         }
     }
 
@@ -2094,6 +2509,12 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_executable_stub(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        make_executable(path);
     }
 
     #[cfg(unix)]
@@ -2184,37 +2605,864 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn run_thumb_analysis_rejects_configured_rizin_before_spawning() {
+    fn successful_radare2_region_never_spawns_rizin() {
         let dir = tempfile::tempdir().unwrap();
         let radare2 = dir.path().join("r2");
-        let sentinel = dir.path().join("spawned");
-        std::fs::write(
+        let rizin = dir.path().join("rizin");
+        let sentinel = dir.path().join("rizin-ran");
+        write_executable_stub(
             &radare2,
-            format!(
-                "#!/bin/sh\n: > '{}'\nprintf '%s\\n' '[{{\"addr\":16384,\"size\":2,\"realsz\":2,\"maxaddr\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"addr\":16384,\"bytes\":\"00bf\"}}]}}'\n",
-                sentinel.display()
-            ),
-        )
-        .unwrap();
-        make_executable(&radare2);
+            "#!/bin/sh\nprintf '%s\\n' '[{\"addr\":16384,\"name\":\"fcn.4000\",\"size\":2,\"realsz\":2,\"minaddr\":16384,\"maxaddr\":16386}]' '{\"addr\":16384,\"ops\":[{\"addr\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}'\n",
+        );
+        write_executable_stub(
+            &rizin,
+            &format!("#!/bin/sh\ntouch '{}'\nexit 99\n", sentinel.display()),
+        );
         let mut tools = thumb_tools(&radare2);
-        tools.rizin = Some(crate::thumb_analysis::ProducerIdentity {
-            producer: crate::thumb_analysis::ThumbProducer::Rizin,
-            executable: std::fs::canonicalize(&radare2).unwrap(),
-            version: "rizin test 1.0".into(),
-            command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
-        });
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
         let out = dir.path().join("out");
 
-        let error =
-            run_thumb_analysis(&tools, &[0, 0xbf], 0x4000, &[(0x4000, 2)], &out).unwrap_err();
+        let summary =
+            run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], &out).unwrap();
 
-        assert!(
-            error.to_string().contains("Rizin is unsupported"),
-            "{error}"
-        );
+        assert_eq!(summary.radare2_runs, 1);
+        assert_eq!(summary.rizin_runs, 0);
         assert!(!sentinel.exists());
-        assert!(!out.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_radare2_region_falls_back_to_rizin_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        write_executable_stub(&radare2, "#!/bin/sh\nexit 1\n");
+        write_executable_stub(
+            &rizin,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"offset\":16384,\"name\":\"fcn.4000\",\"size\":2,\"realsz\":2,\"minbound\":16384,\"maxbound\":16386}]' '{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}' '[{\"from\":16384,\"to\":20480,\"type\":\"DATA\"}]'\n",
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+
+        let summary =
+            run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], dir.path()).unwrap();
+
+        assert_eq!(summary.radare2_runs, 0);
+        assert_eq!(summary.rizin_runs, 1);
+        let artifact =
+            crate::thumb_analysis::read_thumb_artifact(&dir.path().join("thumb_functions.json"))
+                .unwrap();
+        let function = artifact.functions().next().unwrap();
+        assert_eq!(
+            function.producer,
+            crate::thumb_analysis::ThumbProducer::Rizin
+        );
+        assert_eq!(function.value["data_refs"], json!(["0x5000"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn radare2_pairing_failure_triggers_exactly_one_rizin_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let rizin_invocations = dir.path().join("rizin-invocations");
+        write_executable_stub(
+            &radare2,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"addr\":16384,\"name\":\"fcn.4000\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}]'\n",
+        );
+        write_executable_stub(
+            &rizin,
+            &format!(
+                "#!/bin/sh\nprintf 'invoked\\n' >> '{}'\nprintf '%s\\n' '[{{\"offset\":16384,\"name\":\"fcn.4000\",\"size\":2,\"realsz\":2,\"maxbound\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}' '[]'\n",
+                rizin_invocations.display()
+            ),
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+
+        let summary =
+            run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], dir.path()).unwrap();
+
+        assert_eq!(summary.radare2_runs, 0);
+        assert_eq!(summary.rizin_runs, 1);
+        assert_eq!(
+            std::fs::read_to_string(rizin_invocations)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            document["regions"][0]["attempts"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("zero paired pdfj bodies")
+        );
+        assert_eq!(document["regions"][0]["attempts"][1]["status"], "succeeded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_regions_have_contiguous_backend_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        write_executable_stub(
+            &radare2,
+            r#"#!/bin/sh
+case " $* " in
+  *" -m 0x4000 "*)
+    printf '%s\n' '[{"addr":16384,"name":"r2.accepted","size":2,"realsz":32,"maxaddr":16386},{"addr":16416,"name":"r2.quarantined","size":2,"realsz":2,"maxaddr":16418}]' '{"addr":16384,"ops":[{"addr":16384,"bytes":"7047","disasm":"bx lr"}]}'
+    ;;
+  *" -m 0x4040 "*) exit 5 ;;
+  *) exit 98 ;;
+esac
+"#,
+        );
+        write_executable_stub(
+            &rizin,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"offset\":16448,\"name\":\"rizin.accepted\",\"size\":2,\"realsz\":2,\"maxbound\":16450}]' '{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}' '[{\"from\":16448,\"to\":20480,\"type\":\"DATA\"}]'\n",
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        let mut image = vec![0u8; 0x80];
+        image[..2].copy_from_slice(&[0x70, 0x47]);
+        image[0x40..0x42].copy_from_slice(&[0x00, 0xbf]);
+
+        let summary = run_thumb_analysis(
+            &tools,
+            &image,
+            0x4000,
+            &[(0x4000, 0x40), (0x4040, 0x40)],
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            crate::thumb_analysis::ThumbAnalysisSummary {
+                regions_requested: 2,
+                regions_succeeded: 2,
+                regions_failed: 0,
+                radare2_runs: 1,
+                rizin_runs: 1,
+                raw: 3,
+                substantial: 1,
+                accepted: 2,
+                quarantined: 1,
+            }
+        );
+        let bytes = std::fs::read(dir.path().join("thumb_functions.json")).unwrap();
+        let artifact = crate::thumb_analysis::parse_thumb_artifact(&bytes).unwrap();
+        let owned = artifact
+            .functions()
+            .map(|function| {
+                (
+                    function.producer,
+                    function.value["name"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owned,
+            vec![
+                (
+                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    "r2.accepted".to_string()
+                ),
+                (
+                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    "r2.quarantined".to_string()
+                ),
+                (
+                    crate::thumb_analysis::ThumbProducer::Rizin,
+                    "rizin.accepted".to_string()
+                ),
+            ]
+        );
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            document["regions"][0]["function_runs"][0]["first_function"],
+            0
+        );
+        assert_eq!(
+            document["regions"][0]["function_runs"][0]["function_count"],
+            2
+        );
+        assert_eq!(
+            document["regions"][1]["function_runs"][0]["first_function"],
+            2
+        );
+        assert_eq!(
+            document["regions"][1]["function_runs"][0]["function_count"],
+            1
+        );
+        assert_eq!(document["regions"][1]["attempts"][0]["status"], "failed");
+        assert_eq!(document["regions"][1]["attempts"][1]["status"], "succeeded");
+        assert_eq!(document["functions"][2]["data_refs"], json!(["0x5000"]));
+        assert!(dir.path().join("thumb/00004000.radare2.stdout").exists());
+        assert!(dir.path().join("thumb/00004040.radare2.stdout").exists());
+        assert!(dir.path().join("thumb/00004040.rizin.stdout").exists());
+        assert!(!dir.path().join("thumb/00004000.rizin.stdout").exists());
+        assert!(
+            std::fs::read_dir(dir.path().join("thumb"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".frags"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_quarantined_radare2_run_does_not_trigger_quality_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let sentinel = dir.path().join("rizin-ran");
+        write_executable_stub(
+            &radare2,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"addr\":16384,\"name\":\"r2.quarantined\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}]' '{\"addr\":16384,\"ops\":[{\"addr\":16384,\"bytes\":\"zz\",\"disasm\":\"invalid\"}]}'\n",
+        );
+        write_executable_stub(
+            &rizin,
+            &format!("#!/bin/sh\ntouch '{}'\nexit 99\n", sentinel.display()),
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+
+        let summary =
+            run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], dir.path()).unwrap();
+
+        assert_eq!(summary.radare2_runs, 1);
+        assert_eq!(summary.rizin_runs, 0);
+        assert_eq!(summary.raw, 1);
+        assert_eq!(summary.accepted, 0);
+        assert_eq!(summary.quarantined, 1);
+        assert!(!sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_radare2_region_does_not_spawn_rizin_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let sentinel = dir.path().join("rizin-ran");
+        write_executable_stub(&radare2, "#!/bin/sh\nexit 1\n");
+        write_executable_stub(
+            &rizin,
+            &format!("#!/bin/sh\ntouch '{}'\nexit 99\n", sentinel.display()),
+        );
+
+        let error = run_thumb_analysis(
+            &thumb_tools(&radare2),
+            &[0x70, 0x47],
+            0x4000,
+            &[(0x4000, 2)],
+            dir.path(),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("Thumb analysis failed for every requested region"));
+        assert!(message.contains("radare2 exited with status 1"));
+        assert!(!message.contains("rizin"));
+        assert!(!sentinel.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_fallback_both_fail_preserves_sidecar_and_orders_attempt_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        write_executable_stub(
+            &radare2,
+            "#!/bin/sh\nprintf 'radare2 failed: %s\\n' \"$*\"\nexit 3\n",
+        );
+        write_executable_stub(
+            &rizin,
+            "#!/bin/sh\nprintf 'rizin failed: %s\\n' \"$*\"\nexit 4\n",
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        let sidecar = dir.path().join("thumb_functions.json");
+        let original = b"pre-existing sidecar bytes\n";
+        std::fs::write(&sidecar, original).unwrap();
+
+        let error = run_thumb_analysis(
+            &tools,
+            &[0u8; 0x80],
+            0x4000,
+            &[(0x4000, 0x20), (0x4040, 0x20)],
+            dir.path(),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        let first_region = message.find("0x4000:").unwrap();
+        let first_radare2 = message[first_region..]
+            .find("radare2 exited with status 3")
+            .map(|index| first_region + index)
+            .unwrap();
+        let first_rizin = message[first_region..]
+            .find("rizin exited with status 4")
+            .map(|index| first_region + index)
+            .unwrap();
+        let second_region = message.find("0x4040:").unwrap();
+        let second_radare2 = message[second_region..]
+            .find("radare2 exited with status 3")
+            .map(|index| second_region + index)
+            .unwrap();
+        let second_rizin = message[second_region..]
+            .find("rizin exited with status 4")
+            .map(|index| second_region + index)
+            .unwrap();
+        assert!(
+            first_region < first_radare2
+                && first_radare2 < first_rizin
+                && first_rizin < second_region
+                && second_region < second_radare2
+                && second_radare2 < second_rizin
+        );
+        assert_eq!(std::fs::read(sidecar).unwrap(), original);
+        for addr in [0x4000u32, 0x4040] {
+            let radare2_capture = dir.path().join(format!("thumb/{addr:08x}.radare2.stdout"));
+            let rizin_capture = dir.path().join(format!("thumb/{addr:08x}.rizin.stdout"));
+            assert!(radare2_capture.exists());
+            assert!(rizin_capture.exists());
+            assert!(
+                std::fs::read_to_string(radare2_capture)
+                    .unwrap()
+                    .starts_with("radare2 failed:")
+            );
+            assert!(
+                std::fs::read_to_string(rizin_capture)
+                    .unwrap()
+                    .starts_with("rizin failed:")
+            );
+        }
+        assert!(
+            std::fs::read_dir(dir.path().join("thumb"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".frags"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_uses_exact_argv_canonical_identities_and_one_shared_carve() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_radare2 = dir.path().join("real-r2");
+        let real_rizin = dir.path().join("real-rizin");
+        let radare2_alias = dir.path().join("r2");
+        let rizin_alias = dir.path().join("rizin");
+        let radare2_argv = dir.path().join("radare2.argv");
+        let rizin_argv = dir.path().join("rizin.argv");
+        let radare2_executable = dir.path().join("radare2.executable");
+        let rizin_executable = dir.path().join("rizin.executable");
+        let radare2_bin_path = dir.path().join("radare2.bin-path");
+        let rizin_bin_path = dir.path().join("rizin.bin-path");
+        let radare2_bytes = dir.path().join("radare2.bin-bytes");
+        let rizin_bytes = dir.path().join("rizin.bin-bytes");
+        let radare2_limit = dir.path().join("radare2.limit");
+        let rizin_limit = dir.path().join("rizin.limit");
+        write_executable_stub(
+            &real_radare2,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$0\" > '{}'\n\
+                 printf '%s\\n' \"$@\" > '{}'\n\
+                 ulimit -v > '{}'\n\
+                 for arg in \"$@\"; do last=$arg; done\n\
+                 printf '%s\\n' \"$last\" > '{}'\n\
+                 cp \"$last\" '{}'\n\
+                 exit 6\n",
+                radare2_executable.display(),
+                radare2_argv.display(),
+                radare2_limit.display(),
+                radare2_bin_path.display(),
+                radare2_bytes.display(),
+            ),
+        );
+        write_executable_stub(
+            &real_rizin,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$0\" > '{}'\n\
+                 printf '%s\\n' \"$@\" > '{}'\n\
+                 ulimit -v > '{}'\n\
+                 for arg in \"$@\"; do last=$arg; done\n\
+                 printf '%s\\n' \"$last\" > '{}'\n\
+                 cp \"$last\" '{}'\n\
+                 printf '%s\\n' '[{{\"offset\":16672,\"name\":\"rizin.shared\",\"size\":2,\"realsz\":2,\"maxbound\":16674}}]' '{{\"addr\":16672,\"ops\":[{{\"offset\":16672,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}' '[]'\n",
+                rizin_executable.display(),
+                rizin_argv.display(),
+                rizin_limit.display(),
+                rizin_bin_path.display(),
+                rizin_bytes.display(),
+            ),
+        );
+        symlink(&real_radare2, &radare2_alias).unwrap();
+        symlink(&real_rizin, &rizin_alias).unwrap();
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                &radare2_alias,
+            ),
+            rizin: Some(test_identity(
+                crate::thumb_analysis::ThumbProducer::Rizin,
+                &rizin_alias,
+            )),
+        };
+        let mut image = vec![0u8; 0x200];
+        image[0x120..0x124].copy_from_slice(&[0x70, 0x47, 0xaa, 0x55]);
+
+        let summary =
+            run_thumb_analysis(&tools, &image, 0x4000, &[(0x4120, 4)], dir.path()).unwrap();
+
+        assert_eq!(summary.radare2_runs, 0);
+        assert_eq!(summary.rizin_runs, 1);
+        let carved = dir.path().join("thumb/00004120.bin");
+        let expected_radare2 = vec![
+            "-a".to_string(),
+            "arm".to_string(),
+            "-b".to_string(),
+            "16".to_string(),
+            "-m".to_string(),
+            "0x4120".to_string(),
+            "-q".to_string(),
+            "-c".to_string(),
+            crate::thumb_analysis::ThumbProducer::Radare2
+                .command()
+                .to_string(),
+            carved.display().to_string(),
+        ];
+        let expected_rizin = vec![
+            "-a".to_string(),
+            "arm".to_string(),
+            "-b".to_string(),
+            "16".to_string(),
+            "-m".to_string(),
+            "0x4120".to_string(),
+            "-q".to_string(),
+            "-c".to_string(),
+            crate::thumb_analysis::ThumbProducer::Rizin
+                .command()
+                .to_string(),
+            carved.display().to_string(),
+        ];
+        assert_eq!(
+            std::fs::read_to_string(radare2_argv)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            expected_radare2
+        );
+        assert_eq!(
+            std::fs::read_to_string(rizin_argv)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            expected_rizin
+        );
+        assert_eq!(
+            std::fs::read_to_string(radare2_executable).unwrap().trim(),
+            std::fs::canonicalize(&real_radare2)
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(rizin_executable).unwrap().trim(),
+            std::fs::canonicalize(&real_rizin)
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(radare2_bin_path).unwrap().trim(),
+            carved.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(rizin_bin_path).unwrap().trim(),
+            carved.to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read(radare2_bytes).unwrap(),
+            [0x70, 0x47, 0xaa, 0x55]
+        );
+        assert_eq!(
+            std::fs::read(rizin_bytes).unwrap(),
+            [0x70, 0x47, 0xaa, 0x55]
+        );
+        let expected_limit = (ANALYZER_ADDRESS_SPACE_CAP_BYTES / 1024).to_string();
+        assert_eq!(
+            std::fs::read_to_string(radare2_limit).unwrap().trim(),
+            expected_limit
+        );
+        assert_eq!(
+            std::fs::read_to_string(rizin_limit).unwrap().trim(),
+            expected_limit
+        );
+
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["producers"][0]["id"], "radare2");
+        assert_eq!(
+            document["producers"][0]["executable"],
+            tools.radare2.executable.to_str().unwrap()
+        );
+        assert_eq!(document["producers"][0]["version"], tools.radare2.version);
+        assert_eq!(document["producers"][0]["command"], tools.radare2.command);
+        let rizin_identity = tools.rizin.as_ref().unwrap();
+        assert_eq!(document["producers"][1]["id"], "rizin");
+        assert_eq!(
+            document["producers"][1]["executable"],
+            rizin_identity.executable.to_str().unwrap()
+        );
+        assert_eq!(document["producers"][1]["version"], rizin_identity.version);
+        assert_eq!(document["producers"][1]["command"], rizin_identity.command);
+        assert!(dir.path().join("thumb/00004120.radare2.stdout").exists());
+        assert!(dir.path().join("thumb/00004120.rizin.stdout").exists());
+        assert!(!dir.path().join("thumb/00004120.stdout").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_runner_enforces_stdout_cap_for_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("00004000.bin");
+        std::fs::write(&bin, [0u8; 2]).unwrap();
+
+        for producer in [
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            crate::thumb_analysis::ThumbProducer::Rizin,
+        ] {
+            let executable = dir.path().join(producer.as_str());
+            let sentinel = dir.path().join(format!("{}-continued", producer.as_str()));
+            write_executable_stub(
+                &executable,
+                &format!(
+                    "#!/bin/sh\nprintf '123456789'\nsleep 1\ntouch '{}'\n",
+                    sentinel.display()
+                ),
+            );
+            let identity = test_identity(producer, &executable);
+            let stdout = dir
+                .path()
+                .join(format!("00004000.{}.stdout", producer.as_str()));
+            let failure = run_backend_capture(
+                &identity,
+                &bin,
+                0x4000,
+                &stdout,
+                8,
+                (producer == crate::thumb_analysis::ThumbProducer::Rizin)
+                    .then_some(Duration::from_secs(1)),
+            )
+            .unwrap_err();
+
+            assert!(failure.capture.is_none());
+            let reason = failure.error.to_string();
+            assert!(reason.contains(producer.as_str()), "{reason}");
+            assert!(reason.contains("more than 8 stdout bytes"), "{reason}");
+            assert!(!stdout.exists());
+            assert!(!sentinel.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_runner_never_reports_an_unfinalized_capture() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("r2");
+        let bin = dir.path().join("00004000.bin");
+        let stdout = dir.path().join("00004000.radare2.stdout");
+        write_executable_stub(&executable, "#!/bin/sh\nprintf 'captured bytes'\n");
+        std::fs::write(&bin, [0u8; 2]).unwrap();
+        symlink("/dev/full", &stdout).unwrap();
+
+        let failure = run_backend_capture(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Radare2, &executable),
+            &bin,
+            0x4000,
+            &stdout,
+            1024,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(failure.capture.is_none());
+        let reason = failure.error.to_string();
+        assert!(reason.contains("radare2 stdout capture failed"), "{reason}");
+        assert!(!stdout.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rizin_normalization_removes_partial_fragments_before_partial_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        write_executable_stub(
+            &radare2,
+            r#"#!/bin/sh
+case " $* " in
+  *" -m 0x4000 "*)
+    printf '%s\n' '[{"addr":16384,"name":"r2.kept","size":2,"realsz":2,"maxaddr":16386}]' '{"addr":16384,"ops":[{"addr":16384,"bytes":"7047","disasm":"bx lr"}]}'
+    ;;
+  *" -m 0x4040 "*) exit 7 ;;
+  *) exit 98 ;;
+esac
+"#,
+        );
+        write_executable_stub(
+            &rizin,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"offset\":16448,\"name\":\"rizin.partial\",\"size\":2,\"realsz\":2,\"maxbound\":16450},{\"offset\":16450,\"name\":\"rizin.invalid\",\"size\":2,\"realsz\":2}]' '{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}' '{\"addr\":16450,\"ops\":[{\"offset\":16450,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}' '[]'\n",
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        let mut image = vec![0u8; 0x80];
+        image[..2].copy_from_slice(&[0x70, 0x47]);
+        image[0x40..0x44].copy_from_slice(&[0x00, 0xbf, 0x70, 0x47]);
+
+        let summary = run_thumb_analysis(
+            &tools,
+            &image,
+            0x4000,
+            &[(0x4000, 0x40), (0x4040, 0x40)],
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.regions_succeeded, 1);
+        assert_eq!(summary.regions_failed, 1);
+        assert_eq!(summary.radare2_runs, 1);
+        assert_eq!(summary.rizin_runs, 0);
+        assert_eq!(summary.raw, 1);
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["functions"].as_array().unwrap().len(), 1);
+        assert_eq!(document["functions"][0]["name"], "r2.kept");
+        assert_eq!(document["regions"][1]["attempts"][1]["status"], "failed");
+        assert!(
+            document["regions"][1]["attempts"][1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("maxbound")
+        );
+        assert!(
+            document["regions"][1]["function_runs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(dir.path().join("thumb/00004040.rizin.stdout").exists());
+        assert!(!dir.path().join("thumb/00004040.rizin.frags").exists());
+        assert!(!dir.path().join("thumb/00004000.radare2.frags").exists());
+    }
+
+    #[cfg(unix)]
+    fn assert_process_or_group_gone(id: libc::pid_t) {
+        for _ in 0..100 {
+            // SAFETY: signal 0 performs existence/permission checking only.
+            let result = unsafe { libc::kill(id, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("process or process group {id} survived analyzer cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rizin_timeout_reaps_process_group_and_retains_finalized_partial_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let parent_pid_path = dir.path().join("rizin-parent.pid");
+        let child_pid_path = dir.path().join("rizin-child.pid");
+        write_executable_stub(
+            &radare2,
+            r#"#!/bin/sh
+case " $* " in
+  *" -m 0x4000 "*)
+    printf '%s\n' '[{"addr":16384,"name":"fcn.4000","size":2,"realsz":2,"maxaddr":16386}]' '{"addr":16384,"ops":[{"addr":16384,"bytes":"7047","disasm":"bx lr"}]}'
+    ;;
+  *" -m 0x4040 "*)
+    exit 7
+    ;;
+  *) exit 98 ;;
+esac
+"#,
+        );
+        write_executable_stub(
+            &rizin,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$$\" > '{}'\n\
+                 sleep 1 &\n\
+                 child=$!\n\
+                 printf '%s\\n' \"$child\" > '{}'\n\
+                 printf 'partial rizin capture\\n'\n\
+                 wait \"$child\"\n",
+                parent_pid_path.display(),
+                child_pid_path.display(),
+            ),
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        let mut image = vec![0u8; 0x80];
+        image[..2].copy_from_slice(&[0x70, 0x47]);
+        let summary = run_thumb_analysis_with_limits(
+            &tools,
+            &image,
+            0x4000,
+            &[(0x4000, 0x40), (0x4040, 0x40)],
+            dir.path(),
+            RunnerLimits {
+                stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
+                rizin_timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.regions_succeeded, 1);
+        assert_eq!(summary.regions_failed, 1);
+        assert_eq!(summary.radare2_runs, 1);
+        assert_eq!(summary.rizin_runs, 0);
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        let timed_out = &document["regions"][1]["attempts"][1];
+        assert_eq!(timed_out["producer"], "rizin");
+        assert_eq!(timed_out["status"], "failed");
+        let reason = timed_out["error"].as_str().unwrap();
+        assert!(reason.contains("rizin") && reason.contains("timed out after 50 ms"));
+        assert!(
+            document["regions"][1]["function_runs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let capture = &timed_out["stdout"];
+        assert_eq!(capture["path"], "thumb/00004040.rizin.stdout");
+        let retained = std::fs::read(dir.path().join(capture["path"].as_str().unwrap())).unwrap();
+        assert_eq!(retained, b"partial rizin capture\n");
+        assert_eq!(capture["bytes"], retained.len() as u64);
+        assert_eq!(capture["blake3"], blake3::hash(&retained).to_hex().as_str());
+        assert!(!dir.path().join("thumb/00004040.rizin.frags").exists());
+
+        let parent_pid: libc::pid_t = std::fs::read_to_string(parent_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let child_pid: libc::pid_t = std::fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut status = 0;
+        // SAFETY: this only queries whether the analyzer child remains waitable.
+        let wait_result = unsafe { libc::waitpid(parent_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(wait_result, -1, "immediate analyzer child was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "immediate analyzer child is still owned by the test process"
+        );
+        assert_process_or_group_gone(parent_pid);
+        assert_process_or_group_gone(child_pid);
+        assert_process_or_group_gone(-parent_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_rizin_deadline_does_not_apply_to_radare2() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let sentinel = dir.path().join("rizin-ran");
+        write_executable_stub(
+            &radare2,
+            "#!/bin/sh\nsleep 0.1\nprintf '%s\\n' '[{\"addr\":16384,\"name\":\"r2.slow\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}]' '{\"addr\":16384,\"ops\":[{\"addr\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}'\n",
+        );
+        write_executable_stub(
+            &rizin,
+            &format!("#!/bin/sh\ntouch '{}'\nexit 99\n", sentinel.display()),
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+
+        let summary = run_thumb_analysis_with_limits(
+            &tools,
+            &[0x70, 0x47],
+            0x4000,
+            &[(0x4000, 2)],
+            dir.path(),
+            RunnerLimits {
+                stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
+                rizin_timeout: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.radare2_runs, 1);
+        assert_eq!(summary.rizin_runs, 0);
+        assert!(!sentinel.exists());
     }
 
     #[cfg(unix)]
@@ -2917,22 +4165,22 @@ esac
     }
 
     #[test]
-    fn stream_to_cap_streams_chunks_until_eof() {
+    fn capture_to_cap_streams_chunks_until_eof() {
         let input = vec![0xABu8; 100 * 1024]; // 100 KiB
         let mut reader = std::io::Cursor::new(&input[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let capture = stream_to_cap(&mut reader, &mut writer, 1024 * 1024, "capture").unwrap();
+        let capture = capture_to_cap(&mut reader, &mut writer, 1024 * 1024, "capture").unwrap();
         assert_eq!(capture.bytes, 100 * 1024);
         assert_eq!(writer, input);
     }
 
     #[test]
-    fn stream_to_cap_returns_capture_identity_without_rereading() {
+    fn capture_to_cap_returns_capture_identity_without_rereading() {
         let input = b"captured radare2 stdout";
         let mut reader = std::io::Cursor::new(input);
         let mut writer = Vec::new();
 
-        let capture = stream_to_cap(
+        let capture = capture_to_cap(
             &mut reader,
             &mut writer,
             1024,
@@ -2947,12 +4195,12 @@ esac
     }
 
     #[test]
-    fn stream_to_cap_returns_err_on_cap_exceed() {
+    fn capture_to_cap_returns_err_on_cap_exceed() {
         let cap = 1024;
         let input = vec![0xCDu8; cap + 1];
         let mut reader = std::io::Cursor::new(&input[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let err = stream_to_cap(&mut reader, &mut writer, cap, "capture").unwrap_err();
+        let err = capture_to_cap(&mut reader, &mut writer, cap, "capture").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(
             err.to_string().contains(&format!("{cap}")),
@@ -2964,45 +4212,45 @@ esac
     }
 
     #[test]
-    fn stream_to_cap_handles_empty_input() {
+    fn capture_to_cap_handles_empty_input() {
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
         let mut writer: Vec<u8> = Vec::new();
-        let capture = stream_to_cap(&mut reader, &mut writer, 1024, "capture").unwrap();
+        let capture = capture_to_cap(&mut reader, &mut writer, 1024, "capture").unwrap();
         assert_eq!(capture.bytes, 0);
         assert!(writer.is_empty());
     }
 
     #[test]
-    fn stream_to_cap_handles_exact_cap_input() {
+    fn capture_to_cap_handles_exact_cap_input() {
         // Equal-to-cap is OK; exceeds is not. Boundary sentinel.
         let cap = 4096;
         let input = vec![0xEFu8; cap];
         let mut reader = std::io::Cursor::new(&input[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let capture = stream_to_cap(&mut reader, &mut writer, cap, "capture").unwrap();
+        let capture = capture_to_cap(&mut reader, &mut writer, cap, "capture").unwrap();
         assert_eq!(capture.bytes, cap as u64);
         assert_eq!(writer, input);
     }
 
     #[test]
-    fn r2_stdout_cap_bytes_is_4_gib() {
+    fn analyzer_stdout_cap_bytes_is_4_gib() {
         // Regression sentinel against accidental value drift.
-        assert_eq!(R2_STDOUT_CAP_BYTES, 4 * 1024 * 1024 * 1024);
+        assert_eq!(ANALYZER_STDOUT_CAP_BYTES, 4 * 1024 * 1024 * 1024);
     }
 
     #[cfg(unix)]
     #[test]
-    fn r2_address_space_cap_is_applied_to_child_process() {
-        // `limit_r2_address_space` must set RLIMIT_AS on the spawned child so a
+    fn analyzer_address_space_cap_is_applied_to_child_process() {
+        // `configure_analyzer_process` must set RLIMIT_AS on the spawned child so a
         // runaway r2 gets ENOMEM (and fails closed) instead of OOM-killing the
         // host. Observe it through a child `ulimit -v`, which reports the soft
         // address-space limit in KiB.
         let mut cmd = std::process::Command::new("bash");
         cmd.args(["-c", "ulimit -v"]);
-        limit_r2_address_space(&mut cmd);
+        configure_analyzer_process(&mut cmd);
         let out = cmd.output().expect("spawn bash for ulimit probe");
         let printed = String::from_utf8_lossy(&out.stdout);
-        let expected_kib = (R2_ADDRESS_SPACE_CAP_BYTES / 1024).to_string();
+        let expected_kib = (ANALYZER_ADDRESS_SPACE_CAP_BYTES / 1024).to_string();
         assert_eq!(printed.trim(), expected_kib);
     }
 
@@ -3077,9 +4325,10 @@ esac
         .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("failed for every requested region"));
-        let first = message.find("0x4000 radare2:").unwrap();
-        let second = message.find("0x4040 radare2:").unwrap();
+        let first = message.find("0x4000:").unwrap();
+        let second = message.find("0x4040:").unwrap();
         assert!(first < second, "region failures must retain request order");
+        assert_eq!(message.matches("radare2 exited with status 1").count(), 2);
         assert_eq!(std::fs::read(sidecar).unwrap(), b"old");
     }
 
@@ -3349,7 +4598,8 @@ INFO: second pdfj body was noisy and not parseable
 
     #[test]
     fn radare2_thumb_rejects_non_zero_process_status() {
-        let err = check_radare2_thumb_status(false, Some(7), 0x4000).unwrap_err();
+        let err =
+            check_thumb_backend_status(ThumbProducer::Radare2, false, Some(7), 0x4000).unwrap_err();
 
         assert!(
             matches!(err, Error::Serialize(message) if message.contains("exited with status 7"))
@@ -3911,8 +5161,8 @@ INFO: second pdfj body was noisy and not parseable
         assert_eq!(outcome.stats.accepted, accepted);
     }
 
-    /// Env-gated production replay for retained radare2 captures. Stage 2
-    /// intentionally changes function boundaries, so this checks that real
+    /// Env-gated production replay for retained radare2 captures. V3
+    /// intentionally changed function boundaries, so this checks that real
     /// inventories carry the required v3 fields and still normalize with
     /// conserving counts rather than comparing against legacy v2 bytes.
     #[test]

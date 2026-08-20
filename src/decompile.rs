@@ -310,9 +310,9 @@ pub struct ImageResult {
     pub thumb_regions_succeeded: Option<usize>,
     /// Requested Thumb regions for which every configured attempt failed.
     pub thumb_regions_failed: Option<usize>,
-    /// Number of radare2 region attempts made by this run.
+    /// Number of successful radare2-owned function runs.
     pub thumb_radare2_runs: Option<usize>,
-    /// Number of Rizin fallback attempts made by this run.
+    /// Number of successful Rizin-owned function runs.
     pub thumb_rizin_runs: Option<usize>,
     /// Current Ghidra source records with a validated accepted projection.
     pub ghidra_execution_accepted: Option<usize>,
@@ -444,7 +444,7 @@ fn inventory_counts(
 
 fn validate_thumb_analysis_currentness(
     terminal: &TerminalInventorySummary,
-    expected_radare2: &crate::thumb_analysis::ProducerIdentity,
+    expected_tools: &crate::thumb_analysis::ThumbTools,
     expected_region_requests: &[(u32, u32)],
     expected: &crate::thumb_analysis::ThumbAnalysisSummary,
 ) -> Result<()> {
@@ -461,9 +461,28 @@ fn validate_thumb_analysis_currentness(
             metadata.format.as_str(),
         )));
     }
-    if metadata.producers.len() != 1
-        || metadata.producers[0].producer != crate::thumb_analysis::ThumbProducer::Radare2
-    {
+    if expected.rizin_runs > 0 && expected_tools.rizin.is_none() {
+        return Err(Error::Serialize(
+            "current Thumb analysis lost its Rizin producer identity".into(),
+        ));
+    }
+    let mut expected_producers = vec![&expected_tools.radare2];
+    let rizin_attempted =
+        expected.rizin_runs > 0 || (expected.regions_failed > 0 && expected_tools.rizin.is_some());
+    if rizin_attempted {
+        expected_producers.push(
+            expected_tools
+                .rizin
+                .as_ref()
+                .expect("Rizin attempt requires configured identity"),
+        );
+    }
+    if metadata.producers.len() != expected_producers.len() {
+        let expected = expected_producers
+            .iter()
+            .map(|producer| producer.producer.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let found = metadata
             .producers
             .iter()
@@ -471,35 +490,39 @@ fn validate_thumb_analysis_currentness(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(Error::Serialize(format!(
-            "current Thumb producer configuration mismatch: expected exactly [radare2], found [{found}]"
+            "current Thumb producer configuration mismatch: expected exactly [{expected}], found [{found}]"
         )));
     }
-    let observed_radare2 = &metadata.producers[0];
-    if observed_radare2.producer != expected_radare2.producer {
-        return Err(Error::Serialize(format!(
-            "current Thumb producer identity mismatch: expected {}, found {}",
-            expected_radare2.producer.as_str(),
-            observed_radare2.producer.as_str(),
-        )));
-    }
-    if observed_radare2.executable != expected_radare2.executable {
-        return Err(Error::Serialize(format!(
-            "current Thumb radare2 executable mismatch: expected {}, found {}",
-            expected_radare2.executable.display(),
-            observed_radare2.executable.display(),
-        )));
-    }
-    if observed_radare2.version != expected_radare2.version {
-        return Err(Error::Serialize(format!(
-            "current Thumb radare2 version mismatch: expected {:?}, found {:?}",
-            expected_radare2.version, observed_radare2.version,
-        )));
-    }
-    if observed_radare2.command != expected_radare2.command {
-        return Err(Error::Serialize(format!(
-            "current Thumb radare2 command mismatch: expected {:?}, found {:?}",
-            expected_radare2.command, observed_radare2.command,
-        )));
+    for (expected_producer, observed_producer) in
+        expected_producers.into_iter().zip(&metadata.producers)
+    {
+        if observed_producer.producer != expected_producer.producer {
+            return Err(Error::Serialize(format!(
+                "current Thumb producer identity mismatch: expected {}, found {}",
+                expected_producer.producer.as_str(),
+                observed_producer.producer.as_str(),
+            )));
+        }
+        let producer = expected_producer.producer.as_str();
+        if observed_producer.executable != expected_producer.executable {
+            return Err(Error::Serialize(format!(
+                "current Thumb {producer} executable mismatch: expected {}, found {}",
+                expected_producer.executable.display(),
+                observed_producer.executable.display(),
+            )));
+        }
+        if observed_producer.version != expected_producer.version {
+            return Err(Error::Serialize(format!(
+                "current Thumb {producer} version mismatch: expected {:?}, found {:?}",
+                expected_producer.version, observed_producer.version,
+            )));
+        }
+        if observed_producer.command != expected_producer.command {
+            return Err(Error::Serialize(format!(
+                "current Thumb {producer} command mismatch: expected {:?}, found {:?}",
+                expected_producer.command, observed_producer.command,
+            )));
+        }
     }
     for (field, expected, observed) in [
         (
@@ -1700,16 +1723,14 @@ fn run_report_impl(
                 )
                 .and_then(|summary| {
                     if let Some(expected) = &thumb_summary {
-                        let expected_radare2 =
-                            thumb_tools.map(|tools| &tools.radare2).ok_or_else(|| {
-                                Error::Serialize(
-                                    "current Thumb analysis lost its injected radare2 identity"
-                                        .into(),
-                                )
-                            })?;
+                        let expected_tools = thumb_tools.ok_or_else(|| {
+                            Error::Serialize(
+                                "current Thumb analysis lost its injected tool identities".into(),
+                            )
+                        })?;
                         validate_thumb_analysis_currentness(
                             &summary,
-                            expected_radare2,
+                            expected_tools,
                             &regions,
                             expected,
                         )?;
@@ -4196,6 +4217,112 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
   ]
 }"#;
 
+    const TERMINAL_MIXED_V3_ARTIFACT: &str = r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {
+      "id": "radare2",
+      "executable": "/usr/bin/r2",
+      "version": "radare2 test 1.0",
+      "command": "aaa;aflj;pdfj @@f"
+    },
+    {
+      "id": "rizin",
+      "executable": "/usr/bin/rizin",
+      "version": "rizin test 1.0",
+      "command": "aaa;aflj;pdfj @@F;axlj"
+    }
+  ],
+  "regions": [
+    {
+      "start": "0x4000",
+      "end": "0x4002",
+      "attempts": [
+        {
+          "producer": "radare2",
+          "status": "succeeded",
+          "stdout": {
+            "path": "thumb/00004000.radare2.stdout",
+            "bytes": 2,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "error": null
+        }
+      ],
+      "function_runs": [
+        {
+          "producer": "radare2",
+          "first_function": 0,
+          "function_count": 1,
+          "substantial": 0,
+          "accepted": 1,
+          "quarantined": 0
+        }
+      ]
+    },
+    {
+      "start": "0x4010",
+      "end": "0x4012",
+      "attempts": [
+        {
+          "producer": "radare2",
+          "status": "failed",
+          "stdout": {
+            "path": "thumb/00004010.radare2.stdout",
+            "bytes": 0,
+            "blake3": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "error": "radare2 exited with status 1 for Thumb region 0x4010"
+        },
+        {
+          "producer": "rizin",
+          "status": "succeeded",
+          "stdout": {
+            "path": "thumb/00004010.rizin.stdout",
+            "bytes": 2,
+            "blake3": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "error": null
+        }
+      ],
+      "function_runs": [
+        {
+          "producer": "rizin",
+          "first_function": 1,
+          "function_count": 1,
+          "substantial": 0,
+          "accepted": 1,
+          "quarantined": 0
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "body": "0x00004000      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [{"end":"0x4002","isa":"thumb","start":"0x4000"}],
+      "end": "0x4002",
+      "entry": "0x4000",
+      "name": "sym.r2",
+      "size": 2
+    },
+    {
+      "body": "0x00004010      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [{"end":"0x4012","isa":"thumb","start":"0x4010"}],
+      "end": "0x4012",
+      "entry": "0x4010",
+      "name": "sym.rizin",
+      "size": 2
+    }
+  ]
+}"#;
+
     const TERMINAL_V2_ARTIFACT: &str = r#"{
   "format": "pixel-modem-extractor-thumb-functions-v2",
   "functions": [
@@ -4225,6 +4352,15 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
             executable: "/usr/bin/r2".into(),
             version: "radare2 test 1.0".into(),
             command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+        }
+    }
+
+    fn terminal_rizin_identity() -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Rizin,
+            executable: "/usr/bin/rizin".into(),
+            version: "rizin test 1.0".into(),
+            command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
         }
     }
 
@@ -4270,7 +4406,11 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
         regions: &[(u32, u32)],
         summary: &crate::thumb_analysis::ThumbAnalysisSummary,
     ) -> String {
-        validate_thumb_analysis_currentness(terminal, identity, regions, summary)
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: identity.clone(),
+            rizin: None,
+        };
+        validate_thumb_analysis_currentness(terminal, &tools, regions, summary)
             .unwrap_err()
             .to_string()
     }
@@ -4323,6 +4463,68 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
         for (artifact, expected, message) in cases {
             assert_eq!(currentness_error(&artifact, &expected, &summary), message);
         }
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_accepts_exact_mixed_producer_ownership() {
+        let terminal = terminal_inventory_for_artifact(TERMINAL_MIXED_V3_ARTIFACT);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: terminal_radare2_identity(),
+            rizin: Some(terminal_rizin_identity()),
+        };
+        let summary = crate::thumb_analysis::ThumbAnalysisSummary {
+            regions_requested: 2,
+            regions_succeeded: 2,
+            regions_failed: 0,
+            radare2_runs: 1,
+            rizin_runs: 1,
+            raw: 2,
+            substantial: 0,
+            accepted: 2,
+            quarantined: 0,
+        };
+
+        validate_thumb_analysis_currentness(
+            &terminal,
+            &tools,
+            &[(0x4000, 2), (0x4010, 2)],
+            &summary,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_stale_rizin_identity() {
+        let stale = TERMINAL_MIXED_V3_ARTIFACT.replacen("rizin test 1.0", "rizin stale 0.9", 1);
+        let terminal = terminal_inventory_for_artifact(&stale);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: terminal_radare2_identity(),
+            rizin: Some(terminal_rizin_identity()),
+        };
+        let summary = crate::thumb_analysis::ThumbAnalysisSummary {
+            regions_requested: 2,
+            regions_succeeded: 2,
+            regions_failed: 0,
+            radare2_runs: 1,
+            rizin_runs: 1,
+            raw: 2,
+            substantial: 0,
+            accepted: 2,
+            quarantined: 0,
+        };
+
+        let error = validate_thumb_analysis_currentness(
+            &terminal,
+            &tools,
+            &[(0x4000, 2), (0x4010, 2)],
+            &summary,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "serialize: current Thumb rizin version mismatch: expected \"rizin test 1.0\", found \"rizin stale 0.9\""
+        );
     }
 
     #[test]
@@ -4424,7 +4626,10 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
     fn terminal_inventory_currentness_accepts_matching_v3_provenance_and_summary() {
         validate_thumb_analysis_currentness(
             &terminal_inventory_for_artifact(TERMINAL_V3_ARTIFACT),
-            &terminal_radare2_identity(),
+            &crate::thumb_analysis::ThumbTools {
+                radare2: terminal_radare2_identity(),
+                rizin: None,
+            },
             &[(0x4000, 0x10)],
             &terminal_thumb_summary(),
         )
