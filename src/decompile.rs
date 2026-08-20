@@ -1179,9 +1179,104 @@ fn materialize_runtime_load_maps(toc: &Toc, data: &[u8], out: &Path) -> Result<R
 /// image — returning the structured per-image outcomes plus the `ghidra_load.json` path.
 /// Unlike [`run`], this never errors on a per-image analysis failure: every partition is
 /// attempted and recorded, so an orchestrator (e.g. `decompose`) decides what a failure means.
+/// Analyzer discovery occurs once before any modem or output work.
 pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<DecompileReport> {
-    let rizin =
-        discover_configured_rizin(opts.rizin_fallback, crate::thumb_analysis::discover_rizin)?;
+    run_report_with_discovery(
+        modem_bin,
+        opts,
+        out,
+        crate::thumb_analysis::discover_radare2,
+        crate::thumb_analysis::discover_rizin,
+    )
+}
+
+fn run_report_with_discovery(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    discover_radare2: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+    discover_rizin: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+) -> Result<DecompileReport> {
+    if !opts.run {
+        let _rizin = discover_configured_rizin(opts.rizin_fallback, discover_rizin)?;
+        return run_report_impl(
+            modem_bin,
+            opts,
+            out,
+            None,
+            None,
+            crate::thumb_analysis::run_thumb_analysis,
+        );
+    }
+
+    let radare2 = discover_radare2();
+    let rizin = discover_configured_rizin(opts.rizin_fallback, discover_rizin)?;
+    match &radare2 {
+        Ok(radare2) => {
+            let thumb_tools = crate::thumb_analysis::ThumbTools {
+                radare2: radare2.clone(),
+                rizin,
+            };
+            run_report_with_thumb_tools(modem_bin, opts, out, &thumb_tools)
+        }
+        Err(error) => run_report_impl(
+            modem_bin,
+            opts,
+            out,
+            None,
+            Some(error),
+            crate::thumb_analysis::run_thumb_analysis,
+        ),
+    }
+}
+
+/// Run with identities already retained by an orchestrator's preflight. This path performs no
+/// analyzer discovery, ensuring analysis and outer reporting observe the same tool identities.
+pub(crate) fn run_report_with_thumb_tools(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+) -> Result<DecompileReport> {
+    run_report_with_thumb_tools_and_analyzer(
+        modem_bin,
+        opts,
+        out,
+        thumb_tools,
+        crate::thumb_analysis::run_thumb_analysis,
+    )
+}
+
+fn run_report_with_thumb_tools_and_analyzer(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+    analyze_thumb: impl FnMut(
+        &crate::thumb_analysis::ThumbTools,
+        &[u8],
+        u32,
+        &[(u32, u32)],
+        &Path,
+    ) -> Result<crate::thumb_analysis::ThumbAnalysisSummary>,
+) -> Result<DecompileReport> {
+    run_report_impl(modem_bin, opts, out, Some(thumb_tools), None, analyze_thumb)
+}
+
+fn run_report_impl(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    thumb_tools: Option<&crate::thumb_analysis::ThumbTools>,
+    radare2_error: Option<&Error>,
+    mut analyze_thumb: impl FnMut(
+        &crate::thumb_analysis::ThumbTools,
+        &[u8],
+        u32,
+        &[(u32, u32)],
+        &Path,
+    ) -> Result<crate::thumb_analysis::ThumbAnalysisSummary>,
+) -> Result<DecompileReport> {
     let data = std::fs::read(modem_bin)?;
     let toc = Toc::parse(&data)?;
     std::fs::create_dir_all(out)?;
@@ -1244,7 +1339,6 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         std::fs::create_dir_all(ghidra_temp_home(&root))?;
         let root_str = root.to_string_lossy().into_owned();
         let want = opts.image.as_deref();
-        let radare2 = crate::thumb_analysis::discover_radare2();
         // Analyze every selected image, recording each outcome rather than aborting on the
         // first failure — so a heavy or unanalyzable partition (the ~87 MB MAIN, or an
         // encrypted one) can't sink the rest of a full run.
@@ -1554,12 +1648,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             // marked them as data — hand them to radare2 for the protocol stack.
             let (thumb_summary, thumb_error) = if regions.is_empty() {
                 (None, None)
-            } else if let Ok(radare2) = &radare2 {
-                match crate::thumb_analysis::run_thumb_analysis(
-                    &crate::thumb_analysis::ThumbTools {
-                        radare2: radare2.clone(),
-                        rizin: rizin.clone(),
-                    },
+            } else if let Some(thumb_tools) = thumb_tools {
+                match analyze_thumb(
+                    thumb_tools,
                     img,
                     e.load_addr,
                     &regions,
@@ -1589,7 +1680,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 let err = format!(
                     "{} Thumb region(s) left unanalyzed because radare2 is unavailable: {}",
                     regions.len(),
-                    radare2.as_ref().unwrap_err()
+                    radare2_error
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "discovery result was not supplied".to_string())
                 );
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
@@ -1607,11 +1700,13 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 )
                 .and_then(|summary| {
                     if let Some(expected) = &thumb_summary {
-                        let expected_radare2 = radare2.as_ref().map_err(|error| {
-                            Error::Serialize(format!(
-                                "current Thumb analysis lost its radare2 identity: {error}"
-                            ))
-                        })?;
+                        let expected_radare2 =
+                            thumb_tools.map(|tools| &tools.radare2).ok_or_else(|| {
+                                Error::Serialize(
+                                    "current Thumb analysis lost its injected radare2 identity"
+                                        .into(),
+                                )
+                            })?;
                         validate_thumb_analysis_currentness(
                             &summary,
                             expected_radare2,
@@ -2952,6 +3047,57 @@ mod tests {
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         }
+    }
+
+    fn test_identity(
+        producer: crate::thumb_analysis::ThumbProducer,
+        executable: &str,
+        version: &str,
+    ) -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer,
+            executable: executable.into(),
+            version: version.into(),
+            command: producer.command(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_headless(home: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let headless = home.join("support/analyzeHeadless");
+        std::fs::create_dir_all(headless.parent().unwrap()).unwrap();
+        std::fs::write(
+            &headless,
+            format!(
+                r#"#!/bin/sh
+set -eu
+export_dir=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "ExportDecomp.java" ]; then
+    shift
+    export_dir=$1
+    break
+  fi
+  shift
+done
+test -n "$export_dir"
+mkdir -p "$export_dir"
+printf '%s\n' '[]' > "$export_dir/functions.json"
+: > "$export_dir/disasm.lst"
+: > "$export_dir/decompiled.c"
+export_root=$(dirname "$export_dir")
+label=$(basename "$export_dir")
+printf '%s\n' '{}' > "$export_root/$label.complete"
+"#,
+                GHIDRA_EXPORT_COMPLETION
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&headless).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(headless, permissions).unwrap();
     }
 
     #[test]
@@ -4523,6 +4669,96 @@ mod tests {
 
         assert!(
             matches!(error, Error::ToolNotFound(reason) if reason == "configured Rizin is unusable")
+        );
+    }
+
+    #[test]
+    fn run_report_discovers_each_configured_thumb_tool_once_before_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.rizin_fallback = true;
+        let radare2_calls = std::cell::Cell::new(0);
+        let rizin_calls = std::cell::Cell::new(0);
+
+        let error = run_report_with_discovery(
+            &dir.path().join("missing-modem.bin"),
+            &opts,
+            &out,
+            || {
+                radare2_calls.set(radare2_calls.get() + 1);
+                Ok(test_identity(
+                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    "/tools/r2",
+                    "radare2 exact",
+                ))
+            },
+            || {
+                rizin_calls.set(rizin_calls.get() + 1);
+                Ok(test_identity(
+                    crate::thumb_analysis::ThumbProducer::Rizin,
+                    "/tools/rizin",
+                    "rizin exact",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Io(_)));
+        assert_eq!(radare2_calls.get(), 1);
+        assert_eq!(rizin_calls.get(), 1);
+        assert!(!out.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_thumb_tools_reach_analysis_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_thumb_decompile = true;
+        opts.rizin_fallback = true;
+        opts.no_skip_opaque = true;
+        let mut expected = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/preflight/r2",
+                "radare2 preflight",
+            ),
+            rizin: Some(test_identity(
+                crate::thumb_analysis::ThumbProducer::Rizin,
+                "/preflight/rizin",
+                "rizin preflight",
+            )),
+        };
+        expected.radare2.command = "radare2 preflight command";
+        expected.rizin.as_mut().unwrap().command = "rizin preflight command";
+        let observed = std::cell::RefCell::new(Vec::new());
+
+        let report = run_report_with_thumb_tools_and_analyzer(
+            &modem,
+            &opts,
+            &out,
+            &expected,
+            |tools, _, _, _, _| {
+                observed.borrow_mut().push(tools.clone());
+                Err(Error::Serialize("captured injected ThumbTools".into()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed.into_inner(), vec![expected]);
+        assert_eq!(
+            report.images[0].thumb_error.as_deref(),
+            Some("serialize: captured injected ThumbTools")
         );
     }
 

@@ -358,6 +358,57 @@ fn preflight(
     ))
 }
 
+fn analysis_tools(
+    headless: &Path,
+    opts: &Opts,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+) -> AnalysisTools {
+    AnalysisTools {
+        headless: headless.display().to_string(),
+        radare2: thumb_tools.radare2.executable.display().to_string(),
+        radare2_version: thumb_tools.radare2.version.clone(),
+        rizin_fallback: opts.rizin_fallback,
+        rizin: thumb_tools
+            .rizin
+            .as_ref()
+            .map(|identity| identity.executable.display().to_string()),
+        rizin_version: thumb_tools
+            .rizin
+            .as_ref()
+            .map(|identity| identity.version.clone()),
+    }
+}
+
+fn run_decompile_report(
+    modem_bin: &Path,
+    opts: &decompile::Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+) -> Result<decompile::DecompileReport> {
+    run_decompile_report_with(
+        modem_bin,
+        opts,
+        out,
+        thumb_tools,
+        decompile::run_report_with_thumb_tools,
+    )
+}
+
+fn run_decompile_report_with(
+    modem_bin: &Path,
+    opts: &decompile::Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+    run_report: impl FnOnce(
+        &Path,
+        &decompile::Opts,
+        &Path,
+        &crate::thumb_analysis::ThumbTools,
+    ) -> Result<decompile::DecompileReport>,
+) -> Result<decompile::DecompileReport> {
+    run_report(modem_bin, opts, out, thumb_tools)
+}
+
 /// The single `<out>/rootfs/images/<sub>/` directory `extract` produced.
 fn rootfs_image_dir(out: &Path) -> Result<PathBuf> {
     let base = out.join("rootfs").join("images");
@@ -950,20 +1001,7 @@ fn finalize(
         source_blake3: manifest::blake3_file(img).unwrap_or_default(),
         modem_generation,
         out: out.display().to_string(),
-        ghidra: AnalysisTools {
-            headless: headless.display().to_string(),
-            radare2: thumb_tools.radare2.executable.display().to_string(),
-            radare2_version: thumb_tools.radare2.version.clone(),
-            rizin_fallback: opts.rizin_fallback,
-            rizin: thumb_tools
-                .rizin
-                .as_ref()
-                .map(|identity| identity.executable.display().to_string()),
-            rizin_version: thumb_tools
-                .rizin
-                .as_ref()
-                .map(|identity| identity.version.clone()),
-        },
+        ghidra: analysis_tools(headless, opts, thumb_tools),
         pruned: opts.prune,
         ok,
         stages,
@@ -2249,7 +2287,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         tighten_wall_clock_budget_override: opts.tighten_wall_clock_budget_override,
         no_skip_opaque: opts.no_skip_opaque,
     };
-    let mut pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
+    let mut pass1_report = match run_decompile_report(&modem_bin, &dopts, &ghidra_dir, &thumb_tools)
+    {
         Ok(rep) => {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
@@ -5451,6 +5490,90 @@ mod tests {
             }),
             Err(Error::ToolNotFound(reason)) if reason == "Rizin unavailable"
         ));
+    }
+
+    #[test]
+    fn preflight_tools_reach_decompile_and_report_unchanged() {
+        let headless = PathBuf::from("/preflight/ghidra/analyzeHeadless");
+        let radare2 = crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Radare2,
+            executable: "/preflight/r2-exact".into(),
+            version: "radare2 exact version".into(),
+            command: "radare2 exact command",
+        };
+        let rizin = crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Rizin,
+            executable: "/preflight/rizin-exact".into(),
+            version: "rizin exact version".into(),
+            command: "rizin exact command",
+        };
+        let expected = crate::thumb_analysis::ThumbTools {
+            radare2: radare2.clone(),
+            rizin: Some(rizin.clone()),
+        };
+        let (observed_headless, tools) =
+            preflight(Ok(headless.clone()), Ok(radare2), true, || Ok(rizin)).unwrap();
+        let decompile_opts = decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
+            rizin_fallback: true,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        };
+        let opts = Opts {
+            no_verify: false,
+            prune: false,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_symbol_pass: false,
+            no_thumb_decompile: false,
+            rizin_fallback: true,
+            tighten_wall_clock_budget_override: None,
+            globals_provisional: false,
+            globals_k_arm: None,
+            globals_k_thumb: None,
+            no_apply_global_types: false,
+            no_skip_opaque: false,
+        };
+        let decompile_calls = std::cell::Cell::new(0);
+
+        assert_eq!(observed_headless, headless);
+        assert_eq!(tools, expected);
+        let error = run_decompile_report_with(
+            Path::new("/input/modem.bin"),
+            &decompile_opts,
+            Path::new("/output/ghidra"),
+            &tools,
+            |modem_bin, observed_opts, out, observed_tools| {
+                decompile_calls.set(decompile_calls.get() + 1);
+                assert_eq!(modem_bin, Path::new("/input/modem.bin"));
+                assert_eq!(out, Path::new("/output/ghidra"));
+                assert!(observed_opts.run);
+                assert!(observed_opts.rizin_fallback);
+                assert!(std::ptr::eq(observed_tools, &tools));
+                assert_eq!(observed_tools, &expected);
+                Err(Error::Serialize("captured decompose ThumbTools".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Serialize(reason) if reason == "captured decompose ThumbTools")
+        );
+        assert_eq!(decompile_calls.get(), 1);
+        assert_eq!(
+            serde_json::to_value(analysis_tools(&observed_headless, &opts, &tools)).unwrap(),
+            serde_json::json!({
+                "headless": "/preflight/ghidra/analyzeHeadless",
+                "radare2": "/preflight/r2-exact",
+                "radare2_version": "radare2 exact version",
+                "rizin_fallback": true,
+                "rizin": "/preflight/rizin-exact",
+                "rizin_version": "rizin exact version"
+            })
+        );
     }
 
     #[test]
