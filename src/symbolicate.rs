@@ -845,15 +845,9 @@ pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> R
     // thumb_functions.json ({ "functions": [...] })
     let tpath = decompiled.join("thumb_functions.json");
     if tpath.exists() {
-        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&tpath)?)
-            .map_err(|e| Error::Serialize(e.to_string()))?;
-        if let Some(arr) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
-            apply(arr);
-        }
-        std::fs::write(
-            &tpath,
-            serde_json::to_string_pretty(&v).map_err(|e| Error::Serialize(e.to_string()))?,
-        )?;
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&tpath)?;
+        apply(artifact.function_values_mut());
+        artifact.write_atomic(&tpath)?;
     }
     Ok(())
 }
@@ -894,25 +888,21 @@ fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> R
     if !path.exists() {
         return Ok(());
     }
-    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
-        .map_err(|e| Error::Serialize(e.to_string()))?;
-    if let Some(arr) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
-        let renames = build_rename_map(symbols);
-        for func in arr.iter_mut() {
-            let Some(obj) = func.as_object_mut() else {
-                continue;
-            };
-            let Some(body_c) = obj.get("body_c").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let renamed = apply_rename_map(body_c, &renames);
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path)?;
+    let renames = build_rename_map(symbols);
+    for function in artifact.function_values_mut() {
+        let Some(obj) = function.as_object_mut() else {
+            continue;
+        };
+        let Some(body_c) = obj.get("body_c").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let renamed = apply_rename_map(body_c, &renames);
+        if renamed != body_c {
             obj.insert("body_c".into(), serde_json::Value::String(renamed));
         }
     }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&v).map_err(|e| Error::Serialize(e.to_string()))?,
-    )?;
+    artifact.write_atomic(&path)?;
     Ok(())
 }
 
@@ -1786,6 +1776,18 @@ mod tests {
         d
     }
 
+    fn thumb_symbol() -> Symbol {
+        Symbol {
+            address: "0x4000".into(),
+            arch: "thumb",
+            original_name: "thumb_4000".into(),
+            name: Some("recovered_thumb".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec!["file: modem.c".into()],
+        }
+    }
+
     #[test]
     fn writes_symbols_json_with_counts() {
         let dir = tmp("pme_sym_emit");
@@ -1939,6 +1941,120 @@ mod tests {
         // functions.json `name` field. If we read functions.json's name here we'd
         // record "real" and lose the original.
         assert_eq!(v[0]["original_name"], "FUN_10");
+    }
+
+    #[test]
+    fn rewrite_functions_preserves_v3_provenance() {
+        let dir = tmp("pme_sym_v3_rewrite_functions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thumb_functions.json");
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        std::fs::write(&path, original).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(original).unwrap();
+
+        rewrite_functions_json(&dir, &[thumb_symbol()]).unwrap();
+
+        let rewritten_bytes = std::fs::read(&path).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
+        assert_eq!(after["format"], before["format"]);
+        assert_eq!(after["producers"], before["producers"]);
+        assert_eq!(after["regions"], before["regions"]);
+        assert_eq!(
+            after["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|function| function["entry"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["0x4000", "0x4040"]
+        );
+        assert_eq!(after["functions"][0]["name"], "recovered_thumb");
+        assert_eq!(after["functions"][0]["original_name"], "thumb_4000");
+        assert_eq!(
+            after["functions"][0]["annotations"],
+            serde_json::json!(["file: modem.c"])
+        );
+        let mut before_function = before["functions"][0].clone();
+        let mut after_function = after["functions"][0].clone();
+        for field in ["name", "original_name", "annotations"] {
+            before_function.as_object_mut().unwrap().remove(field);
+            after_function.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(after_function, before_function);
+        assert_eq!(after["functions"][1], before["functions"][1]);
+    }
+
+    #[test]
+    fn rewrite_body_c_preserves_v3_provenance() {
+        let dir = tmp("pme_sym_v3_rewrite_body_c");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thumb_functions.json");
+        std::fs::write(
+            &path,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        )
+        .unwrap();
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path).unwrap();
+        artifact.function_values_mut()[0]["body_c"] =
+            serde_json::json!("void thumb_4000(void) { thumb_4000(); }");
+        artifact.write_atomic(&path).unwrap();
+        let before_bytes = std::fs::read(&path).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&before_bytes).unwrap();
+
+        rewrite_body_c_in_thumb_functions(&dir, &[thumb_symbol()]).unwrap();
+
+        let rewritten_bytes = std::fs::read(&path).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
+        assert_eq!(after["format"], before["format"]);
+        assert_eq!(after["producers"], before["producers"]);
+        assert_eq!(after["regions"], before["regions"]);
+        assert_eq!(
+            after["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|function| function["entry"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["0x4000", "0x4040"]
+        );
+        assert_eq!(
+            after["functions"][0]["body_c"],
+            "void recovered_thumb(void) { recovered_thumb(); }"
+        );
+        let mut before_function = before["functions"][0].clone();
+        let mut after_function = after["functions"][0].clone();
+        before_function.as_object_mut().unwrap().remove("body_c");
+        after_function.as_object_mut().unwrap().remove("body_c");
+        assert_eq!(after_function, before_function);
+        assert_eq!(after["functions"][1], before["functions"][1]);
+    }
+
+    #[test]
+    fn v3_noop_mutation_is_byte_identical() {
+        let dir = tmp("pme_sym_v3_noop_functions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thumb_functions.json");
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        std::fs::write(&path, original).unwrap();
+
+        rewrite_functions_json(&dir, &[]).unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn v3_body_c_noop_mutation_is_byte_identical() {
+        let dir = tmp("pme_sym_v3_noop_body_c");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thumb_functions.json");
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        std::fs::write(&path, original).unwrap();
+
+        rewrite_body_c_in_thumb_functions(&dir, &[]).unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]

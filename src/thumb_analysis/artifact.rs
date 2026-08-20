@@ -116,6 +116,7 @@ pub(crate) struct ParsedThumbArtifact {
     document: ThumbDocument,
     owners: Vec<ThumbProducer>,
     original_functions: Vec<Value>,
+    source_blake3: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,6 +146,26 @@ impl ParsedThumbArtifact {
 
     pub fn function_values_mut(&mut self) -> &mut [Value] {
         &mut self.document.functions
+    }
+
+    pub fn source_blake3(&self) -> &str {
+        &self.source_blake3
+    }
+
+    pub fn validated_v3_run_totals(&self) -> Option<(usize, usize, usize)> {
+        (self.format == ThumbFormat::V3).then(|| {
+            self.document
+                .regions
+                .iter()
+                .flat_map(|region| &region.function_runs)
+                .fold((0, 0, 0), |totals, run| {
+                    (
+                        totals.0 + run.substantial,
+                        totals.1 + run.accepted,
+                        totals.2 + run.quarantined,
+                    )
+                })
+        })
     }
 
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
@@ -966,6 +987,7 @@ pub(crate) fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> 
         document,
         owners,
         original_functions,
+        source_blake3: crate::manifest::blake3_bytes(bytes),
     })
 }
 
@@ -995,6 +1017,95 @@ pub(crate) fn validate_thumb_inventory_streaming(
 
 #[cfg(test)]
 impl ParsedThumbArtifact {
+    pub(crate) fn consumer_v3_fixture() -> &'static [u8] {
+        br#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {
+      "id": "radare2",
+      "executable": "/usr/bin/r2",
+      "version": "radare2 6.1.4",
+      "command": "aaa;aflj;pdfj @@f"
+    }
+  ],
+  "regions": [
+    {
+      "start": "0x4000",
+      "end": "0x4080",
+      "attempts": [
+        {
+          "producer": "radare2",
+          "status": "succeeded",
+          "stdout": {
+            "path": "thumb/00004000.radare2.stdout",
+            "bytes": 128,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "error": null
+        }
+      ],
+      "function_runs": [
+        {
+          "producer": "radare2",
+          "first_function": 0,
+          "function_count": 2,
+          "substantial": 1,
+          "accepted": 1,
+          "quarantined": 1
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "body": "0x4000: movw r0, 0x4020\n0x4004: movw r1, 0x4060\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [
+        "0x4020",
+        "0x4060",
+        "0x4070"
+      ],
+      "decode_range_errors": [],
+      "decode_ranges": [
+        {
+          "end": "0x4008",
+          "isa": "thumb",
+          "start": "0x4000"
+        }
+      ],
+      "end": "0x4020",
+      "entry": "0x4000",
+      "name": "thumb_4000",
+      "size": 32
+    },
+    {
+      "body": "0x4040: invalid\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [
+        {
+          "address": "0x4040",
+          "end": null,
+          "kind": "missing_operation_body"
+        }
+      ],
+      "decode_ranges": [],
+      "end": "0x4042",
+      "entry": "0x4040",
+      "name": "thumb_4040",
+      "size": 2
+    }
+  ]
+}"#
+    }
+
+    pub(crate) fn malformed_consumer_v3_fixture() -> Vec<u8> {
+        let fixture = std::str::from_utf8(Self::consumer_v3_fixture()).unwrap();
+        let malformed = fixture.replacen("\"substantial\": 1", "\"substantial\": 0", 1);
+        assert_ne!(malformed, fixture);
+        malformed.into_bytes()
+    }
+
     pub(crate) fn future_multi_run_v3_fixture() -> &'static [u8] {
         br#"{
           "format": "pixel-modem-extractor-thumb-functions-v3",
@@ -1957,6 +2068,22 @@ mod tests {
             serde_json::to_string(&document["functions"]).unwrap(),
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn v3_run_totals_are_derived_from_validated_metadata() {
+        let artifact = parse_thumb_artifact(ParsedThumbArtifact::consumer_v3_fixture()).unwrap();
+        assert_eq!(artifact.validated_v3_run_totals(), Some((1, 1, 1)));
+    }
+
+    #[test]
+    fn parsed_artifact_hashes_the_exact_source_bytes() {
+        let bytes = ParsedThumbArtifact::consumer_v3_fixture();
+        let artifact = parse_thumb_artifact(bytes).unwrap();
+        assert_eq!(
+            artifact.source_blake3(),
+            crate::manifest::blake3_bytes(bytes)
+        );
     }
 
     #[test]

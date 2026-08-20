@@ -421,16 +421,15 @@ pub fn run_with_evidence_projection(
 
     let thumb_path = decompiled.join("thumb_functions.json");
     if thumb_path.exists() {
-        let thumb_text = std::fs::read_to_string(&thumb_path)?;
-        let thumb_v: serde_json::Value = serde_json::from_str(&thumb_text)
-            .map_err(|e| Error::Serialize(format!("parse thumb_functions.json: {e}")))?;
-        if let Some(arr) = thumb_v.get("functions").and_then(|f| f.as_array()) {
-            for f in arr {
-                if let Some(parsed) =
-                    parse_function(f, Arch::Thumb, recovered_function_names, evidence_names)
-                {
-                    all_funcs.push(parsed);
-                }
+        let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path)?;
+        for function in thumb_artifact.function_values() {
+            if let Some(parsed) = parse_function(
+                function,
+                Arch::Thumb,
+                recovered_function_names,
+                evidence_names,
+            ) {
+                all_funcs.push(parsed);
             }
         }
     }
@@ -1405,6 +1404,38 @@ mod tests {
             &empty,
             &GlobalsOpts::default(),
         )
+    }
+
+    #[test]
+    fn loads_v3_thumb_functions() {
+        let img = Img::new("loads_v3_thumb_functions");
+        img.write_functions_json("[]");
+        img.write_thumb_functions_json(
+            std::str::from_utf8(crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture())
+                .unwrap(),
+        );
+        img.write_manifest_load_addr("0x4000");
+        img.write_image_bin(&image_with_strings(0x4000, &[(0x4020, "g_thumb")]));
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(report.recovered_count, 1);
+        let output: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["globals"][0]["address"], "0x4060");
+        assert_eq!(output["globals"][0]["name"], "g_thumb");
+        assert_eq!(output["globals"][0]["arch"], "thumb");
+        let evidence = output["globals"][0]["evidence"].as_array().unwrap();
+        assert!(evidence.iter().any(|item| item["kind"] == "string_load"));
+        assert!(evidence.iter().any(|item| item["kind"] == "global_load"));
+
+        let malformed = crate::thumb_analysis::ParsedThumbArtifact::malformed_consumer_v3_fixture();
+        img.write_thumb_functions_json(std::str::from_utf8(&malformed).unwrap());
+        assert_eq!(
+            run_no_names(&img).unwrap_err().to_string(),
+            "serialize: invalid Thumb artifact: v3 run 0 stored counts do not match its functions"
+        );
     }
 
     /// Build a `Function` for direct unit tests of

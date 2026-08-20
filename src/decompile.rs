@@ -444,7 +444,7 @@ fn validate_thumb_analysis_currentness(
     if metadata.format != crate::thumb_analysis::ThumbFormat::V3 {
         return Err(Error::Serialize(format!(
             "current Thumb artifact format mismatch: expected {}, found {}",
-            crate::thumb_analysis::THUMB_V3_FORMAT,
+            crate::thumb_analysis::ThumbFormat::V3.as_str(),
             metadata.format.as_str(),
         )));
     }
@@ -2538,9 +2538,9 @@ pub fn find_radare2() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// Phase 2: enrich a v1 (or v2 asm-only) `thumb_functions.json` with per-function
-/// `body_c` sourced from a `decompiled.c`. Bumps `format` to v2 iff at least one
-/// `body_c` is populated; otherwise leaves the file byte-identical. Idempotent.
+/// Phase 2: enrich a `thumb_functions.json` with per-function `body_c` sourced
+/// from a `decompiled.c`. A changed v1 artifact is promoted to v2; v2/v3 retain
+/// their format. A semantic no-op leaves the file byte-identical. Idempotent.
 ///
 /// `decompiled.c` is parsed by scanning for ExportDecomp.java's per-function
 /// header line
@@ -2570,52 +2570,29 @@ pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) 
     // Phase 2.1: parse decompiled.c into {normalized_entry_address -> body_text}.
     let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
 
-    // Read thumb_functions.json, augment in memory, decide whether to rewrite.
-    let raw = std::fs::read(thumb_functions_json_path)?;
-    let mut v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
-        Error::Serialize(format!(
-            "parse {}: {e}",
-            thumb_functions_json_path.display()
-        ))
-    })?;
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path)?;
 
     let mut populated = 0usize;
-    if let Some(funcs) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
-        for f in funcs {
-            // Phase 2.1: match by `entry` (address), not by `name`. The `name`
-            // field is radare2's `thumb_<addr>` placeholder and never aligns
-            // with Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
-            let Some(entry_str) = f.get("entry").and_then(|n| n.as_str()) else {
-                continue;
-            };
-            let Some(canonical) = normalize_thumb_addr(entry_str) else {
-                continue;
-            };
-            if let Some(body) = bodies.get(&canonical) {
-                f.as_object_mut().unwrap().insert(
-                    "body_c".to_string(),
-                    serde_json::Value::String(body.clone()),
-                );
-                populated += 1;
-            }
+    for function in artifact.function_values_mut() {
+        // Phase 2.1: match by `entry` (address), not by `name`. The `name`
+        // field is radare2's `thumb_<addr>` placeholder and never aligns
+        // with Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
+        let Some(entry_str) = function.get("entry").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        let Some(canonical) = normalize_thumb_addr(entry_str) else {
+            continue;
+        };
+        if let Some(body) = bodies.get(&canonical) {
+            function.as_object_mut().unwrap().insert(
+                "body_c".to_string(),
+                serde_json::Value::String(body.clone()),
+            );
+            populated += 1;
         }
     }
 
-    if populated == 0 {
-        return Ok(0); // Leave file byte-identical (do not rewrite).
-    }
-
-    // Bump format to v2 on first population.
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert(
-            "format".to_string(),
-            serde_json::Value::String("pixel-modem-extractor-thumb-functions-v2".to_string()),
-        );
-    }
-
-    let out = serde_json::to_string_pretty(&v)
-        .map_err(|e| Error::Serialize(format!("re-serialize thumb_functions.json: {e}")))?;
-    std::fs::write(thumb_functions_json_path, out)?;
+    artifact.write_atomic(thumb_functions_json_path)?;
     Ok(populated)
 }
 
@@ -5072,6 +5049,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn thumb_enrich_preserves_v3_provenance() {
+        let root = temp_dir("thumb_enrich_v3_provenance");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n  return;\n}\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        std::fs::write(&thumb_path, original).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(original).unwrap();
+
+        assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
+        let rewritten_bytes = std::fs::read(&thumb_path).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
+        assert_eq!(after["format"], before["format"]);
+        assert_eq!(after["producers"], before["producers"]);
+        assert_eq!(after["regions"], before["regions"]);
+        assert_eq!(
+            after["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|function| function["entry"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["0x4000", "0x4040"]
+        );
+        let mut before_function = before["functions"][0].clone();
+        let mut after_function = after["functions"][0].clone();
+        before_function.as_object_mut().unwrap().remove("body_c");
+        let body_c = after_function
+            .as_object_mut()
+            .unwrap()
+            .remove("body_c")
+            .unwrap();
+        assert!(body_c.as_str().unwrap().contains("FUN_4000"));
+        assert_eq!(after_function, before_function);
+        assert_eq!(after["functions"][1], before["functions"][1]);
+    }
+
+    #[test]
+    fn thumb_enrich_v3_noop_is_byte_identical() {
+        let root = temp_dir("thumb_enrich_v3_noop");
+        let body = "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n}\n";
+        let c_path = root.join("decompiled.c");
+        std::fs::write(&c_path, body).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        )
+        .unwrap();
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path).unwrap();
+        artifact.function_values_mut()[0]["body_c"] = serde_json::json!(body);
+        artifact.write_atomic(&thumb_path).unwrap();
+        let before = std::fs::read(&thumb_path).unwrap();
+
+        assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
+        assert_eq!(std::fs::read(&thumb_path).unwrap(), before);
     }
 
     #[test]
