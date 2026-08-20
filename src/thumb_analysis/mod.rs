@@ -589,15 +589,61 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ThumbProducer, probe_identity, probe_identity_with_reader_tracking};
+    use super::{
+        ProducerIdentity, ThumbProducer, probe_identity as probe_identity_once,
+        probe_identity_with_reader_tracking as probe_identity_with_reader_tracking_once,
+    };
     use crate::analysis_tool::AnalysisTool;
+    use crate::error::{Error, Result};
     use std::fs;
+    use std::io;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    fn retry_executable_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+        for attempt in 1..=5 {
+            match operation() {
+                Err(Error::Io(error))
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 5 =>
+                {
+                    std::thread::sleep(Duration::from_millis(5 * attempt));
+                }
+                result => return result,
+            }
+        }
+        unreachable!()
+    }
+
+    fn probe_identity(
+        executable: &Path,
+        producer: ThumbProducer,
+        command: &'static str,
+        timeout: Duration,
+    ) -> Result<ProducerIdentity> {
+        retry_executable_busy(|| probe_identity_once(executable, producer, command, timeout))
+    }
+
+    fn probe_identity_with_reader_tracking(
+        executable: &Path,
+        producer: ThumbProducer,
+        command: &'static str,
+        timeout: Duration,
+        active_readers: Arc<AtomicUsize>,
+    ) -> Result<ProducerIdentity> {
+        retry_executable_busy(|| {
+            probe_identity_with_reader_tracking_once(
+                executable,
+                producer,
+                command,
+                timeout,
+                Arc::clone(&active_readers),
+            )
+        })
+    }
 
     fn tool_script(body: &str) -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -617,6 +663,25 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn executable_busy_retry_retries_the_transient_failure() {
+        let mut attempts = 0;
+        let value = retry_executable_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(Error::Io(io::Error::from(
+                    io::ErrorKind::ExecutableFileBusy,
+                )))
+            } else {
+                Ok("ready")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(value, "ready");
+        assert_eq!(attempts, 3);
     }
 
     #[test]
