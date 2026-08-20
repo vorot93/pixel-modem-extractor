@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -199,6 +201,55 @@ fn read_stderr_diagnostic(mut stderr: impl Read) -> std::io::Result<Vec<u8>> {
     }
 }
 
+struct CancellableReader<R> {
+    reader: R,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R> CancellableReader<R> {
+    fn new(reader: R, cancelled: Arc<AtomicBool>) -> Self {
+        Self { reader, cancelled }
+    }
+}
+
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            match self.reader.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(PROBE_POLL_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn make_pipe_cancellable(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let file_descriptor = pipe.as_raw_fd();
+    // SAFETY: `file_descriptor` is borrowed from a live child pipe. `F_GETFL`
+    // and `F_SETFL` do not retain the descriptor or access Rust-managed memory.
+    let flags = unsafe { libc::fcntl(file_descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: same live descriptor and no retained pointers; this only adds
+    // `O_NONBLOCK` to the existing file-status flags.
+    if unsafe { libc::fcntl(file_descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_pipe_cancellable<T>(_pipe: &T) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn reap_after_kill(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -236,29 +287,154 @@ fn wait_with_deadline(
     }
 }
 
-fn join_reader<T>(
-    reader: JoinHandle<std::io::Result<T>>,
-    producer: ThumbProducer,
-    started: Instant,
-    timeout: Duration,
-) -> Result<T> {
-    while !reader.is_finished() {
-        if started.elapsed() >= timeout {
-            return Err(timeout_error(producer, timeout));
-        }
-        thread::sleep(PROBE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
-    }
+fn join_reader<T>(reader: JoinHandle<std::io::Result<T>>) -> Result<T> {
     reader
         .join()
         .map_err(|_| Error::ToolNotFound("version probe output reader panicked".into()))?
         .map_err(Into::into)
 }
 
-fn probe_identity(
+#[derive(Clone, Default)]
+struct ReaderTracker(Option<Arc<AtomicUsize>>);
+
+struct ReaderActivity(Option<Arc<AtomicUsize>>);
+
+impl ReaderTracker {
+    fn start(self) -> ReaderActivity {
+        if let Some(active) = &self.0 {
+            active.fetch_add(1, Ordering::SeqCst);
+        }
+        ReaderActivity(self.0)
+    }
+}
+
+impl Drop for ReaderActivity {
+    fn drop(&mut self) {
+        if let Some(active) = &self.0 {
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn spawn_probe_reader<T, F>(
+    tracker: ReaderTracker,
+    read: F,
+) -> std::io::Result<JoinHandle<std::io::Result<T>>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    let activity = tracker.start();
+    std::thread::Builder::new().spawn(move || {
+        let _activity = activity;
+        read()
+    })
+}
+
+#[cfg(windows)]
+fn interrupt_reader<T>(reader: &JoinHandle<T>) {
+    use std::os::windows::io::AsRawHandle;
+
+    // SAFETY: `reader` owns a live Windows thread handle. Cancellation is
+    // retried until the thread observes the shared flag and exits, covering
+    // the race where no synchronous read is pending during one call.
+    unsafe {
+        let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
+            reader.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn interrupt_reader<T>(_reader: &JoinHandle<T>) {}
+
+struct ProbeReaders {
+    stdout: Option<JoinHandle<std::io::Result<VersionOutput>>>,
+    stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ProbeReaders {
+    fn spawn(
+        stdout: std::process::ChildStdout,
+        stderr: std::process::ChildStderr,
+        tracker: ReaderTracker,
+    ) -> std::io::Result<Self> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stdout_cancelled = Arc::clone(&cancelled);
+        let stderr_cancelled = Arc::clone(&cancelled);
+        let mut readers = Self {
+            stdout: None,
+            stderr: None,
+            cancelled,
+        };
+        readers.stdout = Some(spawn_probe_reader(tracker.clone(), move || {
+            read_version_stdout(CancellableReader::new(stdout, stdout_cancelled))
+        })?);
+        readers.stderr = Some(spawn_probe_reader(tracker, move || {
+            read_stderr_diagnostic(CancellableReader::new(stderr, stderr_cancelled))
+        })?);
+        Ok(readers)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.stdout.as_ref().is_none_or(JoinHandle::is_finished)
+            && self.stderr.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn finish(
+        mut self,
+        producer: ThumbProducer,
+        started: Instant,
+        timeout: Duration,
+    ) -> Result<(VersionOutput, Vec<u8>)> {
+        while !self.is_finished() {
+            if started.elapsed() >= timeout {
+                return Err(timeout_error(producer, timeout));
+            }
+            thread::sleep(PROBE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+        }
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<(VersionOutput, Vec<u8>)> {
+        let stdout = join_reader(self.stdout.take().expect("stdout reader present"));
+        let stderr = join_reader(self.stderr.take().expect("stderr reader present"));
+        Ok((stdout?, stderr?))
+    }
+
+    fn cancel_and_join(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        while !self.is_finished() {
+            if let Some(reader) = &self.stdout {
+                interrupt_reader(reader);
+            }
+            if let Some(reader) = &self.stderr {
+                interrupt_reader(reader);
+            }
+            thread::sleep(PROBE_POLL_INTERVAL);
+        }
+        if let Some(reader) = self.stdout.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl Drop for ProbeReaders {
+    fn drop(&mut self) {
+        self.cancel_and_join();
+    }
+}
+
+fn probe_identity_inner(
     path: &Path,
     producer: ThumbProducer,
     command: &'static str,
     timeout: Duration,
+    tracker: ReaderTracker,
 ) -> Result<ProducerIdentity> {
     let executable = std::fs::canonicalize(path)?;
     let started = Instant::now();
@@ -270,12 +446,21 @@ fn probe_identity(
         .spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = std::thread::spawn(move || read_version_stdout(stdout));
-    let stderr_reader = std::thread::spawn(move || read_stderr_diagnostic(stderr));
+    if let Err(error) = make_pipe_cancellable(&stdout).and_then(|()| make_pipe_cancellable(&stderr))
+    {
+        reap_after_kill(&mut child);
+        return Err(error.into());
+    }
+    let readers = match ProbeReaders::spawn(stdout, stderr, tracker) {
+        Ok(readers) => readers,
+        Err(error) => {
+            reap_after_kill(&mut child);
+            return Err(error.into());
+        }
+    };
 
     let status = wait_with_deadline(&mut child, producer, started, timeout)?;
-    let output = join_reader(stdout_reader, producer, started, timeout)?;
-    let diagnostic = join_reader(stderr_reader, producer, started, timeout)?;
+    let (output, diagnostic) = readers.finish(producer, started, timeout)?;
 
     if !status.success() {
         let status = status
@@ -325,6 +510,32 @@ fn probe_identity(
     })
 }
 
+fn probe_identity(
+    path: &Path,
+    producer: ThumbProducer,
+    command: &'static str,
+    timeout: Duration,
+) -> Result<ProducerIdentity> {
+    probe_identity_inner(path, producer, command, timeout, ReaderTracker::default())
+}
+
+#[cfg(test)]
+fn probe_identity_with_reader_tracking(
+    path: &Path,
+    producer: ThumbProducer,
+    command: &'static str,
+    timeout: Duration,
+    active_readers: Arc<AtomicUsize>,
+) -> Result<ProducerIdentity> {
+    probe_identity_inner(
+        path,
+        producer,
+        command,
+        timeout,
+        ReaderTracker(Some(active_readers)),
+    )
+}
+
 fn discover(executable: &str, producer: ThumbProducer) -> Result<ProducerIdentity> {
     let path = find_executable(executable).ok_or_else(|| {
         Error::ToolNotFound(format!(
@@ -369,11 +580,13 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ThumbProducer, probe_identity};
+    use super::{ThumbProducer, probe_identity, probe_identity_with_reader_tracking};
     use crate::analysis_tool::AnalysisTool;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -578,19 +791,24 @@ mod tests {
     }
 
     #[test]
-    fn probe_version_deadline_includes_pipe_drain_after_child_exit() {
+    fn probe_version_timeout_joins_readers_with_inherited_pipes() {
         let (_dir, script) = tool_script("sleep 1 &\nexit 0");
-        let started = Instant::now();
+        let active_readers = Arc::new(AtomicUsize::new(0));
 
-        let error = probe_identity(
+        let error = probe_identity_with_reader_tracking(
             &script,
             ThumbProducer::Radare2,
             ThumbProducer::Radare2.command(),
             Duration::from_millis(20),
+            Arc::clone(&active_readers),
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("timed out"), "{error}");
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            active_readers.load(Ordering::SeqCst),
+            0,
+            "probe detached reader threads"
+        );
     }
 }
