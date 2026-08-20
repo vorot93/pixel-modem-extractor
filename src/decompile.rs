@@ -458,12 +458,13 @@ pub(crate) fn validate_terminal_inventory_pair(
             (None, None, Vec::new())
         }
         Some(expected_substantial) => {
-            let (inventory, substantial) = crate::r2_thumb::validate_thumb_inventory_streaming(
-                thumb_functions_path,
-                image_start,
-                image_len,
-                expected_substantial,
-            )?;
+            let (inventory, substantial) =
+                crate::thumb_analysis::validate_thumb_inventory_streaming(
+                    thumb_functions_path,
+                    image_start,
+                    image_len,
+                    expected_substantial,
+                )?;
             accepted_identities.extend(inventory.accepted_identities.iter().cloned());
             (
                 Some(inventory_counts(&inventory)),
@@ -1394,7 +1395,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             let (thumb_functions, thumb_error) = if regions.is_empty() {
                 (None, None)
             } else if let Some(r2) = &r2_bin {
-                match crate::r2_thumb::run_radare2_thumb(
+                match crate::thumb_analysis::run_radare2_thumb(
                     r2,
                     img,
                     e.load_addr,
@@ -2557,7 +2558,7 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
         // State machine tracks string/char literals + line/block comments so a `}`
         // inside `"expected }"`, `'}'`, or `// close }` doesn't truncate the body.
         // Mirrors the string-aware scanning used by the production
-        // `r2_thumb::ValueScanner` (`balanced_json_end` is its `#[cfg(test)]`
+        // `thumb_analysis::stream::ValueScanner` (`balanced_json_end` is its `#[cfg(test)]`
         // oracle).
         let mut depth = 0i32;
         let mut saw_brace = false;
