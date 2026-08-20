@@ -1266,8 +1266,10 @@ fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
 /// regions peaks ~1.5 GiB RSS (mustang `02_MAIN`'s 19 MiB region) and completes,
 /// while a pathological region — cheetah `01_MAIN`'s `0x42310000`, only 4 MiB —
 /// runs away to 90+ GiB and OOM-kills the host. 16 GiB is ~10x the measured
-/// healthy peak (ample headroom for larger images) yet far below the RAM of any
-/// machine that can run this pipeline (a full decompose peaks ~56 GiB), so a
+/// healthy peak (ample headroom for larger images) yet far below the host RAM
+/// needed for the rest of a full decompose anyway (Ghidra's JVM et al.; a
+/// decompose peaked ~56 GiB back when r2 output was buffered whole — that
+/// producer is streaming now), so a
 /// runaway region hits the limit and fails closed (r2 gets `ENOMEM` and exits)
 /// rather than exhausting host memory. Same "fail-closed rather than OOM the host"
 /// intent as [`R2_STDOUT_CAP_BYTES`], but for r2's *own* memory rather than the
