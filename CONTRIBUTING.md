@@ -428,12 +428,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   it whole — the Stage-2 streaming rewrite is bounded by the ~86 MB
   `decompiled.c` bodies map plus one function record (measured production
   A/B on the real inputs: 130 s, 2.29 GB peak, byte-identical to the
-  whole-file oracle; see the radare2 streaming bullets) — but `symbolicate`
-  still loads and rewrites it whole (~4 s, ~3 GB peak), and the memory
-  envelope moved to `symbolicate_finalize`'s in-place whole-`Value` rewrite
-  of the same file (symbolicate.rs `rewrite_json_files`; ~24 GB
-  full-`decompose` transient — see the radare2 streaming
-  bullets); pw_tokenizer strings are structured
+  whole-file oracle; see the radare2 streaming bullets) — and `symbolicate`'s
+  finalize rewrites stream too (Stage 4: element-wise stamps and `body_c`
+  renames through `r2_thumb::stream_rewrite_json_array` /
+  `stream_rewrite_thumb_functions`, byte-identical to the whole-file
+  rewriters on the real production tree); the memory envelope now sits in
+  `symbolicate`'s ARM loader: a few pathological Ghidra function records
+  with ~37 MB `entry`–`end` ranges each copy ~190 MB of `disasm.lst` text
+  into per-function strings (~23 GB total) — see the radare2 streaming
+  bullets; pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not
   raw literals, so a byte search won't find them).
 - **String-reference name guesses.** Beyond `__func__` (Recovered) and token
@@ -1272,8 +1275,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   former whole-buffer r2 path) is gone — the producer and `thumb_enrich`
   both stream now (see the radare2 streaming bullets below); plan per the
    README's memory note — the full-`decompose` peak is currently a ~24 GB
-   transient inside `symbolicate_finalize`'s in-place whole-`Value` rewrite
-   of `thumb_functions.json` (the next lever); `recover_source` now loads
+   accumulation in `symbolicate`'s ARM loader (pathological wide-range
+   Ghidra records each copying ~190 MB of `disasm.lst`; the next lever);
+   `recover_source` now loads
    that file through a typed reader (~0.6 GB, measured in-pipeline), and
    Ghidra's own phases peak ~8 GB. Do not parse Ghidra/radare2 disassembly
   text, infer ISA from alignment or inventory name, attribute an address to
@@ -1537,12 +1541,33 @@ hardcoded. Two reference images exercise both models end-to-end:
    `body_c`) ignored, a malformed record failing closed (~0.6 GB measured
    in-pipeline by the 2026-08-20 instrumented probe, down from ~20 GB). The
    remaining full-`decompose` peak is a ~24 GB transient inside
-   `symbolicate_finalize`'s in-place whole-`Value` rewrite of
-   `thumb_functions.json` (symbolicate.rs `rewrite_json_files`; the
-   standalone `symbolicate` subcommand measured 24 GB on the same path) —
-   the next lever, same streaming pattern as enrich; Ghidra's own
-   phases peak ~8 GB, and the producer, streaming enrich, and typed
-   attribution all sit below that. Contract invariants, pinned by the differential oracle
+   `symbolicate`'s ARM loader: `load_functions` copies `disasm.lst` lines in
+   each function's `[entry, end)` range into owned `FuncRec.disasm` strings,
+   and a handful of pathological Ghidra records (bad `end` fields spanning
+   ~37 MB, e.g. the `guess_latency_*` set) each copy ~190 MB — ~23 GB total
+   (measured 2026-08-21 with VmHWM instrumentation on the real tree); the
+   standalone `symbolicate` subcommand peaked 24 GB from exactly this. The
+   next lever is a zero-copy disasm view (borrowed ranges over the loaded
+   `disasm.lst` buffer); Ghidra's own
+   phases peak ~8 GB, and the producer, streaming enrich, typed
+   attribution, and streaming finalize rewrites all sit below that.
+- **Finalize rewrites are streaming, atomic, and byte-identical (Stage 4 of
+  the memory-envelope lever).** `symbolicate`'s stamping
+  (`rewrite_functions_json`: `original_name`/`name`/`annotations` by entry
+  address over both `functions.json` and `thumb_functions.json`) and
+  `body_c` renaming (`rewrite_body_c_in_thumb_functions`) run through the
+  shared element-wise rewriters `r2_thumb::stream_rewrite_json_array` /
+  `stream_rewrite_thumb_functions`: one element per `Value`, fragments
+  rendered at the canonical depth, atomic replace, unknown fields preserved
+  by construction. Invariants: the thumb-doc rewriter requires the
+  canonical shape (exactly `format` then `functions`) and passes the
+  `format` value through verbatim (never bumps it — enrich owns the bump);
+  the array rewriter requires a top-level array; both always rewrite when
+  the file exists and parses, matching the whole-file rewriters they
+  replaced. Verified byte-identical to the retired whole-file
+  implementations (kept as `#[cfg(test)]` oracles — do not delete) by the
+  inline differential tests and by a full-tree A/B of the standalone
+  `symbolicate` subcommand on the real golden tree vs the previous binary. Contract invariants, pinned by the differential oracle
   plus the env-gated production replay: (1) **canonical input required, fail-closed**
   — `thumb_functions.json` must be an object with exactly the keys `format`
   then `functions` (an array); anything else returns `Err`. This is a

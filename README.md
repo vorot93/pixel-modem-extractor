@@ -47,14 +47,16 @@ visitor into an atomic-replace temp file, bounded by the ~86 MB
 `decompiled.c` bodies map plus one function record: byte-identical to the
 retired whole-file rewriter on the real production inputs (632 MB
 `thumb_functions.json` + 86 MB `decompiled.c`: 130 s, 2.29 GB peak RSS in
-the streaming-vs-oracle A/B), and `recover_source` loads the same file
-through a typed reader (no `serde_json::Value` tree; ~0.6 GB in-pipeline,
-measured). The current full-`decompose` peak is ~24 GB, a transient inside
-`symbolicate_finalize`'s in-place whole-`Value` rewrite of
-`thumb_functions.json` (symbolicate.rs `rewrite_json_files`) — the last
-whole-file holder and the next lever; the same 2026-08-20 instrumented probe
-measured every other Rust stage at ≤3.7 GB (enrich sweeps 330 MB,
-attribution 560 MB) and Ghidra's own phases at ~8 GB. The 4 GiB
+the streaming-vs-oracle A/B); `recover_source` loads the same file through a
+typed reader (no `serde_json::Value` tree), and `symbolicate`'s finalize
+rewrites (`functions.json`, `thumb_functions.json` stamps and `body_c`)
+stream element-by-element through atomic writers — byte-identical to the
+whole-file rewriters on the real 632 MB production tree (A/B vs the
+previous binary). The current full-`decompose` peak (~24 GB) is held by
+`symbolicate`'s ARM function loader: a handful of pathological Ghidra
+function records carry ~37 MB `entry`–`end` ranges (bad `end` fields), and
+each copies ~190 MB of `disasm.lst` text into per-function strings (~23 GB
+total) — the next lever; Ghidra's own phases peak ~8 GB. The 4 GiB
 radare2 stdout cap applies per capture. radare2's *own* analysis memory is
 separately bounded to 16 GiB
 (`RLIMIT_AS`) per dense-Thumb region: a pathological region whose `aaa` would
