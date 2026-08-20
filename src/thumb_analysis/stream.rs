@@ -1,20 +1,20 @@
-//! Streaming radare2 Thumb producer: carves dense-Thumb regions, streams r2
-//! stdout to capped on-disk captures, and turns each capture into
-//! `thumb_functions.json` with bounded memory (Stage 1 of the memory-envelope
-//! lever; see the design spec under ~/.superpowers/pixel-modem-extractor/).
+//! Streaming radare2 Thumb backend and coordinator: capture identity, strict
+//! boundary normalization, bounded fragment spills, and atomic v3 assembly.
 
-#[cfg(test)]
-use super::artifact::assemble_v2_into as assemble_into;
 use super::artifact::{
-    Spill, SpillWriter, assemble_v2_atomic as assemble_thumb_functions_json, render_fragment,
+    AttemptRecord, AttemptStatus, CaptureRecord, FunctionRunRecord, RegionRecord, Spill,
+    SpillWriter, assemble_v3_atomic, render_fragment,
 };
+use super::radare2::{FunctionRecord, function_record};
+use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer, ThumbTools};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
     DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionProjection, canonicalize_errors,
     canonicalize_instruction_extents, error, projection_to_json,
 };
+#[cfg(test)]
 use serde_json::json;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 fn json_hex(v: u64) -> String {
@@ -114,10 +114,9 @@ fn pdfj_body(pdfj: &serde_json::Value) -> String {
     body
 }
 
+#[cfg(test)]
 fn radare2_function_entry(raw: &serde_json::Value) -> Option<u64> {
-    raw.get("offset")
-        .or_else(|| raw.get("addr"))
-        .and_then(json_u64)
+    function_record(raw).entry
 }
 
 fn pdfj_entry(pdfj: &serde_json::Value) -> Option<u64> {
@@ -320,35 +319,11 @@ impl<R: Read> ValueScanner<R> {
     }
 }
 
-/// Compact per-function record from the aflj inventory — the only fields
-/// `normalize_radare2_function_checked` consumes from the raw element.
-/// Rebuilding a raw element from these fields reproduces the original
-/// normalization byte-for-byte: both `json_u64` paths (number or numeric
-/// string) resolve to the same u64, and a non-string `name` resolves to the
-/// same default.
-#[derive(Debug, Clone, PartialEq)]
-struct FnRec {
-    entry: Option<u64>,
-    size: u64,
-    name: Option<String>,
-}
-
-fn fn_rec_from_value(raw: &serde_json::Value) -> FnRec {
-    FnRec {
-        entry: radare2_function_entry(raw),
-        size: raw.get("size").and_then(json_u64).unwrap_or(0),
-        name: raw
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    }
-}
-
 /// Sentinel aborting a seq probe when an element disqualifies the array as
 /// the aflj inventory (non-object element, or an object carrying `ops`).
 const NOT_INVENTORY: &str = "\u{0}pme-not-inventory";
 
-fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FnRec>> {
+fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FunctionRecord>> {
     use serde::Deserializer;
 
     let text = String::from_utf8_lossy(bytes);
@@ -362,7 +337,7 @@ fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FnRec>> {
 struct InventoryProbe;
 
 impl<'de> serde::de::Visitor<'de> for InventoryProbe {
-    type Value = Vec<FnRec>;
+    type Value = Vec<FunctionRecord>;
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("aflj function inventory array")
@@ -381,7 +356,7 @@ impl<'de> serde::de::Visitor<'de> for InventoryProbe {
             if disqualified {
                 return Err(serde::de::Error::custom(NOT_INVENTORY));
             }
-            records.push(fn_rec_from_value(&element));
+            records.push(function_record(&element));
         }
         Ok(records)
     }
@@ -394,7 +369,7 @@ impl<'de> serde::de::Visitor<'de> for InventoryProbe {
 /// the stream.
 fn scan_for_inventory<R: Read>(
     scanner: &mut ValueScanner<R>,
-) -> std::io::Result<(usize, Option<Vec<FnRec>>)> {
+) -> std::io::Result<(usize, Option<Vec<FunctionRecord>>)> {
     let mut values = 0usize;
     while let Some(bytes) = scanner.next_value()? {
         values += 1;
@@ -418,10 +393,14 @@ struct RegionOutcome {
     stats: RegionStats,
 }
 
-/// A region whose r2 run failed and was skipped fail-closed.
-struct SkippedRegion {
-    addr: u32,
-    reason: String,
+struct SuccessfulRegion {
+    outcome: RegionOutcome,
+    capture: CaptureRecord,
+}
+
+struct FailedRegion {
+    capture: Option<CaptureRecord>,
+    error: Error,
 }
 
 /// Carries io and callback errors out of `for_each_pdfj_position`'s read loop.
@@ -486,7 +465,7 @@ where
 }
 
 /// Process one captured `.stdout` with bounded memory: stream the inventory
-/// into `FnRec`s (A), entry-match arriving pdfjs normalizing and spilling
+/// into compact records (A), entry-match arriving pdfjs normalizing and spilling
 /// immediately (B1), positional-fallback re-stream (B2), and normalize the
 /// never-paired remainder with `pdfj = None` (C). Validation around these
 /// passes preserves no-JSON, unassignable, orphan, zero-pair producer failure,
@@ -498,7 +477,7 @@ fn process_region_streaming(
     addr: u32,
     thumb_dir: &Path,
 ) -> Result<RegionOutcome> {
-    let spill_path = thumb_dir.join(format!("{addr:08x}.frags"));
+    let spill_path = thumb_dir.join(format!("{addr:08x}.radare2.frags"));
     match process_region_inner(stdout_path, image, load_addr, addr, &spill_path) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -553,7 +532,7 @@ fn process_region_inner(
     let mut spill = SpillWriter::create(spill_path.to_path_buf())?;
     let mut stats = RegionStats {
         raw: fns.len(),
-        substantial: fns.iter().filter(|f| f.size >= 32).count(),
+        substantial: 0,
         accepted: 0,
     };
 
@@ -662,30 +641,27 @@ fn process_region_inner(
     Ok(RegionOutcome { spill, stats })
 }
 
-/// Rebuild the minimal raw aflj element `normalize_radare2_function_checked`
-/// consumes, normalize it, classify the projection from the emitted JSON
-/// (exactly how `run_radare2_thumb` classified accepted), and spill the
-/// fragment. `rec.entry` must be `Some` (unassignable rejected upstream).
+/// Normalize one adapted inventory record, classify its emitted projection,
+/// and spill the fragment. `rec.entry` must be `Some` because unassignable
+/// records are rejected upstream.
 #[allow(clippy::too_many_arguments)]
 fn normalize_and_spill(
     spill: &mut SpillWriter,
     stats: &mut RegionStats,
     fn_idx: usize,
-    rec: &FnRec,
+    rec: &FunctionRecord,
     pdfj: Option<&serde_json::Value>,
     image: &[u8],
     load_addr: u32,
     addr: u32,
 ) -> Result<()> {
-    let entry = rec.entry.expect("unassignable rejected upstream");
-    let mut raw = serde_json::Map::new();
-    raw.insert("offset".to_string(), json!(entry));
-    raw.insert("size".to_string(), json!(rec.size));
-    if let Some(name) = &rec.name {
-        raw.insert("name".to_string(), json!(name));
-    }
-    let raw = serde_json::Value::Object(raw);
-    let normalized = normalize_radare2_function_checked(&raw, pdfj, image, load_addr, addr)?;
+    let normalized = normalize_radare2_record_checked(rec, pdfj, image, load_addr, addr)?;
+    stats.substantial += usize::from(
+        normalized
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|size| size >= 32),
+    );
     if normalized
         .get("decode_ranges")
         .and_then(serde_json::Value::as_array)
@@ -694,7 +670,9 @@ fn normalize_and_spill(
         stats.accepted += 1;
     }
     let fragment = render_fragment(&normalized)?;
-    spill.push(fn_idx as u32, &fragment)?;
+    let function_index = u32::try_from(fn_idx)
+        .map_err(|_| Error::Serialize("radare2 function index exceeds u32".into()))?;
+    spill.push(function_index, &fragment)?;
     Ok(())
 }
 
@@ -902,6 +880,7 @@ fn normalize_radare2_function(
     normalize_radare2_function_checked(raw, Some(pdfj), &image, 0, 0)
 }
 
+#[cfg(test)]
 fn normalize_radare2_function_checked(
     raw: &serde_json::Value,
     pdfj: Option<&serde_json::Value>,
@@ -909,27 +888,91 @@ fn normalize_radare2_function_checked(
     load_addr: u32,
     region_addr: u32,
 ) -> Result<serde_json::Value> {
-    let entry_u64 = radare2_function_entry(raw).ok_or_else(|| {
+    normalize_radare2_record_checked(&function_record(raw), pdfj, image, load_addr, region_addr)
+}
+
+fn normalize_radare2_record_checked(
+    record: &FunctionRecord,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+    region_addr: u32,
+) -> Result<serde_json::Value> {
+    let entry_u64 = record.entry.ok_or_else(|| {
         Error::Serialize(format!(
             "radare2 function lacks entry/addr for Thumb region 0x{region_addr:x}"
         ))
     })?;
-    let size = raw.get("size").and_then(json_u64).unwrap_or(0);
-    let name = raw
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+    let entry = u32::try_from(entry_u64).map_err(|_| {
+        Error::Serialize(format!(
+            "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+        ))
+    })?;
+    let image_end = u64::from(load_addr)
+        .checked_add(image.len() as u64)
+        .filter(|end| *end <= u64::from(u32::MAX))
+        .ok_or_else(|| {
+            Error::Serialize(format!(
+                "mapped image range is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+            ))
+        })?;
+    if entry_u64 < u64::from(load_addr) || entry_u64 >= image_end {
+        return Err(Error::Serialize(format!(
+            "radare2 function entry is outside mapped image for Thumb region 0x{region_addr:x}"
+        )));
+    }
+    let end_u64 = record.end.ok_or_else(|| {
+        Error::Serialize(format!(
+            "radare2 function lacks valid maxaddr for Thumb region 0x{region_addr:x}"
+        ))
+    })?;
+    let end = u32::try_from(end_u64).map_err(|_| {
+        Error::Serialize(format!(
+            "radare2 function maxaddr is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+        ))
+    })?;
+    if end <= entry {
+        return Err(Error::Serialize(format!(
+            "radare2 function maxaddr must follow entry for Thumb region 0x{region_addr:x}"
+        )));
+    }
+    if end_u64 > image_end {
+        return Err(Error::Serialize(format!(
+            "radare2 function maxaddr is outside mapped image for Thumb region 0x{region_addr:x}"
+        )));
+    }
+    let size = record.real_size.filter(|size| *size > 0).ok_or_else(|| {
+        let diagnostic = record
+            .bounding_size
+            .map(|size| format!("; diagnostic aflj size is {size}"))
+            .unwrap_or_default();
+        Error::Serialize(format!(
+            "radare2 function lacks positive realsz for Thumb region 0x{region_addr:x}{diagnostic}"
+        ))
+    })?;
+    if size > image.len() as u64 {
+        return Err(Error::Serialize(format!(
+            "radare2 function realsz exceeds mapped image length for Thumb region 0x{region_addr:x}"
+        )));
+    }
+    let name = record
+        .name
+        .clone()
         .unwrap_or_else(|| format!("thumb_{entry_u64:x}"));
-    let entry = u32::try_from(entry_u64).map_err(|_| Error::Serialize(format!(
-        "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
-    )))?;
     let projection = radare2_execution_projection(entry, pdfj, image, load_addr);
+    if let ExecutionProjection::Accepted(ranges) = &projection
+        && ranges.iter().any(|range| range.end > end)
+    {
+        return Err(Error::Serialize(format!(
+            "radare2 function decode range exceeds maxaddr for Thumb region 0x{region_addr:x}"
+        )));
+    }
     let body = pdfj.map(pdfj_body).unwrap_or_default();
     let data_refs = pdfj.map(data_refs_from_pdfj).unwrap_or_default();
     let mut output = serde_json::json!({
         "name": name,
         "entry": json_hex(entry_u64),
-        "end": json_hex(entry_u64.saturating_add(size)),
+        "end": json_hex(end_u64),
         "size": size,
         "body_kind": "thumb_disassembly",
         "body": body,
@@ -1105,8 +1148,8 @@ const R2_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// fast; large enough that per-chunk write overhead is negligible.
 const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 
-/// Stream up to `cap` bytes from `reader` to `writer`. Returns the number
-/// of bytes written on EOF. If input would exceed `cap`, returns
+/// Stream up to `cap` bytes from `reader` to `writer`, hashing each chunk as
+/// it is written. Returns the capture identity on EOF. If input would exceed `cap`, returns
 /// `Err(io::Error)` with `ErrorKind::Other` and a cap-exceeded message;
 /// the caller is responsible for process cleanup (kill, reap, remove
 /// partial file).
@@ -1117,25 +1160,33 @@ fn stream_to_cap<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     cap: usize,
-) -> std::io::Result<usize> {
+    sidecar_path: &str,
+) -> std::io::Result<CaptureRecord> {
     let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
     let mut written: usize = 0;
+    let mut hasher = blake3::Hasher::new();
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
-            return Ok(written);
+            return Ok(CaptureRecord {
+                path: sidecar_path.to_owned(),
+                bytes: written as u64,
+                blake3: hasher.finalize().to_hex().to_string(),
+            });
         }
         // Check before writing so we never write past the cap.
-        if written + n > cap {
+        if n > cap - written {
             // Write up to the cap (so the caller sees a partial file of
             // exactly `cap` bytes if they inspect it before cleanup).
             let allowed = cap - written;
             writer.write_all(&chunk[..allowed])?;
+            hasher.update(&chunk[..allowed]);
             return Err(std::io::Error::other(format!(
                 "stream_to_cap: input exceeded {cap} bytes"
             )));
         }
         writer.write_all(&chunk[..n])?;
+        hasher.update(&chunk[..n]);
         written += n;
     }
 }
@@ -1189,9 +1240,12 @@ fn validate_thumb_region_requests(
     load_addr: u32,
     regions: &[(u32, u32)],
 ) -> Result<Vec<(u32, u32)>> {
-    let image_end = u64::from(load_addr)
-        .checked_add(image.len() as u64)
-        .ok_or_else(|| Error::Serialize("Thumb image address range overflows u64".into()))?;
+    let image_len = u32::try_from(image.len()).map_err(|_| {
+        Error::Serialize("Thumb mapped image length exceeds the canonical u32 domain".into())
+    })?;
+    let image_end = load_addr.checked_add(image_len).ok_or_else(|| {
+        Error::Serialize("Thumb mapped image range overflows the canonical u32 domain".into())
+    })?;
     let mut validated = Vec::<(u32, u32)>::with_capacity(regions.len());
 
     for &(start, len) in regions {
@@ -1205,7 +1259,7 @@ fn validate_thumb_region_requests(
                 "Thumb region 0x{start:x} length 0x{len:x} overflows the u32 address space"
             ))
         })?;
-        if start < load_addr || u64::from(end) > image_end {
+        if start < load_addr || end > image_end {
             return Err(Error::Serialize(format!(
                 "Thumb region 0x{start:x}..0x{end:x} is outside image 0x{load_addr:x}..0x{image_end:x}"
             )));
@@ -1228,157 +1282,486 @@ fn validate_thumb_region_requests(
     Ok(validated)
 }
 
-/// Analyze an image's dense Thumb-2 regions with radare2, streaming. Each
-/// region is carved out, analyzed as ARM/Thumb (`-a arm -b 16`) based at
-/// its load address, and its normalized functions spill to
-/// `thumb/<addr:08x>.frags`; the final `thumb_functions.json` is assembled
-/// atomically (complete-old-or-complete-new) from the spills in region
-/// order / fn order — byte-identical to the former whole-`Value` rendering,
-/// with peak memory O(largest single JSON value + one fragment) instead of
-/// O(all functions). Region requests must be positive, image-contained,
-/// sorted, and non-overlapping; they are validated before any output is
-/// created. The carved blobs and `.stdout` captures are kept under
-/// `out_dir/thumb/` for follow-up. Returns the count of substantial
-/// (>= 32-byte) functions recovered. Per-region failures are tolerated when
-/// at least one region succeeds; if every requested region fails, no sidecar
-/// is committed and the ordered region failures are returned.
-pub fn run_radare2_thumb(
-    r2: &Path,
+fn validate_thumb_tools(tools: &ThumbTools) -> Result<()> {
+    if tools.rizin.is_some() {
+        return Err(Error::Serialize(
+            "Rizin is unsupported by the current Thumb analysis coordinator".into(),
+        ));
+    }
+    let radare2 = &tools.radare2;
+    if radare2.producer != ThumbProducer::Radare2 {
+        return Err(Error::Serialize(
+            "Thumb primary producer identity must be radare2".into(),
+        ));
+    }
+    if radare2.command != ThumbProducer::Radare2.command() {
+        return Err(Error::Serialize(
+            "radare2 producer command does not match the v3 schema".into(),
+        ));
+    }
+    if radare2.version.is_empty()
+        || radare2.version.trim() != radare2.version
+        || radare2.version.contains(['\r', '\n'])
+    {
+        return Err(Error::Serialize(
+            "radare2 producer version is not normalized".into(),
+        ));
+    }
+    if !radare2.executable.is_absolute()
+        || radare2.executable.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(Error::Serialize(
+            "radare2 producer executable must be a canonical absolute path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn add_count(total: &mut usize, value: usize, label: &str) -> Result<()> {
+    *total = total
+        .checked_add(value)
+        .ok_or_else(|| Error::Serialize(format!("Thumb {label} count overflow")))?;
+    Ok(())
+}
+
+/// Analyze validated dense-Thumb regions with the configured backend policy.
+/// Stage 2 supports radare2 only and writes a provenance-complete v3 sidecar.
+/// Per-region failures remain durable when another region succeeds; an
+/// all-region failure leaves any prior sidecar untouched.
+pub fn run_thumb_analysis(
+    tools: &ThumbTools,
     image: &[u8],
     load_addr: u32,
     regions: &[(u32, u32)],
     out_dir: &Path,
-) -> Result<usize> {
+) -> Result<ThumbAnalysisSummary> {
+    validate_thumb_tools(tools)?;
     let regions = validate_thumb_region_requests(image, load_addr, regions)?;
+    let mut summary = ThumbAnalysisSummary {
+        regions_requested: regions.len(),
+        ..ThumbAnalysisSummary::default()
+    };
+    if regions.is_empty() {
+        return Ok(summary);
+    }
     let thumb_dir = out_dir.join("thumb");
     std::fs::create_dir_all(&thumb_dir)?;
     let mut spills: Vec<Spill> = Vec::new();
-    let mut skipped: Vec<SkippedRegion> = Vec::new();
-    let mut substantial = 0usize;
-    let mut accepted = 0usize;
-    let mut total = 0usize;
+    let mut region_records = Vec::with_capacity(regions.len());
+    let mut failures = Vec::new();
+
     for &(addr, end) in &regions {
         let len = end - addr;
-        match run_radare2_thumb_region(r2, image, load_addr, addr, len, &thumb_dir) {
-            Ok(Some(outcome)) => {
-                substantial += outcome.stats.substantial;
-                accepted += outcome.stats.accepted;
-                total += outcome.stats.raw;
-                spills.push(outcome.spill);
+        match run_radare2_region(&tools.radare2, image, load_addr, addr, len, &thumb_dir) {
+            Ok(success) => {
+                let stats = &success.outcome.stats;
+                let quarantined = stats.raw.checked_sub(stats.accepted).ok_or_else(|| {
+                    Error::Serialize(format!(
+                        "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+                    ))
+                })?;
+                let run = FunctionRunRecord {
+                    producer: ThumbProducer::Radare2,
+                    first_function: summary.raw,
+                    function_count: stats.raw,
+                    substantial: stats.substantial,
+                    accepted: stats.accepted,
+                    quarantined,
+                };
+                add_count(&mut summary.regions_succeeded, 1, "succeeded region")?;
+                add_count(&mut summary.radare2_runs, 1, "radare2 run")?;
+                add_count(&mut summary.raw, stats.raw, "raw function")?;
+                add_count(
+                    &mut summary.substantial,
+                    stats.substantial,
+                    "substantial function",
+                )?;
+                add_count(&mut summary.accepted, stats.accepted, "accepted function")?;
+                add_count(
+                    &mut summary.quarantined,
+                    quarantined,
+                    "quarantined function",
+                )?;
+                region_records.push(RegionRecord {
+                    start: addr,
+                    end,
+                    attempts: vec![AttemptRecord {
+                        producer: ThumbProducer::Radare2,
+                        status: AttemptStatus::Succeeded,
+                        stdout: Some(success.capture),
+                        error: None,
+                    }],
+                    function_runs: vec![run],
+                });
+                spills.push(success.outcome.spill);
             }
-            Ok(None) => {}
-            Err(reason) => skipped.push(SkippedRegion {
-                addr,
-                reason: reason.to_string(),
-            }),
+            Err(failure) => {
+                add_count(&mut summary.regions_failed, 1, "failed region")?;
+                let reason = failure.error.to_string();
+                tracing::warn!(
+                    "Thumb region 0x{addr:x} radare2 attempt failed (fail-closed): {}",
+                    reason
+                );
+                failures.push((addr, reason.clone()));
+                region_records.push(RegionRecord {
+                    start: addr,
+                    end,
+                    attempts: vec![AttemptRecord {
+                        producer: ThumbProducer::Radare2,
+                        status: AttemptStatus::Failed,
+                        stdout: failure.capture,
+                        error: Some(reason),
+                    }],
+                    function_runs: Vec::new(),
+                });
+            }
         }
     }
-    for region in &skipped {
-        tracing::warn!(
-            "radare2: Thumb region 0x{:x} skipped (analysis failed, fail-closed): {}",
-            region.addr,
-            region.reason
-        );
+
+    if summary
+        .regions_succeeded
+        .checked_add(summary.regions_failed)
+        != Some(summary.regions_requested)
+        || summary.accepted.checked_add(summary.quarantined) != Some(summary.raw)
+    {
+        return Err(Error::Serialize(
+            "Thumb analysis summary is not conserving".into(),
+        ));
     }
-    tracing::info!(
-        "radare2: Thumb execution projections accepted={accepted} quarantined={} regions_skipped={}",
-        total - accepted,
-        skipped.len()
-    );
-    if !regions.is_empty() && spills.is_empty() {
-        let reasons = skipped
+    if summary.regions_succeeded == 0 {
+        let reasons = failures
             .iter()
-            .map(|region| format!("0x{:x}: {}", region.addr, region.reason))
+            .map(|(addr, reason)| format!("0x{addr:x} radare2: {reason}"))
             .collect::<Vec<_>>()
             .join("; ");
         return Err(Error::Serialize(format!(
-            "radare2 failed for every requested Thumb region: {reasons}"
+            "Thumb analysis failed for every requested region: {reasons}"
         )));
     }
-    assemble_thumb_functions_json(&out_dir.join("thumb_functions.json"), &spills)?;
-    Ok(substantial)
+
+    if let Err(error) = assemble_v3_atomic(
+        &out_dir.join("thumb_functions.json"),
+        std::slice::from_ref(&tools.radare2),
+        &region_records,
+        &spills,
+    ) {
+        for spill in &spills {
+            let _ = std::fs::remove_file(&spill.path);
+        }
+        return Err(error);
+    }
+    Ok(summary)
 }
 
-/// Analyze one dense Thumb-2 region with radare2 and return its finished
-/// fragment spill plus per-region stats. Carves the region to
-/// `thumb_dir/<addr>.bin`, runs `aaa;aflj;pdfj @@f` under
-/// [`limit_r2_address_space`], streams stdout to a capped `<addr>.stdout`,
-/// then processes that capture via [`process_region_streaming`]. Returns
-/// `Err` on any per-region failure — r2 spawn/kill/non-zero exit (the
-/// address-space cap firing lands here), a stdout-cap exceed, malformed
-/// output, or a non-conserving projection; [`run_radare2_thumb`] records
-/// those as skips rather than aborting. An empty region (offset past the
-/// image end) yields `Ok(None)`.
+fn run_radare2_region(
+    radare2: &ProducerIdentity,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    len: u32,
+    thumb_dir: &Path,
+) -> std::result::Result<SuccessfulRegion, FailedRegion> {
+    let off = (addr - load_addr) as usize;
+    let end = off + len as usize;
+    let bin = thumb_dir.join(format!("{addr:08x}.bin"));
+    if let Err(error) = std::fs::write(&bin, &image[off..end]) {
+        return Err(FailedRegion {
+            capture: None,
+            error: error.into(),
+        });
+    }
+    let mut cmd = std::process::Command::new(&radare2.executable);
+    cmd.args(["-a", "arm", "-b", "16", "-m"])
+        .arg(format!("0x{addr:x}"))
+        .args(["-q", "-c", radare2.command])
+        .arg(&bin)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped());
+    limit_r2_address_space(&mut cmd);
+    let mut child = cmd.spawn().map_err(|error| FailedRegion {
+        capture: None,
+        error: error.into(),
+    })?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stdout_path = thumb_dir.join(format!("{addr:08x}.radare2.stdout"));
+    let mut file = match std::fs::File::create(&stdout_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(FailedRegion {
+                capture: None,
+                error: error.into(),
+            });
+        }
+    };
+    let sidecar_path = format!("thumb/{addr:08x}.radare2.stdout");
+
+    let capture = stream_to_cap(&mut stdout, &mut file, R2_STDOUT_CAP_BYTES, &sidecar_path)
+        .and_then(|capture| {
+            file.flush()?;
+            Ok(capture)
+        });
+    drop(file);
+    drop(stdout);
+
+    let capture = match capture {
+        Ok(capture) => capture,
+        Err(error) => {
+            let kind = error.kind();
+            let error = if kind == std::io::ErrorKind::Other {
+                Error::ToolNotFound(format!(
+                    "radare2 emitted > {R2_STDOUT_CAP_BYTES} bytes for region {addr:08x}; capped to prevent OOM"
+                ))
+            } else {
+                error.into()
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&stdout_path);
+            return Err(FailedRegion {
+                capture: None,
+                error,
+            });
+        }
+    };
+
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(FailedRegion {
+                capture: Some(capture),
+                error: error.into(),
+            });
+        }
+    };
+    if let Err(error) = check_radare2_thumb_status(status.success(), status.code(), addr) {
+        return Err(FailedRegion {
+            capture: Some(capture),
+            error,
+        });
+    }
+    match process_region_streaming(&stdout_path, image, load_addr, addr, thumb_dir) {
+        Ok(outcome) => Ok(SuccessfulRegion { outcome, capture }),
+        Err(error) => Err(FailedRegion {
+            capture: Some(capture),
+            error,
+        }),
+    }
+}
+
+#[cfg(test)]
+fn test_radare2_identity(path: &Path) -> Result<ProducerIdentity> {
+    Ok(ProducerIdentity {
+        producer: ThumbProducer::Radare2,
+        executable: std::fs::canonicalize(path)?,
+        version: "radare2 test".into(),
+        command: ThumbProducer::Radare2.command(),
+    })
+}
+
+#[cfg(test)]
 fn run_radare2_thumb_region(
-    r2: &Path,
+    radare2: &Path,
     image: &[u8],
     load_addr: u32,
     addr: u32,
     len: u32,
     thumb_dir: &Path,
 ) -> Result<Option<RegionOutcome>> {
-    let off = addr.wrapping_sub(load_addr) as usize;
-    if off >= image.len() {
-        return Ok(None);
+    match run_radare2_region(
+        &test_radare2_identity(radare2)?,
+        image,
+        load_addr,
+        addr,
+        len,
+        thumb_dir,
+    ) {
+        Ok(success) => Ok(Some(success.outcome)),
+        Err(failure) => Err(failure.error),
     }
-    let end = off.saturating_add(len as usize).min(image.len());
-    let bin = thumb_dir.join(format!("{addr:08x}.bin"));
-    std::fs::write(&bin, &image[off..end])?;
-    // Stream r2 stdout to a per-region temp file. The file is kept after parse
-    // for debugging (disk is cheap; --prune drops it with the rest of `thumb/`).
-    // Cap is `R2_STDOUT_CAP_BYTES` (4 GiB) — see the const's doc comment.
-    let mut cmd = std::process::Command::new(r2);
-    cmd.args(["-a", "arm", "-b", "16", "-m"])
-        .arg(format!("0x{addr:x}"))
-        .args(["-q", "-c", "aaa;aflj;pdfj @@f"])
-        .arg(&bin)
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped());
-    limit_r2_address_space(&mut cmd);
-    let mut child = cmd.spawn()?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let stdout_path = thumb_dir.join(format!("{addr:08x}.stdout"));
-    let mut file = std::fs::File::create(&stdout_path)?;
-
-    let cap_err = stream_to_cap(&mut stdout, &mut file, R2_STDOUT_CAP_BYTES);
-    drop(file); // close + flush before any read-back or removal
-    drop(stdout); // drop the pipe handle explicitly
-
-    if let Err(e) = cap_err {
-        // Cap exceeded OR genuine I/O error. Either way: kill, reap, remove the
-        // partial file (no value in keeping truncated output), return Err. The
-        // `ErrorKind::Other` discrimination is the cap-exceed signal from
-        // `stream_to_cap`; a genuine I/O error could in rare cases also surface as
-        // `Other`, but the cleanup path is identical, so a misclassification only
-        // changes the error message.
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&stdout_path);
-        if e.kind() == std::io::ErrorKind::Other {
-            return Err(Error::ToolNotFound(format!(
-                "radare2 emitted > {R2_STDOUT_CAP_BYTES} bytes for region {addr:08x}; capped to prevent OOM"
-            )));
-        }
-        // Genuine I/O error during streaming — propagate as Error::Io.
-        return Err(e.into());
-    }
-
-    let status = child.wait()?;
-    check_radare2_thumb_status(status.success(), status.code(), addr)?;
-
-    process_region_streaming(&stdout_path, image, load_addr, addr, thumb_dir).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn thumb_tools(radare2: &Path) -> crate::thumb_analysis::ThumbTools {
+        crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: std::fs::canonicalize(radare2).unwrap(),
+                version: "radare2 test 1.0".to_string(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_thumb_analysis_emits_partial_v3_with_contiguous_runs_and_conserved_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        std::fs::write(
+            &radare2,
+            r#"#!/bin/sh
+case " $* " in
+  *" -m 0x4000 "*)
+    printf '%s\n' '[{"name":"sym.first","addr":16384,"size":4096,"realsz":32,"maxaddr":16386},{"name":"sym.quarantined","addr":16416,"size":64,"realsz":2,"maxaddr":16418}]' '{"addr":16384,"ops":[{"addr":16384,"bytes":"7047","disasm":"bx lr"}]}'
+    ;;
+  *" -m 0x4040 "*)
+    printf 'failed capture\n'
+    exit 7
+    ;;
+  *" -m 0x4080 "*)
+    printf '%s\n' '[{"name":"sym.last","addr":16512,"size":128,"realsz":2,"maxaddr":16514}]' '{"addr":16512,"ops":[{"addr":16512,"bytes":"7047","disasm":"bx lr"}]}'
+    ;;
+  *) exit 98 ;;
+esac
+"#,
+        )
+        .unwrap();
+        make_executable(&radare2);
+        let mut image = vec![0u8; 0xc0];
+        image[0..2].copy_from_slice(&[0x70, 0x47]);
+        image[0x80..0x82].copy_from_slice(&[0x70, 0x47]);
+        let out = dir.path().join("out");
+
+        let summary = crate::thumb_analysis::run_thumb_analysis(
+            &thumb_tools(&radare2),
+            &image,
+            0x4000,
+            &[(0x4000, 0x40), (0x4040, 0x40), (0x4080, 0x40)],
+            &out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary,
+            crate::thumb_analysis::ThumbAnalysisSummary {
+                regions_requested: 3,
+                regions_succeeded: 2,
+                regions_failed: 1,
+                radare2_runs: 2,
+                rizin_runs: 0,
+                raw: 3,
+                substantial: 1,
+                accepted: 2,
+                quarantined: 1,
+            }
+        );
+        let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&bytes).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(artifact["format"], crate::thumb_analysis::THUMB_V3_FORMAT);
+        assert_eq!(artifact["producers"].as_array().unwrap().len(), 1);
+        assert_eq!(artifact["regions"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            artifact["regions"][0]["function_runs"][0]["first_function"],
+            0
+        );
+        assert_eq!(
+            artifact["regions"][0]["function_runs"][0]["function_count"],
+            2
+        );
+        assert!(
+            artifact["regions"][1]["function_runs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            artifact["regions"][2]["function_runs"][0]["first_function"],
+            2
+        );
+        assert_eq!(artifact["regions"][1]["attempts"][0]["status"], "failed");
+        let capture = &artifact["regions"][1]["attempts"][0]["stdout"];
+        assert_eq!(capture["path"], "thumb/00004040.radare2.stdout");
+        let retained = std::fs::read(out.join(capture["path"].as_str().unwrap())).unwrap();
+        assert_eq!(capture["bytes"], retained.len() as u64);
+        assert_eq!(capture["blake3"], blake3::hash(&retained).to_hex().as_str());
+        assert!(!out.join("thumb/00004000.stdout").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_thumb_analysis_rejects_configured_rizin_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let sentinel = dir.path().join("spawned");
+        std::fs::write(
+            &radare2,
+            format!(
+                "#!/bin/sh\n: > '{}'\nprintf '%s\\n' '[{{\"addr\":16384,\"size\":2,\"realsz\":2,\"maxaddr\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"addr\":16384,\"bytes\":\"00bf\"}}]}}'\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&radare2);
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Rizin,
+            executable: std::fs::canonicalize(&radare2).unwrap(),
+            version: "rizin test 1.0".into(),
+            command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
+        });
+        let out = dir.path().join("out");
+
+        let error =
+            run_thumb_analysis(&tools, &[0, 0xbf], 0x4000, &[(0x4000, 2)], &out).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Rizin is unsupported"),
+            "{error}"
+        );
+        assert!(!sentinel.exists());
+        assert!(!out.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_thumb_analysis_empty_request_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        std::fs::write(&radare2, "#!/bin/sh\nexit 99\n").unwrap();
+        make_executable(&radare2);
+        let out = dir.path().join("out");
+
+        let summary = run_thumb_analysis(&thumb_tools(&radare2), &[], 0x4000, &[], &out).unwrap();
+
+        assert_eq!(
+            summary,
+            crate::thumb_analysis::ThumbAnalysisSummary::default()
+        );
+        assert!(!out.exists());
+    }
+
     #[test]
     fn normalize_radare2_function_records_body_and_refs() {
         let raw = serde_json::json!({
             "name": "sym.thumb_func",
             "offset": 0x4120u64,
-            "size": 48u64
+            "size": 4096u64,
+            "realsz": 48u64,
+            "maxaddr": 0x4150u64
         });
         let pdfj = serde_json::json!({
             "ops": [
@@ -1414,6 +1797,127 @@ mod tests {
             "out-of-order pdfj operations must normalize into an exact tagged Thumb range"
         );
         assert_eq!(entry["decode_range_errors"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn v3_uses_maxaddr_and_realsz_not_entry_plus_bounding_size() {
+        let raw = json!({
+            "addr": 0x43b2847cu64,
+            "size": 1_112_420u64,
+            "realsz": 32u64,
+            "minaddr": 0x43a18edcu64,
+            "maxaddr": 0x43b28840u64,
+            "name": "fcn.43b2847c"
+        });
+        let pdfj = json!({
+            "addr": 0x43b2847cu64,
+            "ops": [{
+                "addr": 0x43b2847cu64,
+                "bytes": "7047",
+                "disasm": "bx lr"
+            }]
+        });
+        let mut image = vec![0u8; 0x14_0000];
+        let op_offset = (0x43b2847cu64 - 0x43a00000u64) as usize;
+        image[op_offset..op_offset + 2].copy_from_slice(&[0x70, 0x47]);
+
+        let normalized =
+            normalize_radare2_function_checked(&raw, Some(&pdfj), &image, 0x43a00000, 0x43a00000)
+                .unwrap();
+
+        assert_eq!(normalized["end"], "0x43b28840");
+        assert_eq!(normalized["size"], 32);
+    }
+
+    #[test]
+    fn v3_rejects_missing_or_invalid_radare2_boundaries() {
+        let valid = json!({
+            "addr": 0x4000u64,
+            "size": 0x1000u64,
+            "realsz": 2u64,
+            "maxaddr": 0x4002u64,
+            "name": "fcn.4000"
+        });
+        let cases = [
+            ("missing realsz", None, "realsz"),
+            ("zero realsz", Some(("realsz", json!(0))), "positive realsz"),
+            (
+                "malformed realsz",
+                Some(("realsz", json!("not-a-size"))),
+                "realsz",
+            ),
+            (
+                "oversized realsz",
+                Some(("realsz", json!(0x21))),
+                "mapped image length",
+            ),
+            ("missing maxaddr", None, "maxaddr"),
+            (
+                "malformed maxaddr",
+                Some(("maxaddr", json!("not-an-address"))),
+                "maxaddr",
+            ),
+            (
+                "reversed maxaddr",
+                Some(("maxaddr", json!(0x4000))),
+                "must follow entry",
+            ),
+            (
+                "out-of-image maxaddr",
+                Some(("maxaddr", json!(0x4021))),
+                "outside mapped image",
+            ),
+            (
+                "overflowed maxaddr",
+                Some(("maxaddr", json!(u64::from(u32::MAX) + 1))),
+                "canonical u32",
+            ),
+        ];
+
+        for (case, replacement, expected) in cases {
+            let mut raw = valid.clone();
+            match (case, replacement) {
+                ("missing realsz", _) => {
+                    raw.as_object_mut().unwrap().remove("realsz");
+                }
+                ("missing maxaddr", _) => {
+                    raw.as_object_mut().unwrap().remove("maxaddr");
+                }
+                (_, Some((field, value))) => raw[field] = value,
+                _ => unreachable!(),
+            }
+
+            let error =
+                normalize_radare2_function_checked(&raw, None, &[0u8; 0x20], 0x4000, 0x4000)
+                    .unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_substantial_count_uses_realsz() {
+        let stdout = b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":1,\"realsz\":32,\"maxaddr\":16386}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("capture.stdout");
+        std::fs::write(&stdout_path, stdout).unwrap();
+
+        let outcome = process_region_streaming(
+            &stdout_path,
+            &[
+                0, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ],
+            0x4000,
+            0x4000,
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stats.substantial, 1);
     }
 
     #[test]
@@ -1469,7 +1973,12 @@ mod tests {
 
     #[test]
     fn radare2_pdfj_preserves_gaps_and_ignores_legacy_size_as_an_extent() {
-        let raw = serde_json::json!({"offset": 0x4000u64, "size": 0x1000u64});
+        let raw = serde_json::json!({
+            "offset": 0x4000u64,
+            "size": 0x1000u64,
+            "realsz": 6u64,
+            "maxaddr": 0x4006u64
+        });
         let pdfj = serde_json::json!({"ops": [
             {"offset": 0x4000u64, "bytes": "00bf"},
             {"offset": 0x4004u64, "bytes": "00bf"}
@@ -1482,7 +1991,8 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(entry["size"], 0x1000);
+        assert_eq!(entry["size"], 6);
+        assert_eq!(entry["end"], "0x4006");
         assert_eq!(
             entry["decode_ranges"],
             serde_json::json!([
@@ -1562,9 +2072,29 @@ mod tests {
         let input = vec![0xABu8; 100 * 1024]; // 100 KiB
         let mut reader = std::io::Cursor::new(&input[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let n = stream_to_cap(&mut reader, &mut writer, 1024 * 1024).unwrap();
-        assert_eq!(n, 100 * 1024);
+        let capture = stream_to_cap(&mut reader, &mut writer, 1024 * 1024, "capture").unwrap();
+        assert_eq!(capture.bytes, 100 * 1024);
         assert_eq!(writer, input);
+    }
+
+    #[test]
+    fn stream_to_cap_returns_capture_identity_without_rereading() {
+        let input = b"captured radare2 stdout";
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+
+        let capture = stream_to_cap(
+            &mut reader,
+            &mut writer,
+            1024,
+            "thumb/00004000.radare2.stdout",
+        )
+        .unwrap();
+
+        assert_eq!(writer, input);
+        assert_eq!(capture.path, "thumb/00004000.radare2.stdout");
+        assert_eq!(capture.bytes, input.len() as u64);
+        assert_eq!(capture.blake3, blake3::hash(input).to_hex().as_str());
     }
 
     #[test]
@@ -1573,7 +2103,7 @@ mod tests {
         let input = vec![0xCDu8; cap + 1];
         let mut reader = std::io::Cursor::new(&input[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let err = stream_to_cap(&mut reader, &mut writer, cap).unwrap_err();
+        let err = stream_to_cap(&mut reader, &mut writer, cap, "capture").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(
             err.to_string().contains(&format!("{cap}")),
@@ -1588,8 +2118,8 @@ mod tests {
     fn stream_to_cap_handles_empty_input() {
         let mut reader = std::io::Cursor::new(b"" as &[u8]);
         let mut writer: Vec<u8> = Vec::new();
-        let n = stream_to_cap(&mut reader, &mut writer, 1024).unwrap();
-        assert_eq!(n, 0);
+        let capture = stream_to_cap(&mut reader, &mut writer, 1024, "capture").unwrap();
+        assert_eq!(capture.bytes, 0);
         assert!(writer.is_empty());
     }
 
@@ -1600,8 +2130,8 @@ mod tests {
         let input = vec![0xEFu8; cap];
         let mut reader = std::io::Cursor::new(&input[..]);
         let mut writer: Vec<u8> = Vec::new();
-        let n = stream_to_cap(&mut reader, &mut writer, cap).unwrap();
-        assert_eq!(n, cap);
+        let capture = stream_to_cap(&mut reader, &mut writer, cap, "capture").unwrap();
+        assert_eq!(capture.bytes, cap as u64);
         assert_eq!(writer, input);
     }
 
@@ -1634,7 +2164,7 @@ mod tests {
         // regions' functions still reach thumb_functions.json. Regression guard
         // for the address-space-cap fail-closed path — one runaway region (e.g.
         // cheetah 01_MAIN 0x42310000) must degrade Thumb coverage locally, not
-        // zero it out. Exercises the production fold in `run_radare2_thumb`
+        // zero it out. Exercises the production fold in `run_thumb_analysis`
         // through a stub r2 that fails exactly one region by its -m address.
         let dir = std::env::temp_dir().join(format!("pme_r2_skip_one_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1644,7 +2174,7 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(
             &r2,
-            "#!/usr/bin/env sh\ncase \" $* \" in\n  *\" -m 0x4120 \"*) exit 139;;\n  *) printf '%s\\n' '[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":64}]' '{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}';;\nesac\n",
+            "#!/usr/bin/env sh\ncase \" $* \" in\n  *\" -m 0x4120 \"*) exit 139;;\n  *) printf '%s\\n' '[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":64,\"realsz\":64,\"maxaddr\":16674}]' '{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}';;\nesac\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1655,8 +2185,8 @@ mod tests {
             std::fs::set_permissions(&r2, perm).unwrap();
         }
 
-        let count = run_radare2_thumb(
-            &r2,
+        let summary = run_thumb_analysis(
+            &thumb_tools(&r2),
             &[0u8; 0x180],
             0x4000,
             &[(0x4100, 0x20), (0x4120, 0x20), (0x4140, 0x20)],
@@ -1664,7 +2194,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(count, 2, "surviving regions' functions must be kept");
+        assert_eq!(summary.regions_succeeded, 2);
+        assert_eq!(summary.regions_failed, 1);
+        assert_eq!(summary.radare2_runs, 2);
+        assert_eq!(summary.substantial, 2);
         let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let functions = doc["functions"].as_array().unwrap();
@@ -1685,8 +2218,8 @@ mod tests {
         let sidecar = dir.path().join("thumb_functions.json");
         std::fs::write(&sidecar, b"old").unwrap();
 
-        let err = run_radare2_thumb(
-            &r2,
+        let err = run_thumb_analysis(
+            &thumb_tools(&r2),
             &[0u8; 0x100],
             0x4000,
             &[(0x4000, 0x20), (0x4040, 0x20)],
@@ -1694,9 +2227,9 @@ mod tests {
         )
         .unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("failed for every requested Thumb region"));
-        let first = message.find("0x4000:").unwrap();
-        let second = message.find("0x4040:").unwrap();
+        assert!(message.contains("failed for every requested region"));
+        let first = message.find("0x4000 radare2:").unwrap();
+        let second = message.find("0x4040 radare2:").unwrap();
         assert!(first < second, "region failures must retain request order");
         assert_eq!(std::fs::read(sidecar).unwrap(), b"old");
     }
@@ -1708,7 +2241,7 @@ mod tests {
         let r2 = dir.path().join("r2");
         std::fs::write(
             &r2,
-            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"sym.thumb_func\",\"addr\":16672,\"size\":2}]' '{\"addr\":16672,\"ops\":[{\"addr\":16672,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}'\n",
+            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"sym.thumb_func\",\"addr\":16672,\"size\":64,\"realsz\":2,\"maxaddr\":16674}]' '{\"addr\":16672,\"ops\":[{\"addr\":16672,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}'\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1717,15 +2250,21 @@ mod tests {
         std::fs::set_permissions(&r2, permissions).unwrap();
         let mut image = vec![0u8; 0x200];
         image[0x120..0x122].copy_from_slice(&[0x70, 0x47]);
-        assert_eq!(
-            run_radare2_thumb(&r2, &image, 0x4000, &[(0x4120, 2)], dir.path()).unwrap(),
-            0
-        );
+        let summary = run_thumb_analysis(
+            &thumb_tools(&r2),
+            &image,
+            0x4000,
+            &[(0x4120, 2)],
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(summary.substantial, 0);
         let artifact: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(artifact["functions"][0]["entry"], "0x4120");
+        assert_eq!(artifact["format"], crate::thumb_analysis::THUMB_V3_FORMAT);
         assert_eq!(
             artifact["functions"][0]["decode_ranges"][0]["start"],
             "0x4120"
@@ -1766,7 +2305,7 @@ mod tests {
             std::fs::set_permissions(&r2, permissions).unwrap();
             let out = dir.path().join("out");
 
-            let err = run_radare2_thumb(&r2, &[0u8; 0x100], 0x4000, &regions, &out)
+            let err = run_thumb_analysis(&thumb_tools(&r2), &[0u8; 0x100], 0x4000, &regions, &out)
                 .err()
                 .unwrap_or_else(|| panic!("{name}: invalid request must fail"));
             assert!(
@@ -1778,10 +2317,38 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mapped_image_overflow_fails_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let sentinel = dir.path().join("spawned");
+        std::fs::write(
+            &radare2,
+            format!("#!/bin/sh\n: > '{}'\nexit 0\n", sentinel.display()),
+        )
+        .unwrap();
+        make_executable(&radare2);
+        let out = dir.path().join("out");
+
+        let error = run_thumb_analysis(
+            &thumb_tools(&radare2),
+            &[0u8; 0x20],
+            u32::MAX - 0x0f,
+            &[(u32::MAX - 0x0f, 8)],
+            &out,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("mapped image"), "{error}");
+        assert!(!sentinel.exists());
+        assert!(!out.exists());
+    }
+
     #[test]
     fn noisy_radare2_stdout_still_pairs_and_normalizes_pdfj() {
         let stdout = br#"Warning: run r2 with -e bin.cache=true
-[{"name":"sym.thumb_func","offset":16672,"size":48}]
+        [{"name":"sym.thumb_func","offset":16672,"size":4096,"realsz":48,"maxaddr":16720}]
 INFO: analyzing functions
 {"addr":16672,"ops":[{"offset":16672,"bytes":"b5f0","disasm":"push {r4, lr}","refs":[{"addr":36864,"type":"DATA"}]}]}
 Warning: analysis completed
@@ -1856,7 +2423,7 @@ Warning: analysis completed
     #[test]
     fn radare2_thumb_rejects_non_empty_inventory_with_zero_paired_bodies() {
         let stdout = b"Warning: noisy prelude\n\
-        [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]\n\
+        [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386}]\n\
         INFO: no pdfj body followed\n";
 
         let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
@@ -1867,7 +2434,7 @@ Warning: analysis completed
     #[test]
     fn process_region_streaming_rejects_zero_paired_bodies() {
         let stdout = b"Warning: noisy prelude\n\
-        [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]\n\
+        [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386}]\n\
         INFO: no pdfj body followed\n";
         let dir = tempfile::tempdir().unwrap();
         let stdout_path = dir.path().join("capture.stdout");
@@ -1883,7 +2450,7 @@ Warning: analysis completed
     #[test]
     fn radare2_thumb_retains_paired_empty_pdfj_body_for_quarantine() {
         let stdout = br#"Warning: noisy prelude
-[{"name":"sym.thumb_func","offset":16384,"size":64}]
+        [{"name":"sym.thumb_func","offset":16384,"size":64,"realsz":64,"maxaddr":16386}]
 {"addr":16384,"ops":[]}
 "#;
 
@@ -1895,7 +2462,7 @@ Warning: analysis completed
     #[test]
     fn radare2_thumb_retains_partial_pdfj_recovery_for_per_record_quarantine() {
         let stdout = br#"Warning: noisy prelude
-[{"name":"sym.first","offset":16384,"size":64},{"name":"sym.second","offset":16448,"size":64}]
+        [{"name":"sym.first","offset":16384,"size":64,"realsz":64,"maxaddr":16386},{"name":"sym.second","offset":16448,"size":64,"realsz":64,"maxaddr":16450}]
 {"addr":16384,"ops":[{"offset":16384,"bytes":"b5f0","disasm":"push {r4, lr}"}]}
 INFO: second pdfj body was noisy and not parseable
 "#;
@@ -1909,7 +2476,7 @@ INFO: second pdfj body was noisy and not parseable
     #[test]
     fn radare2_thumb_does_not_reuse_entry_matched_pdfj_as_positional_fallback() {
         let stdout = br#"Warning: noisy prelude
-[{"name":"sym.first","offset":16384,"size":64},{"name":"sym.second","offset":16448,"size":64}]
+        [{"name":"sym.first","offset":16384,"size":64,"realsz":64,"maxaddr":16386},{"name":"sym.second","offset":16448,"size":64,"realsz":64,"maxaddr":16450}]
 {"addr":16448,"ops":[{"offset":16448,"bytes":"4770","disasm":"bx lr"}]}
 "#;
 
@@ -1921,7 +2488,7 @@ INFO: second pdfj body was noisy and not parseable
     #[test]
     fn radare2_thumb_rejects_positional_pdfj_with_different_parseable_entry() {
         let stdout = br#"Warning: noisy prelude
-[{"name":"sym.first","offset":16384,"size":64},{"name":"sym.second","offset":16448,"size":64}]
+        [{"name":"sym.first","offset":16384,"size":64,"realsz":64,"maxaddr":16386},{"name":"sym.second","offset":16448,"size":64,"realsz":64,"maxaddr":16450}]
 {"addr":20480,"ops":[{"offset":20480,"bytes":"00bf","disasm":"nop"}]}
 {"addr":16448,"ops":[{"offset":16448,"bytes":"4770","disasm":"bx lr"}]}
 "#;
@@ -1950,7 +2517,7 @@ INFO: second pdfj body was noisy and not parseable
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(
             &r2,
-            "#!/usr/bin/env sh\nprintf '%s\\n' \"$@\" > \"$0.argv\"\ncat <<'EOF'\n[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":64}]\n{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"$@\" > \"$0.argv\"\ncat <<'EOF'\n[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":64,\"realsz\":64,\"maxaddr\":16674}]\n{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1961,9 +2528,16 @@ INFO: second pdfj body was noisy and not parseable
             std::fs::set_permissions(&r2, perm).unwrap();
         }
 
-        let count = run_radare2_thumb(&r2, &[0u8; 0x180], 0x4000, &[(0x4120, 0x20)], &out).unwrap();
+        let summary = run_thumb_analysis(
+            &thumb_tools(&r2),
+            &[0u8; 0x180],
+            0x4000,
+            &[(0x4120, 0x20)],
+            &out,
+        )
+        .unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(summary.substantial, 1);
         let argv = std::fs::read_to_string(r2.with_file_name("r2.argv")).unwrap();
         let args: Vec<_> = argv.lines().collect();
         assert_eq!(args[0..4], ["-a", "arm", "-b", "16"]);
@@ -1987,7 +2561,7 @@ INFO: second pdfj body was noisy and not parseable
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(
             &r2,
-            "#!/usr/bin/env sh\ncat <<'EOF'\n[{\"name\":\"sym.no_entry\",\"size\":64}]\n{\"ops\":[{\"type\":\"nop\"},{\"offset\":16416,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
+            "#!/usr/bin/env sh\ncat <<'EOF'\n[{\"name\":\"sym.no_entry\",\"size\":64,\"realsz\":2,\"maxaddr\":16386}]\n{\"ops\":[{\"type\":\"nop\"},{\"offset\":16416,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -2086,23 +2660,16 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
-    fn run_radare2_thumb_emits_v2_format_string() {
-        // Phase 2 bumps thumb_functions.json format to v2; the body_c field arrives
-        // in the enrich step. Uses the stub-r2 pattern (cf. radare2_thumb_maps_raw_blob_at_region_address)
-        // so the test is hermetic and does not require a real r2 on PATH.
-        let dir = std::env::temp_dir().join(format!("pme_r2_v2_fmt_{}", std::process::id()));
+    fn run_thumb_analysis_emits_v3_format_and_producer_identity() {
+        let dir = std::env::temp_dir().join(format!("pme_r2_v3_fmt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let r2 = dir.join("r2");
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        // Stub r2 emits a single Thumb function at 0x4120 (16672) + matching pdfj —
-        // the same shape as radare2_thumb_maps_raw_blob_at_region_address's stub.
-        // run_radare2_thumb then writes the wrapper JSON regardless of inventory
-        // content; we only need to verify the format string.
         std::fs::write(
             &r2,
-            "#!/usr/bin/env sh\ncat <<'EOF'\n[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":32}]\n{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
+            "#!/usr/bin/env sh\ncat <<'EOF'\n[{\"name\":\"sym.thumb_func\",\"offset\":16672,\"size\":4096,\"realsz\":32,\"maxaddr\":16674}]\n{\"addr\":16672,\"ops\":[{\"offset\":16672,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -2113,26 +2680,28 @@ INFO: second pdfj body was noisy and not parseable
             std::fs::set_permissions(&r2, perm).unwrap();
         }
 
-        let _ = run_radare2_thumb(&r2, &[0u8; 0x180], 0x4000, &[(0x4120, 0x20)], &out).unwrap();
+        let tools = thumb_tools(&r2);
+        let summary =
+            run_thumb_analysis(&tools, &[0u8; 0x180], 0x4000, &[(0x4120, 0x20)], &out).unwrap();
         let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            v["format"], "pixel-modem-extractor-thumb-functions-v2",
-            "Phase 2 bumps the format to v2 (body_c field arrives in the enrich step)"
-        );
+        assert_eq!(v["format"], crate::thumb_analysis::THUMB_V3_FORMAT);
+        assert_eq!(v["producers"][0]["id"], "radare2");
+        assert_eq!(v["producers"][0]["version"], tools.radare2.version);
+        assert_eq!(summary.substantial, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn run_radare2_thumb_multi_region_is_legacy_order_and_cleans_spills() {
+    fn run_thumb_analysis_preserves_region_function_order_and_cleans_spills() {
         let dir = tempfile::tempdir().unwrap();
         let r2 = dir.path().join("r2");
         // Regions carve to thumb/<addr:08x>.bin, so the stub dispatches on the
         // carved blob name in its last argument.
         std::fs::write(
             &r2,
-            "#!/usr/bin/env sh\ncase \"$*\" in *00004000.bin*) cat <<'EOF'\n[{\"name\":\"sym.a1\",\"offset\":16384,\"size\":64},{\"name\":\"sym.a2\",\"offset\":16448,\"size\":16}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n;; *) cat <<'EOF'\n[{\"name\":\"sym.b1\",\"offset\":32768,\"size\":64}]\n{\"addr\":32768,\"ops\":[{\"offset\":32768,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n;; esac\n",
+            "#!/usr/bin/env sh\ncase \"$*\" in *00004000.bin*) cat <<'EOF'\n[{\"name\":\"sym.a1\",\"offset\":16384,\"size\":4096,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.a2\",\"offset\":16448,\"size\":4096,\"realsz\":16,\"maxaddr\":16450}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n;; *) cat <<'EOF'\n[{\"name\":\"sym.b1\",\"offset\":32768,\"size\":4096,\"realsz\":64,\"maxaddr\":32770}]\n{\"addr\":32768,\"ops\":[{\"offset\":32768,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\nEOF\n;; esac\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -2151,50 +2720,34 @@ INFO: second pdfj body was noisy and not parseable
         let mut image = vec![0u8; 0x1_0000];
         populate_test_image_from_pdfj(&mut image, &pdfj_a);
         populate_test_image_from_pdfj(&mut image, &pdfj_b);
-        let substantial =
-            run_radare2_thumb(&r2, &image, 0, &[(0x4000, 0x100), (0x8000, 0x100)], &out).unwrap();
+        let summary = run_thumb_analysis(
+            &thumb_tools(&r2),
+            &image,
+            0,
+            &[(0x4000, 0x100), (0x8000, 0x100)],
+            &out,
+        )
+        .unwrap();
         let written = std::fs::read(out.join("thumb_functions.json")).unwrap();
-        let expected = {
-            let fns = vec![
-                normalize_radare2_function_checked(
-                    &json!({"name":"sym.a1","offset":16384,"size":64}),
-                    Some(&pdfj_a),
-                    &image,
-                    0,
-                    0x4000,
-                )
-                .unwrap(),
-                normalize_radare2_function_checked(
-                    &json!({"name":"sym.a2","offset":16448,"size":16}),
-                    None,
-                    &image,
-                    0,
-                    0x4000,
-                )
-                .unwrap(),
-                normalize_radare2_function_checked(
-                    &json!({"name":"sym.b1","offset":32768,"size":64}),
-                    Some(&pdfj_b),
-                    &image,
-                    0,
-                    0x8000,
-                )
-                .unwrap(),
-            ];
-            serde_json::to_string_pretty(&json!({
-                "format": "pixel-modem-extractor-thumb-functions-v2",
-                "functions": fns,
-            }))
-            .unwrap()
-        };
+        let artifact: serde_json::Value = serde_json::from_slice(&written).unwrap();
+        assert_eq!(summary.substantial, 2);
+        assert_eq!(summary.raw, 3);
+        assert_eq!(summary.accepted, 2);
+        assert_eq!(summary.quarantined, 1);
+        assert_eq!(artifact["functions"][0]["name"], "sym.a1");
+        assert_eq!(artifact["functions"][1]["name"], "sym.a2");
+        assert_eq!(artifact["functions"][2]["name"], "sym.b1");
         assert_eq!(
-            substantial, 2,
-            "a1 (64) and b1 (64); a2 (16) is not substantial"
+            artifact["regions"][0]["function_runs"][0]["first_function"],
+            0
         );
-        assert_eq!(written, expected.as_bytes());
+        assert_eq!(
+            artifact["regions"][1]["function_runs"][0]["first_function"],
+            2
+        );
         let thumb = out.join("thumb");
-        assert!(thumb.join("00004000.stdout").exists());
-        assert!(thumb.join("00008000.stdout").exists());
+        assert!(thumb.join("00004000.radare2.stdout").exists());
+        assert!(thumb.join("00008000.radare2.stdout").exists());
         let leftovers: Vec<_> = std::fs::read_dir(&thumb)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -2219,8 +2772,8 @@ INFO: second pdfj body was noisy and not parseable
     fn scanner_matches_legacy_values_on_all_fixtures() {
         let fixtures: Vec<&[u8]> = vec![
             b"",
-            b"Warning: noisy prelude\n[{\"name\":\"f\",\"offset\":1,\"size\":2}]\nINFO: tail\n",
-            b"[{\"name\":\"f\",\"offset\":1,\"size\":2}]",
+            b"Warning: noisy prelude\n[{\"name\":\"f\",\"offset\":1,\"size\":2,\"realsz\":2,\"maxaddr\":3}]\nINFO: tail\n",
+            b"[{\"name\":\"f\",\"offset\":1,\"size\":2,\"realsz\":2,\"maxaddr\":3}]",
             b"[{ \"ops\": [] }]  [ { \"ops\": [ { \"offset\": 1 } ] } ]",
             b"{\"a\": \"has } ] { brackets [ inside \"} trailing",
             b"{\"a\": \"esc \\\" ] quote\"}[1,2,3]",
@@ -2273,7 +2826,7 @@ INFO: second pdfj body was noisy and not parseable
         assert_eq!(second, b"{\"b\":2}");
     }
 
-    fn inventory_of(stdout: &[u8]) -> (usize, Option<Vec<FnRec>>) {
+    fn inventory_of(stdout: &[u8]) -> (usize, Option<Vec<FunctionRecord>>) {
         let mut scanner = ValueScanner::new(std::io::Cursor::new(stdout.to_vec()));
         scan_for_inventory(&mut scanner).unwrap()
     }
@@ -2281,13 +2834,13 @@ INFO: second pdfj body was noisy and not parseable
     #[test]
     fn inventory_scan_agrees_with_legacy_detection() {
         let fixtures: Vec<&[u8]> = vec![
-            b"Warning: prelude\n[{\"name\":\"f0\",\"offset\":16384,\"size\":64},{\"name\":\"f1\",\"offset\":16448}]",
+            b"Warning: prelude\n[{\"name\":\"f0\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"f1\",\"offset\":16448,\"size\":2,\"realsz\":2,\"maxaddr\":16450}]",
             b"[]",
             b"[\"scalar\"]",
             b"[{\"ops\":[]}]",
-            b"{\"ops\":[]}\n[{\"name\":\"f\",\"offset\":1}]",
+            b"{\"ops\":[]}\n[{\"name\":\"f\",\"offset\":1,\"size\":2,\"realsz\":2,\"maxaddr\":3}]",
             b"no json",
-            b"[{\"name\":\"f\",\"offset\":\"0x100\",\"size\":\"32\"}]",
+            b"[{\"name\":\"f\",\"offset\":\"0x100\",\"size\":\"32\",\"realsz\":\"32\",\"maxaddr\":\"0x102\"}]",
         ];
         for (i, fixture) in fixtures.iter().enumerate() {
             let legacy_values = radare2_json_values(fixture);
@@ -2305,23 +2858,28 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
-    fn fn_rec_fields_match_normalize_inputs() {
-        let (_, records) =
-            inventory_of(b"[{\"name\":\"f0\",\"offset\":16384,\"size\":64},{\"offset\":\"0x40\"}]");
+    fn inventory_records_adapt_radare2_boundary_fields() {
+        let (_, records) = inventory_of(
+            b"[{\"name\":\"f0\",\"offset\":16384,\"size\":64,\"realsz\":32,\"maxaddr\":16400},{\"offset\":\"0x40\"}]",
+        );
         let records = records.unwrap();
         assert_eq!(
             records[0],
-            FnRec {
+            FunctionRecord {
                 entry: Some(16384),
-                size: 64,
+                end: Some(16400),
+                real_size: Some(32),
+                bounding_size: Some(64),
                 name: Some("f0".to_string())
             }
         );
         assert_eq!(
             records[1],
-            FnRec {
+            FunctionRecord {
                 entry: Some(0x40),
-                size: 0,
+                end: None,
+                real_size: None,
+                bounding_size: None,
                 name: None
             }
         );
@@ -2363,18 +2921,6 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
-    fn assemble_into_empty_renders_inline_empty_functions() {
-        let mut out = Vec::new();
-        assemble_into(&mut out, &[]).unwrap();
-        let expected = serde_json::to_string_pretty(&json!({
-            "format": "pixel-modem-extractor-thumb-functions-v2",
-            "functions": [],
-        }))
-        .unwrap();
-        assert_eq!(out, expected.as_bytes());
-    }
-
-    #[test]
     fn spill_roundtrip_preserves_fragments_in_fn_order() {
         let dir = tempfile::tempdir().unwrap();
         let mut writer = SpillWriter::create(dir.path().join("t.frags")).unwrap();
@@ -2387,12 +2933,12 @@ INFO: second pdfj body was noisy and not parseable
         assert_eq!(out, b"frag-zerofrag-onefrag-two");
     }
 
-    fn legacy_region_document(
+    fn legacy_region_functions(
         stdout: &[u8],
         image: &[u8],
         load_addr: u32,
         addr: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<serde_json::Value>> {
         let parsed = parse_checked_radare2_thumb_output(stdout, addr)?;
         let mut all = Vec::new();
         for (f, pdfj) in &parsed.records {
@@ -2404,14 +2950,23 @@ INFO: second pdfj body was noisy and not parseable
                 addr,
             )?);
         }
-        let wrapped = json!({
-            "format": "pixel-modem-extractor-thumb-functions-v2",
-            "functions": all,
-        });
-        Ok(serde_json::to_string_pretty(&wrapped).unwrap().into_bytes())
+        Ok(all)
     }
 
-    fn streaming_region_document(
+    fn legacy_region_fragments(
+        stdout: &[u8],
+        image: &[u8],
+        load_addr: u32,
+        addr: u32,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for function in legacy_region_functions(stdout, image, load_addr, addr)? {
+            out.extend_from_slice(render_fragment(&function)?.as_bytes());
+        }
+        Ok(out)
+    }
+
+    fn streaming_region_fragments(
         stdout: &[u8],
         image: &[u8],
         load_addr: u32,
@@ -2421,10 +2976,8 @@ INFO: second pdfj body was noisy and not parseable
         let stdout_path = dir.path().join("capture.stdout");
         std::fs::write(&stdout_path, stdout).unwrap();
         let outcome = process_region_streaming(&stdout_path, image, load_addr, addr, dir.path())?;
-        let spills = [outcome.spill];
-        let refs: Vec<&Spill> = spills.iter().collect();
         let mut out = Vec::new();
-        assemble_into(&mut out, &refs)?;
+        outcome.spill.emit(&mut out)?;
         Ok(out)
     }
 
@@ -2432,28 +2985,28 @@ INFO: second pdfj body was noisy and not parseable
     fn streaming_region_matches_legacy_oracle_on_all_fixtures() {
         let fixtures: Vec<&[u8]> = vec![
             // normal pair
-            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64,\"realsz\":64,\"maxaddr\":16450}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
             // positional fallback: entry-less pdfj pairs by position
-            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\n{\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n",
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386}]\n{\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n",
             // pdfjs nested in an array after the inventory
-            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n[{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]},{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}]\n",
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64,\"realsz\":64,\"maxaddr\":16450}]\n[{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]},{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}]\n",
             // duplicate entries: two fns and two pdfjs share one entry
-            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.a2\",\"offset\":16384,\"size\":32}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]}\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.a2\",\"offset\":16384,\"size\":32,\"realsz\":32,\"maxaddr\":16386}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]}\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
             // never-paired fn quarantines with empty body/data_refs
-            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64,\"realsz\":64,\"maxaddr\":16450}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
             // leading + trailing noise
-            b"Warning: noisy prelude\n[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]}\nINFO: tail\n",
+            b"Warning: noisy prelude\n[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]}\nINFO: tail\n",
             // entry-matched pdfj is NOT reused as positional fallback (pinned case)
-            b"[{\"name\":\"sym.first\",\"offset\":16384,\"size\":64},{\"name\":\"sym.second\",\"offset\":16448,\"size\":64}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
+            b"[{\"name\":\"sym.first\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.second\",\"offset\":16448,\"size\":64,\"realsz\":64,\"maxaddr\":16450}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
         ];
         for (i, stdout) in fixtures.iter().enumerate() {
             let mut image = vec![0u8; 0x1_0000];
             for (_, pdfj) in radare2_thumb_function_pdfjs(stdout) {
                 populate_test_image_from_pdfj(&mut image, &pdfj);
             }
-            let legacy = legacy_region_document(stdout, &image, 0, 0x4000)
+            let legacy = legacy_region_fragments(stdout, &image, 0, 0x4000)
                 .unwrap_or_else(|e| panic!("fixture {i} legacy: {e}"));
-            let streaming = streaming_region_document(stdout, &image, 0, 0x4000)
+            let streaming = streaming_region_fragments(stdout, &image, 0, 0x4000)
                 .unwrap_or_else(|e| panic!("fixture {i} streaming: {e}"));
             assert_eq!(legacy, streaming, "fixture {i} must be byte-identical");
         }
@@ -2465,18 +3018,18 @@ INFO: second pdfj body was noisy and not parseable
             b"",
             b"only noise\nand more noise",
             b"\"scalar\" 42",
-            b"[{\"name\":\"x\",\"size\":8}]",
-            b"[{\"name\":\"f\",\"offset\":16384,\"size\":64}]\n{\"addr\":20480,\"ops\":[{\"offset\":20480,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}\n",
-            b"[{\"name\":\"f\",\"offset\":8589934592,\"size\":64}]",
+            b"[{\"name\":\"x\",\"size\":8,\"realsz\":8,\"maxaddr\":2}]",
+            b"[{\"name\":\"f\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386}]\n{\"addr\":20480,\"ops\":[{\"offset\":20480,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}\n",
+            b"[{\"name\":\"f\",\"offset\":8589934592,\"size\":64,\"realsz\":64,\"maxaddr\":8589934594}]",
             // nested-array pdfjs where one element never pairs: orphan verdict
-            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\n[{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]},{\"addr\":9999,\"ops\":[]}]\n",
+            b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386}]\n[{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]},{\"addr\":9999,\"ops\":[]}]\n",
         ];
         for (i, stdout) in fixtures.iter().enumerate() {
             let image = vec![0u8; 0x1_0000];
-            let legacy = legacy_region_document(stdout, &image, 0, 0x4000)
+            let legacy = legacy_region_functions(stdout, &image, 0, 0x4000)
                 .unwrap_err()
                 .to_string();
-            let streaming = streaming_region_document(stdout, &image, 0, 0x4000)
+            let streaming = streaming_region_fragments(stdout, &image, 0, 0x4000)
                 .unwrap_err()
                 .to_string();
             assert_eq!(legacy, streaming, "fixture {i} error strings must match");
@@ -2485,7 +3038,7 @@ INFO: second pdfj body was noisy and not parseable
 
     #[test]
     fn streaming_region_stats_match_document_derived_counts() {
-        let stdout = b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":16}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n";
+        let stdout = b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":4096,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.b\",\"offset\":16448,\"size\":4096,\"realsz\":16,\"maxaddr\":16450}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n";
         let mut image = vec![0u8; 0x1_0000];
         for (_, pdfj) in radare2_thumb_function_pdfjs(stdout) {
             populate_test_image_from_pdfj(&mut image, &pdfj);
@@ -2495,10 +3048,7 @@ INFO: second pdfj body was noisy and not parseable
         std::fs::write(&stdout_path, stdout).unwrap();
         let outcome =
             process_region_streaming(&stdout_path, &image, 0, 0x4000, dir.path()).unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_slice(&streaming_region_document(stdout, &image, 0, 0x4000).unwrap())
-                .unwrap();
-        let functions = doc["functions"].as_array().unwrap();
+        let functions = legacy_region_functions(stdout, &image, 0, 0x4000).unwrap();
         let substantial = functions
             .iter()
             .filter(|f| f["size"].as_u64().unwrap_or(0) >= 32)
@@ -2512,24 +3062,12 @@ INFO: second pdfj body was noisy and not parseable
         assert_eq!(outcome.stats.accepted, accepted);
     }
 
-    /// Env-gated production replay: reprocesses a retained golden mustang
-    /// decompose tree's real r2 captures through the streaming pipeline and
-    /// asserts byte-identity with the producer surface reconstructed from the
-    /// retained `thumb_functions.json`. That file is not the raw r2-stage
-    /// output: after the thumb stage, decompose's finalize passes rewrite it
-    /// in place — symbolicate stamps `annotations` and `original_name` (plus
-    /// a recovered `name`) into every record, and thumb_enrich adds a
-    /// Ghidra-derived `body_c`. The test inverts that deterministic
-    /// post-processing — drops `body_c` and `annotations`, restores `name`
-    /// from `original_name` — and re-serializes, so byte-identity of the
-    /// replay with the inverted golden is byte-identity of the streaming
-    /// producer with the legacy producer on this production data (validated
-    /// in the Stage-1 spike). Skips cleanly (passes trivially) unless
-    /// `PME_GOLDEN_DIR` names an unpruned mustang tree with retained
-    /// `thumb/*.stdout`; a cheetah layout, pruned tree, or missing captures
-    /// are skips, not failures.
+    /// Env-gated production replay for retained radare2 captures. Stage 2
+    /// intentionally changes function boundaries, so this checks that real
+    /// inventories carry the required v3 fields and still normalize with
+    /// conserving counts rather than comparing against legacy v2 bytes.
     #[test]
-    fn streaming_replays_retained_production_thumb_captures_byte_identically() {
+    fn streaming_replays_retained_production_thumb_captures_with_v3_boundaries() {
         let Ok(root) = std::env::var("PME_GOLDEN_DIR") else {
             return;
         };
@@ -2540,27 +3078,6 @@ INFO: second pdfj body was noisy and not parseable
         if !thumb_dir.is_dir() || !image_path.is_file() {
             return;
         }
-        let mut golden: serde_json::Value = serde_json::from_reader(
-            std::fs::File::open(main_dir.join("thumb_functions.json"))
-                .expect("open retained thumb_functions.json"),
-        )
-        .expect("retained thumb_functions.json parses");
-        for record in golden
-            .get_mut("functions")
-            .and_then(serde_json::Value::as_array_mut)
-            .expect("golden functions array")
-        {
-            let record = record.as_object_mut().expect("function record object");
-            record.remove("body_c");
-            record.remove("annotations");
-            if let Some(original_name) = record.remove("original_name") {
-                record.insert("name".into(), original_name);
-            }
-        }
-        let expected = serde_json::to_string_pretty(&golden)
-            .expect("invert golden post-processing")
-            .into_bytes();
-        drop(golden);
         let image = std::fs::read(&image_path).expect("read retained 02_MAIN.bin");
         let load_addr =
             crate::manifest::load_addr_for_image(&decomposed.join("manifest.json"), "02_MAIN")
@@ -2572,46 +3089,29 @@ INFO: second pdfj body was noisy and not parseable
             .filter_map(|entry| {
                 let name = entry.file_name();
                 let name = name.to_str()?;
-                let (stem, ext) = name.split_once('.')?;
-                (ext == "stdout").then_some(u32::from_str_radix(stem, 16).ok())?
+                let stem = name
+                    .strip_suffix(".radare2.stdout")
+                    .or_else(|| name.strip_suffix(".stdout"))?;
+                u32::from_str_radix(stem, 16).ok()
             })
             .collect();
         addrs.sort_unstable();
         assert!(!addrs.is_empty(), "retained tree carries thumb captures");
         let work = tempfile::tempdir().expect("tempdir");
-        let mut spills = Vec::new();
+        let mut total = 0usize;
         for addr in addrs {
-            let outcome = process_region_streaming(
-                &thumb_dir.join(format!("{addr:08x}.stdout")),
-                &image,
-                load_addr,
-                addr,
-                work.path(),
-            )
-            .unwrap_or_else(|e| panic!("region 0x{addr:08x} replays: {e}"));
-            spills.push(outcome.spill);
+            let capture = [
+                thumb_dir.join(format!("{addr:08x}.radare2.stdout")),
+                thumb_dir.join(format!("{addr:08x}.stdout")),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+            .expect("retained capture path");
+            let outcome = process_region_streaming(&capture, &image, load_addr, addr, work.path())
+                .unwrap_or_else(|e| panic!("region 0x{addr:08x} replays: {e}"));
+            assert!(outcome.stats.accepted <= outcome.stats.raw);
+            total += outcome.stats.raw;
         }
-        let assembled = work.path().join("thumb_functions.json");
-        assemble_thumb_functions_json(&assembled, &spills).unwrap();
-        let got = std::fs::read(&assembled).unwrap();
-        if got != expected {
-            assert_eq!(
-                got.len(),
-                expected.len(),
-                "replay byte count differs from inverted golden"
-            );
-            let index = got
-                .iter()
-                .zip(&expected)
-                .position(|(a, b)| a != b)
-                .expect("equal-length buffers differ at some byte");
-            let lo = index.saturating_sub(60);
-            let hi = (lo + 120).min(got.len());
-            panic!(
-                "first differing byte at {index}: replay {:?} vs inverted golden {:?}",
-                String::from_utf8_lossy(&got[lo..hi]),
-                String::from_utf8_lossy(&expected[lo..hi])
-            );
-        }
+        assert!(total > 0, "retained captures yielded no functions");
     }
 }

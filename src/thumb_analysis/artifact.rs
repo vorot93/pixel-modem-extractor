@@ -1730,43 +1730,6 @@ pub(crate) fn assemble_v3_into<W: Write>(
     Ok(())
 }
 
-/// Preserve the production v2 writer until the v3 coordinator is enabled.
-pub(super) fn assemble_v2_into<W: Write>(writer: &mut W, spills: &[&Spill]) -> Result<()> {
-    let total: usize = spills.iter().map(|spill| spill.slots.len()).sum();
-    if total == 0 {
-        writer.write_all(
-            b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": []\n}",
-        )?;
-        return Ok(());
-    }
-    writer.write_all(
-        b"{\n  \"format\": \"pixel-modem-extractor-thumb-functions-v2\",\n  \"functions\": [\n",
-    )?;
-    let mut first = true;
-    for spill in spills {
-        for slot in &spill.slots {
-            if !first {
-                writer.write_all(b",\n")?;
-            }
-            first = false;
-            spill.emit_slot(writer, slot)?;
-        }
-    }
-    writer.write_all(b"\n  ]\n}")?;
-    Ok(())
-}
-
-pub(super) fn assemble_v2_atomic(out_path: &Path, spills: &[Spill]) -> Result<()> {
-    let references: Vec<_> = spills.iter().collect();
-    let mut file = atomic_write_file::AtomicWriteFile::open(out_path)?;
-    assemble_v2_into(&mut file, &references)?;
-    file.commit()?;
-    for spill in spills {
-        let _ = std::fs::remove_file(&spill.path);
-    }
-    Ok(())
-}
-
 pub(crate) fn assemble_v3_atomic(
     out_path: &Path,
     producers: &[ProducerIdentity],

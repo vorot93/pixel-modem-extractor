@@ -25,7 +25,7 @@ pub(crate) use artifact::{
 };
 pub use radare2::discover_radare2;
 pub use rizin::discover_rizin;
-pub use stream::run_radare2_thumb;
+pub use stream::run_thumb_analysis;
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERSION_LINE_MAX_BYTES: usize = 1_024;
@@ -45,6 +45,25 @@ pub struct ProducerIdentity {
     pub executable: PathBuf,
     pub version: String,
     pub command: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbTools {
+    pub radare2: ProducerIdentity,
+    pub rizin: Option<ProducerIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThumbAnalysisSummary {
+    pub regions_requested: usize,
+    pub regions_succeeded: usize,
+    pub regions_failed: usize,
+    pub radare2_runs: usize,
+    pub rizin_runs: usize,
+    pub raw: usize,
+    pub substantial: usize,
+    pub accepted: usize,
+    pub quarantined: usize,
 }
 
 impl ThumbProducer {
