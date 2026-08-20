@@ -10,8 +10,8 @@ use super::artifact::{
 };
 use super::radare2::{FunctionRecord, function_record};
 use super::rizin::{
-    RIZIN_SELECTED_XREF_CAP, RizinXref, function_record as rizin_function_record, read_rizin_xrefs,
-    refs_for_ranges,
+    RIZIN_SELECTED_XREF_CAP, RizinXref, function_record as rizin_function_record,
+    read_rizin_xrefs_with_value_limit, refs_for_ranges,
 };
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer, ThumbTools};
 use crate::error::{Error, Result};
@@ -21,7 +21,7 @@ use crate::execution_ranges::{
 };
 #[cfg(test)]
 use serde_json::json;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 fn json_hex(v: u64) -> String {
@@ -217,6 +217,15 @@ pub(super) struct ValueScanner<R> {
     buf: Vec<u8>,
     eof: bool,
     out: Vec<u8>,
+    consumed: u64,
+    value_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StreamedJsonValue {
+    pub(super) start: u64,
+    pub(super) end: u64,
+    pub(super) opener: u8,
 }
 
 const SCANNER_CHUNK_BYTES: usize = 64 * 1024;
@@ -228,7 +237,21 @@ impl<R: Read> ValueScanner<R> {
             buf: Vec::new(),
             eof: false,
             out: Vec::new(),
+            consumed: 0,
+            value_limit: usize::MAX,
         }
+    }
+
+    pub(super) fn with_value_limit(reader: R, value_limit: usize) -> Self {
+        Self {
+            value_limit,
+            ..Self::new(reader)
+        }
+    }
+
+    fn discard(&mut self, bytes: usize) {
+        self.buf.drain(..bytes);
+        self.consumed += u64::try_from(bytes).expect("scanner byte count fits u64");
     }
 
     fn fill(&mut self) -> std::io::Result<bool> {
@@ -270,14 +293,14 @@ impl<R: Read> ValueScanner<R> {
                 .position(|&b| b == b'{' || b == b'[')
                 .unwrap_or(self.buf.len());
             if noise == self.buf.len() {
-                self.buf.clear();
+                self.discard(noise);
                 if !self.fill()? {
                     return Ok(None);
                 }
                 continue;
             }
             if noise > 0 {
-                self.buf.drain(..noise);
+                self.discard(noise);
             }
             let mut stack: Vec<u8> = Vec::new();
             let mut in_string = false;
@@ -309,20 +332,121 @@ impl<R: Read> ValueScanner<R> {
                 }
             }
             let Some(end) = end else {
+                if self.buf.len() > self.value_limit {
+                    return Err(std::io::Error::other(format!(
+                        "generic JSON value limit of {} bytes exceeded",
+                        self.value_limit
+                    )));
+                }
                 if !self.fill()? {
-                    self.buf.drain(..1);
+                    self.discard(1);
                 }
                 continue;
             };
+            if end + 1 > self.value_limit {
+                return Err(std::io::Error::other(format!(
+                    "generic JSON value limit of {} bytes exceeded",
+                    self.value_limit
+                )));
+            }
             let text = String::from_utf8_lossy(&self.buf[..=end]);
             if serde_json::from_str::<serde::de::IgnoredAny>(&text).is_ok() {
                 self.out.clear();
                 self.out.extend_from_slice(&self.buf[..=end]);
-                self.buf.drain(..=end);
+                self.discard(end + 1);
                 return Ok(Some(&self.out));
             }
-            self.buf.drain(..1);
+            self.discard(1);
         }
+    }
+}
+
+impl<R: Read + Seek> ValueScanner<R> {
+    /// Locate the next parseable object or array without retaining its bytes.
+    /// Seeking lets Rizin distinguish diagnostic brackets from the final axlj
+    /// array without feeding that array to the whole-value accumulator.
+    pub(super) fn next_streamed_value(&mut self) -> Result<Option<StreamedJsonValue>> {
+        self.reader.seek(SeekFrom::Start(self.consumed))?;
+        self.buf.clear();
+        self.out.clear();
+        self.eof = false;
+
+        let mut position = self.consumed;
+        let mut byte = [0u8; 1];
+        loop {
+            if self.reader.read(&mut byte)? == 0 {
+                self.consumed = position;
+                self.eof = true;
+                return Ok(None);
+            }
+            let start = position;
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
+            self.consumed = position;
+            if !matches!(byte[0], b'{' | b'[') {
+                continue;
+            }
+
+            self.reader.seek(SeekFrom::Start(start))?;
+            let mut stream = serde_json::Deserializer::from_reader(&mut self.reader)
+                .into_iter::<serde::de::IgnoredAny>();
+            let parsed = stream.next();
+            let consumed = stream.byte_offset();
+            drop(stream);
+            if matches!(parsed, Some(Ok(_))) {
+                let consumed = u64::try_from(consumed).map_err(|_| {
+                    Error::Serialize("Rizin capture offset exceeds u64".to_string())
+                })?;
+                let end = start
+                    .checked_add(consumed)
+                    .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
+                self.reader.seek(SeekFrom::Start(end))?;
+                self.consumed = end;
+                return Ok(Some(StreamedJsonValue {
+                    start,
+                    end,
+                    opener: byte[0],
+                }));
+            }
+            if let Some(Err(error)) = parsed
+                && error.is_io()
+            {
+                return Err(Error::Serialize(format!(
+                    "scan Rizin capture JSON: {error}"
+                )));
+            }
+
+            position = start
+                .checked_add(1)
+                .ok_or_else(|| Error::Serialize("Rizin capture offset overflow".to_string()))?;
+            self.reader.seek(SeekFrom::Start(position))?;
+            self.consumed = position;
+        }
+    }
+
+    pub(super) fn read_streamed_value(&mut self, value: StreamedJsonValue) -> Result<&[u8]> {
+        let len = value.end.checked_sub(value.start).ok_or_else(|| {
+            Error::Serialize("Rizin capture value has invalid offsets".to_string())
+        })?;
+        let len = usize::try_from(len).map_err(|_| {
+            Error::Serialize("Rizin capture value exceeds addressable memory".to_string())
+        })?;
+        if len > self.value_limit {
+            return Err(Error::Serialize(format!(
+                "generic JSON value limit of {} bytes exceeded",
+                self.value_limit
+            )));
+        }
+
+        self.reader.seek(SeekFrom::Start(value.start))?;
+        self.out.resize(len, 0);
+        self.reader.read_exact(&mut self.out)?;
+        self.reader.seek(SeekFrom::Start(value.end))?;
+        self.buf.clear();
+        self.eof = false;
+        self.consumed = value.end;
+        Ok(&self.out)
     }
 }
 
@@ -342,6 +466,46 @@ fn parse_inventory_value_with(
         Ok(records) if !records.is_empty() => Some(records),
         _ => None,
     }
+}
+
+pub(super) fn scan_rizin_inventory<R: Read>(
+    scanner: &mut ValueScanner<R>,
+    adapt: fn(&serde_json::Value) -> FunctionRecord,
+) -> Result<Vec<FunctionRecord>> {
+    let bytes = scanner
+        .next_value()?
+        .ok_or_else(|| Error::Serialize("Rizin capture lacks a function inventory".to_string()))?;
+    parse_inventory_value_with(bytes, adapt).ok_or_else(|| {
+        Error::Serialize(
+            "Rizin capture inventory must be a non-empty object array without ops".to_string(),
+        )
+    })
+}
+
+pub(super) fn read_rizin_pdfj_value<R: Read + Seek>(
+    scanner: &mut ValueScanner<R>,
+    position: usize,
+) -> Result<serde_json::Value> {
+    let candidate = scanner
+        .next_streamed_value()
+        .map_err(|error| Error::Serialize(format!("Rizin capture pdfj body {position}: {error}")))?
+        .ok_or_else(|| Error::Serialize(format!("Rizin capture lacks pdfj body {position}")))?;
+    if candidate.opener != b'{' {
+        return Err(Error::Serialize(format!(
+            "Rizin capture pdfj body {position}: expected a JSON object before the trailing array"
+        )));
+    }
+    let bytes = scanner.read_streamed_value(candidate).map_err(|error| {
+        Error::Serialize(format!("read Rizin capture pdfj body {position}: {error}"))
+    })?;
+    let value = serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|error| Error::Serialize(format!("parse Rizin pdfj body {position}: {error}")))?;
+    if !value.is_object() {
+        return Err(Error::Serialize(format!(
+            "Rizin pdfj body {position} is not an object"
+        )));
+    }
+    Ok(value)
 }
 
 struct InventoryProbe {
@@ -490,25 +654,11 @@ fn for_each_rizin_pdfj_position<R, F>(
     mut on_pdfj: F,
 ) -> std::result::Result<(), RegionIterError>
 where
-    R: Read,
+    R: Read + Seek,
     F: FnMut(usize, serde_json::Value) -> Result<()>,
 {
     for position in 0..expected {
-        let bytes = scanner.next_value()?.ok_or_else(|| {
-            RegionIterError::Region(Error::Serialize(format!(
-                "Rizin capture lacks pdfj body {position}"
-            )))
-        })?;
-        let value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
-            RegionIterError::Region(Error::Serialize(format!(
-                "parse Rizin pdfj body {position}: {error}"
-            )))
-        })?;
-        if !value.is_object() {
-            return Err(RegionIterError::Region(Error::Serialize(format!(
-                "Rizin pdfj body {position} is not an object"
-            ))));
-        }
+        let value = read_rizin_pdfj_value(scanner, position).map_err(RegionIterError::Region)?;
         on_pdfj(position, value).map_err(RegionIterError::Region)?;
     }
     Ok(())
@@ -521,7 +671,7 @@ fn for_each_backend_pdfj_position<R, F>(
     on_pdfj: F,
 ) -> std::result::Result<(), RegionIterError>
 where
-    R: Read,
+    R: Read + Seek,
     F: FnMut(usize, serde_json::Value) -> Result<()>,
 {
     match producer {
@@ -553,6 +703,7 @@ fn process_region_streaming(
         ThumbProducer::Radare2,
         function_record,
         &[],
+        usize::MAX,
     )
 }
 
@@ -564,9 +715,31 @@ fn process_rizin_region_streaming(
     addr: u32,
     thumb_dir: &Path,
 ) -> Result<RegionOutcome> {
+    process_rizin_region_streaming_with_value_limit(
+        stdout_path,
+        image,
+        load_addr,
+        addr,
+        thumb_dir,
+        usize::MAX,
+    )
+}
+
+fn process_rizin_region_streaming_with_value_limit(
+    stdout_path: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    thumb_dir: &Path,
+    generic_value_limit: usize,
+) -> Result<RegionOutcome> {
     // Index xrefs before normalization so only validated decode ranges can
     // attribute them and a malformed trailing axlj cannot leave a spill.
-    let xrefs = read_rizin_xrefs(stdout_path, RIZIN_SELECTED_XREF_CAP)?;
+    let xrefs = read_rizin_xrefs_with_value_limit(
+        stdout_path,
+        RIZIN_SELECTED_XREF_CAP,
+        generic_value_limit,
+    )?;
     let spill_path = thumb_dir.join(format!("{addr:08x}.rizin.frags"));
     process_region_with_adapter(
         stdout_path,
@@ -577,6 +750,7 @@ fn process_rizin_region_streaming(
         ThumbProducer::Rizin,
         rizin_function_record,
         &xrefs,
+        generic_value_limit,
     )
 }
 
@@ -590,6 +764,7 @@ fn process_region_with_adapter(
     producer: ThumbProducer,
     adapt: fn(&serde_json::Value) -> FunctionRecord,
     xrefs: &[RizinXref],
+    generic_value_limit: usize,
 ) -> Result<RegionOutcome> {
     match process_region_inner(
         stdout_path,
@@ -600,6 +775,7 @@ fn process_region_with_adapter(
         producer,
         adapt,
         xrefs,
+        generic_value_limit,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -619,13 +795,19 @@ fn process_region_inner(
     producer: ThumbProducer,
     adapt: fn(&serde_json::Value) -> FunctionRecord,
     xrefs: &[RizinXref],
+    generic_value_limit: usize,
 ) -> Result<RegionOutcome> {
     let file = std::fs::File::open(stdout_path)?;
-    let mut scanner = ValueScanner::new(std::io::BufReader::new(file));
+    let mut scanner =
+        ValueScanner::with_value_limit(std::io::BufReader::new(file), generic_value_limit);
     let producer_name = producer.as_str();
 
     // Pass A — compact inventory, then the legacy verdicts known up front.
-    let (value_count, inventory) = scan_for_inventory_with(&mut scanner, adapt)?;
+    let (value_count, inventory) = if producer == ThumbProducer::Rizin {
+        (1, Some(scan_rizin_inventory(&mut scanner, adapt)?))
+    } else {
+        scan_for_inventory_with(&mut scanner, adapt)?
+    };
     if value_count == 0 {
         return Err(Error::Serialize(format!(
             "{producer_name} produced no parseable JSON for Thumb region 0x{addr:x}"
@@ -698,8 +880,13 @@ fn process_region_inner(
 
     // B2 — positional fallback over a fresh stream of the same capture.
     let file = std::fs::File::open(stdout_path)?;
-    let mut scanner = ValueScanner::new(std::io::BufReader::new(file));
-    scan_for_inventory_with(&mut scanner, adapt)?; // deterministic re-detection; discard
+    let mut scanner =
+        ValueScanner::with_value_limit(std::io::BufReader::new(file), generic_value_limit);
+    if producer == ThumbProducer::Rizin {
+        scan_rizin_inventory(&mut scanner, adapt)?;
+    } else {
+        scan_for_inventory_with(&mut scanner, adapt)?;
+    }
     for_each_backend_pdfj_position(&mut scanner, producer, fns.len(), |position, pdfj| {
         if pdfj_used.get(position).copied().unwrap_or(false) {
             return Ok(());
@@ -2426,6 +2613,52 @@ esac
 
         assert_eq!(outcome.stats.raw, 1);
         assert_eq!(outcome.stats.accepted, 1);
+    }
+
+    #[test]
+    fn rizin_invalid_inventory_fails_before_generic_large_array_scan() {
+        let large = format!(
+            "[{}]",
+            (0..32)
+                .map(|index| format!("{{\"from\":{index},\"type\":\"CODE\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let captures = [
+            ("empty inventory", format!("[]\n{large}")),
+            (
+                "ops-disqualified inventory",
+                format!("[{{\"ops\":[]}}]\n{{\"ops\":[]}}\n{large}"),
+            ),
+        ];
+
+        for (case, contents) in captures {
+            let dir = tempfile::tempdir().unwrap();
+            let capture = dir.path().join("capture.stdout");
+            std::fs::write(&capture, contents).unwrap();
+
+            let spill = dir.path().join("capture.frags");
+            let error = match process_region_with_adapter(
+                &capture,
+                &[0x00, 0xbf],
+                0x4000,
+                0x4000,
+                &spill,
+                ThumbProducer::Rizin,
+                rizin_function_record,
+                &[],
+                64,
+            ) {
+                Ok(_) => panic!("{case} must fail"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains("inventory"), "{case}: {message}");
+            assert!(
+                !message.contains("generic JSON value limit"),
+                "{case} crossed into the large array: {message}"
+            );
+        }
     }
 
     #[test]

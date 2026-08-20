@@ -5,13 +5,15 @@
 #![allow(dead_code)]
 
 use super::radare2::FunctionRecord;
+use super::stream::{ValueScanner, read_rizin_pdfj_value, scan_rizin_inventory};
 use super::{ProducerIdentity, ThumbProducer, discover};
 use crate::error::{Error, Result};
 use crate::execution_ranges::DecodeRange;
-use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::Deserializer;
+use serde::de::{self, SeqAccess, Visitor};
 use serde_json::Value;
 use std::fmt;
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 pub(crate) const RIZIN_SELECTED_XREF_CAP: usize = 1_000_000;
@@ -49,69 +51,6 @@ pub(super) fn function_record(raw: &Value) -> FunctionRecord {
     }
 }
 
-struct ObjectOnly;
-
-impl<'de> Deserialize<'de> for ObjectOnly {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(ObjectOnlyVisitor)
-    }
-}
-
-struct ObjectOnlyVisitor;
-
-impl<'de> Visitor<'de> for ObjectOnlyVisitor {
-    type Value = ObjectOnly;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(ObjectOnly)
-    }
-}
-
-struct InventoryCount(usize);
-
-impl<'de> Deserialize<'de> for InventoryCount {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(InventoryVisitor)
-    }
-}
-
-struct InventoryVisitor;
-
-impl<'de> Visitor<'de> for InventoryVisitor {
-    type Value = InventoryCount;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a Rizin function inventory array")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut count = 0usize;
-        while sequence.next_element::<ObjectOnly>()?.is_some() {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| de::Error::custom("Rizin inventory count overflow"))?;
-        }
-        Ok(InventoryCount(count))
-    }
-}
-
 fn is_selected_xref(record: &Value) -> bool {
     let Some(kind) = record.get("type").and_then(Value::as_str) else {
         return false;
@@ -124,6 +63,38 @@ fn is_selected_xref(record: &Value) -> bool {
         .iter()
         .any(|needle| kind.contains(needle));
     included && !excluded
+}
+
+fn read_trailing_xrefs(
+    capture: &Path,
+    scanner: &mut ValueScanner<std::io::BufReader<std::fs::File>>,
+    cap: usize,
+) -> Result<Vec<RizinXref>> {
+    let trailing = scanner.next_streamed_value()?.ok_or_else(|| {
+        Error::Serialize("Rizin capture lacks a valid trailing axlj array".to_string())
+    })?;
+    if trailing.opener != b'[' {
+        return Err(Error::Serialize(
+            "Rizin capture axlj array is not the final body sequence".to_string(),
+        ));
+    }
+
+    let mut reader = std::io::BufReader::new(std::fs::File::open(capture)?);
+    reader.seek(SeekFrom::Start(trailing.start))?;
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+    let mut xrefs = deserializer
+        .deserialize_seq(XrefSequence { cap })
+        .map_err(|error| Error::Serialize(format!("parse trailing Rizin axlj: {error}")))?;
+    drop(deserializer);
+
+    if scanner.next_streamed_value()?.is_some() {
+        return Err(Error::Serialize(
+            "Rizin capture contains JSON after the trailing axlj array".to_string(),
+        ));
+    }
+    xrefs.sort_unstable_by_key(|xref| (xref.from, xref.to));
+    xrefs.dedup();
+    Ok(xrefs)
 }
 
 struct XrefSequence {
@@ -175,21 +146,30 @@ impl<'de> Visitor<'de> for XrefSequence {
 }
 
 pub(crate) fn read_rizin_xrefs(capture: &Path, cap: usize) -> Result<Vec<RizinXref>> {
+    read_rizin_xrefs_inner(capture, cap, usize::MAX)
+}
+
+fn read_rizin_xrefs_inner(
+    capture: &Path,
+    cap: usize,
+    generic_value_limit: usize,
+) -> Result<Vec<RizinXref>> {
     let file = std::fs::File::open(capture)?;
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
-    let InventoryCount(inventory_count) = InventoryCount::deserialize(&mut deserializer)
-        .map_err(|error| Error::Serialize(format!("parse Rizin capture inventory: {error}")))?;
-    for _ in 0..inventory_count {
-        ObjectOnly::deserialize(&mut deserializer)
-            .map_err(|error| Error::Serialize(format!("parse Rizin capture pdfj body: {error}")))?;
+    let mut scanner =
+        ValueScanner::with_value_limit(std::io::BufReader::new(file), generic_value_limit);
+    let inventory = scan_rizin_inventory(&mut scanner, function_record)?;
+    for position in 0..inventory.len() {
+        read_rizin_pdfj_value(&mut scanner, position)?;
     }
-    let mut xrefs = deserializer
-        .deserialize_seq(XrefSequence { cap })
-        .and_then(|xrefs| deserializer.end().map(|()| xrefs))
-        .map_err(|error| Error::Serialize(format!("parse trailing Rizin axlj: {error}")))?;
-    xrefs.sort_unstable_by_key(|xref| (xref.from, xref.to));
-    xrefs.dedup();
-    Ok(xrefs)
+    read_trailing_xrefs(capture, &mut scanner, cap)
+}
+
+pub(super) fn read_rizin_xrefs_with_value_limit(
+    capture: &Path,
+    cap: usize,
+    generic_value_limit: usize,
+) -> Result<Vec<RizinXref>> {
+    read_rizin_xrefs_inner(capture, cap, generic_value_limit)
 }
 
 pub(crate) fn refs_for_ranges(xrefs: &[RizinXref], ranges: &[DecodeRange]) -> Vec<String> {
@@ -220,6 +200,20 @@ mod tests {
         let path = dir.path().join("capture.stdout");
         std::fs::write(&path, contents).unwrap();
         (dir, path)
+    }
+
+    fn large_axlj(count: usize) -> String {
+        let records = (0..count)
+            .map(|index| {
+                format!(
+                    "{{\"from\":{},\"to\":{},\"type\":\"DATA\"}}",
+                    0x1000 + index,
+                    0x8000 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{records}]")
     }
 
     #[test]
@@ -286,6 +280,112 @@ mod tests {
         assert_eq!(
             read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).unwrap(),
             Vec::<RizinXref>::new()
+        );
+    }
+
+    #[test]
+    fn axlj_accepts_leading_and_interstitial_diagnostics() {
+        let (_dir, path) = capture(
+            r#"WARN: analysis started
+[{"offset":4096}]
+INFO: [true diagnostic] inventory complete
+{"addr":4096,"ops":[]}
+DEBUG: [false diagnostic] collecting outgoing references
+[{"from":4096,"to":8192,"type":"DATA"}]"#,
+        );
+
+        assert_eq!(
+            read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).unwrap(),
+            vec![RizinXref {
+                from: 0x1000,
+                to: 0x2000,
+            }]
+        );
+    }
+
+    #[test]
+    fn axlj_invalid_inventory_stops_before_large_array_generic_scan() {
+        let large = large_axlj(32);
+        let captures = [
+            ("empty inventory", format!("[]\n{large}")),
+            (
+                "ops-disqualified inventory",
+                format!("[{{\"ops\":[]}}]\n{{\"ops\":[]}}\n{large}"),
+            ),
+        ];
+
+        for (case, contents) in captures {
+            let (_dir, path) = capture(&contents);
+            let error =
+                read_rizin_xrefs_with_value_limit(&path, RIZIN_SELECTED_XREF_CAP, 64).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("inventory"), "{case}: {message}");
+            assert!(
+                !message.contains("generic JSON value limit"),
+                "{case} crossed into the large array: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn axlj_large_sequence_streams_beyond_generic_value_limit_and_honors_cap() {
+        let contents = format!(
+            "WARN: start\n[{{\"offset\":4096}}]\nINFO: body\n{{\"ops\":[]}}\nDEBUG: xrefs\n{}",
+            large_axlj(32)
+        );
+        let (_dir, path) = capture(&contents);
+
+        let xrefs = read_rizin_xrefs_with_value_limit(&path, 32, 64).unwrap();
+        assert_eq!(xrefs.len(), 32);
+        assert_eq!(
+            xrefs.first(),
+            Some(&RizinXref {
+                from: 0x1000,
+                to: 0x8000,
+            })
+        );
+        assert_eq!(
+            xrefs.last(),
+            Some(&RizinXref {
+                from: 0x101f,
+                to: 0x801f,
+            })
+        );
+
+        let error = read_rizin_xrefs_with_value_limit(&path, 8, 64).unwrap_err();
+        assert!(error.to_string().contains("cap"), "{error}");
+    }
+
+    #[test]
+    fn axlj_shared_scanner_preserves_all_trailing_sequence_failures() {
+        let cases = [
+            ("missing", "[{\"offset\":4096}]\n{\"ops\":[]}"),
+            (
+                "malformed",
+                "[{\"offset\":4096}]\n{\"ops\":[]}\n[{\"type\":\"DATA\"}",
+            ),
+            ("duplicate", "[{\"offset\":4096}]\n{\"ops\":[]}\n[]\n[]"),
+            ("non-trailing", "[{\"offset\":4096}]\n[]\n{\"ops\":[]}"),
+            (
+                "additional object",
+                "[{\"offset\":4096}]\n{\"ops\":[]}\n[]\n{\"extra\":true}",
+            ),
+        ];
+
+        for (case, contents) in cases {
+            let (_dir, path) = capture(contents);
+            assert!(
+                read_rizin_xrefs_with_value_limit(&path, RIZIN_SELECTED_XREF_CAP, 64,).is_err(),
+                "{case} must fail"
+            );
+        }
+
+        let (_dir, path) =
+            capture("WARN: start\n[{\"offset\":4096}]\nINFO: body\n{\"ops\":[]}\nDEBUG: xrefs\n[]");
+        assert!(
+            read_rizin_xrefs_with_value_limit(&path, RIZIN_SELECTED_XREF_CAP, 64)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -365,7 +465,7 @@ mod tests {
         ];
 
         for (case, record) in invalid_records {
-            let contents = format!("[]\n[{record}]");
+            let contents = format!("[{{\"offset\":4096}}]\n{{}}\n[{record}]");
             let (_dir, path) = capture(&contents);
             assert!(
                 read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).is_err(),
@@ -374,7 +474,8 @@ mod tests {
         }
 
         let (_dir, path) = capture(
-            r#"[]
+            r#"[{"offset":4096}]
+{}
 [
   {"from":"0xffffffff","to":"0xffffffffffffffff","type":"DATA"},
   {"from":0,"addr":18446744073709551615,"type":"read"}
@@ -398,7 +499,8 @@ mod tests {
     #[test]
     fn axlj_applies_selected_record_cap_before_deduplication() {
         let (_dir, path) = capture(
-            r#"[]
+            r#"[{"offset":4096}]
+{}
 [
   {"from":4096,"to":8192,"type":"DATA"},
   {"from":4096,"to":8192,"type":"DATA"}
