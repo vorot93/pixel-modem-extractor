@@ -1162,9 +1162,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
   goldens need a complete unpruned tree; a pruned golden has no raw
   `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
-  former whole-buffer r2 path) is still the conservative planning number —
-  keep that headroom until the streaming pipeline's full-`decompose` peak is
-  re-measured. Do not parse Ghidra/radare2
+  former whole-buffer r2 path) is gone — the producer streams (see the
+  radare2 streaming bullets below); plan per the README's memory note, and
+  re-measure the full-`decompose` peak when Stage 2 lands. Do not parse
+  Ghidra/radare2
   disassembly text, infer ISA from alignment or inventory name, attribute
   an address to the nearest global, or leak decoder-crate enums outside
   `decoder.rs`.
@@ -1399,7 +1400,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   deterministic edits (drops `body_c`/`annotations`, restores `name` from
   `original_name`) to reconstruct the producer surface; re-baselining
   goldens or touching symbolicate's rewrite shape must revisit that
-  inversion with it. Downstream whole-file consumers (`thumb_enrich`,
+  inversion. Downstream whole-file consumers (`thumb_enrich`,
   `symbolicate`, ~3 GB peaks) remain — that is Stage 2.
   `--no-thumb-decompile` still selects Ghidra `datamark` mode and skips both
   `body_c` enrichment sweeps; the dense-region radare2 capture/parse loop it
