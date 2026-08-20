@@ -1665,6 +1665,13 @@ pub(super) fn render_fragment(value: &Value) -> Result<String> {
         .join("\n"))
 }
 
+/// Validate one normalized v3 function after backend-specific evidence has
+/// been injected, then render it for a fragment spill.
+pub(super) fn render_v3_fragment(value: &Value, function_index: usize) -> Result<String> {
+    validate_function_value(value, function_index, None)?;
+    render_fragment(value)
+}
+
 /// One spill slot is stored as `[u32 LE index][u32 LE length][fragment]`.
 struct FragmentSlot {
     function_index: u32,

@@ -1,11 +1,18 @@
-//! Streaming radare2 Thumb backend and coordinator: capture identity, strict
-//! boundary normalization, bounded fragment spills, and atomic v3 assembly.
+//! Streaming Thumb backend adaptation and radare2 coordinator: capture
+//! identity, strict normalization, bounded fragment spills, and atomic v3
+//! assembly.
 
+#[cfg(test)]
+use super::artifact::render_fragment;
 use super::artifact::{
     AttemptRecord, AttemptStatus, CaptureRecord, FunctionRunRecord, RegionRecord, Spill,
-    SpillWriter, assemble_v3_atomic, render_fragment,
+    SpillWriter, assemble_v3_atomic, render_v3_fragment,
 };
 use super::radare2::{FunctionRecord, function_record};
+use super::rizin::{
+    RIZIN_SELECTED_XREF_CAP, RizinXref, function_record as rizin_function_record, read_rizin_xrefs,
+    refs_for_ranges,
+};
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer, ThumbTools};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
@@ -84,7 +91,7 @@ fn data_refs_from_pdfj(pdfj: &serde_json::Value) -> Vec<String> {
     refs.into_iter().map(json_hex).collect()
 }
 
-fn pdfj_body(pdfj: &serde_json::Value) -> String {
+fn operation_body(pdfj: &serde_json::Value) -> String {
     let mut body = String::new();
     if let Some(ops) = pdfj.get("ops").and_then(serde_json::Value::as_array) {
         for op in ops {
@@ -323,18 +330,23 @@ impl<R: Read> ValueScanner<R> {
 /// the aflj inventory (non-object element, or an object carrying `ops`).
 const NOT_INVENTORY: &str = "\u{0}pme-not-inventory";
 
-fn parse_inventory_value(bytes: &[u8]) -> Option<Vec<FunctionRecord>> {
+fn parse_inventory_value_with(
+    bytes: &[u8],
+    adapt: fn(&serde_json::Value) -> FunctionRecord,
+) -> Option<Vec<FunctionRecord>> {
     use serde::Deserializer;
 
     let text = String::from_utf8_lossy(bytes);
     let mut de = serde_json::Deserializer::from_str(&text);
-    match de.deserialize_seq(InventoryProbe) {
+    match de.deserialize_seq(InventoryProbe { adapt }) {
         Ok(records) if !records.is_empty() => Some(records),
         _ => None,
     }
 }
 
-struct InventoryProbe;
+struct InventoryProbe {
+    adapt: fn(&serde_json::Value) -> FunctionRecord,
+}
 
 impl<'de> serde::de::Visitor<'de> for InventoryProbe {
     type Value = Vec<FunctionRecord>;
@@ -356,7 +368,7 @@ impl<'de> serde::de::Visitor<'de> for InventoryProbe {
             if disqualified {
                 return Err(serde::de::Error::custom(NOT_INVENTORY));
             }
-            records.push(function_record(&element));
+            records.push((self.adapt)(&element));
         }
         Ok(records)
     }
@@ -367,13 +379,21 @@ impl<'de> serde::de::Visitor<'de> for InventoryProbe {
 /// inventory value. The count matches legacy `values.len()` for the zero
 /// check because a found inventory implies >= 1 and an unfound one exhausts
 /// the stream.
+#[cfg(test)]
 fn scan_for_inventory<R: Read>(
     scanner: &mut ValueScanner<R>,
+) -> std::io::Result<(usize, Option<Vec<FunctionRecord>>)> {
+    scan_for_inventory_with(scanner, function_record)
+}
+
+fn scan_for_inventory_with<R: Read>(
+    scanner: &mut ValueScanner<R>,
+    adapt: fn(&serde_json::Value) -> FunctionRecord,
 ) -> std::io::Result<(usize, Option<Vec<FunctionRecord>>)> {
     let mut values = 0usize;
     while let Some(bytes) = scanner.next_value()? {
         values += 1;
-        if let Some(records) = parse_inventory_value(bytes) {
+        if let Some(records) = parse_inventory_value_with(bytes, adapt) {
             return Ok((values, Some(records)));
         }
     }
@@ -464,6 +484,52 @@ where
     Ok(())
 }
 
+fn for_each_rizin_pdfj_position<R, F>(
+    scanner: &mut ValueScanner<R>,
+    expected: usize,
+    mut on_pdfj: F,
+) -> std::result::Result<(), RegionIterError>
+where
+    R: Read,
+    F: FnMut(usize, serde_json::Value) -> Result<()>,
+{
+    for position in 0..expected {
+        let bytes = scanner.next_value()?.ok_or_else(|| {
+            RegionIterError::Region(Error::Serialize(format!(
+                "Rizin capture lacks pdfj body {position}"
+            )))
+        })?;
+        let value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
+            RegionIterError::Region(Error::Serialize(format!(
+                "parse Rizin pdfj body {position}: {error}"
+            )))
+        })?;
+        if !value.is_object() {
+            return Err(RegionIterError::Region(Error::Serialize(format!(
+                "Rizin pdfj body {position} is not an object"
+            ))));
+        }
+        on_pdfj(position, value).map_err(RegionIterError::Region)?;
+    }
+    Ok(())
+}
+
+fn for_each_backend_pdfj_position<R, F>(
+    scanner: &mut ValueScanner<R>,
+    producer: ThumbProducer,
+    expected: usize,
+    on_pdfj: F,
+) -> std::result::Result<(), RegionIterError>
+where
+    R: Read,
+    F: FnMut(usize, serde_json::Value) -> Result<()>,
+{
+    match producer {
+        ThumbProducer::Radare2 => for_each_pdfj_position(scanner, on_pdfj),
+        ThumbProducer::Rizin => for_each_rizin_pdfj_position(scanner, expected, on_pdfj),
+    }
+}
+
 /// Process one captured `.stdout` with bounded memory: stream the inventory
 /// into compact records (A), entry-match arriving pdfjs normalizing and spilling
 /// immediately (B1), positional-fallback re-stream (B2), and normalize the
@@ -478,41 +544,102 @@ fn process_region_streaming(
     thumb_dir: &Path,
 ) -> Result<RegionOutcome> {
     let spill_path = thumb_dir.join(format!("{addr:08x}.radare2.frags"));
-    match process_region_inner(stdout_path, image, load_addr, addr, &spill_path) {
+    process_region_with_adapter(
+        stdout_path,
+        image,
+        load_addr,
+        addr,
+        &spill_path,
+        ThumbProducer::Radare2,
+        function_record,
+        &[],
+    )
+}
+
+#[allow(dead_code)]
+fn process_rizin_region_streaming(
+    stdout_path: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    thumb_dir: &Path,
+) -> Result<RegionOutcome> {
+    // Index xrefs before normalization so only validated decode ranges can
+    // attribute them and a malformed trailing axlj cannot leave a spill.
+    let xrefs = read_rizin_xrefs(stdout_path, RIZIN_SELECTED_XREF_CAP)?;
+    let spill_path = thumb_dir.join(format!("{addr:08x}.rizin.frags"));
+    process_region_with_adapter(
+        stdout_path,
+        image,
+        load_addr,
+        addr,
+        &spill_path,
+        ThumbProducer::Rizin,
+        rizin_function_record,
+        &xrefs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_region_with_adapter(
+    stdout_path: &Path,
+    image: &[u8],
+    load_addr: u32,
+    addr: u32,
+    spill_path: &Path,
+    producer: ThumbProducer,
+    adapt: fn(&serde_json::Value) -> FunctionRecord,
+    xrefs: &[RizinXref],
+) -> Result<RegionOutcome> {
+    match process_region_inner(
+        stdout_path,
+        image,
+        load_addr,
+        addr,
+        spill_path,
+        producer,
+        adapt,
+        xrefs,
+    ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            let _ = std::fs::remove_file(&spill_path);
+            let _ = std::fs::remove_file(spill_path);
             Err(error)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_region_inner(
     stdout_path: &Path,
     image: &[u8],
     load_addr: u32,
     addr: u32,
     spill_path: &Path,
+    producer: ThumbProducer,
+    adapt: fn(&serde_json::Value) -> FunctionRecord,
+    xrefs: &[RizinXref],
 ) -> Result<RegionOutcome> {
     let file = std::fs::File::open(stdout_path)?;
     let mut scanner = ValueScanner::new(std::io::BufReader::new(file));
+    let producer_name = producer.as_str();
 
     // Pass A — compact inventory, then the legacy verdicts known up front.
-    let (value_count, inventory) = scan_for_inventory(&mut scanner)?;
+    let (value_count, inventory) = scan_for_inventory_with(&mut scanner, adapt)?;
     if value_count == 0 {
         return Err(Error::Serialize(format!(
-            "radare2 produced no parseable JSON for Thumb region 0x{addr:x}"
+            "{producer_name} produced no parseable JSON for Thumb region 0x{addr:x}"
         )));
     }
     let Some(fns) = inventory else {
         return Err(Error::Serialize(format!(
-            "radare2 produced parseable JSON but no aflj function inventory for Thumb region 0x{addr:x}"
+            "{producer_name} produced parseable JSON but no aflj function inventory for Thumb region 0x{addr:x}"
         )));
     };
     let unassignable = fns.iter().filter(|f| f.entry.is_none()).count();
     if unassignable > 0 {
         return Err(Error::Serialize(format!(
-            "radare2 reported {unassignable} unassignable aflj function {} for Thumb region 0x{addr:x}",
+            "{producer_name} reported {unassignable} unassignable aflj function {} for Thumb region 0x{addr:x}",
             if unassignable == 1 {
                 "record"
             } else {
@@ -540,7 +667,7 @@ fn process_region_inner(
     // assignment is equivalent to the legacy fn-outer scan: per entry key
     // both orderings pair the i-th fn of the key with the i-th pdfj of the
     // key; different keys never compete.
-    for_each_pdfj_position(&mut scanner, |position, pdfj| {
+    for_each_backend_pdfj_position(&mut scanner, producer, fns.len(), |position, pdfj| {
         pdfj_used.push(false);
         let Some(entry) = pdfj_entry(&pdfj) else {
             return Ok(());
@@ -561,6 +688,8 @@ fn process_region_inner(
                 image,
                 load_addr,
                 addr,
+                producer,
+                xrefs,
             )?;
         }
         Ok(())
@@ -570,8 +699,8 @@ fn process_region_inner(
     // B2 — positional fallback over a fresh stream of the same capture.
     let file = std::fs::File::open(stdout_path)?;
     let mut scanner = ValueScanner::new(std::io::BufReader::new(file));
-    scan_for_inventory(&mut scanner)?; // deterministic re-detection; discard
-    for_each_pdfj_position(&mut scanner, |position, pdfj| {
+    scan_for_inventory_with(&mut scanner, adapt)?; // deterministic re-detection; discard
+    for_each_backend_pdfj_position(&mut scanner, producer, fns.len(), |position, pdfj| {
         if pdfj_used.get(position).copied().unwrap_or(false) {
             return Ok(());
         }
@@ -597,6 +726,8 @@ fn process_region_inner(
                 image,
                 load_addr,
                 addr,
+                producer,
+                xrefs,
             )?;
         }
         Ok(())
@@ -608,19 +739,19 @@ fn process_region_inner(
     let orphan = pdfj_used.iter().filter(|used| !**used).count();
     if orphan > 0 {
         return Err(Error::Serialize(format!(
-            "radare2 produced {orphan} orphan pdfj {} for Thumb region 0x{addr:x}",
+            "{producer_name} produced {orphan} orphan pdfj {} for Thumb region 0x{addr:x}",
             if orphan == 1 { "body" } else { "bodies" }
         )));
     }
     let paired_count = paired.iter().filter(|paired| **paired).count();
     if !fns.is_empty() && paired_count == 0 {
         return Err(Error::Serialize(format!(
-            "radare2 produced a non-empty aflj inventory but zero paired pdfj bodies for Thumb region 0x{addr:x}"
+            "{producer_name} produced a non-empty aflj inventory but zero paired pdfj bodies for Thumb region 0x{addr:x}"
         )));
     }
     if overflow.contains(&true) {
         return Err(Error::Serialize(format!(
-            "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{addr:x}"
+            "{producer_name} function entry is outside the canonical u32 address domain for Thumb region 0x{addr:x}"
         )));
     }
 
@@ -628,14 +759,14 @@ fn process_region_inner(
     for (fn_idx, rec) in fns.iter().enumerate() {
         if !paired[fn_idx] {
             normalize_and_spill(
-                &mut spill, &mut stats, fn_idx, rec, None, image, load_addr, addr,
+                &mut spill, &mut stats, fn_idx, rec, None, image, load_addr, addr, producer, xrefs,
             )?;
         }
     }
 
     assert!(
         stats.accepted <= stats.raw,
-        "radare2 Thumb projection count is not conserving for region 0x{addr:x}"
+        "{producer_name} Thumb projection count is not conserving for region 0x{addr:x}"
     );
     let spill = spill.finish()?;
     Ok(RegionOutcome { spill, stats })
@@ -654,8 +785,17 @@ fn normalize_and_spill(
     image: &[u8],
     load_addr: u32,
     addr: u32,
+    producer: ThumbProducer,
+    xrefs: &[RizinXref],
 ) -> Result<()> {
-    let normalized = normalize_radare2_record_checked(rec, pdfj, image, load_addr, addr)?;
+    let normalized = match producer {
+        ThumbProducer::Radare2 => {
+            normalize_radare2_record_checked(rec, pdfj, image, load_addr, addr)?
+        }
+        ThumbProducer::Rizin => {
+            normalize_rizin_record_checked(rec, pdfj, xrefs, image, load_addr, addr)?
+        }
+    };
     stats.substantial += usize::from(
         normalized
             .get("size")
@@ -669,9 +809,10 @@ fn normalize_and_spill(
     {
         stats.accepted += 1;
     }
-    let fragment = render_fragment(&normalized)?;
-    let function_index = u32::try_from(fn_idx)
-        .map_err(|_| Error::Serialize("radare2 function index exceeds u32".into()))?;
+    let fragment = render_v3_fragment(&normalized, fn_idx)?;
+    let function_index = u32::try_from(fn_idx).map_err(|_| {
+        Error::Serialize(format!("{} function index exceeds u32", producer.as_str()))
+    })?;
     spill.push(function_index, &fragment)?;
     Ok(())
 }
@@ -898,14 +1039,82 @@ fn normalize_radare2_record_checked(
     load_addr: u32,
     region_addr: u32,
 ) -> Result<serde_json::Value> {
+    let (mut output, _) = normalize_function_record_checked(
+        ThumbProducer::Radare2,
+        record,
+        pdfj,
+        image,
+        load_addr,
+        region_addr,
+    )?;
+    output["data_refs"] = serde_json::json!(pdfj.map(data_refs_from_pdfj).unwrap_or_default());
+    Ok(output)
+}
+
+#[cfg(test)]
+fn normalize_rizin_function_checked(
+    raw: &serde_json::Value,
+    pdfj: Option<&serde_json::Value>,
+    xrefs: &[RizinXref],
+    image: &[u8],
+    load_addr: u32,
+    region_addr: u32,
+) -> Result<serde_json::Value> {
+    normalize_rizin_record_checked(
+        &rizin_function_record(raw),
+        pdfj,
+        xrefs,
+        image,
+        load_addr,
+        region_addr,
+    )
+}
+
+fn normalize_rizin_record_checked(
+    record: &FunctionRecord,
+    pdfj: Option<&serde_json::Value>,
+    xrefs: &[RizinXref],
+    image: &[u8],
+    load_addr: u32,
+    region_addr: u32,
+) -> Result<serde_json::Value> {
+    let (mut output, projection) = normalize_function_record_checked(
+        ThumbProducer::Rizin,
+        record,
+        pdfj,
+        image,
+        load_addr,
+        region_addr,
+    )?;
+    let data_refs = match &projection {
+        ExecutionProjection::Accepted(ranges) => refs_for_ranges(xrefs, ranges),
+        ExecutionProjection::Quarantined(_) => Vec::new(),
+    };
+    output["data_refs"] = serde_json::json!(data_refs);
+    Ok(output)
+}
+
+fn normalize_function_record_checked(
+    producer: ThumbProducer,
+    record: &FunctionRecord,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+    region_addr: u32,
+) -> Result<(serde_json::Value, ExecutionProjection)> {
+    let producer_name = producer.as_str();
+    let bound_name = match producer {
+        ThumbProducer::Radare2 => "maxaddr",
+        ThumbProducer::Rizin => "maxbound",
+    };
     let entry_u64 = record.entry.ok_or_else(|| {
         Error::Serialize(format!(
-            "radare2 function lacks entry/addr for Thumb region 0x{region_addr:x}"
+            "{producer_name} function lacks entry/addr for Thumb region 0x{region_addr:x}"
         ))
     })?;
     let entry = u32::try_from(entry_u64).map_err(|_| {
         Error::Serialize(format!(
-            "radare2 function entry is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+            "{producer_name} function entry is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
         ))
     })?;
     let image_end = u64::from(load_addr)
@@ -918,27 +1127,27 @@ fn normalize_radare2_record_checked(
         })?;
     if entry_u64 < u64::from(load_addr) || entry_u64 >= image_end {
         return Err(Error::Serialize(format!(
-            "radare2 function entry is outside mapped image for Thumb region 0x{region_addr:x}"
+            "{producer_name} function entry is outside mapped image for Thumb region 0x{region_addr:x}"
         )));
     }
     let end_u64 = record.end.ok_or_else(|| {
         Error::Serialize(format!(
-            "radare2 function lacks valid maxaddr for Thumb region 0x{region_addr:x}"
+            "{producer_name} function lacks valid {bound_name} for Thumb region 0x{region_addr:x}"
         ))
     })?;
     let end = u32::try_from(end_u64).map_err(|_| {
         Error::Serialize(format!(
-            "radare2 function maxaddr is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
+            "{producer_name} function {bound_name} is outside the canonical u32 address domain for Thumb region 0x{region_addr:x}"
         ))
     })?;
     if end <= entry {
         return Err(Error::Serialize(format!(
-            "radare2 function maxaddr must follow entry for Thumb region 0x{region_addr:x}"
+            "{producer_name} function {bound_name} must follow entry for Thumb region 0x{region_addr:x}"
         )));
     }
     if end_u64 > image_end {
         return Err(Error::Serialize(format!(
-            "radare2 function maxaddr is outside mapped image for Thumb region 0x{region_addr:x}"
+            "{producer_name} function {bound_name} is outside mapped image for Thumb region 0x{region_addr:x}"
         )));
     }
     let size = record.real_size.filter(|size| *size > 0).ok_or_else(|| {
@@ -947,28 +1156,27 @@ fn normalize_radare2_record_checked(
             .map(|size| format!("; diagnostic aflj size is {size}"))
             .unwrap_or_default();
         Error::Serialize(format!(
-            "radare2 function lacks positive realsz for Thumb region 0x{region_addr:x}{diagnostic}"
+            "{producer_name} function lacks positive realsz for Thumb region 0x{region_addr:x}{diagnostic}"
         ))
     })?;
     if size > image.len() as u64 {
         return Err(Error::Serialize(format!(
-            "radare2 function realsz exceeds mapped image length for Thumb region 0x{region_addr:x}"
+            "{producer_name} function realsz exceeds mapped image length for Thumb region 0x{region_addr:x}"
         )));
     }
     let name = record
         .name
         .clone()
         .unwrap_or_else(|| format!("thumb_{entry_u64:x}"));
-    let projection = radare2_execution_projection(entry, pdfj, image, load_addr);
+    let projection = execution_projection(entry, pdfj, image, load_addr);
     if let ExecutionProjection::Accepted(ranges) = &projection
         && ranges.iter().any(|range| range.end > end)
     {
         return Err(Error::Serialize(format!(
-            "radare2 function decode range exceeds maxaddr for Thumb region 0x{region_addr:x}"
+            "{producer_name} function decode range exceeds {bound_name} for Thumb region 0x{region_addr:x}"
         )));
     }
-    let body = pdfj.map(pdfj_body).unwrap_or_default();
-    let data_refs = pdfj.map(data_refs_from_pdfj).unwrap_or_default();
+    let body = pdfj.map(operation_body).unwrap_or_default();
     let mut output = serde_json::json!({
         "name": name,
         "entry": json_hex(entry_u64),
@@ -976,14 +1184,14 @@ fn normalize_radare2_record_checked(
         "size": size,
         "body_kind": "thumb_disassembly",
         "body": body,
-        "data_refs": data_refs,
+        "data_refs": [],
     });
     let tags = projection_to_json(&projection)?;
     output
         .as_object_mut()
         .expect("JSON object")
         .extend(tags.as_object().expect("JSON object").clone());
-    Ok(output)
+    Ok((output, projection))
 }
 
 fn strict_hex_bytes(value: &str) -> Option<Vec<u8>> {
@@ -999,7 +1207,7 @@ fn strict_hex_bytes(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn radare2_execution_projection(
+fn execution_projection(
     entry: u32,
     pdfj: Option<&serde_json::Value>,
     image: &[u8],
@@ -1899,6 +2107,328 @@ esac
     }
 
     #[test]
+    fn rizin_normalization_uses_maxbound_realsz_aliases_and_axlj_refs() {
+        let raw = json!({
+            "offset": "0x4000",
+            "addr": 0x5000u64,
+            "maxbound": "0x4008",
+            "maxaddr": 0x4002u64,
+            "realsz": 6u64,
+            "size": 0x1000u64,
+            "name": "fcn.rizin",
+            "xrefs_to": [{"from": 1, "to": 2, "type": "DATA"}],
+            "codexrefs": [{"from": 3, "to": 4, "type": "DATA"}]
+        });
+        let pdfj = json!({
+            "addr": 0x4000u64,
+            "ops": [
+                {
+                    "offset": 0x4000u64,
+                    "bytes": "00bf",
+                    "disasm": "nop",
+                    "refs": [{"to": 0xaaaa, "type": "DATA"}]
+                },
+                {"addr": 0x4002u64, "bytes": "7047", "disasm": "bx lr"},
+                {"offset": 0x4006u64, "bytes": "00bf", "disasm": "nop"}
+            ],
+            "xrefs_to": [{"from": 5, "to": 6, "type": "DATA"}],
+            "incoming": [{"from": 7, "to": 8, "type": "DATA"}]
+        });
+        let xrefs = vec![
+            crate::thumb_analysis::rizin::RizinXref {
+                from: 0x4000,
+                to: 0x9002,
+            },
+            crate::thumb_analysis::rizin::RizinXref {
+                from: 0x4002,
+                to: 0x9000,
+            },
+            crate::thumb_analysis::rizin::RizinXref {
+                from: 0x4004,
+                to: 0x9001,
+            },
+            crate::thumb_analysis::rizin::RizinXref {
+                from: 0x4006,
+                to: 0x9000,
+            },
+            crate::thumb_analysis::rizin::RizinXref {
+                from: 0x4008,
+                to: 0x9003,
+            },
+        ];
+        let image = [0x00, 0xbf, 0x70, 0x47, 0x00, 0x00, 0x00, 0xbf];
+
+        let normalized =
+            normalize_rizin_function_checked(&raw, Some(&pdfj), &xrefs, &image, 0x4000, 0x4000)
+                .unwrap();
+
+        assert_eq!(normalized["name"], "fcn.rizin");
+        assert_eq!(normalized["entry"], "0x4000");
+        assert_eq!(normalized["end"], "0x4008");
+        assert_eq!(normalized["size"], 6);
+        assert_eq!(
+            normalized["body"],
+            "0x00004000      00bf      nop\n\
+             0x00004002      7047      bx lr\n\
+             0x00004006      00bf      nop\n"
+        );
+        assert_eq!(normalized["data_refs"], json!(["0x9000", "0x9002"]));
+        assert_eq!(
+            normalized["decode_ranges"],
+            json!([
+                {"isa":"thumb", "start":"0x4000", "end":"0x4004"},
+                {"isa":"thumb", "start":"0x4006", "end":"0x4008"}
+            ])
+        );
+        assert_eq!(normalized["decode_range_errors"], json!([]));
+    }
+
+    #[test]
+    fn rizin_inventory_addresses_accept_offset_or_addr_and_enforce_u32_domain() {
+        let pdfj = json!({"ops":[{"offset":0x4000u64,"bytes":"00bf"}]});
+        let xrefs = Vec::new();
+        for raw in [
+            json!({"offset":0x4000u64,"maxbound":0x4002u64,"realsz":2}),
+            json!({"addr":0x4000u64,"maxbound":0x4002u64,"realsz":2}),
+        ] {
+            let normalized = normalize_rizin_function_checked(
+                &raw,
+                Some(&pdfj),
+                &xrefs,
+                &[0x00, 0xbf],
+                0x4000,
+                0x4000,
+            )
+            .unwrap();
+            assert_eq!(normalized["entry"], "0x4000");
+        }
+
+        let invalid = [
+            (
+                "missing entry",
+                json!({"maxbound":0x4002u64,"realsz":2}),
+                "entry/addr",
+            ),
+            (
+                "malformed preferred offset",
+                json!({"offset":"bad","addr":0x4000u64,"maxbound":0x4002u64,"realsz":2}),
+                "entry/addr",
+            ),
+            (
+                "overflowed entry",
+                json!({"offset":u64::from(u32::MAX) + 1,"maxbound":u64::from(u32::MAX) + 2,"realsz":2}),
+                "canonical u32",
+            ),
+            (
+                "out-of-image entry",
+                json!({"offset":0x3ffeu64,"maxbound":0x4000u64,"realsz":2}),
+                "outside mapped image",
+            ),
+        ];
+        for (case, raw, expected) in invalid {
+            let error = normalize_rizin_function_checked(
+                &raw,
+                Some(&pdfj),
+                &xrefs,
+                &[0x00, 0xbf],
+                0x4000,
+                0x4000,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rizin_boundaries_require_strict_maxbound_and_positive_realsz() {
+        let valid = json!({
+            "offset": 0x4000u64,
+            "maxbound": 0x4002u64,
+            "maxaddr": 0x4002u64,
+            "realsz": 2u64,
+            "size": 0x1000u64
+        });
+        let pdfj = json!({"ops":[{"offset":0x4000u64,"bytes":"00bf"}]});
+        let cases = [
+            ("missing maxbound", "maxbound", None),
+            (
+                "malformed maxbound",
+                "maxbound",
+                Some(("maxbound", json!("bad"))),
+            ),
+            (
+                "reversed maxbound",
+                "must follow entry",
+                Some(("maxbound", json!(0x4000))),
+            ),
+            (
+                "out-of-image maxbound",
+                "outside mapped image",
+                Some(("maxbound", json!(0x4021))),
+            ),
+            (
+                "overflowed maxbound",
+                "canonical u32",
+                Some(("maxbound", json!(u64::from(u32::MAX) + 1))),
+            ),
+            ("missing realsz", "realsz", None),
+            ("zero realsz", "positive realsz", Some(("realsz", json!(0)))),
+            ("malformed realsz", "realsz", Some(("realsz", json!("bad")))),
+            (
+                "oversized realsz",
+                "mapped image length",
+                Some(("realsz", json!(0x21))),
+            ),
+        ];
+
+        for (case, expected, replacement) in cases {
+            let mut raw = valid.clone();
+            match (case, replacement) {
+                ("missing maxbound", _) => {
+                    raw.as_object_mut().unwrap().remove("maxbound");
+                }
+                ("missing realsz", _) => {
+                    raw.as_object_mut().unwrap().remove("realsz");
+                }
+                (_, Some((field, value))) => raw[field] = value,
+                _ => unreachable!(),
+            }
+            let error = normalize_rizin_function_checked(
+                &raw,
+                Some(&pdfj),
+                &[],
+                &[0u8; 0x20],
+                0x4000,
+                0x4000,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rizin_operation_addresses_accept_aliases_and_domain_faults_remove_refs() {
+        let raw = json!({"offset":0x4000u64,"maxbound":0x4004u64,"realsz":4});
+        let valid = json!({"ops":[
+            {"offset":0x4000u64,"bytes":"00bf"},
+            {"addr":0x4002u64,"bytes":"7047"}
+        ]});
+        let xrefs = [crate::thumb_analysis::rizin::RizinXref {
+            from: 0x4000,
+            to: 0x9000,
+        }];
+        let normalized = normalize_rizin_function_checked(
+            &raw,
+            Some(&valid),
+            &xrefs,
+            &[0x00, 0xbf, 0x70, 0x47],
+            0x4000,
+            0x4000,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized["decode_ranges"],
+            json!([{"isa":"thumb", "start":"0x4000", "end":"0x4004"}])
+        );
+        assert_eq!(normalized["data_refs"], json!(["0x9000"]));
+
+        let invalid = json!({"ops":[{
+            "offset": u64::from(u32::MAX) + 1,
+            "addr": 0x4000u64,
+            "bytes": "00bf"
+        }]});
+        let normalized = normalize_rizin_function_checked(
+            &raw,
+            Some(&invalid),
+            &xrefs,
+            &[0x00, 0xbf, 0x70, 0x47],
+            0x4000,
+            0x4000,
+        )
+        .unwrap();
+        assert!(normalized["decode_ranges"].as_array().unwrap().is_empty());
+        assert!(
+            normalized["decode_range_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error["kind"] == "invalid_operation_address")
+        );
+        assert!(normalized["data_refs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rizin_capture_normalizes_validates_and_spills_adapted_data_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("capture.stdout");
+        std::fs::write(
+            &capture,
+            r#"[
+  {"offset":16384,"maxbound":16386,"realsz":2,"size":4096,"name":"accepted","xrefs_to":[{"from":1,"to":2,"type":"DATA"}]},
+  {"addr":16386,"maxbound":16388,"realsz":2,"size":4096,"name":"quarantined","codexrefs":[{"from":3,"to":4,"type":"DATA"}]}
+]
+{"addr":16384,"ops":[{"offset":16384,"bytes":"00bf","disasm":"nop"}],"incoming":[{"from":5,"to":6,"type":"DATA"}]}
+{"offset":16386,"ops":[{"addr":16386,"bytes":"zz","disasm":"invalid"}]}
+[
+  {"from":16384,"to":20480,"type":"DATA"},
+  {"from":16386,"addr":24576,"type":"read"}
+]"#,
+        )
+        .unwrap();
+
+        let outcome = process_rizin_region_streaming(
+            &capture,
+            &[0x00, 0xbf, 0x00, 0xbf],
+            0x4000,
+            0x4000,
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stats.raw, 2);
+        assert_eq!(outcome.stats.substantial, 0);
+        assert_eq!(outcome.stats.accepted, 1);
+        let mut fragments = Vec::new();
+        outcome.spill.emit(&mut fragments).unwrap();
+        let functions = serde_json::Deserializer::from_slice(&fragments)
+            .into_iter::<serde_json::Value>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0]["name"], "accepted");
+        assert_eq!(functions[0]["data_refs"], json!(["0x5000"]));
+        assert_eq!(functions[1]["name"], "quarantined");
+        assert!(functions[1]["decode_ranges"].as_array().unwrap().is_empty());
+        assert!(functions[1]["data_refs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rizin_capture_never_reinterprets_axlj_records_as_pdfj_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("capture.stdout");
+        std::fs::write(
+            &capture,
+            r#"[{"offset":16384,"maxbound":16386,"realsz":2}]
+{"addr":16384,"ops":[{"offset":16384,"bytes":"00bf"}]}
+[{"type":"CODE","ops":[]}]"#,
+        )
+        .unwrap();
+
+        let outcome =
+            process_rizin_region_streaming(&capture, &[0x00, 0xbf], 0x4000, 0x4000, dir.path())
+                .unwrap();
+
+        assert_eq!(outcome.stats.raw, 1);
+        assert_eq!(outcome.stats.accepted, 1);
+    }
+
+    #[test]
     fn streaming_substantial_count_uses_realsz() {
         let stdout = b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":1,\"realsz\":32,\"maxaddr\":16386}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"00bf\",\"disasm\":\"nop\"}]}\n";
         let dir = tempfile::tempdir().unwrap();
@@ -1928,7 +2458,7 @@ esac
             {"offset": 0x4003u64, "bytes": "00bf"},
             {"offset": 0x4010u64, "bytes": "00bf"}
         ]});
-        let projection = radare2_execution_projection(0x4000, Some(&pdfj), &[0; 8], 0x4000);
+        let projection = execution_projection(0x4000, Some(&pdfj), &[0; 8], 0x4000);
         let ExecutionProjection::Quarantined(errors) = projection else {
             panic!("invalid operation must quarantine the entire record")
         };
@@ -1956,7 +2486,7 @@ esac
             {"offset": 0x4002u64, "bytes": "f0b50000"},
             {"offset": 0x4000u64, "bytes": "00bf"}
         ]});
-        let projection = radare2_execution_projection(
+        let projection = execution_projection(
             0x4000,
             Some(&pdfj),
             &[0x00, 0xbf, 0xf0, 0xb5, 0x00, 0x00],
@@ -2044,7 +2574,7 @@ esac
         ];
         for (pdfj, entry, image, kind) in cases {
             let ExecutionProjection::Quarantined(errors) =
-                radare2_execution_projection(entry, Some(&pdfj), image, 0x4000)
+                execution_projection(entry, Some(&pdfj), image, 0x4000)
             else {
                 panic!("fault must quarantine")
             };
@@ -2057,7 +2587,7 @@ esac
 
     #[test]
     fn radare2_missing_pdfj_body_is_a_tagged_quarantine() {
-        let projection = radare2_execution_projection(0x4000, None, &[0, 0], 0x4000);
+        let projection = execution_projection(0x4000, None, &[0, 0], 0x4000);
         assert_eq!(
             projection_to_json(&projection).unwrap(),
             serde_json::json!({
@@ -2651,7 +3181,7 @@ INFO: second pdfj body was noisy and not parseable
             vec!["0x9000", "0x9004", "0x9008"]
         );
         assert_eq!(
-            pdfj_body(&pdfj),
+            operation_body(&pdfj),
             "0x00004120      b5f0      push {r4, lr}\n\
              0x00004122      4b02      ldr r3, [pc, 8]\n\
              0x00004124      d001      beq 0x412a\n\
