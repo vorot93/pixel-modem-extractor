@@ -430,9 +430,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   A/B on the real inputs: 130 s, 2.29 GB peak, byte-identical to the
   whole-file oracle; see the radare2 streaming bullets) — but `symbolicate`
   still loads and rewrites it whole (~4 s, ~3 GB peak), and the memory
-  envelope is now held by `recover_source`'s whole-`Value` load of the same
-  file (src/recover_source.rs:367, the parse at :391; ~24.5 GB
-  full-`decompose` peak, the Stage-3 target — see the radare2 streaming
+  envelope moved to `symbolicate_finalize`'s in-place whole-`Value` rewrite
+  of the same file (symbolicate.rs `rewrite_json_files`; ~24 GB
+  full-`decompose` transient — see the radare2 streaming
   bullets); pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not
   raw literals, so a byte search won't find them).
@@ -1271,10 +1271,11 @@ hardcoded. Two reference images exercise both models end-to-end:
   `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
   former whole-buffer r2 path) is gone — the producer and `thumb_enrich`
   both stream now (see the radare2 streaming bullets below); plan per the
-  README's memory note — the full-`decompose` peak is currently ~24.5 GB
-  (2026-08-20 probe), held by `recover_source`'s whole-file parse of
-  `thumb_functions.json` in the attribution windows, the Stage-3 target;
-  Ghidra's own phases peak ~8 GB. Do not parse Ghidra/radare2 disassembly
+   README's memory note — the full-`decompose` peak is currently a ~24 GB
+   transient inside `symbolicate_finalize`'s in-place whole-`Value` rewrite
+   of `thumb_functions.json` (the next lever); `recover_source` now loads
+   that file through a typed reader (~0.6 GB, measured in-pipeline), and
+   Ghidra's own phases peak ~8 GB. Do not parse Ghidra/radare2 disassembly
   text, infer ISA from alignment or inventory name, attribute an address to
   the nearest global, or leak decoder-crate enums outside `decoder.rs`.
 - **Phase 3.2 type application.** Default-on in every normal-route `decompose`
@@ -1508,10 +1509,11 @@ hardcoded. Two reference images exercise both models end-to-end:
   deterministic edits (drops `body_c`/`annotations`, restores `name` from
   `original_name`) to reconstruct the producer surface; re-baselining
   goldens or touching symbolicate's rewrite shape must revisit that
-  inversion. Stage 2 (landed) moved `thumb_enrich` onto the same streaming
-  footing — see the next bullet; the full-`decompose` envelope is now held
-  by `recover_source`, not by any radare2-side stage (also the next
-  bullet).
+   inversion. Stage 2 (landed) moved `thumb_enrich` onto the same streaming
+   footing — see the next bullet; Stage 3 (landed) did the same for
+   `recover_source`'s load, and the full-`decompose` envelope now sits in
+   `symbolicate_finalize`'s rewrite, not in any radare2-side stage (also the
+   next bullet).
   `--no-thumb-decompile` still selects Ghidra `datamark` mode and skips both
   `body_c` enrichment sweeps; the dense-region radare2 capture/parse loop it
   still invokes is the same streaming path.
@@ -1528,15 +1530,19 @@ hardcoded. Two reference images exercise both models end-to-end:
   oracle. Pre-Stage-2, the two whole-file enrich sweeps held the ~24.9 GB
   full-`decompose` peak (the 632 MB JSON parsed to a ~20+ GB `Value` tree,
   twice). Post-Stage-2, enrich is verified out of the envelope (2.29 GB
-  A/B peak) and the holder is `recover_source`:
-  `RecoveredFunctions::load` parses the whole 632 MB `thumb_functions.json`
-  into a `serde_json::Value` (~20+ GB tree) before typed conversion
-  (src/recover_source.rs:367, the whole-`Value` load at :391), so the
-  full-`decompose` peak is still ~24.5 GB (2026-08-20 probe: 23.5 GB
-  pre-pass-2, 24.5 GB post-pass-2, both attribution windows); Ghidra's own
-  phases peak ~8 GB, and the producer, streaming enrich, and `symbolicate`
-  (~3 GB) all sit below that. Stage 3 = a streaming/typed load in
-  `recover_source`. Contract invariants, pinned by the differential oracle
+   A/B peak) and Stage 3 did the same for `recover_source`:
+   `RecoveredFunctions::load` now deserializes `thumb_functions.json`
+   (and `functions.json`) through a typed reader straight from the file —
+   no `serde_json::Value` tree, unknown fields (symbolicate stamps,
+   `body_c`) ignored, a malformed record failing closed (~0.6 GB measured
+   in-pipeline by the 2026-08-20 instrumented probe, down from ~20 GB). The
+   remaining full-`decompose` peak is a ~24 GB transient inside
+   `symbolicate_finalize`'s in-place whole-`Value` rewrite of
+   `thumb_functions.json` (symbolicate.rs `rewrite_json_files`; the
+   standalone `symbolicate` subcommand measured 24 GB on the same path) —
+   the next lever, same streaming pattern as enrich; Ghidra's own
+   phases peak ~8 GB, and the producer, streaming enrich, and typed
+   attribution all sit below that. Contract invariants, pinned by the differential oracle
   plus the env-gated production replay: (1) **canonical input required, fail-closed**
   — `thumb_functions.json` must be an object with exactly the keys `format`
   then `functions` (an array); anything else returns `Err`. This is a
