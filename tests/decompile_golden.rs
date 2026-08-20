@@ -2086,7 +2086,7 @@ fn thumb_enrich_populates_body_c() {
     )
     .unwrap();
 
-    let n = pixel_modem_extractor::decompile::thumb_enrich(&c_path, &thumb_path).unwrap();
+    let n = pixel_modem_extractor::r2_thumb::thumb_enrich(&c_path, &thumb_path).unwrap();
     assert_eq!(n, 1, "thumb_enrich should populate exactly one body_c");
 
     let v: serde_json::Value =

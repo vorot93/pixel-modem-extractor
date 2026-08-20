@@ -13,7 +13,7 @@ use crate::execution_ranges::{
 use serde::Deserializer as _;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -1782,6 +1782,276 @@ impl<'de, 'a> Visitor<'de> for FunctionsSeq<'a> {
     }
 }
 
+/// Phase 2: enrich a v1 (or v2 asm-only) `thumb_functions.json` with per-function
+/// `body_c` sourced from a `decompiled.c`. Bumps `format` to v2 iff at least one
+/// `body_c` is populated; otherwise leaves the file byte-identical. Idempotent.
+///
+/// `decompiled.c` is parsed by scanning for ExportDecomp.java's per-function
+/// header line
+///
+/// ```text
+/// // <name> @ <entrypoint>
+/// <return-type> <name>(<params>)
+/// {
+///   ...
+/// }
+/// ```
+///
+/// and keying each captured body by the normalized entry address
+/// (`normalize_thumb_addr` clears Ghidra's Thumb T-bit so `40e1201` and `40e1200`
+/// agree). Matching against `thumb_functions.json` is likewise by the normalized
+/// `entry` field — Phase 2.1 switched this from name-based to address-based
+/// matching because radare2's `thumb_<addr>` names never align with Ghidra's
+/// `FUN_<addr>`/recovered names. Returns the count of functions whose `body_c`
+/// was populated.
+///
+/// Fail-closed: a malformed `decompiled.c` (read or parse failure) returns `Err`;
+/// the on-disk `thumb_functions.json` is unchanged.
+pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    // std::io::Error auto-converts via Error::Io(#[from]) — `?` propagates directly.
+    let c_text = std::fs::read_to_string(decompiled_c_path)?;
+
+    // Phase 2.1: parse decompiled.c into {normalized_entry_address -> body_text}.
+    let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
+
+    // Read thumb_functions.json, augment in memory, decide whether to rewrite.
+    let raw = std::fs::read(thumb_functions_json_path)?;
+    let mut v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+        Error::Serialize(format!(
+            "parse {}: {e}",
+            thumb_functions_json_path.display()
+        ))
+    })?;
+
+    let mut populated = 0usize;
+    if let Some(funcs) = v.get_mut("functions").and_then(|f| f.as_array_mut()) {
+        for f in funcs {
+            // Phase 2.1: match by `entry` (address), not by `name`. The `name`
+            // field is radare2's `thumb_<addr>` placeholder and never aligns
+            // with Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
+            let Some(entry_str) = f.get("entry").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let Some(canonical) = normalize_thumb_addr(entry_str) else {
+                continue;
+            };
+            if let Some(body) = bodies.get(&canonical) {
+                f.as_object_mut().unwrap().insert(
+                    "body_c".to_string(),
+                    serde_json::Value::String(body.clone()),
+                );
+                populated += 1;
+            }
+        }
+    }
+
+    if populated == 0 {
+        return Ok(0); // Leave file byte-identical (do not rewrite).
+    }
+
+    // Bump format to v2 on first population.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "format".to_string(),
+            serde_json::Value::String("pixel-modem-extractor-thumb-functions-v2".to_string()),
+        );
+    }
+
+    let out = serde_json::to_string_pretty(&v)
+        .map_err(|e| Error::Serialize(format!("re-serialize thumb_functions.json: {e}")))?;
+    std::fs::write(thumb_functions_json_path, out)?;
+    Ok(populated)
+}
+
+/// Canonical comparison form for a Thumb entry address: lowercase hex string
+/// with no `0x` prefix, no leading zeros, low bit cleared (kills Ghidra's Thumb
+/// T-bit so `40e1201` and `40e1200` both become `40e1200`). Returns None if `s`
+/// doesn't parse as a non-empty hex string.
+///
+/// This is the **Phase 2.1 invariant** — both `thumb_enrich`'s parser (over
+/// `decompiled.c`'s `// <name> @ <addr>` headers) and matcher (over
+/// `thumb_functions.json`'s `entry` fields) MUST apply the same normalization,
+/// or matching silently breaks. The inline `thumb_enrich_populates_body_c_
+/// with_tbit_set` test is the regression sentinel.
+fn normalize_thumb_addr(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    let stripped = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let val = u64::from_str_radix(stripped, 16).ok()?;
+    Some(format!("{:x}", val & !1))
+}
+
+#[cfg(test)]
+mod normalize_thumb_addr_tests {
+    use super::*;
+
+    #[test]
+    fn strips_0x_prefix_and_leading_zeros() {
+        assert_eq!(
+            normalize_thumb_addr("0x000040e1200").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(
+            normalize_thumb_addr("0X40E1200").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(normalize_thumb_addr("40e1200").as_deref(), Some("40e1200"));
+    }
+
+    #[test]
+    fn clears_thumb_tbit() {
+        assert_eq!(
+            normalize_thumb_addr("0x40e1201").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(
+            normalize_thumb_addr("00040e1201").as_deref(),
+            Some("40e1200")
+        );
+    }
+
+    #[test]
+    fn rejects_non_hex() {
+        assert_eq!(normalize_thumb_addr("not-an-addr"), None);
+        assert_eq!(normalize_thumb_addr(""), None);
+        assert_eq!(normalize_thumb_addr("0xZZZ"), None);
+    }
+}
+
+/// Parse a `decompiled.c` text into a map of `{normalized_entry_address ->
+/// body_text}`, where `body_text` is the full function including signature and
+/// braces. ExportDecomp.java emits one header per function:
+///
+/// ```text
+/// // <name> @ <entrypoint>
+/// <return-type> <name>(<params>)
+/// {
+///   ...
+/// }
+/// ```
+///
+/// where `<entrypoint>` is `fn.getEntryPoint().toString()`. For ARM Thumb in
+/// Ghidra 12 with `ARM:LE:32:v7`, Thumb entry points carry the T-bit (odd);
+/// `normalize_thumb_addr` clears it so the canonical key matches radare2's
+/// even-form `entry` field. Functions whose header lacks ` @ <addr>` are
+/// silently skipped (no key to insert under) — same fail-soft posture as the
+/// prior name-based parser.
+fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let lines: Vec<&str> = c_text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Match the ExportDecomp header: starts with `//`, contains ` @ `.
+        let addr_str = line
+            .trim()
+            .strip_prefix("//")
+            .and_then(|rest| rest.rsplit_once(" @ "))
+            .map(|(_, addr)| addr.trim())
+            .filter(|addr| !addr.is_empty());
+        let Some(addr_str) = addr_str else {
+            i += 1;
+            continue;
+        };
+        // Bounded lookahead: commit only when `{` appears within the next 1–8
+        // lines. Real ExportDecomp.java output is bi-modal: offset-4 headers
+        // (single-line signatures, ~58% of production 02_MAIN) and offset-6
+        // headers (2-line signatures, ~35%). The 8-line bound captures 99.6% of
+        // real headers in the production histogram. Without this bound, a header-shaped
+        // non-header could commit at position N and absorb following lines into
+        // the wrong address's body until the next real function's `{` — same
+        // rationale as the prior parser's lookahead.
+        let start = i;
+        let opens_brace_within_8 =
+            (start + 1..std::cmp::min(start + 9, lines.len())).any(|j| lines[j].contains('{'));
+        if !opens_brace_within_8 {
+            i = start + 1;
+            continue;
+        }
+        // Capture from this line through the matching closing brace at depth 0.
+        // State machine tracks string/char literals + line/block comments so a `}`
+        // inside `"expected }"`, `'}'`, or `// close }` doesn't truncate the body.
+        // Mirrors the string-aware scanning used by the production
+        // `r2_thumb::ValueScanner` (`balanced_json_end` is its `#[cfg(test)]`
+        // oracle).
+        let mut depth = 0i32;
+        let mut saw_brace = false;
+        let mut body = String::new();
+        let mut in_string = false;
+        let mut in_char = false;
+        let mut escaped = false;
+        let mut in_block_comment = false;
+        while i < lines.len() {
+            let l = lines[i];
+            let mut chars = l.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if in_block_comment {
+                    if ch == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        in_block_comment = false;
+                    }
+                    continue;
+                }
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                if in_char {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '\'' {
+                        in_char = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '\'' => in_char = true,
+                    '/' => {
+                        if chars.peek() == Some(&'/') {
+                            chars.next();
+                            break; // rest of line is a line comment
+                        } else if chars.peek() == Some(&'*') {
+                            chars.next();
+                            in_block_comment = true;
+                        }
+                    }
+                    '{' => {
+                        depth += 1;
+                        saw_brace = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            body.push_str(l);
+            body.push('\n');
+            if saw_brace && depth <= 0 {
+                break;
+            }
+            i += 1;
+        }
+        if let Some(canonical) = normalize_thumb_addr(addr_str) {
+            out.insert(canonical, body);
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3111,5 +3381,305 @@ INFO: second pdfj body was noisy and not parseable
                 String::from_utf8_lossy(&expected[lo..hi])
             );
         }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pme_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn thumb_enrich_populates_body_c_for_matching_entry() {
+        let root = temp_dir("thumb_enrich_match");
+        let c_path = root.join("decompiled.c");
+        // ExportDecomp.java emits "// <name> @ <addr>\n<C>\n\n" per function.
+        // Ghidra's pre-pass-2 names are `FUN_<addr>`; here the entry-address
+        // (00040e1200, even form) is what thumb_enrich matches by.
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(int a)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v1",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []},
+                {"entry": "0x40efffc", "name": "thumb_40efffc", "size": 4,
+                 "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []}
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1, "exactly one function matched by address");
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert_eq!(v["format"], "pixel-modem-extractor-thumb-functions-v2");
+        assert!(v["functions"][0]["body_c"].is_string());
+        assert!(
+            v["functions"][0]["body_c"]
+                .as_str()
+                .unwrap()
+                .contains("FUN_40e1200"),
+            "body_c is the Ghidra C body (pre-pass-2 form): {}",
+            v["functions"][0]["body_c"]
+        );
+        assert!(
+            v["functions"][1].get("body_c").is_none(),
+            "no address match -> no body_c"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines() {
+        // Regression sentinel: real ExportDecomp.java output has TWO blank lines
+        // between the `// FUN_<addr> @ <addr>` comment header and the opening `{`
+        // (one after the header, one after the signature). The original
+        // parser used 1–2 line lookahead for `{`, which worked on synthetic
+        // fixtures (1 blank line) but matched 0 bodies on real production output.
+        let root = temp_dir("thumb_enrich_real_format");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(int a)\n\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "real ExportDecomp format (2 blank lines between header and `{{`) must match"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig() {
+        // Regression sentinel for the second peak in real ExportDecomp.java's
+        // header-to-`{` offset distribution: 2-line signatures produce
+        // offset-6 headers (header, blank, sig-line-1, sig-line-2, blank, `{`).
+        // Captured by histogram analysis on production 02_MAIN.
+        let root = temp_dir("thumb_enrich_real_offset_6");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(\n    int a,\n    int b)\n\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "real ExportDecomp format with 2-line signature (offset-6 header) must match"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_populates_body_c_with_tbit_set() {
+        let root = temp_dir("thumb_enrich_tbit");
+        let c_path = root.join("decompiled.c");
+        // Ghidra emits Thumb entry points with the T-bit set (odd address).
+        // radare2's matching `entry` is the even form. Phase 2.1's normalization
+        // clears the low bit on both sides so they agree.
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1201\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "T-bit normalization: 40e1201 (Ghidra) matches 40e1200 (radare2)"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_zero_matches_leaves_file_unchanged() {
+        let root = temp_dir("thumb_enrich_no_match");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_deadbeef @ 00deadbeef\nvoid FUN_deadbeef(void)\n{\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v1",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []}
+            ]
+        }"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 0);
+        // File is byte-identical (format stays v1 because no body_c was populated).
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+    }
+
+    #[test]
+    fn thumb_enrich_is_idempotent() {
+        let root = temp_dir("thumb_enrich_idem");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_first = std::fs::read_to_string(&thumb_path).unwrap();
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_second = std::fs::read_to_string(&thumb_path).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "second run is a no-op on the same inputs"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_fail_closed_on_malformed_decompiled_c() {
+        let root = temp_dir("thumb_enrich_bad_c");
+        let c_path = root.join("decompiled.c");
+        // Not valid UTF-8.
+        std::fs::write(&c_path, [0xff, 0xfe, 0xfd, 0xfc]).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[]}"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let err = thumb_enrich(&c_path, &thumb_path).unwrap_err();
+        // The on-disk JSON is unchanged.
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+        // Surfaced as a typed error (any variant — just confirm it's not silent).
+        let _ = format!("{err}");
+    }
+
+    #[test]
+    fn thumb_enrich_brace_in_string_does_not_truncate_body() {
+        // A `}` inside a C string literal must NOT be counted as a closing brace.
+        // Before the string-aware counter, this truncated `body_c` at the first
+        // in-string `}`. Block and line comments are exercised too.
+        let root = temp_dir("thumb_enrich_brace_in_string");
+        let c_path = root.join("decompiled.c");
+        let c = "// FUN_40e1300 @ 00040e1300\n\
+                 void FUN_40e1300(void)\n\
+                 {\n\
+                 \x20 const char *s = \"expected } close\";\n\
+                 \x20 /* block comment with } brace */\n\
+                 \x20 // line comment with } brace\n\
+                 \x20 helper_call();\n\
+                 \x20 return;\n\
+                 }\n\n";
+        std::fs::write(&c_path, c).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1300","name":"thumb_40e1300","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        let body_c = v["functions"][0]["body_c"].as_str().unwrap();
+        assert!(
+            body_c.contains("helper_call"),
+            "body_c was truncated by an in-string/comment brace:\n{body_c}"
+        );
+        assert!(body_c.contains("expected } close"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_does_not_treat_char_literal_brace_as_body_end() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char c = '}';\n\
+  helper();\n\
+}\n\
+// FUN_20 @ 00000020\n\
+void FUN_20(void)\n\
+{\n\
+  return;\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        // Keys are normalize_thumb_addr output (strip leading zeros, clear T-bit).
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("helper();"), "{body}");
+        assert!(!body.contains("FUN_20"), "{body}");
+        assert!(bodies.contains_key("20"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_tracks_escaped_char_literals() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char q = '\\'';\n\
+  char b = '}';\n\
+  done();\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("done();"), "{body}");
+        assert!(
+            body.ends_with("}\n") || body.trim_end().ends_with('}'),
+            "{body}"
+        );
     }
 }

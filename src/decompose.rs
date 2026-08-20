@@ -817,7 +817,7 @@ fn run_thumb_enrich_per_image(
             }
             continue;
         }
-        match decompile::thumb_enrich(&decompiled_c, &thumb_json) {
+        match crate::r2_thumb::thumb_enrich(&decompiled_c, &thumb_json) {
             Ok(n) => {
                 ir.thumb_decompiled = Some(n);
                 outcome.counts.push((label.clone(), n));
