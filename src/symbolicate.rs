@@ -2444,7 +2444,7 @@ mod tests {
         vec![
             Symbol {
                 address: "0x40e1200".into(),
-                arch: "thumb".into(),
+                arch: "thumb",
                 original_name: "thumb_40e1200".into(),
                 name: Some("RealName".into()),
                 tier: Tier::Recovered,
@@ -2453,7 +2453,7 @@ mod tests {
             },
             Symbol {
                 address: "0x00000010".into(),
-                arch: "arm".into(),
+                arch: "arm",
                 original_name: "FUN_10".into(),
                 name: None,
                 tier: Tier::Recovered,
@@ -2557,7 +2557,7 @@ mod tests {
     fn real_name_symbol_for_40e1200() -> Symbol {
         Symbol {
             address: "0x40e1200".into(),
-            arch: "thumb".into(),
+            arch: "thumb",
             original_name: "thumb_40e1200".into(),
             name: Some("RealName".into()),
             tier: Tier::Recovered,
