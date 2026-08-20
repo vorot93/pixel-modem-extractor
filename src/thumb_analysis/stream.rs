@@ -1838,8 +1838,8 @@ fn make_analyzer_pipe_cancellable(_pipe: &std::process::ChildStdout) -> std::io:
 }
 
 const ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(5);
-/// Bound proof that the immediate analyzer child has exited and been reaped.
-const ANALYZER_CHILD_REAP_VERIFICATION_LIMIT: Duration = Duration::from_secs(1);
+/// Bound proof that the immediate analyzer child has completed after termination.
+const ANALYZER_CHILD_COMPLETION_LIMIT: Duration = Duration::from_secs(1);
 /// Give a waiting shell time to reap its terminated descendants before SIGKILL.
 #[cfg(unix)]
 const ANALYZER_TERMINATION_GRACE: Duration = Duration::from_millis(100);
@@ -1847,29 +1847,52 @@ const ANALYZER_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 const ANALYZER_GROUP_ABSENCE_VERIFICATION_LIMIT: Duration = Duration::from_secs(1);
 
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnixCleanupEvent {
+    ExitObserved,
+    Signal(libc::c_int),
+    Reap,
+}
+
 #[derive(Clone, Copy)]
 struct CleanupPolicy {
-    child_reap_verification_limit: Duration,
+    child_completion_limit: Duration,
     #[cfg(unix)]
     group_absence_verification_limit: Duration,
     #[cfg(test)]
     inject_verification_failure: bool,
+    #[cfg(all(test, unix))]
+    events: Option<&'static std::sync::Mutex<Vec<UnixCleanupEvent>>>,
 }
 
 impl CleanupPolicy {
     const PRODUCTION: Self = Self {
-        child_reap_verification_limit: ANALYZER_CHILD_REAP_VERIFICATION_LIMIT,
+        child_completion_limit: ANALYZER_CHILD_COMPLETION_LIMIT,
         #[cfg(unix)]
         group_absence_verification_limit: ANALYZER_GROUP_ABSENCE_VERIFICATION_LIMIT,
         #[cfg(test)]
         inject_verification_failure: false,
+        #[cfg(all(test, unix))]
+        events: None,
     };
+
+    #[cfg(all(test, unix))]
+    fn record(self, event: UnixCleanupEvent) {
+        if let Some(events) = self.events {
+            events.lock().unwrap().push(event);
+        }
+    }
 }
 
 struct AnalyzerProcess {
     child: std::process::Child,
     #[cfg(unix)]
     pid: u32,
+    #[cfg(unix)]
+    exit_observed: bool,
+    #[cfg(unix)]
+    reap_attempted: bool,
     status: Option<std::process::ExitStatus>,
     drain: Option<std::thread::JoinHandle<std::io::Result<CaptureRecord>>>,
     drain_control: Arc<DrainControl>,
@@ -1883,13 +1906,73 @@ impl AnalyzerProcess {
             child,
             #[cfg(unix)]
             pid,
+            #[cfg(unix)]
+            exit_observed: false,
+            #[cfg(unix)]
+            reap_attempted: false,
             status: None,
             drain: None,
             drain_control,
         }
     }
 
-    fn poll_status(&mut self) -> std::io::Result<bool> {
+    fn exit_observed(&self) -> bool {
+        #[cfg(unix)]
+        return self.exit_observed;
+        #[cfg(not(unix))]
+        return self.status.is_some();
+    }
+
+    #[cfg(unix)]
+    fn observe_exit(&mut self, policy: CleanupPolicy) -> std::io::Result<bool> {
+        #[cfg(not(test))]
+        let _ = policy;
+        if self.exit_observed {
+            return Ok(true);
+        }
+        loop {
+            // SAFETY: siginfo_t is a C output buffer; zeroing also satisfies
+            // POSIX's WNOHANG requirement that si_pid start at zero.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            // WNOWAIT is the identity invariant: the exited leader remains a
+            // waitable zombie, so its numeric PID/PGID cannot be reused before
+            // every process-group cleanup signal has been sent.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful waitid(WEXITED) initialized the SIGCHLD
+                // payload, including si_pid (or left the zero sentinel).
+                let observed_pid = unsafe { info.si_pid() };
+                if observed_pid == 0 {
+                    return Ok(false);
+                }
+                if observed_pid != self.pid as libc::pid_t {
+                    return Err(std::io::Error::other(format!(
+                        "waitid observed pid {observed_pid} instead of analyzer pid {}",
+                        self.pid
+                    )));
+                }
+                self.exit_observed = true;
+                #[cfg(test)]
+                policy.record(UnixCleanupEvent::ExitObserved);
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn observe_exit(&mut self, policy: CleanupPolicy) -> std::io::Result<bool> {
+        let _ = policy;
         if self.status.is_some() {
             return Ok(true);
         }
@@ -1918,13 +2001,93 @@ impl AnalyzerProcess {
         self.drain_control.bytes()
     }
 
-    fn reap_child_within(&mut self, limit: Duration) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fn observe_exit_within(&mut self, policy: CleanupPolicy) -> std::io::Result<()> {
         let started = std::time::Instant::now();
         loop {
-            if self.poll_status()? {
+            if self.observe_exit(policy)? {
                 return Ok(());
             }
-            if started.elapsed() >= limit {
+            if started.elapsed() >= policy.child_completion_limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "analyzer child exit was not observed before the cleanup deadline",
+                ));
+            }
+            std::thread::sleep(ANALYZER_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn reap_observed_child(&mut self, policy: CleanupPolicy) -> std::io::Result<()> {
+        #[cfg(not(test))]
+        let _ = policy;
+        if self.status.is_some() {
+            return Ok(());
+        }
+        if self.reap_attempted {
+            return Err(std::io::Error::other(
+                "analyzer child reap was already attempted",
+            ));
+        }
+        if !self.exit_observed {
+            return Err(std::io::Error::other(
+                "analyzer child cannot be reaped before exit is observed",
+            ));
+        }
+        self.reap_attempted = true;
+        #[cfg(test)]
+        policy.record(UnixCleanupEvent::Reap);
+        self.status = Some(self.child.wait()?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn signal_process_group(
+        &self,
+        signal: libc::c_int,
+        policy: CleanupPolicy,
+    ) -> std::io::Result<()> {
+        if self.reap_attempted {
+            return Err(std::io::Error::other(
+                "refusing to signal an analyzer process group after reap",
+            ));
+        }
+        signal_analyzer_process_group(self.pid, signal, policy)
+    }
+
+    #[cfg(unix)]
+    fn kill_child(&mut self, policy: CleanupPolicy) -> std::io::Result<()> {
+        if self.reap_attempted {
+            return Err(std::io::Error::other(
+                "refusing to signal an analyzer child after reap",
+            ));
+        }
+        #[cfg(test)]
+        policy.record(UnixCleanupEvent::Signal(libc::SIGKILL));
+        #[cfg(not(test))]
+        let _ = policy;
+        self.child.kill()
+    }
+
+    #[cfg(unix)]
+    fn process_group_exists_after_reap(&self, policy: CleanupPolicy) -> std::io::Result<bool> {
+        if self.status.is_none() {
+            return Err(std::io::Error::other(
+                "refusing to verify analyzer process-group absence before reap",
+            ));
+        }
+        analyzer_process_group_exists(self.pid, policy)
+    }
+
+    #[cfg(not(unix))]
+    fn reap_child_within(&mut self, policy: CleanupPolicy) -> std::io::Result<()> {
+        let started = std::time::Instant::now();
+        loop {
+            if self.observe_exit(policy)? {
+                return Ok(());
+            }
+            if started.elapsed() >= policy.child_completion_limit {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "analyzer child did not exit and reap before the cleanup deadline",
@@ -1961,63 +2124,86 @@ impl AnalyzerProcess {
     #[cfg(unix)]
     fn terminate_and_reap(&mut self, policy: CleanupPolicy) -> std::io::Result<()> {
         let mut first_error = None;
-        if let Err(error) = signal_process_group(self.pid, libc::SIGTERM) {
-            preserve_cleanup_error(
-                &mut first_error,
-                "could not send SIGTERM to analyzer process group",
-                error,
-            );
+        if self.status.is_none() && self.reap_attempted {
+            return Err(std::io::Error::other(
+                "analyzer child reap was attempted but no exit status is available",
+            ));
         }
 
-        let grace_started = std::time::Instant::now();
-        let mut group_absent;
-        loop {
-            if self.status.is_none()
-                && let Err(error) = self.poll_status()
-            {
-                preserve_cleanup_error(
-                    &mut first_error,
-                    "could not poll analyzer child during cleanup",
-                    error,
-                );
-            }
-            group_absent = match process_group_exists(self.pid) {
-                Ok(exists) => !exists,
-                Err(error) => {
+        if self.status.is_none() {
+            let already_observed = self.observe_exit(policy).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not observe analyzer child before cleanup: {error}"),
+                )
+            })?;
+            let mut identity_stable = true;
+            if already_observed {
+                if let Err(error) = self.signal_process_group(libc::SIGKILL, policy) {
                     preserve_cleanup_error(
                         &mut first_error,
-                        "could not inspect analyzer process group during termination grace",
+                        "could not send SIGKILL to exited analyzer process group",
                         error,
                     );
-                    false
                 }
-            };
-            if (group_absent && self.status.is_some())
-                || grace_started.elapsed() >= ANALYZER_TERMINATION_GRACE
-            {
-                break;
+            } else {
+                if let Err(error) = self.signal_process_group(libc::SIGTERM, policy) {
+                    preserve_cleanup_error(
+                        &mut first_error,
+                        "could not send SIGTERM to analyzer process group",
+                        error,
+                    );
+                }
+                let grace_started = std::time::Instant::now();
+                while grace_started.elapsed() < ANALYZER_TERMINATION_GRACE {
+                    match self.observe_exit(policy) {
+                        Ok(true) => break,
+                        Ok(false) => std::thread::sleep(ANALYZER_POLL_INTERVAL),
+                        Err(error) => {
+                            preserve_cleanup_error(
+                                &mut first_error,
+                                "could not observe analyzer child during termination grace",
+                                error,
+                            );
+                            identity_stable = false;
+                            break;
+                        }
+                    }
+                }
+                if identity_stable
+                    && let Err(error) = self.signal_process_group(libc::SIGKILL, policy)
+                {
+                    preserve_cleanup_error(
+                        &mut first_error,
+                        "could not send SIGKILL to analyzer process group",
+                        error,
+                    );
+                }
+                if identity_stable
+                    && !self.exit_observed
+                    && let Err(error) = self.kill_child(policy)
+                    && error.kind() != std::io::ErrorKind::InvalidInput
+                {
+                    preserve_cleanup_error(
+                        &mut first_error,
+                        "could not kill analyzer child during cleanup",
+                        error,
+                    );
+                }
             }
-            std::thread::sleep(ANALYZER_POLL_INTERVAL);
-        }
 
-        if !group_absent && let Err(error) = signal_process_group(self.pid, libc::SIGKILL) {
-            preserve_cleanup_error(
-                &mut first_error,
-                "could not send SIGKILL to analyzer process group",
-                error,
-            );
-        }
-        if self.status.is_none() {
-            if let Err(error) = self.child.kill()
-                && error.kind() != std::io::ErrorKind::InvalidInput
+            if identity_stable
+                && !self.exit_observed
+                && let Err(error) = self.observe_exit_within(policy)
             {
                 preserve_cleanup_error(
                     &mut first_error,
-                    "could not kill analyzer child during cleanup",
+                    "could not observe analyzer child exit during cleanup",
                     error,
                 );
+                identity_stable = false;
             }
-            if let Err(error) = self.reap_child_within(policy.child_reap_verification_limit) {
+            if identity_stable && let Err(error) = self.reap_observed_child(policy) {
                 preserve_cleanup_error(
                     &mut first_error,
                     "could not reap analyzer child during cleanup",
@@ -2026,31 +2212,33 @@ impl AnalyzerProcess {
             }
         }
 
-        let verification_started = std::time::Instant::now();
-        let mut last_verification_error;
-        group_absent = false;
-        loop {
-            last_verification_error = match process_group_exists(self.pid) {
-                Ok(false) => {
-                    group_absent = true;
+        let mut group_absent = false;
+        if self.status.is_some() {
+            let verification_started = std::time::Instant::now();
+            let mut last_verification_error;
+            loop {
+                last_verification_error = match self.process_group_exists_after_reap(policy) {
+                    Ok(false) => {
+                        group_absent = true;
+                        break;
+                    }
+                    Ok(true) => None,
+                    Err(error) => Some(error),
+                };
+                if verification_started.elapsed() >= policy.group_absence_verification_limit {
+                    let detail = last_verification_error.map_or_else(
+                        || "analyzer process group still exists".to_owned(),
+                        |error| format!("analyzer process-group state is unknown: {error}"),
+                    );
+                    preserve_cleanup_error(
+                        &mut first_error,
+                        "could not verify analyzer process-group absence",
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, detail),
+                    );
                     break;
                 }
-                Ok(true) => None,
-                Err(error) => Some(error),
-            };
-            if verification_started.elapsed() >= policy.group_absence_verification_limit {
-                let detail = last_verification_error.map_or_else(
-                    || "analyzer process group still exists".to_owned(),
-                    |error| format!("analyzer process-group state is unknown: {error}"),
-                );
-                preserve_cleanup_error(
-                    &mut first_error,
-                    "could not verify analyzer process-group absence",
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, detail),
-                );
-                break;
+                std::thread::sleep(ANALYZER_POLL_INTERVAL);
             }
-            std::thread::sleep(ANALYZER_POLL_INTERVAL);
         }
 
         if self.status.is_none() {
@@ -2090,7 +2278,7 @@ impl AnalyzerProcess {
                     error,
                 );
             }
-            if let Err(error) = self.reap_child_within(policy.child_reap_verification_limit) {
+            if let Err(error) = self.reap_child_within(policy) {
                 preserve_cleanup_error(
                     &mut first_error,
                     "could not reap analyzer child during cleanup",
@@ -2131,12 +2319,16 @@ impl AnalyzerProcess {
 
 impl Drop for AnalyzerProcess {
     fn drop(&mut self) {
-        if self.status.is_none() || self.drain.is_some() {
+        #[cfg(unix)]
+        let needs_process_cleanup = self.status.is_none() && !self.reap_attempted;
+        #[cfg(not(unix))]
+        let needs_process_cleanup = self.status.is_none();
+        if needs_process_cleanup {
             let _ = self.terminate_and_reap(CleanupPolicy::PRODUCTION);
+        }
+        if self.drain.is_some() {
             self.cancel_drain_and_wait();
-            if self.drain.is_some() {
-                let _ = self.join_drain();
-            }
+            let _ = self.join_drain();
         }
     }
 }
@@ -2152,6 +2344,28 @@ fn preserve_cleanup_error(
             format!("{context}: {error}"),
         ));
     }
+}
+
+#[cfg(unix)]
+fn signal_analyzer_process_group(
+    pid: u32,
+    signal: libc::c_int,
+    policy: CleanupPolicy,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    policy.record(UnixCleanupEvent::Signal(signal));
+    #[cfg(not(test))]
+    let _ = policy;
+    signal_process_group(pid, signal)
+}
+
+#[cfg(unix)]
+fn analyzer_process_group_exists(pid: u32, policy: CleanupPolicy) -> std::io::Result<bool> {
+    #[cfg(test)]
+    policy.record(UnixCleanupEvent::Signal(0));
+    #[cfg(not(test))]
+    let _ = policy;
+    process_group_exists(pid)
 }
 
 #[cfg(unix)]
@@ -2609,7 +2823,6 @@ enum SupervisionState {
         started: std::time::Instant,
         last_progress: std::time::Instant,
         observed_bytes: u64,
-        pending_failure: Option<String>,
     },
 }
 
@@ -2642,18 +2855,81 @@ fn supervision_sleep(
 }
 
 fn classify_running_observation(
-    status_complete: bool,
+    exit_observed: bool,
     capture_complete: bool,
     deadline_expired: bool,
 ) -> RunningObservation {
     if deadline_expired {
         RunningObservation::DeadlineExpired
-    } else if status_complete && capture_complete {
+    } else if exit_observed && capture_complete {
         RunningObservation::Complete
-    } else if status_complete {
+    } else if exit_observed {
         RunningObservation::BeginStdoutFinalization
     } else {
         RunningObservation::Pending
+    }
+}
+
+fn analyzer_status_failure_detail(
+    process: &AnalyzerProcess,
+    producer: ThumbProducer,
+    addr: u32,
+) -> Option<String> {
+    let status = process.status.as_ref()?;
+    if status.success() {
+        return None;
+    }
+    match check_thumb_backend_status(producer, false, status.code(), addr)
+        .expect_err("non-successful analyzer status must fail")
+    {
+        Error::Serialize(detail) => Some(detail),
+        _ => unreachable!("backend status failures are serialization errors"),
+    }
+}
+
+fn finalize_natural_analyzer_capture(
+    process: &mut AnalyzerProcess,
+    capture: CaptureRecord,
+    producer: ThumbProducer,
+    addr: u32,
+    policy: CleanupPolicy,
+) -> std::result::Result<CaptureRecord, FailedRegion> {
+    let cleanup = process.terminate_and_reap(policy);
+    if let Some(detail) = analyzer_status_failure_detail(process, producer, addr) {
+        return Err(FailedRegion::after_cleanup(
+            Some(capture),
+            Error::Serialize(detail),
+            "process cleanup failed",
+            cleanup,
+        ));
+    }
+    match cleanup {
+        Ok(()) if process.status.is_some() => Ok(capture),
+        Ok(()) => {
+            let mut failure = FailedRegion::recoverable(
+                Some(capture),
+                Error::Serialize(format!(
+                    "{} cleanup did not yield an exit status for Thumb region 0x{addr:x}",
+                    producer.as_str()
+                )),
+            );
+            failure.mark_cleanup_failure(
+                "process cleanup failed",
+                std::io::Error::other("analyzer child status is unavailable after cleanup"),
+            );
+            Err(failure)
+        }
+        Err(error) => {
+            let mut failure = FailedRegion::recoverable(
+                Some(capture),
+                Error::Serialize(format!(
+                    "{} process cleanup failed after stdout completion for Thumb region 0x{addr:x}",
+                    producer.as_str()
+                )),
+            );
+            failure.mark_cleanup_failure("process cleanup failed", error);
+            Err(failure)
+        }
     }
 }
 
@@ -2767,7 +3043,6 @@ fn supervise_spawned_analyzer(
             started,
             last_progress,
             observed_bytes,
-            pending_failure,
         } = &mut state
         {
             let bytes = process.drain_bytes();
@@ -2792,13 +3067,12 @@ fn supervise_spawned_analyzer(
                     "stdout remained open after analyzer exit for Thumb region 0x{addr:x}; forced pipe finalization after the {} ms {limit_name} limit",
                     limit.as_millis()
                 );
-                let mut detail = match pending_failure.take() {
-                    Some(mut detail) => {
+                let mut detail = analyzer_status_failure_detail(&process, producer, addr)
+                    .map(|mut detail| {
                         detail.push_str(&format!("; {forced}"));
                         detail
-                    }
-                    None => format!("{producer_name} {forced}"),
-                };
+                    })
+                    .unwrap_or_else(|| format!("{producer_name} {forced}"));
                 if let Some(error) = finalize_error {
                     detail.push_str(&format!("; partial stdout finalization failed: {error}"));
                 }
@@ -2829,7 +3103,7 @@ fn supervise_spawned_analyzer(
 
         match &mut state {
             SupervisionState::Running => {
-                if let Err(error) = process.poll_status() {
+                if let Err(error) = process.observe_exit(limits.cleanup) {
                     let cleanup = process.terminate_and_reap(limits.cleanup);
                     process.cancel_drain_and_wait();
                     let (retained, finalize_error) =
@@ -2849,64 +3123,19 @@ fn supervise_spawned_analyzer(
                 }
 
                 match classify_running_observation(
-                    process.status.is_some(),
+                    process.exit_observed(),
                     capture.is_some(),
                     deadline.is_some_and(|deadline| started.elapsed() >= deadline),
                 ) {
                     RunningObservation::Complete | RunningObservation::BeginStdoutFinalization => {
-                        let pending_failure = if process
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| !status.success())
-                        {
-                            let code = process.status.as_ref().and_then(|status| status.code());
-                            let error = check_thumb_backend_status(producer, false, code, addr)
-                                .expect_err("non-successful analyzer status must fail");
-                            let cleanup = process.terminate_and_reap(limits.cleanup);
-                            let mut detail = match error {
-                                Error::Serialize(detail) => detail,
-                                _ => {
-                                    unreachable!("backend status failures are serialization errors")
-                                }
-                            };
-                            if let Err(error) = cleanup {
-                                process.cancel_drain_and_wait();
-                                let (retained, finalize_error) = finalize_stopped_capture(
-                                    &mut process,
-                                    capture.take(),
-                                    stdout_path,
-                                );
-                                if let Some(error) = finalize_error {
-                                    detail.push_str(&format!(
-                                        "; partial stdout finalization failed: {error}"
-                                    ));
-                                }
-                                let mut failure =
-                                    FailedRegion::recoverable(retained, Error::Serialize(detail));
-                                failure.mark_cleanup_failure("process cleanup failed", error);
-                                return Err(failure);
-                            }
-                            Some(detail)
-                        } else {
-                            None
-                        };
-                        if capture.is_some() {
-                            if let Some(detail) = pending_failure {
-                                return Err(FailedRegion::recoverable(
-                                    capture.take(),
-                                    Error::Serialize(detail),
-                                ));
-                            }
-                            if let Err(error) = process.terminate_and_reap(limits.cleanup) {
-                                let mut failure = FailedRegion::recoverable(
-                                    capture.take(),
-                                    Error::Serialize(format!(
-                                        "{producer_name} process cleanup failed after successful completion for Thumb region 0x{addr:x}"
-                                    )),
-                                );
-                                failure.mark_cleanup_failure("process cleanup failed", error);
-                                return Err(failure);
-                            }
+                        if let Some(finalized) = capture.take() {
+                            capture = Some(finalize_natural_analyzer_capture(
+                                &mut process,
+                                finalized,
+                                producer,
+                                addr,
+                                limits.cleanup,
+                            )?);
                             break;
                         }
                         let now = std::time::Instant::now();
@@ -2914,7 +3143,6 @@ fn supervise_spawned_analyzer(
                             started: now,
                             last_progress: now,
                             observed_bytes: process.drain_bytes(),
-                            pending_failure,
                         };
                         continue;
                     }
@@ -2942,26 +3170,15 @@ fn supervise_spawned_analyzer(
                     RunningObservation::Pending => {}
                 }
             }
-            SupervisionState::FinalizingStdout {
-                pending_failure, ..
-            } => {
-                if capture.is_some() {
-                    if let Some(detail) = pending_failure.take() {
-                        return Err(FailedRegion::recoverable(
-                            capture.take(),
-                            Error::Serialize(detail),
-                        ));
-                    }
-                    if let Err(error) = process.terminate_and_reap(limits.cleanup) {
-                        let mut failure = FailedRegion::recoverable(
-                            capture.take(),
-                            Error::Serialize(format!(
-                                "{producer_name} process cleanup failed after stdout finalization for Thumb region 0x{addr:x}"
-                            )),
-                        );
-                        failure.mark_cleanup_failure("process cleanup failed", error);
-                        return Err(failure);
-                    }
+            SupervisionState::FinalizingStdout { .. } => {
+                if let Some(finalized) = capture.take() {
+                    capture = Some(finalize_natural_analyzer_capture(
+                        &mut process,
+                        finalized,
+                        producer,
+                        addr,
+                        limits.cleanup,
+                    )?);
                     break;
                 }
             }
@@ -3836,7 +4053,6 @@ esac
             started: now,
             last_progress: now,
             observed_bytes: 0,
-            pending_failure: None,
         };
 
         assert_eq!(
@@ -3870,7 +4086,7 @@ esac
         let mut child = command.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         // SAFETY: `waitid` only observes this live child and WNOWAIT leaves it
-        // available for `AnalyzerProcess::poll_status` to reap.
+        // available for `AnalyzerProcess` to reap after anchored cleanup.
         let mut status = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
         let wait_result = unsafe {
             libc::waitid(
@@ -4191,6 +4407,74 @@ esac
     }
 
     #[cfg(unix)]
+    fn cleanup_policy_with_events(
+        events: &'static std::sync::Mutex<Vec<UnixCleanupEvent>>,
+    ) -> CleanupPolicy {
+        CleanupPolicy {
+            events: Some(events),
+            ..CleanupPolicy::PRODUCTION
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_anchored_cleanup_order(events: &[UnixCleanupEvent]) {
+        let reaps = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| (*event == UnixCleanupEvent::Reap).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(reaps.len(), 1, "expected one reap event: {events:?}");
+        let reap = reaps[0];
+        let observations = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                (*event == UnixCleanupEvent::ExitObserved).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observations.len(),
+            1,
+            "expected one exit observation: {events:?}"
+        );
+        let observation = observations[0];
+        assert!(
+            observation < reap,
+            "exit was observed after reap: {events:?}"
+        );
+        assert!(
+            events[..reap]
+                .iter()
+                .any(|event| matches!(event, UnixCleanupEvent::Signal(signal) if *signal != 0)),
+            "cleanup emitted no anchored TERM/KILL before reap: {events:?}"
+        );
+        assert!(
+            events[..observation]
+                .iter()
+                .all(|event| !matches!(event, UnixCleanupEvent::Signal(signal) if *signal != 0)),
+            "post-exit cleanup signaled before observing exit: {events:?}"
+        );
+        assert!(
+            events[..reap]
+                .iter()
+                .all(|event| !matches!(event, UnixCleanupEvent::Signal(0))),
+            "cleanup queried the group before reap: {events:?}"
+        );
+        assert!(
+            events[reap + 1..]
+                .iter()
+                .all(|event| matches!(event, UnixCleanupEvent::Signal(0))),
+            "cleanup emitted a non-verification event after reap: {events:?}"
+        );
+        assert!(
+            events[reap + 1..]
+                .iter()
+                .any(|event| matches!(event, UnixCleanupEvent::Signal(0))),
+            "cleanup never verified group absence after reap: {events:?}"
+        );
+    }
+
+    #[cfg(unix)]
     fn wait_for_file(path: &Path, timeout: Duration) {
         let started = std::time::Instant::now();
         while !path.exists() {
@@ -4201,6 +4485,132 @@ esac
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timely_natural_eof_signals_anchored_group_before_single_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("r2");
+        let bin = dir.path().join("00004000.bin");
+        let stdout = dir.path().join("00004000.radare2.stdout");
+        let events: &'static std::sync::Mutex<Vec<UnixCleanupEvent>> =
+            Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+        write_executable_stub(&executable, "#!/bin/sh\nprintf 'natural eof\\n'\n");
+        std::fs::write(&bin, [0x70, 0x47]).unwrap();
+
+        let capture = match run_backend_capture(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Radare2, &executable),
+            &bin,
+            0x4000,
+            &stdout,
+            RunnerLimits {
+                cleanup: cleanup_policy_with_events(events),
+                ..RunnerLimits::PRODUCTION
+            },
+        ) {
+            Ok(capture) => capture,
+            Err(failure) => panic!("natural EOF failed: {}", failure.error),
+        };
+
+        assert_eq!(capture.bytes, b"natural eof\n".len() as u64);
+        assert_anchored_cleanup_order(&events.lock().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_stdout_finalization_signals_anchored_group_before_single_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("r2");
+        let bin = dir.path().join("00004000.bin");
+        let stdout = dir.path().join("00004000.radare2.stdout");
+        let events: &'static std::sync::Mutex<Vec<UnixCleanupEvent>> =
+            Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+        write_executable_stub(
+            &executable,
+            "#!/bin/sh\nprintf 'forced prefix\\n'\nsleep 60 &\nexit 0\n",
+        );
+        std::fs::write(&bin, [0x70, 0x47]).unwrap();
+
+        let failure = run_backend_capture(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Radare2, &executable),
+            &bin,
+            0x4000,
+            &stdout,
+            RunnerLimits {
+                pipe_finalization_idle: Duration::from_millis(50),
+                pipe_finalization_absolute: Duration::from_millis(250),
+                cleanup: cleanup_policy_with_events(events),
+                ..RunnerLimits::PRODUCTION
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            failure.error.to_string().contains("stdout remained open"),
+            "{}",
+            failure.error
+        );
+        assert_anchored_cleanup_order(&events.lock().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_exit_observation_leaves_child_waitable_until_explicit_cleanup() {
+        let events: &'static std::sync::Mutex<Vec<UnixCleanupEvent>> =
+            Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+        let policy = cleanup_policy_with_events(events);
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 7"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        configure_analyzer_process(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let mut process = AnalyzerProcess::new(child, Arc::new(DrainControl::default()));
+        let started = std::time::Instant::now();
+        while !process.observe_exit(policy).unwrap() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(ANALYZER_POLL_INTERVAL);
+        }
+
+        // A WNOWAIT observation must leave the zombie available to the one
+        // explicit Child::wait that closes process-group cleanup.
+        let mut observed = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let observed_result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut observed,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if observed_result != 0 {
+            // A WNOWAIT mutation may already have reaped the child. Suppress
+            // Drop's best-effort cleanup so the deliberately failing test can
+            // never signal a now-reusable numeric PGID.
+            process.reap_attempted = true;
+            panic!(
+                "exit observation reaped the child early: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(unsafe { observed.si_pid() }, pid as libc::pid_t);
+
+        process.terminate_and_reap(policy).unwrap();
+        assert_eq!(
+            process.status.as_ref().and_then(|status| status.code()),
+            Some(7)
+        );
+        let mut wait_status = 0;
+        let wait_result =
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut wait_status, libc::WNOHANG) };
+        let wait_error = std::io::Error::last_os_error();
+        assert_eq!(wait_result, -1);
+        assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+        assert_anchored_cleanup_order(&events.lock().unwrap());
     }
 
     #[cfg(unix)]
