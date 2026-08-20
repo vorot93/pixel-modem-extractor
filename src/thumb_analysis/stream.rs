@@ -22,6 +22,8 @@ use crate::execution_ranges::{
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 fn json_hex(v: u64) -> String {
@@ -1631,6 +1633,14 @@ fn populate_test_image_from_pdfj(image: &mut [u8], pdfj: &serde_json::Value) {
 const ANALYZER_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// Rizin alone gets the measured per-region cutoff; radare2 retains no wall deadline.
 const RIZIN_REGION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Maximum idle time while finalizing an analyzer's stdout pipe after the
+/// immediate process exits. This bounds pipe finalization only; it is not an
+/// analyzer runtime deadline. New bytes reset this idle window.
+const ANALYZER_PIPE_FINALIZATION_IDLE_LIMIT: Duration = Duration::from_secs(1);
+/// Absolute stdout-pipe finalization bound after the immediate analyzer exits.
+/// Progress cannot extend it. This is deliberately separate from the Rizin
+/// analysis deadline and does not impose a runtime deadline on radare2.
+const ANALYZER_PIPE_FINALIZATION_ABSOLUTE_LIMIT: Duration = Duration::from_secs(30);
 
 /// Chunk size for `capture_to_cap`. Smaller than the typical Linux pipe
 /// buffer (64 KiB since 2.6.11), so size checks fire promptly when r2 emits
@@ -1645,17 +1655,69 @@ const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 ///
 /// Pure I/O — no child-process coupling, no filesystem assumptions. Testable
 /// with `Cursor<Vec<u8>>` readers and `Vec<u8>` writers.
+#[cfg(test)]
 fn capture_to_cap<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     cap: usize,
     sidecar_path: &str,
 ) -> std::io::Result<CaptureRecord> {
+    capture_to_cap_cancellable(reader, writer, cap, sidecar_path, &DrainControl::default())
+}
+
+#[derive(Default)]
+struct DrainControl {
+    cancelled: AtomicBool,
+    bytes: AtomicU64,
+}
+
+impl DrainControl {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+}
+
+fn capture_to_cap_cancellable<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cap: usize,
+    sidecar_path: &str,
+    control: &DrainControl,
+) -> std::io::Result<CaptureRecord> {
     let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
     let mut written: usize = 0;
     let mut hasher = blake3::Hasher::new();
     loop {
-        let n = reader.read(&mut chunk)?;
+        if control.is_cancelled() {
+            return Ok(CaptureRecord {
+                path: sidecar_path.to_owned(),
+                bytes: written as u64,
+                blake3: hasher.finalize().to_hex().to_string(),
+            });
+        }
+        let n = match reader.read(&mut chunk) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ANALYZER_POLL_INTERVAL);
+                continue;
+            }
+            Err(_) if control.is_cancelled() => {
+                return Ok(CaptureRecord {
+                    path: sidecar_path.to_owned(),
+                    bytes: written as u64,
+                    blake3: hasher.finalize().to_hex().to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if n == 0 {
             return Ok(CaptureRecord {
                 path: sidecar_path.to_owned(),
@@ -1663,10 +1725,7 @@ fn capture_to_cap<R: std::io::Read, W: std::io::Write>(
                 blake3: hasher.finalize().to_hex().to_string(),
             });
         }
-        // Check before writing so we never write past the cap.
         if n > cap - written {
-            // Write up to the cap (so the caller sees a partial file of
-            // exactly `cap` bytes if they inspect it before cleanup).
             let allowed = cap - written;
             writer.write_all(&chunk[..allowed])?;
             hasher.update(&chunk[..allowed]);
@@ -1677,6 +1736,7 @@ fn capture_to_cap<R: std::io::Read, W: std::io::Write>(
         writer.write_all(&chunk[..n])?;
         hasher.update(&chunk[..n]);
         written += n;
+        control.bytes.store(written as u64, Ordering::Release);
     }
 }
 
@@ -1726,6 +1786,28 @@ fn configure_analyzer_process(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn configure_analyzer_process(_cmd: &mut std::process::Command) {}
 
+#[cfg(unix)]
+fn make_analyzer_pipe_cancellable(pipe: &std::process::ChildStdout) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let descriptor = pipe.as_raw_fd();
+    // SAFETY: the descriptor is borrowed from a live child pipe. These calls
+    // retain no pointers and only add O_NONBLOCK to its file-status flags.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_analyzer_pipe_cancellable(_pipe: &std::process::ChildStdout) -> std::io::Result<()> {
+    Ok(())
+}
+
 const ANALYZER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Give a waiting shell time to reap its terminated descendants before SIGKILL.
 const ANALYZER_TERMINATION_GRACE: Duration = Duration::from_millis(100);
@@ -1736,10 +1818,11 @@ struct AnalyzerProcess {
     pid: u32,
     status: Option<std::process::ExitStatus>,
     drain: Option<std::thread::JoinHandle<std::io::Result<CaptureRecord>>>,
+    drain_control: Arc<DrainControl>,
 }
 
 impl AnalyzerProcess {
-    fn new(child: std::process::Child) -> Self {
+    fn new(child: std::process::Child, drain_control: Arc<DrainControl>) -> Self {
         #[cfg(unix)]
         let pid = child.id();
         Self {
@@ -1748,6 +1831,7 @@ impl AnalyzerProcess {
             pid,
             status: None,
             drain: None,
+            drain_control,
         }
     }
 
@@ -1776,6 +1860,15 @@ impl AnalyzerProcess {
             .map_err(|_| std::io::Error::other("analyzer stdout drain thread panicked"))?
     }
 
+    fn drain_bytes(&self) -> u64 {
+        self.drain_control.bytes()
+    }
+
+    fn cancel_drain(&self) {
+        self.drain_control.cancel();
+        self.interrupt_drain();
+    }
+
     #[cfg(windows)]
     fn interrupt_drain(&self) {
         use std::os::windows::io::AsRawHandle;
@@ -1791,6 +1884,9 @@ impl AnalyzerProcess {
             }
         }
     }
+
+    #[cfg(not(windows))]
+    fn interrupt_drain(&self) {}
 
     fn terminate_and_reap(&mut self) -> std::io::Result<()> {
         let mut first_error = None;
@@ -1808,17 +1904,31 @@ impl AnalyzerProcess {
         }
 
         let grace_started = std::time::Instant::now();
-        while self.status.is_none() && grace_started.elapsed() < ANALYZER_TERMINATION_GRACE {
-            match self.poll_status() {
-                Ok(true) => break,
-                Ok(false) => std::thread::sleep(ANALYZER_POLL_INTERVAL),
+        loop {
+            if self.status.is_none()
+                && let Err(error) = self.poll_status()
+            {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                break;
+            }
+            #[cfg(unix)]
+            let cleanup_complete = match process_group_exists(self.pid) {
+                Ok(exists) => !exists,
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
-                    break;
+                    true
                 }
+            };
+            #[cfg(not(unix))]
+            let cleanup_complete = self.status.is_some();
+            if cleanup_complete || grace_started.elapsed() >= ANALYZER_TERMINATION_GRACE {
+                break;
             }
+            std::thread::sleep(ANALYZER_POLL_INTERVAL);
         }
 
         #[cfg(unix)]
@@ -1841,7 +1951,11 @@ impl AnalyzerProcess {
             }
         }
 
-        #[cfg(windows)]
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn cancel_drain_and_wait(&mut self) {
+        self.cancel_drain();
         while self
             .drain
             .as_ref()
@@ -1850,8 +1964,6 @@ impl AnalyzerProcess {
             self.interrupt_drain();
             std::thread::sleep(ANALYZER_POLL_INTERVAL);
         }
-
-        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1859,6 +1971,7 @@ impl Drop for AnalyzerProcess {
     fn drop(&mut self) {
         if self.status.is_none() || self.drain.is_some() {
             let _ = self.terminate_and_reap();
+            self.cancel_drain_and_wait();
             if self.drain.is_some() {
                 let _ = self.join_drain();
             }
@@ -1878,6 +1991,22 @@ fn signal_process_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
         Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> std::io::Result<bool> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::other("analyzer pid exceeds the Unix pid_t domain"))?;
+    // SAFETY: signal 0 only checks the child-owned process group's existence.
+    if unsafe { libc::kill(-pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
     } else {
         Err(error)
     }
@@ -1984,13 +2113,38 @@ fn add_count(total: &mut usize, value: usize, label: &str) -> Result<()> {
 struct RunnerLimits {
     stdout_cap: usize,
     rizin_timeout: Duration,
+    pipe_finalization_idle: Duration,
+    pipe_finalization_absolute: Duration,
 }
 
 impl RunnerLimits {
     const PRODUCTION: Self = Self {
         stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
         rizin_timeout: RIZIN_REGION_TIMEOUT,
+        pipe_finalization_idle: ANALYZER_PIPE_FINALIZATION_IDLE_LIMIT,
+        pipe_finalization_absolute: ANALYZER_PIPE_FINALIZATION_ABSOLUTE_LIMIT,
     };
+}
+
+#[derive(Default)]
+struct PendingSpills(Vec<Spill>);
+
+impl PendingSpills {
+    fn push(&mut self, spill: Spill) {
+        self.0.push(spill);
+    }
+
+    fn as_slice(&self) -> &[Spill] {
+        &self.0
+    }
+}
+
+impl Drop for PendingSpills {
+    fn drop(&mut self) {
+        for spill in &self.0 {
+            let _ = std::fs::remove_file(&spill.path);
+        }
+    }
 }
 
 /// Analyze validated dense-Thumb regions with radare2 primary and an optional
@@ -2032,22 +2186,14 @@ fn run_thumb_analysis_with_limits(
     }
     let thumb_dir = out_dir.join("thumb");
     std::fs::create_dir_all(&thumb_dir)?;
-    let mut spills: Vec<Spill> = Vec::new();
+    let mut spills = PendingSpills::default();
     let mut region_records = Vec::with_capacity(regions.len());
     let mut failures: Vec<(u32, Vec<String>)> = Vec::new();
     let mut rizin_attempted = false;
 
     for &(addr, end) in &regions {
         let len = end - addr;
-        let bin = match carve_thumb_region(image, load_addr, addr, len, &thumb_dir) {
-            Ok(bin) => bin,
-            Err(error) => {
-                for spill in &spills {
-                    let _ = std::fs::remove_file(&spill.path);
-                }
-                return Err(error);
-            }
-        };
+        let bin = carve_thumb_region(image, load_addr, addr, len, &thumb_dir)?;
         let mut attempts = Vec::with_capacity(usize::from(tools.rizin.is_some()) + 1);
         let mut region_failures = Vec::with_capacity(attempts.capacity());
         let mut selected = None;
@@ -2085,7 +2231,8 @@ fn run_thumb_analysis_with_limits(
         }
 
         if let Some((producer, outcome)) = selected {
-            let stats = &outcome.stats;
+            let RegionOutcome { spill, stats } = outcome;
+            spills.push(spill);
             let quarantined = stats.raw.checked_sub(stats.accepted).ok_or_else(|| {
                 Error::Serialize(format!(
                     "{} Thumb projection count is not conserving for region 0x{addr:x}",
@@ -2123,7 +2270,6 @@ fn run_thumb_analysis_with_limits(
                 attempts,
                 function_runs: vec![run],
             });
-            spills.push(outcome.spill);
         } else {
             add_count(&mut summary.regions_failed, 1, "failed region")?;
             failures.push((addr, region_failures));
@@ -2168,17 +2314,12 @@ fn run_thumb_analysis_with_limits(
                 .expect("Rizin can be attempted only when configured"),
         );
     }
-    if let Err(error) = assemble_v3_atomic(
+    assemble_v3_atomic(
         &out_dir.join("thumb_functions.json"),
         &attempted_producers,
         &region_records,
-        &spills,
-    ) {
-        for spill in &spills {
-            let _ = std::fs::remove_file(&spill.path);
-        }
-        return Err(error);
-    }
+        spills.as_slice(),
+    )?;
     Ok(summary)
 }
 
@@ -2203,6 +2344,22 @@ fn carve_thumb_region(
 
 type RegionParser = fn(&Path, &[u8], u32, u32, &Path) -> Result<RegionOutcome>;
 
+fn backend_fragment_path(
+    thumb_dir: &Path,
+    addr: u32,
+    producer: ThumbProducer,
+) -> std::path::PathBuf {
+    thumb_dir.join(format!("{addr:08x}.{}.frags", producer.as_str()))
+}
+
+fn remove_backend_fragments(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn run_backend_region(
     identity: &ProducerIdentity,
     bin: &Path,
@@ -2219,23 +2376,62 @@ fn run_backend_region(
         ThumbProducer::Radare2 => process_region_streaming,
         ThumbProducer::Rizin => process_rizin_region_streaming,
     };
-    let deadline = (producer == ThumbProducer::Rizin).then_some(limits.rizin_timeout);
-    let capture = run_backend_capture(
-        identity,
-        bin,
-        addr,
-        &stdout_path,
-        limits.stdout_cap,
-        deadline,
-    )?;
-    match parser(&stdout_path, image, load_addr, addr, thumb_dir) {
-        Ok(outcome) => Ok(SuccessfulRegion { outcome, capture }),
-        Err(error) => Err(FailedRegion {
-            capture: Some(capture),
+    let fragment_path = backend_fragment_path(thumb_dir, addr, producer);
+    if let Err(error) = remove_backend_fragments(&fragment_path) {
+        return Err(FailedRegion {
+            capture: None,
             error: Error::Serialize(format!(
-                "{producer_name} output validation failed for Thumb region 0x{addr:x}: {error}"
+                "{producer_name} could not remove stale fragments for Thumb region 0x{addr:x}: {error}"
             )),
-        }),
+        });
+    }
+    let result = match run_backend_capture(identity, bin, addr, &stdout_path, limits) {
+        Ok(capture) => match parser(&stdout_path, image, load_addr, addr, thumb_dir) {
+            Ok(outcome) => Ok(SuccessfulRegion { outcome, capture }),
+            Err(error) => Err(FailedRegion {
+                capture: Some(capture),
+                error: Error::Serialize(format!(
+                    "{producer_name} output validation failed for Thumb region 0x{addr:x}: {error}"
+                )),
+            }),
+        },
+        Err(failure) => Err(failure),
+    };
+    match result {
+        Ok(success) => Ok(success),
+        Err(mut failure) => {
+            if let Err(error) = remove_backend_fragments(&fragment_path) {
+                failure.error = Error::Serialize(format!(
+                    "{}; {producer_name} fragment cleanup failed: {error}",
+                    failure.error
+                ));
+            }
+            Err(failure)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunningObservation {
+    Complete,
+    BeginStdoutFinalization,
+    DeadlineExpired,
+    Pending,
+}
+
+fn classify_running_observation(
+    status_complete: bool,
+    capture_complete: bool,
+    deadline_expired: bool,
+) -> RunningObservation {
+    if deadline_expired {
+        RunningObservation::DeadlineExpired
+    } else if status_complete && capture_complete {
+        RunningObservation::Complete
+    } else if status_complete {
+        RunningObservation::BeginStdoutFinalization
+    } else {
+        RunningObservation::Pending
     }
 }
 
@@ -2244,8 +2440,7 @@ fn run_backend_capture(
     bin: &Path,
     addr: u32,
     stdout_path: &Path,
-    stdout_cap: usize,
-    deadline: Option<Duration>,
+    limits: RunnerLimits,
 ) -> std::result::Result<CaptureRecord, FailedRegion> {
     let producer = identity.producer;
     let producer_name = producer.as_str();
@@ -2266,7 +2461,35 @@ fn run_backend_capture(
         )),
     })?;
     let stdout = child.stdout.take().expect("piped stdout");
-    let mut process = AnalyzerProcess::new(child);
+    supervise_spawned_analyzer(child, stdout, producer, addr, stdout_path, started, limits)
+}
+
+fn supervise_spawned_analyzer(
+    child: std::process::Child,
+    stdout: std::process::ChildStdout,
+    producer: ThumbProducer,
+    addr: u32,
+    stdout_path: &Path,
+    started: std::time::Instant,
+    limits: RunnerLimits,
+) -> std::result::Result<CaptureRecord, FailedRegion> {
+    let producer_name = producer.as_str();
+    let stdout_cap = limits.stdout_cap;
+    let deadline = (producer == ThumbProducer::Rizin).then_some(limits.rizin_timeout);
+    let drain_control = Arc::new(DrainControl::default());
+    let mut process = AnalyzerProcess::new(child, Arc::clone(&drain_control));
+    if let Err(error) = make_analyzer_pipe_cancellable(&stdout) {
+        let cleanup = process.terminate_and_reap().err();
+        let cleanup = cleanup
+            .map(|error| format!("; process cleanup failed: {error}"))
+            .unwrap_or_default();
+        return Err(FailedRegion {
+            capture: None,
+            error: Error::Serialize(format!(
+                "{producer_name} could not configure cancellable stdout for Thumb region 0x{addr:x}: {error}{cleanup}"
+            )),
+        });
+    }
     let file = match std::fs::File::create(stdout_path) {
         Ok(file) => file,
         Err(error) => {
@@ -2284,7 +2507,13 @@ fn run_backend_capture(
         .spawn(move || {
             let mut stdout = stdout;
             let mut file = file;
-            let capture = capture_to_cap(&mut stdout, &mut file, stdout_cap, &sidecar_path)?;
+            let capture = capture_to_cap_cancellable(
+                &mut stdout,
+                &mut file,
+                stdout_cap,
+                &sidecar_path,
+                &drain_control,
+            )?;
             file.flush()?;
             Ok(capture)
         });
@@ -2302,9 +2531,67 @@ fn run_backend_capture(
     };
 
     let mut capture = None;
-    #[cfg(unix)]
-    let mut closed_descendant_pipes = false;
+    enum SupervisionState {
+        Running,
+        FinalizingStdout {
+            started: std::time::Instant,
+            last_progress: std::time::Instant,
+            observed_bytes: u64,
+            pending_failure: Option<String>,
+        },
+    }
+    let mut state = SupervisionState::Running;
     loop {
+        let now = std::time::Instant::now();
+        if let SupervisionState::FinalizingStdout {
+            started,
+            last_progress,
+            observed_bytes,
+            pending_failure,
+        } = &mut state
+        {
+            let bytes = process.drain_bytes();
+            if bytes != *observed_bytes {
+                *observed_bytes = bytes;
+                *last_progress = now;
+            }
+            let finalization_limit =
+                if now.duration_since(*started) >= limits.pipe_finalization_absolute {
+                    Some(("absolute", limits.pipe_finalization_absolute))
+                } else if now.duration_since(*last_progress) >= limits.pipe_finalization_idle {
+                    Some(("idle", limits.pipe_finalization_idle))
+                } else {
+                    None
+                };
+            if let Some((limit_name, limit)) = finalization_limit {
+                let cleanup = process.terminate_and_reap().err();
+                process.cancel_drain_and_wait();
+                let (retained, finalize_error) =
+                    finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+                let forced = format!(
+                    "stdout remained open after analyzer exit for Thumb region 0x{addr:x}; forced pipe finalization after the {} ms {limit_name} limit",
+                    limit.as_millis()
+                );
+                let mut detail = match pending_failure.take() {
+                    Some(mut detail) => {
+                        detail.push_str(&format!("; {forced}"));
+                        detail
+                    }
+                    None => format!("{producer_name} {forced}"),
+                };
+                if let Some(error) = cleanup {
+                    detail.push_str(&format!("; cleanup failed: {error}"));
+                }
+                if let Some(error) = finalize_error {
+                    detail.push_str(&format!("; partial stdout finalization failed: {error}"));
+                }
+                return Err(FailedRegion {
+                    capture: retained,
+                    error: Error::Serialize(detail),
+                });
+            }
+        }
+
         if capture.is_none() && process.drain_finished() {
             match process.join_drain() {
                 Ok(finalized) => capture = Some(finalized),
@@ -2327,6 +2614,7 @@ fn run_backend_capture(
 
         if let Err(error) = process.poll_status() {
             let cleanup = process.terminate_and_reap().err();
+            process.cancel_drain_and_wait();
             let (retained, finalize_error) =
                 finalize_stopped_capture(&mut process, capture.take(), stdout_path);
             let mut detail = format!(
@@ -2344,58 +2632,129 @@ fn run_backend_capture(
             });
         }
 
-        if capture.is_some() && process.status.is_some() {
+        if process
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.success())
+        {
+            let code = process.status.as_ref().and_then(|status| status.code());
+            let error = check_thumb_backend_status(producer, false, code, addr)
+                .expect_err("non-successful analyzer status must fail");
+            let cleanup = process.terminate_and_reap().err();
+            let mut detail = match error {
+                Error::Serialize(detail) => detail,
+                _ => unreachable!("backend status failures are serialization errors"),
+            };
+            if let Some(error) = cleanup {
+                detail.push_str(&format!("; process cleanup failed: {error}"));
+            }
+            if let Some(capture) = capture.take() {
+                return Err(FailedRegion {
+                    capture: Some(capture),
+                    error: Error::Serialize(detail),
+                });
+            }
+            let now = std::time::Instant::now();
+            state = SupervisionState::FinalizingStdout {
+                started: now,
+                last_progress: now,
+                observed_bytes: process.drain_bytes(),
+                pending_failure: Some(detail),
+            };
+            continue;
+        }
+
+        if capture.is_some()
+            && process.status.is_some()
+            && matches!(state, SupervisionState::FinalizingStdout { .. })
+        {
+            if let SupervisionState::FinalizingStdout {
+                pending_failure: Some(detail),
+                ..
+            } = &mut state
+            {
+                return Err(FailedRegion {
+                    capture: capture.take(),
+                    error: Error::Serialize(std::mem::take(detail)),
+                });
+            }
             break;
         }
 
-        if deadline.is_some_and(|deadline| started.elapsed() >= deadline) {
-            let cleanup = process.terminate_and_reap().err();
-            let (retained, finalize_error) =
-                finalize_stopped_capture(&mut process, capture.take(), stdout_path);
-            let mut detail = format!(
-                "{producer_name} timed out after {} ms for Thumb region 0x{addr:x}",
-                deadline.expect("elapsed deadline is present").as_millis()
-            );
-            if let Some(error) = cleanup {
-                detail.push_str(&format!("; cleanup failed: {error}"));
+        if matches!(state, SupervisionState::Running) {
+            match classify_running_observation(
+                process.status.is_some(),
+                capture.is_some(),
+                deadline.is_some_and(|deadline| started.elapsed() >= deadline),
+            ) {
+                RunningObservation::Complete => break,
+                RunningObservation::BeginStdoutFinalization => {
+                    let now = std::time::Instant::now();
+                    state = SupervisionState::FinalizingStdout {
+                        started: now,
+                        last_progress: now,
+                        observed_bytes: process.drain_bytes(),
+                        pending_failure: None,
+                    };
+                    continue;
+                }
+                RunningObservation::DeadlineExpired => {
+                    let cleanup = process.terminate_and_reap().err();
+                    process.cancel_drain_and_wait();
+                    let (retained, finalize_error) =
+                        finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+                    let mut detail = format!(
+                        "{producer_name} timed out after {} ms for Thumb region 0x{addr:x}",
+                        deadline.expect("elapsed deadline is present").as_millis()
+                    );
+                    if let Some(error) = cleanup {
+                        detail.push_str(&format!("; cleanup failed: {error}"));
+                    }
+                    if let Some(error) = finalize_error {
+                        detail.push_str(&format!("; partial stdout finalization failed: {error}"));
+                    }
+                    return Err(FailedRegion {
+                        capture: retained,
+                        error: Error::Serialize(detail),
+                    });
+                }
+                RunningObservation::Pending => {}
             }
-            if let Some(error) = finalize_error {
-                detail.push_str(&format!("; partial stdout finalization failed: {error}"));
-            }
-            return Err(FailedRegion {
-                capture: retained,
-                error: Error::Serialize(detail),
-            });
         }
 
-        #[cfg(unix)]
-        if process.status.is_some() && capture.is_none() && !closed_descendant_pipes {
-            // A descendant may have inherited stdout after the immediate child
-            // exited. Closing the remaining group prevents a drain-thread deadlock.
-            let _ = signal_process_group(process.pid, libc::SIGKILL);
-            closed_descendant_pipes = true;
-        }
-
-        let sleep = deadline
+        let mut sleep = deadline
             .map(|deadline| ANALYZER_POLL_INTERVAL.min(deadline.saturating_sub(started.elapsed())))
             .unwrap_or(ANALYZER_POLL_INTERVAL);
+        if let SupervisionState::FinalizingStdout {
+            started,
+            last_progress,
+            ..
+        } = &state
+        {
+            sleep = sleep
+                .min(
+                    limits
+                        .pipe_finalization_idle
+                        .saturating_sub(last_progress.elapsed()),
+                )
+                .min(
+                    limits
+                        .pipe_finalization_absolute
+                        .saturating_sub(started.elapsed()),
+                );
+        }
         if !sleep.is_zero() {
             std::thread::sleep(sleep);
         }
     }
 
     let capture = capture.expect("completed analyzer capture is finalized");
-    let status = process
+    let success = process
         .status
         .as_ref()
+        .map(std::process::ExitStatus::success)
         .expect("completed analyzer process is reaped");
-    if let Err(error) = check_thumb_backend_status(producer, status.success(), status.code(), addr)
-    {
-        return Err(FailedRegion {
-            capture: Some(capture),
-            error,
-        });
-    }
+    debug_assert!(success, "failed analyzer status escaped supervision");
 
     Ok(capture)
 }
@@ -3193,9 +3552,11 @@ esac
                 &bin,
                 0x4000,
                 &stdout,
-                8,
-                (producer == crate::thumb_analysis::ThumbProducer::Rizin)
-                    .then_some(Duration::from_secs(1)),
+                RunnerLimits {
+                    stdout_cap: 8,
+                    rizin_timeout: Duration::from_secs(1),
+                    ..RunnerLimits::PRODUCTION
+                },
             )
             .unwrap_err();
 
@@ -3226,8 +3587,10 @@ esac
             &bin,
             0x4000,
             &stdout,
-            1024,
-            None,
+            RunnerLimits {
+                stdout_cap: 1024,
+                ..RunnerLimits::PRODUCTION
+            },
         )
         .unwrap_err();
 
@@ -3235,6 +3598,110 @@ esac
         let reason = failure.error.to_string();
         assert!(reason.contains("radare2 stdout capture failed"), "{reason}");
         assert!(!stdout.exists());
+    }
+
+    #[test]
+    fn expired_rizin_deadline_precedes_completed_observation() {
+        assert_eq!(
+            classify_running_observation(true, true, true),
+            RunningObservation::DeadlineExpired
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_rizin_deadline_rejects_immediately_valid_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("rizin");
+        let bin = dir.path().join("00004000.bin");
+        let stdout = dir.path().join("00004000.rizin.stdout");
+        write_executable_stub(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"offset\":16384,\"name\":\"rizin.too-late\",\"size\":2,\"realsz\":2,\"maxbound\":16386}]' '{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}' '[]'\n",
+        );
+        std::fs::write(&bin, [0x70, 0x47]).unwrap();
+
+        let failure = run_backend_capture(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Rizin, &executable),
+            &bin,
+            0x4000,
+            &stdout,
+            RunnerLimits {
+                rizin_timeout: Duration::ZERO,
+                ..RunnerLimits::PRODUCTION
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            failure.error.to_string().contains("timed out after 0 ms"),
+            "{}",
+            failure.error
+        );
+        if let Some(capture) = failure.capture {
+            let retained = std::fs::read(&stdout).unwrap();
+            assert_eq!(capture.bytes, retained.len() as u64);
+            assert_eq!(capture.blake3, blake3::hash(&retained).to_hex().as_str());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_finalization_cancels_reader_and_reaps_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumb_dir = dir.path().join("thumb");
+        std::fs::create_dir(&thumb_dir).unwrap();
+        let stdout_path = thumb_dir.join("00004000.rizin.stdout");
+        let command_interpreter = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut command = std::process::Command::new(command_interpreter);
+        command
+            .args([
+                "/D",
+                "/S",
+                "/C",
+                "echo partial capture&start \"\" /B ping.exe -n 6 127.0.0.1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        let started = std::time::Instant::now();
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let failure = supervise_spawned_analyzer(
+            child,
+            stdout,
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            0x4000,
+            &stdout_path,
+            started,
+            RunnerLimits {
+                rizin_timeout: Duration::from_secs(3),
+                pipe_finalization_idle: Duration::from_millis(200),
+                pipe_finalization_absolute: Duration::from_secs(1),
+                ..RunnerLimits::PRODUCTION
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Windows drain cancellation waited for the background writer: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("stdout remained open after analyzer exit"),
+            "{}",
+            failure.error
+        );
+        let capture = failure.capture.expect("forced drain was finalized");
+        let retained = std::fs::read(&stdout_path).unwrap();
+        assert!(retained.starts_with(b"partial capture"));
+        assert_eq!(capture.bytes, retained.len() as u64);
+        assert_eq!(capture.blake3, blake3::hash(&retained).to_hex().as_str());
     }
 
     #[cfg(unix)]
@@ -3307,6 +3774,112 @@ esac
     }
 
     #[cfg(unix)]
+    #[test]
+    fn process_failure_removes_stale_backend_fragments_and_retains_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("r2");
+        let thumb_dir = dir.path().join("thumb");
+        let bin = thumb_dir.join("00004000.bin");
+        let fragments = thumb_dir.join("00004000.radare2.frags");
+        std::fs::create_dir(&thumb_dir).unwrap();
+        std::fs::write(&bin, [0x70, 0x47]).unwrap();
+        std::fs::write(&fragments, b"stale fragments").unwrap();
+        write_executable_stub(
+            &executable,
+            "#!/bin/sh\nprintf 'failed capture\\n'\nexit 7\n",
+        );
+
+        let failure = match run_backend_region(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Radare2, &executable),
+            &bin,
+            &[0x70, 0x47],
+            0x4000,
+            0x4000,
+            &thumb_dir,
+            RunnerLimits::PRODUCTION,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("non-zero radare2 unexpectedly succeeded"),
+        };
+
+        assert!(!fragments.exists());
+        let capture = failure.capture.unwrap();
+        let stdout = dir.path().join(&capture.path);
+        let retained = std::fs::read(stdout).unwrap();
+        assert_eq!(retained, b"failed capture\n");
+        assert_eq!(capture.bytes, retained.len() as u64);
+        assert_eq!(capture.blake3, blake3::hash(&retained).to_hex().as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rizin_xref_failure_removes_stale_fragments_and_retains_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("rizin");
+        let thumb_dir = dir.path().join("thumb");
+        let bin = thumb_dir.join("00004000.bin");
+        let fragments = thumb_dir.join("00004000.rizin.frags");
+        std::fs::create_dir(&thumb_dir).unwrap();
+        std::fs::write(&bin, [0x70, 0x47]).unwrap();
+        std::fs::write(&fragments, b"stale fragments").unwrap();
+        write_executable_stub(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"offset\":16384,\"name\":\"rizin.invalid-xref\",\"size\":2,\"realsz\":2,\"maxbound\":16386}]' '{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}' '[{\"from\":\"invalid\",\"to\":20480,\"type\":\"DATA\"}]'\n",
+        );
+
+        let failure = match run_backend_region(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Rizin, &executable),
+            &bin,
+            &[0x70, 0x47],
+            0x4000,
+            0x4000,
+            &thumb_dir,
+            RunnerLimits::PRODUCTION,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("invalid Rizin xref unexpectedly succeeded"),
+        };
+
+        assert!(failure.error.to_string().contains("canonical u32 source"));
+        assert!(!fragments.exists());
+        let capture = failure.capture.unwrap();
+        let stdout = dir.path().join(&capture.path);
+        let retained = std::fs::read(stdout).unwrap();
+        assert!(!retained.is_empty());
+        assert_eq!(capture.bytes, retained.len() as u64);
+        assert_eq!(capture.blake3, blake3::hash(&retained).to_hex().as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assembly_failure_removes_successful_fragments_but_retains_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("r2");
+        let artifact_path = dir.path().join("thumb_functions.json");
+        std::fs::create_dir(&artifact_path).unwrap();
+        write_executable_stub(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"addr\":16384,\"name\":\"r2.assembly-failure\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}]' '{\"addr\":16384,\"ops\":[{\"addr\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}'\n",
+        );
+
+        let error = run_thumb_analysis(
+            &thumb_tools(&executable),
+            &[0x70, 0x47],
+            0x4000,
+            &[(0x4000, 2)],
+            dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert!(!dir.path().join("thumb/00004000.radare2.frags").exists());
+        let retained =
+            std::fs::read_to_string(dir.path().join("thumb/00004000.radare2.stdout")).unwrap();
+        assert!(retained.contains("r2.assembly-failure"));
+        assert!(artifact_path.is_dir());
+    }
+
+    #[cfg(unix)]
     fn assert_process_or_group_gone(id: libc::pid_t) {
         for _ in 0..100 {
             // SAFETY: signal 0 performs existence/permission checking only.
@@ -3320,6 +3893,274 @@ esac
     }
 
     #[cfg(unix)]
+    fn wait_for_file(path: &Path, timeout: Duration) {
+        let started = std::time::Instant::now();
+        while !path.exists() {
+            assert!(
+                started.elapsed() < timeout,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_radare2_with_inherited_stdout_falls_back_and_reaps_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let parent_pid_path = dir.path().join("radare2-parent.pid");
+        let child_pid_path = dir.path().join("radare2-child.pid");
+        let ready_path = dir.path().join("radare2.ready");
+        write_executable_stub(
+            &radare2,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$$\" > '{}'\n\
+                 printf '%s\\n' '[{{\"addr\":16384,\"name\":\"r2.must-not-survive\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"addr\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}'\n\
+                 sleep 60 &\n\
+                 child=$!\n\
+                 printf '%s\\n' \"$child\" > '{}'\n\
+                 : > '{}'\n\
+                 exit 0\n",
+                parent_pid_path.display(),
+                child_pid_path.display(),
+                ready_path.display(),
+            ),
+        );
+        write_executable_stub(
+            &rizin,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"offset\":16384,\"name\":\"rizin.fallback\",\"size\":2,\"realsz\":2,\"maxbound\":16386}]' '{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}' '[]'\n",
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        let started = std::time::Instant::now();
+
+        let summary = run_thumb_analysis_with_limits(
+            &tools,
+            &[0x70, 0x47],
+            0x4000,
+            &[(0x4000, 2)],
+            dir.path(),
+            RunnerLimits {
+                pipe_finalization_idle: Duration::from_millis(100),
+                pipe_finalization_absolute: Duration::from_secs(1),
+                ..RunnerLimits::PRODUCTION
+            },
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "inherited stdout cleanup was not prompt: {:?}",
+            started.elapsed()
+        );
+        assert!(ready_path.exists());
+        assert_eq!(summary.radare2_runs, 0);
+        assert_eq!(summary.rizin_runs, 1);
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        let radare2_attempt = &document["regions"][0]["attempts"][0];
+        assert_eq!(radare2_attempt["status"], "failed");
+        assert!(
+            radare2_attempt["error"]
+                .as_str()
+                .unwrap()
+                .contains("stdout remained open after analyzer exit")
+        );
+        let capture = &radare2_attempt["stdout"];
+        let retained = std::fs::read(dir.path().join(capture["path"].as_str().unwrap())).unwrap();
+        assert_eq!(capture["bytes"], retained.len() as u64);
+        assert_eq!(capture["blake3"], blake3::hash(&retained).to_hex().as_str());
+        assert_eq!(document["functions"][0]["name"], "rizin.fallback");
+        assert!(
+            document["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|function| function["name"] != "r2.must-not-survive")
+        );
+
+        let parent_pid: libc::pid_t = std::fs::read_to_string(parent_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let child_pid: libc::pid_t = std::fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut status = 0;
+        // SAFETY: this only queries whether the analyzer child remains waitable.
+        let wait_result = unsafe { libc::waitpid(parent_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(wait_result, -1, "immediate analyzer child was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_process_or_group_gone(child_pid);
+        assert_process_or_group_gone(-parent_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn continuing_post_exit_output_cannot_extend_absolute_finalization_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("r2");
+        let bin = dir.path().join("00004000.bin");
+        let stdout = dir.path().join("00004000.radare2.stdout");
+        let parent_pid_path = dir.path().join("radare2-parent.pid");
+        let child_pid_path = dir.path().join("radare2-child.pid");
+        write_executable_stub(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$$\" > '{}'\n\
+                 (while :; do printf x; sleep 0.01; done) &\n\
+                 child=$!\n\
+                 printf '%s\\n' \"$child\" > '{}'\n\
+                 exit 0\n",
+                parent_pid_path.display(),
+                child_pid_path.display(),
+            ),
+        );
+        std::fs::write(&bin, [0x70, 0x47]).unwrap();
+        let started = std::time::Instant::now();
+
+        let failure = run_backend_capture(
+            &test_identity(crate::thumb_analysis::ThumbProducer::Radare2, &executable),
+            &bin,
+            0x4000,
+            &stdout,
+            RunnerLimits {
+                stdout_cap: 1024 * 1024,
+                pipe_finalization_idle: Duration::from_millis(100),
+                pipe_finalization_absolute: Duration::from_millis(300),
+                ..RunnerLimits::PRODUCTION
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "absolute pipe-finalization bound was extended: {:?}",
+            started.elapsed()
+        );
+        let reason = failure.error.to_string();
+        assert!(reason.contains("absolute limit"), "{reason}");
+        let capture = failure.capture.expect("forced drain was finalized");
+        let retained = std::fs::read(&stdout).unwrap();
+        assert!(!retained.is_empty());
+        assert!(retained.len() < 1024 * 1024);
+        assert_eq!(capture.bytes, retained.len() as u64);
+        assert_eq!(capture.blake3, blake3::hash(&retained).to_hex().as_str());
+        let parent_pid: libc::pid_t = std::fs::read_to_string(parent_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let child_pid: libc::pid_t = std::fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_or_group_gone(child_pid);
+        assert_process_or_group_gone(-parent_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_radare2_exit_cleans_redirected_descendant_before_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let radare2 = dir.path().join("r2");
+        let rizin = dir.path().join("rizin");
+        let parent_pid_path = dir.path().join("radare2-parent.pid");
+        let child_pid_path = dir.path().join("radare2-child.pid");
+        let descendant_survived = dir.path().join("descendant-survived");
+        write_executable_stub(
+            &radare2,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$$\" > '{}'\n\
+                 sleep 60 >/dev/null 2>&1 &\n\
+                 child=$!\n\
+                 printf '%s\\n' \"$child\" > '{}'\n\
+                 exit 9\n",
+                parent_pid_path.display(),
+                child_pid_path.display(),
+            ),
+        );
+        write_executable_stub(
+            &rizin,
+            &format!(
+                "#!/bin/sh\n\
+                 child=$(cat '{}')\n\
+                 attempts=0\n\
+                 while kill -0 \"$child\" 2>/dev/null && [ \"$attempts\" -lt 100 ]; do\n\
+                   attempts=$((attempts + 1))\n\
+                   sleep 0.01\n\
+                 done\n\
+                 if kill -0 \"$child\" 2>/dev/null; then\n\
+                   : > '{}'\n\
+                   exit 90\n\
+                 fi\n\
+                 printf '%s\\n' '[{{\"offset\":16384,\"name\":\"rizin.after-cleanup\",\"size\":2,\"realsz\":2,\"maxbound\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}' '[]'\n",
+                child_pid_path.display(),
+                descendant_survived.display(),
+            ),
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        let started = std::time::Instant::now();
+
+        let result = run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], dir.path());
+
+        let parent_pid: libc::pid_t = std::fs::read_to_string(parent_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let child_pid: libc::pid_t = std::fs::read_to_string(child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if result.is_err() {
+            // Keep the RED run from leaking the deliberately long-lived child.
+            let _ = signal_process_group(parent_pid as u32, libc::SIGKILL);
+            assert_process_or_group_gone(child_pid);
+        }
+        let summary = result.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "failed-exit cleanup was not prompt: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(summary.radare2_runs, 0);
+        assert_eq!(summary.rizin_runs, 1);
+        assert!(!descendant_survived.exists());
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["functions"][0]["name"], "rizin.after-cleanup");
+        assert_process_or_group_gone(child_pid);
+        assert_process_or_group_gone(-parent_pid);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn rizin_timeout_reaps_process_group_and_retains_finalized_partial_capture() {
         let dir = tempfile::tempdir().unwrap();
@@ -3327,6 +4168,7 @@ esac
         let rizin = dir.path().join("rizin");
         let parent_pid_path = dir.path().join("rizin-parent.pid");
         let child_pid_path = dir.path().join("rizin-child.pid");
+        let ready_path = dir.path().join("rizin.ready");
         write_executable_stub(
             &radare2,
             r#"#!/bin/sh
@@ -3346,13 +4188,15 @@ esac
             &format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$$\" > '{}'\n\
-                 sleep 1 &\n\
+                 sleep 60 &\n\
                  child=$!\n\
                  printf '%s\\n' \"$child\" > '{}'\n\
                  printf 'partial rizin capture\\n'\n\
+                 : > '{}'\n\
                  wait \"$child\"\n",
                 parent_pid_path.display(),
                 child_pid_path.display(),
+                ready_path.display(),
             ),
         );
         let mut tools = thumb_tools(&radare2);
@@ -3362,18 +4206,31 @@ esac
         ));
         let mut image = vec![0u8; 0x80];
         image[..2].copy_from_slice(&[0x70, 0x47]);
-        let summary = run_thumb_analysis_with_limits(
-            &tools,
-            &image,
-            0x4000,
-            &[(0x4000, 0x40), (0x4040, 0x40)],
-            dir.path(),
-            RunnerLimits {
-                stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
-                rizin_timeout: Duration::from_millis(50),
-            },
-        )
-        .unwrap();
+        let started = std::time::Instant::now();
+        let summary = std::thread::scope(|scope| {
+            let analysis = scope.spawn(|| {
+                run_thumb_analysis_with_limits(
+                    &tools,
+                    &image,
+                    0x4000,
+                    &[(0x4000, 0x40), (0x4040, 0x40)],
+                    dir.path(),
+                    RunnerLimits {
+                        stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
+                        rizin_timeout: Duration::from_secs(1),
+                        ..RunnerLimits::PRODUCTION
+                    },
+                )
+            });
+            wait_for_file(&ready_path, Duration::from_secs(5));
+            analysis.join().unwrap().unwrap()
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout cleanup followed the 60-second natural exit: {:?}",
+            started.elapsed()
+        );
 
         assert_eq!(summary.regions_succeeded, 1);
         assert_eq!(summary.regions_failed, 1);
@@ -3387,7 +4244,7 @@ esac
         assert_eq!(timed_out["producer"], "rizin");
         assert_eq!(timed_out["status"], "failed");
         let reason = timed_out["error"].as_str().unwrap();
-        assert!(reason.contains("rizin") && reason.contains("timed out after 50 ms"));
+        assert!(reason.contains("rizin") && reason.contains("timed out after 1000 ms"));
         assert!(
             document["regions"][1]["function_runs"]
                 .as_array()
@@ -3456,6 +4313,7 @@ esac
             RunnerLimits {
                 stdout_cap: ANALYZER_STDOUT_CAP_BYTES,
                 rizin_timeout: Duration::from_millis(50),
+                ..RunnerLimits::PRODUCTION
             },
         )
         .unwrap();
@@ -4254,6 +5112,7 @@ esac
         assert_eq!(printed.trim(), expected_kib);
     }
 
+    #[cfg(unix)]
     #[test]
     fn one_failed_thumb_region_does_not_drop_the_others() {
         // A region whose r2 run fails (spawn/kill/address-space-cap/malformed
@@ -4606,6 +5465,7 @@ INFO: second pdfj body was noisy and not parseable
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn radare2_thumb_maps_raw_blob_at_region_address() {
         let dir = std::env::temp_dir().join(format!("pme_r2_map_addr_{}", std::process::id()));
@@ -4758,6 +5618,7 @@ INFO: second pdfj body was noisy and not parseable
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_thumb_analysis_emits_v3_format_and_producer_identity() {
         let dir = std::env::temp_dir().join(format!("pme_r2_v3_fmt_{}", std::process::id()));
@@ -4792,6 +5653,7 @@ INFO: second pdfj body was noisy and not parseable
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_thumb_analysis_preserves_region_function_order_and_cleans_spills() {
         let dir = tempfile::tempdir().unwrap();

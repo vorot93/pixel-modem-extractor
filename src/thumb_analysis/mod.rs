@@ -548,7 +548,7 @@ fn probe_identity(
     probe_identity_inner(path, producer, command, timeout, ReaderTracker::default())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn probe_identity_with_reader_tracking(
     path: &Path,
     producer: ThumbProducer,
