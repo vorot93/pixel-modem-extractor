@@ -550,7 +550,25 @@ fn convert_regions(wires: Vec<RegionWire>) -> Result<Vec<RegionRecord>> {
         .collect()
 }
 
-fn validate_function_value(function: &Value, index: usize) -> Result<(bool, bool, bool)> {
+#[derive(Clone, Copy)]
+struct MappedImage {
+    start: u32,
+    end: u32,
+    len: u32,
+}
+
+fn mapped_image(start: u32, len: u32) -> Result<MappedImage> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| invalid_artifact("mapped image range overflows u32"))?;
+    Ok(MappedImage { start, end, len })
+}
+
+fn validate_function_value(
+    function: &Value,
+    index: usize,
+    image: Option<MappedImage>,
+) -> Result<(bool, bool, bool)> {
     let wire: FunctionWire = serde_json::from_value(function.clone())
         .map_err(|error| invalid_artifact(format!("invalid v3 function {index}: {error}")))?;
     let entry = canonical_hex_u32(&wire.entry, &format!("function {index} entry"))?;
@@ -564,6 +582,23 @@ fn validate_function_value(function: &Value, index: usize) -> Result<(bool, bool
         return Err(invalid_artifact(format!(
             "function {index} size must be positive"
         )));
+    }
+    if let Some(image) = image {
+        if entry < image.start || entry >= image.end {
+            return Err(invalid_artifact(format!(
+                "function {index} entry is outside mapped image"
+            )));
+        }
+        if end > image.end {
+            return Err(invalid_artifact(format!(
+                "function {index} end is outside mapped image"
+            )));
+        }
+        if wire.size > u64::from(image.len) {
+            return Err(invalid_artifact(format!(
+                "function {index} size exceeds mapped image length"
+            )));
+        }
     }
     if wire.body_kind != "thumb_disassembly" {
         return Err(invalid_artifact(format!(
@@ -621,6 +656,16 @@ fn validate_function_value(function: &Value, index: usize) -> Result<(bool, bool
                 )));
             }
             for (range_index, range) in ranges.iter().enumerate() {
+                if range.end > end {
+                    return Err(invalid_artifact(format!(
+                        "function {index} decode range {range_index} exceeds function end"
+                    )));
+                }
+                if image.is_some_and(|image| range.start < image.start || range.end > image.end) {
+                    return Err(invalid_artifact(format!(
+                        "function {index} decode range {range_index} is outside mapped image"
+                    )));
+                }
                 let length = range.end.checked_sub(range.start);
                 if !range.start.is_multiple_of(2)
                     || length.is_none_or(|length| length == 0 || !length.is_multiple_of(2))
@@ -848,7 +893,7 @@ fn validate_v3(
         let mut quarantined = 0usize;
         for (offset, function) in slice.iter().enumerate() {
             let (is_substantial, is_accepted, is_quarantined) =
-                validate_function_value(function, run.first_function + offset)?;
+                validate_function_value(function, run.first_function + offset, None)?;
             substantial += usize::from(is_substantial);
             accepted += usize::from(is_accepted);
             quarantined += usize::from(is_quarantined);
@@ -1002,14 +1047,17 @@ impl ThumbScan {
             self.shape_invalid("unsupported Thumb functions inventory format");
             return;
         };
-        let Some(image_end) = self.image_start.checked_add(self.image_len) else {
-            self.artifact_invalid(invalid_artifact("mapped image range overflows u32"));
-            return;
+        let image = match mapped_image(self.image_start, self.image_len) {
+            Ok(image) => image,
+            Err(error) => {
+                self.artifact_invalid(error);
+                return;
+            }
         };
         if let Some((index, _)) = regions
             .iter()
             .enumerate()
-            .find(|(_, region)| region.start < self.image_start || region.end > image_end)
+            .find(|(_, region)| region.start < image.start || region.end > image.end)
         {
             self.artifact_invalid(invalid_artifact(format!(
                 "region {index} is outside mapped image"
@@ -1032,7 +1080,14 @@ impl ThumbScan {
             return;
         }
         if self.format == Some(ThumbFormat::V3) {
-            match validate_function_value(&record, function_index) {
+            let image = match mapped_image(self.image_start, self.image_len) {
+                Ok(image) => image,
+                Err(error) => {
+                    self.artifact_invalid(error);
+                    return;
+                }
+            };
+            match validate_function_value(&record, function_index, Some(image)) {
                 Ok((substantial, accepted, quarantined)) => {
                     let run_index = self.v3_layout.as_ref().and_then(|layout| {
                         layout.runs.iter().position(|run| {
@@ -1582,6 +1637,19 @@ fn write_v3_values_into<W: Write>(
     Ok(())
 }
 
+fn parse_v3_fragment(bytes: &[u8], run_index: usize, slot_index: usize) -> Result<Value> {
+    let function: FunctionWire = serde_json::from_slice(bytes).map_err(|error| {
+        invalid_artifact(format!(
+            "v3 assembly run {run_index} function {slot_index} is invalid: {error}"
+        ))
+    })?;
+    serde_json::to_value(function).map_err(|error| {
+        invalid_artifact(format!(
+            "v3 assembly run {run_index} function {slot_index} cannot be rendered: {error}"
+        ))
+    })
+}
+
 fn validate_v3_assembly_layout(
     producers: &[ProducerIdentity],
     regions: &[RegionRecord],
@@ -1608,13 +1676,9 @@ fn validate_v3_assembly_layout(
         let mut observed = RunCounts::default();
         for (slot_index, slot) in spill.slots.iter().enumerate() {
             let bytes = spill.read_slot(slot)?;
-            let function: Value = serde_json::from_slice(&bytes).map_err(|error| {
-                invalid_artifact(format!(
-                    "v3 assembly run {run_index} function {slot_index} is invalid JSON: {error}"
-                ))
-            })?;
+            let function = parse_v3_fragment(&bytes, run_index, slot_index)?;
             let (substantial, accepted, quarantined) =
-                validate_function_value(&function, run.first_function + slot_index)?;
+                validate_function_value(&function, run.first_function + slot_index, None)?;
             observed.substantial += usize::from(substantial);
             observed.accepted += usize::from(accepted);
             observed.quarantined += usize::from(quarantined);
@@ -1651,13 +1715,15 @@ pub(crate) fn assemble_v3_into<W: Write>(
     write_pretty_value(writer, &regions, "  ")?;
     writer.write_all(b",\n  \"functions\": [\n")?;
     let mut first = true;
-    for spill in spills {
-        for slot in &spill.slots {
+    for (run_index, spill) in spills.iter().enumerate() {
+        for (slot_index, slot) in spill.slots.iter().enumerate() {
             if !first {
                 writer.write_all(b",\n")?;
             }
             first = false;
-            spill.emit_slot(writer, slot)?;
+            let bytes = spill.read_slot(slot)?;
+            let function = parse_v3_fragment(&bytes, run_index, slot_index)?;
+            writer.write_all(render_fragment(&function)?.as_bytes())?;
         }
     }
     writer.write_all(b"\n  ]\n}")?;
@@ -2061,6 +2127,18 @@ mod tests {
     }
 
     #[test]
+    fn v3_parser_rejects_decode_range_above_function_end() {
+        let mut document = valid_v3();
+        document["functions"][0]["decode_ranges"][0]["end"] = json!("0x1004");
+
+        let error = parse_thumb_artifact(&canonical_v3(&document)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "serialize: invalid Thumb artifact: function 0 decode range 0 exceeds function end"
+        );
+    }
+
+    #[test]
     fn v3_parser_rejects_null_optional_function_fields() {
         for field in ["original_name", "annotations", "body_c"] {
             let mut document = valid_v3();
@@ -2428,6 +2506,91 @@ mod tests {
     }
 
     #[test]
+    fn v3_assembly_rejects_duplicate_function_keys_before_output() {
+        let mut document = valid_v3();
+        document["producers"].as_array_mut().unwrap().truncate(1);
+        document["regions"].as_array_mut().unwrap().truncate(1);
+        document["functions"].as_array_mut().unwrap().truncate(1);
+        let artifact = parse_thumb_artifact(&canonical_v3(&document)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SpillWriter::create(dir.path().join("duplicate.frags")).unwrap();
+        writer
+            .push(
+                0,
+                r#"{"name":"wrong","name":"fcn.1000","entry":"0x1000","end":"0x1002","size":2,"body_kind":"thumb_disassembly","body":"bx lr\n","data_refs":[],"decode_ranges":[{"end":"0x1002","isa":"thumb","start":"0x1000"}],"decode_range_errors":[]}"#,
+            )
+            .unwrap();
+        let spill = writer.finish().unwrap();
+        let mut output = Vec::new();
+
+        let error = assemble_v3_into(
+            &mut output,
+            &artifact.document.producers,
+            &artifact.document.regions,
+            &[&spill],
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("duplicate field `name`"),
+            "{error}"
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn v3_assembly_canonically_renders_valid_function_fragments() {
+        let mut document = valid_v3();
+        document["producers"].as_array_mut().unwrap().truncate(1);
+        document["regions"].as_array_mut().unwrap().truncate(1);
+        document["functions"].as_array_mut().unwrap().truncate(1);
+        let artifact = parse_thumb_artifact(&canonical_v3(&document)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SpillWriter::create(dir.path().join("noncanonical.frags")).unwrap();
+        writer
+            .push(
+                0,
+                r#"{"size":2,"name":"fcn.1000","entry":"0x1000","end":"0x1002","decode_ranges":[{"start":"0x1000","isa":"thumb","end":"0x1002"}],"decode_range_errors":[],"data_refs":[],"body_kind":"thumb_disassembly","body":"bx lr\n"}"#,
+            )
+            .unwrap();
+        let spill = writer.finish().unwrap();
+        let mut output = Vec::new();
+
+        assemble_v3_into(
+            &mut output,
+            &artifact.document.producers,
+            &artifact.document.regions,
+            &[&spill],
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let (_, function_suffix) = output.split_once("  \"functions\": [\n").unwrap();
+        assert_eq!(
+            function_suffix,
+            r#"    {
+      "body": "bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [
+        {
+          "end": "0x1002",
+          "isa": "thumb",
+          "start": "0x1000"
+        }
+      ],
+      "end": "0x1002",
+      "entry": "0x1000",
+      "name": "fcn.1000",
+      "size": 2
+    }
+  ]
+}"#
+        );
+    }
+
+    #[test]
     fn v3_atomic_assembly_commits_before_removing_spills() {
         let artifact = parse_thumb_artifact(&canonical_v3(&valid_v3())).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -2679,6 +2842,109 @@ mod tests {
                 .contains("region 1 is outside mapped image"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn v3_streaming_validation_rejects_function_boundary_violations() {
+        let cases = [
+            (
+                "accepted entry outside image",
+                "function 0 entry is outside mapped image",
+            ),
+            (
+                "end outside image",
+                "function 0 end is outside mapped image",
+            ),
+            (
+                "size exceeds image length",
+                "function 0 size exceeds mapped image length",
+            ),
+            (
+                "accepted range exceeds function end",
+                "function 0 decode range 0 exceeds function end",
+            ),
+            (
+                "quarantined entry outside image",
+                "function 0 entry is outside mapped image",
+            ),
+        ];
+        let mut mismatches = Vec::new();
+
+        for (case, expected) in cases {
+            let mut document = valid_v3();
+            let expected_substantial = match case {
+                "accepted entry outside image" => {
+                    document["functions"][0]["entry"] = json!("0x3000");
+                    document["functions"][0]["end"] = json!("0x3002");
+                    document["functions"][0]["decode_ranges"] =
+                        json!([{"end":"0x3002","isa":"thumb","start":"0x3000"}]);
+                    1
+                }
+                "end outside image" => {
+                    document["functions"][0]["end"] = json!("0x3002");
+                    1
+                }
+                "size exceeds image length" => {
+                    document["functions"][0]["size"] = json!(0x2001u64);
+                    document["regions"][0]["function_runs"][0]["substantial"] = json!(1);
+                    2
+                }
+                "accepted range exceeds function end" => {
+                    document["functions"][0]["decode_ranges"][0]["end"] = json!("0x1004");
+                    1
+                }
+                "quarantined entry outside image" => {
+                    document["functions"][0]["entry"] = json!("0x3000");
+                    document["functions"][0]["end"] = json!("0x3002");
+                    document["functions"][0]["decode_ranges"] = json!([]);
+                    document["functions"][0]["decode_range_errors"] = json!([{
+                        "kind":"missing_operation_body",
+                        "address":"0x3000",
+                        "end":null
+                    }]);
+                    document["regions"][0]["function_runs"][0]["accepted"] = json!(0);
+                    document["regions"][0]["function_runs"][0]["quarantined"] = json!(1);
+                    1
+                }
+                _ => unreachable!(),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("thumb_functions.json");
+            std::fs::write(&path, canonical_v3(&document)).unwrap();
+            let actual = match validate_thumb_inventory_streaming(
+                &path,
+                0x1000,
+                0x2000,
+                expected_substantial,
+            ) {
+                Ok(_) => "accepted".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            let expected = format!("serialize: invalid Thumb artifact: {expected}");
+            if actual != expected {
+                mismatches.push(format!("{case}: expected {expected:?}, found {actual:?}"));
+            }
+        }
+
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[test]
+    fn v3_streaming_validation_accepts_mapped_ranges_below_entry() {
+        let mut document = valid_v3();
+        document["functions"][0]["entry"] = json!("0x1100");
+        document["functions"][0]["end"] = json!("0x1102");
+        document["functions"][0]["decode_ranges"] = json!([
+            {"end":"0x1002","isa":"thumb","start":"0x1000"},
+            {"end":"0x1102","isa":"thumb","start":"0x1100"}
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb_functions.json");
+        std::fs::write(&path, canonical_v3(&document)).unwrap();
+
+        let (inventory, substantial) =
+            validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        assert_eq!((inventory.accepted, substantial), (2, 1));
     }
 
     #[test]
