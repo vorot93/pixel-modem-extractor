@@ -1,3 +1,6 @@
+// The shared contract is consumed incrementally as sibling pipeline stages migrate.
+#[allow(dead_code)]
+mod artifact;
 mod radare2;
 mod rizin;
 mod stream;
@@ -13,10 +16,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[allow(unused_imports)]
+pub(crate) use artifact::{
+    AttemptRecord, AttemptStatus, CaptureRecord, FunctionRunRecord, OwnedFunctionRef,
+    ParsedThumbArtifact, RegionRecord, THUMB_V1_FORMAT, THUMB_V2_FORMAT, THUMB_V3_FORMAT,
+    ThumbFormat, assemble_v3_atomic, assemble_v3_into, parse_thumb_artifact, read_thumb_artifact,
+    validate_thumb_inventory_streaming,
+};
 pub use radare2::discover_radare2;
 pub use rizin::discover_rizin;
 pub use stream::run_radare2_thumb;
-pub(crate) use stream::validate_thumb_inventory_streaming;
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERSION_LINE_MAX_BYTES: usize = 1_024;
