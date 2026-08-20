@@ -595,10 +595,10 @@ where
 
 /// Process one captured `.stdout` with bounded memory: stream the inventory
 /// into `FnRec`s (A), entry-match arriving pdfjs normalizing and spilling
-/// immediately (B1), positional-fallback re-stream (B2), normalize the
-/// never-paired remainder with `pdfj = None` (C), then the verdicts in the
-/// legacy precedence order — no-JSON, unassignable, orphan, u32-domain.
-/// Any `Err` removes the partial spill.
+/// immediately (B1), positional-fallback re-stream (B2), and normalize the
+/// never-paired remainder with `pdfj = None` (C). Validation around these
+/// passes preserves no-JSON, unassignable, orphan, zero-pair producer failure,
+/// then u32-domain precedence. Any `Err` removes the partial spill.
 fn process_region_streaming(
     stdout_path: &Path,
     image: &[u8],
@@ -732,12 +732,19 @@ fn process_region_inner(
     })
     .map_err(region_iter_err)?;
 
-    // Verdicts in legacy precedence: orphan before u32-domain.
+    // Verdicts preserve orphan precedence; producer integrity precedes the
+    // deferred u32-domain check so the streaming and in-memory paths agree.
     let orphan = pdfj_used.iter().filter(|used| !**used).count();
     if orphan > 0 {
         return Err(Error::Serialize(format!(
             "radare2 produced {orphan} orphan pdfj {} for Thumb region 0x{addr:x}",
             if orphan == 1 { "body" } else { "bodies" }
+        )));
+    }
+    let paired_count = paired.iter().filter(|paired| **paired).count();
+    if !fns.is_empty() && paired_count == 0 {
+        return Err(Error::Serialize(format!(
+            "radare2 produced a non-empty aflj inventory but zero paired pdfj bodies for Thumb region 0x{addr:x}"
         )));
     }
     if overflow.contains(&true) {
@@ -996,6 +1003,16 @@ fn parse_checked_radare2_thumb_output(stdout: &[u8], addr: u32) -> Result<Radare
             } else {
                 "bodies"
             },
+        )));
+    }
+    let paired_count = parsed
+        .records
+        .iter()
+        .filter(|(_, pdfj)| pdfj.is_some())
+        .count();
+    if !parsed.records.is_empty() && paired_count == 0 {
+        return Err(Error::Serialize(format!(
+            "radare2 produced a non-empty aflj inventory but zero paired pdfj bodies for Thumb region 0x{addr:x}"
         )));
     }
     Ok(parsed)
@@ -1305,6 +1322,50 @@ fn limit_r2_address_space(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 fn limit_r2_address_space(_cmd: &mut std::process::Command) {}
 
+fn validate_thumb_region_requests(
+    image: &[u8],
+    load_addr: u32,
+    regions: &[(u32, u32)],
+) -> Result<Vec<(u32, u32)>> {
+    let image_end = u64::from(load_addr)
+        .checked_add(image.len() as u64)
+        .ok_or_else(|| Error::Serialize("Thumb image address range overflows u64".into()))?;
+    let mut validated = Vec::<(u32, u32)>::with_capacity(regions.len());
+
+    for &(start, len) in regions {
+        if len == 0 {
+            return Err(Error::Serialize(format!(
+                "Thumb region 0x{start:x} has zero length"
+            )));
+        }
+        let end = start.checked_add(len).ok_or_else(|| {
+            Error::Serialize(format!(
+                "Thumb region 0x{start:x} length 0x{len:x} overflows the u32 address space"
+            ))
+        })?;
+        if start < load_addr || u64::from(end) > image_end {
+            return Err(Error::Serialize(format!(
+                "Thumb region 0x{start:x}..0x{end:x} is outside image 0x{load_addr:x}..0x{image_end:x}"
+            )));
+        }
+        if let Some(&(previous_start, previous_end)) = validated.last() {
+            if start < previous_start {
+                return Err(Error::Serialize(format!(
+                    "Thumb region requests are not sorted: 0x{start:x} follows 0x{previous_start:x}"
+                )));
+            }
+            if start < previous_end {
+                return Err(Error::Serialize(format!(
+                    "Thumb region requests overlap: 0x{start:x} starts before 0x{previous_end:x}"
+                )));
+            }
+        }
+        validated.push((start, end));
+    }
+
+    Ok(validated)
+}
+
 /// Analyze an image's dense Thumb-2 regions with radare2, streaming. Each
 /// region is carved out, analyzed as ARM/Thumb (`-a arm -b 16`) based at
 /// its load address, and its normalized functions spill to
@@ -1312,10 +1373,13 @@ fn limit_r2_address_space(_cmd: &mut std::process::Command) {}
 /// atomically (complete-old-or-complete-new) from the spills in region
 /// order / fn order — byte-identical to the former whole-`Value` rendering,
 /// with peak memory O(largest single JSON value + one fragment) instead of
-/// O(all functions). The carved blobs and `.stdout` captures are kept under
+/// O(all functions). Region requests must be positive, image-contained,
+/// sorted, and non-overlapping; they are validated before any output is
+/// created. The carved blobs and `.stdout` captures are kept under
 /// `out_dir/thumb/` for follow-up. Returns the count of substantial
-/// (>= 32-byte) functions recovered. Per-region failures are tolerated:
-/// one runaway region does not zero the others.
+/// (>= 32-byte) functions recovered. Per-region failures are tolerated when
+/// at least one region succeeds; if every requested region fails, no sidecar
+/// is committed and the ordered region failures are returned.
 pub fn run_radare2_thumb(
     r2: &Path,
     image: &[u8],
@@ -1323,6 +1387,7 @@ pub fn run_radare2_thumb(
     regions: &[(u32, u32)],
     out_dir: &Path,
 ) -> Result<usize> {
+    let regions = validate_thumb_region_requests(image, load_addr, regions)?;
     let thumb_dir = out_dir.join("thumb");
     std::fs::create_dir_all(&thumb_dir)?;
     let mut spills: Vec<Spill> = Vec::new();
@@ -1330,7 +1395,8 @@ pub fn run_radare2_thumb(
     let mut substantial = 0usize;
     let mut accepted = 0usize;
     let mut total = 0usize;
-    for &(addr, len) in regions {
+    for &(addr, end) in &regions {
+        let len = end - addr;
         match run_radare2_thumb_region(r2, image, load_addr, addr, len, &thumb_dir) {
             Ok(Some(outcome)) => {
                 substantial += outcome.stats.substantial;
@@ -1357,6 +1423,16 @@ pub fn run_radare2_thumb(
         total - accepted,
         skipped.len()
     );
+    if !regions.is_empty() && spills.is_empty() {
+        let reasons = skipped
+            .iter()
+            .map(|region| format!("0x{:x}: {}", region.addr, region.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Error::Serialize(format!(
+            "radare2 failed for every requested Thumb region: {reasons}"
+        )));
+    }
     assemble_thumb_functions_json(&out_dir.join("thumb_functions.json"), &spills)?;
     Ok(substantial)
 }
@@ -2085,6 +2161,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn all_failed_thumb_regions_return_error_without_replacing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let r2 = dir.path().join("r2");
+        std::fs::write(&r2, "#!/bin/sh\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&r2).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&r2, permissions).unwrap();
+        let sidecar = dir.path().join("thumb_functions.json");
+        std::fs::write(&sidecar, b"old").unwrap();
+
+        let err = run_radare2_thumb(
+            &r2,
+            &[0u8; 0x100],
+            0x4000,
+            &[(0x4000, 0x20), (0x4040, 0x20)],
+            dir.path(),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("failed for every requested Thumb region"));
+        let first = message.find("0x4000:").unwrap();
+        let second = message.find("0x4040:").unwrap();
+        assert!(first < second, "region failures must retain request order");
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modern_addr_inventory_pdfj_and_operations_reach_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let r2 = dir.path().join("r2");
+        std::fs::write(
+            &r2,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"name\":\"sym.thumb_func\",\"addr\":16672,\"size\":2}]' '{\"addr\":16672,\"ops\":[{\"addr\":16672,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}]}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&r2).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&r2, permissions).unwrap();
+        let mut image = vec![0u8; 0x200];
+        image[0x120..0x122].copy_from_slice(&[0x70, 0x47]);
+        assert_eq!(
+            run_radare2_thumb(&r2, &image, 0x4000, &[(0x4120, 2)], dir.path()).unwrap(),
+            0
+        );
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thumb_functions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact["functions"][0]["entry"], "0x4120");
+        assert_eq!(
+            artifact["functions"][0]["decode_ranges"][0]["start"],
+            "0x4120"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_region_requests_fail_before_spawning() {
+        let cases = [
+            ("zero-length", vec![(0x4000, 0)], "zero length"),
+            ("checked-add-overflow", vec![(u32::MAX - 1, 4)], "overflows"),
+            ("out-of-image", vec![(0x40f0, 0x20)], "outside image"),
+            (
+                "unsorted",
+                vec![(0x4040, 0x20), (0x4000, 0x20)],
+                "not sorted",
+            ),
+            (
+                "overlapping",
+                vec![(0x4000, 0x40), (0x4020, 0x40)],
+                "overlap",
+            ),
+        ];
+
+        for (name, regions, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let r2 = dir.path().join("r2");
+            let sentinel = dir.path().join("spawned");
+            std::fs::write(
+                &r2,
+                format!("#!/bin/sh\n: > '{}'\nexit 0\n", sentinel.display()),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&r2).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&r2, permissions).unwrap();
+            let out = dir.path().join("out");
+
+            let err = run_radare2_thumb(&r2, &[0u8; 0x100], 0x4000, &regions, &out)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: invalid request must fail"));
+            assert!(
+                matches!(err, Error::Serialize(message) if message.contains(expected)),
+                "{name}: wrong validation error"
+            );
+            assert!(!sentinel.exists(), "{name}: tool must not be spawned");
+            assert!(!out.exists(), "{name}: output must not be created");
+        }
+    }
+
     #[test]
     fn noisy_radare2_stdout_still_pairs_and_normalizes_pdfj() {
         let stdout = br#"Warning: run r2 with -e bin.cache=true
@@ -2148,21 +2330,43 @@ Warning: analysis completed
         assert!(
             matches!(err, Error::Serialize(message) if message.contains("no aflj function inventory"))
         );
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("capture.stdout");
+        std::fs::write(&stdout_path, b"[]").unwrap();
+        let err = process_region_streaming(&stdout_path, &[0u8; 0x100], 0x4000, 0x4000, dir.path())
+            .err()
+            .expect("empty inventory must fail the region");
+        assert!(
+            matches!(err, Error::Serialize(message) if message.contains("no aflj function inventory"))
+        );
     }
 
     #[test]
-    fn radare2_thumb_retains_known_functions_without_parseable_pdfj_bodies() {
-        let stdout = b"Warning: noisy prelude
-[{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]
-INFO: no pdfj body followed
-";
+    fn radare2_thumb_rejects_non_empty_inventory_with_zero_paired_bodies() {
+        let stdout = b"Warning: noisy prelude\n\
+        [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]\n\
+        INFO: no pdfj body followed\n";
 
-        let parsed = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap();
-        assert_eq!(parsed.records.len(), 1);
-        assert!(
-            parsed.records[0].1.is_none(),
-            "missing bodies are record quarantines, not producer failure"
-        );
+        let err = parse_checked_radare2_thumb_output(stdout, 0x4000).unwrap_err();
+        assert!(matches!(err, Error::Serialize(message)
+            if message.contains("zero paired pdfj bodies") && message.contains("0x4000")));
+    }
+
+    #[test]
+    fn process_region_streaming_rejects_zero_paired_bodies() {
+        let stdout = b"Warning: noisy prelude\n\
+        [{\"name\":\"sym.thumb_func\",\"offset\":16384,\"size\":64}]\n\
+        INFO: no pdfj body followed\n";
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("capture.stdout");
+        std::fs::write(&stdout_path, stdout).unwrap();
+
+        let err = process_region_streaming(&stdout_path, &[0u8; 0x100], 0x4000, 0x4000, dir.path())
+            .err()
+            .expect("non-empty inventory without paired bodies must fail");
+        assert!(matches!(err, Error::Serialize(message)
+            if message.contains("zero paired pdfj bodies") && message.contains("0x4000")));
     }
 
     #[test]
@@ -2727,7 +2931,7 @@ INFO: second pdfj body was noisy and not parseable
             // never-paired fn quarantines with empty body/data_refs
             b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
             // leading + trailing noise
-            b"Warning: noisy prelude\n[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\nINFO: tail\n",
+            b"Warning: noisy prelude\n[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push\"}]}\nINFO: tail\n",
             // entry-matched pdfj is NOT reused as positional fallback (pinned case)
             b"[{\"name\":\"sym.first\",\"offset\":16384,\"size\":64},{\"name\":\"sym.second\",\"offset\":16448,\"size\":64}]\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
         ];
