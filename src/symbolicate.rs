@@ -594,6 +594,7 @@ fn load_attribution(source_tree: &Path) -> Result<BTreeMap<(Tool, u64), String>>
                     let tool = match f.tool {
                         Tool::Ghidra => "ghidra",
                         Tool::Radare2 => "radare2",
+                        Tool::Rizin => "rizin",
                     };
                     return Err(Error::DecomposeIncomplete(format!(
                         "source attribution conflict for {tool} entry 0x{entry:x}: \

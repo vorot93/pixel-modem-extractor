@@ -1,3 +1,4 @@
+pub mod analysis_tool;
 pub mod archive;
 pub mod classify;
 pub mod cli;

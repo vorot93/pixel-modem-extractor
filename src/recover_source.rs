@@ -163,12 +163,7 @@ impl SourceTreeIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tool {
-    Ghidra,
-    Radare2,
-}
+pub use crate::analysis_tool::AnalysisTool as Tool;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveredFunction {
