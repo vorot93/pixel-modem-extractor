@@ -16,6 +16,8 @@ pub enum Error {
     BadToc(String),
     #[error("tree-hash target invalid: {0}")]
     BadTree(String),
+    #[error("bad scatter load map: {0}")]
+    BadScatter(String),
     #[error("bad token database: {0}")]
     BadTokenDb(String),
     #[error("size mismatch for {name}: expected {expected}, got {actual}")]

@@ -435,8 +435,16 @@ fn main_image_dir_name(images_dir: &Path) -> Option<String> {
 
 /// Move one image's decompile artifacts into its unified folder:
 ///   `<ghidra>/images/<label>`   (slice file) -> `<images>/<label>/<label>.bin`
-///   `<ghidra>/export/<label>/`  (export dir)  -> `<images>/<label>/decompiled/`
-fn marshal_image(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()> {
+///   current `<ghidra>/export/<label>/`          -> `<images>/<label>/decompiled/`
+///   present `<ghidra>/scatter/<label>/`         -> `<images>/<label>/scatter/`
+///   current raw-only scatter state              -> remove terminal `scatter/`
+fn marshal_image(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    label: &str,
+    export_current: bool,
+    scatter_state: decompile::RuntimeScatterState,
+) -> Result<()> {
     let dest = images_dir.join(label);
     std::fs::create_dir_all(&dest)?;
     let slice = ghidra_dir.join("images").join(label);
@@ -444,8 +452,36 @@ fn marshal_image(ghidra_dir: &Path, images_dir: &Path, label: &str) -> Result<()
         std::fs::rename(&slice, dest.join(format!("{label}.bin")))?;
     }
     let export = ghidra_dir.join("export").join(label);
-    if export.exists() {
+    if export_current {
+        let metadata = std::fs::symlink_metadata(&export).map_err(|error| {
+            Error::DecomposeIncomplete(format!(
+                "missing current export for {label}: {}: {error}",
+                export.display()
+            ))
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "current export for {label} is not a real directory: {}",
+                export.display()
+            )));
+        }
         std::fs::rename(&export, dest.join("decompiled"))?;
+    }
+    let scatter = ghidra_dir.join("scatter").join(label);
+    let scatter_dest = dest.join("scatter");
+    match scatter_state {
+        decompile::RuntimeScatterState::Unmanaged => {}
+        decompile::RuntimeScatterState::Absent => remove_any(&scatter_dest)?,
+        decompile::RuntimeScatterState::Present => {
+            if !scatter.try_exists()? {
+                return Err(Error::DecomposeIncomplete(format!(
+                    "missing current scatter map for {label}: {}",
+                    scatter.display()
+                )));
+            }
+            remove_any(&scatter_dest)?;
+            std::fs::rename(&scatter, scatter_dest)?;
+        }
     }
     Ok(())
 }
@@ -2229,7 +2265,18 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
             for ir in &rep.images {
-                if let Err(e) = marshal_image(&ghidra_dir, &images_dir, &ir.label) {
+                let scatter_state = if matches!(ir.outcome, ImageOutcome::Failed(_)) {
+                    decompile::RuntimeScatterState::Unmanaged
+                } else {
+                    rep.runtime_scatter_state(&ir.label)
+                };
+                if let Err(e) = marshal_image(
+                    &ghidra_dir,
+                    &images_dir,
+                    &ir.label,
+                    rep.export_is_current(&ir.label),
+                    scatter_state,
+                ) {
                     marshal_err = Some(e.to_string());
                     break;
                 }
@@ -5250,17 +5297,46 @@ mod tests {
     }
 
     #[test]
-    fn marshal_moves_slice_and_export() {
+    fn marshal_moves_slice_export_and_scatter() {
         let root = std::env::temp_dir().join(format!("pme_marshal_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ghidra = root.join("ghidra");
         std::fs::create_dir_all(ghidra.join("images")).unwrap();
         std::fs::create_dir_all(ghidra.join("export").join("02_MAIN")).unwrap();
+        std::fs::create_dir_all(ghidra.join("scatter").join("02_MAIN").join("blocks")).unwrap();
         std::fs::write(ghidra.join("images").join("02_MAIN"), b"slice").unwrap();
         std::fs::write(ghidra.join("export").join("02_MAIN").join("out.c"), b"// c").unwrap();
+        std::fs::write(
+            ghidra.join("scatter").join("02_MAIN").join("load_map.json"),
+            b"{\"format\":\"scatter-test\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            ghidra
+                .join("scatter")
+                .join("02_MAIN")
+                .join("blocks")
+                .join("04-decompress1.bin"),
+            b"payload",
+        )
+        .unwrap();
 
         let images = root.join("images");
-        marshal_image(&ghidra, &images, "02_MAIN").unwrap();
+        std::fs::create_dir_all(images.join("02_MAIN").join("scatter")).unwrap();
+        std::fs::write(
+            images.join("02_MAIN").join("scatter").join("stale.bin"),
+            b"stale",
+        )
+        .unwrap();
+        std::fs::write(images.join("02_MAIN").join("sibling.bin"), b"sibling").unwrap();
+        marshal_image(
+            &ghidra,
+            &images,
+            "02_MAIN",
+            true,
+            decompile::RuntimeScatterState::Present,
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read(images.join("02_MAIN").join("02_MAIN.bin")).unwrap(),
@@ -5273,10 +5349,158 @@ mod tests {
                 .join("out.c")
                 .exists()
         );
+        assert_eq!(
+            std::fs::read(images.join("02_MAIN").join("scatter").join("load_map.json")).unwrap(),
+            b"{\"format\":\"scatter-test\"}"
+        );
+        assert_eq!(
+            std::fs::read(
+                images
+                    .join("02_MAIN")
+                    .join("scatter")
+                    .join("blocks")
+                    .join("04-decompress1.bin")
+            )
+            .unwrap(),
+            b"payload"
+        );
+        assert!(
+            !images
+                .join("02_MAIN")
+                .join("scatter")
+                .join("stale.bin")
+                .exists(),
+            "the owned destination is replaced"
+        );
+        assert_eq!(
+            std::fs::read(images.join("02_MAIN").join("sibling.bin")).unwrap(),
+            b"sibling",
+            "sibling per-image artifacts are preserved"
+        );
         assert!(
             !ghidra.join("images").join("02_MAIN").exists(),
             "moved, not copied"
         );
+        assert!(
+            !ghidra.join("scatter").join("02_MAIN").exists(),
+            "scatter artifacts are moved, not copied"
+        );
+    }
+
+    #[test]
+    fn marshal_reused_tree_replaces_a_valid_map_with_current_raw_only_state() {
+        let root =
+            std::env::temp_dir().join(format!("pme_marshal_raw_only_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let current = ghidra.join("scatter/02_MAIN");
+        std::fs::create_dir_all(current.join("blocks")).unwrap();
+        std::fs::write(current.join("load_map.json"), b"current map").unwrap();
+        std::fs::write(current.join("blocks/04-decompress1.bin"), b"payload").unwrap();
+        let images = root.join("images");
+
+        marshal_image(
+            &ghidra,
+            &images,
+            "02_MAIN",
+            false,
+            decompile::RuntimeScatterState::Present,
+        )
+        .unwrap();
+        let scatter = images.join("02_MAIN/scatter");
+        assert_eq!(
+            std::fs::read(scatter.join("load_map.json")).unwrap(),
+            b"current map"
+        );
+        std::fs::write(images.join("02_MAIN/sibling.bin"), b"preserve").unwrap();
+
+        marshal_image(
+            &ghidra,
+            &images,
+            "02_MAIN",
+            false,
+            decompile::RuntimeScatterState::Absent,
+        )
+        .unwrap();
+
+        assert!(
+            !scatter.exists(),
+            "current NoCandidate must remove the stale map"
+        );
+        assert_eq!(
+            std::fs::read(images.join("02_MAIN/sibling.bin")).unwrap(),
+            b"preserve"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn marshal_noncurrent_run_preserves_terminal_artifacts_and_partial_sources() {
+        let root =
+            std::env::temp_dir().join(format!("pme_marshal_noncurrent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let partial_export = ghidra.join("export/02_MAIN");
+        let uncommitted_scatter = ghidra.join("scatter/02_MAIN");
+        std::fs::create_dir_all(&partial_export).unwrap();
+        std::fs::create_dir_all(&uncommitted_scatter).unwrap();
+        std::fs::write(partial_export.join("functions.json"), b"partial").unwrap();
+        std::fs::write(uncommitted_scatter.join("load_map.json"), b"new").unwrap();
+
+        let images = root.join("images");
+        let terminal = images.join("02_MAIN");
+        std::fs::create_dir_all(terminal.join("decompiled")).unwrap();
+        std::fs::create_dir_all(terminal.join("scatter")).unwrap();
+        std::fs::write(terminal.join("decompiled/functions.json"), b"old export").unwrap();
+        std::fs::write(terminal.join("scatter/load_map.json"), b"old map").unwrap();
+
+        marshal_image(
+            &ghidra,
+            &images,
+            "02_MAIN",
+            false,
+            decompile::RuntimeScatterState::Unmanaged,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(terminal.join("decompiled/functions.json")).unwrap(),
+            b"old export"
+        );
+        assert_eq!(
+            std::fs::read(terminal.join("scatter/load_map.json")).unwrap(),
+            b"old map"
+        );
+        assert!(partial_export.join("functions.json").exists());
+        assert!(uncommitted_scatter.join("load_map.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marshal_propagates_scatter_probe_errors() {
+        let root =
+            std::env::temp_dir().join(format!("pme_marshal_probe_error_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        std::fs::create_dir_all(&ghidra).unwrap();
+        std::os::unix::fs::symlink("scatter", ghidra.join("scatter")).unwrap();
+        let retained = root.join("images/02_MAIN/scatter/load_map.json");
+        std::fs::create_dir_all(retained.parent().unwrap()).unwrap();
+        std::fs::write(&retained, b"retained").unwrap();
+
+        let error = marshal_image(
+            &ghidra,
+            &root.join("images"),
+            "02_MAIN",
+            false,
+            decompile::RuntimeScatterState::Present,
+        )
+        .expect_err("a scatter metadata error must not be treated as absence");
+
+        assert!(matches!(error, Error::Io(_)));
+        assert_eq!(std::fs::read(retained).unwrap(), b"retained");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5751,6 +5975,17 @@ mod tests {
             b"{\"sentinel\":true}",
         )
         .unwrap();
+        std::fs::create_dir_all(out.join("images/02_MAIN/scatter/blocks")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/scatter/load_map.json"),
+            b"{\"format\":\"scatter-test\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/scatter/blocks/04-decompress1.bin"),
+            b"payload",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
@@ -5777,6 +6012,14 @@ mod tests {
         assert_eq!(
             std::fs::read(out.join("images/02_MAIN/decompiled/global_shapes.json")).unwrap(),
             b"{\"sentinel\":true}"
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/scatter/load_map.json")).unwrap(),
+            b"{\"format\":\"scatter-test\"}"
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/scatter/blocks/04-decompress1.bin")).unwrap(),
+            b"payload"
         );
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());

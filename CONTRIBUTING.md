@@ -4,7 +4,7 @@ Guide for anyone — human or AI — changing this repository. For *using* the C
 [`README.md`](README.md); this file is about developing it.
 
 `pixel-modem-extractor` is a pure-Rust CLI that extracts and analyzes the Samsung Exynos
-"Shannon" S5400 baseband firmware from a Pixel radio FBPK image. Extraction needs no
+"Shannon" S5300 / S5400 baseband family from a Pixel radio FBPK image. Extraction needs no
 runtime dependencies; the `--run` / `decompose` analysis paths drive a local Ghidra and
 radare2.
 
@@ -56,16 +56,35 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   tiny ARM blob in a valid TOC, so it needs **no firmware** — but it needs a real Ghidra.
   It locates one via `GHIDRA_INSTALL_DIR` or `/opt/ghidra` (looking for
   `support/analyzeHeadless`) and skips otherwise. CI runs it nightly / on demand via the
-  `ghidra-e2e` workflow. The focused pass-2 application test is:
+  `ghidra-e2e` workflow. Run the real-Ghidra binary serially:
+
+      cargo test --test decompile_golden -- --nocapture --test-threads=1
+
+  Parallel tests share Ghidra launcher/JDK state and have produced a baseline exit-127
+  failure even though focused and full serial runs pass. The focused pass-2 application
+  test is:
 
       cargo test --test decompile_golden \
-        pass2_applies_functions_and_strict_globals_in_one_process -- --nocapture
+        pass2_applies_functions_and_strict_globals_in_one_process -- --nocapture --test-threads=1
 
   It drives the real scripts against a synthetic ARM program and skips cleanly when Ghidra is
   unavailable. `run_drives_ghidra_end_to_end` covers pass 1; the focused test covers function and
   global application, strict ownership, atomic map rejection, and the independent final export.
   The sibling `pass2_applies_global_types_and_skips_span_collision` covers `ApplyGlobalTypes.java`
   the same way (applied + span-collision skip); see **Phase 3.2 type application** below.
+- **Runtime-scatter corpus goldens** (`tests/scatter_golden.rs`) authenticate and validate
+  retained MAIN files supplied explicitly from outside the repository:
+
+      PME_S5400_MAIN=/path/to/s5400/MAIN.bin \
+      PME_S5300_MAIN=/path/to/s5300/MAIN.bin \
+      cargo test --release --test scatter_golden -- --nocapture
+
+  Each test is gated only by its own variable and skips cleanly when that variable is unset
+  or its input is absent, so one available corpus still runs independently. Verify the
+  no-corpus path with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test scatter_golden -- --nocapture`.
+  These inputs and every generated payload remain outside git; tests commit only structural
+  metadata, addresses, counts, and hashes, never proprietary firmware or derived bytes.
 - **Phase 3.0 production goldens** (`tests/globals_golden.rs` and
   `report_json_includes_globals_field` in `tests/decompose_golden.rs`) need
   `PME_RADIO_IMG`, Ghidra, and radare2. Run production-scale cases with
@@ -179,8 +198,11 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `ext4.rs` | ext4 filesystem reader (via `ext4-view`) |
 | `archive.rs` | `ustar`/tar handling around the ext4 payload |
 | `gzip.rs` | Gunzip the `RF_CFG_*` calibration blobs |
-| `toc.rs` | `modem.bin` TOC parse + split into the six images |
+| `toc.rs` | `modem.bin` TOC parse + split into the model-dependent embedded images |
 | `classify.rs` | 5-test opaque battery — whole-image H, χ²/df, serial correlation, 64-KiB window entropies; unanimous fail-closed verdict |
+| `scatter/mod.rs` | Semantic A32 scatter discovery, exact bounded-table classification, and checked runtime planning |
+| `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
+| `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
 | `source_tree.rs` | Reconstruct the source-tree layout from `__FILE__` strings |
 | `recover_source.rs` | Attribute recovered Ghidra/radare2 functions to source paths |
 | `decode_rf.rs` | Decode the RF_CFG calibration databases |
@@ -204,7 +226,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ExportDecomp`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ExportDecomp`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -298,6 +320,82 @@ hardcoded. Two reference images exercise both models end-to-end:
   (32 CRC-32 variants × 6 coverage windows × both reference models: zero matches) plus RE
   showing no code in any image ever reads the field confirms the values are offline
   build-tool output — treat the field as opaque (findings under `~/.superpowers`).
+
+### Runtime scatter load maps
+
+- **Discovery is semantic and exactly bounded.** `scatter::discover` scans 4-byte-aligned
+  offsets with `scaleservers-arm32-assembly` for the decoded unconditional A32 sequence
+  `ADD base, PC, #imm; LDMIA base, {r10, r11}; ADD r10, r10, base; ADD r11, r11, base`.
+  `base` is an operand relationship, not a fixed register. A32's visible PC (`loader + 8`)
+  and the decoded immediate locate two little-endian relative words; wrapping addition
+  against that literal-pair address yields the exact table start and exclusive end. Never
+  replace this with retained byte signatures, loader/table/handler addresses, model names,
+  fixed registers, or fixed immediates. Those would turn structural discovery into
+  model-specific matching and silently miss valid firmware variants.
+- **The plausibility threshold separates absence from damage.** A lookalike remains
+  `NoCandidate` until it has a readable literal pair, an ordered in-image nonempty range
+  whose length is an exact multiple of the 16-byte
+  `{source, destination, size, handler}` descriptor, no more than 256 entries, and the exact
+  two-record null sentinel: `{nonzero, 0, 0, nonzero}` followed by
+  `{0, first.source, 0, first.handler}`. Once that threshold is crossed, every record through
+  the resolved exclusive end must validate; malformed tails are not truncated or ignored.
+  A plausible failure wins over another valid-looking anchor, and multiple valid anchors or
+  handler assignments are ambiguity errors rather than score- or order-based choices.
+- **Topology classifies opaque handlers without addresses.** The sentinel handler is `null`
+  and cannot recur after the first two records. Useful entries have nonzero sizes and
+  destinations; the table has exactly four raw handler identities; a nonempty `zero` suffix
+  reaches the exact table end; `copy` and `decompress1` may interleave before it; and the copy
+  class must contain an exact self-copy. The two remaining handler assignments are tested
+  behaviorally and exactly one must survive. Handler identity uses the stored value verbatim;
+  bit 0 is masked only to check that handler code points into the raw image.
+- **`decompress1` is exact.** For each token, set `literal_code = token & 7`; if zero, read a
+  nonzero extension byte; then copy `literal_code - 1` literal bytes. Set `run = token >> 4`
+  and read an extension when zero. When `token & 8 == 0`, append `run` zeroes; otherwise read
+  a one-byte nonzero distance no greater than current output and copy `run + 2` bytes with
+  overlapping LZ semantics. Every read and output extension is checked, a no-progress token
+  is rejected, and success requires exactly the descriptor's output size while recording the
+  actual compressed bytes consumed. Do not copy `shannon_modem_loader`'s `token & 3`
+  interpretation: ShannonBaseband independently corrected and emulator-validated `token & 7`,
+  and only that form reproduces both authenticated retained corpora.
+- **Planning is immutable-raw and resource bounded.** Null records and exact self-copies stay
+  as metadata; other copies, decoded outputs, and zero ranges become runtime destinations.
+  Reject out-of-image sources, sources dependent on an earlier runtime write, 32-bit endpoint
+  wrap, destination overlap, and every non-self destination intersecting the retained raw
+  mapping. The accepted logical output has a 512 MiB per-image limit, and speculative
+  decompression across attempted classifications has a separate cumulative 512 MiB limit.
+  Candidate validation retains checked raw ranges for non-self copies rather than cloned
+  bytes; only the sole candidate remaining after malformed/ambiguity resolution becomes the
+  public `LoadPlan` and materializes those copy bytes. Decoded outputs remain cached under the
+  shared speculative budget.
+- **Artifacts publish before Ghidra consumes them.** Standalone output stages and then
+  publishes `scatter/<label>/load_map.json` plus only the needed
+  `blocks/<entry>-<operation>.bin` payloads. `decompose::marshal_image` moves the owned
+  per-image directory to `images/<label>/scatter/`; it is a terminal artifact and survives
+  `--prune`. Explicit current state drives marshalling: a present map replaces the owned
+  terminal directory, a successful current `NoCandidate` removes it, and failed/unmanaged
+  production preserves prior terminal state. Metadata errors never masquerade as absence.
+  The literal `2.0.0` artifact golden is intentional: package-version changes alter serialized
+  wire output and must explicitly rebaseline the byte-for-byte fixture.
+- **Ghidra preflights before mutation and retains both views.** `ApplyScatterLoad.java`
+  strictly validates the complete schema, raw-image identity, contained payload paths and
+  open-file identities, hashes, entry topology (including `index == array position`), sizes,
+  and all existing/requested memory collisions before creating a block. Mutation consumes
+  those same validated open streams.
+  If creation, permission setting, hashing, or cleanup fails, it removes created blocks in
+  reverse order and explicitly aborts Ghidra's script transaction; throwing alone is
+  insufficient because Ghidra can otherwise commit a failed script transaction. The original
+  raw block remains mapped. Added blocks are loaded, initialized, readable, writable,
+  non-executable, and non-volatile; the scatter table has no trustworthy MPU evidence, so
+  granting execute permission would manufacture analysis evidence.
+- **Research provenance is MIT-compatible, not a copied oracle.** Structural prior art is
+  [`alexander-pick/shannon_modem_loader`](https://github.com/alexander-pick/shannon_modem_loader)
+  commit `2dc27f01782eaaa55ef626e15ef6b4154bf0e392` (MIT-style license),
+  [`grant-h/ShannonBaseband`](https://github.com/grant-h/ShannonBaseband) commit
+  `8ebffcd0ae47d1f2e3ac938ea42b3944537cbd1e` (MIT license), and BaseSpec's
+  scatter-table research as a secondary reference. The production implementation is an
+  idiomatic, independently tested Rust reconstruction; never import upstream code, firmware
+  excerpts, or generated corpus payloads.
+
 - **CLI dispatch is thin.** `cli.rs` only parses args and resolves the `--out` default,
   then delegates to a module-level `run(...)`. Put new logic in the module, not in
   `cli.rs`. The decoder subcommands' `run()` prints its own console report; the pipeline
@@ -1418,6 +1516,21 @@ hardcoded. Two reference images exercise both models end-to-end:
     from stdout by prefix-stripping must also be written via
     `System.out.println(...)` to land unadorned. (See `ApplySymbols.summarize`
     for the dual-emit pattern.)
+  - **A `HeadlessScript` abort does not imply a nonzero Ghidra exit.** It stops
+    follow-on analysis/scripts, which is why scatter preflight failures use it,
+    but `analyzeHeadless` can still exit 0. Current-run provenance therefore
+    cannot rely on process status or a surviving old inventory. Before every
+    generated, direct (including datamark fallback), or pass-2 invocation, remove
+    all three owned exports — `functions.json`, `disasm.lst`, and `decompiled.c`
+    — plus the sibling `export/<label>.complete` marker; opaque skips invalidate too,
+    and any invalidation failure prevents launch. Unsuccessful, aborted, missing-marker,
+    and invalid-output attempts scrub every removable owned path before marshalling.
+    `ExportDecomp.java` checks each `PrintWriter` after its write/flush/close path, writes
+    the marker only after all three checked files, and atomically renames a sibling temp
+    marker into place. Direct and generated validation require the exact marker bytes,
+    including its one trailing newline. Keep the marker outside `export/<label>/` so
+    ownership-aware refresh still consumes exactly the three exports, and marshal only
+    exports explicitly marked current by the producing report.
   - **Gson IS bundled** with Ghidra (`Ghidra/Framework/Generic/lib/gson-*.jar`)
     and on the headless script classpath — use it for JSON in scripts.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script

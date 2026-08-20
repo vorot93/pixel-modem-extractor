@@ -7,34 +7,355 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+const SCATTER_BASE: u32 = 0x4001_0000;
+const SCATTER_IMAGE_LEN: usize = 0x1000;
+const SCATTER_COPY_DESTINATION: u32 = SCATTER_BASE + SCATTER_IMAGE_LEN as u32;
+const SCATTER_DECOMPRESS1_DESTINATION: u32 = SCATTER_COPY_DESTINATION + 0x10;
+const SCATTER_ZERO_DESTINATION: u32 = SCATTER_COPY_DESTINATION + 0x20;
+
+fn analyze_headless_in_home(home: &std::path::Path) -> Option<PathBuf> {
+    [
+        home.join("support/analyzeHeadless"),
+        home.join("libexec/support/analyzeHeadless"),
+    ]
+    .into_iter()
+    .find(|launcher| launcher.exists())
+}
+
 fn find_ghidra_home() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("GHIDRA_INSTALL_DIR") {
         let p = PathBuf::from(dir);
-        if p.join("support").join("analyzeHeadless").exists() {
+        if analyze_headless_in_home(&p).is_some() {
             return Some(p);
         }
     }
     let opt = PathBuf::from("/opt/ghidra");
-    if opt.join("support").join("analyzeHeadless").exists() {
+    if analyze_headless_in_home(&opt).is_some() {
         return Some(opt);
     }
     None
 }
 
-/// Minimal valid `modem.bin`: TOC + one embedded image (index 1, "BOOT", base 0).
-fn craft_modem_bin(payload: &[u8]) -> Vec<u8> {
+fn craft_single_image_modem_bin(name: &str, load_addr: u32, index: u32, payload: &[u8]) -> Vec<u8> {
+    assert!(name.len() <= 12);
     let entry_off = 0x20usize;
     let payload_off = entry_off + 0x20; // one 32-byte entry
     let mut buf = vec![0u8; payload_off + payload.len()];
     buf[0..4].copy_from_slice(b"TOC\0");
     buf[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes()); // count
-    buf[entry_off..entry_off + 4].copy_from_slice(b"BOOT"); // name
+    buf[entry_off..entry_off + name.len()].copy_from_slice(name.as_bytes());
     buf[entry_off + 12..entry_off + 16].copy_from_slice(&(payload_off as u32).to_le_bytes()); // offset
-    buf[entry_off + 16..entry_off + 20].copy_from_slice(&0u32.to_le_bytes()); // load_addr
+    buf[entry_off + 16..entry_off + 20].copy_from_slice(&load_addr.to_le_bytes());
     buf[entry_off + 20..entry_off + 24].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // size
-    buf[entry_off + 28..entry_off + 32].copy_from_slice(&1u32.to_le_bytes()); // index
+    buf[entry_off + 28..entry_off + 32].copy_from_slice(&index.to_le_bytes());
     buf[payload_off..].copy_from_slice(payload);
     buf
+}
+
+/// Minimal valid `modem.bin`: TOC + one embedded image (index 1, "BOOT", base 0).
+fn craft_modem_bin(payload: &[u8]) -> Vec<u8> {
+    craft_single_image_modem_bin("BOOT", 0, 1, payload)
+}
+
+fn write_scatter_u32(image: &mut [u8], offset: usize, value: u32) {
+    image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_scatter_descriptor(
+    image: &mut [u8],
+    table_offset: usize,
+    index: usize,
+    source: u32,
+    destination: u32,
+    size: u32,
+    handler: u32,
+) {
+    let offset = table_offset + index * 16;
+    for (field_offset, value) in [source, destination, size, handler].into_iter().enumerate() {
+        write_scatter_u32(image, offset + field_offset * 4, value);
+    }
+}
+
+fn craft_scatter_main_modem_bin() -> Vec<u8> {
+    const LOADER_OFFSET: usize = 0x40;
+    const LOADER_IMMEDIATE: u32 = 0x38;
+    const LITERAL_OFFSET: usize = LOADER_OFFSET + 8 + LOADER_IMMEDIATE as usize;
+    const TABLE_OFFSET: usize = 0x200;
+    const TABLE_LEN: u32 = 6 * 16;
+    const NULL_HANDLER: u32 = SCATTER_BASE + 0x600;
+    const COPY_HANDLER: u32 = SCATTER_BASE + 0x601;
+    const DECOMPRESS1_HANDLER: u32 = SCATTER_BASE + 0x604;
+    const ZERO_HANDLER: u32 = SCATTER_BASE + 0x609;
+    const SENTINEL_SOURCE: u32 = SCATTER_BASE + 0x680;
+    const SELF_COPY_SOURCE: u32 = SCATTER_BASE + 0x700;
+    const COPY_SOURCE: u32 = SCATTER_BASE + 0x710;
+    const DECOMPRESS1_SOURCE: u32 = SCATTER_BASE + 0x720;
+    const ZERO_SOURCE: u32 = SCATTER_BASE + 0x730;
+
+    let mut image = vec![0; SCATTER_IMAGE_LEN];
+    // add r0, pc, #0x38; ldmia r0, {r10, r11}; add r10, r10, r0; add r11, r11, r0
+    for (offset, instruction) in [0xe28f_0038, 0xe890_0c00, 0xe08a_a000, 0xe08b_b000]
+        .into_iter()
+        .enumerate()
+    {
+        write_scatter_u32(&mut image, LOADER_OFFSET + offset * 4, instruction);
+    }
+    let literal_address = SCATTER_BASE + LITERAL_OFFSET as u32;
+    let table_address = SCATTER_BASE + TABLE_OFFSET as u32;
+    write_scatter_u32(
+        &mut image,
+        LITERAL_OFFSET,
+        table_address.wrapping_sub(literal_address),
+    );
+    write_scatter_u32(
+        &mut image,
+        LITERAL_OFFSET + 4,
+        (table_address + TABLE_LEN).wrapping_sub(literal_address),
+    );
+
+    image[0x700..0x704].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+    image[0x710..0x714].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    image[0x720..0x722].copy_from_slice(&[0x22, 0xaa]);
+    for (index, source, destination, size, handler) in [
+        (0, SENTINEL_SOURCE, 0, 0, NULL_HANDLER),
+        (1, 0, SENTINEL_SOURCE, 0, NULL_HANDLER),
+        (2, SELF_COPY_SOURCE, SELF_COPY_SOURCE, 4, COPY_HANDLER),
+        (3, COPY_SOURCE, SCATTER_COPY_DESTINATION, 4, COPY_HANDLER),
+        (
+            4,
+            DECOMPRESS1_SOURCE,
+            SCATTER_DECOMPRESS1_DESTINATION,
+            3,
+            DECOMPRESS1_HANDLER,
+        ),
+        (5, ZERO_SOURCE, SCATTER_ZERO_DESTINATION, 5, ZERO_HANDLER),
+    ] {
+        write_scatter_descriptor(
+            &mut image,
+            TABLE_OFFSET,
+            index,
+            source,
+            destination,
+            size,
+            handler,
+        );
+    }
+
+    craft_single_image_modem_bin("MAIN", SCATTER_BASE, 3, &image)
+}
+
+const INSPECT_SCATTER_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
+import java.util.Locale;
+
+public class InspectScatter extends GhidraScript {
+    private void requireRuntimeBlock(MemoryBlock block, String name, long start, long size,
+            int[] expected) throws Exception {
+        if (block == null) throw new AssertionError(name + " missing");
+        if (!block.getStart().equals(toAddr(start)) || block.getSize() != size) {
+            throw new AssertionError(name + " range wrong");
+        }
+        if (!block.isInitialized() || !block.isRead() || !block.isWrite()
+                || block.isExecute() || block.isVolatile()) {
+            throw new AssertionError(name + " permissions wrong");
+        }
+        for (int offset = 0; offset < expected.length; offset++) {
+            if ((currentProgram.getMemory().getByte(block.getStart().add(offset)) & 0xff)
+                    != expected[offset]) {
+                throw new AssertionError(name + " bytes wrong at offset " + offset);
+            }
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        Memory memory = currentProgram.getMemory();
+        MemoryBlock raw = memory.getBlock(toAddr(0x40010000L));
+        if (raw == null || !raw.getStart().equals(toAddr(0x40010000L))
+                || raw.getSize() != 0x1000L) {
+            throw new AssertionError("raw block missing or changed");
+        }
+        requireRuntimeBlock(memory.getBlock("SCATTER_COPY_03"), "SCATTER_COPY_03",
+                0x40011000L, 4, new int[] {0x11, 0x22, 0x33, 0x44});
+        requireRuntimeBlock(memory.getBlock("SCATTER_DECOMPRESS1_04"),
+                "SCATTER_DECOMPRESS1_04", 0x40011010L, 3, new int[] {0xaa, 0, 0});
+        requireRuntimeBlock(memory.getBlock("SCATTER_ZERO_05"), "SCATTER_ZERO_05",
+                0x40011020L, 5, new int[] {0, 0, 0, 0, 0});
+        int scatterBlocks = 0;
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (block.getName().toUpperCase(Locale.ROOT).startsWith("SCATTER_")) scatterBlocks++;
+        }
+        if (scatterBlocks != 3) {
+            throw new AssertionError("expected exactly three SCATTER_* blocks, found "
+                    + scatterBlocks);
+        }
+        println("InspectScatter: valid raw and scatter memory map");
+    }
+}
+"#;
+
+const INSPECT_NO_SCATTER_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
+import java.util.Locale;
+
+public class InspectNoScatter extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Memory memory = currentProgram.getMemory();
+        MemoryBlock raw = memory.getBlock(toAddr(0x40010000L));
+        if (raw == null || !raw.getStart().equals(toAddr(0x40010000L))
+                || raw.getSize() != 0x1000L) {
+            throw new AssertionError("saved raw block missing or changed");
+        }
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (block.getName().toUpperCase(Locale.ROOT).startsWith("SCATTER_")) {
+                throw new AssertionError("partial scatter block survived: " + block.getName());
+            }
+        }
+        println("InspectNoScatter: saved raw map has no SCATTER_* blocks");
+    }
+}
+"#;
+
+fn inspect_saved_project(
+    home: &std::path::Path,
+    out: &std::path::Path,
+    label: &str,
+    script: &str,
+) -> std::process::Output {
+    let config = out.join("ghidra_config");
+    let cache = out.join("ghidra_cache");
+    let temp = out.join("ghidra_tmp");
+    let java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        config.display(),
+        cache.display(),
+        temp.display(),
+        temp.display()
+    );
+    std::process::Command::new(
+        analyze_headless_in_home(home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .arg("-process")
+    .arg(label)
+    .arg("-noanalysis")
+    .arg("-scriptPath")
+    .arg(out.join("scripts"))
+    .arg("-postScript")
+    .arg(script)
+    .env("XDG_CONFIG_HOME", config)
+    .env("XDG_CACHE_HOME", cache)
+    .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+    .output()
+    .unwrap()
+}
+
+fn process_diagnostics(output: &std::process::Output) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn test_launcher_finds_homebrew_libexec_layout() {
+    let root = tempfile::tempdir().unwrap();
+    let launcher = root.path().join("libexec/support/analyzeHeadless");
+    std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    std::fs::write(&launcher, b"launcher\n").unwrap();
+
+    assert_eq!(analyze_headless_in_home(root.path()), Some(launcher));
+}
+
+fn generate_scatter_kit(home: &std::path::Path, case: &str) -> (PathBuf, PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("pme_scatter_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, craft_scatter_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let spec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report.spec_path).unwrap()).unwrap();
+    let label = spec["images"][0]["name"].as_str().unwrap().to_string();
+    assert_eq!(label, "02_MAIN");
+    (dir, out, label)
+}
+
+fn run_generated_scatter_kit(
+    home: &std::path::Path,
+    out: &std::path::Path,
+) -> std::process::Output {
+    std::process::Command::new(out.join("run_ghidra.sh"))
+        .env("GHIDRA_INSTALL_DIR", home)
+        .output()
+        .unwrap()
+}
+
+fn assert_generated_scatter_failure_is_closed(
+    home: &std::path::Path,
+    case: &str,
+    expected_failure: &str,
+    mutate: impl FnOnce(&std::path::Path),
+) {
+    let (dir, out, label) = generate_scatter_kit(home, case);
+    mutate(&out);
+
+    let failed_run = run_generated_scatter_kit(home, &out);
+    let failure_diagnostics = process_diagnostics(&failed_run);
+    assert!(
+        !failed_run.status.success(),
+        "malformed generated kit unexpectedly succeeded:\n{failure_diagnostics}"
+    );
+    assert!(
+        failure_diagnostics.contains(expected_failure),
+        "generated kit failed for the wrong reason; expected {expected_failure:?}:\n{failure_diagnostics}"
+    );
+
+    std::fs::write(
+        out.join("scripts/InspectNoScatter.java"),
+        INSPECT_NO_SCATTER_JAVA,
+    )
+    .unwrap();
+    let inspection = inspect_saved_project(home, &out, &label, "InspectNoScatter.java");
+    assert!(
+        inspection.status.success(),
+        "failed project did not retain an inspectable raw-only map:\nfailed run:\n{failure_diagnostics}\ninspection:\n{}",
+        process_diagnostics(&inspection)
+    );
+    assert!(
+        String::from_utf8_lossy(&inspection.stdout)
+            .contains("InspectNoScatter: saved raw map has no SCATTER_* blocks"),
+        "raw-only inspection script did not complete:\n{}",
+        process_diagnostics(&inspection)
+    );
+    eprintln!(
+        "scatter fail-closed [{case}]: generated shell {}; saved raw-only inspection passed",
+        failed_run.status
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn relative_spelling_from_current(path: &std::path::Path) -> PathBuf {
@@ -144,6 +465,440 @@ fn run_drives_ghidra_end_to_end() {
     assert!(out.join("run_ghidra.sh").exists());
     assert!(out.join("scripts").join("ExportDecomp.java").exists());
     assert!(out.join("images").join("00_BOOT").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scatter_load_map_is_applied_before_analysis() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pme_scatter_valid_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, craft_scatter_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home.clone()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let image = report.images.first().expect("synthetic MAIN was selected");
+    assert_eq!(image.label, "02_MAIN");
+    assert!(
+        matches!(
+            image.outcome,
+            pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
+        ),
+        "synthetic MAIN analysis failed: {:?}",
+        image.outcome
+    );
+
+    std::fs::write(
+        out.join("scripts/InspectScatter.java"),
+        INSPECT_SCATTER_JAVA,
+    )
+    .unwrap();
+    let inspection = inspect_saved_project(&home, &out, &image.label, "InspectScatter.java");
+    assert!(
+        inspection.status.success(),
+        "saved scatter map inspection failed:\n{}",
+        process_diagnostics(&inspection)
+    );
+    assert!(
+        String::from_utf8_lossy(&inspection.stdout)
+            .contains("InspectScatter: valid raw and scatter memory map"),
+        "valid scatter inspection script did not complete:\n{}",
+        process_diagnostics(&inspection)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncated_scatter_payload_fails_closed_without_partial_map() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_generated_scatter_failure_is_closed(
+        &home,
+        "truncated_payload",
+        "does not have the declared size",
+        |out| {
+            let payload = out.join("scatter/02_MAIN/blocks/04-decompress1.bin");
+            let length = std::fs::metadata(&payload).unwrap().len();
+            assert!(length > 1);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(payload)
+                .unwrap()
+                .set_len(length - 1)
+                .unwrap();
+        },
+    );
+}
+
+#[test]
+fn scatter_raw_collision_fails_closed_without_partial_map() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_generated_scatter_failure_is_closed(
+        &home,
+        "raw_collision",
+        "overlaps existing memory block",
+        |out| {
+            let map_path = out.join("scatter/02_MAIN/load_map.json");
+            let mut map: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+            assert_eq!(
+                map["entries"][3]["destination"],
+                format!("{SCATTER_COPY_DESTINATION:#010x}")
+            );
+            map["entries"][3]["destination"] = serde_json::json!("0x40010000");
+            let mut bytes = serde_json::to_vec_pretty(&map).unwrap();
+            bytes.push(b'\n');
+            std::fs::write(map_path, bytes).unwrap();
+        },
+    );
+}
+
+#[test]
+fn lenient_scatter_json_fails_closed_without_partial_map() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_generated_scatter_failure_is_closed(
+        &home,
+        "lenient_json",
+        "scatter load map is not strict JSON",
+        |out| {
+            let map_path = out.join("scatter/02_MAIN/load_map.json");
+            let document = std::fs::read_to_string(&map_path).unwrap();
+            let lenient_only = document.replacen("  \"format\":", "  format:", 1);
+            assert_ne!(lenient_only, document);
+            std::fs::write(map_path, lenient_only).unwrap();
+        },
+    );
+}
+
+#[test]
+fn duplicate_scatter_json_member_fails_closed_without_partial_map() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_generated_scatter_failure_is_closed(
+        &home,
+        "duplicate_json_member",
+        "duplicate JSON member format",
+        |out| {
+            let map_path = out.join("scatter/02_MAIN/load_map.json");
+            let document = std::fs::read_to_string(&map_path).unwrap();
+            let duplicate = document.replacen(
+                "{\n",
+                "{\n  \"format\": \"pixel-modem-extractor-scatter-load-v1\",\n",
+                1,
+            );
+            assert_ne!(duplicate, document);
+            std::fs::write(map_path, duplicate).unwrap();
+        },
+    );
+}
+
+#[test]
+fn out_of_order_scatter_indices_fail_closed_without_partial_map() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_generated_scatter_failure_is_closed(
+        &home,
+        "out_of_order_indices",
+        "index does not match its array position",
+        |out| {
+            let map_path = out.join("scatter/02_MAIN/load_map.json");
+            let mut map: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+            map["entries"].as_array_mut().unwrap().swap(3, 4);
+            let mut bytes = serde_json::to_vec_pretty(&map).unwrap();
+            bytes.push(b'\n');
+            std::fs::write(map_path, bytes).unwrap();
+        },
+    );
+}
+
+#[test]
+fn scatter_post_preflight_failure_rolls_back_created_blocks() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_generated_scatter_failure_is_closed(
+        &home,
+        "rollback",
+        "deterministic rollback fault after first create",
+        |out| {
+            let script_path = out.join("scripts/ApplyScatterLoad.java");
+            let script = std::fs::read_to_string(&script_path).unwrap();
+            let mutation_point = "                block.setRead(true);\n";
+            assert_eq!(script.matches(mutation_point).count(), 1);
+            let injected = script.replacen(
+                mutation_point,
+                concat!(
+                    "                if (created.size() == 1) {\n",
+                    "                    throw new MapError(\n",
+                    "                            \"deterministic rollback fault after first create\");\n",
+                    "                }\n",
+                    "                block.setRead(true);\n"
+                ),
+                1,
+            );
+            std::fs::write(script_path, injected).unwrap();
+        },
+    );
+}
+
+#[test]
+fn generated_shell_rejects_partial_export_after_functions_json() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let (dir, out, _) = generate_scatter_kit(&home, "partial_export");
+    let export = out.join("export/02_MAIN");
+    std::fs::create_dir_all(&export).unwrap();
+    std::fs::write(export.join("functions.json"), b"[]\n").unwrap();
+    std::fs::write(export.join("disasm.lst"), b"stale disassembly\n").unwrap();
+    std::fs::write(export.join("decompiled.c"), b"stale decompilation\n").unwrap();
+    let completion = out.join("export/02_MAIN.complete");
+    std::fs::write(&completion, b"pixel-modem-extractor-ghidra-export-v1\n").unwrap();
+
+    let script_path = out.join("scripts/ExportDecomp.java");
+    let script = std::fs::read_to_string(&script_path).unwrap();
+    let mutation_point =
+        "        writeFunctionsJson(new File(outDir, \"functions.json\"), fm, listing);\n";
+    assert_eq!(script.matches(mutation_point).count(), 1);
+    let injected = script.replacen(
+        mutation_point,
+        concat!(
+            "        writeFunctionsJson(new File(outDir, \"functions.json\"), fm, listing);\n",
+            "        if (outDir.isDirectory()) {\n",
+            "            throw new RuntimeException(\n",
+            "                    \"deterministic partial export fault after functions.json\");\n",
+            "        }\n"
+        ),
+        1,
+    );
+    std::fs::write(script_path, injected).unwrap();
+
+    let failed_run = run_generated_scatter_kit(&home, &out);
+    let diagnostics = process_diagnostics(&failed_run);
+    assert!(
+        !failed_run.status.success(),
+        "generated shell accepted a partial current export:\n{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("deterministic partial export fault after functions.json"),
+        "missing injected ExportDecomp failure:\n{diagnostics}"
+    );
+    assert!(!export.join("functions.json").exists());
+    assert!(!export.join("disasm.lst").exists());
+    assert!(!export.join("decompiled.c").exists());
+    assert!(!completion.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn generated_shell_rejects_suppressed_print_writer_error() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let (dir, out, _) = generate_scatter_kit(&home, "print_writer_error");
+    let export = out.join("export/02_MAIN");
+    let completion = out.join("export/02_MAIN.complete");
+
+    let script_path = out.join("scripts/ExportDecomp.java");
+    let script = std::fs::read_to_string(&script_path).unwrap();
+    let mutation_point = "            w.println(\"[\");\n";
+    assert_eq!(script.matches(mutation_point).count(), 1);
+    let injected = script.replacen(
+        mutation_point,
+        concat!(
+            "            w.close();\n",
+            "            w.println(\"[\");\n"
+        ),
+        1,
+    );
+    std::fs::write(script_path, injected).unwrap();
+
+    let failed_run = run_generated_scatter_kit(&home, &out);
+    let diagnostics = process_diagnostics(&failed_run);
+    assert!(
+        !failed_run.status.success(),
+        "generated shell accepted a suppressed PrintWriter error (completion marker published={}):\n{diagnostics}",
+        completion.exists()
+    );
+    assert!(
+        diagnostics.contains("ExportDecomp: failed to write")
+            && diagnostics.contains("functions.json"),
+        "missing checked PrintWriter failure:\n{diagnostics}"
+    );
+    assert!(!export.join("functions.json").exists());
+    assert!(!export.join("disasm.lst").exists());
+    assert!(!export.join("decompiled.c").exists());
+    assert!(!completion.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_run_rejects_stale_valid_inventory_when_invalidation_fails() {
+    let dir = std::env::temp_dir().join(format!("pme_scatter_direct_stale_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("fake-ghidra");
+    std::fs::create_dir_all(home.join("support")).unwrap();
+    std::fs::write(home.join("support/analyzeHeadless"), b"not launched\n").unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, craft_scatter_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    let export = out.join("export/02_MAIN");
+    std::fs::create_dir_all(&export).unwrap();
+    std::fs::create_dir(export.join("functions.json")).unwrap();
+    std::fs::write(export.join("disasm.lst"), b"stale disassembly\n").unwrap();
+    std::fs::write(export.join("decompiled.c"), b"stale decompilation\n").unwrap();
+    std::fs::write(export.join("unrelated.sidecar"), b"preserve\n").unwrap();
+    let completion = out.join("export/02_MAIN.complete");
+    std::fs::write(&completion, b"pixel-modem-extractor-ghidra-export-v1\n").unwrap();
+
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+
+    let image = report.images.first().expect("synthetic MAIN was selected");
+    assert!(
+        matches!(
+            image.outcome,
+            pixel_modem_extractor::decompile::ImageOutcome::Failed(_)
+        ),
+        "direct run accepted stale functions.json without current completion: {:?}",
+        image.outcome
+    );
+    assert!(!completion.exists(), "stale completion marker survived");
+    assert!(export.join("functions.json").is_dir());
+    assert!(!export.join("disasm.lst").exists());
+    assert!(!export.join("decompiled.c").exists());
+    assert_eq!(
+        std::fs::read(export.join("unrelated.sidecar")).unwrap(),
+        b"preserve\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_shell_rejects_extra_marker_bytes_and_scrubs_owned_exports() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("pme_marker_exact_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("fake-ghidra");
+    std::fs::create_dir_all(home.join("support")).unwrap();
+    let launcher = home.join("support/analyzeHeadless");
+    std::fs::write(
+        &launcher,
+        br#"#!/bin/sh
+want_export=0
+for arg in "$@"; do
+  if [ "$want_export" = 1 ]; then
+    export_dir=$arg
+    break
+  fi
+  if [ "$arg" = ExportDecomp.java ]; then
+    want_export=1
+  fi
+done
+mkdir -p "$export_dir"
+printf '[]\n' > "$export_dir/functions.json"
+printf 'disassembly\n' > "$export_dir/disasm.lst"
+printf 'decompiled\n' > "$export_dir/decompiled.c"
+printf 'pixel-modem-extractor-ghidra-export-v1\n\n' > "$export_dir.complete"
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&launcher, permissions).unwrap();
+
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, craft_scatter_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+
+    let result = std::process::Command::new(out.join("run_ghidra.sh"))
+        .env("GHIDRA_INSTALL_DIR", &home)
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "generated shell normalized and accepted extra marker bytes:\n{}",
+        process_diagnostics(&result)
+    );
+    for path in [
+        out.join("export/02_MAIN/functions.json"),
+        out.join("export/02_MAIN/disasm.lst"),
+        out.join("export/02_MAIN/decompiled.c"),
+        out.join("export/02_MAIN.complete"),
+    ] {
+        assert!(
+            !path.exists(),
+            "partial owned export survived: {}",
+            path.display()
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -486,13 +1241,29 @@ public class ApplySymbols extends GhidraScript {
             global_types_map: None,
         },
     )]);
-    let _pass2 =
+    let pass2 =
         pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
-    let functions = std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap();
     assert!(
-        serde_json::from_slice::<serde_json::Value>(&functions).is_err(),
-        "an instruction-free out-of-domain body range must abort before a complete inventory is emitted"
+        matches!(
+            &pass2.outcomes["00_BOOT"],
+            pixel_modem_extractor::decompile::Pass2ProcessOutcome::Failed(reason)
+                if reason.contains("incomplete current export")
+        ),
+        "an instruction-free out-of-domain body range must fail pass 2: {:?}",
+        pass2.outcomes["00_BOOT"]
     );
+    for path in [
+        out.join("export/00_BOOT/functions.json"),
+        out.join("export/00_BOOT/disasm.lst"),
+        out.join("export/00_BOOT/decompiled.c"),
+        out.join("export/00_BOOT.complete"),
+    ] {
+        assert!(
+            !path.exists(),
+            "failed pass-2 export survived: {}",
+            path.display()
+        );
+    }
     let application_log = read_ghidra_application_log(&out);
     assert!(
         application_log.contains("unassignable producer address outside u32"),
@@ -1416,21 +2187,29 @@ fn uniform_test_blob(len: usize) -> Vec<u8> {
 /// directory (only ExportDecomp.java creates it) and an empty
 /// `ghidra_project/` (a real run writes `pixel-modem.rep` into it). If the
 /// skip branch were deleted, Ghidra would import + analyze the blob and every
-/// assertion below fails (outcome becomes `Analyzed(0)` with a populated
-/// export/project). The battery verdict must also label the row "opaque",
-/// agreeing with what manifest.json would record for the same bytes.
+/// assertion below fails. Reused output must lose only the owned stale export
+/// trio and completion marker before the skip is reported. The battery verdict
+/// must also label the row "opaque", agreeing with what manifest.json would
+/// record for the same bytes.
 #[test]
 fn run_report_skips_opaque_image_without_spawning_ghidra() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
     let dir = std::env::temp_dir().join(format!("pme_opaque_skip_wiring_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("fake-ghidra");
+    std::fs::create_dir_all(home.join("support")).unwrap();
+    std::fs::write(home.join("support/analyzeHeadless"), b"not launched\n").unwrap();
     let modem_path = dir.join("modem.bin");
     std::fs::write(&modem_path, craft_modem_bin(&uniform_test_blob(256 * 1024))).unwrap();
     let out = dir.join("out");
+    let stale_export = out.join("export/00_BOOT");
+    std::fs::create_dir_all(&stale_export).unwrap();
+    for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+        std::fs::write(stale_export.join(name), b"stale\n").unwrap();
+    }
+    std::fs::write(stale_export.join("unrelated.sidecar"), b"preserve\n").unwrap();
+    let completion = out.join("export/00_BOOT.complete");
+    std::fs::write(&completion, b"pixel-modem-extractor-ghidra-export-v1\n").unwrap();
 
     let opts = pixel_modem_extractor::decompile::Opts {
         run: true,
@@ -1456,9 +2235,19 @@ fn run_report_skips_opaque_image_without_spawning_ghidra() {
     );
     assert_eq!(image.classification, Some("opaque"));
 
+    for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+        assert!(
+            !stale_export.join(name).exists(),
+            "opaque skip retained stale owned export {name}"
+        );
+    }
     assert!(
-        !out.join("export").exists(),
-        "skip must not create export/ (only ExportDecomp.java does)"
+        !completion.exists(),
+        "opaque skip retained stale completion"
+    );
+    assert_eq!(
+        std::fs::read(stale_export.join("unrelated.sidecar")).unwrap(),
+        b"preserve\n"
     );
     let project_entries: Vec<_> = std::fs::read_dir(out.join("ghidra_project"))
         .expect("run_report pre-creates ghidra_project")
