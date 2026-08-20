@@ -19,6 +19,7 @@ pub mod model;
 pub mod pipeline;
 pub mod r2_thumb;
 pub mod recover_source;
+pub mod scatter;
 pub mod source_tree;
 pub mod symbolicate;
 pub mod toc;

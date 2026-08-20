@@ -8,6 +8,7 @@
 use crate::{
     error::{Error, Result},
     execution_ranges::{ExecutionIdentity, TaggedExecutionRecord, validate_inventory_records},
+    scatter,
     toc::Toc,
 };
 use serde::Serialize;
@@ -23,12 +24,15 @@ const TAME_ANALYSIS_JAVA: &str = include_str!("ghidra/TameAnalysis.java");
 const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
 const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
+const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 /// Ghidra project name passed to `analyzeHeadless` (the directory is
 /// `<root>/ghidra_project`). Shared by pass 1 (`-import`) and pass 2
 /// (`-process`) so the two argument vectors never drift on a rename.
 const GHIDRA_PROJECT_NAME: &str = "pixel-modem";
+const GHIDRA_EXPORT_FILES: [&str; 3] = ["functions.json", "disasm.lst", "decompiled.c"];
+const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v1";
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -68,6 +72,8 @@ pub struct ImageSpec {
     pub base_addr: String,
     pub entry_point: String,
     pub blake3: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_load_map: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -109,6 +115,7 @@ pub fn build_load_spec(
                 base_addr: format!("0x{:08x}", e.load_addr),
                 entry_point: format!("0x{:08x}", e.load_addr),
                 blake3: crate::manifest::blake3_bytes(&data[start..end]),
+                runtime_load_map: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -136,6 +143,7 @@ fn headless_args(
     label: &str,
     processor: &str,
     base_addr: u32,
+    runtime_load_map: Option<&str>,
     thumb_regions: &[(u32, u32)],
     mode: &str,
 ) -> Vec<String> {
@@ -152,16 +160,25 @@ fn headless_args(
         format!("{base_addr:08x}"),
         "-scriptPath".to_string(),
         format!("{root}/scripts"),
-        // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as
-        // its arg[0]. In `datamark` mode it also disables the Aggressive
-        // Instruction Finder and marks the dense high-entropy regions passed
-        // below (each as "addrHex:lenHex") as data — Thumb-2 protocol-stack
-        // code Ghidra can't converge on, so radare2 analyzes it separately. In
-        // `tighten` mode no regions are passed (Phase 2+: let Ghidra try).
+    ];
+    if let Some(relative_path) = runtime_load_map {
+        args.extend([
+            "-preScript".to_string(),
+            "ApplyScatterLoad.java".to_string(),
+            root.to_string(),
+            label.to_string(),
+            format!("{root}/{relative_path}"),
+        ]);
+    }
+    // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as its
+    // arg[0]. In `datamark` mode it also disables the Aggressive Instruction
+    // Finder and marks the dense high-entropy regions passed below (each as
+    // "addrHex:lenHex") as data. In `tighten` mode no regions are passed.
+    args.extend([
         "-preScript".to_string(),
         "TameAnalysis.java".to_string(),
         mode.to_string(),
-    ];
+    ]);
     if mode == "datamark" {
         for (addr, len) in thumb_regions {
             args.push(format!("{addr:08x}:{len:x}"));
@@ -354,6 +371,28 @@ pub struct ImageResult {
 pub struct DecompileReport {
     pub images: Vec<ImageResult>,
     pub spec_path: PathBuf,
+    current_exports: BTreeSet<String>,
+    runtime_scatter: HashMap<String, RuntimeScatterState>,
+}
+
+impl DecompileReport {
+    pub(crate) fn export_is_current(&self, label: &str) -> bool {
+        self.current_exports.contains(label)
+    }
+
+    pub(crate) fn runtime_scatter_state(&self, label: &str) -> RuntimeScatterState {
+        self.runtime_scatter
+            .get(label)
+            .copied()
+            .unwrap_or(RuntimeScatterState::Unmanaged)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeScatterState {
+    Unmanaged,
+    Absent,
+    Present,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +548,110 @@ fn count_functions(export_dir: &Path) -> usize {
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.as_array().map(|a| a.len()))
         .unwrap_or(0)
+}
+
+#[derive(Debug, Clone)]
+struct GhidraExportRun {
+    directory: PathBuf,
+    completion: PathBuf,
+}
+
+impl GhidraExportRun {
+    fn new(root: &Path, label: &str) -> Self {
+        let export_root = root.join("export");
+        Self {
+            directory: export_root.join(label),
+            completion: export_root.join(format!("{label}.complete")),
+        }
+    }
+
+    fn invalidate(&self) -> std::io::Result<()> {
+        let mut first_error = None;
+        if let Err(error) = remove_file_if_present(&self.completion) {
+            first_error = Some(error);
+        }
+        for name in GHIDRA_EXPORT_FILES {
+            if let Err(error) = remove_file_if_present(&self.directory.join(name))
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_current(&self) -> std::result::Result<(), String> {
+        for name in GHIDRA_EXPORT_FILES {
+            let path = self.directory.join(name);
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("current Ghidra export lacks {name}: {error}"))?;
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "current Ghidra export {name} is not a regular file"
+                ));
+            }
+        }
+        let marker = std::fs::read(&self.completion)
+            .map_err(|error| format!("current Ghidra export lacks completion marker: {error}"))?;
+        let expected = format!("{GHIDRA_EXPORT_COMPLETION}\n");
+        if marker != expected.as_bytes() {
+            return Err("current Ghidra export has an invalid completion marker".to_string());
+        }
+        Ok(())
+    }
+}
+
+struct GhidraExportAttempt {
+    run: GhidraExportRun,
+    current: bool,
+}
+
+impl GhidraExportAttempt {
+    fn begin(root: &Path, label: &str) -> std::io::Result<Self> {
+        let run = GhidraExportRun::new(root, label);
+        run.invalidate()?;
+        Ok(Self {
+            run,
+            current: false,
+        })
+    }
+
+    fn mark_current(&mut self) {
+        self.current = true;
+    }
+}
+
+impl std::ops::Deref for GhidraExportAttempt {
+    type Target = GhidraExportRun;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run
+    }
+}
+
+impl Drop for GhidraExportAttempt {
+    fn drop(&mut self) {
+        if !self.current
+            && let Err(error) = self.run.invalidate()
+        {
+            tracing::warn!(
+                "failed to scrub incomplete Ghidra export {}: {error}",
+                self.run.directory.display()
+            );
+        }
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn generation_only_hint(out: &Path) -> String {
@@ -704,9 +847,9 @@ fn kill_process_group(_child_pid: u32) {
 
 /// POSIX shell-quote: wrap the input in single quotes, escaping any embedded
 /// single quote as `'\''`. Robust against `"`, `$`, backticks, semicolons,
-/// spaces, and any other shell metacharacter — used by the generated
-/// `run_ghidra.sh` for every arg, since `--processor`, `--ghidra-home`, and the
-/// project root flow in from user-controlled inputs. Empty string → `''`.
+/// spaces, and any other shell metacharacter. The generated script uses this
+/// for every non-path argument, including the user-controlled processor.
+/// Empty string → `''`.
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
@@ -724,9 +867,22 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
+fn shell_arg(arg: &str) -> String {
+    if let Some(suffix) = arg.strip_prefix("$HERE") {
+        format!("\"${{HERE}}{}\"", suffix.replace('"', "\\\""))
+    } else {
+        shell_quote(arg)
+    }
+}
+
 /// Write a turnkey `run_ghidra.sh` (one `analyzeHeadless` invocation per image),
 /// built from `headless_args` against a relocatable `$HERE` root.
-fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
+fn write_run_script(
+    out: &Path,
+    toc: &Toc,
+    processor: &str,
+    runtime_load_maps: &HashMap<String, String>,
+) -> Result<()> {
     let mut s = String::new();
     s.push_str("#!/usr/bin/env sh\n");
     s.push_str(
@@ -743,7 +899,7 @@ fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
     s.push_str("  echo \"analyzeHeadless not found under $GHIDRA_INSTALL_DIR (looked in support/ and libexec/support/)\" >&2\n");
     s.push_str("  exit 1\n");
     s.push_str("fi\n");
-    s.push_str("HERE=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\n");
+    s.push_str("HERE=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd -P)\"\n");
     s.push_str("export XDG_CONFIG_HOME=\"$HERE/ghidra_config\"\n");
     s.push_str("export XDG_CACHE_HOME=\"$HERE/ghidra_cache\"\n");
     // NOTE: `$HERE` is interpolated into these `-D…` tokens and the resulting
@@ -765,18 +921,55 @@ fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
         // empty slice and skip the entropy scan; the regions are computed in
         // `run_report` under `--run` only when `mode=datamark` actually needs them.
         let mode = "tighten";
-        let args = headless_args("$HERE", &e.label(), processor, e.load_addr, &[], mode);
-        s.push_str("\"$HEADLESS\"");
-        for a in &args {
-            // Shell-quote every arg: `--processor` and `--ghidra-home` flow in from
-            // the user and could otherwise inject into the generated script. Labels
-            // are already whitelisted by `toc::TocEntry::label` but quoting is the
-            // robust boundary. POSIX single-quote form: closes the quote on an
-            // embedded `'`, emits `'\''`, reopens.
-            s.push(' ');
-            s.push_str(&shell_quote(a));
+        let label = e.label();
+        let export_dir = format!("$HERE/export/{label}");
+        let completion = format!("$HERE/export/{label}.complete");
+        let mut cleanup = format!("rm -f {}", shell_arg(&completion));
+        for name in GHIDRA_EXPORT_FILES {
+            cleanup.push(' ');
+            cleanup.push_str(&shell_arg(&format!("{export_dir}/{name}")));
         }
+        s.push_str(&cleanup);
         s.push('\n');
+        let args = headless_args(
+            "$HERE",
+            &label,
+            processor,
+            e.load_addr,
+            runtime_load_maps.get(&label).map(String::as_str),
+            &[],
+            mode,
+        );
+        s.push_str("if \"$HEADLESS\"");
+        let mut processor_value = false;
+        for arg in &args {
+            s.push(' ');
+            if processor_value {
+                s.push_str(&shell_quote(arg));
+            } else {
+                s.push_str(&shell_arg(arg));
+            }
+            processor_value = arg == "-processor";
+        }
+        for name in GHIDRA_EXPORT_FILES {
+            s.push_str(&format!(
+                " && test -f {}",
+                shell_arg(&format!("{export_dir}/{name}"))
+            ));
+        }
+        s.push_str(&format!(
+            " && printf '%s\\n' {} | cmp -s - {}; then\n",
+            shell_quote(GHIDRA_EXPORT_COMPLETION),
+            shell_arg(&completion)
+        ));
+        s.push_str("  :\n");
+        s.push_str("else\n");
+        s.push_str("  status=$?\n");
+        s.push_str("  ");
+        s.push_str(&cleanup);
+        s.push_str(" || true\n");
+        s.push_str("  exit \"$status\"\n");
+        s.push_str("fi\n");
     }
     let path = out.join("run_ghidra.sh");
     std::fs::write(&path, s)?;
@@ -788,6 +981,42 @@ fn write_run_script(out: &Path, toc: &Toc, processor: &str) -> Result<()> {
         std::fs::set_permissions(&path, perm)?;
     }
     Ok(())
+}
+
+struct RuntimeLoadMaps {
+    paths: HashMap<String, String>,
+    states: HashMap<String, RuntimeScatterState>,
+}
+
+fn materialize_runtime_load_maps(toc: &Toc, data: &[u8], out: &Path) -> Result<RuntimeLoadMaps> {
+    let mut paths = HashMap::new();
+    let mut states = HashMap::new();
+    for entry in toc
+        .embedded()
+        .into_iter()
+        .filter(|entry| entry.name == "MAIN")
+    {
+        let label = entry.label();
+        scatter::clear_materialized(out, &label)?;
+        let start = entry.offset as usize;
+        let end = start + entry.size as usize;
+        let image = &data[start..end];
+        let plan = scatter::discover(image, entry.load_addr)
+            .map_err(|error| Error::BadScatter(error.to_string()))?;
+        let Some(plan) = plan else {
+            tracing::info!("scatter: {label} has no load-map candidate; keeping raw mapping");
+            states.insert(label, RuntimeScatterState::Absent);
+            continue;
+        };
+        let materialized = scatter::materialize(&plan, image, &label, out)?;
+        tracing::info!(
+            "scatter: {label} runtime load map -> {}",
+            materialized.relative_path
+        );
+        states.insert(label.clone(), RuntimeScatterState::Present);
+        paths.insert(label, materialized.relative_path);
+    }
+    Ok(RuntimeLoadMaps { paths, states })
 }
 
 /// Build the Ghidra import kit (always) and, with `--run`, drive `analyzeHeadless` per
@@ -802,12 +1031,18 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    // 2. embedded Java scripts -> out/scripts/{TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
+    let runtime_load_maps = materialize_runtime_load_maps(&toc, &data, out)?;
+
+    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplySymbols,
     //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
+    std::fs::write(
+        scripts.join("ApplyScatterLoad.java"),
+        APPLY_SCATTER_LOAD_JAVA,
+    )?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
@@ -822,7 +1057,10 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("modem.bin");
-    let spec = build_load_spec(&toc, &data, source_name, &opts.processor)?;
+    let mut spec = build_load_spec(&toc, &data, source_name, &opts.processor)?;
+    for image in &mut spec.images {
+        image.runtime_load_map = runtime_load_maps.paths.get(&image.name).cloned();
+    }
     let spec_path = out.join("ghidra_load.json");
     std::fs::write(
         &spec_path,
@@ -830,10 +1068,11 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     )?;
 
     // 4. turnkey shell script -> out/run_ghidra.sh
-    write_run_script(out, &toc, &opts.processor)?;
+    write_run_script(out, &toc, &opts.processor, &runtime_load_maps.paths)?;
 
     // 5. optional: drive Ghidra headless per selected image, plus radare2 for dense Thumb regions
     let mut image_results: Vec<ImageResult> = Vec::new();
+    let mut current_exports = BTreeSet::new();
     if opts.run {
         let install = find_ghidra(opts)?;
         let java_home =
@@ -890,6 +1129,28 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             } else {
                 "not_opaque"
             };
+            let mode = mode_from_opts(opts);
+            let mut export_attempt = match GhidraExportAttempt::begin(&root, &label) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    tracing::warn!(
+                        "ghidra: {label} failed to invalidate prior export before {mode} or opaque skip: {error}"
+                    );
+                    results.push(RunResult {
+                        label,
+                        outcome: ImageOutcome::Failed(-1),
+                        classification,
+                        thumb_functions: None,
+                        terminal_inventory: None,
+                        image_start: e.load_addr,
+                        image_len: e.size,
+                        thumb_error: None,
+                        tighten_error: None,
+                        thumb_decompiled: None,
+                    });
+                    continue;
+                }
+            };
             // Opaque-image gate, BEFORE any Ghidra project work: a unanimous
             // battery verdict means there is no code to recover, so bypass the
             // entire per-image Ghidra + radare2 block (no import, no tighten
@@ -922,7 +1183,6 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 continue;
             }
             let regions = thumb_regions(img, e.load_addr);
-            let mode = mode_from_opts(opts);
             tracing::info!(
                 "ghidra: analyzing {label} (base 0x{:08x}, mode={mode})",
                 e.load_addr
@@ -941,6 +1201,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 &label,
                 &opts.processor,
                 e.load_addr,
+                runtime_load_maps.paths.get(&label).map(String::as_str),
                 &regions,
                 mode,
             );
@@ -955,7 +1216,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             // definitively zero so downstream stages don't enqueue
             // work against an empty decompiled.c.
             let mut thumb_decompiled_override: Option<usize> = None;
-            let status = if mode == "tighten" {
+            let status: Option<std::process::ExitStatus> = if mode == "tighten" {
                 let mut cmd =
                     headless_command(&install.headless, &args, &root, java_home.as_deref());
                 cmd.stdout(std::process::Stdio::piped());
@@ -1070,39 +1331,63 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                             &label,
                             &opts.processor,
                             e.load_addr,
+                            runtime_load_maps.paths.get(&label).map(String::as_str),
                             &regions,
                             "datamark",
                         );
-                        let retry_status = headless_command(
-                            &install.headless,
-                            &datamark_args,
-                            &root,
-                            java_home.as_deref(),
-                        )
-                        .status()?;
-                        if retry_status.success() {
-                            tracing::info!(
-                                "ghidra: {label} datamark retry succeeded after tighten kill"
-                            );
-                        } else {
-                            tracing::warn!(
-                                "ghidra: {label} datamark retry failed (exit {}) after tighten kill",
-                                retry_status.code().unwrap_or(-1)
-                            );
+                        let retry_status = match export_attempt.invalidate() {
+                            Ok(()) => Some(
+                                headless_command(
+                                    &install.headless,
+                                    &datamark_args,
+                                    &root,
+                                    java_home.as_deref(),
+                                )
+                                .status()?,
+                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "ghidra: {label} failed to invalidate tighten output before datamark retry: {error}"
+                                );
+                                None
+                            }
+                        };
+                        if let Some(retry_status) = &retry_status {
+                            if retry_status.success() {
+                                tracing::info!(
+                                    "ghidra: {label} datamark retry succeeded after tighten kill"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "ghidra: {label} datamark retry failed (exit {}) after tighten kill",
+                                    retry_status.code().unwrap_or(-1)
+                                );
+                            }
                         }
                         retry_status
                     }
-                    None => child.wait()?,
+                    None => Some(child.wait()?),
                 }
             } else {
-                headless_command(&install.headless, &args, &root, java_home.as_deref()).status()?
+                Some(
+                    headless_command(&install.headless, &args, &root, java_home.as_deref())
+                        .status()?,
+                )
             };
-            let mut outcome = if status.success() {
-                ImageOutcome::Analyzed(count_functions(&root.join("export").join(&label)))
-            } else {
-                let code = status.code().unwrap_or(-1);
-                tracing::warn!("ghidra: {label} failed (analyzeHeadless exit {code})");
-                ImageOutcome::Failed(code)
+            let mut outcome = match status.as_ref() {
+                Some(status) if status.success() => match export_attempt.validate_current() {
+                    Ok(()) => ImageOutcome::Analyzed(count_functions(&export_attempt.directory)),
+                    Err(error) => {
+                        tracing::warn!("ghidra: {label} current export is incomplete: {error}");
+                        ImageOutcome::Failed(-1)
+                    }
+                },
+                Some(status) => {
+                    let code = status.code().unwrap_or(-1);
+                    tracing::warn!("ghidra: {label} failed (analyzeHeadless exit {code})");
+                    ImageOutcome::Failed(code)
+                }
+                None => ImageOutcome::Failed(-1),
             };
             // Ghidra can't converge on the dense Thumb-2 regions (overlap-repair loop) and
             // marked them as data — hand them to radare2 for the protocol stack.
@@ -1158,6 +1443,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             } else {
                 None
             };
+            if terminal_inventory.is_some() && matches!(outcome, ImageOutcome::Analyzed(_)) {
+                export_attempt.mark_current();
+            }
             if matches!(outcome, ImageOutcome::Analyzed(0)) {
                 tracing::warn!(
                     "ghidra: {label} yielded 0 functions — no decompilable code (e.g. a compressed/encrypted partition)"
@@ -1221,45 +1509,51 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         }
         image_results = results
             .into_iter()
-            .map(|r| ImageResult {
-                label: r.label,
-                outcome: r.outcome,
-                classification: Some(r.classification),
-                thumb_functions: r.thumb_functions,
-                ghidra_execution_accepted: r
-                    .terminal_inventory
-                    .as_ref()
-                    .map(|inventory| inventory.ghidra.accepted),
-                ghidra_execution_quarantined: r
-                    .terminal_inventory
-                    .as_ref()
-                    .map(|inventory| inventory.ghidra.quarantined),
-                thumb_execution_accepted: r
-                    .terminal_inventory
-                    .as_ref()
-                    .and_then(|inventory| inventory.thumb.map(|thumb| thumb.accepted)),
-                thumb_execution_quarantined: r
-                    .terminal_inventory
-                    .as_ref()
-                    .and_then(|inventory| inventory.thumb.map(|thumb| thumb.quarantined)),
-                image_start: r.image_start,
-                image_len: r.image_len,
-                thumb_error: r.thumb_error,
-                pass2_applied: None,
-                pass2_error: None,
-                thumb_decompiled: r.thumb_decompiled,
-                thumb_tighten_error: r.tighten_error,
-                thumb_enrich_error: None,
-                globals_error: None,
-                globals_recovered: None,
-                globals_applied: None,
-                globals_apply_skipped: None,
-                globals_apply_error: None,
-                global_types_applied: None,
-                global_types_apply_skipped: None,
-                global_types_apply_error: None,
-                globals_provisional: None,
-                globals_provisional_suppressed: None,
+            .map(|r| {
+                if r.terminal_inventory.is_some() && matches!(&r.outcome, ImageOutcome::Analyzed(_))
+                {
+                    current_exports.insert(r.label.clone());
+                }
+                ImageResult {
+                    label: r.label,
+                    outcome: r.outcome,
+                    classification: Some(r.classification),
+                    thumb_functions: r.thumb_functions,
+                    ghidra_execution_accepted: r
+                        .terminal_inventory
+                        .as_ref()
+                        .map(|inventory| inventory.ghidra.accepted),
+                    ghidra_execution_quarantined: r
+                        .terminal_inventory
+                        .as_ref()
+                        .map(|inventory| inventory.ghidra.quarantined),
+                    thumb_execution_accepted: r
+                        .terminal_inventory
+                        .as_ref()
+                        .and_then(|inventory| inventory.thumb.map(|thumb| thumb.accepted)),
+                    thumb_execution_quarantined: r
+                        .terminal_inventory
+                        .as_ref()
+                        .and_then(|inventory| inventory.thumb.map(|thumb| thumb.quarantined)),
+                    image_start: r.image_start,
+                    image_len: r.image_len,
+                    thumb_error: r.thumb_error,
+                    pass2_applied: None,
+                    pass2_error: None,
+                    thumb_decompiled: r.thumb_decompiled,
+                    thumb_tighten_error: r.tighten_error,
+                    thumb_enrich_error: None,
+                    globals_error: None,
+                    globals_recovered: None,
+                    globals_applied: None,
+                    globals_apply_skipped: None,
+                    globals_apply_error: None,
+                    global_types_applied: None,
+                    global_types_apply_skipped: None,
+                    global_types_apply_error: None,
+                    globals_provisional: None,
+                    globals_provisional_suppressed: None,
+                }
             })
             .collect();
     }
@@ -1277,6 +1571,8 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     Ok(DecompileReport {
         images: image_results,
         spec_path,
+        current_exports,
+        runtime_scatter: runtime_load_maps.states,
     })
 }
 
@@ -1781,6 +2077,15 @@ pub fn run_two_pass(
         }
 
         tracing::info!("ghidra: pass 2 application for {}", ir.label);
+        let mut export_attempt = match GhidraExportAttempt::begin(&root, &ir.label) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let reason = format!("export invalidation: {error}");
+                ir.pass2_error = Some(reason.clone());
+                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                continue;
+            }
+        };
         // Spawn failure (e.g. executable bit lost, Ghidra uninstalled mid-run)
         // lands in `pass2_error` per image instead of propagating — pass 1
         // already produced a valid `decompiled.c` for every image.
@@ -1798,6 +2103,13 @@ pub fn run_two_pass(
             }
         };
         if output.status.success() {
+            if let Err(error) = export_attempt.validate_current() {
+                let reason = format!("incomplete current export: {error}");
+                ir.pass2_error = Some(reason.clone());
+                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                continue;
+            }
+            export_attempt.mark_current();
             let stdout = String::from_utf8_lossy(&output.stdout);
             if applies_functions {
                 ir.pass2_applied = parse_pass2_summary(&stdout);
@@ -2356,6 +2668,99 @@ mod tests {
         buf
     }
 
+    const SCATTER_BASE: u32 = 0x1000_0000;
+
+    fn write_test_u32(image: &mut [u8], offset: usize, value: u32) {
+        image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_test_descriptor(
+        image: &mut [u8],
+        table_offset: usize,
+        index: usize,
+        source: u32,
+        destination: u32,
+        size: u32,
+        handler: u32,
+    ) {
+        let offset = table_offset + index * 16;
+        write_test_u32(image, offset, source);
+        write_test_u32(image, offset + 4, destination);
+        write_test_u32(image, offset + 8, size);
+        write_test_u32(image, offset + 12, handler);
+    }
+
+    fn scatter_main_image() -> Vec<u8> {
+        const IMAGE_LEN: usize = 0x1000;
+        const LOADER_OFFSET: usize = 0x40;
+        const LITERAL_OFFSET: usize = 0x80;
+        const TABLE_OFFSET: usize = 0x200;
+        const TABLE_LEN: u32 = 6 * 16;
+        const NULL_HANDLER: u32 = SCATTER_BASE + 0x600;
+        const COPY_HANDLER: u32 = SCATTER_BASE + 0x601;
+        const DECOMPRESS1_HANDLER: u32 = SCATTER_BASE + 0x604;
+        const ZERO_HANDLER: u32 = SCATTER_BASE + 0x609;
+        const SENTINEL_SOURCE: u32 = SCATTER_BASE + 0x680;
+        const SELF_COPY_SOURCE: u32 = SCATTER_BASE + 0x700;
+        const COPY_SOURCE: u32 = SCATTER_BASE + 0x710;
+        const DECOMPRESS1_SOURCE: u32 = SCATTER_BASE + 0x720;
+        const ZERO_SOURCE: u32 = SCATTER_BASE + 0x730;
+
+        let mut image = vec![0; IMAGE_LEN];
+        // ADD r0, pc, #0x38; LDMIA r0, {r10,r11}; ADD r10/r11, r0.
+        write_test_u32(&mut image, LOADER_OFFSET, 0xe28f_0038);
+        write_test_u32(&mut image, LOADER_OFFSET + 4, 0xe890_0c00);
+        write_test_u32(&mut image, LOADER_OFFSET + 8, 0xe08a_a000);
+        write_test_u32(&mut image, LOADER_OFFSET + 12, 0xe08b_b000);
+        let literal_address = SCATTER_BASE + LITERAL_OFFSET as u32;
+        let table_address = SCATTER_BASE + TABLE_OFFSET as u32;
+        write_test_u32(
+            &mut image,
+            LITERAL_OFFSET,
+            table_address.wrapping_sub(literal_address),
+        );
+        write_test_u32(
+            &mut image,
+            LITERAL_OFFSET + 4,
+            (table_address + TABLE_LEN).wrapping_sub(literal_address),
+        );
+
+        image[0x700..0x704].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        image[0x710..0x714].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        image[0x720..0x722].copy_from_slice(&[0x22, 0xaa]);
+        for (index, source, destination, size, handler) in [
+            (0, SENTINEL_SOURCE, 0, 0, NULL_HANDLER),
+            (1, 0, SENTINEL_SOURCE, 0, NULL_HANDLER),
+            (2, SELF_COPY_SOURCE, SELF_COPY_SOURCE, 4, COPY_HANDLER),
+            (3, COPY_SOURCE, 0x2000_0100, 4, COPY_HANDLER),
+            (4, DECOMPRESS1_SOURCE, 0x2000_0200, 3, DECOMPRESS1_HANDLER),
+            (5, ZERO_SOURCE, 0x2000_0300, 5, ZERO_HANDLER),
+        ] {
+            write_test_descriptor(
+                &mut image,
+                TABLE_OFFSET,
+                index,
+                source,
+                destination,
+                size,
+                handler,
+            );
+        }
+        image
+    }
+
+    fn generation_opts(image: Option<&str>) -> Opts {
+        Opts {
+            run: false,
+            image: image.map(str::to_string),
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        }
+    }
+
     #[test]
     fn headless_args_base_addr_is_hex_without_0x() {
         let args = headless_args(
@@ -2363,6 +2768,7 @@ mod tests {
             "02_MAIN",
             "ARM:LE:32:v7",
             0x4001_0000,
+            None,
             &[(0x4109_0000, 0x288_0000)],
             "datamark",
         );
@@ -2390,7 +2796,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "-overwrite"));
         // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly
         // follows the mode arg
-        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, &[], "datamark");
+        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, None, &[], "datamark");
         let zpre = z.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(z[zpre + 1], "TameAnalysis.java");
         assert_eq!(z[zpre + 2], "datamark");
@@ -2406,6 +2812,7 @@ mod tests {
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
+            None,
             &[(0x40e12000, 0x100000)],
             "tighten",
         );
@@ -2427,12 +2834,48 @@ mod tests {
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
+            None,
             &[(0x40e12000, 0x100000)],
             "datamark",
         );
         let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
         assert_eq!(args[pre_idx + 1], "datamark");
         assert!(args[pre_idx + 2..].iter().any(|a| a == "40e12000:100000"));
+    }
+
+    #[test]
+    fn headless_args_applies_scatter_before_tame_analysis() {
+        let args = headless_args(
+            "/out",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            SCATTER_BASE,
+            Some("scatter/02_MAIN/load_map.json"),
+            &[],
+            "tighten",
+        );
+        let apply = args
+            .iter()
+            .position(|arg| arg == "ApplyScatterLoad.java")
+            .unwrap();
+        let tame = args
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert_eq!(
+            &args[apply - 1..=apply + 3],
+            [
+                "-preScript",
+                "ApplyScatterLoad.java",
+                "/out",
+                "02_MAIN",
+                "/out/scatter/02_MAIN/load_map.json",
+            ]
+        );
+        assert!(apply < tame);
+
+        let raw_only = headless_args("/out", "00_BOOT", "ARM:LE:32:v7", 0, None, &[], "tighten");
+        assert!(!raw_only.iter().any(|arg| arg == "ApplyScatterLoad.java"));
     }
 
     #[test]
@@ -3384,6 +3827,148 @@ mod tests {
     }
 
     #[test]
+    fn generation_only_materializes_main_scatter_map() {
+        let main = scatter_main_image();
+        let buf = craft_modem_bin(&[("BOOT", 0, 1, &[0u8; 4]), ("MAIN", SCATTER_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+
+        run_report(&modem, &generation_opts(None), &out).unwrap();
+
+        assert!(out.join("scripts/ApplyScatterLoad.java").is_file());
+        assert!(out.join("scatter/02_MAIN/load_map.json").is_file());
+        assert_eq!(
+            std::fs::read(out.join("scatter/02_MAIN/blocks/03-copy.bin")).unwrap(),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(
+            std::fs::read(out.join("scatter/02_MAIN/blocks/04-decompress1.bin")).unwrap(),
+            [0xaa, 0, 0]
+        );
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        let main = spec["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|image| image["name"] == "02_MAIN")
+            .unwrap();
+        assert_eq!(main["runtime_load_map"], "scatter/02_MAIN/load_map.json");
+    }
+
+    #[test]
+    fn generation_only_no_candidate_omits_runtime_load_map() {
+        let buf = craft_modem_bin(&[("MAIN", SCATTER_BASE, 3, &[0u8; 64])]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        let stale = out.join("scatter/02_MAIN/stale.bin");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::write(&modem, buf).unwrap();
+
+        run_report(&modem, &generation_opts(None), &out).unwrap();
+
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        assert!(spec["images"][0].get("runtime_load_map").is_none());
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(!script.contains("ApplyScatterLoad.java"));
+        assert!(!out.join("scatter/02_MAIN").exists());
+    }
+
+    #[test]
+    fn image_filter_does_not_change_generated_main_map() {
+        let main = scatter_main_image();
+        let buf = craft_modem_bin(&[("BOOT", 0, 1, &[0u8; 4]), ("MAIN", SCATTER_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+
+        run_report(&modem, &generation_opts(Some("BOOT")), &out).unwrap();
+
+        assert!(out.join("scatter/02_MAIN/load_map.json").is_file());
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        assert_eq!(
+            spec["images"][1]["runtime_load_map"],
+            "scatter/02_MAIN/load_map.json"
+        );
+    }
+
+    #[test]
+    fn plausible_malformed_main_returns_bad_scatter() {
+        let mut main = scatter_main_image();
+        write_test_u32(&mut main, 0x200 + 5 * 16 + 8, 0);
+        let buf = craft_modem_bin(&[("MAIN", SCATTER_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+
+        let error = run_report(&modem, &generation_opts(None), &out).unwrap_err();
+
+        assert!(matches!(error, Error::BadScatter(reason) if reason.contains("entry Some(5)")));
+        assert!(!out.join("ghidra_load.json").exists());
+    }
+
+    #[test]
+    fn run_script_expands_here_for_import_and_scatter_paths() {
+        let main = scatter_main_image();
+        let buf = craft_modem_bin(&[("MAIN", SCATTER_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let processor = "$HERE/processor'; touch injected; echo '";
+        let mut opts = generation_opts(None);
+        opts.processor = processor.to_string();
+
+        run_report(&modem, &opts, &out).unwrap();
+
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(
+            script.contains("\"${HERE}/images/02_MAIN\""),
+            "script:\n{script}"
+        );
+        assert!(
+            script.contains("\"${HERE}/scatter/02_MAIN/load_map.json\""),
+            "script:\n{script}"
+        );
+        assert!(script.contains("\"${HERE}\""), "script:\n{script}");
+        assert!(!script.contains("'$HERE/images/02_MAIN'"));
+        assert!(!script.contains("'$HERE/scatter/02_MAIN/load_map.json'"));
+        for path in [
+            "${HERE}/export/02_MAIN.complete",
+            "${HERE}/export/02_MAIN/functions.json",
+            "${HERE}/export/02_MAIN/disasm.lst",
+            "${HERE}/export/02_MAIN/decompiled.c",
+        ] {
+            assert!(script.contains(path), "missing {path} in script:\n{script}");
+        }
+        assert!(
+            script.contains(GHIDRA_EXPORT_COMPLETION),
+            "missing exact completion contract in script:\n{script}"
+        );
+        assert!(
+            script.contains("cmp -s -"),
+            "marker validation must compare exact bytes:\n{script}"
+        );
+        assert!(
+            !script.contains("$(cat "),
+            "command substitution normalizes marker newlines:\n{script}"
+        );
+        assert!(
+            script.contains(&shell_quote(processor)),
+            "script:\n{script}"
+        );
+        assert!(!script.contains("\"${HERE}/processor"));
+    }
+
+    #[test]
     fn report_failure_returns_thumb_error_when_only_thumb_failed() {
         let report = DecompileReport {
             images: vec![ImageResult {
@@ -3415,6 +4000,8 @@ mod tests {
                 globals_provisional_suppressed: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
+            current_exports: BTreeSet::new(),
+            runtime_scatter: HashMap::new(),
         };
 
         let err = report_failure(&report).expect("thumb error should fail standalone run");
@@ -3488,6 +4075,8 @@ mod tests {
                 globals_provisional_suppressed: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
+            current_exports: BTreeSet::new(),
+            runtime_scatter: HashMap::new(),
         };
         assert!(report_failure(&report).is_none());
     }
@@ -3527,6 +4116,8 @@ mod tests {
                 globals_provisional_suppressed: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
+            current_exports: BTreeSet::new(),
+            runtime_scatter: HashMap::new(),
         };
 
         let err = report_failure(&report).expect("thumb error should fail standalone run");
@@ -3891,13 +4482,70 @@ mod tests {
     }
 
     #[test]
+    fn ghidra_export_run_invalidates_and_validates_only_a_complete_current_set() {
+        let root = tempfile::tempdir().unwrap();
+        let run = GhidraExportRun::new(root.path(), "02_MAIN");
+        assert_eq!(run.directory, root.path().join("export/02_MAIN"));
+        assert_eq!(run.completion, root.path().join("export/02_MAIN.complete"));
+        std::fs::create_dir_all(&run.directory).unwrap();
+        for name in GHIDRA_EXPORT_FILES {
+            std::fs::write(run.directory.join(name), format!("stale {name}\n")).unwrap();
+        }
+        std::fs::write(&run.completion, format!("{GHIDRA_EXPORT_COMPLETION}\n")).unwrap();
+
+        run.invalidate().unwrap();
+
+        assert!(!run.completion.exists());
+        for name in GHIDRA_EXPORT_FILES {
+            assert!(!run.directory.join(name).exists());
+        }
+        assert!(run.validate_current().is_err());
+
+        for name in GHIDRA_EXPORT_FILES {
+            std::fs::write(run.directory.join(name), b"current\n").unwrap();
+        }
+        std::fs::write(&run.completion, b"wrong generation\n").unwrap();
+        assert!(run.validate_current().is_err());
+        std::fs::write(&run.completion, format!("{GHIDRA_EXPORT_COMPLETION}\n")).unwrap();
+        run.validate_current().unwrap();
+    }
+
+    #[test]
+    fn export_invalidation_scrubs_other_owned_files_after_a_structural_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let run = GhidraExportRun::new(root.path(), "02_MAIN");
+        std::fs::create_dir_all(run.directory.join("functions.json")).unwrap();
+        std::fs::write(run.directory.join("disasm.lst"), b"stale\n").unwrap();
+        std::fs::write(run.directory.join("decompiled.c"), b"stale\n").unwrap();
+        std::fs::write(&run.completion, format!("{GHIDRA_EXPORT_COMPLETION}\n")).unwrap();
+
+        run.invalidate().unwrap_err();
+
+        assert!(!run.completion.exists());
+        assert!(run.directory.join("functions.json").is_dir());
+        assert!(!run.directory.join("disasm.lst").exists());
+        assert!(!run.directory.join("decompiled.c").exists());
+    }
+
+    #[test]
+    fn exporter_publishes_completion_atomically_in_the_marker_directory() {
+        assert!(
+            EXPORT_DECOMP_JAVA.contains(
+                "File.createTempFile(outDir.getName() + \".complete.\", \".tmp\", parent)"
+            )
+        );
+        assert!(EXPORT_DECOMP_JAVA.contains("StandardCopyOption.ATOMIC_MOVE"));
+        assert!(EXPORT_DECOMP_JAVA.contains("StandardCopyOption.REPLACE_EXISTING"));
+    }
+
+    #[test]
     fn run_script_probes_both_ghidra_layouts() {
         let base = std::env::temp_dir().join(format!("pme_runscript_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb, 0xcc, 0xdd])]);
         let toc = Toc::parse(&buf).unwrap();
-        write_run_script(&base, &toc, "ARM:LE:32:v7").unwrap();
+        write_run_script(&base, &toc, "ARM:LE:32:v7", &HashMap::new()).unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
         assert!(
             sh.contains("$GHIDRA_INSTALL_DIR/support/analyzeHeadless"),
@@ -3932,7 +4580,7 @@ mod tests {
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb])]);
         let toc = Toc::parse(&buf).unwrap();
         let evil = "a';rm -rf $HOME;echo'";
-        write_run_script(&base, &toc, evil).unwrap();
+        write_run_script(&base, &toc, evil, &HashMap::new()).unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
         // The processor appears only inside the single-quoted, escaped form — never
         // raw. The dangerous chars (`;`, `$`, ` `, `'`) are inert inside the quotes.

@@ -23,8 +23,11 @@
 //@category PixelModem
 import java.io.File;
 import java.io.FileWriter;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.math.BigInteger;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -50,6 +53,7 @@ import java.util.TreeSet;
 public class ExportDecomp extends GhidraScript {
     private static final long U32_END = 0x1_0000_0000L;
     private static final long U32_MAX = U32_END - 1L;
+    private static final String COMPLETION = "pixel-modem-extractor-ghidra-export-v1\n";
 
     private static class DecodeRange implements Comparable<DecodeRange> {
         final long start;
@@ -132,8 +136,28 @@ public class ExportDecomp extends GhidraScript {
         writeFunctionsJson(new File(outDir, "functions.json"), fm, listing);
         writeDisassembly(new File(outDir, "disasm.lst"), listing);
         writeDecompiledC(new File(outDir, "decompiled.c"), fm);
+        writeCompletionMarker(outDir);
 
         println("ExportDecomp: wrote export to " + outDir.getAbsolutePath());
+    }
+
+    private static void writeCompletionMarker(File outDir) throws Exception {
+        File parent = outDir.getParentFile();
+        if (parent == null) {
+            throw new Exception("export directory has no parent for completion marker");
+        }
+        File marker = new File(parent, outDir.getName() + ".complete");
+        File temporary = File.createTempFile(outDir.getName() + ".complete.", ".tmp", parent);
+        try {
+            try (FileWriter writer = new FileWriter(temporary, false)) {
+                writer.write(COMPLETION);
+            }
+            Files.move(temporary.toPath(), marker.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        }
+        finally {
+            Files.deleteIfExists(temporary.toPath());
+        }
     }
 
     // Minimal RFC 8259 string escaping: backslash, quote, and control chars.
@@ -379,8 +403,15 @@ public class ExportDecomp extends GhidraScript {
         return out.toString();
     }
 
+    private static void checkWriter(PrintWriter writer, File file) throws IOException {
+        if (writer.checkError()) {
+            throw new IOException("ExportDecomp: failed to write " + file.getAbsolutePath());
+        }
+    }
+
     private void writeFunctionsJson(File f, FunctionManager fm, Listing listing) throws Exception {
-        try (PrintWriter w = new PrintWriter(new FileWriter(f))) {
+        PrintWriter w = new PrintWriter(new FileWriter(f));
+        try (w) {
             w.println("[");
             boolean first = true;
             for (Function fn : fm.getFunctions(true)) {
@@ -407,10 +438,12 @@ public class ExportDecomp extends GhidraScript {
             }
             w.println("]");
         }
+        checkWriter(w, f);
     }
 
     private void writeDisassembly(File f, Listing listing) throws Exception {
-        try (PrintWriter w = new PrintWriter(new FileWriter(f))) {
+        PrintWriter w = new PrintWriter(new FileWriter(f));
+        try (w) {
             InstructionIterator it = listing.getInstructions(true);
             while (it.hasNext()) {
                 Instruction ins = it.next();
@@ -426,13 +459,15 @@ public class ExportDecomp extends GhidraScript {
                 w.println(ins.getAddress().toString() + ": " + hex + "  " + ins.toString());
             }
         }
+        checkWriter(w, f);
     }
 
     private void writeDecompiledC(File f, FunctionManager fm) throws Exception {
         DecompInterface dif = new DecompInterface();
         try {
             dif.openProgram(currentProgram);
-            try (PrintWriter w = new PrintWriter(new FileWriter(f))) {
+            PrintWriter w = new PrintWriter(new FileWriter(f));
+            try (w) {
                 for (Function fn : fm.getFunctions(true)) {
                     w.println("// " + fn.getName() + " @ " + fn.getEntryPoint());
                     DecompileResults res = dif.decompileFunction(fn, 60, monitor);
@@ -444,6 +479,7 @@ public class ExportDecomp extends GhidraScript {
                     w.println();
                 }
             }
+            checkWriter(w, f);
         } finally {
             dif.dispose();
         }
