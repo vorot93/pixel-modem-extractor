@@ -171,17 +171,47 @@ pub(super) fn read_rizin_xrefs_with_value_limit(
     read_rizin_xrefs_inner(capture, cap, generic_value_limit)
 }
 
-pub(crate) fn refs_for_ranges(xrefs: &[RizinXref], ranges: &[DecodeRange]) -> Vec<String> {
-    let mut targets = std::collections::BTreeSet::new();
-    for range in ranges {
-        let start = xrefs.partition_point(|xref| xref.from < range.start);
-        let end = xrefs.partition_point(|xref| xref.from < range.end);
-        targets.extend(xrefs[start..end].iter().map(|xref| xref.to));
+/// Sorted, deduplicated selected `axlj` pairs plus mapping diagnostics. A
+/// selected xref whose source lies outside every accepted decode range is
+/// permitted — analyzed code the projection quarantined still emits edges — so
+/// it is counted rather than failing the attempt.
+pub(crate) struct RizinXrefIndex {
+    xrefs: Vec<RizinXref>,
+    mapped: Vec<bool>,
+}
+
+impl RizinXrefIndex {
+    pub(crate) fn new(xrefs: Vec<RizinXref>) -> Self {
+        let mapped = vec![false; xrefs.len()];
+        Self { xrefs, mapped }
     }
-    targets
-        .into_iter()
-        .map(|target| format!("0x{target:x}"))
-        .collect()
+
+    /// Canonical ascending targets for every selected xref whose source falls
+    /// in one of `ranges`, recording those sources as mapped.
+    pub(crate) fn refs_for_ranges(&mut self, ranges: &[DecodeRange]) -> Vec<String> {
+        let mut targets = std::collections::BTreeSet::new();
+        for range in ranges {
+            let start = self.xrefs.partition_point(|xref| xref.from < range.start);
+            let end = self.xrefs.partition_point(|xref| xref.from < range.end);
+            for index in start..end {
+                self.mapped[index] = true;
+                targets.insert(self.xrefs[index].to);
+            }
+        }
+        targets
+            .into_iter()
+            .map(|target| format!("0x{target:x}"))
+            .collect()
+    }
+
+    pub(crate) fn selected(&self) -> usize {
+        self.xrefs.len()
+    }
+
+    /// Selected xrefs never attributed to any function's accepted decode range.
+    pub(crate) fn unmapped(&self) -> usize {
+        self.mapped.iter().filter(|mapped| !**mapped).count()
+    }
 }
 
 pub fn discover_rizin() -> Result<ProducerIdentity> {
@@ -623,6 +653,48 @@ DEBUG: [false diagnostic] collecting outgoing references
         let error = read_rizin_xrefs(&path, 1).unwrap_err();
 
         assert!(error.to_string().contains("cap"), "{error}");
+    }
+
+    /// Unmapped selected xrefs are permitted and counted for diagnostics; they
+    /// never fail the attempt.
+    #[test]
+    fn xref_index_counts_selected_sources_no_function_claimed() {
+        let mut index = RizinXrefIndex::new(vec![
+            RizinXref {
+                from: 0x0fff,
+                to: 0xdead,
+            },
+            RizinXref {
+                from: 0x1000,
+                to: 0x9000,
+            },
+            RizinXref {
+                from: 0x2000,
+                to: 0x9001,
+            },
+        ]);
+        assert_eq!(index.selected(), 3);
+        assert_eq!(index.unmapped(), 3);
+
+        let targets = index.refs_for_ranges(&[DecodeRange {
+            isa: DecodeIsa::Thumb,
+            start: 0x1000,
+            end: 0x1002,
+        }]);
+
+        assert_eq!(targets, vec!["0x9000"]);
+        assert_eq!(index.unmapped(), 2);
+        // Re-selecting the same source does not double-count it as mapped.
+        index.refs_for_ranges(&[DecodeRange {
+            isa: DecodeIsa::Thumb,
+            start: 0x1000,
+            end: 0x1002,
+        }]);
+        assert_eq!(index.unmapped(), 2);
+    }
+
+    fn refs_for_ranges(xrefs: &[RizinXref], ranges: &[DecodeRange]) -> Vec<String> {
+        RizinXrefIndex::new(xrefs.to_vec()).refs_for_ranges(ranges)
     }
 
     #[test]

@@ -9,8 +9,8 @@ use super::artifact::{
 };
 use super::radare2::{FunctionRecord, function_record};
 use super::rizin::{
-    RIZIN_SELECTED_XREF_CAP, RizinXref, function_record as rizin_function_record,
-    read_rizin_xrefs_with_value_limit, refs_for_ranges,
+    RIZIN_SELECTED_XREF_CAP, RizinXrefIndex, function_record as rizin_function_record,
+    read_rizin_xrefs_with_value_limit,
 };
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer, ThumbTools};
 use crate::error::{Error, Result};
@@ -841,7 +841,9 @@ fn process_region_streaming(
         &spill_path,
         ThumbProducer::Radare2,
         function_record,
-        &[],
+        // radare2 emits per-operation references directly; only Rizin needs
+        // the adapted `axlj` index.
+        &mut RizinXrefIndex::new(Vec::new()),
         usize::MAX,
     )
 }
@@ -873,13 +875,13 @@ fn process_rizin_region_streaming_with_value_limit(
 ) -> Result<RegionOutcome> {
     // Index xrefs before normalization so only validated decode ranges can
     // attribute them and a malformed trailing axlj cannot leave a spill.
-    let xrefs = read_rizin_xrefs_with_value_limit(
+    let mut xrefs = RizinXrefIndex::new(read_rizin_xrefs_with_value_limit(
         stdout_path,
         RIZIN_SELECTED_XREF_CAP,
         generic_value_limit,
-    )?;
+    )?);
     let spill_path = thumb_dir.join(format!("{addr:08x}.rizin.frags"));
-    process_region_with_adapter(
+    let outcome = process_region_with_adapter(
         stdout_path,
         image,
         load_addr,
@@ -887,9 +889,17 @@ fn process_rizin_region_streaming_with_value_limit(
         &spill_path,
         ThumbProducer::Rizin,
         rizin_function_record,
-        &xrefs,
+        &mut xrefs,
         generic_value_limit,
-    )
+    )?;
+    // Unmapped selected xrefs are permitted; only their count is reported.
+    tracing::debug!(
+        "Rizin region 0x{addr:x} adapted {} of {} selected xrefs; {} unmapped",
+        xrefs.selected() - xrefs.unmapped(),
+        xrefs.selected(),
+        xrefs.unmapped(),
+    );
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -901,7 +911,7 @@ fn process_region_with_adapter(
     spill_path: &Path,
     producer: ThumbProducer,
     adapt: fn(&serde_json::Value) -> FunctionRecord,
-    xrefs: &[RizinXref],
+    xrefs: &mut RizinXrefIndex,
     generic_value_limit: usize,
 ) -> Result<RegionOutcome> {
     match process_region_inner(
@@ -938,7 +948,7 @@ fn process_region_inner(
     spill_path: &Path,
     producer: ThumbProducer,
     adapt: fn(&serde_json::Value) -> FunctionRecord,
-    xrefs: &[RizinXref],
+    xrefs: &mut RizinXrefIndex,
     generic_value_limit: usize,
 ) -> Result<RegionOutcome> {
     let file = std::fs::File::open(stdout_path)?;
@@ -1118,7 +1128,7 @@ fn normalize_and_spill(
     load_addr: u32,
     addr: u32,
     producer: ThumbProducer,
-    xrefs: &[RizinXref],
+    xrefs: &mut RizinXrefIndex,
 ) -> Result<()> {
     let normalized = match producer {
         ThumbProducer::Radare2 => {
@@ -1389,11 +1399,13 @@ fn normalize_radare2_record_checked(
     Ok(output)
 }
 
+/// Test-only single-record helper: owns the xref index so cases can pass a
+/// plain slice of selected pairs.
 #[cfg(test)]
 fn normalize_rizin_function_checked(
     raw: &serde_json::Value,
     pdfj: Option<&serde_json::Value>,
-    xrefs: &[RizinXref],
+    xrefs: &[super::rizin::RizinXref],
     image: &[u8],
     load_addr: u32,
     region_addr: u32,
@@ -1401,7 +1413,7 @@ fn normalize_rizin_function_checked(
     normalize_rizin_record_checked(
         &rizin_function_record(raw),
         pdfj,
-        xrefs,
+        &mut RizinXrefIndex::new(xrefs.to_vec()),
         image,
         load_addr,
         region_addr,
@@ -1411,7 +1423,7 @@ fn normalize_rizin_function_checked(
 fn normalize_rizin_record_checked(
     record: &FunctionRecord,
     pdfj: Option<&serde_json::Value>,
-    xrefs: &[RizinXref],
+    xrefs: &mut RizinXrefIndex,
     image: &[u8],
     load_addr: u32,
     region_addr: u32,
@@ -1425,7 +1437,7 @@ fn normalize_rizin_record_checked(
         region_addr,
     )?;
     let data_refs = match &projection {
-        ExecutionProjection::Accepted(ranges) => refs_for_ranges(xrefs, ranges),
+        ExecutionProjection::Accepted(ranges) => xrefs.refs_for_ranges(ranges),
         ExecutionProjection::Quarantined(_) => Vec::new(),
     };
     output["data_refs"] = serde_json::json!(data_refs);
@@ -6145,7 +6157,7 @@ esac
                 &spill,
                 ThumbProducer::Rizin,
                 rizin_function_record,
-                &[],
+                &mut RizinXrefIndex::new(Vec::new()),
                 64,
             ) {
                 Ok(_) => panic!("{case} must fail"),
