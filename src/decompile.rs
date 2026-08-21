@@ -13,8 +13,9 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     ffi::{OsStr, OsString},
+    io::BufRead,
     num::NonZeroUsize,
     path::{Path, PathBuf},
 };
@@ -2713,27 +2714,22 @@ pub fn find_radare2() -> Option<PathBuf> {
 /// `FUN_<addr>`/recovered names. Returns the count of functions whose `body_c`
 /// was populated.
 ///
-/// Fail-closed: a malformed `decompiled.c` (read or parse failure) returns `Err`;
-/// the on-disk `thumb_functions.json` is unchanged.
+/// Both inputs stream: the C file is read line-by-line into the address-to-body
+/// map and the artifact is rewritten one function at a time through the shared
+/// atomic v1/v2/v3 mutator. No whole artifact `Value` tree is materialized.
+/// Any malformed input fails closed with the on-disk artifact unchanged.
 pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
-    // std::io::Error auto-converts via Error::Io(#[from]) — `?` propagates directly.
-    let c_text = std::fs::read_to_string(decompiled_c_path)?;
-
-    // Phase 2.1: parse decompiled.c into {normalized_entry_address -> body_text}.
-    let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
-
-    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path)?;
-
+    let bodies = collect_decompiled_c_bodies(decompiled_c_path)?;
     let mut populated = 0usize;
-    for function in artifact.function_values_mut() {
+    crate::thumb_analysis::stream_rewrite_thumb_functions(thumb_functions_json_path, |function| {
         // Phase 2.1: match by `entry` (address), not by `name`. The `name`
         // field is analyzer-generated and does not reliably align with
         // Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
         let Some(entry_str) = function.get("entry").and_then(|name| name.as_str()) else {
-            continue;
+            return Ok(());
         };
         let Some(canonical) = normalize_thumb_addr(entry_str) else {
-            continue;
+            return Ok(());
         };
         if let Some(body) = bodies.get(&canonical) {
             function.as_object_mut().unwrap().insert(
@@ -2742,8 +2738,33 @@ pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) 
             );
             populated += 1;
         }
-    }
+        Ok(())
+    })?;
+    Ok(populated)
+}
 
+/// Whole-file differential oracle for the streaming enricher.
+#[cfg(test)]
+fn thumb_enrich_whole(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    let c_text = std::fs::read_to_string(decompiled_c_path)?;
+    let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path)?;
+    let mut populated = 0usize;
+    for function in artifact.function_values_mut() {
+        let Some(entry) = function.get("entry").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(entry) = normalize_thumb_addr(entry) else {
+            continue;
+        };
+        if let Some(body) = bodies.get(&entry) {
+            function.as_object_mut().unwrap().insert(
+                "body_c".to_string(),
+                serde_json::Value::String(body.clone()),
+            );
+            populated += 1;
+        }
+    }
     artifact.write_atomic(thumb_functions_json_path)?;
     Ok(populated)
 }
@@ -2825,7 +2846,9 @@ mod normalize_thumb_addr_tests {
 /// `normalize_thumb_addr` clears it so the canonical key matches radare2's
 /// even-form `entry` field. Functions whose header lacks ` @ <addr>` are
 /// silently skipped (no key to insert under) — same fail-soft posture as the
-/// prior name-based parser.
+/// prior name-based parser. This whole-string implementation is retained only
+/// as the differential oracle for the streaming collector.
+#[cfg(test)]
 fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let lines: Vec<&str> = c_text.lines().collect();
@@ -2935,6 +2958,150 @@ fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, S
         i += 1;
     }
     out
+}
+
+fn collect_decompiled_c_bodies(path: &Path) -> Result<HashMap<String, String>> {
+    let file = std::fs::File::open(path)?;
+    let mut source = LineSource::new(std::io::BufReader::new(file));
+    let mut out = HashMap::new();
+    while let Some(line) = source.next_line()? {
+        let Some(addr_str) = decompiled_c_header_addr(&line) else {
+            continue;
+        };
+        let mut window = VecDeque::with_capacity(8);
+        let mut opens_brace = false;
+        while window.len() < 8 {
+            let Some(next) = source.next_line()? else {
+                break;
+            };
+            opens_brace |= next.contains('{');
+            window.push_back(next);
+            if opens_brace {
+                break;
+            }
+        }
+        if !opens_brace {
+            source.push_front_all(window);
+            continue;
+        }
+        let mut scan = BodyScan::default();
+        let mut body = String::new();
+        let mut closed = scan.push_line(&line, &mut body);
+        while !closed {
+            let next = window
+                .pop_front()
+                .map_or_else(|| source.next_line(), |line| Ok(Some(line)));
+            let Some(next) = next? else { break };
+            closed = scan.push_line(&next, &mut body);
+        }
+        source.push_front_all(window);
+        if let Some(canonical) = normalize_thumb_addr(addr_str) {
+            out.insert(canonical, body);
+        }
+    }
+    Ok(out)
+}
+
+fn decompiled_c_header_addr(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("//")
+        .and_then(|rest| rest.rsplit_once(" @ "))
+        .map(|(_, addr)| addr.trim())
+        .filter(|addr| !addr.is_empty())
+}
+
+struct LineSource<B: BufRead> {
+    lines: std::io::Lines<B>,
+    pushback: VecDeque<String>,
+}
+
+impl<B: BufRead> LineSource<B> {
+    fn new(reader: B) -> Self {
+        Self {
+            lines: reader.lines(),
+            pushback: VecDeque::new(),
+        }
+    }
+
+    fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        if let Some(line) = self.pushback.pop_front() {
+            return Ok(Some(line));
+        }
+        self.lines.next().transpose()
+    }
+
+    fn push_front_all(&mut self, lines: VecDeque<String>) {
+        for line in lines.into_iter().rev() {
+            self.pushback.push_front(line);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BodyScan {
+    depth: i32,
+    saw_brace: bool,
+    in_string: bool,
+    in_char: bool,
+    escaped: bool,
+    in_block_comment: bool,
+}
+
+impl BodyScan {
+    fn push_line(&mut self, line: &str, body: &mut String) -> bool {
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if self.in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    self.in_block_comment = false;
+                }
+                continue;
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            if self.in_char {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '\'' {
+                    self.in_char = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => self.in_string = true,
+                '\'' => self.in_char = true,
+                '/' => {
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    } else if chars.peek() == Some(&'*') {
+                        chars.next();
+                        self.in_block_comment = true;
+                    }
+                }
+                '{' => {
+                    self.depth += 1;
+                    self.saw_brace = true;
+                }
+                '}' => self.depth -= 1,
+                _ => {}
+            }
+        }
+        body.push_str(line);
+        body.push('\n');
+        self.saw_brace && self.depth <= 0
+    }
 }
 
 #[cfg(test)]
@@ -5701,7 +5868,6 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
-
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pme_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6063,6 +6229,110 @@ void FUN_10(void)\n\
         assert!(
             body.ends_with("}\n") || body.trim_end().ends_with('}'),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn streaming_decompiled_c_body_collection_matches_whole_oracle() {
+        let fixtures = [
+            "\n\n// FUN_100 @ 0x100\nvoid FUN_100(void)\n{\n  return;\n}\n\n",
+            "\n\n// FUN_200 @ 0x200\nvoid FUN_200(\n    int a)\n{\n  a;\n}\n",
+            "// f @ 40e1201\nvoid f(void)\n{\n  x;\n}\n",
+            "// f @ 0x00040e1200\nint f(void)\n{\n  return \"}{\"[0];\n}\n",
+            "// g @ 0x300\nvoid g(void);\n\n\n\n\n\n\n\n\n{\n}\n",
+            "// a @ 0x10\nvoid a(void)\n{\n}\n// b @ 0x20\nvoid b(void)\n{\n}\n",
+            "// h @ 0x40\nvoid h(\n   int a,\n   int b,\n   int c,\n   int d,\n   int e)\n{\n}\n",
+            "",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (index, text) in fixtures.iter().enumerate() {
+            let path = dir.path().join(format!("fixture-{index}.c"));
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                collect_decompiled_c_bodies(&path).unwrap(),
+                parse_decompiled_c_function_bodies_by_addr(text),
+                "fixture {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_thumb_enrich_matches_whole_oracle_for_legacy_and_v3() {
+        let c = "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n  return;\n}\n";
+        let inputs: [&[u8]; 2] = [
+            br#"{
+  "format": "pixel-modem-extractor-thumb-functions-v2",
+  "functions": [
+    {"entry":"0x4000","name":"thumb_4000","size":4,"body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}
+  ]
+}"#,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        ];
+        for (index, input) in inputs.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let c_path = dir.path().join("decompiled.c");
+            let streaming = dir.path().join("streaming.json");
+            let oracle = dir.path().join("oracle.json");
+            std::fs::write(&c_path, c).unwrap();
+            std::fs::write(&streaming, input).unwrap();
+            std::fs::write(&oracle, input).unwrap();
+
+            let streaming_count = thumb_enrich(&c_path, &streaming).unwrap();
+            let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
+
+            assert_eq!(streaming_count, oracle_count, "fixture {index} count");
+            assert_eq!(
+                std::fs::read(&streaming).unwrap(),
+                std::fs::read(&oracle).unwrap(),
+                "fixture {index} bytes"
+            );
+        }
+    }
+
+    /// Production-scale differential replay. The retained tree is read-only;
+    /// both enrichers operate on disposable copies outside the tree.
+    #[test]
+    fn streaming_enrich_ab_matches_oracle_on_production_inputs() {
+        let Ok(root) = std::env::var("PME_GOLDEN_DIR") else {
+            return;
+        };
+        let images = Path::new(&root).join("images");
+        let Some(main_dir) = std::fs::read_dir(&images)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("decompiled"))
+            .find(|dir| {
+                dir.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.to_string_lossy().ends_with("_MAIN"))
+                    && dir.join("decompiled.c").is_file()
+                    && dir.join("thumb_functions.json").is_file()
+            })
+        else {
+            return;
+        };
+        let c_path = main_dir.join("decompiled.c");
+        let source = main_dir.join("thumb_functions.json");
+        let work = tempfile::tempdir().unwrap();
+        let streaming = work.path().join("streaming.json");
+        let oracle = work.path().join("oracle.json");
+        std::fs::copy(&source, &streaming).unwrap();
+        std::fs::copy(&source, &oracle).unwrap();
+
+        let streaming_count = thumb_enrich(&c_path, &streaming).unwrap();
+        let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
+
+        assert_eq!(streaming_count, oracle_count);
+        assert!(streaming_count > 0, "production replay enriched no records");
+        assert_eq!(
+            std::fs::metadata(&streaming).unwrap().len(),
+            std::fs::metadata(&oracle).unwrap().len()
+        );
+        assert_eq!(
+            crate::manifest::blake3_file(&streaming).unwrap(),
+            crate::manifest::blake3_file(&oracle).unwrap()
         );
     }
 }

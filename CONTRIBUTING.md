@@ -263,10 +263,10 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `decode_rf.rs` | Decode the RF_CFG calibration databases |
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
-| `decompile.rs` | Ghidra import kit, `--run` orchestration, Thumb summary/currentness, and v3-preserving enrichment |
+| `decompile.rs` | Ghidra import kit, `--run` orchestration, Thumb summary/currentness, and streaming v3-preserving enrichment |
 | `thumb_analysis/mod.rs` | Tool discovery/identity, public configuration and summaries, and subsystem exports |
 | `thumb_analysis/stream.rs` | Request validation, fallback coordination, process supervision, bounded capture/scanning, normalization, and spills |
-| `thumb_analysis/artifact.rs` | Sole v1/v2/v3 parser, strict run ownership, canonical assembly, terminal validation, and atomic mutation |
+| `thumb_analysis/artifact.rs` | Sole v1/v2/v3 parser, strict run ownership, typed consumer streaming, canonical assembly, terminal validation, and streaming atomic mutation |
 | `thumb_analysis/radare2.rs` | radare2 command profile, inventory aliases/bounds, and per-operation reference adaptation |
 | `thumb_analysis/rizin.rs` | Rizin command profile, inventory aliases/bounds, trailing `axlj` streaming, filtering, and range assignment |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
@@ -567,10 +567,21 @@ hardcoded. Two reference images exercise both models end-to-end:
   entry must not win over a live one for the same token); recover_func_name dedups
   `data_refs` by string content before the "exactly one identifier" check so a repeated
   `__func__` reference doesn't look ambiguous.
-  Scale note: `02_MAIN`'s `thumb_functions.json` is large (~600 MB, ~141k Thumb functions)
-  and is loaded/rewritten whole (~4 s, ~3 GB peak); pw_tokenizer strings are structured
-  `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not raw literals, so
-  a byte search won't find them).
+  Scale note: `02_MAIN`'s `thumb_functions.json` is large (632 MB with
+  `body_c`, ~141k Thumb functions). `thumb_enrich` no longer loads/rewrites
+  it whole — the Stage-2 streaming rewrite is bounded by the ~86 MB
+  `decompiled.c` bodies map plus one function record (measured production
+  A/B on the real inputs: 130 s, 2.29 GB peak, byte-identical to the
+  whole-file oracle; see the radare2 streaming bullets) — and `symbolicate`'s
+  finalize rewrites stream too (Stage 4: element-wise stamps and `body_c`
+  renames through `thumb_analysis::stream_rewrite_json_array` /
+  `stream_rewrite_thumb_functions`, byte-identical to the whole-file
+  rewriters on the real production tree); and the ARM loader holds zero-copy
+  borrowed views of `disasm.lst` (Stage 5), so the pathological wide-range
+  Ghidra records no longer copy ~190 MB each — see the radare2 streaming
+  bullets; pw_tokenizer strings are structured
+  `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not
+  raw literals, so a byte search won't find them).
 - **String-reference name guesses.** Beyond `__func__` (Recovered) and token
   matches (Provisional `guess_`), `symbolicate` recovers a third, lowest-
   precedence evidence source: a function's single *distinct* referenced
@@ -1405,12 +1416,14 @@ hardcoded. Two reference images exercise both models end-to-end:
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
   goldens need a complete unpruned tree; a pruned golden has no raw
   `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
-  former whole-buffer r2 path) is gone: both backends use the shared streaming
-  producer described above. Whole-file consumers remain, so plan per the README's
-  memory note. Outside the existing canonical adapters, do not parse Ghidra/radare2/Rizin
-  disassembly text, infer ISA from alignment or inventory name, attribute
-  an address to the nearest global, or leak decoder-crate enums outside
-  `decoder.rs`.
+  former whole-buffer r2 path) is gone. Both Thumb backends, enrichment,
+  typed `recover_source` loading, and symbolication's artifact mutations
+  stream; ARM disassembly records borrow zero-copy ranges from the shared
+  buffer. The full-`decompose` peak is ~7.7 GB in Ghidra's own analyze/export
+  phase (2026-08-21 probe; the Rust process peaks near ~2.5 GB). Outside the
+  existing canonical adapters, do not parse Ghidra/radare2/Rizin disassembly
+  text, infer ISA from alignment or inventory name, attribute an address to
+  the nearest global, or leak decoder-crate enums outside `decoder.rs`.
 - **Phase 3.2 type application.** Default-on in every normal-route `decompose`
   (there is no pass 2 on `--no-symbol-pass`, so this never runs there —
   shapes are still recovered into the sidecar on that route). **Fidelity is
@@ -1604,9 +1617,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   capture, pairs inventories and bodies with backend-specific rules, validates
   boundaries, and spills normalized records to producer-qualified `.frags` files
   before atomically assembling strict v3. Rizin additionally streams `axlj` values
-  through the selected-xref cap. Producer peak RSS is bounded by one JSON value,
-  while later whole-document consumers such as enrichment and symbolication still
-  require memory proportional to `thumb_functions.json`.
+  through the selected-xref cap. Producer peak RSS is bounded by one JSON value;
+  enrichment, typed source recovery, and symbolication mutations also stream as
+  described below.
 - **Historical retained-capture replay is a boundary/conservation gate, not a byte
   identity oracle.** The env-gated
   `streaming_replays_retained_production_thumb_captures_with_v3_boundaries` test
@@ -1618,6 +1631,44 @@ hardcoded. Two reference images exercise both models end-to-end:
   `datamark` mode and skips both `body_c` enrichment sweeps; dense-region radare2
   analysis and opt-in failure-only Rizin fallback otherwise follow the same shared
   route and limits.
+- **`thumb_enrich` is streaming, atomic, and bounded (memory-envelope Stage
+  2).** `decompile::thumb_enrich` collects `decompiled.c` bodies line-by-line
+  (~86 MB map on `02_MAIN`) and delegates the artifact rewrite to
+  `thumb_analysis::artifact`, which retains one function `Value` at a time.
+  Strict v3 metadata and producer-written fields are validated and preserved;
+  a changed v1 file promotes to v2, v2/v3 keep their format, and a semantic
+  no-op leaves the original bytes untouched. The production A/B over a 632 MB
+  artifact plus 86 MB C file measured 130 seconds and 2.29 GB peak RSS with
+  byte-identical output and equal populated counts versus the whole-file oracle.
+- **Typed source loading and zero-copy ARM disassembly complete Stages 3 and
+  5.** `RecoveredFunctions::load` reads `functions.json` and producer-owned
+  Thumb records through typed buffered readers; strict v3 run ownership is
+  resolved before records are exposed, with no document-wide `Value` tree.
+  The measured in-pipeline load fell to ~0.6 GB from ~20 GB. `FuncRec.disasm`
+  is a `Cow` view: `DisasmIndex::slice_cow` borrows ordinary newline-terminated
+  ranges and falls back to an owned `slice_for` copy only for CRLF or a missing
+  final newline. The standalone symbolication A/B was byte-identical and fell
+  from 24 GB to 1.8 GB; a full `decompose` now peaks near ~7.7 GB in Ghidra,
+  while the Rust process peaks near ~2.5 GB (mostly real owned Thumb bodies).
+- **Finalize rewrites stream and preserve strict v3 (Stage 4).** Symbolication's
+  `functions.json` stamps and Thumb `name`/`original_name`/`annotations`/`body_c`
+  changes use `stream_rewrite_json_array` and
+  `stream_rewrite_thumb_functions`. The latter validates metadata-first v3,
+  ordered run ownership and derived counts, rejects producer-field or unknown
+  field changes, and writes canonical metadata plus one function at a time.
+  Every rewrite is atomic and a no-op is byte-identical. Legacy mutation keeps
+  the established v1-to-v2 promotion. Differential whole-file oracles remain
+  test-only; the production-scale enrich replay is
+  `streaming_enrich_ab_matches_oracle_on_production_inputs`.
+- **Golden/production `body_c` embeds TWO enrich generations.** A completed
+  tree's `thumb_functions.json` carries pass-1 residue (addresses whose
+  bodies left the final `decompiled.c` when pass 2 overwrote it) plus the
+  post-pass-2 bodies — so no single-sweep enrich over any reconstructible
+  input can byte-match a completed tree's file. Verification of enrich
+  changes is therefore the in-test oracle A/B on real inputs
+  (`streaming_enrich_ab_matches_oracle_on_production_inputs`), not a golden
+  byte-compare. Anyone re-baselining goldens or writing enrich tests must
+  know this, or they will chase a phantom mismatch.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`

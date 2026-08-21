@@ -126,6 +126,39 @@ pub(crate) struct OwnedFunctionRef<'a> {
     pub value: &'a Value,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThumbDecodeRange {
+    pub end: String,
+    pub isa: String,
+    pub start: String,
+}
+
+/// Typed function payload used by streaming consumers. Unlike the strict v3
+/// wire type, this accepts legacy enrichment fields and ignores unknown legacy
+/// fields while avoiding a document-sized `serde_json::Value` tree.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThumbFunctionRecord {
+    pub name: String,
+    #[serde(default)]
+    pub original_name: Option<String>,
+    pub entry: String,
+    pub end: String,
+    pub size: u64,
+    pub body_kind: String,
+    pub body: String,
+    #[serde(default)]
+    pub data_refs: Vec<String>,
+    #[serde(default)]
+    pub decode_ranges: Vec<ThumbDecodeRange>,
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedThumbFunction {
+    pub producer: ThumbProducer,
+    pub legacy_range_semantics: bool,
+    pub function: ThumbFunctionRecord,
+}
+
 impl ParsedThumbArtifact {
     pub fn functions(&self) -> impl ExactSizeIterator<Item = OwnedFunctionRef<'_>> {
         let legacy_range_semantics = self.format != ThumbFormat::V3;
@@ -214,26 +247,7 @@ impl ParsedThumbArtifact {
             .zip(&self.document.functions)
             .enumerate()
         {
-            let original = original.as_object().ok_or_else(|| {
-                invalid_artifact(format!("original v3 function {index} is not an object"))
-            })?;
-            let current = current.as_object().ok_or_else(|| {
-                invalid_artifact(format!("mutated v3 function {index} is not an object"))
-            })?;
-            for field in IMMUTABLE_FIELDS {
-                if current.get(field) != original.get(field) {
-                    return Err(invalid_artifact(format!(
-                        "v3 function {index} producer field {field:?} changed during mutation"
-                    )));
-                }
-            }
-            for field in ["original_name", "annotations", "body_c"] {
-                if original.contains_key(field) && !current.contains_key(field) {
-                    return Err(invalid_artifact(format!(
-                        "v3 function {index} enrichment field {field:?} was removed"
-                    )));
-                }
-            }
+            validate_v3_function_mutation(original, current, index, &IMMUTABLE_FIELDS)?;
         }
         let owners = validate_v3(
             &self.document.producers,
@@ -247,6 +261,36 @@ impl ParsedThumbArtifact {
         }
         Ok(())
     }
+}
+
+fn validate_v3_function_mutation(
+    original: &Value,
+    current: &Value,
+    index: usize,
+    immutable_fields: &[&str],
+) -> Result<()> {
+    let original = original.as_object().ok_or_else(|| {
+        invalid_artifact(format!("original v3 function {index} is not an object"))
+    })?;
+    let current_object = current
+        .as_object()
+        .ok_or_else(|| invalid_artifact(format!("mutated v3 function {index} is not an object")))?;
+    for field in immutable_fields {
+        if current_object.get(*field) != original.get(*field) {
+            return Err(invalid_artifact(format!(
+                "v3 function {index} producer field {field:?} changed during mutation"
+            )));
+        }
+    }
+    for field in ["original_name", "annotations", "body_c"] {
+        if original.contains_key(field) && !current_object.contains_key(field) {
+            return Err(invalid_artifact(format!(
+                "v3 function {index} enrichment field {field:?} was removed"
+            )));
+        }
+    }
+    validate_function_value(current, index, None)?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +400,30 @@ struct FunctionWire {
     annotations: OptionalField<Vec<String>>,
     #[serde(default, skip_serializing_if = "OptionalField::is_missing")]
     body_c: OptionalField<String>,
+}
+
+impl From<FunctionWire> for ThumbFunctionRecord {
+    fn from(function: FunctionWire) -> Self {
+        Self {
+            name: function.name,
+            original_name: function.original_name.0,
+            entry: function.entry,
+            end: function.end,
+            size: function.size,
+            body_kind: function.body_kind,
+            body: function.body,
+            data_refs: function.data_refs,
+            decode_ranges: function
+                .decode_ranges
+                .into_iter()
+                .map(|range| ThumbDecodeRange {
+                    end: range.end,
+                    isa: range.isa,
+                    start: range.start,
+                })
+                .collect(),
+        }
+    }
 }
 
 enum WireDocument {
@@ -993,6 +1061,280 @@ pub(crate) fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> 
 
 pub(crate) fn read_thumb_artifact(path: &Path) -> Result<ParsedThumbArtifact> {
     parse_thumb_artifact(&std::fs::read(path)?)
+}
+
+/// Load consumer-facing Thumb records directly from a buffered JSON reader.
+/// Metadata and run ownership are validated before records are exposed, and
+/// only typed records (not a document-wide `Value` tree) are retained.
+pub(crate) fn read_thumb_functions_streaming(path: &Path) -> Result<Vec<OwnedThumbFunction>> {
+    let file = std::fs::File::open(path)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let mut scan = TypedFunctionScan::default();
+    let parsed = deserializer.deserialize_map(TypedFunctionVisitor { scan: &mut scan });
+    parsed
+        .and_then(|()| deserializer.end())
+        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))?;
+    scan.finish()
+}
+
+#[derive(Default)]
+struct TypedFunctionScan {
+    format: Option<ThumbFormat>,
+    saw_producers: bool,
+    saw_regions: bool,
+    saw_functions: bool,
+    layout: Option<V3Layout>,
+    observed: Vec<RunCounts>,
+    functions: Vec<OwnedThumbFunction>,
+}
+
+impl TypedFunctionScan {
+    fn set_v3_metadata(
+        &mut self,
+        producers: Vec<ProducerWire>,
+        regions: Vec<RegionWire>,
+    ) -> Result<()> {
+        let producers = convert_producers(producers)?;
+        let regions = convert_regions(regions)?;
+        let layout = validate_v3_metadata(&producers, &regions)?;
+        self.observed = vec![RunCounts::default(); layout.runs.len()];
+        self.layout = Some(layout);
+        Ok(())
+    }
+
+    fn push_legacy(&mut self, function: ThumbFunctionRecord) {
+        self.functions.push(OwnedThumbFunction {
+            producer: ThumbProducer::Radare2,
+            legacy_range_semantics: true,
+            function,
+        });
+    }
+
+    fn push_v3(&mut self, function: FunctionWire) -> Result<()> {
+        let function_index = self.functions.len();
+        let value = serde_json::to_value(&function).map_err(|error| {
+            invalid_artifact(format!(
+                "v3 function {function_index} cannot be rendered: {error}"
+            ))
+        })?;
+        let (substantial, accepted, quarantined) =
+            validate_function_value(&value, function_index, None)?;
+        let layout = self.layout.as_ref().ok_or_else(|| {
+            invalid_artifact("v3 artifact lacks validated producer and region metadata")
+        })?;
+        let run_index = layout.runs.iter().position(|run| {
+            run.first_function <= function_index
+                && function_index < run.first_function.saturating_add(run.function_count)
+        });
+        let Some(run_index) = run_index else {
+            return Err(invalid_artifact(
+                "every v3 function must have exactly one run owner",
+            ));
+        };
+        let run = &layout.runs[run_index];
+        let observed = &mut self.observed[run_index];
+        observed.substantial += usize::from(substantial);
+        observed.accepted += usize::from(accepted);
+        observed.quarantined += usize::from(quarantined);
+        self.functions.push(OwnedThumbFunction {
+            producer: run.producer,
+            legacy_range_semantics: false,
+            function: function.into(),
+        });
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<OwnedThumbFunction>> {
+        let format = self
+            .format
+            .ok_or_else(|| invalid_artifact("missing Thumb artifact format"))?;
+        if !self.saw_functions {
+            return Err(invalid_artifact("Thumb artifact lacks functions array"));
+        }
+        if format == ThumbFormat::V3 {
+            let layout = self.layout.as_ref().ok_or_else(|| {
+                invalid_artifact("v3 artifact lacks validated producer and region metadata")
+            })?;
+            if self.functions.len() != layout.function_count {
+                return Err(invalid_artifact(
+                    "every v3 function must have exactly one run owner",
+                ));
+            }
+            for (run_index, (run, observed)) in layout.runs.iter().zip(&self.observed).enumerate() {
+                if (run.substantial, run.accepted, run.quarantined)
+                    != (
+                        observed.substantial,
+                        observed.accepted,
+                        observed.quarantined,
+                    )
+                {
+                    return Err(invalid_artifact(format!(
+                        "v3 run {run_index} stored counts do not match its functions"
+                    )));
+                }
+            }
+        }
+        Ok(self.functions)
+    }
+}
+
+struct TypedFunctionVisitor<'a> {
+    scan: &'a mut TypedFunctionScan,
+}
+
+impl<'de> Visitor<'de> for TypedFunctionVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a canonical Thumb artifact object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let key = map
+            .next_key::<String>()?
+            .ok_or_else(|| de::Error::missing_field("format"))?;
+        if key != "format" {
+            return Err(de::Error::custom(format!(
+                "expected top-level field \"format\", found {key:?}"
+            )));
+        }
+        let raw_format = map.next_value::<String>()?;
+        let format = ThumbFormat::parse(&raw_format)
+            .ok_or_else(|| de::Error::custom("unsupported Thumb artifact format"))?;
+        self.scan.format = Some(format);
+
+        match format {
+            ThumbFormat::V1 | ThumbFormat::V2 => {
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("functions"))?;
+                if key != "functions" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"functions\", found {key:?}"
+                    )));
+                }
+                self.scan.saw_functions = true;
+                map.next_value_seed(TypedLegacyFunctions {
+                    scan: &mut *self.scan,
+                })?;
+            }
+            ThumbFormat::V3 => {
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("producers"))?;
+                if key != "producers" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"producers\", found {key:?}"
+                    )));
+                }
+                self.scan.saw_producers = true;
+                let producers = map.next_value::<Vec<ProducerWire>>()?;
+
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("regions"))?;
+                if key != "regions" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"regions\", found {key:?}"
+                    )));
+                }
+                self.scan.saw_regions = true;
+                let regions = map.next_value::<Vec<RegionWire>>()?;
+                self.scan
+                    .set_v3_metadata(producers, regions)
+                    .map_err(de::Error::custom)?;
+
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("functions"))?;
+                if key != "functions" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"functions\", found {key:?}"
+                    )));
+                }
+                self.scan.saw_functions = true;
+                map.next_value_seed(TypedV3Functions {
+                    scan: &mut *self.scan,
+                })?;
+            }
+        }
+
+        if let Some(key) = map.next_key::<String>()? {
+            return Err(de::Error::custom(format!(
+                "unexpected top-level field {key:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct TypedLegacyFunctions<'a> {
+    scan: &'a mut TypedFunctionScan,
+}
+
+impl<'de> DeserializeSeed<'de> for TypedLegacyFunctions<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for TypedLegacyFunctions<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Thumb functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(function) = seq.next_element::<ThumbFunctionRecord>()? {
+            self.scan.push_legacy(function);
+        }
+        Ok(())
+    }
+}
+
+struct TypedV3Functions<'a> {
+    scan: &'a mut TypedFunctionScan,
+}
+
+impl<'de> DeserializeSeed<'de> for TypedV3Functions<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for TypedV3Functions<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a strict v3 Thumb functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(function) = seq.next_element::<FunctionWire>()? {
+            self.scan.push_v3(function).map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
 }
 
 /// Validate a terminal Thumb artifact while retaining at most one function
@@ -1869,6 +2211,453 @@ fn write_v3_values_into<W: Write>(
     }
     writer.write_all(b"\n  ]\n}")?;
     Ok(())
+}
+
+/// Atomically rewrite a Thumb artifact one function at a time. V3 metadata,
+/// ownership, function order, and producer fields are validated and preserved;
+/// legacy mutations retain the established v1-to-v2 promotion. A semantic
+/// no-op drops the temporary file and leaves the source bytes untouched.
+pub(crate) fn stream_rewrite_thumb_functions<F>(path: &Path, on_function: F) -> Result<()>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    let input = std::fs::File::open(path)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
+    let mut scan =
+        ThumbRewriteScan::new(atomic_write_file::AtomicWriteFile::open(path)?, on_function);
+    let parsed = deserializer.deserialize_map(ThumbRewriteVisitor { scan: &mut scan });
+    parsed
+        .and_then(|()| deserializer.end())
+        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))?;
+    scan.finish()?;
+    if scan.changed {
+        scan.output.commit()?;
+    }
+    Ok(())
+}
+
+const V3_IMMUTABLE_FUNCTION_FIELDS: [&str; 8] = [
+    "entry",
+    "end",
+    "size",
+    "body_kind",
+    "body",
+    "data_refs",
+    "decode_ranges",
+    "decode_range_errors",
+];
+
+struct ThumbRewriteScan<F> {
+    output: atomic_write_file::AtomicWriteFile,
+    on_function: F,
+    format: Option<ThumbFormat>,
+    producers: Vec<ProducerIdentity>,
+    regions: Vec<RegionRecord>,
+    layout: Option<V3Layout>,
+    observed: Vec<RunCounts>,
+    function_count: usize,
+    changed: bool,
+    wrote_function: bool,
+}
+
+impl<F> ThumbRewriteScan<F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    fn new(output: atomic_write_file::AtomicWriteFile, on_function: F) -> Self {
+        Self {
+            output,
+            on_function,
+            format: None,
+            producers: Vec::new(),
+            regions: Vec::new(),
+            layout: None,
+            observed: Vec::new(),
+            function_count: 0,
+            changed: false,
+            wrote_function: false,
+        }
+    }
+
+    fn set_v3_metadata(
+        &mut self,
+        producers: Vec<ProducerWire>,
+        regions: Vec<RegionWire>,
+    ) -> Result<()> {
+        self.producers = convert_producers(producers)?;
+        self.regions = convert_regions(regions)?;
+        let layout = validate_v3_metadata(&self.producers, &self.regions)?;
+        self.observed = vec![RunCounts::default(); layout.runs.len()];
+        self.layout = Some(layout);
+        Ok(())
+    }
+
+    fn rewrite_legacy(&mut self, mut function: Value) -> Result<()> {
+        let original = function.clone();
+        (self.on_function)(&mut function)?;
+        self.changed |= function != original;
+        self.write_function(&function)
+    }
+
+    fn rewrite_v3(&mut self, function: FunctionWire) -> Result<()> {
+        let mut function = serde_json::to_value(function).map_err(|error| {
+            invalid_artifact(format!(
+                "v3 function {} cannot be rendered: {error}",
+                self.function_count
+            ))
+        })?;
+        let original = function.clone();
+        (self.on_function)(&mut function)?;
+        validate_v3_function_mutation(
+            &original,
+            &function,
+            self.function_count,
+            &V3_IMMUTABLE_FUNCTION_FIELDS,
+        )?;
+        let (substantial, accepted, quarantined) =
+            validate_function_value(&function, self.function_count, None)?;
+        let layout = self.layout.as_ref().ok_or_else(|| {
+            invalid_artifact("v3 artifact lacks validated producer and region metadata")
+        })?;
+        let run_index = layout.runs.iter().position(|run| {
+            run.first_function <= self.function_count
+                && self.function_count < run.first_function.saturating_add(run.function_count)
+        });
+        let Some(run_index) = run_index else {
+            return Err(invalid_artifact(
+                "every v3 function must have exactly one run owner",
+            ));
+        };
+        let observed = &mut self.observed[run_index];
+        observed.substantial += usize::from(substantial);
+        observed.accepted += usize::from(accepted);
+        observed.quarantined += usize::from(quarantined);
+        self.changed |= function != original;
+        self.write_function(&function)
+    }
+
+    fn write_function(&mut self, function: &Value) -> Result<()> {
+        if self.wrote_function {
+            self.output.write_all(b",\n")?;
+        } else {
+            match self
+                .format
+                .ok_or_else(|| invalid_artifact("missing Thumb artifact format"))?
+            {
+                ThumbFormat::V1 | ThumbFormat::V2 => {
+                    self.output.write_all(b"{\n  \"format\": \"")?;
+                    self.output.write_all(THUMB_V2_FORMAT.as_bytes())?;
+                    self.output.write_all(b"\",\n  \"functions\": [\n")?;
+                }
+                ThumbFormat::V3 => {
+                    let producer_output = producer_output(&self.producers)?;
+                    self.output.write_all(b"{\n  \"format\": \"")?;
+                    self.output.write_all(THUMB_V3_FORMAT.as_bytes())?;
+                    self.output.write_all(b"\",\n  \"producers\": ")?;
+                    write_pretty_value(&mut self.output, &producer_output, "  ")?;
+                    self.output.write_all(b",\n  \"regions\": ")?;
+                    write_pretty_value(&mut self.output, &self.regions, "  ")?;
+                    self.output.write_all(b",\n  \"functions\": [\n")?;
+                }
+            }
+            self.wrote_function = true;
+        }
+        self.output
+            .write_all(render_fragment(function)?.as_bytes())?;
+        self.function_count = self
+            .function_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_artifact("Thumb function count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let format = self
+            .format
+            .ok_or_else(|| invalid_artifact("missing Thumb artifact format"))?;
+        if format == ThumbFormat::V3 {
+            let layout = self.layout.as_ref().ok_or_else(|| {
+                invalid_artifact("v3 artifact lacks validated producer and region metadata")
+            })?;
+            if self.function_count != layout.function_count {
+                return Err(invalid_artifact(
+                    "every v3 function must have exactly one run owner",
+                ));
+            }
+            for (run_index, (run, observed)) in layout.runs.iter().zip(&self.observed).enumerate() {
+                if (run.substantial, run.accepted, run.quarantined)
+                    != (
+                        observed.substantial,
+                        observed.accepted,
+                        observed.quarantined,
+                    )
+                {
+                    return Err(invalid_artifact(format!(
+                        "v3 run {run_index} stored counts do not match its functions"
+                    )));
+                }
+            }
+        }
+        if self.wrote_function {
+            self.output.write_all(b"\n  ]\n}")?;
+        }
+        Ok(())
+    }
+}
+
+struct ThumbRewriteVisitor<'a, F> {
+    scan: &'a mut ThumbRewriteScan<F>,
+}
+
+impl<'de, F> Visitor<'de> for ThumbRewriteVisitor<'_, F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a canonical Thumb artifact object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let key = map
+            .next_key::<String>()?
+            .ok_or_else(|| de::Error::missing_field("format"))?;
+        if key != "format" {
+            return Err(de::Error::custom(format!(
+                "expected top-level field \"format\", found {key:?}"
+            )));
+        }
+        let raw_format = map.next_value::<String>()?;
+        let format = ThumbFormat::parse(&raw_format)
+            .ok_or_else(|| de::Error::custom("unsupported Thumb artifact format"))?;
+        self.scan.format = Some(format);
+
+        match format {
+            ThumbFormat::V1 | ThumbFormat::V2 => {
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("functions"))?;
+                if key != "functions" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"functions\", found {key:?}"
+                    )));
+                }
+                map.next_value_seed(RewriteLegacyFunctions {
+                    scan: &mut *self.scan,
+                })?;
+            }
+            ThumbFormat::V3 => {
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("producers"))?;
+                if key != "producers" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"producers\", found {key:?}"
+                    )));
+                }
+                let producers = map.next_value::<Vec<ProducerWire>>()?;
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("regions"))?;
+                if key != "regions" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"regions\", found {key:?}"
+                    )));
+                }
+                let regions = map.next_value::<Vec<RegionWire>>()?;
+                self.scan
+                    .set_v3_metadata(producers, regions)
+                    .map_err(de::Error::custom)?;
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::missing_field("functions"))?;
+                if key != "functions" {
+                    return Err(de::Error::custom(format!(
+                        "expected top-level field \"functions\", found {key:?}"
+                    )));
+                }
+                map.next_value_seed(RewriteV3Functions {
+                    scan: &mut *self.scan,
+                })?;
+            }
+        }
+        if let Some(key) = map.next_key::<String>()? {
+            return Err(de::Error::custom(format!(
+                "unexpected top-level field {key:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct RewriteLegacyFunctions<'a, F> {
+    scan: &'a mut ThumbRewriteScan<F>,
+}
+
+impl<'de, F> DeserializeSeed<'de> for RewriteLegacyFunctions<'_, F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de, F> Visitor<'de> for RewriteLegacyFunctions<'_, F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Thumb functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(function) = seq.next_element::<Value>()? {
+            self.scan
+                .rewrite_legacy(function)
+                .map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
+}
+
+struct RewriteV3Functions<'a, F> {
+    scan: &'a mut ThumbRewriteScan<F>,
+}
+
+impl<'de, F> DeserializeSeed<'de> for RewriteV3Functions<'_, F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de, F> Visitor<'de> for RewriteV3Functions<'_, F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a strict v3 Thumb functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(function) = seq.next_element::<FunctionWire>()? {
+            self.scan.rewrite_v3(function).map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
+}
+
+/// Atomically rewrite a top-level JSON array while retaining at most one
+/// element at a time. A no-op leaves the original bytes untouched.
+pub(crate) fn stream_rewrite_json_array<F>(path: &Path, on_element: F) -> Result<()>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    let input = std::fs::File::open(path)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
+    let mut scan = ArrayRewriteScan {
+        output: atomic_write_file::AtomicWriteFile::open(path)?,
+        on_element,
+        changed: false,
+        wrote_element: false,
+    };
+    let parsed = deserializer.deserialize_seq(ArrayRewriteVisitor { scan: &mut scan });
+    parsed
+        .and_then(|()| deserializer.end())
+        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))?;
+    if scan.wrote_element {
+        scan.output.write_all(b"\n]")?;
+    }
+    if scan.changed {
+        scan.output.commit()?;
+    }
+    Ok(())
+}
+
+struct ArrayRewriteScan<F> {
+    output: atomic_write_file::AtomicWriteFile,
+    on_element: F,
+    changed: bool,
+    wrote_element: bool,
+}
+
+impl<F> ArrayRewriteScan<F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    fn rewrite(&mut self, mut element: Value) -> Result<()> {
+        let original = element.clone();
+        (self.on_element)(&mut element)?;
+        self.changed |= element != original;
+        if self.wrote_element {
+            self.output.write_all(b",\n")?;
+        } else {
+            self.output.write_all(b"[\n")?;
+            self.wrote_element = true;
+        }
+        let pretty = serde_json::to_string_pretty(&element)
+            .map_err(|error| Error::Serialize(error.to_string()))?;
+        for (index, line) in pretty.split('\n').enumerate() {
+            if index != 0 {
+                self.output.write_all(b"\n")?;
+            }
+            self.output.write_all(b"  ")?;
+            self.output.write_all(line.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+struct ArrayRewriteVisitor<'a, F> {
+    scan: &'a mut ArrayRewriteScan<F>,
+}
+
+impl<'de, F> Visitor<'de> for ArrayRewriteVisitor<'_, F>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(element) = seq.next_element::<Value>()? {
+            self.scan.rewrite(element).map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
 }
 
 fn parse_v3_fragment(bytes: &[u8], run_index: usize, slot_index: usize) -> Result<Value> {

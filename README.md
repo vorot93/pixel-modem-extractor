@@ -68,10 +68,20 @@ metadata when partial stdout can be finalized; spawn or capture-finalization fai
 `stdout: null`. `--prune` removes all captures and carved region inputs while v3 retains their
 recorded identity.
 
-The producer is bounded by its largest JSON value rather than the complete capture. Whole-file
-consumers such as `thumb_enrich` and `symbolicate` still load `thumb_functions.json` in full, so
-large trees can require several GiB beyond Ghidra's JVM. `--no-thumb-decompile` changes only the
-Ghidra side to `datamark` and skips `body_c` enrichment; the host Thumb analyzer still runs.
+**Memory:** the complete dense-Thumb Rust path is streaming. Each backend capture is parsed
+value-by-value, functions are normalized and spilled one at a time, and strict v3 is assembled
+atomically. The retained Mustang replay measured ~3.65 GiB of radare2 stdout, 151,411 functions,
+582,543,970 output bytes, ~248 seconds, and ~2.8 GB peak RSS for replay plus comparison; capture
+production itself measured ~0.3 GB. `thumb_enrich` streams `decompiled.c` and rewrites one function
+at a time, bounded by its ~86 MB body map plus one record (632 MB artifact A/B: 130 seconds,
+2.29 GB peak, byte-identical). `recover_source` uses a typed streaming reader, symbolication's
+artifact rewrites stream through atomic v3-preserving writers, and ARM disassembly ranges are
+zero-copy borrowed views. The standalone symbolication A/B dropped from 24 GB to 1.8 GB with
+byte-identical output. A full dense-Thumb `decompose` now peaks at ~7.7 GB in Ghidra's own
+analyze/export phase; the Rust process peaks near ~2.5 GB, mostly owned function bodies.
+
+`--no-thumb-decompile` changes only Ghidra to `datamark` mode and skips `body_c` enrichment. The
+streaming host Thumb analyzer, including opt-in failure-only Rizin fallback, still runs.
 
 **Project path:** `pixel-modem-extractor` canonicalizes its output root before
 constructing the Ghidra headless project path. Ghidra 12 rejects any

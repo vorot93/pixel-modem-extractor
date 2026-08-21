@@ -324,26 +324,6 @@ fn is_meaningful_ghidra_body_line(line: &str) -> bool {
         && trimmed != FAILED_DECOMPILATION_SENTINEL
 }
 
-#[derive(Debug, Deserialize)]
-struct ThumbFunctionJson {
-    name: String,
-    entry: String,
-    end: String,
-    size: u64,
-    body_kind: String,
-    body: String,
-    #[serde(default)]
-    data_refs: Vec<String>,
-    #[serde(default)]
-    decode_ranges: Vec<ThumbDecodeRangeJson>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ThumbDecodeRangeJson {
-    start: String,
-    end: String,
-}
-
 fn parse_data_refs(raw: &[String]) -> Result<Vec<u64>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -356,26 +336,17 @@ fn parse_data_refs(raw: &[String]) -> Result<Vec<u64>> {
     Ok(out)
 }
 
-fn load_json_file(path: &Path) -> Result<serde_json::Value> {
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))
-}
-
 impl RecoveredFunctions {
     pub fn load(dir: &Path) -> Result<Self> {
-        let ghidra_json = load_json_file(&dir.join("functions.json"))?;
-        let ghidra_functions = ghidra_json
-            .as_array()
-            .ok_or_else(|| Error::Serialize("functions.json must contain an array".to_string()))?;
+        let ghidra_reader =
+            std::io::BufReader::new(std::fs::File::open(dir.join("functions.json"))?);
         let bodies = parse_decompiled_bodies(&std::fs::read_to_string(dir.join("decompiled.c"))?);
         let mut skipped = 0usize;
         let mut functions = Vec::new();
 
-        for value in ghidra_functions {
-            let Ok(f) = serde_json::from_value::<GhidraFunctionJson>(value.clone()) else {
-                skipped += 1;
-                continue;
-            };
+        let ghidra_file: Vec<GhidraFunctionJson> = serde_json::from_reader(ghidra_reader)
+            .map_err(|e| Error::Serialize(format!("functions.json: {e}")))?;
+        for f in ghidra_file {
             let Some(function) = recovered_ghidra_function(f, &bodies) else {
                 skipped += 1;
                 continue;
@@ -385,14 +356,12 @@ impl RecoveredFunctions {
 
         let thumb_path = dir.join("thumb_functions.json");
         if thumb_path.exists() {
-            let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path)?;
-            for owned in thumb_artifact.functions() {
-                let Ok(f) = serde_json::from_value::<ThumbFunctionJson>(owned.value.clone()) else {
-                    skipped += 1;
-                    continue;
-                };
+            // Typed streaming load retains only consumer fields and function
+            // bodies while strict v3 metadata resolves each run owner. It never
+            // builds the former document-wide `serde_json::Value` tree.
+            for owned in crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path)? {
                 let Some(function) = recovered_thumb_function(
-                    f,
+                    owned.function,
                     owned.producer.into(),
                     owned.legacy_range_semantics,
                 ) else {
@@ -437,7 +406,7 @@ fn recovered_ghidra_function(
 }
 
 fn recovered_thumb_function(
-    f: ThumbFunctionJson,
+    f: crate::thumb_analysis::ThumbFunctionRecord,
     tool: Tool,
     legacy_range_semantics: bool,
 ) -> Option<RecoveredFunction> {
@@ -1213,6 +1182,75 @@ mod tests {
         assert!(!map.contains_key("foo/gap.cc"));
         assert_eq!(map["foo/covered.cc"][0].confidence, Confidence::Proximity);
         assert!(map["foo/covered.cc"][0].reason.contains("0x1080-0x1090"));
+    }
+
+    #[test]
+    fn thumb_function_with_symbolicate_stamps_parses() {
+        // The production file carries symbolicate's stamps (`annotations`,
+        // `original_name`) and enrich's `body_c`; the typed load ignores
+        // unknown fields and never materializes a `serde_json::Value`.
+        let root = temp_dir("recover_radare2_stamped");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(root.join("disasm.lst"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            r#"{
+              "format": "pixel-modem-extractor-thumb-functions-v2",
+              "functions": [
+                {
+                  "name": "AtiParsePlusCOPS",
+                  "original_name": "thumb_4120",
+                  "annotations": [],
+                  "entry": "0x4120",
+                  "end": "0x4150",
+                  "size": 48,
+                  "body_kind": "thumb_disassembly",
+                  "body": "0x4120 push {lr}\n",
+                  "body_c": "void AtiParsePlusCOPS(void)\n{\n}\n",
+                  "data_refs": ["0x9000"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let funcs = RecoveredFunctions::load(&root).unwrap();
+
+        assert_eq!(funcs.functions.len(), 1);
+        assert_eq!(funcs.functions[0].name, "AtiParsePlusCOPS");
+        assert_eq!(funcs.functions[0].entry, 0x4120);
+        assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
+    }
+
+    #[test]
+    fn malformed_thumb_record_fails_closed() {
+        // A record that does not fit the typed shape is a hard error, not a
+        // silent skip: in-pipeline the file is always our canonical writer's
+        // output, so a malformed record means corruption upstream.
+        let root = temp_dir("recover_radare2_malformed");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(root.join("disasm.lst"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            r#"{
+              "format": "pixel-modem-extractor-thumb-functions-v2",
+              "functions": [
+                {"name": "ok", "entry": "0x4120", "end": "0x4150", "size": 48,
+                 "body_kind": "thumb_disassembly", "body": "", "data_refs": []},
+                {"name": 7}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = RecoveredFunctions::load(&root).unwrap_err();
+
+        assert!(
+            err.to_string().contains("thumb_functions.json"),
+            "error must name the artifact: {err}"
+        );
     }
 
     fn source_entry(path: &str, vaddr: u64, offset: usize) -> SourceEntry {

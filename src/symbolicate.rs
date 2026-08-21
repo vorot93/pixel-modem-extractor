@@ -14,6 +14,7 @@
 //! and therefore *do* reach Ghidra pass 2. Everything else is a comment.
 //! Precedence: `__func__` > registration > token > string-ref.
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
+use crate::disasm_index::DisasmIndex;
 use crate::error::{Error, Result};
 use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
@@ -82,13 +83,18 @@ pub struct RawEvidence {
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
-pub struct FuncRec {
+pub struct FuncRec<'a> {
     pub arch: &'static str, // "arm" | "thumb"
     pub name: String,       // original, e.g. "FUN_40e1bff4"
     pub entry: u64,
     pub end: u64,
     pub data_refs: Vec<u64>,
-    pub disasm: String, // ARM: disasm.lst lines in range; Thumb: the `body`
+    /// ARM: a zero-copy view of the `disasm.lst` lines in range (borrowed
+    /// from the one loaded buffer — the memory-envelope lever for the
+    /// pathological wide-range Ghidra records that would otherwise each
+    /// copy ~hundreds of MB of owned text); Thumb: the owned `body` from
+    /// `thumb_functions.json`.
+    pub disasm: std::borrow::Cow<'a, str>,
     /// Which recovery tool produced this function record. ARM/`functions.json`
     /// is Ghidra; each Thumb record retains its artifact run owner. Used to look up
     /// source attribution keyed by `(tool, entry)`.
@@ -434,26 +440,11 @@ struct ArmFnJson {
     data_refs: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct ThumbFnJson {
-    name: String,
-    #[serde(default)]
-    original_name: Option<String>,
-    entry: String,
-    #[serde(default)]
-    end: String,
-    #[serde(default)]
-    data_refs: Vec<String>,
-    #[serde(default)]
-    body: String,
-}
-
-fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
+fn load_functions<'a>(decompiled: &Path, index: &DisasmIndex<'a>) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("functions.json");
     let bytes = std::fs::read(&path)?;
     let raw: Vec<ArmFnJson> =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    let index = crate::disasm_index::DisasmIndex::new(disasm);
     let mut out = Vec::with_capacity(raw.len());
     for f in raw {
         let entry = parse_hex(&f.entry)?;
@@ -469,23 +460,22 @@ fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
             entry,
             end,
             data_refs,
-            disasm: index.slice_for(entry, end),
+            disasm: index.slice_cow(entry, end),
             tool: Tool::Ghidra,
         });
     }
     Ok(out)
 }
 
-fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
+fn load_thumb_functions<'a>(decompiled: &Path) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("thumb_functions.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let artifact = crate::thumb_analysis::read_thumb_artifact(&path)?;
-    let mut out = Vec::with_capacity(artifact.functions().len());
-    for owned in artifact.functions() {
-        let f: ThumbFnJson = serde_json::from_value(owned.value.clone())
-            .map_err(|e| Error::Serialize(e.to_string()))?;
+    let functions = crate::thumb_analysis::read_thumb_functions_streaming(&path)?;
+    let mut out = Vec::with_capacity(functions.len());
+    for owned in functions {
+        let f = owned.function;
         let entry = parse_hex(&f.entry)?;
         let end = if f.end.is_empty() {
             entry
@@ -503,7 +493,7 @@ fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
             entry,
             end,
             data_refs,
-            disasm: f.body,
+            disasm: std::borrow::Cow::Owned(f.body),
             tool: owned.producer.into(),
         });
     }
@@ -776,11 +766,80 @@ fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
 
 /// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
 /// and `thumb_functions.json` (matched by entry address), preserving all other
-/// fields. Operates on `serde_json::Value` to avoid a lossy round-trip.
+/// fields. Both files are rewritten element-by-element through the shared
+/// streaming rewriters (`thumb_analysis::stream_rewrite_json_array` /
+/// `stream_rewrite_thumb_functions`) — no whole-document `Value` tree, and
+/// unknown fields survive by construction because each element stays a
+/// `Value`. The retired whole-file implementation is kept test-only as
+/// `rewrite_functions_json_whole`, the differential oracle.
 /// `pub(crate)` so `decompose`'s route tests can drive the real finalize
 /// rewriter when modeling the symbol-route input-rewrite sequence.
 pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
     // entry vaddr -> symbol (numeric, so "0x10" and "0x00000010" match).
+    let by_addr: HashMap<u64, &Symbol> = symbols
+        .iter()
+        .filter_map(|s| parse_hex(&s.address).ok().map(|a| (a, s)))
+        .collect();
+
+    let stamp = |item: &mut serde_json::Value| -> Result<()> {
+        let Some(addr) = item
+            .get("entry")
+            .and_then(|v| v.as_str())
+            .and_then(|e| parse_hex(e).ok())
+        else {
+            return Ok(());
+        };
+        let Some(sym) = by_addr.get(&addr) else {
+            return Ok(());
+        };
+        let Some(obj) = item.as_object_mut() else {
+            return Ok(());
+        };
+        if obj.contains_key("original_name") {
+            return Ok(()); // already symbolicated — idempotent re-run
+        }
+        // Source original_name from the Symbol record, not from obj["name"]:
+        // on the Phase-1 two-pass path, obj["name"] already holds the
+        // recovered name (pass 2 renamed in-program before regenerating
+        // functions.json). The Symbol preserves the true original.
+        obj.insert(
+            "original_name".into(),
+            serde_json::Value::String(sym.original_name.clone()),
+        );
+        if let Some(name) = &sym.name {
+            obj.insert("name".into(), serde_json::Value::String(name.clone()));
+        }
+        obj.insert(
+            "annotations".into(),
+            serde_json::Value::Array(
+                sym.annotations
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        Ok(())
+    };
+
+    // functions.json (a bare array)
+    let fpath = decompiled.join("functions.json");
+    if fpath.exists() {
+        crate::thumb_analysis::stream_rewrite_json_array(&fpath, stamp)?;
+    }
+
+    // thumb_functions.json ({ "functions": [...] })
+    let tpath = decompiled.join("thumb_functions.json");
+    if tpath.exists() {
+        crate::thumb_analysis::stream_rewrite_thumb_functions(&tpath, stamp)?;
+    }
+    Ok(())
+}
+
+/// Retired whole-file `rewrite_functions_json`, kept verbatim as the
+/// differential oracle for the streaming rewrite; test-only.
+#[cfg(test)]
+fn rewrite_functions_json_whole(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
     let by_addr: HashMap<u64, &Symbol> = symbols
         .iter()
         .filter_map(|s| parse_hex(&s.address).ok().map(|a| (a, s)))
@@ -804,10 +863,6 @@ pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> R
             if obj.contains_key("original_name") {
                 continue; // already symbolicated — idempotent re-run
             }
-            // Source original_name from the Symbol record, not from obj["name"]:
-            // on the Phase-1 two-pass path, obj["name"] already holds the
-            // recovered name (pass 2 renamed in-program before regenerating
-            // functions.json). The Symbol preserves the true original.
             obj.insert(
                 "original_name".into(),
                 serde_json::Value::String(sym.original_name.clone()),
@@ -888,6 +943,30 @@ fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> R
     if !path.exists() {
         return Ok(());
     }
+    let renames = build_rename_map(symbols);
+    crate::thumb_analysis::stream_rewrite_thumb_functions(&path, |func| {
+        let Some(obj) = func.as_object_mut() else {
+            return Ok(());
+        };
+        let Some(body_c) = obj.get("body_c").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        let renamed = apply_rename_map(body_c, &renames);
+        if renamed != body_c {
+            obj.insert("body_c".into(), serde_json::Value::String(renamed));
+        }
+        Ok(())
+    })
+}
+
+/// Retired whole-file `rewrite_body_c_in_thumb_functions`, kept verbatim as
+/// the differential oracle for the streaming rewrite; test-only.
+#[cfg(test)]
+fn rewrite_body_c_in_thumb_functions_whole(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
+    let path = decompiled.join("thumb_functions.json");
+    if !path.exists() {
+        return Ok(());
+    }
     let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path)?;
     let renames = build_rename_map(symbols);
     for function in artifact.function_values_mut() {
@@ -958,8 +1037,9 @@ pub(crate) fn build_map(
 ) -> Result<Vec<Symbol>> {
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
+    let index = crate::disasm_index::DisasmIndex::new(&disasm);
 
-    let mut funcs = load_functions(&decompiled, &disasm)?;
+    let mut funcs = load_functions(&decompiled, &index)?;
     funcs.extend(load_thumb_functions(&decompiled)?);
 
     let source_tree = image_dir.join("source_tree");
@@ -1611,7 +1691,8 @@ mod tests {
         )
         .unwrap();
         let disasm = "0x10: 41f2 movw r0, 0x1\n0x14: c0f2 movt r0, 0x2\n0x20: other\n";
-        let fns = load_functions(&dir, disasm).unwrap();
+        let index = DisasmIndex::new(disasm);
+        let fns = load_functions(&dir, &index).unwrap();
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].arch, "arm");
         assert_eq!(fns[0].entry, 0x10);
@@ -1630,7 +1711,8 @@ mod tests {
             r#"[{"name":"guess_x_10","original_name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
         )
         .unwrap();
-        let fns = load_functions(&dir, "").unwrap();
+        let index = DisasmIndex::new("");
+        let fns = load_functions(&dir, &index).unwrap();
         assert_eq!(fns[0].name, "FUN_10"); // true original recovered, not the renamed value
     }
 
@@ -2503,6 +2585,120 @@ mod tests {
             ]
         }"#;
         std::fs::write(dec.join("thumb_functions.json"), original_json).unwrap();
+    }
+
+    fn stamping_symbols() -> Vec<Symbol> {
+        vec![
+            Symbol {
+                address: "0x40e1200".into(),
+                arch: "thumb",
+                original_name: "thumb_40e1200".into(),
+                name: Some("RealName".into()),
+                tier: Tier::Recovered,
+                evidence: vec![],
+                annotations: vec!["log: boot".into()],
+            },
+            Symbol {
+                address: "0x00000010".into(),
+                arch: "arm",
+                original_name: "FUN_10".into(),
+                name: None,
+                tier: Tier::Recovered,
+                evidence: vec![],
+                annotations: vec![],
+            },
+        ]
+    }
+
+    fn write_stamping_fixtures(dec: &std::path::Path) {
+        std::fs::write(
+            dec.join("functions.json"),
+            r#"[
+  {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8},
+  {"entry": "0x10", "name": "FUN_10", "size": 4},
+  {"entry": "0x9999", "name": "unmatched", "size": 4},
+  {"name": "no_entry", "size": 4}
+]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dec.join("thumb_functions.json"),
+            r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v2",
+  "functions": [
+    {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+     "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []},
+    {"entry": "0x40e1200", "name": "already", "original_name": "thumb_x",
+     "size": 8, "body_kind": "thumb_disassembly", "body": "", "data_refs": []},
+    {"entry": "0x9999", "name": "unmatched", "size": 4,
+     "body_kind": "thumb_disassembly", "body": "", "data_refs": []}
+  ]
+}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn streaming_stamp_rewrite_matches_whole_oracle() {
+        let mut dirs = Vec::new();
+        for _ in 0..2 {
+            let root = tmp(&format!("pme_sym_stamp_ab_{}", std::process::id()));
+            let dec = root.join("decompiled");
+            std::fs::create_dir_all(&dec).unwrap();
+            write_stamping_fixtures(&dec);
+            dirs.push(dec);
+        }
+        let symbols = stamping_symbols();
+        rewrite_functions_json(&dirs[0], &symbols).unwrap();
+        rewrite_functions_json_whole(&dirs[1], &symbols).unwrap();
+        for name in ["functions.json", "thumb_functions.json"] {
+            assert_eq!(
+                std::fs::read(dirs[0].join(name)).unwrap(),
+                std::fs::read(dirs[1].join(name)).unwrap(),
+                "{name}: streaming must match the whole-file oracle"
+            );
+        }
+        // Idempotent re-run: stable bytes.
+        let before = std::fs::read(dirs[0].join("thumb_functions.json")).unwrap();
+        rewrite_functions_json(&dirs[0], &symbols).unwrap();
+        assert_eq!(
+            before,
+            std::fs::read(dirs[0].join("thumb_functions.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_body_c_rewrite_matches_whole_oracle() {
+        let mut dirs = Vec::new();
+        for _ in 0..2 {
+            let root = tmp(&format!("pme_sym_bodyc_ab_{}", std::process::id()));
+            let dec = root.join("decompiled");
+            std::fs::create_dir_all(&dec).unwrap();
+            std::fs::write(
+                dec.join("thumb_functions.json"),
+                r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v2",
+  "functions": [
+    {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+     "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": [],
+     "body_c": "void thumb_40e1200(void) { thumb_40e1200(); }"},
+    {"entry": "0x5000", "name": "no_body_c", "size": 4,
+     "body_kind": "thumb_disassembly", "body": "", "data_refs": []}
+  ]
+}"#,
+            )
+            .unwrap();
+            dirs.push(dec);
+        }
+        let symbols = vec![real_name_symbol_for_40e1200()];
+        rewrite_body_c_in_thumb_functions(&dirs[0], &symbols).unwrap();
+        rewrite_body_c_in_thumb_functions_whole(&dirs[1], &symbols).unwrap();
+        assert_eq!(
+            std::fs::read(dirs[0].join("thumb_functions.json")).unwrap(),
+            std::fs::read(dirs[1].join("thumb_functions.json")).unwrap()
+        );
+        let after = std::fs::read_to_string(dirs[0].join("thumb_functions.json")).unwrap();
+        assert!(after.contains("RealName(void)"), "body_c renamed: {after}");
     }
 
     fn real_name_symbol_for_40e1200() -> Symbol {
