@@ -14,6 +14,7 @@
 //! and therefore *do* reach Ghidra pass 2. Everything else is a comment.
 //! Precedence: `__func__` > registration > token > string-ref.
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
+use crate::disasm_index::DisasmIndex;
 use crate::error::{Error, Result};
 use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
@@ -82,13 +83,18 @@ pub struct RawEvidence {
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
-pub struct FuncRec {
+pub struct FuncRec<'a> {
     pub arch: &'static str, // "arm" | "thumb"
     pub name: String,       // original, e.g. "FUN_40e1bff4"
     pub entry: u64,
     pub end: u64,
     pub data_refs: Vec<u64>,
-    pub disasm: String, // ARM: disasm.lst lines in range; Thumb: the `body`
+    /// ARM: a zero-copy view of the `disasm.lst` lines in range (borrowed
+    /// from the one loaded buffer — the memory-envelope lever for the
+    /// pathological wide-range Ghidra records that would otherwise each
+    /// copy ~hundreds of MB of owned text); Thumb: the owned `body` from
+    /// `thumb_functions.json`.
+    pub disasm: std::borrow::Cow<'a, str>,
     /// Which recovery tool produced this function record. ARM/`functions.json`
     /// is Ghidra; Thumb/`thumb_functions.json` is radare2. Used to look up
     /// source attribution keyed by `(tool, entry)`.
@@ -454,12 +460,11 @@ struct ThumbFnJson {
     body: String,
 }
 
-fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
+fn load_functions<'a>(decompiled: &Path, index: &DisasmIndex<'a>) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("functions.json");
     let bytes = std::fs::read(&path)?;
     let raw: Vec<ArmFnJson> =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    let index = crate::disasm_index::DisasmIndex::new(disasm);
     let mut out = Vec::with_capacity(raw.len());
     for f in raw {
         let entry = parse_hex(&f.entry)?;
@@ -475,14 +480,14 @@ fn load_functions(decompiled: &Path, disasm: &str) -> Result<Vec<FuncRec>> {
             entry,
             end,
             data_refs,
-            disasm: index.slice_for(entry, end),
+            disasm: index.slice_cow(entry, end),
             tool: Tool::Ghidra,
         });
     }
     Ok(out)
 }
 
-fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
+fn load_thumb_functions<'a>(decompiled: &Path) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("thumb_functions.json");
     if !path.exists() {
         return Ok(Vec::new());
@@ -509,7 +514,7 @@ fn load_thumb_functions(decompiled: &Path) -> Result<Vec<FuncRec>> {
             entry,
             end,
             data_refs,
-            disasm: f.body,
+            disasm: std::borrow::Cow::Owned(f.body),
             tool: Tool::Radare2,
         });
     }
@@ -1058,8 +1063,9 @@ pub(crate) fn build_map(
 ) -> Result<Vec<Symbol>> {
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
+    let index = crate::disasm_index::DisasmIndex::new(&disasm);
 
-    let mut funcs = load_functions(&decompiled, &disasm)?;
+    let mut funcs = load_functions(&decompiled, &index)?;
     funcs.extend(load_thumb_functions(&decompiled)?);
 
     let source_tree = image_dir.join("source_tree");
@@ -1711,7 +1717,8 @@ mod tests {
         )
         .unwrap();
         let disasm = "0x10: 41f2 movw r0, 0x1\n0x14: c0f2 movt r0, 0x2\n0x20: other\n";
-        let fns = load_functions(&dir, disasm).unwrap();
+        let index = DisasmIndex::new(disasm);
+        let fns = load_functions(&dir, &index).unwrap();
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].arch, "arm");
         assert_eq!(fns[0].entry, 0x10);
@@ -1730,7 +1737,8 @@ mod tests {
             r#"[{"name":"guess_x_10","original_name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
         )
         .unwrap();
-        let fns = load_functions(&dir, "").unwrap();
+        let index = DisasmIndex::new("");
+        let fns = load_functions(&dir, &index).unwrap();
         assert_eq!(fns[0].name, "FUN_10"); // true original recovered, not the renamed value
     }
 
