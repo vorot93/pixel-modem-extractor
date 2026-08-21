@@ -1026,6 +1026,12 @@ impl ParsedThumbArtifact {
       "executable": "/usr/bin/r2",
       "version": "radare2 6.1.4",
       "command": "aaa;aflj;pdfj @@f"
+    },
+    {
+      "id": "rizin",
+      "executable": "/usr/bin/rizin",
+      "version": "rizin 0.8.2",
+      "command": "aaa;aflj;pdfj @@F;axlj"
     }
   ],
   "regions": [
@@ -1035,9 +1041,15 @@ impl ParsedThumbArtifact {
       "attempts": [
         {
           "producer": "radare2",
+          "status": "failed",
+          "stdout": null,
+          "error": "radare2 fixture failure"
+        },
+        {
+          "producer": "rizin",
           "status": "succeeded",
           "stdout": {
-            "path": "thumb/00004000.radare2.stdout",
+            "path": "thumb/00004000.rizin.stdout",
             "bytes": 128,
             "blake3": "0000000000000000000000000000000000000000000000000000000000000000"
           },
@@ -1046,7 +1058,7 @@ impl ParsedThumbArtifact {
       ],
       "function_runs": [
         {
-          "producer": "radare2",
+          "producer": "rizin",
           "first_function": 0,
           "function_count": 2,
           "substantial": 1,

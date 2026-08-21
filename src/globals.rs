@@ -537,8 +537,8 @@ pub fn run_with_evidence_projection(
             continue;
         }
         // Per-function disasm slice. ARM: slice disasm.lst by [entry, end).
-        // Thumb: the per-function `body` field from thumb_functions.json
-        // (radare2 pdfj output — different format from disasm.lst; do NOT
+        // Thumb: the canonical per-function `body` field from thumb_functions.json
+        // (adapted analyzer output — different format from disasm.lst; do NOT
         // re-slice disasm.lst for Thumb).
         let (disasm_slice, k) = match f.arch {
             Arch::Arm => (disasm_index.slice_for(f.entry, f.end), opts.k_arm),
@@ -855,7 +855,7 @@ struct Function {
     recovered_name: Option<String>,
     data_refs: Vec<u64>,
     /// Thumb only: the per-function disassembly body from
-    /// `thumb_functions.json`'s `body` field (radare2 pdfj output). `None`
+    /// `thumb_functions.json`'s canonical `body` field (adapted analyzer output). `None`
     /// for ARM — ARM slices `disasm.lst` by `[entry, end)` at processing
     /// time (Ghidra's full-image disasm, different format from Thumb's
     /// per-function body).
@@ -957,8 +957,8 @@ struct Contributor {
 /// silently switch metrics — `recovered_tier_requires_disasm_proximity_within_k`
 /// is the regression sentinel.
 ///
-/// **Thumb `data_refs` augmentation:** radare2's per-op
-/// `refs` field excludes addresses materialized via `movw`/`movt` pairs (only
+/// **Thumb `data_refs` augmentation:** neither backend's adapted references are
+/// guaranteed to include addresses materialized via `movw`/`movt` pairs (only
 /// Ghidra resolves those into `data_refs` for ARM). Without augmentation, the
 /// Thumb side produces 0 global-load events. For Thumb functions, the values
 /// materialized in `load_events` (== `reconstruct_immediates` results, PC-
@@ -1413,6 +1413,20 @@ mod tests {
         img.write_thumb_functions_json(
             std::str::from_utf8(crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture())
                 .unwrap(),
+        );
+        let artifact = crate::thumb_analysis::read_thumb_artifact(
+            &img.image_dir().join("decompiled/thumb_functions.json"),
+        )
+        .unwrap();
+        assert!(
+            artifact
+                .functions()
+                .all(|function| function.producer == crate::thumb_analysis::ThumbProducer::Rizin),
+            "the downstream fixture must exercise Rizin-owned v3 records"
+        );
+        assert_eq!(
+            artifact.functions().next().unwrap().value["data_refs"],
+            serde_json::json!(["0x4020", "0x4060", "0x4070"])
         );
         img.write_manifest_load_addr("0x4000");
         img.write_image_bin(&image_with_strings(0x4000, &[(0x4020, "g_thumb")]));

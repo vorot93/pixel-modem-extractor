@@ -3,7 +3,7 @@
 //! `ghidra_load.json` load spec, a turnkey `run_ghidra.sh`, and an embedded Java
 //! exporter); the opt-in `--run` drives `analyzeHeadless` headless to export
 //! decompiled C, a disassembly listing, a function inventory, and a saved project,
-//! with radare2 covering dense Thumb regions that Ghidra cannot converge on.
+//! with radare2 primary and optional failure-only Rizin covering dense Thumb regions.
 
 use crate::{
     error::{Error, Result},
@@ -40,10 +40,9 @@ pub struct Opts {
     pub image: Option<String>,
     pub ghidra_home: Option<PathBuf>,
     pub processor: String,
-    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode
-    /// (today's Phase-1 behavior — dense Thumb regions marked as data, radare2
-    /// handles them, no `thumb_enrich` runs, and `thumb_functions.json` remains
-    /// assembly-only). Default false (tighten mode).
+    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode.
+    /// Dense Thumb regions are marked as data for Ghidra, the configured host
+    /// analyzers still emit strict v3, and `thumb_enrich` does not add `body_c`.
     pub no_thumb_decompile: bool,
     /// Enable Rizin as a failure-only fallback for dense Thumb regions.
     /// radare2 remains required and is always attempted first. Default false.
@@ -55,7 +54,7 @@ pub struct Opts {
     /// Production callers leave this `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
     /// Opaque-image escape hatch: when true, images whose battery is
-    /// unanimously opaque still run Ghidra + radare2 exactly as before
+    /// unanimously opaque still run Ghidra + configured Thumb analyzers
     /// (run-everything behavior, for research). Default false (skip —
     /// nothing is recoverable from those bytes under the standard import).
     pub no_skip_opaque: bool,
@@ -278,7 +277,7 @@ fn opaque_skip(bytes: &[u8]) -> Option<crate::classify::BatteryStats> {
 
 /// One image's `--run` result: analyzed (with the function count ExportDecomp
 /// recorded), `analyzeHeadless` exited non-zero, or skipped because the opaque
-/// battery was unanimously opaque (no Ghidra/radare2 process was ever spawned;
+/// battery was unanimously opaque (no Ghidra or Thumb-analyzer process was spawned;
 /// the carried stats are what the skip decision measured). Recorded per image
 /// so a full run reports every partition instead of aborting on the first
 /// failure.
@@ -835,7 +834,7 @@ fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
 
 fn generation_only_hint(out: &Path) -> String {
     format!(
-        "(generation only; pass --run to drive Ghidra plus radare2 for dense Thumb regions, or run {}/run_ghidra.sh for Ghidra-only import/export)",
+        "(generation only; pass --run to drive Ghidra plus radare2 primary for dense Thumb regions, with optional failure-only Rizin via --rizin-fallback; or run {}/run_ghidra.sh for Ghidra-only import/export)",
         out.display()
     )
 }
@@ -864,10 +863,9 @@ fn window_entropy(w: &[u8]) -> f64 {
 /// Detect large dense-Thumb regions in an image by entropy. MAIN interleaves ARM/A32
 /// code with multi-MB Thumb-2 blobs — the upper protocol stack (IMS/VoLTE/SIP, RRC,
 /// NAS, L1/PHY, 5G-NR). Thumb-2 is denser than A32 (~7 bits/byte vs ~5-6), so high
-/// entropy marks the Thumb regions. Ghidra cannot converge on them (it spins forever
-/// in a `ClearFlowAndRepairCmd` overlapping-function loop — ~10M+ repair messages on
-/// MAIN), so the pre-script marks them as data for Ghidra and the host analyzes them
-/// with radare2 instead.
+/// entropy marks the Thumb regions. Tighten mode lets Ghidra analyze them under the
+/// overlap-repair watch; datamark mode marks them as data. Independently, the host
+/// analyzes every detected region with radare2 primary and optional Rizin fallback.
 ///
 /// Windows above `ENTROPY_THRESHOLD` are merged; only regions ≥ `MIN_REGION` are
 /// returned, so small high-entropy spans (A32 constant pools) aren't misclassified.
@@ -1346,7 +1344,7 @@ fn run_report_impl(
     // 4. turnkey shell script -> out/run_ghidra.sh
     write_run_script(out, &toc, &opts.processor, &runtime_load_maps.paths)?;
 
-    // 5. optional: drive Ghidra headless per selected image, plus radare2 for dense Thumb regions
+    // 5. optional: drive Ghidra headless and the configured dense-Thumb analyzers per image
     let mut image_results: Vec<ImageResult> = Vec::new();
     let mut current_exports = BTreeSet::new();
     if opts.run {
@@ -1430,7 +1428,7 @@ fn run_report_impl(
             };
             // Opaque-image gate, BEFORE any Ghidra project work: a unanimous
             // battery verdict means there is no code to recover, so bypass the
-            // entire per-image Ghidra + radare2 block (no import, no tighten
+            // entire per-image Ghidra + Thumb-analysis block (no import, no tighten
             // watch, no export, no Thumb analysis) but still record a
             // RunResult — `--image 01_PSP` stays a successful non-empty run.
             // `--no-skip-opaque` restores run-everything behavior.
@@ -1667,8 +1665,8 @@ fn run_report_impl(
                 }
                 None => ImageOutcome::Failed(-1),
             };
-            // Ghidra can't converge on the dense Thumb-2 regions (overlap-repair loop) and
-            // marked them as data — hand them to radare2 for the protocol stack.
+            // Analyze dense Thumb independently of Ghidra, using the configured
+            // radare2-primary route regardless of tighten/datamark mode.
             let (thumb_summary, thumb_error) = if regions.is_empty() {
                 (None, None)
             } else if let Some(thumb_tools) = thumb_tools {
@@ -2502,8 +2500,8 @@ pub fn run_two_pass(
     Ok(Pass2RunReport { report, outcomes })
 }
 
-/// Generate the kit and (with `--run`) drive Ghidra plus radare2 for dense Thumb
-/// regions; non-zero if any selected image failed either analysis path.
+/// Generate the kit and (with `--run`) drive Ghidra plus configured dense-Thumb
+/// analyzers; non-zero if any selected image failed either analysis path.
 pub fn run(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let report = run_report(modem_bin, opts, out)?;
     // Non-zero exit if any image failed — but only after all were attempted (run_report
@@ -2685,8 +2683,7 @@ fn find_ghidra(opts: &Opts) -> Result<GhidraInstall> {
     find_headless(opts.ghidra_home.as_deref())
 }
 
-/// Locate the `radare2` binary (`r2`) on `PATH` — used to analyze the Thumb-2 regions
-/// Ghidra cannot. `None` if not installed (those regions are then left unanalyzed).
+/// Locate the required `radare2` primary (`r2`) on `PATH`. `None` if it is not installed.
 pub fn find_radare2() -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|d| d.join("r2"))
@@ -2712,7 +2709,7 @@ pub fn find_radare2() -> Option<PathBuf> {
 /// (`normalize_thumb_addr` clears Ghidra's Thumb T-bit so `40e1201` and `40e1200`
 /// agree). Matching against `thumb_functions.json` is likewise by the normalized
 /// `entry` field — Phase 2.1 switched this from name-based to address-based
-/// matching because radare2's `thumb_<addr>` names never align with Ghidra's
+/// matching because analyzer-generated names do not reliably align with Ghidra's
 /// `FUN_<addr>`/recovered names. Returns the count of functions whose `body_c`
 /// was populated.
 ///
@@ -2730,8 +2727,8 @@ pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) 
     let mut populated = 0usize;
     for function in artifact.function_values_mut() {
         // Phase 2.1: match by `entry` (address), not by `name`. The `name`
-        // field is radare2's `thumb_<addr>` placeholder and never aligns
-        // with Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
+        // field is analyzer-generated and does not reliably align with
+        // Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
         let Some(entry_str) = function.get("entry").and_then(|name| name.as_str()) else {
             continue;
         };
@@ -3084,14 +3081,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_fake_headless(home: &Path) {
+    fn write_executable(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
 
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_headless(home: &Path) {
         let headless = home.join("support/analyzeHeadless");
-        std::fs::create_dir_all(headless.parent().unwrap()).unwrap();
-        std::fs::write(
+        write_executable(
             &headless,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 set -eu
 export_dir=
@@ -3114,11 +3119,19 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
 "#,
                 GHIDRA_EXPORT_COMPLETION
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&headless).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(headless, permissions).unwrap();
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_fake_radare2(path: &Path, succeeds: bool) {
+        let body = if succeeds {
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"minaddr":1073807360,"maxaddr":1073807362}]' '{"addr":1073807360,"ops":[{"addr":1073807360,"bytes":"0001","disasm":"lsls r0, r0, 4"}]}'
+"#
+        } else {
+            "#!/bin/sh\nexit 9\n"
+        };
+        write_executable(path, body);
     }
 
     #[test]
@@ -4967,6 +4980,126 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fake_radare2_route_emits_strict_v3_and_all_region_failure_preserves_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_thumb_decompile = true;
+        opts.no_skip_opaque = true;
+
+        let radare2 = dir.path().join("tools/r2-success");
+        write_fake_radare2(&radare2, true);
+        let radare2 = std::fs::canonicalize(radare2).unwrap();
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: radare2.clone(),
+                version: "radare2 route fixture 1.0".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let out = dir.path().join("success");
+
+        let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools).unwrap();
+        let image_result = &report.images[0];
+        assert_eq!(image_result.thumb_functions, Some(0));
+        assert_eq!(image_result.thumb_regions_requested, Some(1));
+        assert_eq!(image_result.thumb_regions_succeeded, Some(1));
+        assert_eq!(image_result.thumb_regions_failed, Some(0));
+        assert_eq!(image_result.thumb_radare2_runs, Some(1));
+        assert_eq!(image_result.thumb_rizin_runs, Some(0));
+        assert_eq!(image_result.thumb_execution_accepted, Some(1));
+        assert_eq!(image_result.thumb_execution_quarantined, Some(0));
+        assert!(image_result.thumb_error.is_none());
+
+        let export = out.join("export/02_MAIN");
+        let sidecar = export.join("thumb_functions.json");
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&sidecar_bytes).unwrap();
+        assert_eq!(
+            artifact["format"],
+            "pixel-modem-extractor-thumb-functions-v3"
+        );
+        assert_eq!(artifact.as_object().unwrap().len(), 4);
+        assert_eq!(
+            artifact["producers"],
+            serde_json::json!([{
+                "id": "radare2",
+                "executable": radare2.display().to_string(),
+                "version": "radare2 route fixture 1.0",
+                "command": "aaa;aflj;pdfj @@f"
+            }])
+        );
+        assert_eq!(artifact["regions"].as_array().unwrap().len(), 1);
+        let region = &artifact["regions"][0];
+        assert_eq!(region["start"], "0x40010000");
+        assert_eq!(region["end"], "0x40190000");
+        assert_eq!(region["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(region["attempts"][0]["producer"], "radare2");
+        assert_eq!(region["attempts"][0]["status"], "succeeded");
+        assert!(region["attempts"][0]["error"].is_null());
+        let capture = &region["attempts"][0]["stdout"];
+        assert_eq!(capture["path"], "thumb/40010000.radare2.stdout");
+        let capture_bytes = std::fs::read(export.join(capture["path"].as_str().unwrap())).unwrap();
+        assert_eq!(capture["bytes"], capture_bytes.len() as u64);
+        assert_eq!(
+            capture["blake3"],
+            crate::manifest::blake3_bytes(&capture_bytes)
+        );
+        assert_eq!(
+            region["function_runs"],
+            serde_json::json!([{
+                "producer": "radare2",
+                "first_function": 0,
+                "function_count": 1,
+                "substantial": 0,
+                "accepted": 1,
+                "quarantined": 0
+            }])
+        );
+        assert_eq!(artifact["functions"].as_array().unwrap().len(), 1);
+
+        let failing_radare2 = dir.path().join("tools/r2-failure");
+        write_fake_radare2(&failing_radare2, false);
+        let failing_tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: std::fs::canonicalize(failing_radare2).unwrap(),
+                version: "radare2 route fixture failure".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let fresh_failure_out = dir.path().join("fresh-failure");
+        let failed =
+            run_report_with_thumb_tools(&modem, &opts, &fresh_failure_out, &failing_tools).unwrap();
+        assert!(
+            failed.images[0]
+                .thumb_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed for every requested region"))
+        );
+        assert!(
+            !fresh_failure_out
+                .join("export/02_MAIN/thumb_functions.json")
+                .exists()
+        );
+
+        let before = std::fs::read(&sidecar).unwrap();
+        let failed = run_report_with_thumb_tools(&modem, &opts, &out, &failing_tools).unwrap();
+        assert!(failed.images[0].thumb_error.is_some());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
     /// Low-entropy ARM-ish pattern half for the partial-encryption guard
     /// (mirrors classify.rs's test pattern: 16 distinct bytes).
     fn arm_ish_pattern_blob(len: usize) -> Vec<u8> {
@@ -4997,7 +5130,7 @@ printf '%s\n' '{}' > "$export_root/$label.complete"
         // A SkippedOpaque RunResult is a successful outcome: report_failure
         // must return None, so `decompile --run --image 01_PSP` exits 0 and
         // no export/<label>/ expectations are validated for it (the skip
-        // branch returns before any Ghidra/radare2 spawn; exhaustive match
+        // branch returns before any Ghidra/Thumb-analyzer spawn; exhaustive match
         // sites are enforced by compiling).
         let report = DecompileReport {
             images: vec![ImageResult {

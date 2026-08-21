@@ -72,7 +72,7 @@ pub enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Decompile modem TOC images; --run drives Ghidra headless and radare2 for dense Thumb regions
+    /// Decompile modem TOC images; --run drives Ghidra and dense-Thumb analyzers
     Decompile {
         modem_bin: PathBuf,
         #[arg(long)]
@@ -85,9 +85,9 @@ pub enum Commands {
         ghidra_home: Option<PathBuf>,
         #[arg(long, default_value = "ARM:LE:32:v7")]
         processor: String,
-        /// Skip Phase-2 Thumb decompilation: dense Thumb regions stay marked as data
-        /// (today's Phase-1 behavior). `thumb_functions.json` is emitted at v2
-        /// asm-only (no `body_c`). Use when the tightened TameAnalysis regresses on
+        /// Skip Ghidra Thumb decompilation: dense Thumb regions stay marked as data.
+        /// Host analysis still emits strict-v3 `thumb_functions.json` without `body_c`.
+        /// Use when the tightened TameAnalysis regresses on
         /// your firmware version.
         #[arg(long)]
         no_thumb_decompile: bool,
@@ -102,14 +102,14 @@ pub enum Commands {
         /// `--no-thumb-decompile` instead.
         #[arg(long, hide = true)]
         tighten_wall_clock_budget_sec: Option<u64>,
-        /// Run Ghidra + radare2 even for unanimously-opaque images (the statistical
+        /// Run Ghidra + configured Thumb analyzers even for unanimously-opaque images (the statistical
         /// battery that e.g. Pixel `01_PSP` fails on every test). Research escape
         /// hatch; by default such images are skipped — nothing is recoverable from
         /// them under the standard import.
         #[arg(long)]
         no_skip_opaque: bool,
     },
-    /// Exhaustive pipeline: extract, Ghidra/radare2 decompile, recovered attribution, and decoders
+    /// Exhaustive pipeline: extract, external code analysis, recovered attribution, and decoders
     Decompose {
         img: PathBuf,
         #[arg(long)]
@@ -125,9 +125,8 @@ pub enum Commands {
         ghidra_home: Option<PathBuf>,
         #[arg(long, default_value = "ARM:LE:32:v7")]
         processor: String,
-        /// Skip Phase-2 Thumb decompilation: dense Thumb regions stay marked as data
-        /// (today's Phase-1 behavior). `thumb_functions.json` is emitted at v2
-        /// asm-only (no `body_c`).
+        /// Skip Ghidra Thumb decompilation: dense Thumb regions stay marked as data.
+        /// Host analysis still emits strict-v3 `thumb_functions.json` without `body_c`.
         #[arg(long)]
         no_thumb_decompile: bool,
         /// Enable failure-only Rizin fallback for dense Thumb regions. radare2
@@ -156,7 +155,7 @@ pub enum Commands {
         /// Do not apply recovered global shapes as undefinedN types to decompiled.c.
         #[arg(long)]
         no_apply_global_types: bool,
-        /// Run Ghidra + radare2 even for unanimously-opaque images (the statistical
+        /// Run Ghidra + configured Thumb analyzers even for unanimously-opaque images (the statistical
         /// battery that e.g. Pixel `01_PSP` fails on every test). Research escape
         /// hatch; by default such images are skipped — nothing is recoverable from
         /// them under the standard import.

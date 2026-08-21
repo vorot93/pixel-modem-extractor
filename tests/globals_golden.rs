@@ -1,4 +1,4 @@
-//! Env-gated golden tests for globals recovery on a real `02_MAIN`.
+//! Synthetic v3 integration coverage plus env-gated globals goldens for a real `02_MAIN`.
 //!
 //! Two cohorts, both skip cleanly without their gating env:
 //! - **Phase 3.0** (first three tests): auto-run decompose when
@@ -10,9 +10,75 @@
 
 use pixel_modem_extractor::{decompile, decompose};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+const RIZIN_THUMB_V3: &str = r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {"id":"radare2","executable":"/usr/bin/r2","version":"radare2 fixture","command":"aaa;aflj;pdfj @@f"},
+    {"id":"rizin","executable":"/usr/bin/rizin","version":"rizin fixture","command":"aaa;aflj;pdfj @@F;axlj"}
+  ],
+  "regions": [{
+    "start":"0x4000",
+    "end":"0x4080",
+    "attempts":[
+      {"producer":"radare2","status":"failed","stdout":null,"error":"radare2 fixture failed"},
+      {"producer":"rizin","status":"succeeded","stdout":{"path":"thumb/00004000.rizin.stdout","bytes":1,"blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"error":null}
+    ],
+    "function_runs":[
+      {"producer":"rizin","first_function":0,"function_count":1,"substantial":0,"accepted":1,"quarantined":0}
+    ]
+  }],
+  "functions": [{
+    "name":"rizin_thumb_4000","entry":"0x4000","end":"0x4002","size":2,
+    "body_kind":"thumb_disassembly","body":"0x4000 bx lr\n","data_refs":["0x4020","0x4060"],
+    "decode_ranges":[{"end":"0x4002","isa":"thumb","start":"0x4000"}],"decode_range_errors":[]
+  }]
+}"#;
+
+#[test]
+fn synthetic_rizin_v3_ownership_and_data_refs_reach_downstream_consumers() {
+    let root = tempfile::tempdir().unwrap();
+    let image_dir = root.path().join("images/01_MAIN");
+    let decompiled = image_dir.join("decompiled");
+    std::fs::create_dir_all(&decompiled).unwrap();
+    std::fs::write(decompiled.join("functions.json"), b"[]").unwrap();
+    std::fs::write(decompiled.join("decompiled.c"), b"").unwrap();
+    std::fs::write(decompiled.join("thumb_functions.json"), RIZIN_THUMB_V3).unwrap();
+
+    let functions =
+        pixel_modem_extractor::recover_source::RecoveredFunctions::load(&decompiled).unwrap();
+    assert_eq!(functions.functions.len(), 1);
+    assert_eq!(
+        functions.functions[0].tool,
+        pixel_modem_extractor::recover_source::Tool::Rizin
+    );
+    assert_eq!(functions.functions[0].data_refs, [0x4020, 0x4060]);
+
+    let mut image = vec![0u8; 0x80];
+    image[0x20..0x28].copy_from_slice(b"g_rizin\0");
+    std::fs::write(image_dir.join("01_MAIN.bin"), image).unwrap();
+    let manifest = root.path().join("manifest.json");
+    std::fs::write(&manifest, br#"{"toc":[{"name":"MAIN","load_addr":16384}]}"#).unwrap();
+
+    let report = pixel_modem_extractor::globals::run(
+        &image_dir,
+        "01_MAIN",
+        &manifest,
+        &HashMap::new(),
+        &pixel_modem_extractor::globals::GlobalsOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(report.recovered_count, 1);
+    let globals: Value =
+        serde_json::from_slice(&std::fs::read(decompiled.join("globals.json")).unwrap()).unwrap();
+    assert_eq!(globals["globals"][0]["address"], "0x4060");
+    assert_eq!(globals["globals"][0]["name"], "g_rizin");
+    assert_eq!(globals["globals"][0]["arch"], "thumb");
+}
 
 fn env_or_skip() -> Option<PathBuf> {
     let Some(img) = std::env::var_os("PME_RADIO_IMG").map(PathBuf::from) else {

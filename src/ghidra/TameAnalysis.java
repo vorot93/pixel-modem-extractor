@@ -6,8 +6,8 @@
 //     (TIGHTEN_EXTRA disables the `Repair Flow Damage` sub-option of
 //     `Non-Returning Functions - Discovered` — see CONTRIBUTING.md § Winning
 //     TameAnalysis options). Does NOT data-mark regions; Ghidra attempts Thumb
-//     function discovery and decompilation. Per-function convergence failures
-//     fall through to radare2 in the Rust host (see decompile::thumb_enrich).
+//     function discovery and decompilation. Independently, the Rust host analyzes
+//     dense regions with radare2 primary and optional failure-only Rizin fallback.
 //
 //   arg[0] = "datamark" (today's Phase-1 behavior; also used by --no-thumb-decompile):
 //     additionally mark each remaining arg "addrHex:lenHex" as DATA so Ghidra's
@@ -91,7 +91,7 @@ public class TameAnalysis extends GhidraScript {
                     Address end = start.add(len - 1);
                     listing.clearCodeUnits(start, end, false);
                     listing.createData(start, new ArrayDataType(Undefined1DataType.dataType, (int) len, 1));
-                    println("TameAnalysis: marked data region (radare2 handles it) " + start + ".." + end);
+                    println("TameAnalysis: marked data region (Rust host handles dense Thumb) " + start + ".." + end);
                 } catch (Exception e) {
                     println("TameAnalysis: could not mark region " + arg + ": " + e.getMessage());
                 }

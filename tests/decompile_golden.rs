@@ -1500,15 +1500,27 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
             )
         })
         .collect();
-    let retained_thumb = serde_json::to_vec(&serde_json::json!({
-        "format":"pixel-modem-extractor-thumb-functions-v2",
-        "functions":[{
-            "name":"retained_thumb_fixture", "entry":"0x0", "end":"0x2", "size":2,
-            "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2"}],
-            "decode_range_errors":[], "body_kind":"thumb_disassembly", "body":"", "data_refs":[]
-        }]
-    }))
-    .unwrap();
+    let retained_thumb = br#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {"id":"radare2","executable":"/usr/bin/r2","version":"radare2 fixture","command":"aaa;aflj;pdfj @@f"},
+    {"id":"rizin","executable":"/usr/bin/rizin","version":"rizin fixture","command":"aaa;aflj;pdfj @@F;axlj"}
+  ],
+  "regions": [{
+    "start":"0x0","end":"0x2",
+    "attempts":[
+      {"producer":"radare2","status":"failed","stdout":null,"error":"radare2 fixture failure"},
+      {"producer":"rizin","status":"succeeded","stdout":{"path":"thumb/00000000.rizin.stdout","bytes":1,"blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"error":null}
+    ],
+    "function_runs":[{"producer":"rizin","first_function":0,"function_count":1,"substantial":0,"accepted":1,"quarantined":0}]
+  }],
+  "functions": [{
+    "name":"retained_thumb_fixture","entry":"0x0","end":"0x2","size":2,
+    "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2"}],
+    "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":[]
+  }]
+}"#
+    .to_vec();
     std::fs::write(
         out.join("export/00_BOOT/thumb_functions.json"),
         &retained_thumb,
@@ -2068,11 +2080,10 @@ fn tightened_tame_analysis_dispatchs_tighten_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Phase-2 e2e: `thumb_enrich` populates `body_c` from a synthetic
-/// `decompiled.c` keyed by entry address (Phase 2.1: address-based matching,
-/// T-bit normalized), and bumps `format` to v2 on first population. Does not
-/// require Ghidra — pure Rust step — grouped with the Ghidra tests as Phase-2
-/// contract regression.
+/// Legacy-mutation e2e: `thumb_enrich` populates `body_c` from a synthetic
+/// `decompiled.c` keyed by normalized entry address. The deliberately-v1 input
+/// promotes to retained v2; fresh producer output is strict v3 and its provenance
+/// preservation is covered separately. This pure-Rust step does not require Ghidra.
 #[test]
 fn thumb_enrich_populates_body_c() {
     let dir = std::env::temp_dir().join(format!(
@@ -2106,7 +2117,7 @@ fn thumb_enrich_populates_body_c() {
         serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
     assert_eq!(
         v["format"], "pixel-modem-extractor-thumb-functions-v2",
-        "format should bump to v2 after population: {v}"
+        "legacy v1 should promote to v2 after population: {v}"
     );
     assert!(
         v["functions"][0]["body_c"].is_string(),

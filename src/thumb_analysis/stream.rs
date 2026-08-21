@@ -209,8 +209,8 @@ fn radare2_json_values(stdout: &[u8]) -> Vec<serde_json::Value> {
     values
 }
 
-/// Streaming, noise-tolerant scanner for radare2 stdout: yields one
-/// top-level JSON value's bytes at a time, byte-for-byte equivalent to the
+/// Streaming, noise-tolerant analyzer-output scanner: yields one top-level JSON
+/// value's bytes at a time, byte-for-byte equivalent to the
 /// legacy in-memory `radare2_json_values`/`balanced_json_end` pair (kept as
 /// the `#[cfg(test)]` oracle). Memory is bounded by the largest single
 /// top-level value plus one read chunk.
@@ -1655,9 +1655,9 @@ fn populate_test_image_from_pdfj(image: &mut [u8], pdfj: &serde_json::Value) {
 /// Defensive upper bound on a single Thumb analyzer's region stdout. Grounded in
 /// production: 02_MAIN's largest dense-Thumb region (`410b0000`, ~20 MiB
 /// carved .bin, ~71 k functions) emits ~1.82 GiB of `aflj;pdfj @@f` JSON
-/// (~25 KiB/function). 4 GiB is ~2× that peak, with headroom for r2 version
+/// (~25 KiB/function). 4 GiB is ~2× that peak, with headroom for analyzer-version
 /// differences and slightly larger images. Exceeding it indicates genuine
-/// r2 pathology (infinite loop, corrupt input triggering verbose output) —
+/// analyzer pathology (infinite loop, corrupt input triggering verbose output) —
 /// fail-closed rather than OOM the host.
 const ANALYZER_STDOUT_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// Rizin alone gets the measured per-region cutoff; radare2 retains no wall deadline.

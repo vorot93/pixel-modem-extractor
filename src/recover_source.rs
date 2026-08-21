@@ -1121,9 +1121,9 @@ mod tests {
 
     #[test]
     fn parses_optional_radare2_thumb_functions_v2() {
-        // Phase 2 bumps thumb_functions.json to v2. v1 golden trees must
-        // still parse (covered by parses_optional_radare2_thumb_functions above);
-        // this fixture verifies the new v2 default round-trips identically.
+        // Legacy v1 golden trees must still parse (covered above); this fixture
+        // verifies retained v2 radare2 evidence round-trips identically. Fresh
+        // producer output is strict v3 and has separate ownership tests.
         let root = temp_dir("recover_radare2_v2");
         std::fs::write(root.join("functions.json"), b"[]").unwrap();
         std::fs::write(root.join("decompiled.c"), b"").unwrap();

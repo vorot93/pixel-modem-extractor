@@ -1,6 +1,7 @@
 //! `decompose` — the exhaustive one-command pipeline. Runs extraction, decompiles
-//! every modem image (Ghidra + radare2), and runs every decoder, marshaling all
-//! outputs into one per-image tree with a machine-readable `report.json`. Best-effort:
+//! every modem image (Ghidra plus configured dense-Thumb analyzers), and runs every
+//! decoder, marshaling all outputs into one per-image tree with a machine-readable
+//! `report.json`. Best-effort:
 //! a stage failure is recorded and the run continues; the process exits non-zero if
 //! anything failed. `--prune` reduces the tree to only the terminal ("leaf") artifacts.
 
@@ -56,7 +57,7 @@ pub struct Opts {
     /// Default: apply.
     pub no_apply_global_types: bool,
     /// Opaque-image escape hatch: when true, images whose battery is
-    /// unanimously opaque still run Ghidra + radare2 exactly as before
+    /// unanimously opaque still run Ghidra + configured Thumb analyzers
     /// (run-everything behavior, for research). Default false (skip —
     /// nothing is recoverable from those bytes under the standard import).
     /// Wired to `--no-skip-opaque`.
@@ -74,7 +75,7 @@ pub struct ImageReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<&'static str>,
     /// Why a skipped image was skipped: "opaque" (unanimous battery verdict;
-    /// no Ghidra/radare2 ran, no decompiled/ sidecars exist).
+    /// no Ghidra or Thumb analyzer ran, no decompiled/ sidecars exist).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2883,6 +2884,37 @@ mod tests {
         }
     }
 
+    fn producer_identity(
+        producer: crate::thumb_analysis::ThumbProducer,
+        executable: &str,
+        version: &str,
+    ) -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer,
+            executable: executable.into(),
+            version: version.into(),
+            command: producer.command(),
+        }
+    }
+
+    fn analysis_opts(rizin_fallback: bool) -> Opts {
+        Opts {
+            no_verify: false,
+            prune: false,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_symbol_pass: false,
+            no_thumb_decompile: false,
+            rizin_fallback,
+            tighten_wall_clock_budget_override: None,
+            globals_provisional: false,
+            globals_k_arm: None,
+            globals_k_thumb: None,
+            no_apply_global_types: false,
+            no_skip_opaque: false,
+        }
+    }
+
     fn tagged_functions(name: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!([{
             "name": name,
@@ -4653,6 +4685,18 @@ mod tests {
 
     #[test]
     fn report_serializes_and_ok_reflects_failure() {
+        let thumb_tools = crate::thumb_analysis::ThumbTools {
+            radare2: producer_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/usr/bin/r2",
+                "radare2 6.1.4",
+            ),
+            rizin: Some(producer_identity(
+                crate::thumb_analysis::ThumbProducer::Rizin,
+                "/usr/bin/rizin",
+                "rizin 0.8.2",
+            )),
+        };
         let stages = vec![
             StageReport::ok("extract", "manifest.json", 5),
             StageReport::decompile(
@@ -4767,14 +4811,11 @@ mod tests {
             source_blake3: "abc".into(),
             modem_generation: None,
             out: "radio.decomposed".into(),
-            ghidra: AnalysisTools {
-                headless: "/g/analyzeHeadless".into(),
-                radare2: "/usr/bin/r2".into(),
-                radare2_version: "radare2 6.1.4".into(),
-                rizin_fallback: true,
-                rizin: Some("/usr/bin/rizin".into()),
-                rizin_version: Some("rizin 0.8.2".into()),
-            },
+            ghidra: analysis_tools(
+                Path::new("/g/analyzeHeadless"),
+                &analysis_opts(true),
+                &thumb_tools,
+            ),
             pruned: false,
             ok: Report::is_ok(&stages),
             stages,
@@ -4861,26 +4902,51 @@ mod tests {
     }
 
     #[test]
-    fn analysis_tools_omit_rizin_identity_when_fallback_is_disabled() {
-        let json = serde_json::to_value(AnalysisTools {
-            headless: "/g/analyzeHeadless".into(),
-            radare2: "/usr/bin/r2".into(),
-            radare2_version: "radare2 6.1.4".into(),
-            rizin_fallback: false,
-            rizin: None,
-            rizin_version: None,
-        })
-        .unwrap();
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "headless": "/g/analyzeHeadless",
-                "radare2": "/usr/bin/r2",
-                "radare2_version": "radare2 6.1.4",
-                "rizin_fallback": false
-            })
+    fn analysis_tools_serialize_exact_enabled_and_disabled_identities() {
+        let radare2 = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            "/usr/bin/r2",
+            "radare2 6.1.4",
         );
+        let rizin = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            "/usr/bin/rizin",
+            "rizin 0.8.2",
+        );
+        for (enabled, expected) in [
+            (
+                false,
+                serde_json::json!({
+                    "headless": "/g/analyzeHeadless",
+                    "radare2": "/usr/bin/r2",
+                    "radare2_version": "radare2 6.1.4",
+                    "rizin_fallback": false
+                }),
+            ),
+            (
+                true,
+                serde_json::json!({
+                    "headless": "/g/analyzeHeadless",
+                    "radare2": "/usr/bin/r2",
+                    "radare2_version": "radare2 6.1.4",
+                    "rizin_fallback": true,
+                    "rizin": "/usr/bin/rizin",
+                    "rizin_version": "rizin 0.8.2"
+                }),
+            ),
+        ] {
+            let tools = crate::thumb_analysis::ThumbTools {
+                radare2: radare2.clone(),
+                rizin: enabled.then(|| rizin.clone()),
+            };
+            let json = serde_json::to_value(analysis_tools(
+                Path::new("/g/analyzeHeadless"),
+                &analysis_opts(enabled),
+                &tools,
+            ))
+            .unwrap();
+            assert_eq!(json, expected);
+        }
     }
 
     #[test]
@@ -5444,18 +5510,16 @@ mod tests {
     #[test]
     fn preflight_requires_primary_tools_and_discovers_rizin_only_when_enabled() {
         let g = PathBuf::from("/opt/ghidra/support/analyzeHeadless");
-        let r = crate::thumb_analysis::ProducerIdentity {
-            producer: crate::thumb_analysis::ThumbProducer::Radare2,
-            executable: "/usr/bin/r2".into(),
-            version: "radare2 6.1.4".into(),
-            command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
-        };
-        let z = crate::thumb_analysis::ProducerIdentity {
-            producer: crate::thumb_analysis::ThumbProducer::Rizin,
-            executable: "/usr/bin/rizin".into(),
-            version: "rizin 0.8.2".into(),
-            command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
-        };
+        let r = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            "/usr/bin/r2",
+            "radare2 6.1.4",
+        );
+        let z = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            "/usr/bin/rizin",
+            "rizin 0.8.2",
+        );
 
         let (_, tools) = preflight(Ok(g.clone()), Ok(r.clone()), false, || -> Result<_> {
             panic!("disabled Rizin fallback must not run discovery")
@@ -5496,18 +5560,18 @@ mod tests {
     #[test]
     fn preflight_tools_reach_decompile_and_report_unchanged() {
         let headless = PathBuf::from("/preflight/ghidra/analyzeHeadless");
-        let radare2 = crate::thumb_analysis::ProducerIdentity {
-            producer: crate::thumb_analysis::ThumbProducer::Radare2,
-            executable: "/preflight/r2-exact".into(),
-            version: "radare2 exact version".into(),
-            command: "radare2 exact command",
-        };
-        let rizin = crate::thumb_analysis::ProducerIdentity {
-            producer: crate::thumb_analysis::ThumbProducer::Rizin,
-            executable: "/preflight/rizin-exact".into(),
-            version: "rizin exact version".into(),
-            command: "rizin exact command",
-        };
+        let mut radare2 = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            "/preflight/r2-exact",
+            "radare2 exact version",
+        );
+        radare2.command = "radare2 exact command";
+        let mut rizin = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            "/preflight/rizin-exact",
+            "rizin exact version",
+        );
+        rizin.command = "rizin exact command";
         let expected = crate::thumb_analysis::ThumbTools {
             radare2: radare2.clone(),
             rizin: Some(rizin.clone()),
