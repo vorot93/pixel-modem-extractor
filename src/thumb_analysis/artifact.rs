@@ -2259,9 +2259,13 @@ fn write_v3_values_into<W: Write>(
 /// ownership, function order, and producer fields are validated and preserved;
 /// legacy mutations retain the established v1-to-v2 promotion. A semantic
 /// no-op drops the temporary file and leaves the source bytes untouched.
+/// Atomically rewrite each function record in place, handing the mutator the
+/// record's validated run owner: a v3 region may hold same-entry records from
+/// different producers, so an address-only mutation cannot identify them.
+/// V1/v2 records report `radare2`, the owner their format implies.
 pub(crate) fn stream_rewrite_thumb_functions<F>(path: &Path, on_function: F) -> Result<()>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     let input = std::fs::File::open(path)?;
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
@@ -2305,7 +2309,7 @@ struct ThumbRewriteScan<F> {
 
 impl<F> ThumbRewriteScan<F>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     fn new(output: atomic_write_file::AtomicWriteFile, on_function: F) -> Self {
         Self {
@@ -2339,7 +2343,7 @@ where
 
     fn rewrite_legacy(&mut self, mut function: Value) -> Result<()> {
         let original = function.clone();
-        (self.on_function)(&mut function)?;
+        (self.on_function)(ThumbProducer::Radare2, &mut function)?;
         self.changed |= function != original;
         self.write_function(&function)
     }
@@ -2352,15 +2356,9 @@ where
             ))
         })?;
         let original = function.clone();
-        (self.on_function)(&mut function)?;
-        validate_v3_function_mutation(
-            &original,
-            &function,
-            self.function_count,
-            &V3_IMMUTABLE_FUNCTION_FIELDS,
-        )?;
-        let (substantial, accepted, quarantined) =
-            validate_function_value(&function, self.function_count, None)?;
+        // Ownership is resolved before the mutation so the callback can key by
+        // producer; the cursor stays monotonic because `write_function`
+        // advances `function_count` exactly once per record.
         let layout = self.layout.as_ref().ok_or_else(|| {
             invalid_artifact("v3 artifact lacks validated producer and region metadata")
         })?;
@@ -2372,6 +2370,16 @@ where
                 "every v3 function must have exactly one run owner",
             ));
         };
+        let producer = layout.runs[run_index].producer;
+        (self.on_function)(producer, &mut function)?;
+        validate_v3_function_mutation(
+            &original,
+            &function,
+            self.function_count,
+            &V3_IMMUTABLE_FUNCTION_FIELDS,
+        )?;
+        let (substantial, accepted, quarantined) =
+            validate_function_value(&function, self.function_count, None)?;
         let observed = &mut self.observed[run_index];
         observed.substantial += usize::from(substantial);
         observed.accepted += usize::from(accepted);
@@ -2455,7 +2463,7 @@ struct ThumbRewriteVisitor<'a, F> {
 
 impl<'de, F> Visitor<'de> for ThumbRewriteVisitor<'_, F>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2544,7 +2552,7 @@ struct RewriteLegacyFunctions<'a, F> {
 
 impl<'de, F> DeserializeSeed<'de> for RewriteLegacyFunctions<'_, F>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2558,7 +2566,7 @@ where
 
 impl<'de, F> Visitor<'de> for RewriteLegacyFunctions<'_, F>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2585,7 +2593,7 @@ struct RewriteV3Functions<'a, F> {
 
 impl<'de, F> DeserializeSeed<'de> for RewriteV3Functions<'_, F>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2599,7 +2607,7 @@ where
 
 impl<'de, F> Visitor<'de> for RewriteV3Functions<'_, F>
 where
-    F: FnMut(&mut Value) -> Result<()>,
+    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
 {
     type Value = ();
 

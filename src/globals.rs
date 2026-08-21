@@ -146,16 +146,28 @@ pub struct FunctionEvidenceNameProjection {
 }
 
 impl FunctionEvidenceNameProjection {
+    /// Each symbol projects only into its own ISA. A `Symbol` describes one
+    /// function record, so an ARM entry and a Thumb entry that happen to share
+    /// an address must not name each other.
     pub fn from_symbols(symbols: &[symbolicate::Symbol]) -> Self {
         let mut projection = Self::default();
         for symbol in symbols {
             let Some(address) = parse_numeric_symbol_address(&symbol.address) else {
                 continue;
             };
-            if let Some(name) = &symbol.name {
-                projection.arm.insert(address, name.clone());
+            match symbol.arch {
+                "arm" => {
+                    if let Some(name) = &symbol.name {
+                        projection.arm.insert(address, name.clone());
+                    }
+                }
+                // Thumb records the absence of a name too: an entry present
+                // with `None` is a known function the writer left unnamed.
+                "thumb" => {
+                    projection.thumb.insert(address, symbol.name.clone());
+                }
+                _ => {}
             }
-            projection.thumb.insert(address, symbol.name.clone());
         }
         projection
     }
@@ -1284,6 +1296,7 @@ mod tests {
             .map(|address| symbolicate::Symbol {
                 address: address.to_string(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_invalid".to_string(),
                 name: Some("SHOULD_NOT_PROJECT".to_string()),
                 tier: symbolicate::Tier::Recovered,
@@ -1682,7 +1695,9 @@ mod tests {
             make_arm_function(0x2300, &[0x3300, 0x4300]),
         ];
         late_arm[0]["name"] = serde_json::json!("ARM_FINAL_2000");
-        late_arm[1]["name"] = serde_json::json!("COLLISION_FINAL_2300");
+        // Owner-aware finalize stamps the ARM record from the ARM symbol, so
+        // the same-address Thumb symbol never renames it.
+        late_arm[1]["name"] = serde_json::json!("COLLISION_FIRST_2300");
         let early_arm = vec![
             make_arm_function(0x2000, &[0x3000, 0x4000]),
             make_arm_function(0x2300, &[0x3300, 0x4300]),
@@ -1730,6 +1745,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2000".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_2000".into(),
                 name: Some("ARM_FINAL_2000".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1739,6 +1755,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2100".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "fcn.2100".into(),
                 name: Some("THUMB_FINAL_2100".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -1748,6 +1765,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2200".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_2200".into(),
                 name: Some("ARM_SHARED_2200".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1757,6 +1775,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2200".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "fcn.2200".into(),
                 name: None,
                 tier: symbolicate::Tier::None,
@@ -1766,6 +1785,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2300".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_2300".into(),
                 name: Some("COLLISION_FIRST_2300".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1775,6 +1795,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2300".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "fcn.2300".into(),
                 name: Some("COLLISION_FINAL_2300".into()),
                 tier: symbolicate::Tier::Provisional,

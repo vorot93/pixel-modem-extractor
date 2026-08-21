@@ -2721,25 +2721,28 @@ pub fn find_radare2() -> Option<PathBuf> {
 pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
     let bodies = collect_decompiled_c_bodies(decompiled_c_path)?;
     let mut populated = 0usize;
-    crate::thumb_analysis::stream_rewrite_thumb_functions(thumb_functions_json_path, |function| {
-        // Phase 2.1: match by `entry` (address), not by `name`. The `name`
-        // field is analyzer-generated and does not reliably align with
-        // Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
-        let Some(entry_str) = function.get("entry").and_then(|name| name.as_str()) else {
-            return Ok(());
-        };
-        let Some(canonical) = normalize_thumb_addr(entry_str) else {
-            return Ok(());
-        };
-        if let Some(body) = bodies.get(&canonical) {
-            function.as_object_mut().unwrap().insert(
-                "body_c".to_string(),
-                serde_json::Value::String(body.clone()),
-            );
-            populated += 1;
-        }
-        Ok(())
-    })?;
+    crate::thumb_analysis::stream_rewrite_thumb_functions(
+        thumb_functions_json_path,
+        |_, function| {
+            // Phase 2.1: match by `entry` (address), not by `name`. The `name`
+            // field is analyzer-generated and does not reliably align with
+            // Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
+            let Some(entry_str) = function.get("entry").and_then(|name| name.as_str()) else {
+                return Ok(());
+            };
+            let Some(canonical) = normalize_thumb_addr(entry_str) else {
+                return Ok(());
+            };
+            if let Some(body) = bodies.get(&canonical) {
+                function.as_object_mut().unwrap().insert(
+                    "body_c".to_string(),
+                    serde_json::Value::String(body.clone()),
+                );
+                populated += 1;
+            }
+            Ok(())
+        },
+    )?;
     Ok(populated)
 }
 

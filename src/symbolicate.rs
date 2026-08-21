@@ -63,6 +63,11 @@ pub struct Evidence {
 pub struct Symbol {
     pub address: String,    // "0x40e1bff4"
     pub arch: &'static str, // "arm" | "thumb"
+    /// Which recovery tool produced the function record this symbol describes.
+    /// A valid multi-run v3 artifact can hold a radare2 and a Rizin record at
+    /// the same entry, so `(tool, address)` — not the address alone — is what
+    /// identifies the record a symbol belongs to.
+    pub tool: Tool,
     pub original_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -795,13 +800,15 @@ fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
 /// `pub(crate)` so `decompose`'s route tests can drive the real finalize
 /// rewriter when modeling the symbol-route input-rewrite sequence.
 pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
-    // entry vaddr -> symbol (numeric, so "0x10" and "0x00000010" match).
-    let by_addr: HashMap<u64, &Symbol> = symbols
+    // (producer, entry vaddr) -> symbol. Numeric, so "0x10" and "0x00000010"
+    // match; producer-keyed, so same-entry records from different analyzers
+    // each receive their own symbol instead of whichever one wins.
+    let by_owner: HashMap<(Tool, u64), &Symbol> = symbols
         .iter()
-        .filter_map(|s| parse_hex(&s.address).ok().map(|a| (a, s)))
+        .filter_map(|s| parse_hex(&s.address).ok().map(|a| ((s.tool, a), s)))
         .collect();
 
-    let stamp = |item: &mut serde_json::Value| -> Result<()> {
+    let stamp = |tool: Tool, item: &mut serde_json::Value| -> Result<()> {
         let Some(addr) = item
             .get("entry")
             .and_then(|v| v.as_str())
@@ -809,7 +816,7 @@ pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> R
         else {
             return Ok(());
         };
-        let Some(sym) = by_addr.get(&addr) else {
+        let Some(sym) = by_owner.get(&(tool, addr)) else {
             return Ok(());
         };
         let Some(obj) = item.as_object_mut() else {
@@ -842,16 +849,19 @@ pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> R
         Ok(())
     };
 
-    // functions.json (a bare array)
+    // functions.json (a bare array) is always Ghidra's inventory.
     let fpath = decompiled.join("functions.json");
     if fpath.exists() {
-        crate::thumb_analysis::stream_rewrite_json_array(&fpath, stamp)?;
+        crate::thumb_analysis::stream_rewrite_json_array(&fpath, |item| stamp(Tool::Ghidra, item))?;
     }
 
-    // thumb_functions.json ({ "functions": [...] })
+    // thumb_functions.json ({ "functions": [...] }); the mutator resolves each
+    // record's validated run owner.
     let tpath = decompiled.join("thumb_functions.json");
     if tpath.exists() {
-        crate::thumb_analysis::stream_rewrite_thumb_functions(&tpath, stamp)?;
+        crate::thumb_analysis::stream_rewrite_thumb_functions(&tpath, |producer, item| {
+            stamp(producer.into(), item)
+        })?;
     }
     Ok(())
 }
@@ -964,7 +974,7 @@ fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> R
         return Ok(());
     }
     let renames = build_rename_map(symbols);
-    crate::thumb_analysis::stream_rewrite_thumb_functions(&path, |func| {
+    crate::thumb_analysis::stream_rewrite_thumb_functions(&path, |_, func| {
         let Some(obj) = func.as_object_mut() else {
             return Ok(());
         };
@@ -1212,6 +1222,7 @@ pub(crate) fn build_map(
         symbols.push(Symbol {
             address: format!("0x{addr_hex}"),
             arch: f.arch,
+            tool: f.tool,
             original_name: f.name.clone(),
             name,
             tier,
@@ -1650,6 +1661,7 @@ mod tests {
             Symbol {
                 address: "0xaa".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_aa".into(),
                 name: Some("dup".into()),
                 tier: Tier::Recovered,
@@ -1659,6 +1671,7 @@ mod tests {
             Symbol {
                 address: "0xbb".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_bb".into(),
                 name: Some("dup".into()),
                 tier: Tier::Recovered,
@@ -1828,6 +1841,58 @@ mod tests {
         );
     }
 
+    /// The valid multi-run v3 fixture carries a radare2 and a Rizin record at
+    /// the same entry, so an address-only rewrite map stamps both from whichever
+    /// symbol wins. Ownership must decide which record each symbol updates.
+    #[test]
+    fn finalize_rewrites_same_entry_records_by_producer_identity() {
+        let dir = tmp("pme_sym_v3_owner_aware_rewrite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thumb_functions.json");
+        std::fs::write(
+            &path,
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap();
+        let symbol = |tool: Tool, name: &str| Symbol {
+            address: "0x1000".into(),
+            arch: "thumb",
+            tool,
+            original_name: format!("original_{name}"),
+            name: Some(name.to_string()),
+            tier: Tier::Recovered,
+            evidence: Vec::new(),
+            annotations: vec![format!("annotation_{name}")],
+        };
+
+        rewrite_functions_json(
+            &dir,
+            &[
+                symbol(Tool::Radare2, "from_radare2"),
+                symbol(Tool::Rizin, "from_rizin"),
+            ],
+        )
+        .unwrap();
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let functions = document["functions"].as_array().unwrap();
+        assert_eq!(functions[0]["name"], "from_radare2");
+        assert_eq!(functions[0]["original_name"], "original_from_radare2");
+        assert_eq!(
+            functions[0]["annotations"],
+            serde_json::json!(["annotation_from_radare2"])
+        );
+        assert_eq!(functions[1]["name"], "from_rizin");
+        assert_eq!(functions[1]["original_name"], "original_from_rizin");
+        assert_eq!(
+            functions[1]["annotations"],
+            serde_json::json!(["annotation_from_rizin"])
+        );
+        // The rewrite must preserve run ownership and every provenance field.
+        crate::thumb_analysis::parse_thumb_artifact(&std::fs::read(&path).unwrap(), None).unwrap();
+    }
+
     #[test]
     fn load_attribution_fails_closed_on_same_tool_path_conflict() {
         let dir = tmp("pme_sym_attr_conflict");
@@ -1884,10 +1949,12 @@ mod tests {
         d
     }
 
+    /// A symbol for the Rizin-owned record at 0x4000 in `consumer_v3_fixture`.
     fn thumb_symbol() -> Symbol {
         Symbol {
             address: "0x4000".into(),
             arch: "thumb",
+            tool: crate::recover_source::Tool::Rizin,
             original_name: "thumb_4000".into(),
             name: Some("recovered_thumb".into()),
             tier: Tier::Recovered,
@@ -1904,6 +1971,7 @@ mod tests {
             Symbol {
                 address: "0x10".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_10".into(),
                 name: Some("real".into()),
                 tier: Tier::Recovered,
@@ -1913,6 +1981,7 @@ mod tests {
             Symbol {
                 address: "0x20".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "thumb_20".into(),
                 name: Some("guess_x_20".into()),
                 tier: Tier::Provisional,
@@ -1922,6 +1991,7 @@ mod tests {
             Symbol {
                 address: "0x30".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_30".into(),
                 name: None,
                 tier: Tier::None,
@@ -1943,6 +2013,7 @@ mod tests {
         let syms = vec![Symbol {
             address: "0x40e1bff4".into(),
             arch: "arm",
+            tool: crate::recover_source::Tool::Ghidra,
             original_name: "FUN_40e1bff4".into(),
             name: Some("real_fn".into()),
             tier: Tier::Recovered,
@@ -1965,6 +2036,7 @@ mod tests {
             Symbol {
                 address: "0x40e1200".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "thumb_40e1200".into(),
                 name: Some("guess_short_040e1200".into()),
                 tier: Tier::Provisional,
@@ -1974,6 +2046,7 @@ mod tests {
             Symbol {
                 address: "0x40e12000".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "thumb_40e12000".into(),
                 name: Some("guess_long_40e12000".into()),
                 tier: Tier::Provisional,
@@ -2006,6 +2079,7 @@ mod tests {
         let syms = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
+            tool: crate::recover_source::Tool::Ghidra,
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2035,6 +2109,7 @@ mod tests {
         let syms = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
+            tool: crate::recover_source::Tool::Ghidra,
             original_name: "FUN_10".into(), // the true original
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2491,6 +2566,7 @@ mod tests {
         let symbols = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
+            tool: crate::recover_source::Tool::Ghidra,
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2519,6 +2595,7 @@ mod tests {
             Symbol {
                 address: "0x40e1bff4".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_40e1bff4".into(),
                 name: Some("LteRrc_Reestab".into()),
                 tier: Tier::Recovered,
@@ -2528,6 +2605,7 @@ mod tests {
             Symbol {
                 address: "0x40e1c000".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_40e1c000".into(),
                 name: None, // Tier::None — no rename
                 tier: Tier::None,
@@ -2574,6 +2652,7 @@ mod tests {
         let symbols = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
+            tool: crate::recover_source::Tool::Ghidra,
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2618,6 +2697,7 @@ mod tests {
             Symbol {
                 address: "0x40e1200".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "thumb_40e1200".into(),
                 name: Some("RealName".into()),
                 tier: Tier::Recovered,
@@ -2627,6 +2707,7 @@ mod tests {
             Symbol {
                 address: "0x00000010".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_10".into(),
                 name: None,
                 tier: Tier::Recovered,
@@ -2731,6 +2812,7 @@ mod tests {
         Symbol {
             address: "0x40e1200".into(),
             arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
             original_name: "thumb_40e1200".into(),
             name: Some("RealName".into()),
             tier: Tier::Recovered,

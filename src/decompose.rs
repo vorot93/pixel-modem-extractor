@@ -2840,6 +2840,11 @@ mod tests {
         symbolicate::Symbol {
             address: address.to_string(),
             arch,
+            tool: if arch == "thumb" {
+                crate::recover_source::Tool::Radare2
+            } else {
+                crate::recover_source::Tool::Ghidra
+            },
             original_name: format!("original_{address}"),
             name: name.map(str::to_string),
             tier,
@@ -3052,6 +3057,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x0000ABCD".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_abcd".into(),
                 name: Some("recovered_name".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -3061,6 +3067,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "000000EF".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "thumb_ef".into(),
                 name: Some("provisional_name".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -3070,6 +3077,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x00000012".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_12".into(),
                 name: None,
                 tier: symbolicate::Tier::None,
@@ -3152,9 +3160,11 @@ mod tests {
             projection.name_for(globals::Arch::Arm, 0xabcd),
             Some("ARM_SHARED")
         );
+        // Each ISA projects only its own symbol: the ARM entry at 0xef keeps
+        // its own recovered name instead of the Thumb entry's.
         assert_eq!(
             projection.name_for(globals::Arch::Arm, 0xef),
-            Some("PROVISIONAL_EF")
+            Some("RECOVERED_EF")
         );
         assert_eq!(
             projection.name_for(globals::Arch::Arm, 0xa2),
@@ -3165,10 +3175,8 @@ mod tests {
             projection.name_for(globals::Arch::Thumb, 0xef),
             Some("PROVISIONAL_EF")
         );
-        assert_eq!(
-            projection.name_for(globals::Arch::Thumb, 0xa2),
-            Some("UPPER_A2")
-        );
+        // 0xa2 has only an ARM symbol, so no Thumb record is renamed there.
+        assert_eq!(projection.name_for(globals::Arch::Thumb, 0xa2), None);
     }
 
     #[test]
@@ -7068,14 +7076,25 @@ mod tests {
             serde_json::to_vec(&value).unwrap()
         };
         std::fs::write(&thumb_path, &rewritten_thumb).unwrap();
+        // One symbol per owned record: finalize keys by (producer, entry), so
+        // the Ghidra ARM entry and the radare2-owned Thumb entry at the same
+        // address are stamped from their own symbols.
         symbolicate::rewrite_functions_json(
             &decompiled,
-            &[test_symbol(
-                "0x4000",
-                "arm",
-                Some("Recovered_4000"),
-                symbolicate::Tier::Recovered,
-            )],
+            &[
+                test_symbol(
+                    "0x4000",
+                    "arm",
+                    Some("Recovered_4000"),
+                    symbolicate::Tier::Recovered,
+                ),
+                test_symbol(
+                    "0x4000",
+                    "thumb",
+                    Some("Recovered_thumb_4000"),
+                    symbolicate::Tier::Recovered,
+                ),
+            ],
         )
         .unwrap();
         let final_functions = std::fs::read(&functions_path).unwrap();
