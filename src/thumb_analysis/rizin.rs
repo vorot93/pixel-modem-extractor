@@ -1,9 +1,10 @@
 //! Rizin inventory, capture-shape, and outgoing-xref adaptation for the
 //! coordinator's failure-only fallback.
 
+use super::identity::discover;
 use super::radare2::FunctionRecord;
 use super::stream::{ValueScanner, read_rizin_pdfj_value, scan_rizin_inventory};
-use super::{ProducerIdentity, ThumbProducer, discover};
+use super::{ProducerIdentity, ThumbProducer};
 use crate::error::{Error, Result};
 use crate::execution_ranges::DecodeRange;
 use serde::Deserializer;

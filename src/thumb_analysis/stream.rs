@@ -2476,14 +2476,7 @@ fn validate_producer_identity(identity: &ProducerIdentity, expected: ThumbProduc
             "{producer} producer version is not normalized"
         )));
     }
-    if !identity.executable.is_absolute()
-        || identity.executable.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
+    if !super::identity::is_canonical_executable_path(&identity.executable) {
         return Err(Error::Serialize(format!(
             "{producer} producer executable must be a canonical absolute path"
         )));
@@ -2566,15 +2559,38 @@ fn run_thumb_analysis_with_limits(
     out_dir: &Path,
     limits: RunnerLimits,
 ) -> Result<ThumbAnalysisSummary> {
+    let mut carver = carve_thumb_region;
+    run_thumb_analysis_with_limits_and_carver(
+        tools,
+        image,
+        load_addr,
+        regions,
+        out_dir,
+        limits,
+        &mut carver,
+    )
+}
+
+type RegionCarver<'a> = dyn FnMut(&[u8], u32, u32, u32, &Path) -> Result<std::path::PathBuf> + 'a;
+
+fn run_thumb_analysis_with_limits_and_carver(
+    tools: &ThumbTools,
+    image: &[u8],
+    load_addr: u32,
+    regions: &[(u32, u32)],
+    out_dir: &Path,
+    limits: RunnerLimits,
+    carve_region: &mut RegionCarver<'_>,
+) -> Result<ThumbAnalysisSummary> {
+    if regions.is_empty() {
+        return Ok(ThumbAnalysisSummary::default());
+    }
     validate_thumb_tools(tools)?;
     let regions = validate_thumb_region_requests(image, load_addr, regions)?;
     let mut summary = ThumbAnalysisSummary {
         regions_requested: regions.len(),
         ..ThumbAnalysisSummary::default()
     };
-    if regions.is_empty() {
-        return Ok(summary);
-    }
     let thumb_dir = out_dir.join("thumb");
     std::fs::create_dir_all(&thumb_dir)?;
     let mut spills = PendingSpills::default();
@@ -2584,7 +2600,7 @@ fn run_thumb_analysis_with_limits(
 
     for &(addr, end) in &regions {
         let len = end - addr;
-        let bin = carve_thumb_region(image, load_addr, addr, len, &thumb_dir)?;
+        let bin = carve_region(image, load_addr, addr, len, &thumb_dir)?;
         let mut attempts = Vec::with_capacity(usize::from(tools.rizin.is_some()) + 1);
         let mut region_failures = Vec::with_capacity(attempts.capacity());
         let mut selected = None;
@@ -3251,7 +3267,7 @@ fn test_radare2_identity(path: &Path) -> Result<ProducerIdentity> {
 }
 
 #[cfg(test)]
-fn run_radare2_thumb_region(
+fn run_radare2_region(
     radare2: &Path,
     image: &[u8],
     load_addr: u32,
@@ -3847,9 +3863,23 @@ esac
         let mut image = vec![0u8; 0x200];
         image[0x120..0x124].copy_from_slice(&[0x70, 0x47, 0xaa, 0x55]);
 
-        let summary =
-            run_thumb_analysis(&tools, &image, 0x4000, &[(0x4120, 4)], dir.path()).unwrap();
+        let mut carve_calls = 0usize;
+        let mut carver = |image: &[u8], load_addr, addr, len, thumb_dir: &Path| {
+            carve_calls += 1;
+            carve_thumb_region(image, load_addr, addr, len, thumb_dir)
+        };
+        let summary = run_thumb_analysis_with_limits_and_carver(
+            &tools,
+            &image,
+            0x4000,
+            &[(0x4120, 4)],
+            dir.path(),
+            RunnerLimits::PRODUCTION,
+            &mut carver,
+        )
+        .unwrap();
 
+        assert_eq!(carve_calls, 1, "fallback must not rewrite the shared carve");
         assert_eq!(summary.radare2_runs, 0);
         assert_eq!(summary.rizin_runs, 1);
         let carved = dir.path().join("thumb/00004120.bin");
@@ -5282,18 +5312,25 @@ esac
     #[test]
     fn run_thumb_analysis_empty_request_is_a_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let radare2 = dir.path().join("r2");
-        std::fs::write(&radare2, "#!/bin/sh\nexit 99\n").unwrap();
-        make_executable(&radare2);
         let out = dir.path().join("out");
+        std::fs::write(&out, b"not a directory").unwrap();
+        let invalid_tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Rizin,
+                executable: "relative/r2".into(),
+                version: "".into(),
+                command: "wrong",
+            },
+            rizin: None,
+        };
 
-        let summary = run_thumb_analysis(&thumb_tools(&radare2), &[], 0x4000, &[], &out).unwrap();
+        let summary = run_thumb_analysis(&invalid_tools, &[0], u32::MAX, &[], &out).unwrap();
 
         assert_eq!(
             summary,
             crate::thumb_analysis::ThumbAnalysisSummary::default()
         );
-        assert!(!out.exists());
+        assert_eq!(std::fs::read(out).unwrap(), b"not a directory");
     }
 
     #[test]
@@ -6231,6 +6268,34 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn noncanonical_runtime_executable_path_fails_before_output_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: std::path::PathBuf::from("/tmp//r2/"),
+                version: "radare2 test 1.0".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let out = dir.path().join("out");
+
+        let error =
+            run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], &out).unwrap_err();
+
+        assert!(
+            error.to_string().contains("canonical absolute path"),
+            "{error}"
+        );
+        assert!(
+            !out.exists(),
+            "identity validation must precede output writes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn mapped_image_overflow_fails_before_spawning() {
         let dir = tempfile::tempdir().unwrap();
         let radare2 = dir.path().join("r2");
@@ -6466,7 +6531,7 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
-    fn run_radare2_thumb_region_rejects_unnormalizable_raw_function() {
+    fn run_radare2_region_rejects_unnormalizable_raw_function() {
         let dir = std::env::temp_dir().join(format!("pme_r2_bad_normalize_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6494,7 +6559,7 @@ INFO: second pdfj body was noisy and not parseable
         // non-Io failure mode.
         let mut last = None;
         for attempt in 0..5u32 {
-            match run_radare2_thumb_region(&r2, &[0u8; 16], 0x4000, 0x4000, 16, &out) {
+            match run_radare2_region(&r2, &[0u8; 16], 0x4000, 0x4000, 16, &out) {
                 Ok(_) => break,
                 Err(e) if matches!(e, Error::Io(ref io) if io.kind() == std::io::ErrorKind::ExecutableFileBusy) =>
                 {
@@ -6508,7 +6573,7 @@ INFO: second pdfj body was noisy and not parseable
                 }
             }
         }
-        let err = last.expect("expected an error from run_radare2_thumb_region");
+        let err = last.expect("expected an error from run_radare2_region");
 
         assert!(
             matches!(err, Error::Serialize(message) if message.contains("unassignable aflj") && message.contains("0x4000"))

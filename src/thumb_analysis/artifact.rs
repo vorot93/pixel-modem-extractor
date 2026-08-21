@@ -1,6 +1,7 @@
 //! Shared Thumb sidecar parsing, provenance validation, bounded fragment
 //! assembly, terminal scanning, and atomic function-local mutation.
 
+use super::identity::is_canonical_executable_path;
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
@@ -13,7 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub(crate) const THUMB_V1_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v1";
 pub(crate) const THUMB_V2_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v2";
@@ -581,11 +582,7 @@ fn convert_producers(wires: Vec<ProducerWire>) -> Result<Vec<ProducerIdentity>> 
             )));
         }
         let executable = PathBuf::from(&wire.executable);
-        if !executable.is_absolute()
-            || executable
-                .components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-        {
+        if !is_canonical_executable_path(&executable) {
             return Err(invalid_artifact(format!(
                 "{} producer executable must be a canonical absolute path",
                 wire.id.as_str()
@@ -803,6 +800,38 @@ struct V3Layout {
     function_count: usize,
 }
 
+#[derive(Default)]
+struct V3RunCursor {
+    run_index: usize,
+    #[cfg(test)]
+    inspected_runs: usize,
+}
+
+impl V3RunCursor {
+    fn owner_index(&mut self, runs: &[FunctionRunRecord], function_index: usize) -> Option<usize> {
+        while let Some(run) = runs.get(self.run_index) {
+            #[cfg(test)]
+            {
+                self.inspected_runs += 1;
+            }
+            let end = run.first_function.checked_add(run.function_count)?;
+            if function_index < run.first_function {
+                return None;
+            }
+            if function_index < end {
+                return Some(self.run_index);
+            }
+            self.run_index += 1;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn inspected_runs(&self) -> usize {
+        self.inspected_runs
+    }
+}
+
 fn validate_v3_metadata(
     producers: &[ProducerIdentity],
     regions: &[RegionRecord],
@@ -832,12 +861,7 @@ fn validate_v3_metadata(
                 producer.producer.as_str()
             )));
         }
-        if !producer.executable.is_absolute()
-            || producer
-                .executable
-                .components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-        {
+        if !is_canonical_executable_path(&producer.executable) {
             return Err(invalid_artifact(format!(
                 "{} producer executable must be a canonical absolute path",
                 producer.producer.as_str()
@@ -1084,6 +1108,7 @@ struct TypedFunctionScan {
     saw_regions: bool,
     saw_functions: bool,
     layout: Option<V3Layout>,
+    run_cursor: V3RunCursor,
     observed: Vec<RunCounts>,
     functions: Vec<OwnedThumbFunction>,
 }
@@ -1098,6 +1123,7 @@ impl TypedFunctionScan {
         let regions = convert_regions(regions)?;
         let layout = validate_v3_metadata(&producers, &regions)?;
         self.observed = vec![RunCounts::default(); layout.runs.len()];
+        self.run_cursor = V3RunCursor::default();
         self.layout = Some(layout);
         Ok(())
     }
@@ -1122,10 +1148,7 @@ impl TypedFunctionScan {
         let layout = self.layout.as_ref().ok_or_else(|| {
             invalid_artifact("v3 artifact lacks validated producer and region metadata")
         })?;
-        let run_index = layout.runs.iter().position(|run| {
-            run.first_function <= function_index
-                && function_index < run.first_function.saturating_add(run.function_count)
-        });
+        let run_index = self.run_cursor.owner_index(&layout.runs, function_index);
         let Some(run_index) = run_index else {
             return Err(invalid_artifact(
                 "every v3 function must have exactly one run owner",
@@ -1523,6 +1546,7 @@ struct ThumbScan {
     v3_producers: Option<Vec<ProducerIdentity>>,
     v3_regions: Option<Vec<RegionRecord>>,
     v3_layout: Option<V3Layout>,
+    v3_run_cursor: V3RunCursor,
     v3_observed: Vec<RunCounts>,
     shape_error: Option<Error>,
     size_error: Option<Error>,
@@ -1547,6 +1571,7 @@ impl ThumbScan {
             v3_producers: None,
             v3_regions: None,
             v3_layout: None,
+            v3_run_cursor: V3RunCursor::default(),
             v3_observed: Vec::new(),
             shape_error: None,
             size_error: None,
@@ -1590,6 +1615,7 @@ impl ThumbScan {
         match validate_v3_metadata(producers, &regions) {
             Ok(layout) => {
                 self.v3_observed = vec![RunCounts::default(); layout.runs.len()];
+                self.v3_run_cursor = V3RunCursor::default();
                 self.v3_regions = Some(regions);
                 self.v3_layout = Some(layout);
             }
@@ -1614,11 +1640,7 @@ impl ThumbScan {
             match validate_function_value(&record, function_index, Some(image)) {
                 Ok((substantial, accepted, quarantined)) => {
                     let run_index = self.v3_layout.as_ref().and_then(|layout| {
-                        layout.runs.iter().position(|run| {
-                            run.first_function <= function_index
-                                && function_index
-                                    < run.first_function.saturating_add(run.function_count)
-                        })
+                        self.v3_run_cursor.owner_index(&layout.runs, function_index)
                     });
                     let Some(run_index) = run_index else {
                         self.shape_invalid("every v3 function must have exactly one run owner");
@@ -2254,6 +2276,7 @@ struct ThumbRewriteScan<F> {
     producers: Vec<ProducerIdentity>,
     regions: Vec<RegionRecord>,
     layout: Option<V3Layout>,
+    run_cursor: V3RunCursor,
     observed: Vec<RunCounts>,
     function_count: usize,
     changed: bool,
@@ -2272,6 +2295,7 @@ where
             producers: Vec::new(),
             regions: Vec::new(),
             layout: None,
+            run_cursor: V3RunCursor::default(),
             observed: Vec::new(),
             function_count: 0,
             changed: false,
@@ -2288,6 +2312,7 @@ where
         self.regions = convert_regions(regions)?;
         let layout = validate_v3_metadata(&self.producers, &self.regions)?;
         self.observed = vec![RunCounts::default(); layout.runs.len()];
+        self.run_cursor = V3RunCursor::default();
         self.layout = Some(layout);
         Ok(())
     }
@@ -2319,10 +2344,9 @@ where
         let layout = self.layout.as_ref().ok_or_else(|| {
             invalid_artifact("v3 artifact lacks validated producer and region metadata")
         })?;
-        let run_index = layout.runs.iter().position(|run| {
-            run.first_function <= self.function_count
-                && self.function_count < run.first_function.saturating_add(run.function_count)
-        });
+        let run_index = self
+            .run_cursor
+            .owner_index(&layout.runs, self.function_count);
         let Some(run_index) = run_index else {
             return Err(invalid_artifact(
                 "every v3 function must have exactly one run owner",
@@ -2917,6 +2941,44 @@ mod tests {
     }
 
     #[test]
+    fn v3_run_cursor_never_rescans_earlier_runs() {
+        const RUNS: usize = 4_096;
+        let layout = V3Layout {
+            runs: (0..RUNS)
+                .map(|index| FunctionRunRecord {
+                    producer: if index.is_multiple_of(2) {
+                        ThumbProducer::Radare2
+                    } else {
+                        ThumbProducer::Rizin
+                    },
+                    first_function: index,
+                    function_count: 1,
+                    substantial: 0,
+                    accepted: 1,
+                    quarantined: 0,
+                })
+                .collect(),
+            function_count: RUNS,
+        };
+        let mut cursor = V3RunCursor::default();
+
+        for function_index in 0..RUNS {
+            let run_index = cursor.owner_index(&layout.runs, function_index).unwrap();
+            assert_eq!(run_index, function_index);
+        }
+        assert_eq!(cursor.owner_index(&layout.runs, RUNS), None);
+        assert!(
+            cursor.inspected_runs() <= RUNS * 2,
+            "cursor inspected {} runs for {RUNS} functions",
+            cursor.inspected_runs()
+        );
+
+        let mut empty = V3RunCursor::default();
+        assert_eq!(empty.owner_index(&[], 0), None);
+        assert_eq!(empty.inspected_runs(), 0);
+    }
+
+    #[test]
     fn v3_parser_rejects_empty_or_successless_documents() {
         let cases = ["producers", "regions", "functions", "successful_run"];
         for case in cases {
@@ -3028,6 +3090,40 @@ mod tests {
                 "accepted invalid {case}"
             );
         }
+    }
+
+    #[test]
+    fn v3_parser_rejects_noncanonical_executable_path_spelling() {
+        for executable in [
+            "/usr//bin/r2",
+            "/usr/bin/r2/",
+            r"\\?\C:\tools\\r2.exe",
+            r"\\?\C:\tools\r2.exe\",
+            r"\\?\C:\tools\.\r2.exe",
+            r"\\?\C:tools\r2.exe",
+            r"C:\tools\r2.exe",
+        ] {
+            let mut document = valid_v3();
+            document["producers"][0]["executable"] = json!(executable);
+
+            let error = parse_thumb_artifact(&canonical_v3(&document)).unwrap_err();
+
+            assert!(
+                error.to_string().contains("canonical absolute path"),
+                "accepted {executable:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_parser_accepts_canonical_executable_paths_from_both_host_families() {
+        let mut document = valid_v3();
+        document["producers"][0]["executable"] = json!("/usr/bin/r2");
+        document["producers"][1]["executable"] = json!(r"\\?\C:\tools\rizin.exe");
+        assert!(parse_thumb_artifact(&canonical_v3(&document)).is_ok());
+
+        document["producers"][1]["executable"] = json!(r"\\?\UNC\server\share\tools\rizin.exe");
+        assert!(parse_thumb_artifact(&canonical_v3(&document)).is_ok());
     }
 
     #[test]

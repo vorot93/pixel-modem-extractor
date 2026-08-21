@@ -1,4 +1,5 @@
-use super::{ProducerIdentity, ThumbProducer, discover};
+use super::identity::discover;
+use super::{ProducerIdentity, ThumbProducer};
 use crate::error::Result;
 use serde_json::Value;
 

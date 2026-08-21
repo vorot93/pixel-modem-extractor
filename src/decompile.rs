@@ -1666,7 +1666,7 @@ fn run_report_impl(
                 }
                 None => ImageOutcome::Failed(-1),
             };
-            // Analyze dense Thumb independently of Ghidra, using the configured
+            // After the Ghidra attempt, analyze dense Thumb through the configured
             // radare2-primary route regardless of tighten/datamark mode.
             let (thumb_summary, thumb_error) = if regions.is_empty() {
                 (None, None)

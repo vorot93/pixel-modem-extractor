@@ -1,10 +1,11 @@
-//! Synthetic v3 integration coverage plus env-gated globals goldens for a real `02_MAIN`.
+//! One always-running synthetic v3 integration test plus two env-gated globals
+//! golden cohorts for a real `02_MAIN`.
 //!
-//! Two cohorts, both skip cleanly without their gating env:
-//! - **Phase 3.0** (first three tests): auto-run decompose when
+//! The six corpus tests skip cleanly without their cohort's gating env:
+//! - **Phase 3.0** (next three tests): auto-run decompose when
 //!   `PME_RADIO_IMG` + `GHIDRA_INSTALL_DIR` are set; one shared ~110-min run
 //!   via `shared_decompose_output`.
-//! - **Phase 3.0.1** (last three tests): read pre-existing decompose output
+//! - **Phase 3.0.1** (final three tests): read pre-existing decompose output
 //!   from `PME_GOLDEN_DIR`; never auto-run decompose. Production
 //!   verification supplies the env.
 

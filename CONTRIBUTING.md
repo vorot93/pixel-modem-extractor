@@ -264,7 +264,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
 | `decompile.rs` | Ghidra import kit, `--run` orchestration, Thumb summary/currentness, and streaming v3-preserving enrichment |
-| `thumb_analysis/mod.rs` | Tool discovery/identity, public configuration and summaries, and subsystem exports |
+| `thumb_analysis/mod.rs` | Stable producer/tool types, public configuration and summaries, and subsystem exports |
+| `thumb_analysis/identity.rs` | Canonical cross-platform executable identity, discovery, bounded version probing, and probe-process cleanup |
 | `thumb_analysis/stream.rs` | Request validation, fallback coordination, process supervision, bounded capture/scanning, normalization, and spills |
 | `thumb_analysis/artifact.rs` | Sole v1/v2/v3 parser, strict run ownership, typed consumer streaming, canonical assembly, terminal validation, and streaming atomic mutation |
 | `thumb_analysis/radare2.rs` | radare2 command profile, inventory aliases/bounds, and per-operation reference adaptation |
