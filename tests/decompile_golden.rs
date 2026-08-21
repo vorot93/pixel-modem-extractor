@@ -290,6 +290,7 @@ fn generate_scatter_kit(home: &std::path::Path, case: &str) -> (PathBuf, PathBuf
             ghidra_home: Some(home.to_path_buf()),
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -414,6 +415,7 @@ fn run_drives_ghidra_end_to_end() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -489,6 +491,7 @@ fn scatter_load_map_is_applied_before_analysis() {
             ghidra_home: Some(home.clone()),
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -797,6 +800,7 @@ fn direct_run_rejects_stale_valid_inventory_when_invalidation_fails() {
             ghidra_home: Some(home),
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -871,6 +875,7 @@ printf 'pixel-modem-extractor-ghidra-export-v1\n\n' > "$export_dir.complete"
             ghidra_home: None,
             processor: "ARM:LE:32:v7".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: true,
         },
@@ -927,6 +932,7 @@ fn exporter_quarantines_instruction_when_tmode_register_is_missing() {
             ghidra_home: Some(home),
             processor: "x86:LE:32:default".to_string(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         },
@@ -980,6 +986,7 @@ fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1092,6 +1099,7 @@ fn saved_program_quarantines_when_same_isa_merge_makes_entry_interior() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1190,6 +1198,7 @@ fn saved_program_rejects_instruction_free_body_range_outside_u32() {
         ghidra_home: Some(home),
         processor: "x86:LE:64:default".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1296,6 +1305,7 @@ fn saved_program_quarantines_complete_defective_records_and_continues() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1449,6 +1459,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -1489,15 +1500,27 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
             )
         })
         .collect();
-    let retained_thumb = serde_json::to_vec(&serde_json::json!({
-        "format":"pixel-modem-extractor-thumb-functions-v2",
-        "functions":[{
-            "name":"retained_thumb_fixture", "entry":"0x0", "end":"0x2", "size":2,
-            "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2"}],
-            "decode_range_errors":[], "body_kind":"thumb_disassembly", "body":"", "data_refs":[]
-        }]
-    }))
-    .unwrap();
+    let retained_thumb = br#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {"id":"radare2","executable":"/usr/bin/r2","version":"radare2 fixture","command":"aaa;aflj;pdfj @@f"},
+    {"id":"rizin","executable":"/usr/bin/rizin","version":"rizin fixture","command":"aaa;aflj;pdfj @@F;axlj"}
+  ],
+  "regions": [{
+    "start":"0x0","end":"0x2",
+    "attempts":[
+      {"producer":"radare2","status":"failed","stdout":null,"error":"radare2 fixture failure"},
+      {"producer":"rizin","status":"succeeded","stdout":{"path":"thumb/00000000.rizin.stdout","bytes":1,"blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"error":null}
+    ],
+    "function_runs":[{"producer":"rizin","first_function":0,"function_count":1,"substantial":0,"accepted":1,"quarantined":0}]
+  }],
+  "functions": [{
+    "name":"retained_thumb_fixture","entry":"0x0","end":"0x2","size":2,
+    "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2"}],
+    "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":[]
+  }]
+}"#
+    .to_vec();
     std::fs::write(
         out.join("export/00_BOOT/thumb_functions.json"),
         &retained_thumb,
@@ -1866,6 +1889,7 @@ fn pass2_applies_global_types_and_skips_span_collision() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -2023,6 +2047,7 @@ fn tightened_tame_analysis_dispatchs_tighten_mode() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -2055,11 +2080,10 @@ fn tightened_tame_analysis_dispatchs_tighten_mode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Phase-2 e2e: `thumb_enrich` populates `body_c` from a synthetic
-/// `decompiled.c` keyed by entry address (Phase 2.1: address-based matching,
-/// T-bit normalized), and bumps `format` to v2 on first population. Does not
-/// require Ghidra — pure Rust step — grouped with the Ghidra tests as Phase-2
-/// contract regression.
+/// Legacy-mutation e2e: `thumb_enrich` populates `body_c` from a synthetic
+/// `decompiled.c` keyed by normalized entry address. The deliberately-v1 input
+/// promotes to retained v2; fresh producer output is strict v3 and its provenance
+/// preservation is covered separately. This pure-Rust step does not require Ghidra.
 #[test]
 fn thumb_enrich_populates_body_c() {
     let dir = std::env::temp_dir().join(format!(
@@ -2086,14 +2110,14 @@ fn thumb_enrich_populates_body_c() {
     )
     .unwrap();
 
-    let n = pixel_modem_extractor::r2_thumb::thumb_enrich(&c_path, &thumb_path).unwrap();
+    let n = pixel_modem_extractor::decompile::thumb_enrich(&c_path, &thumb_path).unwrap();
     assert_eq!(n, 1, "thumb_enrich should populate exactly one body_c");
 
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
     assert_eq!(
         v["format"], "pixel-modem-extractor-thumb-functions-v2",
-        "format should bump to v2 after population: {v}"
+        "legacy v1 should promote to v2 after population: {v}"
     );
     assert!(
         v["functions"][0]["body_c"].is_string(),
@@ -2137,6 +2161,7 @@ fn no_thumb_decompile_flag_falls_back_to_datamark() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: true,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
@@ -2217,6 +2242,7 @@ fn run_report_skips_opaque_image_without_spawning_ghidra() {
         ghidra_home: Some(home),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };

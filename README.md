@@ -1,11 +1,11 @@
 # pixel-modem-extractor
 
-Pure-Rust CLI that extracts and analyzes **Pixel modem** firmware — the Samsung Exynos "Shannon"
-baseband, across the **S5300 / S5400** family — from any Pixel radio **FBPK** `.img`. One command
-unpacks the image down to the raw modem code and configuration; further subcommands decode the RF
-calibration databases and the Pigweed token database, reconstruct the firmware's source-tree layout,
-and generate decompile kits without external runtime dependencies. `--run`/`decompose` can also drive
-local Ghidra plus radare2 for code-image analysis.
+Rust CLI that extracts and analyzes **Pixel modem** firmware — the Samsung Exynos "Shannon"
+baseband, across the **S5300 / S5400** family — from any Pixel radio **FBPK** `.img`. Extraction,
+format parsing, and the decoders are pure Rust. One command unpacks the image down to the raw modem
+code and configuration; further subcommands decode the RF calibration databases and the Pigweed token
+database, reconstruct the firmware's source-tree layout, and generate decompile kits. The optional
+code-analysis routes drive local Ghidra and radare2, with opt-in Rizin fallback.
 
 The pipeline is structural (TOC-driven), with **no per-model code**: the firmware directory inside the
 image is detected by *content* — the `/images/*` subdir that contains `modem.bin` — not by a hardcoded
@@ -23,50 +23,68 @@ Requires the latest stable Rust (2024 edition).
     cargo install --path .                   # from a local checkout
     cargo build --release                    # binary at target/release/pixel-modem-extractor
 
-## Ghidra + radare2 (for `--run` and `decompose`)
+## External code analysis
 
-Extraction and the decoders are pure-Rust and need nothing external. The optional
-code-analysis paths — `decompile --run` and `decompose` — additionally require a local
-**Ghidra** and **radare2** (`r2` on `PATH`); on macOS, `brew install ghidra radare2`.
+Extraction, generation-only `decompile`, and the decoders need no external runtime. The
+`decompile --run` and `decompose` analysis routes require both local **Ghidra** and
+**radare2** (`r2` on `PATH`). Rizin never substitutes for a missing radare2 primary.
+On macOS, install the required tools with `brew install ghidra radare2`; optionally install
+Rizin with `brew install rizin` when you intend to use `--rizin-fallback`.
 
 Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PATH` (its
-`ghidraRun` launcher), and **both the upstream release-tarball and Homebrew layouts are
-supported** — a `brew install ghidra` is discovered automatically. Its bundled JDK is used
-to launch the headless analyzer unless you set your own `JAVA_HOME`.
+`ghidraRun` launcher), with `/opt/ghidra` as the final Linux fallback. Both the upstream
+release-tarball and Homebrew layouts are supported. Its bundled JDK is used unless you set
+`JAVA_HOME`. radare2 is discovered, canonicalized, and version-probed as a hard preflight: both
+`decompile --run` and `decompose` fail immediately when it is missing, before Rizin is probed and
+before any output is written, so a run can never succeed without its required primary. Rizin is not
+discovered or probed in the default mode; it is preflighted only when `--rizin-fallback` is
+present.
 
-**Memory:** the dense-Thumb Rust path is fully streaming (Stages 1–2 of the
-memory-envelope lever). Each region's radare2 stdout capture is parsed
-value-by-value from disk, functions are normalized and spilled one at a time,
-and `thumb_functions.json` is assembled atomically from the spills —
-byte-identical to the previous whole-buffer rendering (env-gated replay of
-mustang `02_MAIN`'s five retained captures: ~3.65 GiB of r2 stdout → 151,411
-functions, 582,543,970 output bytes, ~248 s wall, ~2.8 GB peak RSS for the
-replay+compare; the producer itself measured ~0.3 GB during the captures) —
-and `thumb_enrich` now rewrites `thumb_functions.json` through a JSON stream
-visitor into an atomic-replace temp file, bounded by the ~86 MB
-`decompiled.c` bodies map plus one function record: byte-identical to the
-retired whole-file rewriter on the real production inputs (632 MB
-`thumb_functions.json` + 86 MB `decompiled.c`: 130 s, 2.29 GB peak RSS in
-the streaming-vs-oracle A/B); `recover_source` loads the same file through a
-typed reader (no `serde_json::Value` tree); `symbolicate`'s finalize
-rewrites (`functions.json`, `thumb_functions.json` stamps and `body_c`)
-stream element-by-element through atomic writers; and `symbolicate`'s ARM
-loader holds zero-copy borrowed views of `disasm.lst` instead of owned
-per-function copies (byte-identical, verified by a full-tree A/B — the
-standalone `symbolicate` dropped from 24 GB to 1.8 GB). **A full dense-Thumb
-`decompose` now peaks at ~7.7 GB, held by Ghidra's own analyze/export
-phase** (2026-08-21 probe; the Rust process peaks at ~2.5 GB — mostly the
-owned Thumb bodies). The 4 GiB
-radare2 stdout cap applies per capture. radare2's *own* analysis memory is
-separately bounded to 16 GiB
-(`RLIMIT_AS`) per dense-Thumb region: a pathological region whose `aaa` would
-otherwise run away (seen on one 4 MiB region of cheetah's MAIN, ~90+ GiB) fails
-closed and is skipped, so the rest of the image's Thumb still decompiles instead
-of the host OOM-ing. Smaller images without dense Thumb regions (`00_BOOT`,
-`01_PSP`, etc.) stay under 1 GiB. `--no-thumb-decompile` switches Ghidra to
-`datamark` mode and skips `body_c` enrichment, but it still runs the
-(now-streaming) dense-region radare2 capture/parse path — without the old
-dense-Thumb memory envelope.
+**Dense Thumb policy:** radare2 runs `aaa;aflj;pdfj @@f` first for every detected region.
+With `--rizin-fallback`, and only after that region's radare2 attempt fails, Rizin runs
+`aaa;aflj;pdfj @@F;axlj`. A healthy radare2 result stops the region even if it has low
+coverage, many quarantined functions, or different boundaries from Rizin. The coordinator
+retains one successful producer run per region and never unions analyzer output.
+
+A valid partial result is published when at least one region succeeds: failed attempts remain
+visible in the v3 region ledger and `report.json` reports the failed-region count without a
+`thumb_error`. If every requested region fails, the Thumb stage fails and publishes no new
+`thumb_functions.json`; an existing sidecar is left byte-identical and is not current for that
+run.
+
+Fresh Thumb output is strict `pixel-modem-extractor-thumb-functions-v3`. Its ordered
+`producers`, `regions`, and `attempts` identify the canonical executable, version, exact command,
+attempt outcome, and retained capture. Each successful attempt owns one contiguous slice of the
+flat `functions` array through `function_runs`; consumers derive radare2 or Rizin ownership from
+those validated runs. Retained v1/v2 files remain readable as legacy radare2 evidence, but new
+analysis never writes them.
+
+**Resources and captures:** every radare2 or Rizin attempt has a 4 GiB stdout cap and, on
+Unix, a 16 GiB child `RLIMIT_AS`. Rizin additionally has a fixed 30-minute deadline per
+region. Analyzer stdout is drained to `thumb/<start:08x>.<producer>.stdout`, hashed incrementally,
+parsed value-by-value, normalized into bounded fragment spills, and assembled atomically; the
+capture is never buffered whole. Rizin's trailing `axlj` is streamed, with an exact cap of
+1,000,000 selected xref records before sorting and deduplication. Successful attempts always record
+the capture's relative path, exact byte count, and lowercase BLAKE3. Failed attempts retain the same
+metadata when partial stdout can be finalized; spawn or capture-finalization failure records
+`stdout: null`. `--prune` removes all captures and carved region inputs while v3 retains their
+recorded identity.
+
+**Memory:** the dense-Thumb producer and every downstream mutation are streaming. Each backend
+capture is parsed value-by-value, functions are normalized and spilled one at a time, and strict v3
+is assembled atomically. One consumer is deliberately whole-file: `global_shapes` retains the
+complete validated function set because its decoder analyzes those records together. The retained Mustang replay measured ~3.65 GiB of radare2 stdout, 151,411 functions,
+582,543,970 output bytes, ~248 seconds, and ~2.8 GB peak RSS for replay plus comparison; capture
+production itself measured ~0.3 GB. `thumb_enrich` streams `decompiled.c` and rewrites one function
+at a time, bounded by its ~86 MB body map plus one record (632 MB artifact A/B: 130 seconds,
+2.29 GB peak, byte-identical). `recover_source` uses a typed streaming reader, symbolication's
+artifact rewrites stream through atomic v3-preserving writers, and ARM disassembly ranges are
+zero-copy borrowed views. The standalone symbolication A/B dropped from 24 GB to 1.8 GB with
+byte-identical output. A full dense-Thumb `decompose` now peaks at ~7.7 GB in Ghidra's own
+analyze/export phase; the Rust process peaks near ~2.5 GB, mostly owned function bodies.
+
+`--no-thumb-decompile` changes only Ghidra to `datamark` mode and skips `body_c` enrichment. The
+streaming host Thumb analyzer, including opt-in failure-only Rizin fallback, still runs.
 
 **Project path:** `pixel-modem-extractor` canonicalizes its output root before
 constructing the Ghidra headless project path. Ghidra 12 rejects any
@@ -84,10 +102,14 @@ canonical path contains no dot-prefixed components.
     cd radio.extracted
     pixel-modem-extractor decode-tokens rootfs/images/*/pw_token_db
     pixel-modem-extractor source-tree   modem.bin.split/*_MAIN
-    pixel-modem-extractor decompile     rootfs/images/*/modem.bin   # add --run for Ghidra + radare2 Thumb analysis
+    pixel-modem-extractor decompile rootfs/images/*/modem.bin
+    pixel-modem-extractor decompile rootfs/images/*/modem.bin --run
+    pixel-modem-extractor decompile rootfs/images/*/modem.bin --run --rizin-fallback
 
-    # Or do all of the above in one shot (needs local Ghidra + radare2):
-    pixel-modem-extractor decompose radio.img          # add --prune for leaves only
+    # Or do all of the above in one shot (Ghidra + radare2 required):
+    pixel-modem-extractor decompose radio.img
+    pixel-modem-extractor decompose radio.img --rizin-fallback
+    pixel-modem-extractor decompose radio.img --prune
 
 Every subcommand accepts `--out DIR` (a sensible default is used otherwise); run any with `--help` for
 its full set of flags.
@@ -97,12 +119,12 @@ its full set of flags.
 | Command | What it does |
 |---|---|
 | `extract <radio.img>` | **Main entry.** Full pipeline: FBPK → ext4 → rootfs → gunzip `RF_CFG_*` → split TOC, recording a per-image opaque battery (see Formats) in `manifest.json`. Default out `./<img>.extracted/`. `--no-verify` skips CRC/size checks. |
-| `decompose <radio.img>` | **Everything, one shot.** Runs `extract`, decompiles all code images (Ghidra; the image set is model-dependent — six on mustang, four on cheetah), enriches the MAIN image's `source_tree` with recovered-code evidence when attribution is possible, and runs every decoder into one per-image tree (`images/NN_NAME/{decompiled,…}`, `rf/`, `tokens/`) with a `report.json`. A MAIN with exactly one validated runtime scatter map retains its flat raw mapping and gains reconstructed runtime blocks before Ghidra analysis; no candidate stays raw-only, while a plausible malformed or ambiguous map aborts the command. Unanimously-opaque images (per the battery; see Formats) are skipped without spawning Ghidra — `--no-skip-opaque` forces a run. The MAIN split name varies by model (`02_MAIN` on mustang, `01_MAIN` on cheetah); the tool selects the `*_MAIN` split dir, so `02_MAIN` below denotes the mustang concrete path. **Requires a local Ghidra and radare2** (`r2`), probed up front. `--prune` keeps only the terminal artifacts; `--out`, `--ghidra-home`, `--processor`, `--no-verify` as elsewhere. Default out `./<img>.decomposed/`. **Phase 1:** decompile runs **twice** per eligible image — pass 1 analyzes and exports an initial inventory; pass 2 runs the applicable `ApplySymbols.java`, `ApplyGlobals.java`, and/or `ApplyGlobalTypes.java` scripts, then `ExportDecomp.java`, in one saved-project process. Recovered function and strict Recovered global names — and, since Phase 3.2, recovered global storage widths — are therefore baked into regenerated `decompiled.c` and disassembly instead of text-substituted afterward. Global application renames only exact Ghidra-default `DAT_<addr>` labels at the matching address; missing, non-default, rejected-name, and outside-memory candidates are preserved and reported as skips. Pass 2's ownership-aware refresh replaces only `decompiled.c` / `disasm.lst` / `functions.json` and leaves `globals.json`, `global_shapes.json`, `thumb_functions.json`, `thumb/`, and other sidecars byte-for-byte unchanged. `--no-symbol-pass` skips pass 2 entirely: it still writes `globals.json`, but globals remain record-only and `DAT_<addr>` placeholders are not changed in Ghidra. **Phase 2:** Dense Thumb regions in `02_MAIN` are decompiled by Ghidra (tightened `TameAnalysis`). A runtime Surface B watch kills Ghidra on overlap-repair spin and falls back to Phase-1 datamark per image (`thumb_tighten_error`, image not failed). Phase 2.1 closed both dormancy causes: `thumb_enrich` matches by entry address, and `TameAnalysis mode=tighten` carries the winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow Damage"`) so Ghidra converges on full `02_MAIN` in ~23 min without Surface B firing. **Production — mustang / S5400 (verified full `decompose`, ~1 h 37 m wall, exit 0):** `functions` = 107,955; `thumb_functions` = 117,444; `thumb_decompiled` = 77,456; five `thumb/*.stdout` preserved across pass 2; radare2 4 GiB streaming path did not hit the cap. **Second model — cheetah / S5300 (verified, ~84 min, exit 0):** MAIN is `01_MAIN`; `functions` = 104,395; `thumb_functions` = 87,026; `thumb_decompiled` = 70,906; `globals_recovered` = 1,061; one 4 MiB dense-Thumb region hit the 16 GiB radare2 address-space cap and was skipped (the rest decompiled); four images (no PSP/DBGCORE); no RF_CFG blobs, so `decode_rf`/`hardware_config` skipped. `thumb_functions.json` is v2 (optional per-function `body_c`). `--no-thumb-decompile` skips Phase 2 (Phase-1 datamark behavior end-to-end). **Phase 3.0:** Global names are recovered from direct string evidence when a function has exactly one non-string `data_ref` and exactly one unique underscored identifier across its referenced strings. The per-image `decompiled/globals.json` is Recovered-only by default and remains the strict evidence source of truth; conflicting names for one address are dropped. In normal `decompose`, eligible Recovered records feed the existing pass 2. **Phase 3.0.1:** Disasm-anchored Recovered globals — a `movw`+`movt` load pair within K=4 load-events of a string load pins that string's identifier as the global's name, regardless of `data_ref` cardinality. On production `02_MAIN` (Thumb through pass 2) `globals_recovered` = **915** (arch: arm 367 / thumb 545 / mixed 3); stage total recovered 921 with 194 conflicts dropped. `--globals-provisional` opts in to additionally emitting name-prior-derived `tier: "provisional"` entries (default off; bare `globals.json` is byte-equivalent to Phase 3.0's for the Recovered set). Provisional records are always record-only and never application candidates. **Phase 3.2:** `decompose` always runs a record-only `global_shapes` stage exactly once per route: on the normal route it now runs right after `globals.json` is written and **before** pass 2, so the recovered shapes are ready for a pass-2 script to consume; on `--no-symbol-pass` (which has no pass 2) it still runs last. It decodes accepted A32/T32 function bytes with the pure-Rust `scaleservers-arm32-assembly` 1.0.0 adapter and writes `decompiled/global_shapes.json` v4 — one record per Recovered global; facts cross direct CFG edges by a must-facts join (every incoming path must agree; join kills counted). `globals.json` is not rewritten. `--prune` retains the sidecar. Each record is `inferred`, `no_evidence`, or `conflicting`; summaries carry only `minimum_size` and a provisional `scalar_candidate` / `array_candidate` / `unknown` label. No exact allocation size or authoritative type is inferred. Quarantined producer records never reach the decoder and are counted separately from accepted-range `decode_failures`. Distinct ARM and Thumb identities may cover the same bytes and remain independent interpretations. **Production (mustang `02_MAIN`):** Recovered shapes 915 MAIN / 921 total; **154 inferred / 761 `no_evidence` / 0 conflicting** under the v3 cross-block engine + same-instruction multi-offset fix (v2-era: 125/787/3 — net +29 recovered shapes, `conflicting` → 0; the v2-era verified run's MAIN observations were 32 ARM + 907 Thumb); `decode_failures` = 37,629 (recoverable; the image still succeeds); `globals.json` unchanged. `decompose` now also runs a **default-on depth-1 interprocedural pass** (direct `bl` only, AAPCS r0–r3) that re-runs the shape tracker inside directly-called functions with the argument register seeded — the seed joins at the callee entry and propagates cross-block by the same must-facts join; it is **record-only and additive-only** (it never demotes an `inferred` global and never produces `conflicting`). The v2-era pass alone yielded **0 new shapes** (the pass-by-reference callees store, not dereference, the pointer); since the v3 engine propagates seeds in-callee, interprocedural evidence grew 3→58 observations — see CONTRIBUTING for the mechanism and limitations. Eligible recovered shapes are also **applied**, by default, as Ghidra `undefinedN` types in that same pass 2 — a scalar `inferred` global (width 1/2/4/8) reads in `decompiled.c` as one correctly-sized typed value instead of raw `DAT_` bytes; arrays, `unknown`, `conflicting`, and `no_evidence` shapes are never applied, only counted. `--no-apply-global-types` turns off just this application step — `global_shapes.json` is still produced either way. `--no-symbol-pass` has no pass 2 to apply into, so its `global_shapes.json` never carries applied types regardless of this flag. |
+| `decompose <radio.img>` | **Everything, one shot.** Runs `extract`, decompiles all code images (Ghidra; the image set is model-dependent — six on mustang, four on cheetah), enriches the MAIN image's `source_tree` with recovered-code evidence when attribution is possible, and runs every decoder into one per-image tree (`images/NN_NAME/{decompiled,…}`, `rf/`, `tokens/`) with a `report.json`. A MAIN with exactly one validated runtime scatter map retains its flat raw mapping and gains reconstructed runtime blocks before Ghidra analysis; no candidate stays raw-only, while a plausible malformed or ambiguous map aborts the command. Unanimously-opaque images (per the battery; see Formats) are skipped without spawning Ghidra — `--no-skip-opaque` forces a run. The MAIN split name varies by model (`02_MAIN` on mustang, `01_MAIN` on cheetah); the tool selects the `*_MAIN` split dir, so `02_MAIN` below denotes the mustang concrete path. **Requires local Ghidra and radare2** (`r2`), probed up front; `--rizin-fallback` also preflights Rizin. `--prune` keeps only the terminal artifacts; `--out`, `--ghidra-home`, `--processor`, `--no-verify` as elsewhere. Default out `./<img>.decomposed/`. **Phase 1:** decompile runs **twice** per eligible image — pass 1 analyzes and exports an initial inventory; pass 2 runs the applicable `ApplySymbols.java`, `ApplyGlobals.java`, and/or `ApplyGlobalTypes.java` scripts, then `ExportDecomp.java`, in one saved-project process. Recovered function and strict Recovered global names — and, since Phase 3.2, recovered global storage widths — are therefore baked into regenerated `decompiled.c` and disassembly instead of text-substituted afterward. Global application renames only exact Ghidra-default `DAT_<addr>` labels at the matching address; missing, non-default, rejected-name, and outside-memory candidates are preserved and reported as skips. Pass 2's ownership-aware refresh replaces only `decompiled.c` / `disasm.lst` / `functions.json` and leaves `globals.json`, `global_shapes.json`, `thumb_functions.json`, `thumb/`, and other sidecars byte-for-byte unchanged. `--no-symbol-pass` skips pass 2 entirely: it still writes `globals.json`, but globals remain record-only and `DAT_<addr>` placeholders are not changed in Ghidra. **Phase 2:** Dense Thumb regions in `02_MAIN` are decompiled by Ghidra (tightened `TameAnalysis`). A runtime Surface B watch kills Ghidra on overlap-repair spin and falls back to Phase-1 datamark per image (`thumb_tighten_error`, image not failed). Phase 2.1 closed both dormancy causes: `thumb_enrich` matches by entry address, and `TameAnalysis mode=tighten` carries the winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow Damage"`) so Ghidra converges on full `02_MAIN` in ~23 min without Surface B firing. **Historical pre-v3 production — mustang / S5400 (verified full `decompose`, ~1 h 37 m wall, exit 0):** `functions` = 107,955; `thumb_functions` = 117,444; `thumb_decompiled` = 77,456; five `thumb/*.stdout` preserved across pass 2; radare2 4 GiB streaming path did not hit the cap. **Historical pre-v3 second model — cheetah / S5300 (verified, ~84 min, exit 0):** MAIN is `01_MAIN`; `functions` = 104,395; `thumb_functions` = 87,026; `thumb_decompiled` = 70,906; `globals_recovered` = 1,061; one 4 MiB dense-Thumb region hit the 16 GiB radare2 address-space cap and was skipped (the rest decompiled); four images (no PSP/DBGCORE); no RF_CFG blobs, so `decode_rf`/`hardware_config` skipped. Those historical runs wrote v2 with optional per-function `body_c`; fresh output is strict v3 with producer-owned runs and capture provenance. `--no-thumb-decompile` selects Ghidra datamark mode and skips `body_c` enrichment, but host Thumb analysis still emits strict v3. **Phase 3.0:** Global names are recovered from direct string evidence when a function has exactly one non-string `data_ref` and exactly one unique underscored identifier across its referenced strings. The per-image `decompiled/globals.json` is Recovered-only by default and remains the strict evidence source of truth; conflicting names for one address are dropped. In normal `decompose`, eligible Recovered records feed the existing pass 2. **Phase 3.0.1:** Disasm-anchored Recovered globals — a `movw`+`movt` load pair within K=4 load-events of a string load pins that string's identifier as the global's name, regardless of `data_ref` cardinality. On production `02_MAIN` (Thumb through pass 2) `globals_recovered` = **915** (arch: arm 367 / thumb 545 / mixed 3); stage total recovered 921 with 194 conflicts dropped. `--globals-provisional` opts in to additionally emitting name-prior-derived `tier: "provisional"` entries (default off; bare `globals.json` is byte-equivalent to Phase 3.0's for the Recovered set). Provisional records are always record-only and never application candidates. **Phase 3.2:** `decompose` always runs a record-only `global_shapes` stage exactly once per route: on the normal route it now runs right after `globals.json` is written and **before** pass 2, so the recovered shapes are ready for a pass-2 script to consume; on `--no-symbol-pass` (which has no pass 2) it still runs last. It decodes accepted A32/T32 function bytes with the pure-Rust `scaleservers-arm32-assembly` 1.0.0 adapter and writes `decompiled/global_shapes.json` v4 — one record per Recovered global; facts cross direct CFG edges by a must-facts join (every incoming path must agree; join kills counted). `globals.json` is not rewritten. `--prune` retains the sidecar. Each record is `inferred`, `no_evidence`, or `conflicting`; summaries carry only `minimum_size` and a provisional `scalar_candidate` / `array_candidate` / `unknown` label. No exact allocation size or authoritative type is inferred. Quarantined producer records never reach the decoder and are counted separately from accepted-range `decode_failures`. Distinct ARM and Thumb identities may cover the same bytes and remain independent interpretations. **Production (mustang `02_MAIN`):** Recovered shapes 915 MAIN / 921 total; **154 inferred / 761 `no_evidence` / 0 conflicting** under the v3 cross-block engine + same-instruction multi-offset fix (v2-era: 125/787/3 — net +29 recovered shapes, `conflicting` → 0; the v2-era verified run's MAIN observations were 32 ARM + 907 Thumb); `decode_failures` = 37,629 (recoverable; the image still succeeds); `globals.json` unchanged. `decompose` now also runs a **default-on depth-1 interprocedural pass** (direct `bl` only, AAPCS r0–r3) that re-runs the shape tracker inside directly-called functions with the argument register seeded — the seed joins at the callee entry and propagates cross-block by the same must-facts join; it is **record-only and additive-only** (it never demotes an `inferred` global and never produces `conflicting`). The v2-era pass alone yielded **0 new shapes** (the pass-by-reference callees store, not dereference, the pointer); since the v3 engine propagates seeds in-callee, interprocedural evidence grew 3→58 observations — see CONTRIBUTING for the mechanism and limitations. Eligible recovered shapes are also **applied**, by default, as Ghidra `undefinedN` types in that same pass 2 — a scalar `inferred` global (width 1/2/4/8) reads in `decompiled.c` as one correctly-sized typed value instead of raw `DAT_` bytes; arrays, `unknown`, `conflicting`, and `no_evidence` shapes are never applied, only counted. `--no-apply-global-types` turns off just this application step — `global_shapes.json` is still produced either way. `--no-symbol-pass` has no pass 2 to apply into, so its `global_shapes.json` never carries applied types regardless of this flag. |
 | `source-tree <MAIN_image>` | Reconstruct the firmware source-tree layout from embedded `__FILE__` strings — **names and structure only, not original source**. The input is the MAIN code image; its split name is model-dependent (`02_MAIN` on mustang, `01_MAIN` on cheetah) and the generated labels name whichever image you pass. `--modem <LABEL>` sets the Shannon generation in the generated README (e.g. `S5300`; auto-derived under `decompose`). `--no-attribution`, `--gap`, `--shared-pct`, `--min-run` tune the heuristics. |
 | `decode-rf <RF_CFG_dir> --hwcfg <hardware_config.json>` | Semantic decode of the RF_CFG calibration databases (heuristic calibration-vector extraction + per-variant mapping). Default out `./decoded_rf/`. |
 | `decode-tokens <pw_token_db>` | Decode the Pigweed `pw_tokenizer` token database to canonical CSV + `summary.json`. Default out `./decoded_tokens/`. |
 | `hardware-config <hardware_config.json>` | Structural stats + RF_CFG-coverage summary. `--rf-dir` cross-checks which calibration blobs are actually present. Default out `./hwcfg_summary/`. |
-| `decompile <modem.bin>` | Write a Ghidra import kit for all code images at their load addresses (the image set is model-dependent — six on mustang, four on cheetah). For a recognized MAIN, generation validates and emits a runtime scatter map; Ghidra retains the raw mapping and applies those runtime blocks before analysis. No candidate leaves the image raw-only, while a plausible malformed or ambiguous map fails the command. `--run` drives `analyzeHeadless` (needs a local Ghidra) to export decompiled C, a disassembly listing, and a function inventory; unanimously-opaque images are skipped without spawning Ghidra (`--no-skip-opaque` forces a run); selected images with dense Thumb regions also use radare2 (`r2`) and fail if those regions cannot be analyzed. `--image`, `--ghidra-home`, `--processor` (default `ARM:LE:32:v7`). `--no-thumb-decompile` reverts Phase-2 Thumb decompilation to Phase-1 datamark behavior. |
+| `decompile <modem.bin>` | Write a Ghidra import kit for all code images at their load addresses (the image set is model-dependent — six on mustang, four on cheetah). For a recognized MAIN, generation validates and emits a runtime scatter map; Ghidra retains the raw mapping and applies those runtime blocks before analysis. No candidate leaves the image raw-only, while a plausible malformed or ambiguous map fails the command. `--run` drives `analyzeHeadless` (needs a local Ghidra) to export decompiled C, a disassembly listing, and a function inventory; unanimously-opaque images are skipped without spawning Ghidra (`--no-skip-opaque` forces a run); selected images with dense Thumb regions use radare2 primary and, with `--rizin-fallback`, one Rizin attempt after a region failure. The Thumb stage fails if every requested region fails and publishes no new sidecar. `--image`, `--ghidra-home`, `--processor` (default `ARM:LE:32:v7`). `--no-thumb-decompile` selects Ghidra datamark mode and skips `body_c` enrichment; host Thumb analysis and strict-v3 output remain enabled. |
 | `symbolicate <decomposed_dir>` | Recover function names + inline log/assert/file annotations from evidence already produced (pw_tokenizer DB, `__func__`, attributed strings), rewriting `decompiled.c`/`disasm.lst`/`functions.json`/`thumb_functions.json` **in place** and emitting `symbols.json`. Tiered + fail-closed (precedence `__func__` > registration > token > string-ref): `__func__` and `{name,fn}` **registration-table** matches yield authoritative (`Recovered`) renames; token matches become marked `guess_…` names; strings/files are comments. `--token-db` gives the raw `pw_token_db` (TOKENS); without it, token evidence is skipped. Registration names come from scanning the raw image for handler/dispatch tables (AT-command, ISR, protocol) whose pointer resolves to a known function entry — the crown-jewel names (e.g. `AtiParsePlusCOPS`, `PICH_HISR`), ~100% precision but a small set (~233 mustang / 101 cheetah). Also derives lowest-precedence `guess_*` names from a function's uniquely-referenced identifier string (fail-closed: dropped if all-caps, a recovered global, or another function's name), recorded as `string_ref` evidence. It also runs automatically as a `decompose` stage. |
 | `tree-hash <dir>` | Print the whole-tree `pme-paq-v1` hash of `<dir>` — one lowercase 64-hex value — and write nothing. Fails closed with no hash printed if the target is missing, not a directory, contains a symlink, or has any non-UTF-8 path component. No external tools. |
 | `unpack-fbpk <radio.img>` | Lower-level: emit `modem.ext4` (a partial-pipeline shortcut — currently runs the full `extract` under the hood). |
@@ -134,14 +156,14 @@ The manifest is the auditable map; payload files exist only for materialized cop
 In `ghidra_load.json`, a recognized MAIN image gains optional `runtime_load_map` with the
 import-kit-relative path `scatter/<label>/load_map.json`; raw-only images omit the field.
 
-`decompose` writes (default `./<img>.decomposed/`; `--prune` keeps only these leaf artifacts):
+`decompose` writes (default `./<img>.decomposed/`; this shows the unpruned tree):
 
     radio.decomposed/
     ├── images/
     │   ├── 00_BOOT/decompiled/       # decompiled.c, disasm.lst, functions.json, symbols.json, globals.json, global_shapes.json
     │   ├── 01_PSP/decompiled/
     │   ├── 02_MAIN/
-    │   │   ├── decompiled/           # …+ thumb_functions.json (Phase-2 v2), thumb/, symbols.json, globals.json, global_shapes.json
+    │   │   ├── decompiled/           # …+ strict-v3 thumb_functions.json, thumb/ captures, symbols.json, globals.json, global_shapes.json
     │   │   ├── source_tree/          # reconstructed tree + recovered_index.json (MAIN image only)
     │   │   └── scatter/              # load_map.json + blocks/; retained by --prune (MAIN when recognized)
     │   ├── 03_APM/decompiled/
@@ -150,13 +172,29 @@ import-kit-relative path `scatter/<label>/load_map.json`; raw-only images omit t
     ├── rf/                           # decoded/  +  hwcfg_summary/  (only when the model ships RF_CFG)
     ├── tokens/                       # pw_token_db.csv + summary.json
     ├── manifest.json
-    ├── ghidra/symbol_maps/           # per-image symbol_map.json (input to pass 2; Phase 1+)
+    ├── ghidra/symbol_maps/           # per-image symbol_map.json (intermediate input to pass 2)
     └── report.json                   # includes modem_generation (e.g. "S5300"/"S5400")
 
 The `images/` set above is the mustang (S5400) layout. The image set and the MAIN dir are
 model-dependent: cheetah (S5300) has `00_BOOT 01_MAIN 02_VSS 03_APM`, with `source_tree/` under
 `01_MAIN`. A recognized map lives at `images/<MAIN>/scatter/` on either model and survives
-`--prune`. `rf/` appears only when the model ships RF_CFG blobs (cheetah has none).
+`--prune`. `rf/` appears only when the model ships RF_CFG blobs (cheetah has none). Pruning
+retains `thumb_functions.json` but removes `decompiled/thumb/` captures and carved inputs.
+
+`report.json` keeps its top-level `ghidra` object. It always records `headless`, `radare2`,
+`radare2_version`, and boolean `rizin_fallback`; enabled runs additionally record `rizin` and
+`rizin_version`, even when no failed region needed Rizin. Per analyzed image, a current Thumb
+run reports `thumb_regions_requested`, `thumb_regions_succeeded`, `thumb_regions_failed`,
+`thumb_radare2_runs`, and `thumb_rizin_runs`. The v3 sidecar, rather than the report's configured
+tool list, is the source of truth for producers actually attempted and functions they own.
+
+Failure reporting distinguishes its stages. `exit` appears only for an `analyzeHeadless` process
+failure. When Ghidra completes but the terminal execution inventory or the current-run Thumb
+validation rejects the export, the image is `failed` with no `exit` and a reason-only
+`terminal_error`; if the Thumb sidecar was the stage that rejected it, `thumb_error` carries a
+reason too. A stale or failed Thumb result is therefore never reported as "Ghidra failed".
+Top-level `prune_requested` records whether `--prune` was asked for and `pruned` whether the
+leaves-only sweep actually completed — a failed sweep also records a failed `prune` stage.
 
 ## Formats
 
@@ -204,6 +242,11 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   and a top-level `provisional_suppressed` count (set whenever any Provisional
   globals were generated, regardless of `--globals-provisional`; absent only
   when none were generated).
+- **thumb_functions.json** — fresh output is strict
+  `pixel-modem-extractor-thumb-functions-v3`: producer identities, requested regions, ordered
+  attempts, capture provenance, contiguous producer-owned function runs, then normalized
+  functions. `end` is the backend's exclusive `maxaddr`/`maxbound`, `size` is positive `realsz`,
+  and `decode_ranges` are authoritative executable coverage. v1/v2 remain legacy readable inputs.
 - **global_shapes.json** — `pixel-modem-extractor-global-shapes-v4`; record-only
   storage-shape evidence for Recovered globals, written by the default-on
   `global_shapes` stage (on the normal route, before pass 2; on

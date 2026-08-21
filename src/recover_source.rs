@@ -163,12 +163,7 @@ impl SourceTreeIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tool {
-    Ghidra,
-    Radare2,
-}
+pub use crate::analysis_tool::AnalysisTool as Tool;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveredFunction {
@@ -176,6 +171,7 @@ pub struct RecoveredFunction {
     pub name: String,
     pub entry: u64,
     pub end: u64,
+    pub decode_ranges: Option<Vec<(u64, u64)>>,
     pub size: u64,
     pub body_kind: String,
     pub body: String,
@@ -328,24 +324,6 @@ fn is_meaningful_ghidra_body_line(line: &str) -> bool {
         && trimmed != FAILED_DECOMPILATION_SENTINEL
 }
 
-#[derive(Debug, Deserialize)]
-struct ThumbFunctionFile {
-    #[serde(default)]
-    functions: Vec<ThumbFunctionJson>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ThumbFunctionJson {
-    name: String,
-    entry: String,
-    end: String,
-    size: u64,
-    body_kind: String,
-    body: String,
-    #[serde(default)]
-    data_refs: Vec<String>,
-}
-
 fn parse_data_refs(raw: &[String]) -> Result<Vec<u64>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -378,17 +356,18 @@ impl RecoveredFunctions {
 
         let thumb_path = dir.join("thumb_functions.json");
         if thumb_path.exists() {
-            // Typed streaming load straight from the reader: no
-            // `serde_json::Value` tree (the former ~20 GB peak holder on the
-            // 632 MB production file), unknown fields (symbolicate stamps,
-            // `body_c`) ignored, and a malformed record fails closed instead
-            // of silently skipping — in-pipeline the file is always our own
-            // canonical writer's output.
-            let thumb_reader = std::io::BufReader::new(std::fs::File::open(&thumb_path)?);
-            let thumb_file: ThumbFunctionFile = serde_json::from_reader(thumb_reader)
-                .map_err(|e| Error::Serialize(format!("thumb_functions.json: {e}")))?;
-            for f in thumb_file.functions {
-                let Some(function) = recovered_thumb_function(f) else {
+            // Typed streaming load retains only consumer fields and function
+            // bodies while strict v3 metadata resolves each run owner. It never
+            // builds the former document-wide `serde_json::Value` tree.
+            // Source recovery is handed only the decompiled directory, with no
+            // manifest load address or raw image, so it cannot supply the
+            // image-aware context; range matching uses validated decode ranges.
+            for owned in crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, None)? {
+                let Some(function) = recovered_thumb_function(
+                    owned.function,
+                    owned.producer.into(),
+                    owned.legacy_range_semantics,
+                ) else {
                     skipped += 1;
                     continue;
                 };
@@ -420,6 +399,7 @@ fn recovered_ghidra_function(
         name: f.name,
         entry,
         end,
+        decode_ranges: None,
         size: f.size,
         body_kind: "decompiled_c".to_string(),
         body,
@@ -428,16 +408,32 @@ fn recovered_ghidra_function(
     })
 }
 
-fn recovered_thumb_function(f: ThumbFunctionJson) -> Option<RecoveredFunction> {
+fn recovered_thumb_function(
+    f: crate::thumb_analysis::ThumbFunctionRecord,
+    tool: Tool,
+    legacy_range_semantics: bool,
+) -> Option<RecoveredFunction> {
     let entry = parse_hex_addr(&f.entry).ok()?;
     let end = parse_hex_addr(&f.end).ok()?;
     let data_refs = parse_data_refs(&f.data_refs).ok()?;
+    let decode_ranges = if legacy_range_semantics {
+        None
+    } else {
+        Some(
+            f.decode_ranges
+                .iter()
+                .map(|range| Ok((parse_hex_addr(&range.start)?, parse_hex_addr(&range.end)?)))
+                .collect::<Result<Vec<_>>>()
+                .ok()?,
+        )
+    };
 
     Some(RecoveredFunction {
-        tool: Tool::Radare2,
+        tool,
         name: f.name,
         entry,
         end,
+        decode_ranges,
         size: f.size,
         body_kind: f.body_kind,
         body: f.body,
@@ -459,10 +455,18 @@ fn direct_match(source: &SourceEntry, function: &RecoveredFunction) -> Option<St
 
 fn range_match(source: &SourceEntry, function: &RecoveredFunction) -> Option<String> {
     source.occurrences.iter().find_map(|occ| {
-        (occ.vaddr >= function.entry && occ.vaddr < function.end).then(|| {
+        let matching_range = match &function.decode_ranges {
+            Some(ranges) => ranges
+                .iter()
+                .copied()
+                .find(|(start, end)| occ.vaddr >= *start && occ.vaddr < *end),
+            None => (occ.vaddr >= function.entry && occ.vaddr < function.end)
+                .then_some((function.entry, function.end)),
+        };
+        matching_range.map(|(start, end)| {
             format!(
                 "function range 0x{:x}-0x{:x} contains source-path string at 0x{:x}",
-                function.entry, function.end, occ.vaddr
+                start, end, occ.vaddr
             )
         })
     })
@@ -1084,13 +1088,14 @@ mod tests {
         assert_eq!(funcs.functions[0].body_kind, "thumb_disassembly");
         assert!(funcs.functions[0].body.contains("push"));
         assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
+        assert_eq!(funcs.functions[0].decode_ranges, None);
     }
 
     #[test]
     fn parses_optional_radare2_thumb_functions_v2() {
-        // Phase 2 bumps thumb_functions.json to v2. v1 golden trees must
-        // still parse (covered by parses_optional_radare2_thumb_functions above);
-        // this fixture verifies the new v2 default round-trips identically.
+        // Legacy v1 golden trees must still parse (covered above); this fixture
+        // verifies retained v2 radare2 evidence round-trips identically. Fresh
+        // producer output is strict v3 and has separate ownership tests.
         let root = temp_dir("recover_radare2_v2");
         std::fs::write(root.join("functions.json"), b"[]").unwrap();
         std::fs::write(root.join("decompiled.c"), b"").unwrap();
@@ -1123,6 +1128,63 @@ mod tests {
         assert_eq!(funcs.functions[0].body_kind, "thumb_disassembly");
         assert!(funcs.functions[0].body.contains("push"));
         assert_eq!(funcs.functions[0].data_refs, vec![0x9000]);
+        assert_eq!(funcs.functions[0].decode_ranges, None);
+
+        let sources = vec![source_entry("foo/legacy.cc", 0x4140, 0x100)];
+        let map = attribute(&sources, &funcs.functions, &Opts::default());
+        assert_eq!(map["foo/legacy.cc"][0].confidence, Confidence::Proximity);
+    }
+
+    #[test]
+    fn loads_v3_thumb_producer_ownership() {
+        let root = temp_dir("recover_thumb_v3_owners");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap();
+
+        let funcs = RecoveredFunctions::load(&root).unwrap();
+
+        assert_eq!(funcs.functions.len(), 2);
+        assert_eq!(funcs.functions[0].entry, 0x1000);
+        assert_eq!(funcs.functions[1].entry, 0x1000);
+        assert_eq!(funcs.functions[0].tool, Tool::Radare2);
+        assert_eq!(funcs.functions[1].tool, Tool::Rizin);
+        assert_eq!(
+            funcs.functions[1].decode_ranges,
+            Some(vec![(0x1000, 0x1010), (0x1080, 0x1090)])
+        );
+    }
+
+    #[test]
+    fn v3_range_matching_uses_decode_ranges() {
+        let root = temp_dir("recover_thumb_v3_decode_ranges");
+        std::fs::write(root.join("functions.json"), b"[]").unwrap();
+        std::fs::write(root.join("decompiled.c"), b"").unwrap();
+        std::fs::write(
+            root.join("thumb_functions.json"),
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap();
+        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let rizin = funcs
+            .functions
+            .into_iter()
+            .find(|function| function.tool == Tool::Rizin)
+            .unwrap();
+        let sources = vec![
+            source_entry("foo/gap.cc", 0x1040, 0x100),
+            source_entry("foo/covered.cc", 0x1084, 0x120),
+        ];
+
+        let map = attribute(&sources, &[rizin], &Opts::default());
+
+        assert!(!map.contains_key("foo/gap.cc"));
+        assert_eq!(map["foo/covered.cc"][0].confidence, Confidence::Proximity);
+        assert!(map["foo/covered.cc"][0].reason.contains("0x1080-0x1090"));
     }
 
     #[test]
@@ -1208,6 +1270,7 @@ mod tests {
             name: name.to_string(),
             entry,
             end,
+            decode_ranges: None,
             size: end - entry,
             body_kind: "decompiled_c".to_string(),
             body: format!("int {name}(void) {{\n    return 1;\n}}"),
@@ -1416,6 +1479,7 @@ mod tests {
                 name: "FUN_40001000".into(),
                 entry: 0x40001000,
                 end: 0x40001100,
+                decode_ranges: None,
                 size: 0x100,
                 body_kind: "c".into(),
                 body: "int FUN_40001000(void) { return 1; }\n".into(),
@@ -1447,6 +1511,7 @@ mod tests {
                 name: "thumb_40e1200".into(),
                 entry: 0x40e1200,
                 end: 0x40e1300,
+                decode_ranges: None,
                 size: 0x100,
                 body_kind: "thumb_disassembly".into(),
                 body: "push {r7}\n".into(),

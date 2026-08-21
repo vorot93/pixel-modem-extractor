@@ -3,7 +3,7 @@
 //! `ghidra_load.json` load spec, a turnkey `run_ghidra.sh`, and an embedded Java
 //! exporter); the opt-in `--run` drives `analyzeHeadless` headless to export
 //! decompiled C, a disassembly listing, a function inventory, and a saved project,
-//! with radare2 covering dense Thumb regions that Ghidra cannot converge on.
+//! with radare2 primary and optional failure-only Rizin covering dense Thumb regions.
 
 use crate::{
     error::{Error, Result},
@@ -13,8 +13,9 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     ffi::{OsStr, OsString},
+    io::BufRead,
     num::NonZeroUsize,
     path::{Path, PathBuf},
 };
@@ -40,11 +41,13 @@ pub struct Opts {
     pub image: Option<String>,
     pub ghidra_home: Option<PathBuf>,
     pub processor: String,
-    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode
-    /// (today's Phase-1 behavior — dense Thumb regions marked as data, radare2
-    /// handles them, no `thumb_enrich` runs, `thumb_functions.json` stays at v2
-    /// asm-only). Default false (tighten mode).
+    /// Phase 2 escape hatch: when true, `TameAnalysis` runs in `datamark` mode.
+    /// Dense Thumb regions are marked as data for Ghidra, the configured host
+    /// analyzers still emit strict v3, and `thumb_enrich` does not add `body_c`.
     pub no_thumb_decompile: bool,
+    /// Enable Rizin as a failure-only fallback for dense Thumb regions.
+    /// radare2 remains required and is always attempted first. Default false.
+    pub rizin_fallback: bool,
     /// Phase 2 / Surface B: test-only override that bypasses
     /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
     /// budget for the tighten-watch kill decision. Wired to the hidden
@@ -52,7 +55,7 @@ pub struct Opts {
     /// Production callers leave this `None`.
     pub tighten_wall_clock_budget_override: Option<std::time::Duration>,
     /// Opaque-image escape hatch: when true, images whose battery is
-    /// unanimously opaque still run Ghidra + radare2 exactly as before
+    /// unanimously opaque still run Ghidra + configured Thumb analyzers
     /// (run-everything behavior, for research). Default false (skip —
     /// nothing is recoverable from those bytes under the standard import).
     pub no_skip_opaque: bool,
@@ -274,15 +277,22 @@ fn opaque_skip(bytes: &[u8]) -> Option<crate::classify::BatteryStats> {
 }
 
 /// One image's `--run` result: analyzed (with the function count ExportDecomp
-/// recorded), `analyzeHeadless` exited non-zero, or skipped because the opaque
-/// battery was unanimously opaque (no Ghidra/radare2 process was ever spawned;
-/// the carried stats are what the skip decision measured). Recorded per image
-/// so a full run reports every partition instead of aborting on the first
-/// failure.
+/// recorded), `analyzeHeadless` exited non-zero, the export was rejected by
+/// terminal/currentness validation, or skipped because the opaque battery was
+/// unanimously opaque (no Ghidra or Thumb-analyzer process was spawned; the
+/// carried stats are what the skip decision measured). Recorded per image so a
+/// full run reports every partition instead of aborting on the first failure.
 #[derive(Debug, Clone)]
 pub enum ImageOutcome {
     Analyzed(usize),
+    /// `analyzeHeadless` did not run to completion; carries its exit code.
     Failed(i32),
+    /// Ghidra completed but the terminal execution inventory or current-run
+    /// Thumb validation rejected the export. Distinct from `Failed` so a
+    /// successful Ghidra run with stale or failed Thumb output is never
+    /// reported as a Ghidra failure, and so the reason survives as
+    /// `ImageResult::terminal_error` instead of collapsing to `exit: -1`.
+    TerminalInvalid,
     SkippedOpaque(crate::classify::BatteryStats),
 }
 
@@ -301,6 +311,16 @@ pub struct ImageResult {
     /// construction); failed rows omit it in report.json.
     pub classification: Option<&'static str>,
     pub thumb_functions: Option<usize>,
+    /// Dense Thumb regions requested from the configured analysis backends.
+    pub thumb_regions_requested: Option<usize>,
+    /// Requested Thumb regions with a successful terminal attempt.
+    pub thumb_regions_succeeded: Option<usize>,
+    /// Requested Thumb regions for which every configured attempt failed.
+    pub thumb_regions_failed: Option<usize>,
+    /// Number of successful radare2-owned function runs.
+    pub thumb_radare2_runs: Option<usize>,
+    /// Number of successful Rizin-owned function runs.
+    pub thumb_rizin_runs: Option<usize>,
     /// Current Ghidra source records with a validated accepted projection.
     pub ghidra_execution_accepted: Option<usize>,
     /// Current Ghidra source records retained as whole-record quarantines.
@@ -312,8 +332,13 @@ pub struct ImageResult {
     /// Raw-image mapping used to validate terminal execution ranges.
     pub(crate) image_start: u32,
     pub(crate) image_len: u32,
-    /// Reason-only Thumb/radare2 failure text; `label` already identifies the image.
+    /// Reason-only Thumb-stage failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
+    /// Reason-only terminal-validation failure text: Ghidra completed but the
+    /// export pair could not be certified as this run's output. Always set
+    /// alongside `ImageOutcome::TerminalInvalid`; when the Thumb sidecar is the
+    /// stage that rejected it, `thumb_error` carries the reason too.
+    pub terminal_error: Option<String>,
     /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
     /// reported applying. `None` when no function-map invocation occurred
     /// (including a globals-only invocation) or no valid function summary was parsed.
@@ -329,8 +354,8 @@ pub struct ImageResult {
     /// or log-spam watch killed the tightened run and fell back to `datamark`.
     pub thumb_tighten_error: Option<String>,
     /// Phase 2 / Surface C: reason-only text set when `thumb_enrich` could not
-    /// parse `decompiled.c` (malformed output). The v1 `thumb_functions.json`
-    /// is left intact; downstream stages keep working against v1.
+    /// parse `decompiled.c` (malformed output). `thumb_functions.json` is left
+    /// intact so downstream stages can keep using the producer artifact.
     pub thumb_enrich_error: Option<String>,
     /// Phase 3.0 / Surface 3.0-A: reason-only text set when `globals::run`
     /// returned Err for this image (e.g. malformed functions.json, raw image
@@ -407,6 +432,7 @@ pub(crate) struct TerminalInventorySummary {
     pub ghidra: ExecutionInventoryCounts,
     pub thumb: Option<ExecutionInventoryCounts>,
     pub thumb_substantial: Option<usize>,
+    pub(crate) thumb_metadata: Option<crate::thumb_analysis::ThumbTerminalMetadata>,
     pub accepted_identities: Vec<ExecutionIdentity>,
     pub ghidra_records: Vec<TaggedExecutionRecord>,
     pub thumb_records: Vec<TaggedExecutionRecord>,
@@ -428,6 +454,188 @@ fn inventory_counts(
     }
 }
 
+fn validate_thumb_analysis_currentness(
+    terminal: &TerminalInventorySummary,
+    expected_tools: &crate::thumb_analysis::ThumbTools,
+    expected_region_requests: &[(u32, u32)],
+    expected: &crate::thumb_analysis::ThumbAnalysisSummary,
+) -> Result<()> {
+    terminal.thumb.ok_or_else(|| {
+        Error::Serialize("current Thumb analysis lacks a terminal inventory".into())
+    })?;
+    let metadata = terminal.thumb_metadata.as_ref().ok_or_else(|| {
+        Error::Serialize("current Thumb analysis lacks terminal provenance metadata".into())
+    })?;
+    if metadata.format != crate::thumb_analysis::ThumbFormat::V3 {
+        return Err(Error::Serialize(format!(
+            "current Thumb artifact format mismatch: expected {}, found {}",
+            crate::thumb_analysis::ThumbFormat::V3.as_str(),
+            metadata.format.as_str(),
+        )));
+    }
+    if expected.rizin_runs > 0 && expected_tools.rizin.is_none() {
+        return Err(Error::Serialize(
+            "current Thumb analysis lost its Rizin producer identity".into(),
+        ));
+    }
+    let mut expected_producers = vec![&expected_tools.radare2];
+    let rizin_attempted =
+        expected.rizin_runs > 0 || (expected.regions_failed > 0 && expected_tools.rizin.is_some());
+    if rizin_attempted {
+        expected_producers.push(
+            expected_tools
+                .rizin
+                .as_ref()
+                .expect("Rizin attempt requires configured identity"),
+        );
+    }
+    if metadata.producers.len() != expected_producers.len() {
+        let expected = expected_producers
+            .iter()
+            .map(|producer| producer.producer.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let found = metadata
+            .producers
+            .iter()
+            .map(|producer| producer.producer.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Serialize(format!(
+            "current Thumb producer configuration mismatch: expected exactly [{expected}], found [{found}]"
+        )));
+    }
+    for (expected_producer, observed_producer) in
+        expected_producers.into_iter().zip(&metadata.producers)
+    {
+        if observed_producer.producer != expected_producer.producer {
+            return Err(Error::Serialize(format!(
+                "current Thumb producer identity mismatch: expected {}, found {}",
+                expected_producer.producer.as_str(),
+                observed_producer.producer.as_str(),
+            )));
+        }
+        let producer = expected_producer.producer.as_str();
+        if observed_producer.executable != expected_producer.executable {
+            return Err(Error::Serialize(format!(
+                "current Thumb {producer} executable mismatch: expected {}, found {}",
+                expected_producer.executable.display(),
+                observed_producer.executable.display(),
+            )));
+        }
+        if observed_producer.version != expected_producer.version {
+            return Err(Error::Serialize(format!(
+                "current Thumb {producer} version mismatch: expected {:?}, found {:?}",
+                expected_producer.version, observed_producer.version,
+            )));
+        }
+        if observed_producer.command != expected_producer.command {
+            return Err(Error::Serialize(format!(
+                "current Thumb {producer} command mismatch: expected {:?}, found {:?}",
+                expected_producer.command, observed_producer.command,
+            )));
+        }
+    }
+    for (field, expected, observed) in [
+        (
+            "regions_requested",
+            expected.regions_requested,
+            metadata.summary.regions_requested,
+        ),
+        (
+            "regions_succeeded",
+            expected.regions_succeeded,
+            metadata.summary.regions_succeeded,
+        ),
+        (
+            "regions_failed",
+            expected.regions_failed,
+            metadata.summary.regions_failed,
+        ),
+        (
+            "radare2_runs",
+            expected.radare2_runs,
+            metadata.summary.radare2_runs,
+        ),
+        (
+            "rizin_runs",
+            expected.rizin_runs,
+            metadata.summary.rizin_runs,
+        ),
+        ("raw", expected.raw, metadata.summary.raw),
+        (
+            "substantial",
+            expected.substantial,
+            metadata.summary.substantial,
+        ),
+        ("accepted", expected.accepted, metadata.summary.accepted),
+        (
+            "quarantined",
+            expected.quarantined,
+            metadata.summary.quarantined,
+        ),
+    ] {
+        if observed != expected {
+            return Err(Error::Serialize(format!(
+                "current Thumb {field} mismatch: expected {expected}, found {observed}"
+            )));
+        }
+    }
+    let expected_regions = expected_region_requests
+        .iter()
+        .map(|&(start, len)| {
+            start
+                .checked_add(len)
+                .map(|end| (start, end))
+                .ok_or_else(|| {
+                    Error::Serialize(format!(
+                        "current Thumb region 0x{start:x} length 0x{len:x} overflows u32"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if metadata.regions != expected_regions {
+        let render = |regions: &[(u32, u32)]| {
+            format!(
+                "[{}]",
+                regions
+                    .iter()
+                    .map(|(start, end)| format!("(0x{start:x}, 0x{end:x})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        return Err(Error::Serialize(format!(
+            "current Thumb region ledger mismatch: expected {}, found {}",
+            render(&expected_regions),
+            render(&metadata.regions),
+        )));
+    }
+    Ok(())
+}
+
+/// A rejected terminal export, tagged with the stage responsible. A Thumb-side
+/// rejection also means the Thumb stage left no current sidecar, so it feeds
+/// `thumb_error`; a Ghidra-side rejection is not a Thumb failure and must not
+/// be reported as one.
+pub(crate) struct TerminalValidationFailure {
+    pub thumb: bool,
+    pub error: Error,
+}
+
+impl TerminalValidationFailure {
+    fn ghidra(error: Error) -> Self {
+        Self {
+            thumb: false,
+            error,
+        }
+    }
+
+    fn thumb(error: Error) -> Self {
+        Self { thumb: true, error }
+    }
+}
+
 /// Validate one complete terminal Ghidra/optional-Thumb pair. When
 /// `expected_current` is supplied, every normalized tagged source record must
 /// match the already-validated current producer result before refresh.
@@ -439,35 +647,63 @@ pub(crate) fn validate_terminal_inventory_pair(
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
 ) -> Result<TerminalInventorySummary> {
-    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")?;
-    let ghidra_records = ghidra_json
-        .as_array()
-        .ok_or_else(|| Error::Serialize("Ghidra functions inventory must be an array".into()))?;
+    validate_terminal_inventory_pair_staged(
+        ghidra_functions_path,
+        thumb_functions_path,
+        image_start,
+        image_len,
+        expected_thumb_substantial,
+        expected_current,
+    )
+    .map_err(|failure| failure.error)
+}
+
+pub(crate) fn validate_terminal_inventory_pair_staged(
+    ghidra_functions_path: &Path,
+    thumb_functions_path: &Path,
+    image_start: u32,
+    image_len: u32,
+    expected_thumb_substantial: Option<usize>,
+    expected_current: Option<&TerminalInventorySummary>,
+) -> std::result::Result<TerminalInventorySummary, TerminalValidationFailure> {
+    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")
+        .map_err(TerminalValidationFailure::ghidra)?;
+    let ghidra_records = ghidra_json.as_array().ok_or_else(|| {
+        TerminalValidationFailure::ghidra(Error::Serialize(
+            "Ghidra functions inventory must be an array".into(),
+        ))
+    })?;
     let ghidra =
-        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)?;
+        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)
+            .map_err(TerminalValidationFailure::ghidra)?;
     let mut accepted_identities: BTreeSet<ExecutionIdentity> =
         ghidra.accepted_identities.iter().cloned().collect();
 
-    let (thumb, thumb_substantial, thumb_records) = match expected_thumb_substantial {
+    let (thumb, thumb_substantial, thumb_metadata, thumb_records) = match expected_thumb_substantial
+    {
         None => {
             if thumb_functions_path.exists() {
-                return Err(Error::Serialize(
+                return Err(TerminalValidationFailure::thumb(Error::Serialize(
                     "unexpected Thumb inventory without a current producer result".into(),
-                ));
+                )));
             }
-            (None, None, Vec::new())
+            (None, None, None, Vec::new())
         }
         Some(expected_substantial) => {
-            let (inventory, substantial) = crate::r2_thumb::validate_thumb_inventory_streaming(
+            let validated = crate::thumb_analysis::validate_thumb_inventory_streaming(
                 thumb_functions_path,
                 image_start,
                 image_len,
                 expected_substantial,
-            )?;
+            )
+            .map_err(TerminalValidationFailure::thumb)?;
+            let inventory = validated.inventory;
+            let metadata = validated.metadata;
             accepted_identities.extend(inventory.accepted_identities.iter().cloned());
             (
                 Some(inventory_counts(&inventory)),
-                Some(substantial),
+                Some(metadata.summary.substantial),
+                Some(metadata),
                 inventory.records,
             )
         }
@@ -477,6 +713,7 @@ pub(crate) fn validate_terminal_inventory_pair(
         ghidra: inventory_counts(&ghidra),
         thumb,
         thumb_substantial,
+        thumb_metadata,
         accepted_identities: accepted_identities.into_iter().collect(),
         ghidra_records: ghidra.records,
         thumb_records,
@@ -484,9 +721,18 @@ pub(crate) fn validate_terminal_inventory_pair(
     if let Some(expected) = expected_current
         && &summary != expected
     {
-        return Err(Error::Serialize(
-            "terminal execution inventory differs from the current producer result".into(),
-        ));
+        // The comparison spans both stages; a differing Thumb ledger is the
+        // only way this can be a Thumb-stage problem.
+        let thumb = summary.thumb_metadata != expected.thumb_metadata
+            || summary.thumb != expected.thumb
+            || summary.thumb_substantial != expected.thumb_substantial
+            || summary.thumb_records != expected.thumb_records;
+        return Err(TerminalValidationFailure {
+            thumb,
+            error: Error::Serialize(
+                "terminal execution inventory differs from the current producer result".into(),
+            ),
+        });
     }
     Ok(summary)
 }
@@ -507,7 +753,7 @@ pub(crate) fn validate_image_terminal_inventory(
     )?;
     let raw_functions = match image.outcome {
         ImageOutcome::Analyzed(raw) => raw,
-        ImageOutcome::Failed(_) => {
+        ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid => {
             return Err(Error::Serialize(
                 "failed image has no current terminal inventory".into(),
             ));
@@ -656,7 +902,7 @@ fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
 
 fn generation_only_hint(out: &Path) -> String {
     format!(
-        "(generation only; pass --run to drive Ghidra plus radare2 for dense Thumb regions, or run {}/run_ghidra.sh for Ghidra-only import/export)",
+        "(generation only; pass --run to drive Ghidra plus radare2 primary for dense Thumb regions, with optional failure-only Rizin via --rizin-fallback; or run {}/run_ghidra.sh for Ghidra-only import/export)",
         out.display()
     )
 }
@@ -685,10 +931,9 @@ fn window_entropy(w: &[u8]) -> f64 {
 /// Detect large dense-Thumb regions in an image by entropy. MAIN interleaves ARM/A32
 /// code with multi-MB Thumb-2 blobs — the upper protocol stack (IMS/VoLTE/SIP, RRC,
 /// NAS, L1/PHY, 5G-NR). Thumb-2 is denser than A32 (~7 bits/byte vs ~5-6), so high
-/// entropy marks the Thumb regions. Ghidra cannot converge on them (it spins forever
-/// in a `ClearFlowAndRepairCmd` overlapping-function loop — ~10M+ repair messages on
-/// MAIN), so the pre-script marks them as data for Ghidra and the host analyzes them
-/// with radare2 instead.
+/// entropy marks the Thumb regions. Tighten mode lets Ghidra analyze them under the
+/// overlap-repair watch; datamark mode marks them as data. Independently, the host
+/// analyzes every detected region with radare2 primary and optional Rizin fallback.
 ///
 /// Windows above `ENTROPY_THRESHOLD` are merged; only regions ≥ `MIN_REGION` are
 /// returned, so small high-entropy spans (A32 constant pools) aren't misclassified.
@@ -1023,7 +1268,91 @@ fn materialize_runtime_load_maps(toc: &Toc, data: &[u8], out: &Path) -> Result<R
 /// image — returning the structured per-image outcomes plus the `ghidra_load.json` path.
 /// Unlike [`run`], this never errors on a per-image analysis failure: every partition is
 /// attempted and recorded, so an orchestrator (e.g. `decompose`) decides what a failure means.
+/// Analyzer discovery occurs once before any modem or output work.
 pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<DecompileReport> {
+    run_report_with_discovery(
+        modem_bin,
+        opts,
+        out,
+        crate::thumb_analysis::discover_radare2,
+        crate::thumb_analysis::discover_rizin,
+    )
+}
+
+fn run_report_with_discovery(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    discover_radare2: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+    discover_rizin: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+) -> Result<DecompileReport> {
+    if !opts.run {
+        let _rizin = discover_configured_rizin(opts.rizin_fallback, discover_rizin)?;
+        return run_report_impl(
+            modem_bin,
+            opts,
+            out,
+            None,
+            crate::thumb_analysis::run_thumb_analysis,
+        );
+    }
+
+    // radare2 is the required dense-Thumb primary, so its discovery failure is
+    // a hard preflight: deferring it would probe Rizin, parse the modem, create
+    // the output tree, and spend a full Ghidra run before failing — and could
+    // even succeed for an image with no dense Thumb region.
+    let radare2 = discover_radare2()?;
+    let rizin = discover_configured_rizin(opts.rizin_fallback, discover_rizin)?;
+    let thumb_tools = crate::thumb_analysis::ThumbTools { radare2, rizin };
+    run_report_with_thumb_tools(modem_bin, opts, out, &thumb_tools)
+}
+
+/// Run with identities already retained by an orchestrator's preflight. This path performs no
+/// analyzer discovery, ensuring analysis and outer reporting observe the same tool identities.
+pub(crate) fn run_report_with_thumb_tools(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+) -> Result<DecompileReport> {
+    run_report_with_thumb_tools_and_analyzer(
+        modem_bin,
+        opts,
+        out,
+        thumb_tools,
+        crate::thumb_analysis::run_thumb_analysis,
+    )
+}
+
+fn run_report_with_thumb_tools_and_analyzer(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+    analyze_thumb: impl FnMut(
+        &crate::thumb_analysis::ThumbTools,
+        &[u8],
+        u32,
+        &[(u32, u32)],
+        &Path,
+    ) -> Result<crate::thumb_analysis::ThumbAnalysisSummary>,
+) -> Result<DecompileReport> {
+    run_report_impl(modem_bin, opts, out, Some(thumb_tools), analyze_thumb)
+}
+
+fn run_report_impl(
+    modem_bin: &Path,
+    opts: &Opts,
+    out: &Path,
+    thumb_tools: Option<&crate::thumb_analysis::ThumbTools>,
+    mut analyze_thumb: impl FnMut(
+        &crate::thumb_analysis::ThumbTools,
+        &[u8],
+        u32,
+        &[(u32, u32)],
+        &Path,
+    ) -> Result<crate::thumb_analysis::ThumbAnalysisSummary>,
+) -> Result<DecompileReport> {
     let data = std::fs::read(modem_bin)?;
     let toc = Toc::parse(&data)?;
     std::fs::create_dir_all(out)?;
@@ -1070,7 +1399,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
     // 4. turnkey shell script -> out/run_ghidra.sh
     write_run_script(out, &toc, &opts.processor, &runtime_load_maps.paths)?;
 
-    // 5. optional: drive Ghidra headless per selected image, plus radare2 for dense Thumb regions
+    // 5. optional: drive Ghidra headless and the configured dense-Thumb analyzers per image
     let mut image_results: Vec<ImageResult> = Vec::new();
     let mut current_exports = BTreeSet::new();
     if opts.run {
@@ -1086,7 +1415,6 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         std::fs::create_dir_all(ghidra_temp_home(&root))?;
         let root_str = root.to_string_lossy().into_owned();
         let want = opts.image.as_deref();
-        let r2_bin = find_radare2();
         // Analyze every selected image, recording each outcome rather than aborting on the
         // first failure — so a heavy or unanalyzable partition (the ~87 MB MAIN, or an
         // encrypted one) can't sink the rest of a full run.
@@ -1099,10 +1427,12 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             /// `battery.label` even on escape-hatch runs.
             classification: &'static str,
             thumb_functions: Option<usize>,
+            thumb_summary: Option<crate::thumb_analysis::ThumbAnalysisSummary>,
             terminal_inventory: Option<TerminalInventorySummary>,
             image_start: u32,
             image_len: u32,
             thumb_error: Option<String>,
+            terminal_error: Option<String>,
             tighten_error: Option<String>,
             // When the tighten-watch kills the run, we re-spawn as datamark
             // and there is no `thumb_enrich` to run later; mark the count
@@ -1141,10 +1471,12 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                         outcome: ImageOutcome::Failed(-1),
                         classification,
                         thumb_functions: None,
+                        thumb_summary: None,
                         terminal_inventory: None,
                         image_start: e.load_addr,
                         image_len: e.size,
                         thumb_error: None,
+                        terminal_error: None,
                         tighten_error: None,
                         thumb_decompiled: None,
                     });
@@ -1153,7 +1485,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             };
             // Opaque-image gate, BEFORE any Ghidra project work: a unanimous
             // battery verdict means there is no code to recover, so bypass the
-            // entire per-image Ghidra + radare2 block (no import, no tighten
+            // entire per-image Ghidra + Thumb-analysis block (no import, no tighten
             // watch, no export, no Thumb analysis) but still record a
             // RunResult — `--image 01_PSP` stays a successful non-empty run.
             // `--no-skip-opaque` restores run-everything behavior.
@@ -1173,10 +1505,12 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     outcome: ImageOutcome::SkippedOpaque(stats),
                     classification,
                     thumb_functions: None,
+                    thumb_summary: None,
                     terminal_inventory: None,
                     image_start: e.load_addr,
                     image_len: e.size,
                     thumb_error: None,
+                    terminal_error: None,
                     tighten_error: None,
                     thumb_decompiled: None,
                 });
@@ -1192,7 +1526,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
             // message would be misleading.
             if mode == "datamark" && !regions.is_empty() {
                 tracing::info!(
-                    "ghidra: {label} has {} dense Thumb-2 region(s) — marked as data (radare2 handles them)",
+                    "ghidra: {label} has {} dense Thumb-2 region(s) — marked as data (Thumb analysis handles them)",
                     regions.len()
                 );
             }
@@ -1389,54 +1723,98 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 }
                 None => ImageOutcome::Failed(-1),
             };
-            // Ghidra can't converge on the dense Thumb-2 regions (overlap-repair loop) and
-            // marked them as data — hand them to radare2 for the protocol stack.
-            let (thumb_functions, thumb_error) = if regions.is_empty() {
+            // After the Ghidra attempt, analyze dense Thumb through the configured
+            // radare2-primary route regardless of tighten/datamark mode.
+            let (thumb_summary, mut thumb_error) = if regions.is_empty() {
                 (None, None)
-            } else if let Some(r2) = &r2_bin {
-                match crate::r2_thumb::run_radare2_thumb(
-                    r2,
+            } else if let Some(thumb_tools) = thumb_tools {
+                match analyze_thumb(
+                    thumb_tools,
                     img,
                     e.load_addr,
                     &regions,
                     &root.join("export").join(&label),
                 ) {
-                    Ok(n) => {
-                        tracing::info!("radare2: {label} Thumb stack -> {n} function(s)");
-                        (Some(n), None)
+                    Ok(summary) => {
+                        tracing::info!(
+                            "Thumb: {label} regions requested={} succeeded={} failed={} radare2_runs={} rizin_runs={} raw={} substantial={} accepted={} quarantined={}",
+                            summary.regions_requested,
+                            summary.regions_succeeded,
+                            summary.regions_failed,
+                            summary.radare2_runs,
+                            summary.rizin_runs,
+                            summary.raw,
+                            summary.substantial,
+                            summary.accepted,
+                            summary.quarantined,
+                        );
+                        (Some(summary), None)
                     }
                     Err(err) => {
-                        tracing::warn!("radare2: {label} failed: {err}");
+                        tracing::warn!("Thumb: {label} failed: {err}");
                         (None, Some(err.to_string()))
                     }
                 }
             } else {
+                // Only the generation-only route reaches this: `--run` fails
+                // preflight when radare2 is missing, so no analyzed image can
+                // ever be published without its required primary.
                 let err = format!(
-                    "{} Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them",
-                    regions.len()
+                    "{} Thumb region(s) left unanalyzed because no analyzer was configured",
+                    regions.len(),
                 );
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
             };
+            let thumb_functions = thumb_summary.as_ref().map(|summary| summary.substantial);
+            let mut terminal_error = None;
             let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
                 let export = root.join("export").join(&label);
-                match validate_terminal_inventory_pair(
+                let validation = validate_terminal_inventory_pair_staged(
                     &export.join("functions.json"),
                     &export.join("thumb_functions.json"),
                     e.load_addr,
                     e.size,
                     thumb_functions,
                     None,
-                ) {
+                )
+                .and_then(|summary| {
+                    let Some(expected) = &thumb_summary else {
+                        return Ok(summary);
+                    };
+                    let expected_tools = thumb_tools.ok_or_else(|| {
+                        TerminalValidationFailure::thumb(Error::Serialize(
+                            "current Thumb analysis lost its injected tool identities".into(),
+                        ))
+                    })?;
+                    validate_thumb_analysis_currentness(
+                        &summary,
+                        expected_tools,
+                        &regions,
+                        expected,
+                    )
+                    .map_err(TerminalValidationFailure::thumb)?;
+                    Ok(summary)
+                });
+                match validation {
                     Ok(summary) => {
                         outcome = ImageOutcome::Analyzed(summary.ghidra.raw);
                         Some(summary)
                     }
-                    Err(error) => {
+                    Err(failure) => {
+                        let reason = failure.error.to_string();
                         tracing::warn!(
-                            "terminal execution inventory for {label} failed validation: {error}"
+                            "terminal execution inventory for {label} failed validation: {reason}"
                         );
-                        outcome = ImageOutcome::Failed(-1);
+                        // Ghidra ran to completion, so this is not a Ghidra
+                        // process failure. A Thumb-stage rejection also means
+                        // no current sidecar; keep any root-cause `thumb_error`
+                        // the analysis stage already recorded.
+                        if failure.thumb {
+                            thumb_error.get_or_insert_with(|| reason.clone());
+                        }
+                        terminal_error = Some(reason);
+                        outcome = ImageOutcome::TerminalInvalid;
                         None
                     }
                 }
@@ -1456,10 +1834,12 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 outcome,
                 classification,
                 thumb_functions,
+                thumb_summary,
                 terminal_inventory,
                 image_start: e.load_addr,
                 image_len: e.size,
                 thumb_error,
+                terminal_error,
                 tighten_error,
                 thumb_decompiled: thumb_decompiled_override,
             });
@@ -1481,9 +1861,9 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
         );
         for r in &results {
             let t = if let Some(n) = r.thumb_functions {
-                format!("  + {n} Thumb fn(s) [radare2]")
+                format!("  + {n} Thumb fn(s)")
             } else if let Some(err) = &r.thumb_error {
-                format!("  + Thumb FAILED [radare2: {err}]")
+                format!("  + Thumb FAILED [{err}]")
             } else {
                 String::new()
             };
@@ -1498,6 +1878,10 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                 }
                 ImageOutcome::Failed(code) => {
                     println!("  {:<11} FAILED (exit {code}){t}{k}", r.label)
+                }
+                ImageOutcome::TerminalInvalid => {
+                    let reason = r.terminal_error.as_deref().unwrap_or("unknown reason");
+                    println!("  {:<11} FAILED (terminal: {reason}){t}{k}", r.label)
                 }
                 ImageOutcome::SkippedOpaque(_) => {
                     println!(
@@ -1519,6 +1903,15 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     outcome: r.outcome,
                     classification: Some(r.classification),
                     thumb_functions: r.thumb_functions,
+                    thumb_regions_requested: r
+                        .thumb_summary
+                        .map(|summary| summary.regions_requested),
+                    thumb_regions_succeeded: r
+                        .thumb_summary
+                        .map(|summary| summary.regions_succeeded),
+                    thumb_regions_failed: r.thumb_summary.map(|summary| summary.regions_failed),
+                    thumb_radare2_runs: r.thumb_summary.map(|summary| summary.radare2_runs),
+                    thumb_rizin_runs: r.thumb_summary.map(|summary| summary.rizin_runs),
                     ghidra_execution_accepted: r
                         .terminal_inventory
                         .as_ref()
@@ -1538,6 +1931,7 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
                     image_start: r.image_start,
                     image_len: r.image_len,
                     thumb_error: r.thumb_error,
+                    terminal_error: r.terminal_error,
                     pass2_applied: None,
                     pass2_error: None,
                     thumb_decompiled: r.thumb_decompiled,
@@ -1579,9 +1973,12 @@ pub fn run_report(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<Decompile
 /// Convert structured per-image outcomes into the standalone `decompile` failure,
 /// after every selected image has had a chance to run.
 fn report_failure(report: &DecompileReport) -> Option<Error> {
+    // Only a real `analyzeHeadless` failure is a Ghidra failure.
     if let Some(code) = report.images.iter().find_map(|r| match r.outcome {
         ImageOutcome::Failed(c) => Some(c),
-        ImageOutcome::Analyzed(_) | ImageOutcome::SkippedOpaque(_) => None,
+        ImageOutcome::Analyzed(_)
+        | ImageOutcome::TerminalInvalid
+        | ImageOutcome::SkippedOpaque(_) => None,
     }) {
         let failed: Vec<&str> = report
             .images
@@ -1595,22 +1992,43 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
             code,
         });
     }
-    let thumb_failed: Vec<String> = report
-        .images
-        .iter()
-        .filter_map(|r| {
-            r.thumb_error
-                .as_ref()
-                .map(|err| format!("{}: {err}", r.label))
-        })
-        .collect();
-    if !thumb_failed.is_empty() {
+    // Thumb-stage reasons come first: for a rejected export they are the root
+    // cause, and the terminal reason is its consequence.
+    if let Some(reasons) = labelled_reasons(report, |image| image.thumb_error.as_deref()) {
         return Some(Error::DecomposeIncomplete(format!(
-            "radare2 failed on {}",
-            thumb_failed.join(", ")
+            "Thumb analysis failed on {reasons}"
+        )));
+    }
+    if let Some(reasons) = labelled_reasons(report, |image| image.terminal_error.as_deref()) {
+        return Some(Error::DecomposeIncomplete(format!(
+            "terminal inventory validation failed on {reasons}"
         )));
     }
     None
+}
+
+/// `"<label>: <reason>, …"` over every image carrying a reason, or `None`.
+fn labelled_reasons(
+    report: &DecompileReport,
+    reason: impl Fn(&ImageResult) -> Option<&str>,
+) -> Option<String> {
+    let labelled: Vec<String> = report
+        .images
+        .iter()
+        .filter_map(|image| reason(image).map(|reason| format!("{}: {reason}", image.label)))
+        .collect();
+    (!labelled.is_empty()).then(|| labelled.join(", "))
+}
+
+pub(crate) fn discover_configured_rizin(
+    enabled: bool,
+    discover: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+) -> Result<Option<crate::thumb_analysis::ProducerIdentity>> {
+    if enabled {
+        discover().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
@@ -2171,8 +2589,8 @@ pub fn run_two_pass(
     Ok(Pass2RunReport { report, outcomes })
 }
 
-/// Generate the kit and (with `--run`) drive Ghidra plus radare2 for dense Thumb
-/// regions; non-zero if any selected image failed either analysis path.
+/// Generate the kit and (with `--run`) drive Ghidra plus configured dense-Thumb
+/// analyzers; non-zero if any selected image failed either analysis path.
 pub fn run(modem_bin: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     let report = run_report(modem_bin, opts, out)?;
     // Non-zero exit if any image failed — but only after all were attempted (run_report
@@ -2354,12 +2772,427 @@ fn find_ghidra(opts: &Opts) -> Result<GhidraInstall> {
     find_headless(opts.ghidra_home.as_deref())
 }
 
-/// Locate the `radare2` binary (`r2`) on `PATH` — used to analyze the Thumb-2 regions
-/// Ghidra cannot. `None` if not installed (those regions are then left unanalyzed).
+/// Locate the required `radare2` primary (`r2`) on `PATH`. `None` if it is not installed.
 pub fn find_radare2() -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|d| d.join("r2"))
         .find(|p| p.exists())
+}
+
+/// Phase 2: enrich a `thumb_functions.json` with per-function `body_c` sourced
+/// from a `decompiled.c`. A changed v1 artifact is promoted to v2; v2/v3 retain
+/// their format. A semantic no-op leaves the file byte-identical. Idempotent.
+///
+/// `decompiled.c` is parsed by scanning for ExportDecomp.java's per-function
+/// header line
+///
+/// ```text
+/// // <name> @ <entrypoint>
+/// <return-type> <name>(<params>)
+/// {
+///   ...
+/// }
+/// ```
+///
+/// and keying each captured body by the normalized entry address
+/// (`normalize_thumb_addr` clears Ghidra's Thumb T-bit so `40e1201` and `40e1200`
+/// agree). Matching against `thumb_functions.json` is likewise by the normalized
+/// `entry` field — Phase 2.1 switched this from name-based to address-based
+/// matching because analyzer-generated names do not reliably align with Ghidra's
+/// `FUN_<addr>`/recovered names. Returns the count of functions whose `body_c`
+/// was populated.
+///
+/// Both inputs stream: the C file is read line-by-line into the address-to-body
+/// map and the artifact is rewritten one function at a time through the shared
+/// atomic v1/v2/v3 mutator. No whole artifact `Value` tree is materialized.
+/// Any malformed input fails closed with the on-disk artifact unchanged.
+pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    let bodies = collect_decompiled_c_bodies(decompiled_c_path)?;
+    let mut populated = 0usize;
+    crate::thumb_analysis::stream_rewrite_thumb_functions(
+        thumb_functions_json_path,
+        |_, function| {
+            // Phase 2.1: match by `entry` (address), not by `name`. The `name`
+            // field is analyzer-generated and does not reliably align with
+            // Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
+            let Some(entry_str) = function.get("entry").and_then(|name| name.as_str()) else {
+                return Ok(());
+            };
+            let Some(canonical) = normalize_thumb_addr(entry_str) else {
+                return Ok(());
+            };
+            if let Some(body) = bodies.get(&canonical) {
+                function.as_object_mut().unwrap().insert(
+                    "body_c".to_string(),
+                    serde_json::Value::String(body.clone()),
+                );
+                populated += 1;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(populated)
+}
+
+/// Whole-file differential oracle for the streaming enricher.
+#[cfg(test)]
+fn thumb_enrich_whole(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+    let c_text = std::fs::read_to_string(decompiled_c_path)?;
+    let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path, None)?;
+    let mut populated = 0usize;
+    for function in artifact.function_values_mut() {
+        let Some(entry) = function.get("entry").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(entry) = normalize_thumb_addr(entry) else {
+            continue;
+        };
+        if let Some(body) = bodies.get(&entry) {
+            function.as_object_mut().unwrap().insert(
+                "body_c".to_string(),
+                serde_json::Value::String(body.clone()),
+            );
+            populated += 1;
+        }
+    }
+    artifact.write_atomic(thumb_functions_json_path)?;
+    Ok(populated)
+}
+
+/// Canonical comparison form for a Thumb entry address: lowercase hex string
+/// with no `0x` prefix, no leading zeros, low bit cleared (kills Ghidra's Thumb
+/// T-bit so `40e1201` and `40e1200` both become `40e1200`). Returns None if `s`
+/// doesn't parse as a non-empty hex string.
+///
+/// This is the **Phase 2.1 invariant** — both `thumb_enrich`'s parser (over
+/// `decompiled.c`'s `// <name> @ <addr>` headers) and matcher (over
+/// `thumb_functions.json`'s `entry` fields) MUST apply the same normalization,
+/// or matching silently breaks. The inline `thumb_enrich_populates_body_c_
+/// with_tbit_set` test is the regression sentinel.
+fn normalize_thumb_addr(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    let stripped = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let val = u64::from_str_radix(stripped, 16).ok()?;
+    Some(format!("{:x}", val & !1))
+}
+
+#[cfg(test)]
+mod normalize_thumb_addr_tests {
+    use super::*;
+
+    #[test]
+    fn strips_0x_prefix_and_leading_zeros() {
+        assert_eq!(
+            normalize_thumb_addr("0x000040e1200").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(
+            normalize_thumb_addr("0X40E1200").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(normalize_thumb_addr("40e1200").as_deref(), Some("40e1200"));
+    }
+
+    #[test]
+    fn clears_thumb_tbit() {
+        assert_eq!(
+            normalize_thumb_addr("0x40e1201").as_deref(),
+            Some("40e1200")
+        );
+        assert_eq!(
+            normalize_thumb_addr("00040e1201").as_deref(),
+            Some("40e1200")
+        );
+    }
+
+    #[test]
+    fn rejects_non_hex() {
+        assert_eq!(normalize_thumb_addr("not-an-addr"), None);
+        assert_eq!(normalize_thumb_addr(""), None);
+        assert_eq!(normalize_thumb_addr("0xZZZ"), None);
+    }
+}
+
+/// Parse a `decompiled.c` text into a map of `{normalized_entry_address ->
+/// body_text}`, where `body_text` is the full function including signature and
+/// braces. ExportDecomp.java emits one header per function:
+///
+/// ```text
+/// // <name> @ <entrypoint>
+/// <return-type> <name>(<params>)
+/// {
+///   ...
+/// }
+/// ```
+///
+/// where `<entrypoint>` is `fn.getEntryPoint().toString()`. For ARM Thumb in
+/// Ghidra 12 with `ARM:LE:32:v7`, Thumb entry points carry the T-bit (odd);
+/// `normalize_thumb_addr` clears it so the canonical key matches radare2's
+/// even-form `entry` field. Functions whose header lacks ` @ <addr>` are
+/// silently skipped (no key to insert under) — same fail-soft posture as the
+/// prior name-based parser. This whole-string implementation is retained only
+/// as the differential oracle for the streaming collector.
+#[cfg(test)]
+fn parse_decompiled_c_function_bodies_by_addr(c_text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let lines: Vec<&str> = c_text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        // Match the ExportDecomp header: starts with `//`, contains ` @ `.
+        let addr_str = line
+            .trim()
+            .strip_prefix("//")
+            .and_then(|rest| rest.rsplit_once(" @ "))
+            .map(|(_, addr)| addr.trim())
+            .filter(|addr| !addr.is_empty());
+        let Some(addr_str) = addr_str else {
+            i += 1;
+            continue;
+        };
+        // Bounded lookahead: commit only when `{` appears within the next 1–8
+        // lines. Real ExportDecomp.java output is bi-modal: offset-4 headers
+        // (single-line signatures, ~58% of production 02_MAIN) and offset-6
+        // headers (2-line signatures, ~35%). The 8-line bound captures 99.6% of
+        // real headers in the production histogram. Without this bound, a header-shaped
+        // non-header could commit at position N and absorb following lines into
+        // the wrong address's body until the next real function's `{` — same
+        // rationale as the prior parser's lookahead.
+        let start = i;
+        let opens_brace_within_8 =
+            (start + 1..std::cmp::min(start + 9, lines.len())).any(|j| lines[j].contains('{'));
+        if !opens_brace_within_8 {
+            i = start + 1;
+            continue;
+        }
+        // Capture from this line through the matching closing brace at depth 0.
+        // State machine tracks string/char literals + line/block comments so a `}`
+        // inside `"expected }"`, `'}'`, or `// close }` doesn't truncate the body.
+        // Mirrors the string-aware scanning used by the production
+        // `thumb_analysis::stream::ValueScanner` (`balanced_json_end` is its `#[cfg(test)]`
+        // oracle).
+        let mut depth = 0i32;
+        let mut saw_brace = false;
+        let mut body = String::new();
+        let mut in_string = false;
+        let mut in_char = false;
+        let mut escaped = false;
+        let mut in_block_comment = false;
+        while i < lines.len() {
+            let l = lines[i];
+            let mut chars = l.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if in_block_comment {
+                    if ch == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        in_block_comment = false;
+                    }
+                    continue;
+                }
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                if in_char {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '\'' {
+                        in_char = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '\'' => in_char = true,
+                    '/' => {
+                        if chars.peek() == Some(&'/') {
+                            chars.next();
+                            break; // rest of line is a line comment
+                        } else if chars.peek() == Some(&'*') {
+                            chars.next();
+                            in_block_comment = true;
+                        }
+                    }
+                    '{' => {
+                        depth += 1;
+                        saw_brace = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            body.push_str(l);
+            body.push('\n');
+            if saw_brace && depth <= 0 {
+                break;
+            }
+            i += 1;
+        }
+        if let Some(canonical) = normalize_thumb_addr(addr_str) {
+            out.insert(canonical, body);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn collect_decompiled_c_bodies(path: &Path) -> Result<HashMap<String, String>> {
+    let file = std::fs::File::open(path)?;
+    let mut source = LineSource::new(std::io::BufReader::new(file));
+    let mut out = HashMap::new();
+    while let Some(line) = source.next_line()? {
+        let Some(addr_str) = decompiled_c_header_addr(&line) else {
+            continue;
+        };
+        let mut window = VecDeque::with_capacity(8);
+        let mut opens_brace = false;
+        while window.len() < 8 {
+            let Some(next) = source.next_line()? else {
+                break;
+            };
+            opens_brace |= next.contains('{');
+            window.push_back(next);
+            if opens_brace {
+                break;
+            }
+        }
+        if !opens_brace {
+            source.push_front_all(window);
+            continue;
+        }
+        let mut scan = BodyScan::default();
+        let mut body = String::new();
+        let mut closed = scan.push_line(&line, &mut body);
+        while !closed {
+            let next = window
+                .pop_front()
+                .map_or_else(|| source.next_line(), |line| Ok(Some(line)));
+            let Some(next) = next? else { break };
+            closed = scan.push_line(&next, &mut body);
+        }
+        source.push_front_all(window);
+        if let Some(canonical) = normalize_thumb_addr(addr_str) {
+            out.insert(canonical, body);
+        }
+    }
+    Ok(out)
+}
+
+fn decompiled_c_header_addr(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("//")
+        .and_then(|rest| rest.rsplit_once(" @ "))
+        .map(|(_, addr)| addr.trim())
+        .filter(|addr| !addr.is_empty())
+}
+
+struct LineSource<B: BufRead> {
+    lines: std::io::Lines<B>,
+    pushback: VecDeque<String>,
+}
+
+impl<B: BufRead> LineSource<B> {
+    fn new(reader: B) -> Self {
+        Self {
+            lines: reader.lines(),
+            pushback: VecDeque::new(),
+        }
+    }
+
+    fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        if let Some(line) = self.pushback.pop_front() {
+            return Ok(Some(line));
+        }
+        self.lines.next().transpose()
+    }
+
+    fn push_front_all(&mut self, lines: VecDeque<String>) {
+        for line in lines.into_iter().rev() {
+            self.pushback.push_front(line);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BodyScan {
+    depth: i32,
+    saw_brace: bool,
+    in_string: bool,
+    in_char: bool,
+    escaped: bool,
+    in_block_comment: bool,
+}
+
+impl BodyScan {
+    fn push_line(&mut self, line: &str, body: &mut String) -> bool {
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if self.in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    self.in_block_comment = false;
+                }
+                continue;
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            if self.in_char {
+                if self.escaped {
+                    self.escaped = false;
+                } else if ch == '\\' {
+                    self.escaped = true;
+                } else if ch == '\'' {
+                    self.in_char = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => self.in_string = true,
+                '\'' => self.in_char = true,
+                '/' => {
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    } else if chars.peek() == Some(&'*') {
+                        chars.next();
+                        self.in_block_comment = true;
+                    }
+                }
+                '{' => {
+                    self.depth += 1;
+                    self.saw_brace = true;
+                }
+                '}' => self.depth -= 1,
+                _ => {}
+            }
+        }
+        body.push_str(line);
+        body.push('\n');
+        self.saw_brace && self.depth <= 0
+    }
 }
 
 #[cfg(test)]
@@ -2486,9 +3319,77 @@ mod tests {
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         }
+    }
+
+    fn test_identity(
+        producer: crate::thumb_analysis::ThumbProducer,
+        executable: &str,
+        version: &str,
+    ) -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer,
+            executable: executable.into(),
+            version: version.into(),
+            command: producer.command(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_headless(home: &Path) {
+        let headless = home.join("support/analyzeHeadless");
+        write_executable(
+            &headless,
+            &format!(
+                r#"#!/bin/sh
+set -eu
+export_dir=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "ExportDecomp.java" ]; then
+    shift
+    export_dir=$1
+    break
+  fi
+  shift
+done
+test -n "$export_dir"
+mkdir -p "$export_dir"
+printf '%s\n' '[]' > "$export_dir/functions.json"
+: > "$export_dir/disasm.lst"
+: > "$export_dir/decompiled.c"
+export_root=$(dirname "$export_dir")
+label=$(basename "$export_dir")
+printf '%s\n' '{}' > "$export_root/$label.complete"
+"#,
+                GHIDRA_EXPORT_COMPLETION
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_fake_radare2(path: &Path, succeeds: bool) {
+        let body = if succeeds {
+            r#"#!/bin/sh
+printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"minaddr":1073807360,"maxaddr":1073807362}]' '{"addr":1073807360,"ops":[{"addr":1073807360,"bytes":"0001","disasm":"lsls r0, r0, 4"}]}'
+"#
+        } else {
+            "#!/bin/sh\nexit 9\n"
+        };
+        write_executable(path, body);
     }
 
     #[test]
@@ -3413,7 +4314,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_pair_validates_current_tags_counts_and_complete_identities() {
+    fn terminal_inventory_pair_validates_current_tags_counts_and_complete_identities() {
         let root = std::env::temp_dir().join(format!("pme_terminal_pair_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -3528,6 +4429,484 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    const TERMINAL_V3_ARTIFACT: &str = r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {
+      "id": "radare2",
+      "executable": "/usr/bin/r2",
+      "version": "radare2 test 1.0",
+      "command": "aaa;aflj;pdfj @@f"
+    }
+  ],
+  "regions": [
+    {
+      "start": "0x4000",
+      "end": "0x4010",
+      "attempts": [
+        {
+          "producer": "radare2",
+          "status": "succeeded",
+          "stdout": {
+            "path": "thumb/00004000.radare2.stdout",
+            "bytes": 2,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "error": null
+        }
+      ],
+      "function_runs": [
+        {
+          "producer": "radare2",
+          "first_function": 0,
+          "function_count": 1,
+          "substantial": 0,
+          "accepted": 1,
+          "quarantined": 0
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "body": "0x00004000      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [
+        {
+          "end": "0x4002",
+          "isa": "thumb",
+          "start": "0x4000"
+        }
+      ],
+      "end": "0x4002",
+      "entry": "0x4000",
+      "name": "sym.thumb",
+      "size": 2
+    }
+  ]
+}"#;
+
+    const TERMINAL_MIXED_V3_ARTIFACT: &str = r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v3",
+  "producers": [
+    {
+      "id": "radare2",
+      "executable": "/usr/bin/r2",
+      "version": "radare2 test 1.0",
+      "command": "aaa;aflj;pdfj @@f"
+    },
+    {
+      "id": "rizin",
+      "executable": "/usr/bin/rizin",
+      "version": "rizin test 1.0",
+      "command": "aaa;aflj;pdfj @@F;axlj"
+    }
+  ],
+  "regions": [
+    {
+      "start": "0x4000",
+      "end": "0x4002",
+      "attempts": [
+        {
+          "producer": "radare2",
+          "status": "succeeded",
+          "stdout": {
+            "path": "thumb/00004000.radare2.stdout",
+            "bytes": 2,
+            "blake3": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "error": null
+        }
+      ],
+      "function_runs": [
+        {
+          "producer": "radare2",
+          "first_function": 0,
+          "function_count": 1,
+          "substantial": 0,
+          "accepted": 1,
+          "quarantined": 0
+        }
+      ]
+    },
+    {
+      "start": "0x4010",
+      "end": "0x4012",
+      "attempts": [
+        {
+          "producer": "radare2",
+          "status": "failed",
+          "stdout": {
+            "path": "thumb/00004010.radare2.stdout",
+            "bytes": 0,
+            "blake3": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "error": "radare2 exited with status 1 for Thumb region 0x4010"
+        },
+        {
+          "producer": "rizin",
+          "status": "succeeded",
+          "stdout": {
+            "path": "thumb/00004010.rizin.stdout",
+            "bytes": 2,
+            "blake3": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "error": null
+        }
+      ],
+      "function_runs": [
+        {
+          "producer": "rizin",
+          "first_function": 1,
+          "function_count": 1,
+          "substantial": 0,
+          "accepted": 1,
+          "quarantined": 0
+        }
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "body": "0x00004000      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [{"end":"0x4002","isa":"thumb","start":"0x4000"}],
+      "end": "0x4002",
+      "entry": "0x4000",
+      "name": "sym.r2",
+      "size": 2
+    },
+    {
+      "body": "0x00004010      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [{"end":"0x4012","isa":"thumb","start":"0x4010"}],
+      "end": "0x4012",
+      "entry": "0x4010",
+      "name": "sym.rizin",
+      "size": 2
+    }
+  ]
+}"#;
+
+    const TERMINAL_V2_ARTIFACT: &str = r#"{
+  "format": "pixel-modem-extractor-thumb-functions-v2",
+  "functions": [
+    {
+      "body": "0x00004000      7047      bx lr\n",
+      "body_kind": "thumb_disassembly",
+      "data_refs": [],
+      "decode_range_errors": [],
+      "decode_ranges": [
+        {
+          "end": "0x4002",
+          "isa": "thumb",
+          "start": "0x4000"
+        }
+      ],
+      "end": "0x4002",
+      "entry": "0x4000",
+      "name": "sym.thumb",
+      "size": 2
+    }
+  ]
+}"#;
+
+    fn terminal_radare2_identity() -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Radare2,
+            executable: "/usr/bin/r2".into(),
+            version: "radare2 test 1.0".into(),
+            command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+        }
+    }
+
+    fn terminal_rizin_identity() -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer: crate::thumb_analysis::ThumbProducer::Rizin,
+            executable: "/usr/bin/rizin".into(),
+            version: "rizin test 1.0".into(),
+            command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
+        }
+    }
+
+    fn terminal_thumb_summary() -> crate::thumb_analysis::ThumbAnalysisSummary {
+        crate::thumb_analysis::ThumbAnalysisSummary {
+            regions_requested: 1,
+            regions_succeeded: 1,
+            regions_failed: 0,
+            radare2_runs: 1,
+            rizin_runs: 0,
+            raw: 1,
+            substantial: 0,
+            accepted: 1,
+            quarantined: 0,
+        }
+    }
+
+    fn terminal_inventory_for_artifact(artifact: &str) -> TerminalInventorySummary {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("functions.json");
+        let thumb = root.path().join("thumb_functions.json");
+        std::fs::write(&ghidra, b"[]").unwrap();
+        std::fs::write(&thumb, artifact).unwrap();
+        validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x20, Some(0), None).unwrap()
+    }
+
+    fn currentness_error(
+        artifact: &str,
+        identity: &crate::thumb_analysis::ProducerIdentity,
+        summary: &crate::thumb_analysis::ThumbAnalysisSummary,
+    ) -> String {
+        currentness_error_for_terminal(
+            &terminal_inventory_for_artifact(artifact),
+            identity,
+            &[(0x4000, 0x10)],
+            summary,
+        )
+    }
+
+    fn currentness_error_for_terminal(
+        terminal: &TerminalInventorySummary,
+        identity: &crate::thumb_analysis::ProducerIdentity,
+        regions: &[(u32, u32)],
+        summary: &crate::thumb_analysis::ThumbAnalysisSummary,
+    ) -> String {
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: identity.clone(),
+            rizin: None,
+        };
+        validate_thumb_analysis_currentness(terminal, &tools, regions, summary)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_matching_v2_when_current_run_requires_v3() {
+        assert_eq!(
+            currentness_error(
+                TERMINAL_V2_ARTIFACT,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb artifact format mismatch: expected pixel-modem-extractor-thumb-functions-v3, found pixel-modem-extractor-thumb-functions-v2"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_compares_complete_radare2_identity() {
+        let expected = terminal_radare2_identity();
+        let summary = terminal_thumb_summary();
+        let cases = [
+            (
+                TERMINAL_V3_ARTIFACT.to_owned(),
+                crate::thumb_analysis::ProducerIdentity {
+                    producer: crate::thumb_analysis::ThumbProducer::Rizin,
+                    ..expected.clone()
+                },
+                "serialize: current Thumb producer identity mismatch: expected rizin, found radare2",
+            ),
+            (
+                TERMINAL_V3_ARTIFACT.replacen("/usr/bin/r2", "/opt/r2", 1),
+                expected.clone(),
+                "serialize: current Thumb radare2 executable mismatch: expected /usr/bin/r2, found /opt/r2",
+            ),
+            (
+                TERMINAL_V3_ARTIFACT.replacen("radare2 test 1.0", "radare2 stale 0.9", 1),
+                expected.clone(),
+                "serialize: current Thumb radare2 version mismatch: expected \"radare2 test 1.0\", found \"radare2 stale 0.9\"",
+            ),
+            (
+                TERMINAL_V3_ARTIFACT.to_owned(),
+                crate::thumb_analysis::ProducerIdentity {
+                    command: crate::thumb_analysis::ThumbProducer::Rizin.command(),
+                    ..expected
+                },
+                "serialize: current Thumb radare2 command mismatch: expected \"aaa;aflj;pdfj @@F;axlj\", found \"aaa;aflj;pdfj @@f\"",
+            ),
+        ];
+
+        for (artifact, expected, message) in cases {
+            assert_eq!(currentness_error(&artifact, &expected, &summary), message);
+        }
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_accepts_exact_mixed_producer_ownership() {
+        let terminal = terminal_inventory_for_artifact(TERMINAL_MIXED_V3_ARTIFACT);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: terminal_radare2_identity(),
+            rizin: Some(terminal_rizin_identity()),
+        };
+        let summary = crate::thumb_analysis::ThumbAnalysisSummary {
+            regions_requested: 2,
+            regions_succeeded: 2,
+            regions_failed: 0,
+            radare2_runs: 1,
+            rizin_runs: 1,
+            raw: 2,
+            substantial: 0,
+            accepted: 2,
+            quarantined: 0,
+        };
+
+        validate_thumb_analysis_currentness(
+            &terminal,
+            &tools,
+            &[(0x4000, 2), (0x4010, 2)],
+            &summary,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_stale_rizin_identity() {
+        let stale = TERMINAL_MIXED_V3_ARTIFACT.replacen("rizin test 1.0", "rizin stale 0.9", 1);
+        let terminal = terminal_inventory_for_artifact(&stale);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: terminal_radare2_identity(),
+            rizin: Some(terminal_rizin_identity()),
+        };
+        let summary = crate::thumb_analysis::ThumbAnalysisSummary {
+            regions_requested: 2,
+            regions_succeeded: 2,
+            regions_failed: 0,
+            radare2_runs: 1,
+            rizin_runs: 1,
+            raw: 2,
+            substantial: 0,
+            accepted: 2,
+            quarantined: 0,
+        };
+
+        let error = validate_thumb_analysis_currentness(
+            &terminal,
+            &tools,
+            &[(0x4000, 2), (0x4010, 2)],
+            &summary,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "serialize: current Thumb rizin version mismatch: expected \"rizin test 1.0\", found \"rizin stale 0.9\""
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_compares_every_thumb_summary_field() {
+        let expected = terminal_thumb_summary();
+        let cases = [
+            ("regions_requested", 1, 2),
+            ("regions_succeeded", 1, 0),
+            ("regions_failed", 0, 1),
+            ("radare2_runs", 1, 0),
+            ("rizin_runs", 0, 1),
+            ("raw", 1, 2),
+            ("substantial", 0, 1),
+            ("accepted", 1, 0),
+            ("quarantined", 0, 1),
+        ];
+
+        for (field, expected_value, found_value) in cases {
+            let mut terminal = terminal_inventory_for_artifact(TERMINAL_V3_ARTIFACT);
+            let observed = &mut terminal.thumb_metadata.as_mut().unwrap().summary;
+            match field {
+                "regions_requested" => observed.regions_requested = found_value,
+                "regions_succeeded" => observed.regions_succeeded = found_value,
+                "regions_failed" => observed.regions_failed = found_value,
+                "radare2_runs" => observed.radare2_runs = found_value,
+                "rizin_runs" => observed.rizin_runs = found_value,
+                "raw" => observed.raw = found_value,
+                "substantial" => observed.substantial = found_value,
+                "accepted" => observed.accepted = found_value,
+                "quarantined" => observed.quarantined = found_value,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                currentness_error_for_terminal(
+                    &terminal,
+                    &terminal_radare2_identity(),
+                    &[(0x4000, 0x10)],
+                    &expected
+                ),
+                format!(
+                    "serialize: current Thumb {field} mismatch: expected {expected_value}, found {found_value}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_stale_region_counts_and_ledger_shape() {
+        let extra_failed_region = TERMINAL_V3_ARTIFACT.replacen(
+            "      ]\n    }\n  ],\n  \"functions\"",
+            "      ]\n    },\n    {\n      \"start\": \"0x4010\",\n      \"end\": \"0x4020\",\n      \"attempts\": [\n        {\n          \"producer\": \"radare2\",\n          \"status\": \"failed\",\n          \"stdout\": null,\n          \"error\": \"stale failed attempt\"\n        }\n      ],\n      \"function_runs\": []\n    }\n  ],\n  \"functions\"",
+            1,
+        );
+        assert_eq!(
+            currentness_error(
+                &extra_failed_region,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb regions_requested mismatch: expected 1, found 2"
+        );
+
+        let changed_region =
+            TERMINAL_V3_ARTIFACT.replacen("\"end\": \"0x4010\"", "\"end\": \"0x4018\"", 1);
+        assert_eq!(
+            currentness_error(
+                &changed_region,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb region ledger mismatch: expected [(0x4000, 0x4010)], found [(0x4000, 0x4018)]"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_rejects_rizin_configuration_with_matching_totals() {
+        let with_rizin = TERMINAL_V3_ARTIFACT
+            .replacen(
+                "    }\n  ],\n  \"regions\"",
+                "    },\n    {\n      \"id\": \"rizin\",\n      \"executable\": \"/usr/bin/rizin\",\n      \"version\": \"rizin test 1.0\",\n      \"command\": \"aaa;aflj;pdfj @@F;axlj\"\n    }\n  ],\n  \"regions\"",
+                1,
+            )
+            .replacen(
+                "          \"error\": null\n        }\n      ],",
+                "          \"error\": null\n        },\n        {\n          \"producer\": \"rizin\",\n          \"status\": \"failed\",\n          \"stdout\": null,\n          \"error\": \"stale fallback attempt\"\n        }\n      ],",
+                1,
+            );
+        assert_eq!(
+            currentness_error(
+                &with_rizin,
+                &terminal_radare2_identity(),
+                &terminal_thumb_summary(),
+            ),
+            "serialize: current Thumb producer configuration mismatch: expected exactly [radare2], found [radare2, rizin]"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_currentness_accepts_matching_v3_provenance_and_summary() {
+        validate_thumb_analysis_currentness(
+            &terminal_inventory_for_artifact(TERMINAL_V3_ARTIFACT),
+            &crate::thumb_analysis::ThumbTools {
+                radare2: terminal_radare2_identity(),
+                rizin: None,
+            },
+            &[(0x4000, 0x10)],
+            &terminal_thumb_summary(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn run_report_without_run_has_spec_and_empty_images() {
         let buf = craft_modem_bin(&[
@@ -3545,6 +4924,7 @@ mod tests {
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         };
@@ -3706,6 +5086,11 @@ mod tests {
                 outcome: ImageOutcome::Analyzed(12),
                 classification: Some("not_opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -3713,6 +5098,7 @@ mod tests {
                 image_start: 0,
                 image_len: 0,
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -3737,7 +5123,386 @@ mod tests {
         let err = report_failure(&report).expect("thumb error should fail standalone run");
         assert_eq!(
             err.to_string(),
-            "decompose incomplete: radare2 failed on 02_MAIN: radare2 parser rejected empty stdout"
+            "decompose incomplete: Thumb analysis failed on 02_MAIN: radare2 parser rejected empty stdout"
+        );
+    }
+
+    #[test]
+    fn disabled_rizin_fallback_skips_discovery() {
+        let identity = discover_configured_rizin(false, || -> Result<_> {
+            panic!("disabled Rizin fallback must not run discovery")
+        })
+        .unwrap();
+
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn enabled_rizin_fallback_propagates_discovery_failure() {
+        let error = discover_configured_rizin(true, || {
+            Err(Error::ToolNotFound("configured Rizin is unusable".into()))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, Error::ToolNotFound(reason) if reason == "configured Rizin is unusable")
+        );
+    }
+
+    #[test]
+    fn run_report_discovers_each_configured_thumb_tool_once_before_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.rizin_fallback = true;
+        let radare2_calls = std::cell::Cell::new(0);
+        let rizin_calls = std::cell::Cell::new(0);
+
+        let error = run_report_with_discovery(
+            &dir.path().join("missing-modem.bin"),
+            &opts,
+            &out,
+            || {
+                radare2_calls.set(radare2_calls.get() + 1);
+                Ok(test_identity(
+                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    "/tools/r2",
+                    "radare2 exact",
+                ))
+            },
+            || {
+                rizin_calls.set(rizin_calls.get() + 1);
+                Ok(test_identity(
+                    crate::thumb_analysis::ThumbProducer::Rizin,
+                    "/tools/rizin",
+                    "rizin exact",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Io(_)));
+        assert_eq!(radare2_calls.get(), 1);
+        assert_eq!(rizin_calls.get(), 1);
+        assert!(!out.exists());
+    }
+
+    /// radare2 is the required primary for `--run`, so a discovery failure is a
+    /// hard preflight: no Rizin probe, no Ghidra work, no output tree, and no
+    /// chance of a "successful" run that simply found no dense region.
+    #[cfg(unix)]
+    #[test]
+    fn missing_radare2_fails_preflight_before_rizin_ghidra_or_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.rizin_fallback = true;
+        opts.ghidra_home = Some(ghidra_home.clone());
+        let rizin_calls = std::cell::Cell::new(0);
+
+        let error = run_report_with_discovery(
+            &modem,
+            &opts,
+            &out,
+            || Err(Error::ToolNotFound("radare2 (r2) not found on PATH".into())),
+            || {
+                rizin_calls.set(rizin_calls.get() + 1);
+                Ok(test_identity(
+                    crate::thumb_analysis::ThumbProducer::Rizin,
+                    "/tools/rizin",
+                    "rizin exact",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::ToolNotFound(reason) if reason.contains("radare2")),
+            "{error}"
+        );
+        assert_eq!(rizin_calls.get(), 0, "Rizin was discovered without radare2");
+        // The whole output tree — image slices, the import kit, and Ghidra's
+        // export root — lives under `out`, so its absence proves nothing ran.
+        assert!(!out.exists(), "preflight failure mutated the output tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_thumb_tools_reach_analysis_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_thumb_decompile = true;
+        opts.rizin_fallback = true;
+        opts.no_skip_opaque = true;
+        let mut expected = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/preflight/r2",
+                "radare2 preflight",
+            ),
+            rizin: Some(test_identity(
+                crate::thumb_analysis::ThumbProducer::Rizin,
+                "/preflight/rizin",
+                "rizin preflight",
+            )),
+        };
+        expected.radare2.command = "radare2 preflight command";
+        expected.rizin.as_mut().unwrap().command = "rizin preflight command";
+        let observed = std::cell::RefCell::new(Vec::new());
+
+        let report = run_report_with_thumb_tools_and_analyzer(
+            &modem,
+            &opts,
+            &out,
+            &expected,
+            |tools, _, _, _, _| {
+                observed.borrow_mut().push(tools.clone());
+                Err(Error::Serialize("captured injected ThumbTools".into()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed.into_inner(), vec![expected]);
+        assert_eq!(
+            report.images[0].thumb_error.as_deref(),
+            Some("serialize: captured injected ThumbTools")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_radare2_route_emits_strict_v3_and_all_region_failure_preserves_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_thumb_decompile = true;
+        opts.no_skip_opaque = true;
+
+        let radare2 = dir.path().join("tools/r2-success");
+        write_fake_radare2(&radare2, true);
+        let radare2 = std::fs::canonicalize(radare2).unwrap();
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: radare2.clone(),
+                version: "radare2 route fixture 1.0".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let out = dir.path().join("success");
+
+        let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools).unwrap();
+        let image_result = &report.images[0];
+        assert_eq!(image_result.thumb_functions, Some(0));
+        assert_eq!(image_result.thumb_regions_requested, Some(1));
+        assert_eq!(image_result.thumb_regions_succeeded, Some(1));
+        assert_eq!(image_result.thumb_regions_failed, Some(0));
+        assert_eq!(image_result.thumb_radare2_runs, Some(1));
+        assert_eq!(image_result.thumb_rizin_runs, Some(0));
+        assert_eq!(image_result.thumb_execution_accepted, Some(1));
+        assert_eq!(image_result.thumb_execution_quarantined, Some(0));
+        assert!(image_result.thumb_error.is_none());
+
+        let export = out.join("export/02_MAIN");
+        let sidecar = export.join("thumb_functions.json");
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&sidecar_bytes).unwrap();
+        assert_eq!(
+            artifact["format"],
+            "pixel-modem-extractor-thumb-functions-v3"
+        );
+        assert_eq!(artifact.as_object().unwrap().len(), 4);
+        assert_eq!(
+            artifact["producers"],
+            serde_json::json!([{
+                "id": "radare2",
+                "executable": radare2.display().to_string(),
+                "version": "radare2 route fixture 1.0",
+                "command": "aaa;aflj;pdfj @@f"
+            }])
+        );
+        assert_eq!(artifact["regions"].as_array().unwrap().len(), 1);
+        let region = &artifact["regions"][0];
+        assert_eq!(region["start"], "0x40010000");
+        assert_eq!(region["end"], "0x40190000");
+        assert_eq!(region["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(region["attempts"][0]["producer"], "radare2");
+        assert_eq!(region["attempts"][0]["status"], "succeeded");
+        assert!(region["attempts"][0]["error"].is_null());
+        let capture = &region["attempts"][0]["stdout"];
+        assert_eq!(capture["path"], "thumb/40010000.radare2.stdout");
+        let capture_bytes = std::fs::read(export.join(capture["path"].as_str().unwrap())).unwrap();
+        assert_eq!(capture["bytes"], capture_bytes.len() as u64);
+        assert_eq!(
+            capture["blake3"],
+            crate::manifest::blake3_bytes(&capture_bytes)
+        );
+        assert_eq!(
+            region["function_runs"],
+            serde_json::json!([{
+                "producer": "radare2",
+                "first_function": 0,
+                "function_count": 1,
+                "substantial": 0,
+                "accepted": 1,
+                "quarantined": 0
+            }])
+        );
+        assert_eq!(artifact["functions"].as_array().unwrap().len(), 1);
+
+        let failing_radare2 = dir.path().join("tools/r2-failure");
+        write_fake_radare2(&failing_radare2, false);
+        let failing_tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: std::fs::canonicalize(failing_radare2).unwrap(),
+                version: "radare2 route fixture failure".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let fresh_failure_out = dir.path().join("fresh-failure");
+        let failed =
+            run_report_with_thumb_tools(&modem, &opts, &fresh_failure_out, &failing_tools).unwrap();
+        assert!(
+            failed.images[0]
+                .thumb_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed for every requested region"))
+        );
+        assert!(
+            !fresh_failure_out
+                .join("export/02_MAIN/thumb_functions.json")
+                .exists()
+        );
+
+        // Rerunning over a tree that still holds the prior sidecar: Ghidra
+        // succeeds, the Thumb stage fails every region, and terminal validation
+        // rejects the retained sidecar as not current. That is a Thumb/terminal
+        // failure, never "Ghidra failed" with a fabricated `exit: -1`.
+        let before = std::fs::read(&sidecar).unwrap();
+        let failed = run_report_with_thumb_tools(&modem, &opts, &out, &failing_tools).unwrap();
+        let stale = &failed.images[0];
+        assert!(matches!(stale.outcome, ImageOutcome::TerminalInvalid));
+        assert!(
+            stale
+                .terminal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("without a current producer result")),
+            "{:?}",
+            stale.terminal_error
+        );
+        // The all-region failure stays the reported root cause.
+        assert!(
+            stale
+                .thumb_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed for every requested region"))
+        );
+        assert!(
+            matches!(
+                report_failure(&failed),
+                Some(Error::DecomposeIncomplete(ref reason))
+                    if reason.contains("Thumb analysis failed")
+            ),
+            "{:?}",
+            report_failure(&failed)
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
+    /// A current-run v3 ledger that disagrees with the retained sidecar is a
+    /// Thumb/terminal failure with an actionable reason, not `exit: -1` from a
+    /// Ghidra run that in fact succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn post_analysis_currentness_mismatch_is_terminal_not_a_ghidra_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_thumb_decompile = true;
+        opts.no_skip_opaque = true;
+        let radare2 = dir.path().join("tools/r2-success");
+        write_fake_radare2(&radare2, true);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: std::fs::canonicalize(radare2).unwrap(),
+                version: "radare2 currentness fixture".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let out = dir.path().join("mismatch");
+
+        let report = run_report_with_thumb_tools_and_analyzer(
+            &modem,
+            &opts,
+            &out,
+            &tools,
+            |tools, image, load_addr, regions, out_dir| {
+                // Produce a real v3 sidecar, then report a run ledger that
+                // claims one more radare2 run than the artifact records.
+                let mut summary = crate::thumb_analysis::run_thumb_analysis(
+                    tools, image, load_addr, regions, out_dir,
+                )?;
+                summary.radare2_runs += 1;
+                Ok(summary)
+            },
+        )
+        .unwrap();
+
+        let mismatched = &report.images[0];
+        assert!(matches!(mismatched.outcome, ImageOutcome::TerminalInvalid));
+        assert!(
+            mismatched
+                .terminal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("radare2_runs")),
+            "{:?}",
+            mismatched.terminal_error
+        );
+        assert_eq!(
+            mismatched.thumb_error.as_deref(),
+            mismatched.terminal_error.as_deref(),
+            "a Thumb-stage rejection must populate thumb_error"
+        );
+        assert!(
+            matches!(
+                report_failure(&report),
+                Some(Error::DecomposeIncomplete(ref reason))
+                    if reason.contains("Thumb analysis failed")
+            ),
+            "{:?}",
+            report_failure(&report)
         );
     }
 
@@ -3771,7 +5536,7 @@ mod tests {
         // A SkippedOpaque RunResult is a successful outcome: report_failure
         // must return None, so `decompile --run --image 01_PSP` exits 0 and
         // no export/<label>/ expectations are validated for it (the skip
-        // branch returns before any Ghidra/radare2 spawn; exhaustive match
+        // branch returns before any Ghidra/Thumb-analyzer spawn; exhaustive match
         // sites are enforced by compiling).
         let report = DecompileReport {
             images: vec![ImageResult {
@@ -3781,6 +5546,11 @@ mod tests {
                 )),
                 classification: Some("opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -3788,6 +5558,7 @@ mod tests {
                 image_start: 0,
                 image_len: 0,
                 thumb_error: None,
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -3819,6 +5590,11 @@ mod tests {
                 outcome: ImageOutcome::Analyzed(12),
                 classification: Some("not_opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -3829,6 +5605,7 @@ mod tests {
                     "1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
                         .into(),
                 ),
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -3853,7 +5630,7 @@ mod tests {
         let err = report_failure(&report).expect("thumb error should fail standalone run");
         assert_eq!(
             err.to_string(),
-            "decompose incomplete: radare2 failed on 02_MAIN: 1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
+            "decompose incomplete: Thumb analysis failed on 02_MAIN: 1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
         );
     }
 
@@ -3864,6 +5641,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(10),
             classification: Some("not_opaque"),
             thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -3871,6 +5653,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -3909,6 +5692,7 @@ mod tests {
             ghidra_home: None,
             processor: "ARM:LE:32:v7".into(),
             no_thumb_decompile: false,
+            rizin_fallback: false,
             tighten_wall_clock_budget_override: None,
             no_skip_opaque: false,
         };
@@ -4325,5 +6109,472 @@ mod tests {
             "raw injection payload leaked unquoted in:\n{sh}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pme_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn thumb_enrich_preserves_v3_provenance() {
+        let root = temp_dir("thumb_enrich_v3_provenance");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n  return;\n}\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        std::fs::write(&thumb_path, original).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(original).unwrap();
+
+        assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
+        let rewritten_bytes = std::fs::read(&thumb_path).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
+        assert_eq!(after["format"], before["format"]);
+        assert_eq!(after["producers"], before["producers"]);
+        assert_eq!(after["regions"], before["regions"]);
+        assert_eq!(
+            after["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|function| function["entry"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["0x4000", "0x4040"]
+        );
+        let mut before_function = before["functions"][0].clone();
+        let mut after_function = after["functions"][0].clone();
+        before_function.as_object_mut().unwrap().remove("body_c");
+        let body_c = after_function
+            .as_object_mut()
+            .unwrap()
+            .remove("body_c")
+            .unwrap();
+        assert!(body_c.as_str().unwrap().contains("FUN_4000"));
+        assert_eq!(after_function, before_function);
+        assert_eq!(after["functions"][1], before["functions"][1]);
+    }
+
+    #[test]
+    fn thumb_enrich_v3_noop_is_byte_identical() {
+        let root = temp_dir("thumb_enrich_v3_noop");
+        let body = "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n}\n";
+        let c_path = root.join("decompiled.c");
+        std::fs::write(&c_path, body).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        )
+        .unwrap();
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path, None).unwrap();
+        artifact.function_values_mut()[0]["body_c"] = serde_json::json!(body);
+        artifact.write_atomic(&thumb_path).unwrap();
+        let before = std::fs::read(&thumb_path).unwrap();
+
+        assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
+        assert_eq!(std::fs::read(&thumb_path).unwrap(), before);
+    }
+
+    #[test]
+    fn thumb_enrich_populates_body_c_for_matching_entry() {
+        let root = temp_dir("thumb_enrich_match");
+        let c_path = root.join("decompiled.c");
+        // ExportDecomp.java emits "// <name> @ <addr>\n<C>\n\n" per function.
+        // Ghidra's pre-pass-2 names are `FUN_<addr>`; here the entry-address
+        // (00040e1200, even form) is what thumb_enrich matches by.
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(int a)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v1",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []},
+                {"entry": "0x40efffc", "name": "thumb_40efffc", "size": 4,
+                 "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []}
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1, "exactly one function matched by address");
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert_eq!(v["format"], "pixel-modem-extractor-thumb-functions-v2");
+        assert!(v["functions"][0]["body_c"].is_string());
+        assert!(
+            v["functions"][0]["body_c"]
+                .as_str()
+                .unwrap()
+                .contains("FUN_40e1200"),
+            "body_c is the Ghidra C body (pre-pass-2 form): {}",
+            v["functions"][0]["body_c"]
+        );
+        assert!(
+            v["functions"][1].get("body_c").is_none(),
+            "no address match -> no body_c"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_handles_real_exportdecomp_format_with_two_blank_lines() {
+        // Regression sentinel: real ExportDecomp.java output has TWO blank lines
+        // between the `// FUN_<addr> @ <addr>` comment header and the opening `{`
+        // (one after the header, one after the signature). The original
+        // parser used 1–2 line lookahead for `{`, which worked on synthetic
+        // fixtures (1 blank line) but matched 0 bodies on real production output.
+        let root = temp_dir("thumb_enrich_real_format");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(int a)\n\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "real ExportDecomp format (2 blank lines between header and `{{`) must match"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_handles_real_exportdecomp_offset_6_multiline_sig() {
+        // Regression sentinel for the second peak in real ExportDecomp.java's
+        // header-to-`{` offset distribution: 2-line signatures produce
+        // offset-6 headers (header, blank, sig-line-1, sig-line-2, blank, `{`).
+        // Captured by histogram analysis on production 02_MAIN.
+        let root = temp_dir("thumb_enrich_real_offset_6");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(\n    int a,\n    int b)\n\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "real ExportDecomp format with 2-line signature (offset-6 header) must match"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_populates_body_c_with_tbit_set() {
+        let root = temp_dir("thumb_enrich_tbit");
+        let c_path = root.join("decompiled.c");
+        // Ghidra emits Thumb entry points with the T-bit set (odd address).
+        // radare2's matching `entry` is the even form. Phase 2.1's normalization
+        // clears the low bit on both sides so they agree.
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1201\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(
+            n, 1,
+            "T-bit normalization: 40e1201 (Ghidra) matches 40e1200 (radare2)"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        assert!(v["functions"][0]["body_c"].is_string());
+    }
+
+    #[test]
+    fn thumb_enrich_zero_matches_leaves_file_unchanged() {
+        let root = temp_dir("thumb_enrich_no_match");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_deadbeef @ 00deadbeef\nvoid FUN_deadbeef(void)\n{\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{
+            "format": "pixel-modem-extractor-thumb-functions-v1",
+            "functions": [
+                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
+                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []}
+            ]
+        }"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 0);
+        // File is byte-identical (format stays v1 because no body_c was populated).
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+    }
+
+    #[test]
+    fn thumb_enrich_is_idempotent() {
+        let root = temp_dir("thumb_enrich_idem");
+        let c_path = root.join("decompiled.c");
+        std::fs::write(
+            &c_path,
+            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+        )
+        .unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_first = std::fs::read_to_string(&thumb_path).unwrap();
+        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let after_second = std::fs::read_to_string(&thumb_path).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "second run is a no-op on the same inputs"
+        );
+    }
+
+    #[test]
+    fn thumb_enrich_fail_closed_on_malformed_decompiled_c() {
+        let root = temp_dir("thumb_enrich_bad_c");
+        let c_path = root.join("decompiled.c");
+        // Not valid UTF-8.
+        std::fs::write(&c_path, [0xff, 0xfe, 0xfd, 0xfc]).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        let original = r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[]}"#;
+        std::fs::write(&thumb_path, original).unwrap();
+
+        let err = thumb_enrich(&c_path, &thumb_path).unwrap_err();
+        // The on-disk JSON is unchanged.
+        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+        // Surfaced as a typed error (any variant — just confirm it's not silent).
+        let _ = format!("{err}");
+    }
+
+    #[test]
+    fn thumb_enrich_brace_in_string_does_not_truncate_body() {
+        // A `}` inside a C string literal must NOT be counted as a closing brace.
+        // Before the string-aware counter, this truncated `body_c` at the first
+        // in-string `}`. Block and line comments are exercised too.
+        let root = temp_dir("thumb_enrich_brace_in_string");
+        let c_path = root.join("decompiled.c");
+        let c = "// FUN_40e1300 @ 00040e1300\n\
+                 void FUN_40e1300(void)\n\
+                 {\n\
+                 \x20 const char *s = \"expected } close\";\n\
+                 \x20 /* block comment with } brace */\n\
+                 \x20 // line comment with } brace\n\
+                 \x20 helper_call();\n\
+                 \x20 return;\n\
+                 }\n\n";
+        std::fs::write(&c_path, c).unwrap();
+        let thumb_path = root.join("thumb_functions.json");
+        std::fs::write(
+            &thumb_path,
+            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
+            {"entry":"0x40e1300","name":"thumb_40e1300","size":4,
+             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
+        )
+        .unwrap();
+
+        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        assert_eq!(n, 1);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
+        let body_c = v["functions"][0]["body_c"].as_str().unwrap();
+        assert!(
+            body_c.contains("helper_call"),
+            "body_c was truncated by an in-string/comment brace:\n{body_c}"
+        );
+        assert!(body_c.contains("expected } close"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_does_not_treat_char_literal_brace_as_body_end() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char c = '}';\n\
+  helper();\n\
+}\n\
+// FUN_20 @ 00000020\n\
+void FUN_20(void)\n\
+{\n\
+  return;\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        // Keys are normalize_thumb_addr output (strip leading zeros, clear T-bit).
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("helper();"), "{body}");
+        assert!(!body.contains("FUN_20"), "{body}");
+        assert!(bodies.contains_key("20"));
+    }
+
+    #[test]
+    fn parse_decompiled_c_tracks_escaped_char_literals() {
+        let text = "\
+// FUN_10 @ 00000010\n\
+void FUN_10(void)\n\
+{\n\
+  char q = '\\'';\n\
+  char b = '}';\n\
+  done();\n\
+}\n";
+        let bodies = parse_decompiled_c_function_bodies_by_addr(text);
+        let body = bodies.get("10").expect("entry 0x10");
+        assert!(body.contains("done();"), "{body}");
+        assert!(
+            body.ends_with("}\n") || body.trim_end().ends_with('}'),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn streaming_decompiled_c_body_collection_matches_whole_oracle() {
+        let fixtures = [
+            "\n\n// FUN_100 @ 0x100\nvoid FUN_100(void)\n{\n  return;\n}\n\n",
+            "\n\n// FUN_200 @ 0x200\nvoid FUN_200(\n    int a)\n{\n  a;\n}\n",
+            "// f @ 40e1201\nvoid f(void)\n{\n  x;\n}\n",
+            "// f @ 0x00040e1200\nint f(void)\n{\n  return \"}{\"[0];\n}\n",
+            "// g @ 0x300\nvoid g(void);\n\n\n\n\n\n\n\n\n{\n}\n",
+            "// a @ 0x10\nvoid a(void)\n{\n}\n// b @ 0x20\nvoid b(void)\n{\n}\n",
+            "// h @ 0x40\nvoid h(\n   int a,\n   int b,\n   int c,\n   int d,\n   int e)\n{\n}\n",
+            "",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (index, text) in fixtures.iter().enumerate() {
+            let path = dir.path().join(format!("fixture-{index}.c"));
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                collect_decompiled_c_bodies(&path).unwrap(),
+                parse_decompiled_c_function_bodies_by_addr(text),
+                "fixture {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_thumb_enrich_matches_whole_oracle_for_legacy_and_v3() {
+        let c = "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n  return;\n}\n";
+        let inputs: [&[u8]; 2] = [
+            br#"{
+  "format": "pixel-modem-extractor-thumb-functions-v2",
+  "functions": [
+    {"entry":"0x4000","name":"thumb_4000","size":4,"body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}
+  ]
+}"#,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        ];
+        for (index, input) in inputs.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let c_path = dir.path().join("decompiled.c");
+            let streaming = dir.path().join("streaming.json");
+            let oracle = dir.path().join("oracle.json");
+            std::fs::write(&c_path, c).unwrap();
+            std::fs::write(&streaming, input).unwrap();
+            std::fs::write(&oracle, input).unwrap();
+
+            let streaming_count = thumb_enrich(&c_path, &streaming).unwrap();
+            let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
+
+            assert_eq!(streaming_count, oracle_count, "fixture {index} count");
+            assert_eq!(
+                std::fs::read(&streaming).unwrap(),
+                std::fs::read(&oracle).unwrap(),
+                "fixture {index} bytes"
+            );
+        }
+    }
+
+    /// Production-scale differential replay. The retained tree is read-only;
+    /// both enrichers operate on disposable copies outside the tree.
+    #[test]
+    fn streaming_enrich_ab_matches_oracle_on_production_inputs() {
+        let Ok(root) = std::env::var("PME_GOLDEN_DIR") else {
+            return;
+        };
+        let images = Path::new(&root).join("images");
+        let Some(main_dir) = std::fs::read_dir(&images)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("decompiled"))
+            .find(|dir| {
+                dir.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.to_string_lossy().ends_with("_MAIN"))
+                    && dir.join("decompiled.c").is_file()
+                    && dir.join("thumb_functions.json").is_file()
+            })
+        else {
+            return;
+        };
+        let c_path = main_dir.join("decompiled.c");
+        let source = main_dir.join("thumb_functions.json");
+        let work = tempfile::tempdir().unwrap();
+        let streaming = work.path().join("streaming.json");
+        let oracle = work.path().join("oracle.json");
+        std::fs::copy(&source, &streaming).unwrap();
+        std::fs::copy(&source, &oracle).unwrap();
+
+        let streaming_count = thumb_enrich(&c_path, &streaming).unwrap();
+        let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
+
+        assert_eq!(streaming_count, oracle_count);
+        assert!(streaming_count > 0, "production replay enriched no records");
+        assert_eq!(
+            std::fs::metadata(&streaming).unwrap().len(),
+            std::fs::metadata(&oracle).unwrap().len()
+        );
+        assert_eq!(
+            crate::manifest::blake3_file(&streaming).unwrap(),
+            crate::manifest::blake3_file(&oracle).unwrap()
+        );
     }
 }

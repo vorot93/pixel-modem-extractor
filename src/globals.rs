@@ -146,16 +146,28 @@ pub struct FunctionEvidenceNameProjection {
 }
 
 impl FunctionEvidenceNameProjection {
+    /// Each symbol projects only into its own ISA. A `Symbol` describes one
+    /// function record, so an ARM entry and a Thumb entry that happen to share
+    /// an address must not name each other.
     pub fn from_symbols(symbols: &[symbolicate::Symbol]) -> Self {
         let mut projection = Self::default();
         for symbol in symbols {
             let Some(address) = parse_numeric_symbol_address(&symbol.address) else {
                 continue;
             };
-            if let Some(name) = &symbol.name {
-                projection.arm.insert(address, name.clone());
+            match symbol.arch {
+                "arm" => {
+                    if let Some(name) = &symbol.name {
+                        projection.arm.insert(address, name.clone());
+                    }
+                }
+                // Thumb records the absence of a name too: an entry present
+                // with `None` is a known function the writer left unnamed.
+                "thumb" => {
+                    projection.thumb.insert(address, symbol.name.clone());
+                }
+                _ => {}
             }
-            projection.thumb.insert(address, symbol.name.clone());
         }
         projection
     }
@@ -421,16 +433,23 @@ pub fn run_with_evidence_projection(
 
     let thumb_path = decompiled.join("thumb_functions.json");
     if thumb_path.exists() {
-        let thumb_text = std::fs::read_to_string(&thumb_path)?;
-        let thumb_v: serde_json::Value = serde_json::from_str(&thumb_text)
-            .map_err(|e| Error::Serialize(format!("parse thumb_functions.json: {e}")))?;
-        if let Some(arr) = thumb_v.get("functions").and_then(|f| f.as_array()) {
-            for f in arr {
-                if let Some(parsed) =
-                    parse_function(f, Arch::Thumb, recovered_function_names, evidence_names)
-                {
-                    all_funcs.push(parsed);
-                }
+        // The raw image is loaded above, so v3 region bounds and function
+        // envelopes are validated against the image they describe.
+        let mapped = crate::thumb_analysis::MappedImage::new(
+            u32::try_from(load_addr)
+                .map_err(|_| Error::Serialize("globals: load_addr does not fit u32".into()))?,
+            u32::try_from(image_bytes.len())
+                .map_err(|_| Error::Serialize("globals: image length does not fit u32".into()))?,
+        )?;
+        let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path, Some(mapped))?;
+        for function in thumb_artifact.function_values() {
+            if let Some(parsed) = parse_function(
+                function,
+                Arch::Thumb,
+                recovered_function_names,
+                evidence_names,
+            ) {
+                all_funcs.push(parsed);
             }
         }
     }
@@ -538,8 +557,8 @@ pub fn run_with_evidence_projection(
             continue;
         }
         // Per-function disasm slice. ARM: slice disasm.lst by [entry, end).
-        // Thumb: the per-function `body` field from thumb_functions.json
-        // (radare2 pdfj output — different format from disasm.lst; do NOT
+        // Thumb: the canonical per-function `body` field from thumb_functions.json
+        // (adapted analyzer output — different format from disasm.lst; do NOT
         // re-slice disasm.lst for Thumb).
         let (disasm_slice, k) = match f.arch {
             Arch::Arm => (disasm_index.slice_for(f.entry, f.end), opts.k_arm),
@@ -856,7 +875,7 @@ struct Function {
     recovered_name: Option<String>,
     data_refs: Vec<u64>,
     /// Thumb only: the per-function disassembly body from
-    /// `thumb_functions.json`'s `body` field (radare2 pdfj output). `None`
+    /// `thumb_functions.json`'s canonical `body` field (adapted analyzer output). `None`
     /// for ARM — ARM slices `disasm.lst` by `[entry, end)` at processing
     /// time (Ghidra's full-image disasm, different format from Thumb's
     /// per-function body).
@@ -958,8 +977,8 @@ struct Contributor {
 /// silently switch metrics — `recovered_tier_requires_disasm_proximity_within_k`
 /// is the regression sentinel.
 ///
-/// **Thumb `data_refs` augmentation:** radare2's per-op
-/// `refs` field excludes addresses materialized via `movw`/`movt` pairs (only
+/// **Thumb `data_refs` augmentation:** neither backend's adapted references are
+/// guaranteed to include addresses materialized via `movw`/`movt` pairs (only
 /// Ghidra resolves those into `data_refs` for ARM). Without augmentation, the
 /// Thumb side produces 0 global-load events. For Thumb functions, the values
 /// materialized in `load_events` (== `reconstruct_immediates` results, PC-
@@ -1277,6 +1296,7 @@ mod tests {
             .map(|address| symbolicate::Symbol {
                 address: address.to_string(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_invalid".to_string(),
                 name: Some("SHOULD_NOT_PROJECT".to_string()),
                 tier: symbolicate::Tier::Recovered,
@@ -1405,6 +1425,67 @@ mod tests {
             &empty,
             &GlobalsOpts::default(),
         )
+    }
+
+    #[test]
+    fn loads_v3_thumb_functions() {
+        let img = Img::new("loads_v3_thumb_functions");
+        img.write_functions_json("[]");
+        img.write_thumb_functions_json(
+            std::str::from_utf8(crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture())
+                .unwrap(),
+        );
+        let artifact = crate::thumb_analysis::read_thumb_artifact(
+            &img.image_dir().join("decompiled/thumb_functions.json"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            artifact
+                .functions()
+                .all(|function| function.producer == crate::thumb_analysis::ThumbProducer::Rizin),
+            "the downstream fixture must exercise Rizin-owned v3 records"
+        );
+        assert_eq!(
+            artifact.functions().next().unwrap().value["data_refs"],
+            serde_json::json!(["0x4020", "0x4060", "0x4070"])
+        );
+        img.write_manifest_load_addr("0x4000");
+        // Globals knows the load address and image length, so it validates the
+        // artifact against the image it was produced for: an image that does
+        // not span the fixture's 0x4000..0x4080 v3 region is a hard input
+        // error, not silently accepted evidence.
+        let mut image = image_with_strings(0x4000, &[(0x4020, "g_thumb")]);
+        img.write_image_bin(&image);
+        assert!(
+            run_no_names(&img)
+                .unwrap_err()
+                .to_string()
+                .contains("region 0 is outside mapped image")
+        );
+
+        image.resize(0x80, 0);
+        img.write_image_bin(&image);
+
+        let report = run_no_names(&img).unwrap();
+        assert_eq!(report.recovered_count, 1);
+        let output: serde_json::Value = serde_json::from_slice(
+            &fs::read(img.image_dir().join("decompiled").join("globals.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["globals"][0]["address"], "0x4060");
+        assert_eq!(output["globals"][0]["name"], "g_thumb");
+        assert_eq!(output["globals"][0]["arch"], "thumb");
+        let evidence = output["globals"][0]["evidence"].as_array().unwrap();
+        assert!(evidence.iter().any(|item| item["kind"] == "string_load"));
+        assert!(evidence.iter().any(|item| item["kind"] == "global_load"));
+
+        let malformed = crate::thumb_analysis::ParsedThumbArtifact::malformed_consumer_v3_fixture();
+        img.write_thumb_functions_json(std::str::from_utf8(&malformed).unwrap());
+        assert_eq!(
+            run_no_names(&img).unwrap_err().to_string(),
+            "serialize: invalid Thumb artifact: v3 run 0 stored counts do not match its functions"
+        );
     }
 
     /// Build a `Function` for direct unit tests of
@@ -1614,7 +1695,9 @@ mod tests {
             make_arm_function(0x2300, &[0x3300, 0x4300]),
         ];
         late_arm[0]["name"] = serde_json::json!("ARM_FINAL_2000");
-        late_arm[1]["name"] = serde_json::json!("COLLISION_FINAL_2300");
+        // Owner-aware finalize stamps the ARM record from the ARM symbol, so
+        // the same-address Thumb symbol never renames it.
+        late_arm[1]["name"] = serde_json::json!("COLLISION_FIRST_2300");
         let early_arm = vec![
             make_arm_function(0x2000, &[0x3000, 0x4000]),
             make_arm_function(0x2300, &[0x3300, 0x4300]),
@@ -1662,6 +1745,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2000".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_2000".into(),
                 name: Some("ARM_FINAL_2000".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1671,6 +1755,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2100".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "fcn.2100".into(),
                 name: Some("THUMB_FINAL_2100".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -1680,6 +1765,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2200".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_2200".into(),
                 name: Some("ARM_SHARED_2200".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1689,6 +1775,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2200".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "fcn.2200".into(),
                 name: None,
                 tier: symbolicate::Tier::None,
@@ -1698,6 +1785,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2300".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_2300".into(),
                 name: Some("COLLISION_FIRST_2300".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1707,6 +1795,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x2300".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "fcn.2300".into(),
                 name: Some("COLLISION_FINAL_2300".into()),
                 tier: symbolicate::Tier::Provisional,

@@ -3,10 +3,10 @@
 Guide for anyone — human or AI — changing this repository. For *using* the CLI, see
 [`README.md`](README.md); this file is about developing it.
 
-`pixel-modem-extractor` is a pure-Rust CLI that extracts and analyzes the Samsung Exynos
-"Shannon" S5300 / S5400 baseband family from a Pixel radio FBPK image. Extraction needs no
-runtime dependencies; the `--run` / `decompose` analysis paths drive a local Ghidra and
-radare2.
+`pixel-modem-extractor` is a Rust CLI that extracts and analyzes the Samsung Exynos
+"Shannon" S5300 / S5400 baseband family from a Pixel radio FBPK image. Extraction and the
+decoders need no runtime dependencies. `decompile --run` and `decompose` require local Ghidra
+and radare2; explicit `--rizin-fallback` additionally preflights Rizin for failed Thumb regions.
 
 ## Ground rules (read first)
 
@@ -21,9 +21,9 @@ radare2.
   return an error rather than emitting silent, plausible-looking garbage. Preserve this —
   much of the recent history is hardening exactly this behavior. This applies to the
   decoder shell-outs too: a truncated `RF_CFG_*` (< 0x90 bytes) returns
-  `Error::SizeMismatch` rather than indexing OOB; radare2 stdout > 4 GiB is rejected,
-  and radare2's own analysis memory is capped (`RLIMIT_AS`) so a pathological Thumb
-  region fails closed and is skipped rather than OOMing the host.
+  `Error::SizeMismatch` rather than indexing OOB. Every Thumb analyzer attempt rejects
+  stdout beyond 4 GiB and receives a 16 GiB Unix `RLIMIT_AS`; a failed region is recorded
+  durably when another region succeeds, while all-region failure publishes no new sidecar.
 
 ## Build, lint, test
 
@@ -110,8 +110,56 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   the raw per-image slices; it analyzes twice in memory, does not write, and
   asserts the tree is unchanged. Point it at a disposable complete tree, not
   a pruned golden.
-- **External tools:** the `--run` and `decompose` paths shell out to Ghidra
-  (`analyzeHeadless`) and radare2 (`r2`); both are probed up front.
+- **External tools:** `decompile --run` and `decompose` require and preflight Ghidra
+  (`analyzeHeadless`) plus radare2 (`r2`). Rizin is neither discovered nor version-probed
+  by default; it is a third preflight requirement only with `--rizin-fallback`.
+- **Dense-Thumb hermetic coverage:** `decompile::tests::fake_radare2_route_emits_strict_v3_and_all_region_failure_preserves_sidecars`
+  drives the real route with synthetic image bytes and fake Ghidra/radare2; `thumb_analysis`
+  tests cover exact argv, fallback ordering, timeout/process-tree cleanup, caps, xref adaptation,
+  and mixed ownership. `globals_golden::synthetic_rizin_v3_ownership_and_data_refs_reach_downstream_consumers`
+  proves Rizin attribution and canonical `data_refs` without firmware or external tools. Do not
+  move process-level fallback duplication into a Ghidra route test.
+- **Two-model Thumb acceptance:** run `scripts/rizin-thumb-acceptance.sh`. It is the recipe — a
+  transcript of shell commands can fall through a reused root, a missing wrapper, or a failed
+  build and still look like it ran, so every provenance gate lives in one `set -euo pipefail`
+  script instead:
+
+      scripts/rizin-thumb-acceptance.sh \
+          --root /absolute/non-hidden/disk-backed/rizin-thumb-fallback-acceptance \
+          --mustang /absolute/path/to/mustang-radio.img \
+          --cheetah /absolute/path/to/cheetah-radio.img
+
+  `--print-legs` performs every gate and prints the four leg commands without running them; `--rizin`
+  overrides the wrapped executable. What the script enforces, and why each gate exists:
+
+  - The acceptance root must be absolute, outside the repository, non-hidden, not under `/tmp`, and
+    **must not already exist** — a reused root is invalid provenance.
+  - It creates the `rizin` audit wrapper under the root and puts it first on `PATH` for *all four*
+    legs, so an empty default log proves no discovery/probe/spawn rather than only no analysis. Each
+    enabled-log `-v` entry is a version probe and each `-c` entry an analyzer process, so a
+    configured-but-unused Rizin has one probe and zero analyzer calls.
+  - The binary is built `--release --locked` into an isolated `CARGO_TARGET_DIR` under the root, with
+    `--manifest-path` anchored to the worktree holding the script. Linked worktrees can overwrite a
+    shared `target/release` or shared `CARGO_TARGET_DIR`, so such a binary is invalid provenance, and
+    a path selected by mtime is never a substitute.
+  - Before the first leg it records HEAD, the worktree-diff hash, `cargo pkgid`, the resolved binary
+    path and its hash into `provenance.txt`, and checks the binary really carries this feature: the
+    strict-v3 format marker, the Rizin `aaa;aflj;pdfj @@F;axlj` command, and `--rizin-fallback` in
+    `decompose --help`.
+  - The four legs (mustang/cheetah × default/fallback) run sequentially under `/usr/bin/time -v`.
+    After each one, and before the next starts, the completed `report.json` must carry the audited
+    package `tool_version`, an exact radare2 path and version, the leg's `rizin_fallback` value, and
+    (when enabled) the wrapper as the Rizin executable plus its exact version.
+
+  The script stops at measurement; the analysis gates are still yours. Keep inputs, trees, captures,
+  logs, and `/usr/bin/time -v` output outside git. Record canonical tool identities, wall time, and
+  maximum RSS. For each fresh sidecar compare raw/substantial/accepted/quarantined counts and accepted
+  execution identities with the retained pre-v3 tree; explain size changes from `realsz` and
+  source-attribution changes from `decode_ranges`. Prove healthy regions and mustang's largest region
+  remain radare2-owned. On cheetah, require `0x42310000` to show failed radare2 then successful Rizin,
+  non-empty adapted refs, downstream `AnalysisTool::Rizin`, and globals yield/conflicts against the
+  valid no-xref baseline. Never infer a corpus pass from a clean env-gated skip, and never hardcode
+  analyzer-version-dependent inventory counts into unit tests.
 - Write the failing test first (TDD), then the minimal code to pass it.
 
 ### Hashing and golden identity
@@ -189,7 +237,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 
 ## Repository layout
 
-`src/*.rs` is a flat set of focused modules — one concern each:
+`src/` is a set of focused modules and small subsystems — one concern each:
 
 | Path | Responsibility |
 |---|---|
@@ -204,16 +252,22 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
 | `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
 | `source_tree.rs` | Reconstruct the source-tree layout from `__FILE__` strings |
-| `recover_source.rs` | Attribute recovered Ghidra/radare2 functions to source paths |
+| `analysis_tool.rs` | Shared `AnalysisTool::{Ghidra, Radare2, Rizin}` downstream identity |
+| `recover_source.rs` | Attribute producer-owned Ghidra/Thumb functions to source paths |
 | `decode_rf.rs` | Decode the RF_CFG calibration databases |
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
-| `decompile.rs` | Ghidra import kit + `--run` orchestration (the radare2 Thumb producer lives in `r2_thumb.rs`) |
-| `r2_thumb.rs` | Streaming radare2 Thumb producer: scanner, pairing passes, fragment spill, atomic assembler, streaming thumb-leg validation; owns the streaming `thumb_enrich` (`body_c` enrichment, Stage 2 of the memory-envelope lever, moved out of `decompile.rs`) |
+| `decompile.rs` | Ghidra import kit, `--run` orchestration, Thumb summary/currentness, and streaming v3-preserving enrichment |
+| `thumb_analysis/mod.rs` | Stable producer/tool types, public configuration and summaries, and subsystem exports |
+| `thumb_analysis/identity.rs` | Canonical cross-platform executable identity, discovery, bounded version probing, and probe-process cleanup |
+| `thumb_analysis/stream.rs` | Request validation, fallback coordination, process supervision, bounded capture/scanning, normalization, and spills |
+| `thumb_analysis/artifact.rs` | Sole v1/v2/v3 parser, strict run ownership, typed consumer streaming, canonical assembly, terminal validation, and streaming atomic mutation |
+| `thumb_analysis/radare2.rs` | radare2 command profile, inventory aliases/bounds, and per-operation reference adaptation |
+| `thumb_analysis/rizin.rs` | Rizin command profile, inventory aliases/bounds, trailing `axlj` streaming, filtering, and range assignment |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
-| `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by the Ghidra and radare2 producers and `global_shapes` |
+| `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by Ghidra, both Thumb backends, and `global_shapes` |
 | `global_shapes/mod.rs` | Phase 3.2 per-image coordinator: one-function decode/track/aggregate, panic containment, atomic sidecar commit |
 | `global_shapes/decoder.rs` | Pure-Rust adapter over `scaleservers-arm32-assembly` 1.0.0; project-owned instructions only |
 | `global_shapes/tracker.rs` | Sound cross-block must-facts dataflow over direct CFG edges (worklist join), Recovered-global access observations, v3 barriers, cross-block counters |
@@ -231,6 +285,144 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
+
+### Dense Thumb analyzer invariants
+
+- **Preflight and identity.** radare2 remains mandatory and Rizin cannot substitute for it.
+  Rizin discovery occurs only for explicit `--rizin-fallback`. Both backends are canonicalized
+  before a direct `-v` probe with a 10-second deadline. A probe requires successful UTF-8 stdout
+  and retains the first non-empty trimmed line, at most 1,024 bytes. `decompose` preflights all
+  required/configured tools before creating output and passes those exact `ProducerIdentity`
+  values through analysis and `report.json`; nested decompile must not rediscover them.
+- **Requests are valid before effects.** The complete `(start, length)` list is checked before
+  creating `thumb/`, carving bytes, or spawning: length is positive, checked addition fits the
+  canonical u32 address domain, every range lies in the mapped image, and ranges are sorted and
+  non-overlapping. Every backend receives the same prevalidated `thumb/<start:08x>.bin` carve.
+- **Backend adaptation is strict.** Inventory, top-level `pdfj`, and operation addresses accept
+  the live modern/legacy `addr|offset` aliases. V3 radare2 bounds require `maxaddr`; Rizin bounds
+  require `maxbound`; both require positive `realsz`. Normalized `end` is that exclusive bound and
+  normalized `size` is `realsz`; never derive either from `entry +` raw `aflj.size`. Raw `size` is
+  diagnostic bounding span only. `decode_ranges` are byte-validated executable coverage and remain
+  authoritative for execution identity and v3 source-range attribution.
+- **Body integrity fails the attempt.** Pair inventory and `pdfj` by entry before positional
+  fallback. A non-empty inventory with zero paired bodies is a region failure; an empty inventory,
+  orphan bodies, malformed boundaries, projection errors that break conservation, and unusable
+  process output also fail the attempt. Once at least one body pairs, individual missing/invalid
+  bodies may remain whole-record quarantines. Do not turn a command/schema failure into an empty
+  successful sidecar.
+- **Commands and fallback policy are fixed.** radare2 runs exactly
+  `aaa;aflj;pdfj @@f`; Rizin runs exactly `aaa;aflj;pdfj @@F;axlj` in one process.
+  radare2 is attempted first for every region. Rizin is attempted once only after that region's
+  radare2 attempt fails. Healthy, all-quarantined, or low-coverage radare2 output never triggers
+  fallback. Production retains the first successful producer run and never unions backends within
+  a region.
+- **Partial and total failure differ.** If any requested region succeeds, canonical v3 commits
+  atomically with every requested region and its ordered attempts; partial success remains analyzed
+  with no `thumb_error`. If all regions fail, return one ordered aggregate error, remove temporary
+  fragments, publish no sidecar, and leave any prior `thumb_functions.json` byte-identical. Callers
+  must never treat that old file as current after the error.
+- **Capture provenance is durable.** Analyzer stdout paths are
+  `thumb/<start:08x>.radare2.stdout` and `thumb/<start:08x>.rizin.stdout`; temporary spills use the
+  same producer qualification and are never terminal. Captures stream to disk while exact bytes and
+  BLAKE3 are accumulated. A successful attempt requires capture metadata. A failed attempt retains
+  finalized partial stdout when possible; spawn/capture-finalization failures record `stdout: null`.
+  `--prune` removes capture files, but v3 preserves their relative path, byte count, and hash.
+- **Analyzer runtime and pipe-finalization bounds are distinct.** Both backends have a 4 GiB stdout
+  cap and a 16 GiB Unix `RLIMIT_AS`. Rizin has a 30-minute per-region analysis deadline; radare2 has
+  no analysis deadline. After the immediate analyzer exit is observed, either backend may spend at
+  most 1 second idle (new bytes reset this window) and 30 seconds absolute finalizing inherited
+  stdout pipes (progress cannot extend this window). Reaching either post-exit bound forces pipe
+  finalization and fails the attempt; neither bound is an analyzer runtime deadline.
+- **Cleanup guarantees are platform-specific terminal contracts.** On Unix, each analyzer runs in
+  its own process group. Exit observation uses identity-stable `WNOWAIT` ordering so the leader
+  remains waitable while the anchored group is signaled; cleanup then reaps the leader exactly once
+  and verifies that the process group is absent. On non-Unix platforms, the portable contract is
+  limited to terminating/reaping the immediate child and cancelling/joining its stdout drain; it
+  does not claim descendant process-group cleanup. If the applicable cleanup proof fails, the
+  coordinator aborts the stage: it must not start Rizin fallback or a later region after a
+  potentially surviving analyzer.
+- **One typed terminal path, and it is wider than "cleanup".** `FailedRegion::terminal` marks any
+  attempt that left unverified process or on-disk state; the coordinator then records **no attempt
+  record**, no fallback, no later region, and no publication. It covers pre-attempt housekeeping
+  (`FailedRegion::setup` — nothing was spawned, so recording an attempt would claim a process that
+  never ran), output that could not be removed (`remove_stale_output` treats only an absent path as
+  success), a drain that would not stop, and unverified process cleanup. The design's one *ordinary*
+  case is narrow and must stay so: a partial capture whose finalization failed but which was
+  **provably removed** records `stdout: null` and stays fallback-eligible.
+- **Declared bounds must bound the return, not the cancellation.** The 10-second version probe and
+  the post-exit pipe-finalization limits are meaningless if cleanup then blocks forever, so
+  `kill_and_reap`, `ProbeReaders::cancel_and_join`, and `AnalyzerProcess::cancel_drain_and_wait` are
+  all bounded and report their failures. A reader that never observes cancellation is **detached**,
+  not joined; `join_drain` on a detached drain is an error, so a detached reader can never yield a
+  capture identity. `CancelSynchronousIo` failures are reported except `ERROR_NOT_FOUND`, which just
+  means no synchronous read was pending.
+- **Rizin xrefs are bounded outgoing evidence.** The one trailing `axlj` array must be final and is
+  streamed rather than materialized. Types are case-insensitive: include `data`, `str`, `string`,
+  `mem`, `ptr`, or `read`; deny `code`, `call`, `jump`, or `exec`. Selected records require a u32
+  `from` and u64 `to|addr`; incoming `xrefs_to`/`codexrefs` are ignored. The cap is exactly 1,000,000
+  selected input records per region, checked before sorting/dedup so duplicate floods remain bounded.
+  Binary searches assign each target only where `from` lies in an accepted `decode_range`; targets
+  sort/dedup per function, overlapping functions each receive the edge, and quarantined/unmapped
+  records contribute no false function reference. `RizinXrefIndex` records which sources an accepted
+  range claimed, so unmapped selected xrefs are counted and logged per region rather than failing
+  the attempt. Every `pdfj` body must carry an array-valued `ops` field: without that check, schema
+  drift emitting bare objects pairs positionally, quarantines every function as `empty_projection`,
+  and publishes an all-quarantined "successful" run.
+- **V3 owns provenance and mutation.** Canonical top-level order is `format`, `producers`, `regions`,
+  `functions`. Producers are actually attempted identities; regions stay in request order; attempts
+  stay in process order. Every successful attempt owns one non-empty contiguous `function_runs`
+  slice, all slices cover the flat function array exactly once, and stored substantial/accepted/
+  quarantined counts are rederived. Readers accept multiple successful runs for a future union mode,
+  but the current writer emits at most one per region. Currentness compares strict v3 format, full
+  producer identity, requested ranges, run ownership, and all summary totals. Mutators may change only
+  `body_c`, `name`, `original_name`, and `annotations`; format/provenance/order/count/execution fields
+  are immutable, writes are atomic, and a no-op is byte-identical.
+- **All consumers share ownership.** Only `thumb_analysis::artifact` recognizes Thumb formats. V1/v2
+  remain readable and infer radare2; v3 resolves each function through validated runs. Source
+  attribution and symbolication preserve `AnalysisTool::Rizin`; globals consumes Rizin-adapted
+  `data_refs` through the same canonical record path; `global_shapes` validates provenance before
+  flattening execution identities. Typed source recovery and enrichment/symbolication mutations
+  stream function records; `global_shapes` intentionally retains the complete validated function
+  set because its decoder analyzes those records together.
+- **Ownership survives all the way to mutation.** `(AnalysisTool, entry)` is the record identity, not
+  the entry alone: a valid multi-run v3 region can hold a radare2 and a Rizin record at the same
+  entry. `Symbol` therefore carries its `tool` (and `symbols.json` records it),
+  `stream_rewrite_thumb_functions` hands the mutator
+  each record's validated run owner (v1/v2 report `radare2`), symbol application keys by
+  `(producer, entry)` with `functions.json` owned by Ghidra, and the globals evidence-name projection
+  routes each symbol into its own ISA only.
+- **Consumers that know the image must validate against it.** `parse_thumb_artifact`,
+  `read_thumb_artifact`, and `read_thumb_functions_streaming` take `Option<MappedImage>` so each call
+  site states whether it knows the load address and image length. Supplied, it checks v3 region
+  bounds and every function envelope, not only decode ranges — without it a document with in-image
+  decode ranges beside an out-of-image region passes. `global_shapes`, `globals`, and symbolication
+  supply it; `recover_source` is handed only a decompiled directory and cannot.
+- **Producer identity has two modes, and legacy records have neither.** One validator
+  (`identity::producer_identity_error`) serves both: `IdentityMode::Runtime` for identities the
+  coordinator will spawn (this host's path family, `canonicalize` equality with the recorded
+  spelling, an executable file) and `IdentityMode::Artifact` for retained artifacts, which record a
+  possibly foreign host and can only be checked lexically. Both reject what discovery cannot produce:
+  versions past the 1,024-byte probe bound, and Windows reserved device names, Win32-reserved
+  characters, trailing space/dot components, or an unusable verbatim prefix. Separately, the typed
+  consumer record requires only `name` and `entry`, because retained v1/v2 artifacts carry no v3
+  semantic contract and legacy symbolication defaulted the rest; v3 stays strict through
+  `FunctionWire`.
+- **Report conservation.** Current runs copy `regions_requested`, `regions_succeeded`,
+  `regions_failed`, `radare2_runs`, and `rizin_runs` into the five `thumb_*` image fields. Require
+  requested = succeeded + failed and succeeded = radare2 runs + Rizin runs under the no-union policy.
+  The report's tool object describes configured identities; the sidecar describes actual attempts.
+- **Failures name their own stage.** `ImageOutcome::Failed(code)` is an `analyzeHeadless` process
+  failure and is the only outcome that reports `exit`; `ImageOutcome::TerminalInvalid` is a
+  completed Ghidra run whose export terminal/currentness validation rejected, and it reports
+  reason-only `terminal_error`. `TerminalValidationFailure` records which stage rejected the pair, so
+  a Thumb-side rejection also populates `thumb_error` (keeping any root-cause reason the analysis
+  stage already recorded) while a Ghidra-side one does not. `Error::GhidraFailed` is reserved for
+  real process failures. `report.json` likewise separates `prune_requested` (the flag) from `pruned`
+  (the sweep completed); a failed sweep records a failed `prune` stage and `pruned: false`.
+- **Both analyzers preflight before output.** radare2 discovery is a hard preflight on the
+  standalone `decompile --run` route as well as `decompose`: it propagates before Rizin discovery
+  and before any modem parsing, output creation, or Ghidra work. Deferring it once allowed an image
+  with no dense Thumb region to succeed without the required primary.
 
 ## Multiple models (model-agnostic design)
 
@@ -266,15 +458,18 @@ hardcoded. Two reference images exercise both models end-to-end:
   model-independent — point them at either reference image and both pass. Assertions are structural
   (the firmware dir contains `modem.bin`; a `*_MAIN` split exists; `firmware_prefix` parses;
   `modem.size > 0`), never a literal model name or byte size.
-- **cheetah / S5300 as the second reference data point** (verified full `decompose`, ~84 min, exit 0):
+- **cheetah / S5300 as the second reference data point** (historical pre-v3 full
+  `decompose`, ~84 min, exit 0; retain these measurements as comparison data, not current output):
   four images `00_BOOT / 01_MAIN / 02_VSS / 03_APM` (no PSP/DBGCORE), MAIN = `01_MAIN`. Headline
   `report.json` counts: `functions` = 104,395 (MAIN); `thumb_functions` = 87,026; `thumb_decompiled`
   = 70,906 (dense-Thumb converged on S5300 — the primary risk); `globals_recovered` = 1,061;
-  `global_shapes` 1046 obs / 274 inferred / 784 `no_evidence` / 3 conflicting (that tree's
-  retained sidecar is v2-vintage by design; the v3 in-memory split is 295/766/0). One 4 MiB dense-Thumb
-  region (`0x42310000`) drove radare2's `aaa` toward ~90+ GiB and hit the 16 GiB `RLIMIT_AS` cap, so
-  it was skipped fail-closed (`regions_skipped=1`) while the other six regions decompiled — see the
-  radare2 address-space-cap invariant in the domain map.
+  `global_shapes` 1046 obs / 274 inferred / 784 `no_evidence` / 3 conflicting (that retained
+  global-shapes sidecar is stale-vintage by design; the newer in-memory engine split is 295/766/0).
+  In this historical run, where radare2 was the only host producer, region `0x42310000` hit the
+  16 GiB `RLIMIT_AS` and contributed no
+  Thumb records while six regions survived. Current default v3 records that failure as an ordered
+  region attempt; opt-in acceptance additionally expects a successful Rizin-owned run there. The
+  old warning-only loss is not current behavior.
 
 ## Domain map & code conventions
 
@@ -430,7 +625,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   A/B on the real inputs: 130 s, 2.29 GB peak, byte-identical to the
   whole-file oracle; see the radare2 streaming bullets) — and `symbolicate`'s
   finalize rewrites stream too (Stage 4: element-wise stamps and `body_c`
-  renames through `r2_thumb::stream_rewrite_json_array` /
+  renames through `thumb_analysis::stream_rewrite_json_array` /
   `stream_rewrite_thumb_functions`, byte-identical to the whole-file
   rewriters on the real production tree); and the ARM loader holds zero-copy
   borrowed views of `disasm.lst` (Stage 5), so the pathological wide-range
@@ -555,12 +750,12 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **Phase 2 + 2.1: Thumb decompilation.** Dense Thumb regions in `02_MAIN`
   are no longer data-marked for Ghidra; the tightened `TameAnalysis`
   (`mode=tighten`) lets Ghidra attempt function discovery and decompilation.
-  Per-function hybrid output: `thumb_functions.json` v2 with optional
-  per-function `body_c`; the asm `body` is always populated (radare2
-  unchanged). `thumb_enrich` parses `decompiled.c` and fills `body_c` by
+  Per-function hybrid output is strict v3 with optional per-function `body_c`;
+  the asm `body` comes from the owning radare2 or Rizin run. `thumb_enrich`
+  parses `decompiled.c` and fills `body_c` by
   **entry address** (Phase 2.1's matching fix — Phase 2 shipped name-based
-  matching, which never aligned radare2's `thumb_<addr>` / `sym.thumb_<addr>`
-  with Ghidra's `FUN_<addr>` / recovered names; Phase 2.1 switched to
+  matching, which never aligned analyzer-generated names with Ghidra's
+  `FUN_<addr>` / recovered names; Phase 2.1 switched to
   address-based matching per the spec's original intent; see Phase 2.1
   invariants below). `thumb_enrich` is pure Rust, idempotent, runs after pass
   1 and again after pass 2. `--no-thumb-decompile` reverts to Phase-1 datamark
@@ -568,7 +763,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   overlapping-function-repair spin and falls back to datamark per image
   (recorded as `thumb_tighten_error`, image not marked `failed`); see
   **Surface B mechanics** below for the kill path and budget calibration.
-  **Production status (verified end-to-end on a real `02_MAIN`):** Phase 2.1's
+  **Historical pre-v3 production status (verified end-to-end on a real `02_MAIN`):** Phase 2.1's
   winning `TIGHTEN_EXTRA` (`"Non-Returning Functions - Discovered.Repair Flow
   Damage"`) lets Ghidra 12 converge in ~23 min with 0
   `ClearFlowAndRepairCmd` repair-log lines. Surface B's budget (~112 min
@@ -579,8 +774,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   `globals_recovered` = 915 (arch: arm 367 / thumb 545 / mixed 3);
   `thumb_tighten_error` / `thumb_error` / `thumb_enrich_error` /
   `pass2_error` absent. Do not re-assert older `thumb_decompiled` = 10,965
-  figures as current HEAD. Ownership-aware `refresh_decompiled` preserves
-  `thumb_functions.json` and `thumb/*.stdout` across pass 2. The Phase 2
+  figures as current HEAD. These inventory counts predate corrected `realsz` and Rizin fallback;
+  use them only as a measured Ghidra-enrichment baseline. Ownership-aware
+  `refresh_decompiled` preserves `thumb_functions.json` and producer-qualified
+  `thumb/*.stdout` across pass 2. The Phase 2
   fields are surfaced in the `decompile` stage's per-image entry via
   `refresh_decompile_stage_images` (called after both pass-1 and post-pass-2
   `thumb_enrich` sweeps); without that refresh, the decompile StageReport
@@ -595,7 +792,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   prove Ghidra's Thumb discovery end-to-end in `tests/decompile_golden.rs`.
   Empirical verification: Ghidra's `ARM:LE:32:v7` auto-analysis does **not**
   follow an immediate BLX into Thumb mode for a small synthetic blob. Real-
-  firmware Thumb discovery is driven by radare2 region hints + Ghidra's flow
+  firmware Thumb discovery is driven by host-detected dense regions + Ghidra's flow
   analysis over megabytes of code, not by any single mode-switch instruction
   a synthetic fixture could carry. Even a working fixture would test an
   artificial path that could pass CI while production breaks. CI coverage for
@@ -641,15 +838,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   same contract as pass-2 skipping on `--no-symbol-pass`. Don't "helpfully"
   drop the post-pass-2 enrich when adding a fast path.
   (2) **`--no-thumb-decompile` skips both `thumb_enrich` runs** and forces
-  `TameAnalysis mode=datamark` end-to-end. The output is byte-equivalent to
-  today's Phase-1 behavior (modulo the v2 format bump on `thumb_functions.json`,
-  which is informational-only at load time).
+  `TameAnalysis mode=datamark` end-to-end. The host analyzer still emits the
+  same strict v3 artifact; this flag changes Ghidra discovery/`body_c`, not
+  producer provenance or fallback policy.
   (3) **The runtime watch (Surface B) is non-deterministic.** Its data fields
   (`thumb_tighten_error`) are structurally tested at the report-shape level;
   the kill behavior itself is verified manually via
   `--tighten-wall-clock-budget-sec 1`. Don't assert on the kill firing in a
   unit test — it depends on Ghidra's repair-log cadence against real firmware.
-  (4) **Missing `thumb_functions.json` after radare2 success is an error.**
+  (4) **Missing `thumb_functions.json` after successful Thumb analysis is an error.**
   `run_thumb_enrich_per_image` treats `thumb_functions == None` as legitimate
   "no Thumb regions" and skips; `thumb_functions == Some(_)` with a missing
   JSON records `thumb_enrich_error` and fails the `thumb_enrich` /
@@ -811,8 +1008,13 @@ hardcoded. Two reference images exercise both models end-to-end:
   `global_load`/`string_load` only on the disasm-anchored path and does not
   backfill them onto Phase 3.0 entries. A future "unify the evidence shape"
   change is a separate decision; don't fold it into an unrelated fix.
-  (Current production total on `02_MAIN` is 915 Recovered across both
-  paths — see the Phase 3.0.1 production-state bullet.)
+  Fresh Task 11 acceptance on the retained Mustang/S5400 image with
+  pixel-modem-extractor 2.0.0, Ghidra 12.1.2_DEV, and radare2 6.1.4 measured
+  919 Recovered on `02_MAIN` and 925 stage-wide in both default and
+  `--rizin-fallback` runs; the fallback leg preflighted Rizin 0.8.2 but made no
+  Rizin analyzer call. These are corpus/tool-version observations, not universal invariants.
+  The 915 MAIN result below remains useful only as labeled historical pre-v3
+  evidence.
 - **Surface 3.0.1-A: visibility when disasm is unreadable/absent.** When
   `disasm.lst` is missing or its read returns `Err`, `globals.json` is still
   written with Phase 3.0-only content (strict-string-rule Recovered) plus a
@@ -831,9 +1033,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   firmware); the `phase3_0_1_provisional_emitted_only_with_opt_in` golden
   test asserts the always-true upper bound `materialized <= generated`
   rather than nonzero, precisely because of this.
-- **Thumb data_refs augmentation.** radare2's per-function `refs` exclude
-  movw/movt-constructed addresses (only direct `LDR`/`STR` refs surface);
-  the Thumb path augments `non_string_refs` with
+- **Thumb data_refs augmentation.** Producer references already share one canonical field:
+  radare2 adapts selected per-operation refs and Rizin adapts selected trailing `axlj` edges.
+  Neither source is guaranteed to include every movw/movt-constructed address, so the globals
+  Thumb path additionally augments `non_string_refs` with
   `reconstruct_immediates`-style results before applying Phase 3.0's
   cardinality rule, mirroring the ARM-side `data_refs` source
   (`symbolicate.rs`'s `data_refs_for` / inline `non_string_refs`
@@ -845,16 +1048,18 @@ hardcoded. Two reference images exercise both models end-to-end:
   the pre-sweep snapshot and the Phase 3.0.1 fields are invisible in
   `report.json`. The `report_json_includes_phase3_0_1_fields` golden test
   (env-gated on `PME_GOLDEN_DIR`) is the regression sentinel.
-- **Phase 3.0.1 production state on `02_MAIN` is ARM+Thumb.** Full two-pass
+- **Historical pre-v3 Phase 3.0.1 production state on `02_MAIN` is ARM+Thumb.** Full two-pass
   `decompose` with ownership-aware pass-2 refresh and 4 GiB radare2 streaming
   closed Thumb through pass 2: `globals_recovered` = **915** on `02_MAIN`
   (arch: arm 367 / thumb 545 / mixed 3); stage total recovered 921 with 194
   conflicts dropped. Older ARM-only figures (370 post-`__FILE__`-fragment
   filter; 933 unfiltered; Phase 3.0's 424 ARM-only / 968 ARM+Thumb) are
   historical pre-fix observations — do not cite them as current HEAD
-  production. The `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden
+  production. These numbers predate corrected v3 boundaries and Rizin fallback; retain them as
+  a comparison baseline, not a current inventory promise. The
+  `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden
   sentinel still asserts `> PHASE3_0_ARM_ONLY_BASELINE` (424) and is
-  env-gated (`PME_GOLDEN_DIR`); it holds under the verified 915 total.
+  env-gated (`PME_GOLDEN_DIR`); it held under the historical 915 total.
 - **Cross-path conflict characterization.** Of the 223
   same-address proposals dropped by strict-single-source on an earlier
   ARM-only production `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-
@@ -862,32 +1067,23 @@ hardcoded. Two reference images exercise both models end-to-end:
   conflicts). Strict-precedence would gain +11 Recovered; disasm-precedence
   +9; **both propagate clearly-wrong names** on the cases they flip. Current
   strict-drop (drop both on disagreement) is the right call — neither path
-  is reliable enough to arbitrate the other. The verified post-fix net
-  on `02_MAIN` is 915 Recovered (see the production-state bullet above).
-- **radare2 4 GiB `R2_STDOUT_CAP` streaming is verified live.** The former
-  256 MiB in-memory cap blocked Thumb on production; stdout is now streamed
-  to `thumb/<addr:08x>.stdout` with `R2_STDOUT_CAP_BYTES = 4 GiB` (see
-  **radare2 stdout streaming** below). The verified full `decompose` did not
-  hit the cap (`thumb_functions` = 117,444; no `thumb_error`) and closed
-  Thumb through pass 2 (`thumb_decompiled` = 77,456; globals thumb-majority).
-- **radare2 address-space cap (`RLIMIT_AS`) prevents host OOM; a failed region
-  is skipped, not fatal.** The stdout cap above bounds only the output *we
-  read back*, never r2's own analysis memory — so `aaa` on a pathological
-  dense-Thumb region can still OOM the host. Measured: cheetah `01_MAIN`'s
+  is reliable enough to arbitrate the other. The historically verified pre-v3
+  post-fix net on `02_MAIN` was 915 Recovered (see the production-state bullet
+  above).
+- **Historical cap calibration remains valid for both backends.** The former 256 MiB
+  in-memory cap blocked production radare2. A healthy mustang region emitted ~1.82 GiB and the
+  complete old run emitted ~3.65 GiB across captures, grounding the current shared 4 GiB
+  per-attempt stdout cap. The producer now records backend-qualified capture identity in v3;
+  do not reintroduce backend-specific cap names or unqualified capture paths.
+- **The cheetah runaway is the fallback acceptance case, not a silent skip.** Measured:
+  cheetah `01_MAIN`'s
   `0x42310000` (a 4 MiB blob) runs `aaa` away to ~93.5 GiB, while every other
   region on both reference models peaks ≤ ~2.3 GiB *virtual* under the full
-  `aaa;aflj;pdfj` command. `limit_r2_address_space` sets `RLIMIT_AS =
-  R2_ADDRESS_SPACE_CAP_BYTES` (16 GiB, ~7× the measured healthy ceiling) on the
-  r2 child via `pre_exec`, so a runaway region is denied further allocations
-  and exits (`ENOMEM` → fail-closed) instead of exhausting RAM. `run_radare2_thumb`
-  analyzes each region independently (`run_radare2_thumb_region`, with the
-  per-region fold inline in `run_radare2_thumb`): a region whose r2 run
-  fails is logged
-  (`regions_skipped`) and skipped, so the surviving regions still populate
-  `thumb_functions.json` — one runaway region degrades Thumb coverage locally
-  instead of zeroing it (previously the whole stage aborted). Unix-only; Windows
-  has no portable per-child address-space limit, so a pathological region there
-  can still OOM — use `--no-thumb-decompile`. **Root cause of `0x42310000`
+  `aaa;aflj;pdfj @@f` command. The shared Unix child setup applies 16 GiB `RLIMIT_AS`, so
+  radare2 exits fail-closed instead of exhausting the host. Default v3 retains that failed
+  attempt when another region succeeds. With opt-in fallback, Rizin then recovers the region
+  under its own command/deadline and owns its function run. Windows has no portable child
+  address-space limit, so run this corpus gate on Unix. **Root cause of `0x42310000`
   (investigated):** it is *not* misclassified data — the region is genuine dense
   Thumb (entropy ≈ 7.05 and real `bx lr`/`push`/`pop` markers, indistinguishable
   from the healthy regions). Isolating r2's analysis passes under the cap shows a
@@ -895,8 +1091,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   `aab`, `aar`, and `aae` all complete. But those lighter passes find only 0–1
   functions here — the region's functions are *only* discoverable via `aac`'s
   call-following, which is the very pass that explodes — so no lighter-analysis
-  fallback can recover it. Skipping it fail-closed is therefore the optimal
-  handling; a real fix would live upstream in radare2's `aac`.
+  radare2 profile can recover it. The primary fix still belongs upstream in radare2's `aac`;
+  failure-only Rizin is the bounded downstream recovery path, not a lighter-r2 substitute.
 - **Phase 3.2: global storage-shape recovery.** Default-on in every
   `decompose` (normal, `--no-symbol-pass`, and valid pass-2 fallback), via
   the shared `run_global_shapes_stage` wrapper — but the two symbol routes
@@ -1271,15 +1467,12 @@ hardcoded. Two reference images exercise both models end-to-end:
   canonically dot-free (see **Ghidra 12 headless API notes**). Replay and
   goldens need a complete unpruned tree; a pruned golden has no raw
   `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
-  former whole-buffer r2 path) is gone — the producer and `thumb_enrich`
-  both stream now (see the radare2 streaming bullets below); plan per the
-   README's memory note — the full-`decompose` peak is ~7.7 GB, held by
-   Ghidra's own analyze/export phase (2026-08-21 probe; the Rust process
-   peaks at ~2.5 GB); every whole-file `Value` tree and owned disasm copy
-   on the dense-Thumb path is gone (Stages 1-5 of the memory-envelope
-   lever). `recover_source` loads
-   `thumb_functions.json` through a typed reader, and
-   Ghidra's own phases peak ~8 GB. Do not parse Ghidra/radare2 disassembly
+  former whole-buffer r2 path) is gone. Both Thumb backends, enrichment,
+  typed `recover_source` loading, and symbolication's artifact mutations
+  stream; ARM disassembly records borrow zero-copy ranges from the shared
+  buffer. The full-`decompose` peak is ~7.7 GB in Ghidra's own analyze/export
+  phase (2026-08-21 probe; the Rust process peaks near ~2.5 GB). Outside the
+  existing canonical adapters, do not parse Ghidra/radare2/Rizin disassembly
   text, infer ISA from alignment or inventory name, attribute an address to
   the nearest global, or leak decoder-crate enums outside `decoder.rs`.
 - **Phase 3.2 type application.** Default-on in every normal-route `decompose`
@@ -1461,133 +1654,63 @@ hardcoded. Two reference images exercise both models end-to-end:
   checks the budget on every poll, not only after each line, so a GC storm or
   deadlock that stops emitting stdout is still killed. Do not switch back to a
   blocking `BufRead::lines` loop — that would re-introduce the blind spot.
-- **radare2 stdout streaming (Phase 2+).** `run_radare2_thumb` streams
-  r2 stdout to `thumb/<addr:08x>.stdout` in 8 KiB chunks via the
-  pure-I/O `stream_to_cap` helper, accumulating a byte counter;
-  exceeding `R2_STDOUT_CAP_BYTES = 4 GiB` fails closed (kill + reap +
-  remove partial file + `Error::ToolNotFound`). The 4 GiB value is
-  grounded in production: `02_MAIN`'s `410b0000` region emits ~1.82 GiB
-  of `aflj;pdfj @@f` JSON (~25 KiB/function × ~71 k functions); 4 GiB
-  is ~2× headroom. Do not lower this cap without confirming the
-  largest real image's region still fits — the failure mode
-  (`thumb_error` on the image, no `thumb_functions.json` written) is
-  silent at the JSON level. Do not raise it casually — pathological r2
-  output is what the cap exists to defend against.
-- **`thumb/<addr:08x>.stdout` retention.** The streamed file is kept
-  after parse (not deleted). Disk is cheap; the debugging value
-  (inspect r2 output when `data_refs` look wrong or parse fails)
-  outweighs storage cost. `--prune` drops it with the rest of the
-  `thumb/` tree.
-- **Why streaming-to-disk.** Three reasons: (1) decouples r2's write
-  rate from Rust's read rate (no pipe-stall during slow parse); (2)
-  persistent artifact for post-hoc inspection; (3) the streaming parse
-  consumes it (Stage 1 of the memory-envelope lever). Raw `.stdout`
-  captures remain on disk.
-  **Memory profile is now streaming (Stage 1).** `run_radare2_thumb` parses
-  each capture with `ValueScanner` (noise-tolerant top-level value scanner,
-  differentially-tested against the legacy `radare2_json_values` oracle),
-  pairs pdfjs in two streaming passes (entry-match, then positional
-  fallback — the greedy orderings are provably equivalent), normalizes and
-  spills one fragment per function to `thumb/<addr:08x>.frags`
-  (`[u32 LE fn_idx][u32 LE len][bytes]`), and assembles
-  `thumb_functions.json` atomically from the spills. Producer peak RSS is
-  bounded by the largest single JSON value, not the image. Invariants a
-  future change must not break: (1) a fragment is `to_string_pretty` of the
-  function `Value` with every line prefixed by 4 spaces — byte-identity
-  with the whole-document rendering relies on serde_json's `Map` being a
-  `BTreeMap` (no `preserve_order` feature); (2) region order then fn order
-  is the emission order; (3) the verdict precedence is no-JSON →
-  unassignable → orphan → u32-domain → conserving; (4) the terminal
-  thumb-leg validation streams too and requires `format` before
-  `functions` (our writer guarantees it); (5) the legacy parse chain stays
-  as the `#[cfg(test)]` differential oracle — do not delete it. The
-  env-gated `streaming_replays_retained_production_thumb_captures_byte_identically`
-  test replays a retained golden tree's captures and asserts byte-identity
-  with the producer surface reconstructed from the production
-  `thumb_functions.json` (measured on mustang `02_MAIN`'s five retained
-  captures: ~3.65 GiB stdout, 151,411 functions, 582,543,970 B output,
-  ~248 s wall, ~2.8 GB peak RSS for the replay+compare). **Golden
-  provenance:** that retained `thumb_functions.json` is a *post-processed*
-  artifact — symbolicate stamps `name`/`original_name`/`annotations` on
-  every record and thumb_enrich adds `body_c` — and the test inverts those
-  deterministic edits (drops `body_c`/`annotations`, restores `name` from
-  `original_name`) to reconstruct the producer surface; re-baselining
-  goldens or touching symbolicate's rewrite shape must revisit that
-   inversion. Stage 2 (landed) moved `thumb_enrich` onto the same streaming
-   footing — see the next bullet; Stage 3 (landed) did the same for
-   `recover_source`'s load, and the full-`decompose` envelope now sits in
-   `symbolicate_finalize`'s rewrite, not in any radare2-side stage (also the
-   next bullet).
-  `--no-thumb-decompile` still selects Ghidra `datamark` mode and skips both
-  `body_c` enrichment sweeps; the dense-region radare2 capture/parse loop it
-  still invokes is the same streaming path.
-- **`thumb_enrich` is streaming, atomic, and bounded (Stage 2 of the
-  memory-envelope lever).** `r2_thumb::thumb_enrich` (moved out of
-  `decompile.rs` by pure motion) collects `decompiled.c` bodies via the
-  streaming `collect_decompiled_c_bodies` pass (~86 MB map on `02_MAIN`) and
-  rewrites `thumb_functions.json` through a `serde_json` stream visitor into
-  an `atomic-write-file` temp — peak RSS is bounded by the bodies map plus
-  one function record, never a whole-document `Value` tree. Measured
-  production A/B on the real inputs (632 MB golden
-  `thumb_functions.json` + 86 MB `decompiled.c`): 130 s, 2.29 GB peak,
-  byte-identical bytes and equal `populated` counts vs the whole-file
-  oracle. Pre-Stage-2, the two whole-file enrich sweeps held the ~24.9 GB
-  full-`decompose` peak (the 632 MB JSON parsed to a ~20+ GB `Value` tree,
-  twice). Post-Stage-2, enrich is verified out of the envelope (2.29 GB
-   A/B peak) and Stage 3 did the same for `recover_source`:
-   `RecoveredFunctions::load` now deserializes `thumb_functions.json`
-   (and `functions.json`) through a typed reader straight from the file —
-   no `serde_json::Value` tree, unknown fields (symbolicate stamps,
-   `body_c`) ignored, a malformed record failing closed (~0.6 GB measured
-   in-pipeline by the 2026-08-20 instrumented probe, down from ~20 GB). The
-   last holder was `symbolicate`'s ARM loader: owned per-function copies of
-   `disasm.lst` ranges, where a handful of pathological Ghidra records
-   (bad `end` fields spanning ~37 MB, e.g. the `guess_latency_*` set) each
-   copied ~190 MB — ~23 GB total (measured 2026-08-21 with VmHWM
-   instrumentation on the real tree; the standalone `symbolicate`
-   subcommand peaked 24 GB from exactly this). Stage 5 closed it:
-   `FuncRec.disasm` is a `Cow` view — `DisasmIndex::slice_cow` borrows a
-   byte range from the one loaded `disasm.lst` buffer whenever that is
-   byte-identical to the joined form (Unix `\n` separators, trailing
-   newline) and degrades to the owned `slice_for` copy otherwise (CRLF,
-   missing final newline) — pinned equal by tests. Verified by a
-   full-tree A/B of the standalone `symbolicate` on the real golden tree
-   (byte-identical; 24 GB → 1.8 GB, 15 s faster). **A full `decompose`
-   now peaks at ~7.7 GB — Ghidra's own analyze/export phase; the Rust
-   process peaks at ~2.5 GB (mostly owned Thumb bodies, real data).**
-- **Finalize rewrites are streaming, atomic, and byte-identical (Stage 4 of
-  the memory-envelope lever).** `symbolicate`'s stamping
-  (`rewrite_functions_json`: `original_name`/`name`/`annotations` by entry
-  address over both `functions.json` and `thumb_functions.json`) and
-  `body_c` renaming (`rewrite_body_c_in_thumb_functions`) run through the
-  shared element-wise rewriters `r2_thumb::stream_rewrite_json_array` /
-  `stream_rewrite_thumb_functions`: one element per `Value`, fragments
-  rendered at the canonical depth, atomic replace, unknown fields preserved
-  by construction. Invariants: the thumb-doc rewriter requires the
-  canonical shape (exactly `format` then `functions`) and passes the
-  `format` value through verbatim (never bumps it — enrich owns the bump);
-  the array rewriter requires a top-level array; both always rewrite when
-  the file exists and parses, matching the whole-file rewriters they
-  replaced. Verified byte-identical to the retired whole-file
-  implementations (kept as `#[cfg(test)]` oracles — do not delete) by the
-  inline differential tests and by a full-tree A/B of the standalone
-  `symbolicate` subcommand on the real golden tree vs the previous binary. Contract invariants, pinned by the differential oracle
-  plus the env-gated production replay: (1) **canonical input required, fail-closed**
-  — `thumb_functions.json` must be an object with exactly the keys `format`
-  then `functions` (an array); anything else returns `Err`. This is a
-  deliberate change from the old silent `Ok(0)` fail-open, where a
-  non-canonical document masqueraded as "nothing to enrich". (2)
-  **`populated == 0` ⇒ no write** — the uncommitted temp is dropped and the
-  on-disk file stays byte-identical. (3) **v2 bump on write** — `format`
-  moves to v2 iff at least one `body_c` was populated. (4) **Atomic
-  replace** via `AtomicWriteFile`: a reader sees the complete old file or
-  the complete new file, never a truncate-in-progress. The retired
-  whole-file rewriter (`thumb_enrich_whole`) and the legacy
-  `decompiled.c` body parser
-  (`parse_decompiled_c_function_bodies_by_addr`) stay in-tree as
-  `#[cfg(test)]` differential oracles — do not delete them; the env-gated
-  `streaming_enrich_ab_matches_oracle_on_production_inputs` test is the
-  production-scale pin.
+- **Shared Thumb capture streaming (Phase 2+).** `thumb_analysis::stream`
+  incrementally drains either analyzer into
+  `thumb/<addr:08x>.<producer>.stdout`, hashing the exact bytes while enforcing
+  `ANALYZER_STDOUT_CAP_BYTES = 4 GiB`. The backend-qualified capture is retained
+  after a successful attempt and its relative path, length, and lowercase BLAKE3
+  are committed to v3. Failed attempts retain finalized partial captures when possible;
+  spawn or capture-finalization failures record `stdout: null`. `--prune` removes the
+  retained `thumb/` tree while leaving that v3 identity intact. The cap remains grounded
+  in the historical mustang radare2 measurements (~1.82 GiB for the largest region and
+  ~3.65 GiB across five captures); do not lower or raise it without re-running the corpus gate.
+- **Streaming normalization is backend-aware.** `ValueScanner` consumes each
+  capture, pairs inventories and bodies with backend-specific rules, validates
+  boundaries, and spills normalized records to producer-qualified `.frags` files
+  before atomically assembling strict v3. Rizin additionally streams `axlj` values
+  through the selected-xref cap. Producer peak RSS is bounded by one JSON value;
+  enrichment, typed source recovery, and symbolication mutations also stream as
+  described below.
+- **Historical retained-capture replay is a boundary/conservation gate, not a byte
+  identity oracle.** The env-gated
+  `streaming_replays_retained_production_thumb_captures_with_v3_boundaries` test
+  accepts producer-qualified captures and old unqualified radare2 captures from
+  the retained pre-v3 tree, then proves that real inventories normalize under the
+  current v3 rules with conserving counts. Corrected boundaries and provenance
+  intentionally make byte comparison with the old v2 artifact invalid.
+- **`--no-thumb-decompile` does not disable the host analyzer.** It selects Ghidra
+  `datamark` mode and skips both `body_c` enrichment sweeps; dense-region radare2
+  analysis and opt-in failure-only Rizin fallback otherwise follow the same shared
+  route and limits.
+- **`thumb_enrich` is streaming, atomic, and bounded (memory-envelope Stage
+  2).** `decompile::thumb_enrich` collects `decompiled.c` bodies line-by-line
+  (~86 MB map on `02_MAIN`) and delegates the artifact rewrite to
+  `thumb_analysis::artifact`, which retains one function `Value` at a time.
+  Strict v3 metadata and producer-written fields are validated and preserved;
+  a changed v1 file promotes to v2, v2/v3 keep their format, and a semantic
+  no-op leaves the original bytes untouched. The production A/B over a 632 MB
+  artifact plus 86 MB C file measured 130 seconds and 2.29 GB peak RSS with
+  byte-identical output and equal populated counts versus the whole-file oracle.
+- **Typed source loading and zero-copy ARM disassembly complete Stages 3 and
+  5.** `RecoveredFunctions::load` reads `functions.json` and producer-owned
+  Thumb records through typed buffered readers; strict v3 run ownership is
+  resolved before records are exposed, with no document-wide `Value` tree.
+  The measured in-pipeline load fell to ~0.6 GB from ~20 GB. `FuncRec.disasm`
+  is a `Cow` view: `DisasmIndex::slice_cow` borrows ordinary newline-terminated
+  ranges and falls back to an owned `slice_for` copy only for CRLF or a missing
+  final newline. The standalone symbolication A/B was byte-identical and fell
+  from 24 GB to 1.8 GB; a full `decompose` now peaks near ~7.7 GB in Ghidra,
+  while the Rust process peaks near ~2.5 GB (mostly real owned Thumb bodies).
+- **Finalize rewrites stream and preserve strict v3 (Stage 4).** Symbolication's
+  `functions.json` stamps and Thumb `name`/`original_name`/`annotations`/`body_c`
+  changes use `stream_rewrite_json_array` and
+  `stream_rewrite_thumb_functions`. The latter validates metadata-first v3,
+  ordered run ownership and derived counts, rejects producer-field or unknown
+  field changes, and writes canonical metadata plus one function at a time.
+  Every rewrite is atomic and a no-op is byte-identical. Legacy mutation keeps
+  the established v1-to-v2 promotion. Differential whole-file oracles remain
+  test-only; the production-scale enrich replay is
+  `streaming_enrich_ab_matches_oracle_on_production_inputs`.
 - **Golden/production `body_c` embeds TWO enrich generations.** A completed
   tree's `thumb_functions.json` carries pass-1 residue (addresses whose
   bodies left the final `decompiled.c` when pass 2 overwrote it) plus the
@@ -1597,12 +1720,6 @@ hardcoded. Two reference images exercise both models end-to-end:
   (`streaming_enrich_ab_matches_oracle_on_production_inputs`), not a golden
   byte-compare. Anyone re-baselining goldens or writing enrich tests must
   know this, or they will chase a phantom mismatch.
-- **`stream_to_cap` helper.** The pure-I/O streaming loop is extracted
-  into `fn stream_to_cap<R, W>(reader, writer, cap) -> io::Result<usize>`
-  so it's unit-testable without spawning r2 (`Cursor<Vec<u8>>` readers,
-  `Vec<u8>` writers). Callers own process lifecycle (kill, reap,
-  file removal). Five inline unit tests cover happy path, cap-exceed,
-  empty input, exact-cap boundary, and the constant value.
 - **Provenance invariant for `functions.json`.** Pass 2 regenerates
   `functions.json` with recovered names in the `name` field (because
   `ApplySymbols.java` renamed in-program first). `rewrite_functions_json`
@@ -1708,8 +1825,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   (user-facing) and/or this file (contributor-facing) in the same change.
 - **Docs are the durable memory.** Here that means the facts this codebase makes you learn
   the hard way: a newly-pinned magic number or struct offset (→ README **Formats**, or a
-  comment in the parser module), non-obvious Ghidra / `analyzeHeadless` or radare2 Thumb
-  behavior and its failure modes (→ this file, or README **Ghidra + radare2**), and why a
+  comment in the parser module), non-obvious Ghidra / `analyzeHeadless` or host Thumb-analyzer
+  behavior and its failure modes (→ this file, or README **External code analysis**), and why a
   reconstruction or attribution threshold (`--gap`, `--shared-pct`, `--min-run`) sits where
   it does (→ a comment beside it). Record structure, offsets, and behavior only — never
   proprietary firmware bytes (see **Ground rules**).

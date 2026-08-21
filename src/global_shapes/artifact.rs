@@ -17,8 +17,6 @@ use std::io::Write;
 use std::path::Path;
 
 const GLOBALS_FORMAT: &str = "pixel-modem-extractor-globals-v1";
-const THUMB_V1_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v1";
-const THUMB_V2_FORMAT: &str = "pixel-modem-extractor-thumb-functions-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputHashes {
@@ -90,9 +88,26 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
             (None, ParsedInventory::empty())
         }
         Some((substantial, accepted, quarantined)) => {
-            let (hash, json) = read_json(&thumb_path)?;
-            let parsed = parse_thumb_inventory(&json, load_address, image_len)?;
-            drop(json);
+            let artifact = crate::thumb_analysis::read_thumb_artifact(
+                &thumb_path,
+                Some(crate::thumb_analysis::MappedImage::new(
+                    load_address,
+                    image_len,
+                )?),
+            )?;
+            let hash = artifact.source_blake3().to_owned();
+            let parsed =
+                parse_thumb_inventory(artifact.function_values(), load_address, image_len)?;
+            if artifact
+                .validated_v3_run_totals()
+                .is_some_and(|run_totals| {
+                    (parsed.substantial, parsed.accepted, parsed.quarantined) != run_totals
+                })
+            {
+                return Err(invalid(
+                    "thumb projection counts do not match validated v3 run totals",
+                ));
+            }
             if parsed.substantial != substantial
                 || parsed.accepted != accepted
                 || parsed.quarantined != quarantined
@@ -278,24 +293,10 @@ fn parse_ghidra_inventory(
 }
 
 fn parse_thumb_inventory(
-    value: &Value,
+    records: &[Value],
     image_start: u32,
     image_len: u32,
 ) -> Result<ParsedInventory> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| invalid("thumb_functions.json must be an object"))?;
-    let format = object
-        .get("format")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("thumb_functions format must be a string"))?;
-    if format != THUMB_V1_FORMAT && format != THUMB_V2_FORMAT {
-        return Err(invalid("unsupported thumb_functions format"));
-    }
-    let records = object
-        .get("functions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid("thumb_functions functions must be an array"))?;
     parse_inventory_records(records, false, image_start, image_len)
 }
 
@@ -868,6 +869,52 @@ mod tests {
 
     fn load_ok(request: &RunRequest<'_>) -> super::LoadedInputs {
         load_inputs(request).expect("valid fixture must load")
+    }
+
+    #[test]
+    fn loads_v3_thumb_inventory() {
+        let fixture = Fixture::new("v3_thumb_inventory");
+        fixture.write_manifest(u64::from(LOAD_ADDR));
+        fixture.write_image(&[0u8; 0x80]);
+        fixture.write_globals(&globals_file(&[]));
+        fixture.write_functions(&json!([]));
+        let thumb = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        fixture.write_thumb_bytes(thumb);
+        let bound = BoundRequest::from_fixture(&fixture, 0, 0, 0, Some(1), Some(1), Some(1), 0);
+
+        let loaded = load_ok(&bound.get());
+        assert_eq!(
+            loaded.hashes.thumb_functions_blake3,
+            Some(blake3_bytes(thumb))
+        );
+        assert_eq!(loaded.functions.len(), 1);
+        assert_eq!(loaded.functions[0].identity.entry, 0x4000);
+        assert_eq!(
+            loaded.functions[0].identity.decode_ranges,
+            vec![DecodeRange {
+                start: 0x4000,
+                end: 0x4008,
+                isa: DecodeIsa::Thumb,
+            }]
+        );
+        assert_eq!(
+            loaded.source_counts,
+            SourceProjectionCounts {
+                ghidra_accepted: 0,
+                ghidra_quarantined: 0,
+                thumb_accepted: 1,
+                thumb_quarantined: 1,
+                quarantine_errors: 1,
+            }
+        );
+
+        fixture.write_thumb_bytes(
+            &crate::thumb_analysis::ParsedThumbArtifact::malformed_consumer_v3_fixture(),
+        );
+        assert_eq!(
+            load_inputs(&bound.get()).unwrap_err().to_string(),
+            "serialize: invalid Thumb artifact: v3 run 0 stored counts do not match its functions"
+        );
     }
 
     #[test]

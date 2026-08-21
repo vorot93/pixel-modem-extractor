@@ -31,11 +31,16 @@ tar = "0.4"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+typed-path = "0.12.3"
 
 # Unix-only: Surface B's tighten-watch kills the Ghidra process group
 # (`analyzeHeadless` bash launcher + its Java grandchild) via `kill(-pgid, SIGKILL)`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.188"
+
+[target."cfg(windows)".dependencies]
+# Cancel blocking version-probe pipe reads before joining their threads.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_IO"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -1,6 +1,7 @@
 //! `decompose` — the exhaustive one-command pipeline. Runs extraction, decompiles
-//! every modem image (Ghidra + radare2), and runs every decoder, marshaling all
-//! outputs into one per-image tree with a machine-readable `report.json`. Best-effort:
+//! every modem image (Ghidra plus configured dense-Thumb analyzers), and runs every
+//! decoder, marshaling all outputs into one per-image tree with a machine-readable
+//! `report.json`. Best-effort:
 //! a stage failure is recorded and the run continues; the process exits non-zero if
 //! anything failed. `--prune` reduces the tree to only the terminal ("leaf") artifacts.
 
@@ -30,6 +31,9 @@ pub struct Opts {
     /// (Phase-1 behavior) and `thumb_enrich` does not run for either pass.
     /// The public `--no-thumb-decompile` clap flag wires to this field.
     pub no_thumb_decompile: bool,
+    /// Enable Rizin as a failure-only fallback for dense Thumb regions.
+    /// radare2 remains required and is always attempted first. Default false.
+    pub rizin_fallback: bool,
     /// Phase 2 / Surface B: test-only override that bypasses
     /// `baseline * wall_clock_multiplier` and supplies an absolute wall-clock
     /// budget for the tighten-watch kill decision. Wired to the hidden
@@ -53,7 +57,7 @@ pub struct Opts {
     /// Default: apply.
     pub no_apply_global_types: bool,
     /// Opaque-image escape hatch: when true, images whose battery is
-    /// unanimously opaque still run Ghidra + radare2 exactly as before
+    /// unanimously opaque still run Ghidra + configured Thumb analyzers
     /// (run-everything behavior, for research). Default false (skip —
     /// nothing is recoverable from those bytes under the standard import).
     /// Wired to `--no-skip-opaque`.
@@ -71,13 +75,23 @@ pub struct ImageReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<&'static str>,
     /// Why a skipped image was skipped: "opaque" (unanimous battery verdict;
-    /// no Ghidra/radare2 ran, no decompiled/ sidecars exist).
+    /// no Ghidra or Thumb analyzer ran, no decompiled/ sidecars exist).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub functions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_functions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_regions_requested: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_regions_succeeded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_regions_failed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_radare2_runs: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_rizin_runs: Option<usize>,
     /// Current Ghidra records with accepted execution projections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ghidra_execution_accepted: Option<usize>,
@@ -92,6 +106,11 @@ pub struct ImageReport {
     pub thumb_execution_quarantined: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_error: Option<String>,
+    /// Reason-only terminal-validation failure: Ghidra completed but the export
+    /// pair could not be certified as this run's output. Present exactly when
+    /// the outcome is `ImageOutcome::TerminalInvalid`, which reports no `exit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,137 +185,73 @@ pub struct ImageReport {
 
 impl ImageReport {
     pub fn from_result(r: &decompile::ImageResult) -> Self {
-        match r.outcome {
-            ImageOutcome::Analyzed(n) => ImageReport {
-                image: r.label.clone(),
-                status: if r.thumb_error.is_some() {
+        let (status, classification, skipped_reason, functions, exit) = match r.outcome {
+            ImageOutcome::Analyzed(n) => (
+                if r.thumb_error.is_some() {
                     "failed"
                 } else {
                     "analyzed"
                 },
-                classification: r.classification,
-                skipped_reason: None,
-                functions: Some(n),
-                thumb_functions: r.thumb_functions,
-                ghidra_execution_accepted: r.ghidra_execution_accepted,
-                ghidra_execution_quarantined: r.ghidra_execution_quarantined,
-                thumb_execution_accepted: r.thumb_execution_accepted,
-                thumb_execution_quarantined: r.thumb_execution_quarantined,
-                thumb_error: r.thumb_error.clone(),
-                exit: None,
-                pass2_applied: r.pass2_applied,
-                pass2_error: r.pass2_error.clone(),
-                globals_applied: r.globals_applied,
-                globals_apply_skipped: r.globals_apply_skipped,
-                globals_apply_error: r.globals_apply_error.clone(),
-                thumb_decompiled: r.thumb_decompiled,
-                thumb_tighten_error: r.thumb_tighten_error.clone(),
-                thumb_enrich_error: r.thumb_enrich_error.clone(),
-                globals_error: r.globals_error.clone(),
-                globals_recovered: r.globals_recovered,
-                globals_provisional: r.globals_provisional,
-                globals_provisional_suppressed: r.globals_provisional_suppressed,
-                global_shapes_inferred: None,
-                global_shapes_no_evidence: None,
-                global_shapes_conflicting: None,
-                global_shape_observations: None,
-                global_shapes_ghidra_quarantined: None,
-                global_shapes_thumb_quarantined: None,
-                global_shapes_quarantine_errors: None,
-                global_shapes_decode_failures: None,
-                global_shapes_state_barriers: None,
-                global_shapes_error: None,
-                global_types_applied: None,
-                global_types_candidates: None,
-                global_types_ineligible: None,
-                global_types_skipped: None,
-                global_types_error: None,
-            },
-            ImageOutcome::Failed(code) => ImageReport {
-                image: r.label.clone(),
-                status: "failed",
-                classification: None,
-                skipped_reason: None,
-                functions: None,
-                thumb_functions: r.thumb_functions,
-                ghidra_execution_accepted: r.ghidra_execution_accepted,
-                ghidra_execution_quarantined: r.ghidra_execution_quarantined,
-                thumb_execution_accepted: r.thumb_execution_accepted,
-                thumb_execution_quarantined: r.thumb_execution_quarantined,
-                thumb_error: r.thumb_error.clone(),
-                exit: Some(code),
-                pass2_applied: r.pass2_applied,
-                pass2_error: r.pass2_error.clone(),
-                globals_applied: r.globals_applied,
-                globals_apply_skipped: r.globals_apply_skipped,
-                globals_apply_error: r.globals_apply_error.clone(),
-                thumb_decompiled: r.thumb_decompiled,
-                thumb_tighten_error: r.thumb_tighten_error.clone(),
-                thumb_enrich_error: r.thumb_enrich_error.clone(),
-                globals_error: r.globals_error.clone(),
-                globals_recovered: r.globals_recovered,
-                globals_provisional: r.globals_provisional,
-                globals_provisional_suppressed: r.globals_provisional_suppressed,
-                global_shapes_inferred: None,
-                global_shapes_no_evidence: None,
-                global_shapes_conflicting: None,
-                global_shape_observations: None,
-                global_shapes_ghidra_quarantined: None,
-                global_shapes_thumb_quarantined: None,
-                global_shapes_quarantine_errors: None,
-                global_shapes_decode_failures: None,
-                global_shapes_state_barriers: None,
-                global_shapes_error: None,
-                global_types_applied: None,
-                global_types_candidates: None,
-                global_types_ineligible: None,
-                global_types_skipped: None,
-                global_types_error: None,
-            },
-            // Unanimously-opaque image: Ghidra and radare2 never ran, so there
-            // is no export to count, no exit code, and no Thumb inventory —
-            // only the battery verdict that caused the skip.
-            ImageOutcome::SkippedOpaque(_) => ImageReport {
-                image: r.label.clone(),
-                status: "skipped",
-                classification: Some("opaque"),
-                skipped_reason: Some("opaque"),
-                functions: None,
-                thumb_functions: r.thumb_functions,
-                ghidra_execution_accepted: r.ghidra_execution_accepted,
-                ghidra_execution_quarantined: r.ghidra_execution_quarantined,
-                thumb_execution_accepted: r.thumb_execution_accepted,
-                thumb_execution_quarantined: r.thumb_execution_quarantined,
-                thumb_error: r.thumb_error.clone(),
-                exit: None,
-                pass2_applied: r.pass2_applied,
-                pass2_error: r.pass2_error.clone(),
-                globals_applied: r.globals_applied,
-                globals_apply_skipped: r.globals_apply_skipped,
-                globals_apply_error: r.globals_apply_error.clone(),
-                thumb_decompiled: r.thumb_decompiled,
-                thumb_tighten_error: r.thumb_tighten_error.clone(),
-                thumb_enrich_error: r.thumb_enrich_error.clone(),
-                globals_error: r.globals_error.clone(),
-                globals_recovered: r.globals_recovered,
-                globals_provisional: r.globals_provisional,
-                globals_provisional_suppressed: r.globals_provisional_suppressed,
-                global_shapes_inferred: None,
-                global_shapes_no_evidence: None,
-                global_shapes_conflicting: None,
-                global_shape_observations: None,
-                global_shapes_ghidra_quarantined: None,
-                global_shapes_thumb_quarantined: None,
-                global_shapes_quarantine_errors: None,
-                global_shapes_decode_failures: None,
-                global_shapes_state_barriers: None,
-                global_shapes_error: None,
-                global_types_applied: None,
-                global_types_candidates: None,
-                global_types_ineligible: None,
-                global_types_skipped: None,
-                global_types_error: None,
-            },
+                r.classification,
+                None,
+                Some(n),
+                None,
+            ),
+            ImageOutcome::Failed(code) => ("failed", None, None, None, Some(code)),
+            // Ghidra completed, so there is no analyzeHeadless exit code to
+            // report; `terminal_error` carries the actionable reason.
+            ImageOutcome::TerminalInvalid => ("failed", r.classification, None, None, None),
+            // No analysis process ran for a unanimously opaque image.
+            ImageOutcome::SkippedOpaque(_) => {
+                ("skipped", Some("opaque"), Some("opaque"), None, None)
+            }
+        };
+        ImageReport {
+            image: r.label.clone(),
+            status,
+            classification,
+            skipped_reason,
+            functions,
+            thumb_functions: r.thumb_functions,
+            thumb_regions_requested: r.thumb_regions_requested,
+            thumb_regions_succeeded: r.thumb_regions_succeeded,
+            thumb_regions_failed: r.thumb_regions_failed,
+            thumb_radare2_runs: r.thumb_radare2_runs,
+            thumb_rizin_runs: r.thumb_rizin_runs,
+            ghidra_execution_accepted: r.ghidra_execution_accepted,
+            ghidra_execution_quarantined: r.ghidra_execution_quarantined,
+            thumb_execution_accepted: r.thumb_execution_accepted,
+            thumb_execution_quarantined: r.thumb_execution_quarantined,
+            thumb_error: r.thumb_error.clone(),
+            terminal_error: r.terminal_error.clone(),
+            exit,
+            pass2_applied: r.pass2_applied,
+            pass2_error: r.pass2_error.clone(),
+            globals_applied: r.globals_applied,
+            globals_apply_skipped: r.globals_apply_skipped,
+            globals_apply_error: r.globals_apply_error.clone(),
+            thumb_decompiled: r.thumb_decompiled,
+            thumb_tighten_error: r.thumb_tighten_error.clone(),
+            thumb_enrich_error: r.thumb_enrich_error.clone(),
+            globals_error: r.globals_error.clone(),
+            globals_recovered: r.globals_recovered,
+            globals_provisional: r.globals_provisional,
+            globals_provisional_suppressed: r.globals_provisional_suppressed,
+            global_shapes_inferred: None,
+            global_shapes_no_evidence: None,
+            global_shapes_conflicting: None,
+            global_shape_observations: None,
+            global_shapes_ghidra_quarantined: None,
+            global_shapes_thumb_quarantined: None,
+            global_shapes_quarantine_errors: None,
+            global_shapes_decode_failures: None,
+            global_shapes_state_barriers: None,
+            global_shapes_error: None,
+            global_types_applied: None,
+            global_types_candidates: None,
+            global_types_ineligible: None,
+            global_types_skipped: None,
+            global_types_error: None,
         }
     }
 }
@@ -365,9 +320,15 @@ impl StageReport {
 }
 
 #[derive(Debug, Serialize)]
-pub struct GhidraTools {
+pub struct AnalysisTools {
     pub headless: String,
     pub radare2: String,
+    pub radare2_version: String,
+    pub rizin_fallback: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rizin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rizin_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,7 +339,11 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modem_generation: Option<String>,
     pub out: String,
-    pub ghidra: GhidraTools,
+    pub ghidra: AnalysisTools,
+    /// Whether `--prune` was requested.
+    pub prune_requested: bool,
+    /// Whether the leaves-only sweep actually completed. A failed sweep leaves
+    /// a partially cleaned tree, so automation must not read intent as state.
     pub pruned: bool,
     pub ok: bool,
     pub stages: Vec<StageReport>,
@@ -390,13 +355,72 @@ impl Report {
     }
 }
 
-/// Both tools are hard requirements; error before anything is written if either is absent.
-fn preflight(headless: Result<PathBuf>, r2: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
+/// Ghidra and radare2 are hard requirements. Rizin is discovered only for an
+/// explicit fallback opt-in; every configured tool must be usable before output.
+fn preflight(
+    headless: Result<PathBuf>,
+    radare2: Result<crate::thumb_analysis::ProducerIdentity>,
+    rizin_fallback: bool,
+    discover_rizin: impl FnOnce() -> Result<crate::thumb_analysis::ProducerIdentity>,
+) -> Result<(PathBuf, crate::thumb_analysis::ThumbTools)> {
     let headless = headless?;
-    let r2 = r2.ok_or_else(|| {
-        Error::ToolNotFound("radare2 (r2) on PATH — required by `decompose`".into())
-    })?;
-    Ok((headless, r2))
+    let radare2 = radare2?;
+    let rizin = decompile::discover_configured_rizin(rizin_fallback, discover_rizin)?;
+    Ok((
+        headless,
+        crate::thumb_analysis::ThumbTools { radare2, rizin },
+    ))
+}
+
+fn analysis_tools(
+    headless: &Path,
+    opts: &Opts,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+) -> AnalysisTools {
+    AnalysisTools {
+        headless: headless.display().to_string(),
+        radare2: thumb_tools.radare2.executable.display().to_string(),
+        radare2_version: thumb_tools.radare2.version.clone(),
+        rizin_fallback: opts.rizin_fallback,
+        rizin: thumb_tools
+            .rizin
+            .as_ref()
+            .map(|identity| identity.executable.display().to_string()),
+        rizin_version: thumb_tools
+            .rizin
+            .as_ref()
+            .map(|identity| identity.version.clone()),
+    }
+}
+
+fn run_decompile_report(
+    modem_bin: &Path,
+    opts: &decompile::Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+) -> Result<decompile::DecompileReport> {
+    run_decompile_report_with(
+        modem_bin,
+        opts,
+        out,
+        thumb_tools,
+        decompile::run_report_with_thumb_tools,
+    )
+}
+
+fn run_decompile_report_with(
+    modem_bin: &Path,
+    opts: &decompile::Opts,
+    out: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
+    run_report: impl FnOnce(
+        &Path,
+        &decompile::Opts,
+        &Path,
+        &crate::thumb_analysis::ThumbTools,
+    ) -> Result<decompile::DecompileReport>,
+) -> Result<decompile::DecompileReport> {
+    run_report(modem_bin, opts, out, thumb_tools)
 }
 
 /// The single `<out>/rootfs/images/<sub>/` directory `extract` produced.
@@ -783,14 +807,14 @@ fn decompile_pass2_stage(
     }
 }
 
-/// Phase 2: run `r2_thumb::thumb_enrich` (streaming) against each image's
+/// Phase 2: run `decompile::thumb_enrich` (streaming) against each image's
 /// `images/<label>/decompiled/{decompiled.c,thumb_functions.json}`. Mutates each
 /// `ImageResult.thumb_decompiled` (count) or `thumb_enrich_error` (failure text)
 /// in place. Returns the per-image outcome so the caller can build a StageReport.
 ///
 /// Missing `thumb_functions.json`:
 /// - `thumb_functions == None` → legitimate "no Thumb regions"; skip silently.
-/// - `thumb_functions == Some(_)` → radare2 reported Thumb output but the JSON
+/// - `thumb_functions == Some(_)` → Thumb analysis reported output but the JSON
 ///   is gone (e.g. destroyed by a buggy pass-2 refresh); record
 ///   `thumb_enrich_error` and a stage error so the loss cannot go green.
 fn run_thumb_enrich_per_image(
@@ -810,14 +834,14 @@ fn run_thumb_enrich_per_image(
             .join("thumb_functions.json");
         if !thumb_json.exists() {
             if ir.thumb_functions.is_some() {
-                let msg = "thumb_functions.json missing after radare2 reported Thumb functions"
+                let msg = "thumb_functions.json missing after Thumb analysis reported functions"
                     .to_string();
                 ir.thumb_enrich_error = Some(msg.clone());
                 outcome.errors.push((label.clone(), msg));
             }
             continue;
         }
-        match crate::r2_thumb::thumb_enrich(&decompiled_c, &thumb_json) {
+        match decompile::thumb_enrich(&decompiled_c, &thumb_json) {
             Ok(n) => {
                 ir.thumb_decompiled = Some(n);
                 outcome.counts.push((label.clone(), n));
@@ -950,6 +974,7 @@ fn prune(out: &Path) -> Result<()> {
                 && let Some(label) = dir.file_name().and_then(|n| n.to_str())
             {
                 remove_any(&dir.join(format!("{label}.bin")))?;
+                remove_any(&dir.join("decompiled/thumb"))?;
             }
         }
     }
@@ -975,14 +1000,16 @@ fn run_stage(
 }
 
 /// Write `report.json`; return its path on full success, or `Err` if any stage failed.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     out: &Path,
     img: &Path,
     opts: &Opts,
     headless: &Path,
-    r2: &Path,
+    thumb_tools: &crate::thumb_analysis::ThumbTools,
     stages: Vec<StageReport>,
     modem_generation: Option<String>,
+    pruned: bool,
 ) -> Result<PathBuf> {
     let ok = Report::is_ok(&stages);
     let report = Report {
@@ -991,11 +1018,9 @@ fn finalize(
         source_blake3: manifest::blake3_file(img).unwrap_or_default(),
         modem_generation,
         out: out.display().to_string(),
-        ghidra: GhidraTools {
-            headless: headless.display().to_string(),
-            radare2: r2.display().to_string(),
-        },
-        pruned: opts.prune,
+        ghidra: analysis_tools(headless, opts, thumb_tools),
+        prune_requested: opts.prune,
+        pruned,
         ok,
         stages,
     };
@@ -2202,13 +2227,16 @@ fn build_and_write_symbol_maps(
     (out_maps, errors)
 }
 
-/// Exhaustive pipeline into one per-image tree. Ghidra + radare2 required (probed
-/// first). Best-effort across stages; writes `report.json`; `Err` if any stage failed.
+/// Exhaustive pipeline into one per-image tree. Ghidra and radare2 are required;
+/// configured Rizin fallback is also probed first. Best-effort across stages;
+/// writes `report.json`; `Err` if any stage failed.
 pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
-    // 1. Preflight — both tools required, before anything is written.
-    let (headless, r2) = preflight(
+    // 1. Preflight every required or configured tool before anything is written.
+    let (headless, thumb_tools) = preflight(
         decompile::find_headless(opts.ghidra_home.as_deref()).map(|g| g.headless),
-        decompile::find_radare2(),
+        crate::thumb_analysis::discover_radare2(),
+        opts.rizin_fallback,
+        crate::thumb_analysis::discover_rizin,
     )?;
     std::fs::create_dir_all(out)?;
     let mut stages: Vec<StageReport> = Vec::new();
@@ -2234,14 +2262,33 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 e.to_string(),
                 t.elapsed().as_millis(),
             ));
-            return finalize(out, img, opts, &headless, &r2, stages, modem_label.clone()); // nothing to analyze
+            return finalize(
+                out,
+                img,
+                opts,
+                &headless,
+                &thumb_tools,
+                stages,
+                modem_label.clone(),
+                // These early returns precede the prune stage.
+                false,
+            ); // nothing to analyze
         }
     }
     let rootfs = match rootfs_image_dir(out) {
         Ok(p) => p,
         Err(e) => {
             stages.push(StageReport::failed("locate_rootfs", e.to_string(), 0));
-            return finalize(out, img, opts, &headless, &r2, stages, modem_label.clone());
+            return finalize(
+                out,
+                img,
+                opts,
+                &headless,
+                &thumb_tools,
+                stages,
+                modem_label.clone(),
+                false,
+            );
         }
     };
     let modem_bin = rootfs.join("modem.bin");
@@ -2257,15 +2304,22 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         ghidra_home: opts.ghidra_home.clone(),
         processor: opts.processor.clone(),
         no_thumb_decompile: opts.no_thumb_decompile,
+        rizin_fallback: opts.rizin_fallback,
         tighten_wall_clock_budget_override: opts.tighten_wall_clock_budget_override,
         no_skip_opaque: opts.no_skip_opaque,
     };
-    let mut pass1_report = match decompile::run_report(&modem_bin, &dopts, &ghidra_dir) {
+    let mut pass1_report = match run_decompile_report(&modem_bin, &dopts, &ghidra_dir, &thumb_tools)
+    {
         Ok(rep) => {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
             for ir in &rep.images {
-                let scatter_state = if matches!(ir.outcome, ImageOutcome::Failed(_)) {
+                // A rejected export is as unusable as a failed Ghidra run, so
+                // its runtime scatter map stays unmanaged either way.
+                let scatter_state = if matches!(
+                    ir.outcome,
+                    ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid
+                ) {
                     decompile::RuntimeScatterState::Unmanaged
                 } else {
                     rep.runtime_scatter_state(&ir.label)
@@ -2781,12 +2835,37 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     });
 
     // 6. Prune (opt-in) then write the report.
-    if opts.prune
-        && let Err(e) = prune(out)
-    {
-        stages.push(StageReport::failed("prune", e.to_string(), 0));
+    let pruned = run_prune_stage(&mut stages, opts.prune, || prune(out));
+    finalize(
+        out,
+        img,
+        opts,
+        &headless,
+        &thumb_tools,
+        stages,
+        modem_label.clone(),
+        pruned,
+    )
+}
+
+/// Run the opt-in leaves-only sweep, recording a failed stage when it does not
+/// complete. Returns whether the tree was actually pruned, so `report.json`
+/// reports successful state rather than intent.
+fn run_prune_stage(
+    stages: &mut Vec<StageReport>,
+    requested: bool,
+    prune: impl FnOnce() -> Result<()>,
+) -> bool {
+    if !requested {
+        return false;
     }
-    finalize(out, img, opts, &headless, &r2, stages, modem_label.clone())
+    match prune() {
+        Ok(()) => true,
+        Err(error) => {
+            stages.push(StageReport::failed("prune", error.to_string(), 0));
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2802,6 +2881,11 @@ mod tests {
         symbolicate::Symbol {
             address: address.to_string(),
             arch,
+            tool: if arch == "thumb" {
+                crate::recover_source::Tool::Radare2
+            } else {
+                crate::recover_source::Tool::Ghidra
+            },
             original_name: format!("original_{address}"),
             name: name.map(str::to_string),
             tier,
@@ -2816,6 +2900,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(1),
             classification: Some("not_opaque"),
             thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -2823,6 +2912,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -2838,6 +2928,37 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+        }
+    }
+
+    fn producer_identity(
+        producer: crate::thumb_analysis::ThumbProducer,
+        executable: &str,
+        version: &str,
+    ) -> crate::thumb_analysis::ProducerIdentity {
+        crate::thumb_analysis::ProducerIdentity {
+            producer,
+            executable: executable.into(),
+            version: version.into(),
+            command: producer.command(),
+        }
+    }
+
+    fn analysis_opts(rizin_fallback: bool) -> Opts {
+        Opts {
+            no_verify: false,
+            prune: false,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_symbol_pass: false,
+            no_thumb_decompile: false,
+            rizin_fallback,
+            tighten_wall_clock_budget_override: None,
+            globals_provisional: false,
+            globals_k_arm: None,
+            globals_k_thumb: None,
+            no_apply_global_types: false,
+            no_skip_opaque: false,
         }
     }
 
@@ -2891,6 +3012,36 @@ mod tests {
         assert_eq!(json["classification"], "not_opaque");
         assert!(json.get("skipped_reason").is_none());
         assert!(json["functions"].is_u64());
+    }
+
+    #[test]
+    fn image_report_keeps_partial_thumb_success_analyzed() {
+        let mut image = analyzed_image("02_MAIN");
+        image.thumb_functions = Some(7);
+        image.thumb_regions_requested = Some(3);
+        image.thumb_regions_succeeded = Some(2);
+        image.thumb_regions_failed = Some(1);
+        image.thumb_radare2_runs = Some(1);
+        image.thumb_rizin_runs = Some(1);
+
+        let json = serde_json::to_value(ImageReport::from_result(&image)).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "image": "02_MAIN",
+                "status": "analyzed",
+                "classification": "not_opaque",
+                "functions": 1,
+                "thumb_functions": 7,
+                "thumb_regions_requested": 3,
+                "thumb_regions_succeeded": 2,
+                "thumb_regions_failed": 1,
+                "thumb_radare2_runs": 1,
+                "thumb_rizin_runs": 1
+            })
+        );
+        assert!(json.get("thumb_error").is_none());
     }
 
     fn tagged_thumb_functions() -> Vec<u8> {
@@ -2948,6 +3099,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x0000ABCD".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_abcd".into(),
                 name: Some("recovered_name".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -2957,6 +3109,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "000000EF".into(),
                 arch: "thumb",
+                tool: crate::recover_source::Tool::Radare2,
                 original_name: "thumb_ef".into(),
                 name: Some("provisional_name".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -2966,6 +3119,7 @@ mod tests {
             symbolicate::Symbol {
                 address: "0x00000012".into(),
                 arch: "arm",
+                tool: crate::recover_source::Tool::Ghidra,
                 original_name: "FUN_12".into(),
                 name: None,
                 tier: symbolicate::Tier::None,
@@ -3048,9 +3202,11 @@ mod tests {
             projection.name_for(globals::Arch::Arm, 0xabcd),
             Some("ARM_SHARED")
         );
+        // Each ISA projects only its own symbol: the ARM entry at 0xef keeps
+        // its own recovered name instead of the Thumb entry's.
         assert_eq!(
             projection.name_for(globals::Arch::Arm, 0xef),
-            Some("PROVISIONAL_EF")
+            Some("RECOVERED_EF")
         );
         assert_eq!(
             projection.name_for(globals::Arch::Arm, 0xa2),
@@ -3061,10 +3217,8 @@ mod tests {
             projection.name_for(globals::Arch::Thumb, 0xef),
             Some("PROVISIONAL_EF")
         );
-        assert_eq!(
-            projection.name_for(globals::Arch::Thumb, 0xa2),
-            Some("UPPER_A2")
-        );
+        // 0xa2 has only an ARM symbol, so no Thumb record is renamed there.
+        assert_eq!(projection.name_for(globals::Arch::Thumb, 0xa2), None);
     }
 
     #[test]
@@ -4581,6 +4735,18 @@ mod tests {
 
     #[test]
     fn report_serializes_and_ok_reflects_failure() {
+        let thumb_tools = crate::thumb_analysis::ThumbTools {
+            radare2: producer_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/usr/bin/r2",
+                "radare2 6.1.4",
+            ),
+            rizin: Some(producer_identity(
+                crate::thumb_analysis::ThumbProducer::Rizin,
+                "/usr/bin/rizin",
+                "rizin 0.8.2",
+            )),
+        };
         let stages = vec![
             StageReport::ok("extract", "manifest.json", 5),
             StageReport::decompile(
@@ -4592,11 +4758,17 @@ mod tests {
                         skipped_reason: None,
                         functions: Some(3),
                         thumb_functions: Some(1),
+                        thumb_regions_requested: None,
+                        thumb_regions_succeeded: None,
+                        thumb_regions_failed: None,
+                        thumb_radare2_runs: None,
+                        thumb_rizin_runs: None,
                         ghidra_execution_accepted: None,
                         ghidra_execution_quarantined: None,
                         thumb_execution_accepted: None,
                         thumb_execution_quarantined: None,
                         thumb_error: None,
+                        terminal_error: None,
                         exit: None,
                         pass2_applied: None,
                         pass2_error: None,
@@ -4633,11 +4805,17 @@ mod tests {
                         skipped_reason: None,
                         functions: None,
                         thumb_functions: None,
+                        thumb_regions_requested: None,
+                        thumb_regions_succeeded: None,
+                        thumb_regions_failed: None,
+                        thumb_radare2_runs: None,
+                        thumb_rizin_runs: None,
                         ghidra_execution_accepted: None,
                         ghidra_execution_quarantined: None,
                         thumb_execution_accepted: None,
                         thumb_execution_quarantined: None,
                         thumb_error: None,
+                        terminal_error: None,
                         exit: Some(1),
                         pass2_applied: None,
                         pass2_error: None,
@@ -4685,10 +4863,12 @@ mod tests {
             source_blake3: "abc".into(),
             modem_generation: None,
             out: "radio.decomposed".into(),
-            ghidra: GhidraTools {
-                headless: "/g/analyzeHeadless".into(),
-                radare2: "/usr/bin/r2".into(),
-            },
+            ghidra: analysis_tools(
+                Path::new("/g/analyzeHeadless"),
+                &analysis_opts(true),
+                &thumb_tools,
+            ),
+            prune_requested: false,
             pruned: false,
             ok: Report::is_ok(&stages),
             stages,
@@ -4702,6 +4882,17 @@ mod tests {
         assert_eq!(v["stages"][1]["images"][1]["exit"], 1);
         assert_eq!(v["stages"][2]["status"], "skipped");
         assert_eq!(v["stages"][2]["reason"], "no pw_token_db");
+        assert_eq!(
+            v["ghidra"],
+            serde_json::json!({
+                "headless": "/g/analyzeHeadless",
+                "radare2": "/usr/bin/r2",
+                "radare2_version": "radare2 6.1.4",
+                "rizin_fallback": true,
+                "rizin": "/usr/bin/rizin",
+                "rizin_version": "rizin 0.8.2"
+            })
+        );
         let stage = |name: &str| {
             v["stages"]
                 .as_array()
@@ -4764,6 +4955,54 @@ mod tests {
     }
 
     #[test]
+    fn analysis_tools_serialize_exact_enabled_and_disabled_identities() {
+        let radare2 = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            "/usr/bin/r2",
+            "radare2 6.1.4",
+        );
+        let rizin = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            "/usr/bin/rizin",
+            "rizin 0.8.2",
+        );
+        for (enabled, expected) in [
+            (
+                false,
+                serde_json::json!({
+                    "headless": "/g/analyzeHeadless",
+                    "radare2": "/usr/bin/r2",
+                    "radare2_version": "radare2 6.1.4",
+                    "rizin_fallback": false
+                }),
+            ),
+            (
+                true,
+                serde_json::json!({
+                    "headless": "/g/analyzeHeadless",
+                    "radare2": "/usr/bin/r2",
+                    "radare2_version": "radare2 6.1.4",
+                    "rizin_fallback": true,
+                    "rizin": "/usr/bin/rizin",
+                    "rizin_version": "rizin 0.8.2"
+                }),
+            ),
+        ] {
+            let tools = crate::thumb_analysis::ThumbTools {
+                radare2: radare2.clone(),
+                rizin: enabled.then(|| rizin.clone()),
+            };
+            let json = serde_json::to_value(analysis_tools(
+                Path::new("/g/analyzeHeadless"),
+                &analysis_opts(enabled),
+                &tools,
+            ))
+            .unwrap();
+            assert_eq!(json, expected);
+        }
+    }
+
+    #[test]
     fn image_report_distinguishes_uninvoked_executed_zero_and_failed_global_application() {
         // This catches the ImageReport mirror dropping the raw pass-2 outcome,
         // collapsing executed zero into absent, or serializing stale success
@@ -4823,6 +5062,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(42),
             classification: Some("not_opaque"),
             thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -4830,6 +5074,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -4870,6 +5115,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(7),
             classification: Some("not_opaque"),
             thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -4877,6 +5127,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -4972,6 +5223,11 @@ mod tests {
                 outcome: ImageOutcome::Analyzed(10),
                 classification: Some("not_opaque"),
                 thumb_functions: Some(1),
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -4979,6 +5235,7 @@ mod tests {
                 image_start: 0,
                 image_len: 0,
                 thumb_error: None,
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5000,6 +5257,11 @@ mod tests {
                 outcome: ImageOutcome::Analyzed(3),
                 classification: Some("not_opaque"),
                 thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
                 ghidra_execution_accepted: None,
                 ghidra_execution_quarantined: None,
                 thumb_execution_accepted: None,
@@ -5007,6 +5269,7 @@ mod tests {
                 image_start: 0,
                 image_len: 0,
                 thumb_error: None,
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5067,6 +5330,11 @@ mod tests {
             classification: Some("not_opaque"),
             // In-memory result says radare2 produced Thumb output.
             thumb_functions: Some(5),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -5074,6 +5342,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -5134,11 +5403,17 @@ mod tests {
             skipped_reason: None,
             functions: Some(107_955),
             thumb_functions: Some(117_444),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
             thumb_execution_quarantined: None,
             thumb_error: None,
+            terminal_error: None,
             exit: None,
             pass2_applied: None,
             pass2_error: None,
@@ -5176,6 +5451,11 @@ mod tests {
             outcome: decompile::ImageOutcome::Analyzed(107_955),
             classification: Some("not_opaque"),
             thumb_functions: Some(117_444),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -5183,6 +5463,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: Some(81_763), // post-enrich
@@ -5242,6 +5523,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(0),
             classification: Some("not_opaque"),
             thumb_functions: Some(0),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -5249,6 +5535,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -5282,18 +5569,137 @@ mod tests {
     }
 
     #[test]
-    fn preflight_requires_both_tools() {
+    fn preflight_requires_primary_tools_and_discovers_rizin_only_when_enabled() {
         let g = PathBuf::from("/opt/ghidra/support/analyzeHeadless");
-        let r = PathBuf::from("/usr/bin/r2");
-        assert!(preflight(Ok(g.clone()), Some(r.clone())).is_ok());
+        let r = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            "/usr/bin/r2",
+            "radare2 6.1.4",
+        );
+        let z = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            "/usr/bin/rizin",
+            "rizin 0.8.2",
+        );
+
+        let (_, tools) = preflight(Ok(g.clone()), Ok(r.clone()), false, || -> Result<_> {
+            panic!("disabled Rizin fallback must not run discovery")
+        })
+        .unwrap();
+        assert_eq!(tools.radare2, r);
+        assert!(tools.rizin.is_none());
+
+        let (_, tools) = preflight(Ok(g.clone()), Ok(r.clone()), true, || Ok(z.clone())).unwrap();
+        assert_eq!(tools.rizin, Some(z));
+
         assert!(matches!(
-            preflight(Err(Error::GhidraNotFound("x".into())), Some(r.clone())),
+            preflight(
+                Err(Error::GhidraNotFound("x".into())),
+                Ok(r.clone()),
+                false,
+                || unreachable!()
+            ),
             Err(Error::GhidraNotFound(_))
         ));
         assert!(matches!(
-            preflight(Ok(g), None),
+            preflight(
+                Ok(g.clone()),
+                Err(Error::ToolNotFound("radare2 unavailable".into())),
+                false,
+                || unreachable!()
+            ),
             Err(Error::ToolNotFound(_))
         ));
+        assert!(matches!(
+            preflight(Ok(g), Ok(r), true, || {
+                Err(Error::ToolNotFound("Rizin unavailable".into()))
+            }),
+            Err(Error::ToolNotFound(reason)) if reason == "Rizin unavailable"
+        ));
+    }
+
+    #[test]
+    fn preflight_tools_reach_decompile_and_report_unchanged() {
+        let headless = PathBuf::from("/preflight/ghidra/analyzeHeadless");
+        let mut radare2 = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Radare2,
+            "/preflight/r2-exact",
+            "radare2 exact version",
+        );
+        radare2.command = "radare2 exact command";
+        let mut rizin = producer_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            "/preflight/rizin-exact",
+            "rizin exact version",
+        );
+        rizin.command = "rizin exact command";
+        let expected = crate::thumb_analysis::ThumbTools {
+            radare2: radare2.clone(),
+            rizin: Some(rizin.clone()),
+        };
+        let (observed_headless, tools) =
+            preflight(Ok(headless.clone()), Ok(radare2), true, || Ok(rizin)).unwrap();
+        let decompile_opts = decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
+            rizin_fallback: true,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        };
+        let opts = Opts {
+            no_verify: false,
+            prune: false,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_symbol_pass: false,
+            no_thumb_decompile: false,
+            rizin_fallback: true,
+            tighten_wall_clock_budget_override: None,
+            globals_provisional: false,
+            globals_k_arm: None,
+            globals_k_thumb: None,
+            no_apply_global_types: false,
+            no_skip_opaque: false,
+        };
+        let decompile_calls = std::cell::Cell::new(0);
+
+        assert_eq!(observed_headless, headless);
+        assert_eq!(tools, expected);
+        let error = run_decompile_report_with(
+            Path::new("/input/modem.bin"),
+            &decompile_opts,
+            Path::new("/output/ghidra"),
+            &tools,
+            |modem_bin, observed_opts, out, observed_tools| {
+                decompile_calls.set(decompile_calls.get() + 1);
+                assert_eq!(modem_bin, Path::new("/input/modem.bin"));
+                assert_eq!(out, Path::new("/output/ghidra"));
+                assert!(observed_opts.run);
+                assert!(observed_opts.rizin_fallback);
+                assert!(std::ptr::eq(observed_tools, &tools));
+                assert_eq!(observed_tools, &expected);
+                Err(Error::Serialize("captured decompose ThumbTools".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Serialize(reason) if reason == "captured decompose ThumbTools")
+        );
+        assert_eq!(decompile_calls.get(), 1);
+        assert_eq!(
+            serde_json::to_value(analysis_tools(&observed_headless, &opts, &tools)).unwrap(),
+            serde_json::json!({
+                "headless": "/preflight/ghidra/analyzeHeadless",
+                "radare2": "/preflight/r2-exact",
+                "radare2_version": "radare2 exact version",
+                "rizin_fallback": true,
+                "rizin": "/preflight/rizin-exact",
+                "rizin_version": "rizin exact version"
+            })
+        );
     }
 
     #[test]
@@ -5912,6 +6318,11 @@ mod tests {
             outcome: ImageOutcome::Analyzed(1),
             classification: Some("not_opaque"),
             thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: Some(1),
             ghidra_execution_quarantined: Some(0),
             thumb_execution_accepted: None,
@@ -5919,6 +6330,7 @@ mod tests {
             image_start: 0x4000,
             image_len: 0x10,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -5975,6 +6387,17 @@ mod tests {
             b"{\"sentinel\":true}",
         )
         .unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/decompiled/thumb_functions.json"),
+            b"{\"format\":\"thumb-sentinel\"}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(out.join("images/02_MAIN/decompiled/thumb")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/decompiled/thumb/40000000.radare2.stdout"),
+            b"capture",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("images/02_MAIN/scatter/blocks")).unwrap();
         std::fs::write(
             out.join("images/02_MAIN/scatter/load_map.json"),
@@ -5990,6 +6413,9 @@ mod tests {
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
 
+        prune(&out).unwrap();
+        // A second sweep over an already-pruned tree is a no-op, not an error:
+        // every removal treats an absent path as done.
         prune(&out).unwrap();
 
         assert!(!out.join("modem.ext4").exists());
@@ -6014,6 +6440,11 @@ mod tests {
             b"{\"sentinel\":true}"
         );
         assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/decompiled/thumb_functions.json")).unwrap(),
+            b"{\"format\":\"thumb-sentinel\"}"
+        );
+        assert!(!out.join("images/02_MAIN/decompiled/thumb").exists());
+        assert_eq!(
             std::fs::read(out.join("images/02_MAIN/scatter/load_map.json")).unwrap(),
             b"{\"format\":\"scatter-test\"}"
         );
@@ -6024,6 +6455,63 @@ mod tests {
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());
         assert!(out.join("manifest.json").exists());
+    }
+
+    /// `report.json` must describe the tree that exists, not the flag that was
+    /// passed: a failed sweep leaves a partially cleaned tree, so automation
+    /// reading `pruned: true` would act on artifacts that are still present.
+    #[test]
+    fn prune_report_distinguishes_request_from_successful_completion() {
+        let mut stages = Vec::new();
+        assert!(!run_prune_stage(&mut stages, false, || panic!(
+            "prune must not run unless requested"
+        )));
+        assert!(stages.is_empty());
+
+        assert!(run_prune_stage(&mut stages, true, || Ok(())));
+        assert!(stages.is_empty());
+
+        assert!(!run_prune_stage(&mut stages, true, || Err(
+            Error::Serialize("ghidra/ could not be removed".into())
+        )));
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].stage, "prune");
+        assert_eq!(stages[0].status, "failed");
+        assert!(
+            stages[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("could not be removed"))
+        );
+    }
+
+    #[test]
+    fn report_serializes_prune_request_and_completion_separately() {
+        let report = Report {
+            tool_version: "test".into(),
+            source_image: "radio.img".into(),
+            source_blake3: String::new(),
+            modem_generation: None,
+            out: "out".into(),
+            ghidra: AnalysisTools {
+                headless: "analyzeHeadless".into(),
+                radare2: "/usr/bin/r2".into(),
+                radare2_version: "radare2 6.1.4".into(),
+                rizin_fallback: false,
+                rizin: None,
+                rizin_version: None,
+            },
+            prune_requested: true,
+            pruned: false,
+            ok: false,
+            stages: Vec::new(),
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+
+        assert_eq!(json["prune_requested"], true);
+        assert_eq!(json["pruned"], false);
     }
 
     #[test]
@@ -6076,6 +6564,11 @@ mod tests {
             outcome: decompile::ImageOutcome::Analyzed(10),
             classification: Some("not_opaque"),
             thumb_functions: Some(5),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -6083,6 +6576,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6114,6 +6608,11 @@ mod tests {
             outcome: decompile::ImageOutcome::Analyzed(10),
             classification: Some("not_opaque"),
             thumb_functions: Some(5),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -6121,6 +6620,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: Some(3),
@@ -6151,6 +6651,11 @@ mod tests {
             outcome: decompile::ImageOutcome::Analyzed(10),
             classification: Some("not_opaque"),
             thumb_functions: Some(5),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -6158,6 +6663,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6189,6 +6695,11 @@ mod tests {
             outcome: decompile::ImageOutcome::Analyzed(10),
             classification: Some("not_opaque"),
             thumb_functions: Some(5),
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
             ghidra_execution_accepted: None,
             ghidra_execution_quarantined: None,
             thumb_execution_accepted: None,
@@ -6196,6 +6707,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6682,14 +7194,25 @@ mod tests {
             serde_json::to_vec(&value).unwrap()
         };
         std::fs::write(&thumb_path, &rewritten_thumb).unwrap();
+        // One symbol per owned record: finalize keys by (producer, entry), so
+        // the Ghidra ARM entry and the radare2-owned Thumb entry at the same
+        // address are stamped from their own symbols.
         symbolicate::rewrite_functions_json(
             &decompiled,
-            &[test_symbol(
-                "0x4000",
-                "arm",
-                Some("Recovered_4000"),
-                symbolicate::Tier::Recovered,
-            )],
+            &[
+                test_symbol(
+                    "0x4000",
+                    "arm",
+                    Some("Recovered_4000"),
+                    symbolicate::Tier::Recovered,
+                ),
+                test_symbol(
+                    "0x4000",
+                    "thumb",
+                    Some("Recovered_thumb_4000"),
+                    symbolicate::Tier::Recovered,
+                ),
+            ],
         )
         .unwrap();
         let final_functions = std::fs::read(&functions_path).unwrap();

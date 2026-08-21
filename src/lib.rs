@@ -1,3 +1,4 @@
+pub mod analysis_tool;
 pub mod archive;
 pub mod classify;
 pub mod cli;
@@ -17,11 +18,11 @@ pub mod hwcfg;
 pub mod manifest;
 pub mod model;
 pub mod pipeline;
-pub mod r2_thumb;
 pub mod recover_source;
 pub mod scatter;
 pub mod source_tree;
 pub mod symbolicate;
+pub mod thumb_analysis;
 pub mod toc;
 pub mod tokens;
 pub mod tree_hash;

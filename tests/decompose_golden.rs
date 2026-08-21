@@ -30,6 +30,7 @@ fn decompose_produces_unified_tree() {
         processor: "ARM:LE:32:v7".to_string(),
         no_symbol_pass: false,
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         globals_provisional: false,
         globals_k_arm: None,
@@ -72,6 +73,12 @@ fn decompose_produces_unified_tree() {
     let recovered_index = source_tree.join("recovered_index.json");
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    assert!(report["ghidra"]["headless"].is_string());
+    assert!(report["ghidra"]["radare2"].is_string());
+    assert!(report["ghidra"]["radare2_version"].is_string());
+    assert_eq!(report["ghidra"]["rizin_fallback"], false);
+    assert!(report["ghidra"].get("rizin").is_none());
+    assert!(report["ghidra"].get("rizin_version").is_none());
     let source_attribution = report["stages"]
         .as_array()
         .and_then(|stages| {
@@ -139,6 +146,50 @@ fn decompose_produces_unified_tree() {
                     .as_u64()
                     .expect("retained Thumb inventory must report quarantine count");
                 assert!(accepted + quarantined > 0, "{image}");
+                for field in [
+                    "thumb_regions_requested",
+                    "thumb_regions_succeeded",
+                    "thumb_regions_failed",
+                    "thumb_radare2_runs",
+                    "thumb_rizin_runs",
+                ] {
+                    assert!(
+                        image
+                            .get(field)
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some(),
+                        "current Thumb result must report {field}: {image}"
+                    );
+                }
+                assert_eq!(
+                    image["thumb_regions_requested"].as_u64().unwrap(),
+                    image["thumb_regions_succeeded"].as_u64().unwrap()
+                        + image["thumb_regions_failed"].as_u64().unwrap(),
+                    "Thumb region totals must conserve: {image}"
+                );
+                assert_eq!(
+                    image["thumb_regions_succeeded"].as_u64().unwrap(),
+                    image["thumb_radare2_runs"].as_u64().unwrap()
+                        + image["thumb_rizin_runs"].as_u64().unwrap(),
+                    "successful regions must have exactly one producer run: {image}"
+                );
+                assert_eq!(image["thumb_rizin_runs"], 0);
+                if image["thumb_regions_failed"].as_u64().unwrap() > 0 {
+                    assert_eq!(image["status"], "analyzed");
+                    assert!(image.get("thumb_error").is_none(), "{image}");
+                }
+                let sidecar = out
+                    .join("images")
+                    .join(image["image"].as_str().unwrap())
+                    .join("decompiled/thumb_functions.json");
+                let artifact: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+                assert_eq!(
+                    artifact["format"],
+                    "pixel-modem-extractor-thumb-functions-v3",
+                    "fresh decompose Thumb output must be strict v3: {}",
+                    sidecar.display()
+                );
             }
             None => {
                 assert!(image.get("thumb_execution_accepted").is_none(), "{image}");
@@ -415,6 +466,7 @@ fn report_json_includes_phase2_fields() {
         processor: "ARM:LE:32:v7".to_string(),
         no_symbol_pass: false,
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         globals_provisional: false,
         globals_k_arm: None,
@@ -473,6 +525,7 @@ fn report_json_includes_globals_field() {
         processor: "ARM:LE:32:v7".to_string(),
         no_symbol_pass: true,
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         globals_provisional: false,
         globals_k_arm: None,
@@ -854,6 +907,7 @@ fn decompose_pinned_surfaces_match_reference() {
         processor: "ARM:LE:32:v7".to_string(),
         no_symbol_pass: false,
         no_thumb_decompile: false,
+        rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         globals_provisional: false,
         globals_k_arm: None,
