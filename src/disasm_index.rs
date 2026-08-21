@@ -67,24 +67,30 @@ impl<'a> DisasmIndex<'a> {
 
     /// Zero-copy view of the same lines [`Self::slice_for`] would join:
     /// borrowed from the backing buffer whenever that is byte-identical
-    /// (Unix `\n` separators and a terminator after the final matching
-    /// line), and an owned copy otherwise (CRLF separators, or the final
-    /// matching line lacking its trailing newline). The returned value is
-    /// ALWAYS equal to `slice_for(entry, end)` — the fallback exists so a
-    /// borrowed range can never drift from the joined form. This is the
-    /// memory-envelope lever for `symbolicate`'s ARM loader: pathological
-    /// wide-range function records must not each copy ~hundreds of MB of
-    /// owned text.
+    /// (the selected lines are adjacent in the buffer, with Unix `\n`
+    /// separators and a terminator after the final one), and an owned copy
+    /// otherwise (a skipped non-address line between two selected lines,
+    /// CRLF separators, or the final matching line lacking its trailing
+    /// newline). The returned value is ALWAYS equal to
+    /// `slice_for(entry, end)` — the fallback exists so a borrowed range can
+    /// never drift from the joined form. This is the memory-envelope lever
+    /// for `symbolicate`'s ARM loader: pathological wide-range function
+    /// records must not each copy ~hundreds of MB of owned text.
     pub fn slice_cow(&self, entry: u64, end: u64) -> std::borrow::Cow<'a, str> {
         let start = self.lines.partition_point(|(a, _, _, _)| *a < entry);
         let mut first: Option<usize> = None;
         let mut last_end = 0usize;
+        let mut contiguous = true;
         for (addr, _, s, e) in &self.lines[start..] {
             if *addr >= end {
                 break;
             }
-            if first.is_none() {
-                first = Some(*s);
+            match first {
+                // A gap means a blank, comment, or malformed line the index
+                // dropped sits between two selected lines: the borrowed range
+                // would include bytes `slice_for` omits.
+                Some(_) => contiguous &= *s == last_end,
+                None => first = Some(*s),
             }
             last_end = *e;
         }
@@ -94,7 +100,7 @@ impl<'a> DisasmIndex<'a> {
         let view = &self.src[first..last_end];
         // Byte-identical to the '\n'-joined form only when the borrowed
         // bytes carry exactly '\n' separators and end with one.
-        if !view.contains('\r') && view.ends_with('\n') {
+        if contiguous && !view.contains('\r') && view.ends_with('\n') {
             std::borrow::Cow::Borrowed(view)
         } else {
             std::borrow::Cow::Owned(self.slice_for(entry, end))
@@ -149,6 +155,33 @@ mod tests {
         // No matching lines: both empty.
         assert_eq!(idx.slice_cow(0x2000, 0x2008), "");
         assert_eq!(idx.slice_cow(0x2000, 0x2008), idx.slice_for(0x2000, 0x2008));
+    }
+
+    /// A blank, comment, or otherwise non-address line between two selected
+    /// address lines lies inside the borrowed byte range but is dropped by
+    /// `slice_for`, so the borrowed view must degrade to an owned copy.
+    #[test]
+    fn slice_cow_falls_back_to_owned_across_skipped_interstitial_lines() {
+        let disasm = "\
+0x1000: 00  mov r0, #1
+// FUNCTION 1004
+
+0x1008: 00  mov r2, #3
+0x100c: 00  mov r3, #4
+";
+        let idx = DisasmIndex::new(disasm);
+
+        assert!(matches!(
+            idx.slice_cow(0x1000, 0x1010),
+            std::borrow::Cow::Owned(_)
+        ));
+        assert_eq!(idx.slice_cow(0x1000, 0x1010), idx.slice_for(0x1000, 0x1010));
+        // Ranges wholly on one side of the gap stay zero-copy.
+        assert!(matches!(
+            idx.slice_cow(0x1008, 0x1010),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(idx.slice_cow(0x1008, 0x1010), idx.slice_for(0x1008, 0x1010));
     }
 
     #[test]
