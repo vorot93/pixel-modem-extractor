@@ -273,6 +273,23 @@ mod tests {
     }
 
     #[test]
+    fn pdfj_bodies_require_an_array_valued_ops_field() {
+        let cases = [
+            ("empty object", "[{\"offset\":4096}]\n{}\n[]"),
+            ("missing ops", "[{\"offset\":4096}]\n{\"addr\":4096}\n[]"),
+            ("non-array ops", "[{\"offset\":4096}]\n{\"ops\":7}\n[]"),
+            ("null ops", "[{\"offset\":4096}]\n{\"ops\":null}\n[]"),
+            ("object ops", "[{\"offset\":4096}]\n{\"ops\":{}}\n[]"),
+        ];
+
+        for (case, contents) in cases {
+            let (_dir, path) = capture(contents);
+            let error = read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).unwrap_err();
+            assert!(error.to_string().contains("ops"), "{case}: {error}");
+        }
+    }
+
+    #[test]
     fn axlj_accepts_empty_trailing_array() {
         let (_dir, path) = capture("[{\"offset\":4096}]\n{\"ops\":[]}\n[]\n");
 
@@ -526,7 +543,7 @@ DEBUG: [false diagnostic] collecting outgoing references
             ("non-object pdfj", "[{\"offset\":4096}]\n7\n[]"),
             (
                 "too few pdfj objects",
-                "[{\"offset\":4096},{\"offset\":8192}]\n{}\n[]",
+                "[{\"offset\":4096},{\"offset\":8192}]\n{\"ops\":[]}\n[]",
             ),
         ];
 
@@ -561,7 +578,7 @@ DEBUG: [false diagnostic] collecting outgoing references
         ];
 
         for (case, record) in invalid_records {
-            let contents = format!("[{{\"offset\":4096}}]\n{{}}\n[{record}]");
+            let contents = format!("[{{\"offset\":4096}}]\n{{\"ops\":[]}}\n[{record}]");
             let (_dir, path) = capture(&contents);
             assert!(
                 read_rizin_xrefs(&path, RIZIN_SELECTED_XREF_CAP).is_err(),
@@ -571,7 +588,7 @@ DEBUG: [false diagnostic] collecting outgoing references
 
         let (_dir, path) = capture(
             r#"[{"offset":4096}]
-{}
+{"ops":[]}
 [
   {"from":"0xffffffff","to":"0xffffffffffffffff","type":"DATA"},
   {"from":0,"addr":18446744073709551615,"type":"read"}
@@ -596,7 +613,7 @@ DEBUG: [false diagnostic] collecting outgoing references
     fn axlj_applies_selected_record_cap_before_deduplication() {
         let (_dir, path) = capture(
             r#"[{"offset":4096}]
-{}
+{"ops":[]}
 [
   {"from":4096,"to":8192,"type":"DATA"},
   {"from":4096,"to":8192,"type":"DATA"}

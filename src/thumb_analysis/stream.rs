@@ -588,9 +588,14 @@ pub(super) fn read_rizin_pdfj_value<R: Read + Seek>(
     })?;
     let value = serde_json::from_slice::<serde_json::Value>(bytes)
         .map_err(|error| Error::Serialize(format!("parse Rizin pdfj body {position}: {error}")))?;
-    if !value.is_object() {
+    // `pdfj @@F` emits one object per analyzed function and `ops` is the
+    // operation array every projection is built from. Accepting any object
+    // would let schema drift pair empty bodies positionally, quarantine every
+    // function as `empty_projection`, and publish an all-quarantined
+    // "successful" Rizin run instead of failing the attempt closed.
+    if !value.get("ops").is_some_and(serde_json::Value::is_array) {
         return Err(Error::Serialize(format!(
-            "Rizin pdfj body {position} is not an object"
+            "Rizin pdfj body {position} lacks an array-valued ops field"
         )));
     }
     Ok(value)
@@ -3526,6 +3531,48 @@ esac
                 .contains("zero paired pdfj bodies")
         );
         assert_eq!(document["regions"][0]["attempts"][1]["status"], "succeeded");
+    }
+
+    /// Schema drift that emits objects without an `ops` array must fail the
+    /// Rizin attempt instead of pairing empty bodies, quarantining every
+    /// function, and publishing an all-quarantined "successful" run.
+    #[cfg(unix)]
+    #[test]
+    fn rizin_pdfj_bodies_without_an_ops_array_fail_the_attempt() {
+        for (case, body) in [
+            ("empty object", "{}"),
+            ("missing ops", "{\"addr\":16384}"),
+            ("non-array ops", "{\"addr\":16384,\"ops\":7}"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let radare2 = dir.path().join("r2");
+            let rizin = dir.path().join("rizin");
+            write_executable_stub(&radare2, "#!/bin/sh\nexit 1\n");
+            write_executable_stub(
+                &rizin,
+                &[
+                    "#!/bin/sh\nprintf '%s\\n' ",
+                    "'[{\"offset\":16384,\"name\":\"fcn.4000\",\"size\":2,\"realsz\":2,\"maxbound\":16386}]' ",
+                    "'", body, "' '[]'\n",
+                ]
+                .concat(),
+            );
+            let mut tools = thumb_tools(&radare2);
+            tools.rizin = Some(test_identity(
+                crate::thumb_analysis::ThumbProducer::Rizin,
+                &rizin,
+            ));
+
+            let error =
+                run_thumb_analysis(&tools, &[0x70, 0x47], 0x4000, &[(0x4000, 2)], dir.path())
+                    .unwrap_err();
+
+            assert!(error.to_string().contains("ops"), "{case}: {error}");
+            assert!(
+                !dir.path().join("thumb_functions.json").exists(),
+                "{case} published a sidecar"
+            );
+        }
     }
 
     #[cfg(unix)]
