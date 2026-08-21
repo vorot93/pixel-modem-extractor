@@ -960,6 +960,7 @@ fn prune(out: &Path) -> Result<()> {
                 && let Some(label) = dir.file_name().and_then(|n| n.to_str())
             {
                 remove_any(&dir.join(format!("{label}.bin")))?;
+                remove_any(&dir.join("decompiled/thumb"))?;
             }
         }
     }
@@ -6260,6 +6261,17 @@ mod tests {
             b"{\"sentinel\":true}",
         )
         .unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/decompiled/thumb_functions.json"),
+            b"{\"format\":\"thumb-sentinel\"}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(out.join("images/02_MAIN/decompiled/thumb")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/decompiled/thumb/40000000.radare2.stdout"),
+            b"capture",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("images/02_MAIN/scatter/blocks")).unwrap();
         std::fs::write(
             out.join("images/02_MAIN/scatter/load_map.json"),
@@ -6298,6 +6310,11 @@ mod tests {
             std::fs::read(out.join("images/02_MAIN/decompiled/global_shapes.json")).unwrap(),
             b"{\"sentinel\":true}"
         );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/decompiled/thumb_functions.json")).unwrap(),
+            b"{\"format\":\"thumb-sentinel\"}"
+        );
+        assert!(!out.join("images/02_MAIN/decompiled/thumb").exists());
         assert_eq!(
             std::fs::read(out.join("images/02_MAIN/scatter/load_map.json")).unwrap(),
             b"{\"format\":\"scatter-test\"}"
