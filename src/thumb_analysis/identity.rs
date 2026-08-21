@@ -23,11 +23,112 @@ const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// cleanup starts, not when the probe returns.
 const PROBE_CLEANUP_LIMIT: Duration = Duration::from_secs(1);
 
+/// How a producer identity is being checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdentityMode {
+    /// A retained artifact records the host that produced it, which may be a
+    /// different OS family with paths this host cannot resolve. Only the
+    /// lexical spelling can be verified.
+    Artifact,
+    /// A runtime identity is what the coordinator will spawn and what v3 will
+    /// record as the executable actually used, so it must additionally name an
+    /// executable file on *this* host that resolves to exactly that spelling.
+    Runtime,
+}
+
+/// The single producer-identity check shared by the coordinator and every
+/// artifact reader. Returns the reason the identity is unusable, so each caller
+/// can wrap it in its own error vocabulary.
+pub(super) fn producer_identity_error(
+    identity: &ProducerIdentity,
+    expected: ThumbProducer,
+    mode: IdentityMode,
+) -> Option<String> {
+    let producer = expected.as_str();
+    if identity.producer != expected {
+        return Some(format!(
+            "Thumb {producer} producer identity has the wrong backend"
+        ));
+    }
+    if identity.command != expected.command() {
+        return Some(format!(
+            "{producer} producer command does not match the v3 schema"
+        ));
+    }
+    if identity.version.is_empty()
+        || identity.version.trim() != identity.version
+        || identity.version.contains(['\r', '\n'])
+    {
+        return Some(format!("{producer} producer version is not normalized"));
+    }
+    // Discovery cannot produce a longer version, so a longer one did not come
+    // from a version probe.
+    if identity.version.len() > VERSION_LINE_MAX_BYTES {
+        return Some(format!(
+            "{producer} producer version exceeds the {VERSION_LINE_MAX_BYTES}-byte discovery bound"
+        ));
+    }
+    if !is_canonical_executable_path(&identity.executable) {
+        return Some(format!(
+            "{producer} producer executable must be a canonical absolute path"
+        ));
+    }
+    match mode {
+        IdentityMode::Artifact => None,
+        IdentityMode::Runtime => runtime_executable_error(&identity.executable, producer),
+    }
+}
+
+fn runtime_executable_error(executable: &Path, producer: &str) -> Option<String> {
+    if !is_canonical_native_executable_path(executable) {
+        return Some(format!(
+            "{producer} producer executable {} is not a canonical path for this host",
+            executable.display()
+        ));
+    }
+    let resolved = match std::fs::canonicalize(executable) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Some(format!(
+                "{producer} producer executable {} cannot be resolved: {error}",
+                executable.display()
+            ));
+        }
+    };
+    if resolved != executable {
+        return Some(format!(
+            "{producer} producer executable {} is not the canonical path of {}",
+            executable.display(),
+            resolved.display()
+        ));
+    }
+    if !is_executable(executable) {
+        return Some(format!(
+            "{producer} producer executable {} is not an executable file",
+            executable.display()
+        ));
+    }
+    None
+}
+
 pub(super) fn is_canonical_executable_path(path: &Path) -> bool {
     let Some(spelling) = path.to_str() else {
         return false;
     };
     is_canonical_unix_executable_path(spelling) || is_canonical_windows_executable_path(spelling)
+}
+
+/// Canonical spelling for *this* host's path family. A runtime identity in the
+/// other family cannot name a file the coordinator will spawn.
+fn is_canonical_native_executable_path(path: &Path) -> bool {
+    let Some(spelling) = path.to_str() else {
+        return false;
+    };
+    if cfg!(windows) {
+        is_canonical_windows_executable_path(spelling)
+    } else {
+        is_canonical_unix_executable_path(spelling)
+    }
 }
 
 fn is_canonical_unix_executable_path(spelling: &str) -> bool {
@@ -70,25 +171,24 @@ fn is_canonical_windows_executable_path(spelling: &str) -> bool {
         _ => return false,
     };
     match prefix.kind() {
-        Utf8WindowsPrefix::Verbatim(name) if !name.is_empty() => {}
-        Utf8WindowsPrefix::VerbatimDisk(_) => {}
+        Utf8WindowsPrefix::Verbatim(name) if is_valid_windows_component(name) => {}
+        Utf8WindowsPrefix::VerbatimDisk(letter) if letter.is_ascii_alphabetic() => {}
         Utf8WindowsPrefix::VerbatimUNC(server, share)
-            if !server.is_empty() && !share.is_empty() => {}
+            if is_valid_windows_component(server) && is_valid_windows_component(share) => {}
         _ => return false,
     }
     if !matches!(components.next(), Some(Utf8WindowsComponent::RootDir)) {
         return false;
     }
+    // The raw split is authoritative: the component iterator normalizes `.`
+    // away, so a non-canonical spelling would otherwise survive.
     let Some(tail) = spelling
         .get(prefix.as_str().len()..)
         .and_then(|suffix| suffix.strip_prefix('\\'))
     else {
         return false;
     };
-    if tail
-        .split('\\')
-        .any(|component| component.is_empty() || matches!(component, "." | ".."))
-    {
+    if !tail.split('\\').all(is_valid_windows_component) {
         return false;
     }
     let mut saw_name = false;
@@ -99,6 +199,110 @@ fn is_canonical_windows_executable_path(spelling: &str) -> bool {
         }
         _ => false,
     }) && saw_name
+}
+
+/// Windows names that address a character device rather than a file, in any
+/// directory and with any extension. Discovery resolves a real executable, so
+/// an identity naming one of these did not come from discovery.
+const WINDOWS_RESERVED_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// One canonical Windows path component. `Utf8Component::is_valid` rejects NUL
+/// and separators but accepts reserved device names, trailing spaces/dots, and
+/// the characters Win32 reserves — none of which discovery can produce.
+fn is_valid_windows_component(component: &str) -> bool {
+    if component.is_empty() || component == "." || component == ".." {
+        return false;
+    }
+    if component.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+    }) {
+        return false;
+    }
+    if component.ends_with(' ') || component.ends_with('.') {
+        return false;
+    }
+    let stem = component.split('.').next().unwrap_or(component);
+    !WINDOWS_RESERVED_DEVICE_NAMES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+}
+
+#[cfg(test)]
+mod path_validation_tests {
+    use super::{
+        IdentityMode, ProducerIdentity, ThumbProducer, is_canonical_executable_path,
+        producer_identity_error,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn artifact_identity(executable: &str, version: &str) -> ProducerIdentity {
+        ProducerIdentity {
+            producer: ThumbProducer::Radare2,
+            executable: PathBuf::from(executable),
+            version: version.to_owned(),
+            command: ThumbProducer::Radare2.command(),
+        }
+    }
+
+    /// Discovery canonicalizes a real executable, so it can never yield a
+    /// reserved device name, a Win32-reserved character, or an unusable
+    /// verbatim prefix. Accepting those admits identities no probe produced.
+    #[test]
+    fn canonical_windows_paths_reject_reserved_names_and_prefixes() {
+        for accepted in [
+            r"\\?\C:\Program Files\radare2\r2.exe",
+            r"\\?\UNC\server\share\r2.exe",
+            r"\\?\cat_pics\r2.exe",
+        ] {
+            assert!(
+                is_canonical_executable_path(Path::new(accepted)),
+                "{accepted}"
+            );
+        }
+
+        for rejected in [
+            r"\\?\C:\bin\CON",
+            r"\\?\C:\bin\nul.exe",
+            r"\\?\C:\bin\LPT9.exe",
+            r"\\?\C:\bin\r2 ",
+            r"\\?\C:\bin\r2.",
+            r"\\?\C:\bin\r*2.exe",
+            r"\\?\C:\bin\r|2.exe",
+            r"\\?\CON\r2.exe",
+            r"\\?\UNC\CON\share\r2.exe",
+            r"\\?\UNC\server\PRN\r2.exe",
+            r"\\?\UNC\\share\r2.exe",
+            r"\\?\1:\bin\r2.exe",
+        ] {
+            assert!(
+                !is_canonical_executable_path(Path::new(rejected)),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_identity_rejects_versions_beyond_the_discovery_bound() {
+        let accepted = artifact_identity("/usr/bin/r2", &"v".repeat(1_024));
+        assert_eq!(
+            producer_identity_error(&accepted, ThumbProducer::Radare2, IdentityMode::Artifact),
+            None
+        );
+
+        let oversized = artifact_identity("/usr/bin/r2", &"v".repeat(1_025));
+        let reason =
+            producer_identity_error(&oversized, ThumbProducer::Radare2, IdentityMode::Artifact)
+                .expect("an oversized version cannot come from discovery");
+
+        assert!(reason.contains("1024-byte discovery bound"), "{reason}");
+    }
 }
 
 enum VersionOutput {
@@ -846,6 +1050,65 @@ mod tests {
         assert!(super::is_canonical_executable_path(&identity.executable));
         assert_eq!(identity.version, "rizin 0.8.2");
         assert_eq!(identity.command, "aaa;aflj;pdfj @@F;axlj");
+    }
+
+    fn runtime_identity(executable: PathBuf) -> ProducerIdentity {
+        ProducerIdentity {
+            producer: ThumbProducer::Radare2,
+            executable,
+            version: "radare2 5.9.0".into(),
+            command: ThumbProducer::Radare2.command(),
+        }
+    }
+
+    fn runtime_reason(identity: &ProducerIdentity) -> Option<String> {
+        super::producer_identity_error(
+            identity,
+            ThumbProducer::Radare2,
+            super::IdentityMode::Runtime,
+        )
+    }
+
+    /// A runtime identity is spawned and then recorded as the executable
+    /// actually used, so a lexically canonical spelling is not enough: it must
+    /// resolve to itself on this host and name an executable file.
+    #[test]
+    fn runtime_identity_requires_a_resolved_native_executable() {
+        let (dir, script) = tool_script("printf 'radare2 5.9.0\\n'");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let alias = root.join("tool-alias");
+        symlink(&script, &alias).unwrap();
+        let data = root.join("not-a-tool");
+        fs::write(&data, b"data").unwrap();
+
+        let canonical = runtime_identity(fs::canonicalize(&script).unwrap());
+        assert_eq!(runtime_reason(&canonical), None);
+
+        for (case, executable, expected) in [
+            ("symlink spelling", alias, "is not the canonical path of"),
+            ("non-executable file", data, "is not an executable file"),
+            ("missing file", root.join("absent"), "cannot be resolved"),
+            (
+                "other host family",
+                PathBuf::from(r"\\?\C:\bin\r2.exe"),
+                "is not a canonical path for this host",
+            ),
+        ] {
+            let identity = runtime_identity(executable);
+            // The same spelling is acceptable when read back from a retained
+            // artifact produced on another host.
+            assert_eq!(
+                super::producer_identity_error(
+                    &identity,
+                    ThumbProducer::Radare2,
+                    super::IdentityMode::Artifact,
+                ),
+                None,
+                "{case} must stay readable as artifact provenance"
+            );
+            let reason = runtime_reason(&identity).unwrap_or_else(|| panic!("{case} was accepted"));
+            assert!(reason.contains(expected), "{case}: {reason}");
+        }
     }
 
     #[test]

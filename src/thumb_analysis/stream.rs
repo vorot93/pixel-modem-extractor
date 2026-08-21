@@ -2527,32 +2527,17 @@ fn validate_thumb_tools(tools: &ThumbTools) -> Result<()> {
     Ok(())
 }
 
+/// The coordinator will spawn these identities and v3 will record them as the
+/// executables actually used, so they are checked in runtime-native mode.
 fn validate_producer_identity(identity: &ProducerIdentity, expected: ThumbProducer) -> Result<()> {
-    let producer = expected.as_str();
-    if identity.producer != expected {
-        return Err(Error::Serialize(format!(
-            "Thumb {producer} producer identity has the wrong backend"
-        )));
+    match super::identity::producer_identity_error(
+        identity,
+        expected,
+        super::identity::IdentityMode::Runtime,
+    ) {
+        Some(reason) => Err(Error::Serialize(reason)),
+        None => Ok(()),
     }
-    if identity.command != expected.command() {
-        return Err(Error::Serialize(format!(
-            "{producer} producer command does not match the v3 schema"
-        )));
-    }
-    if identity.version.is_empty()
-        || identity.version.trim() != identity.version
-        || identity.version.contains(['\r', '\n'])
-    {
-        return Err(Error::Serialize(format!(
-            "{producer} producer version is not normalized"
-        )));
-    }
-    if !super::identity::is_canonical_executable_path(&identity.executable) {
-        return Err(Error::Serialize(format!(
-            "{producer} producer executable must be a canonical absolute path"
-        )));
-    }
-    Ok(())
 }
 
 fn add_count(total: &mut usize, value: usize, label: &str) -> Result<()> {

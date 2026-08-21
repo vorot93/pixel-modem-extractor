@@ -1,7 +1,7 @@
 //! Shared Thumb sidecar parsing, provenance validation, bounded fragment
 //! assembly, terminal scanning, and atomic function-local mutation.
 
-use super::identity::is_canonical_executable_path;
+use super::identity::{IdentityMode, producer_identity_error};
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
@@ -572,25 +572,11 @@ fn convert_producers(wires: Vec<ProducerWire>) -> Result<Vec<ProducerIdentity>> 
                 wire.id.as_str()
             )));
         }
-        if wire.version.is_empty()
-            || wire.version.trim() != wire.version
-            || wire.version.contains(['\r', '\n'])
-        {
-            return Err(invalid_artifact(format!(
-                "{} producer version is not normalized",
-                wire.id.as_str()
-            )));
-        }
-        let executable = PathBuf::from(&wire.executable);
-        if !is_canonical_executable_path(&executable) {
-            return Err(invalid_artifact(format!(
-                "{} producer executable must be a canonical absolute path",
-                wire.id.as_str()
-            )));
-        }
+        // Field-level rules live in the shared producer-identity validator,
+        // which `validate_v3_metadata` applies to every parsed document.
         producers.push(ProducerIdentity {
             producer: wire.id,
-            executable,
+            executable: PathBuf::from(&wire.executable),
             version: wire.version,
             command: wire.id.command(),
         });
@@ -846,26 +832,12 @@ fn validate_v3_metadata(
                 "v3 producers must be unique and ordered radare2 then rizin",
             ));
         }
-        if producer.command != producer.producer.command() {
-            return Err(invalid_artifact(format!(
-                "{} producer command does not match the v3 schema",
-                producer.producer.as_str()
-            )));
-        }
-        if producer.version.is_empty()
-            || producer.version.trim() != producer.version
-            || producer.version.contains(['\r', '\n'])
+        // A retained artifact records the host that produced it, so only the
+        // lexical spelling of its executable can be checked here.
+        if let Some(reason) =
+            producer_identity_error(producer, expected_producers[index], IdentityMode::Artifact)
         {
-            return Err(invalid_artifact(format!(
-                "{} producer version is not normalized",
-                producer.producer.as_str()
-            )));
-        }
-        if !is_canonical_executable_path(&producer.executable) {
-            return Err(invalid_artifact(format!(
-                "{} producer executable must be a canonical absolute path",
-                producer.producer.as_str()
-            )));
+            return Err(invalid_artifact(reason));
         }
     }
     if regions.is_empty() {
@@ -3124,6 +3096,49 @@ mod tests {
 
         document["producers"][1]["executable"] = json!(r"\\?\UNC\server\share\tools\rizin.exe");
         assert!(parse_thumb_artifact(&canonical_v3(&document)).is_ok());
+    }
+
+    /// Discovery caps a version at the first 1,024 stdout bytes, so a longer
+    /// one cannot be a truthful producer identity.
+    #[test]
+    fn v3_parser_rejects_versions_beyond_the_discovery_bound() {
+        let mut accepted = valid_v3();
+        accepted["producers"][0]["version"] = json!("v".repeat(1_024));
+        assert!(parse_thumb_artifact(&canonical_v3(&accepted)).is_ok());
+
+        let mut oversized = valid_v3();
+        oversized["producers"][0]["version"] = json!("v".repeat(1_025));
+
+        let error = parse_thumb_artifact(&canonical_v3(&oversized)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("1024-byte discovery bound"),
+            "{error}"
+        );
+    }
+
+    /// Producer executables are identities discovery could have produced, so
+    /// spellings a version probe can never yield are rejected on both hosts.
+    #[test]
+    fn v3_parser_rejects_windows_reserved_and_malformed_prefix_executables() {
+        for executable in [
+            r"\\?\C:\tools\CON",
+            r"\\?\C:\tools\nul.exe",
+            r"\\?\C:\tools\rizin.exe ",
+            r"\\?\C:\tools\ri*zin.exe",
+            r"\\?\CON\rizin.exe",
+            r"\\?\UNC\PRN\share\rizin.exe",
+        ] {
+            let mut document = valid_v3();
+            document["producers"][0]["executable"] = json!(executable);
+
+            let error = parse_thumb_artifact(&canonical_v3(&document)).unwrap_err();
+
+            assert!(
+                error.to_string().contains("canonical absolute path"),
+                "accepted {executable:?}: {error}"
+            );
+        }
     }
 
     #[test]
