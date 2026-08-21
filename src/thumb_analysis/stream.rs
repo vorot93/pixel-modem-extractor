@@ -678,21 +678,38 @@ struct SuccessfulRegion {
 struct FailedRegion {
     capture: Option<CaptureRecord>,
     error: Error,
-    fatal_cleanup: bool,
+    /// Set when the attempt left unverified process or on-disk state: a child
+    /// that could not be reaped, a drain that would not stop, or output that
+    /// could not be removed. The coordinator then records no attempt, runs no
+    /// fallback, processes no later region, and publishes no artifact.
+    terminal: bool,
 }
 
 impl FailedRegion {
+    /// An ordinary backend failure. The attempt is recorded and, when enabled,
+    /// the region may still fall back to the other producer.
     fn recoverable(capture: Option<CaptureRecord>, error: Error) -> Self {
         Self {
             capture,
             error,
-            fatal_cleanup: false,
+            terminal: false,
         }
     }
 
-    fn mark_cleanup_failure(&mut self, context: &str, cleanup: std::io::Error) {
-        self.error = Error::Serialize(format!("{}; {context}: {cleanup}", self.error));
-        self.fatal_cleanup = true;
+    /// Pre-attempt housekeeping failed, so no backend process was spawned.
+    /// Recording an attempt here would claim a process that never ran and
+    /// would hand a region to the fallback without running the primary.
+    fn setup(error: Error) -> Self {
+        Self {
+            capture: None,
+            error,
+            terminal: true,
+        }
+    }
+
+    fn mark_terminal(&mut self, context: &str, cause: std::io::Error) {
+        self.error = Error::Serialize(format!("{}; {context}: {cause}", self.error));
+        self.terminal = true;
     }
 
     fn after_cleanup(
@@ -703,7 +720,7 @@ impl FailedRegion {
     ) -> Self {
         let mut failure = Self::recoverable(capture, error);
         if let Err(error) = cleanup {
-            failure.mark_cleanup_failure(cleanup_context, error);
+            failure.mark_terminal(cleanup_context, error);
         }
         failure
     }
@@ -899,10 +916,16 @@ fn process_region_with_adapter(
         generic_value_limit,
     ) {
         Ok(outcome) => Ok(outcome),
-        Err(error) => {
-            let _ = std::fs::remove_file(spill_path);
-            Err(error)
-        }
+        // A partial spill must not survive a failed parse. An unverified
+        // removal is preserved in the message; `run_backend_region` sweeps the
+        // same path afterwards and turns the repeat failure into a terminal
+        // one, so the coordinator never publishes over unowned fragments.
+        Err(error) => Err(match remove_stale_output(spill_path) {
+            Ok(()) => error,
+            Err(cleanup) => {
+                Error::Serialize(format!("{error}; fragment spill cleanup failed: {cleanup}"))
+            }
+        }),
     }
 }
 
@@ -2627,9 +2650,9 @@ fn run_thumb_analysis_with_limits_and_carver(
                 }
                 Err(failure) => {
                     let reason = failure.error.to_string();
-                    if failure.fatal_cleanup {
+                    if failure.terminal {
                         tracing::error!(
-                            "Thumb region 0x{addr:x} {} cleanup is unverified; aborting analysis: {reason}",
+                            "Thumb region 0x{addr:x} {} left unverified state; aborting analysis: {reason}",
                             identity.producer.as_str()
                         );
                         return Err(failure.error);
@@ -2771,7 +2794,10 @@ fn backend_fragment_path(
     thumb_dir.join(format!("{addr:08x}.{}.frags", producer.as_str()))
 }
 
-fn remove_backend_fragments(path: &Path) -> std::io::Result<()> {
+/// Remove output a failed or superseded attempt must not leave behind. An
+/// absent path is the success case; every other error means unverified bytes
+/// remain beside the sidecar, which is terminal for the whole request.
+fn remove_stale_output(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2796,13 +2822,10 @@ fn run_backend_region(
         ThumbProducer::Rizin => process_rizin_region_streaming,
     };
     let fragment_path = backend_fragment_path(thumb_dir, addr, producer);
-    if let Err(error) = remove_backend_fragments(&fragment_path) {
-        return Err(FailedRegion::recoverable(
-            None,
-            Error::Serialize(format!(
-                "{producer_name} could not remove stale fragments for Thumb region 0x{addr:x}: {error}"
-            )),
-        ));
+    if let Err(error) = remove_stale_output(&fragment_path) {
+        return Err(FailedRegion::setup(Error::Serialize(format!(
+            "{producer_name} could not remove stale fragments for Thumb region 0x{addr:x}: {error}"
+        ))));
     }
     let result = match run_backend_capture(identity, bin, addr, &stdout_path, limits) {
         Ok(capture) => match parser(&stdout_path, image, load_addr, addr, thumb_dir) {
@@ -2819,11 +2842,8 @@ fn run_backend_region(
     match result {
         Ok(success) => Ok(success),
         Err(mut failure) => {
-            if let Err(error) = remove_backend_fragments(&fragment_path) {
-                failure.error = Error::Serialize(format!(
-                    "{}; {producer_name} fragment cleanup failed: {error}",
-                    failure.error
-                ));
+            if let Err(error) = remove_stale_output(&fragment_path) {
+                failure.mark_terminal(&format!("{producer_name} fragment cleanup failed"), error);
             }
             Err(failure)
         }
@@ -2934,7 +2954,7 @@ fn finalize_natural_analyzer_capture(
                     producer.as_str()
                 )),
             );
-            failure.mark_cleanup_failure(
+            failure.mark_terminal(
                 "process cleanup failed",
                 std::io::Error::other("analyzer child status is unavailable after cleanup"),
             );
@@ -2948,7 +2968,7 @@ fn finalize_natural_analyzer_capture(
                     producer.as_str()
                 )),
             );
-            failure.mark_cleanup_failure("process cleanup failed", error);
+            failure.mark_terminal("process cleanup failed", error);
             Err(failure)
         }
     }
@@ -3043,16 +3063,20 @@ fn supervise_spawned_analyzer(
     process.drain = match drain {
         Ok(drain) => Some(drain),
         Err(error) => {
-            let _ = std::fs::remove_file(stdout_path);
+            let removed = remove_stale_output(stdout_path);
             let cleanup = process.terminate_and_reap(limits.cleanup);
-            return Err(FailedRegion::after_cleanup(
+            let mut failure = FailedRegion::after_cleanup(
                 None,
                 Error::Serialize(format!(
                     "{producer_name} could not start stdout capture for Thumb region 0x{addr:x}: {error}"
                 )),
                 "process cleanup failed",
                 cleanup,
-            ));
+            );
+            if let Err(error) = removed {
+                failure.mark_terminal("unstarted stdout capture cleanup failed", error);
+            }
+            return Err(failure);
         }
     };
 
@@ -3082,27 +3106,18 @@ fn supervise_spawned_analyzer(
             if let Some((limit_name, limit)) = finalization_limit {
                 let cleanup = process.terminate_and_reap(limits.cleanup);
                 process.cancel_drain_and_wait();
-                let (retained, finalize_error) =
-                    finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+                let stopped = finalize_stopped_capture(&mut process, capture.take(), stdout_path);
                 let forced = format!(
                     "stdout remained open after analyzer exit for Thumb region 0x{addr:x}; forced pipe finalization after the {} ms {limit_name} limit",
                     limit.as_millis()
                 );
-                let mut detail = analyzer_status_failure_detail(&process, producer, addr)
+                let detail = analyzer_status_failure_detail(&process, producer, addr)
                     .map(|mut detail| {
                         detail.push_str(&format!("; {forced}"));
                         detail
                     })
                     .unwrap_or_else(|| format!("{producer_name} {forced}"));
-                if let Some(error) = finalize_error {
-                    detail.push_str(&format!("; partial stdout finalization failed: {error}"));
-                }
-                return Err(FailedRegion::after_cleanup(
-                    retained,
-                    Error::Serialize(detail),
-                    "cleanup failed",
-                    cleanup,
-                ));
+                return Err(stopped.into_failure(detail, cleanup));
             }
         }
 
@@ -3111,13 +3126,17 @@ fn supervise_spawned_analyzer(
                 Ok(finalized) => capture = Some(finalized),
                 Err(error) => {
                     let cleanup = process.terminate_and_reap(limits.cleanup);
-                    let _ = std::fs::remove_file(stdout_path);
-                    return Err(FailedRegion::after_cleanup(
+                    let removed = remove_stale_output(stdout_path);
+                    let mut failure = FailedRegion::after_cleanup(
                         None,
                         capture_failure_error(producer, addr, stdout_cap, error),
                         "process cleanup failed",
                         cleanup,
-                    ));
+                    );
+                    if let Err(error) = removed {
+                        failure.mark_terminal("unfinalized stdout capture cleanup failed", error);
+                    }
+                    return Err(failure);
                 }
             }
         }
@@ -3127,20 +3146,12 @@ fn supervise_spawned_analyzer(
                 if let Err(error) = process.observe_exit(limits.cleanup) {
                     let cleanup = process.terminate_and_reap(limits.cleanup);
                     process.cancel_drain_and_wait();
-                    let (retained, finalize_error) =
+                    let stopped =
                         finalize_stopped_capture(&mut process, capture.take(), stdout_path);
-                    let mut detail = format!(
+                    let detail = format!(
                         "{producer_name} process supervision failed for Thumb region 0x{addr:x}: {error}"
                     );
-                    if let Some(error) = finalize_error {
-                        detail.push_str(&format!("; stdout finalization failed: {error}"));
-                    }
-                    return Err(FailedRegion::after_cleanup(
-                        retained,
-                        Error::Serialize(detail),
-                        "cleanup failed",
-                        cleanup,
-                    ));
+                    return Err(stopped.into_failure(detail, cleanup));
                 }
 
                 match classify_running_observation(
@@ -3170,23 +3181,13 @@ fn supervise_spawned_analyzer(
                     RunningObservation::DeadlineExpired => {
                         let cleanup = process.terminate_and_reap(limits.cleanup);
                         process.cancel_drain_and_wait();
-                        let (retained, finalize_error) =
+                        let stopped =
                             finalize_stopped_capture(&mut process, capture.take(), stdout_path);
-                        let mut detail = format!(
+                        let detail = format!(
                             "{producer_name} timed out after {} ms for Thumb region 0x{addr:x}",
                             deadline.expect("elapsed deadline is present").as_millis()
                         );
-                        if let Some(error) = finalize_error {
-                            detail.push_str(&format!(
-                                "; partial stdout finalization failed: {error}"
-                            ));
-                        }
-                        return Err(FailedRegion::after_cleanup(
-                            retained,
-                            Error::Serialize(detail),
-                            "cleanup failed",
-                            cleanup,
-                        ));
+                        return Err(stopped.into_failure(detail, cleanup));
                     }
                     RunningObservation::Pending => {}
                 }
@@ -3222,20 +3223,62 @@ fn supervise_spawned_analyzer(
     Ok(capture)
 }
 
+/// What became of a capture whose analyzer was stopped rather than finishing
+/// naturally. The design permits recording `stdout: null` for a partial file
+/// that could not be finalized, but only once that file is provably gone.
+struct StoppedCapture {
+    retained: Option<CaptureRecord>,
+    /// The drain could not be joined, so the partial file was removed and the
+    /// attempt truthfully records `stdout: null`. An ordinary failure.
+    finalize_error: Option<std::io::Error>,
+    /// The partial file could not be removed, so unowned bytes remain beside
+    /// the sidecar. Terminal for the whole request.
+    cleanup_error: Option<std::io::Error>,
+}
+
+impl StoppedCapture {
+    /// Fold the drain and removal outcomes into the attempt failure `detail`
+    /// describes, plus the process cleanup result.
+    fn into_failure(self, mut detail: String, cleanup: std::io::Result<()>) -> FailedRegion {
+        if let Some(error) = &self.finalize_error {
+            detail.push_str(&format!("; partial stdout finalization failed: {error}"));
+        }
+        let mut failure = FailedRegion::after_cleanup(
+            self.retained,
+            Error::Serialize(detail),
+            "cleanup failed",
+            cleanup,
+        );
+        if let Some(error) = self.cleanup_error {
+            failure.mark_terminal("partial stdout capture cleanup failed", error);
+        }
+        failure
+    }
+}
+
 fn finalize_stopped_capture(
     process: &mut AnalyzerProcess,
     capture: Option<CaptureRecord>,
     stdout_path: &Path,
-) -> (Option<CaptureRecord>, Option<std::io::Error>) {
+) -> StoppedCapture {
     if let Some(capture) = capture {
-        return (Some(capture), None);
+        return StoppedCapture {
+            retained: Some(capture),
+            finalize_error: None,
+            cleanup_error: None,
+        };
     }
     match process.join_drain() {
-        Ok(capture) => (Some(capture), None),
-        Err(error) => {
-            let _ = std::fs::remove_file(stdout_path);
-            (None, Some(error))
-        }
+        Ok(capture) => StoppedCapture {
+            retained: Some(capture),
+            finalize_error: None,
+            cleanup_error: None,
+        },
+        Err(error) => StoppedCapture {
+            retained: None,
+            finalize_error: Some(error),
+            cleanup_error: remove_stale_output(stdout_path).err(),
+        },
     }
 }
 
@@ -5119,6 +5162,145 @@ esac
         assert!(!rizin_sentinel.exists());
         assert!(!later_region_sentinel.exists());
         assert_eq!(std::fs::read(artifact).unwrap(), stable_artifact);
+    }
+
+    /// Fake backends whose only job is to prove they were never spawned, plus
+    /// a second region's radare2 branch that must never be reached.
+    #[cfg(unix)]
+    fn sentinel_backends(
+        dir: &Path,
+    ) -> (
+        crate::thumb_analysis::ThumbTools,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let radare2 = dir.join("r2");
+        let rizin = dir.join("rizin");
+        let radare2_sentinel = dir.join("radare2-ran");
+        let rizin_sentinel = dir.join("rizin-ran");
+        write_executable_stub(
+            &radare2,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> '{}'\n\
+                 printf '%s\\n' '[{{\"addr\":16384,\"name\":\"r2.fn\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"addr\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}'\n",
+                radare2_sentinel.display(),
+            ),
+        );
+        write_executable_stub(
+            &rizin,
+            &format!(
+                "#!/bin/sh\n\
+                 : > '{}'\n\
+                 printf '%s\\n' '[{{\"offset\":16384,\"name\":\"rizin.must-not-run\",\"size\":2,\"realsz\":2,\"maxbound\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"offset\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}' '[]'\n",
+                rizin_sentinel.display(),
+            ),
+        );
+        let mut tools = thumb_tools(&radare2);
+        tools.rizin = Some(test_identity(
+            crate::thumb_analysis::ThumbProducer::Rizin,
+            &rizin,
+        ));
+        (tools, radare2_sentinel, rizin_sentinel)
+    }
+
+    /// A pre-attempt housekeeping failure means no backend process was ever
+    /// attempted, so it must abort the request rather than fabricate a failed
+    /// radare2 attempt and hand the region to Rizin.
+    #[cfg(unix)]
+    #[test]
+    fn undeletable_stale_fragment_aborts_before_any_backend_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, radare2_sentinel, rizin_sentinel) = sentinel_backends(dir.path());
+        let artifact = dir.path().join("thumb_functions.json");
+        let stable_artifact = b"stable stale-fragment artifact";
+        std::fs::write(&artifact, stable_artifact).unwrap();
+        // An undeletable stale fragment: `remove_file` on a populated directory
+        // fails without needing permission tricks or a privileged test host.
+        let stale = dir.path().join("thumb").join("00004000.radare2.frags");
+        std::fs::create_dir_all(stale.join("occupied")).unwrap();
+        let mut image = vec![0u8; 0x80];
+        image[..2].copy_from_slice(&[0x70, 0x47]);
+        image[0x40..0x42].copy_from_slice(&[0x70, 0x47]);
+
+        let error = run_thumb_analysis(
+            &tools,
+            &image,
+            0x4000,
+            &[(0x4000, 0x40), (0x4040, 0x40)],
+            dir.path(),
+        )
+        .unwrap_err();
+        let detail = error.to_string();
+
+        assert!(detail.contains("stale fragments"), "{detail}");
+        assert!(!radare2_sentinel.exists(), "the primary was spawned");
+        assert!(!rizin_sentinel.exists(), "the fallback was spawned");
+        assert_eq!(std::fs::read(artifact).unwrap(), stable_artifact);
+    }
+
+    /// Fragment cleanup that cannot be verified leaves unowned bytes beside the
+    /// sidecar, so it is terminal rather than an ordinary fallback-eligible
+    /// backend failure.
+    #[cfg(unix)]
+    #[test]
+    fn unverified_fragment_cleanup_aborts_fallback_and_later_regions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tools, _radare2_sentinel, rizin_sentinel) = sentinel_backends(dir.path());
+        let later_region_sentinel = dir.path().join("later-region-ran");
+        let artifact = dir.path().join("thumb_functions.json");
+        let stable_artifact = b"stable cleanup artifact";
+        std::fs::write(&artifact, stable_artifact).unwrap();
+        // The carved region input is the last argument, so the stub can occupy
+        // the fragment path this attempt is about to spill into. The spill then
+        // fails and its cleanup cannot verify the path is gone.
+        write_executable_stub(
+            &dir.path().join("r2"),
+            &format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do last=\"$arg\"; done\n\
+                 case \" $* \" in\n\
+                   *\" -m 0x4000 \"*) mkdir -p \"$(dirname \"$last\")/00004000.radare2.frags/occupied\" ;;\n\
+                   *\" -m 0x4040 \"*) : > '{}' ;;\n\
+                 esac\n\
+                 printf '%s\\n' '[{{\"addr\":16384,\"name\":\"r2.fn\",\"size\":2,\"realsz\":2,\"maxaddr\":16386}}]' '{{\"addr\":16384,\"ops\":[{{\"addr\":16384,\"bytes\":\"7047\",\"disasm\":\"bx lr\"}}]}}'\n",
+                later_region_sentinel.display(),
+            ),
+        );
+        let mut image = vec![0u8; 0x80];
+        image[..2].copy_from_slice(&[0x70, 0x47]);
+        image[0x40..0x42].copy_from_slice(&[0x70, 0x47]);
+
+        let error = run_thumb_analysis(
+            &tools,
+            &image,
+            0x4000,
+            &[(0x4000, 0x40), (0x4040, 0x40)],
+            dir.path(),
+        )
+        .unwrap_err();
+        let detail = error.to_string();
+
+        assert!(detail.contains("fragment cleanup failed"), "{detail}");
+        assert!(!rizin_sentinel.exists(), "the fallback was spawned");
+        assert!(!later_region_sentinel.exists(), "a later region ran");
+        assert_eq!(std::fs::read(artifact).unwrap(), stable_artifact);
+    }
+
+    #[test]
+    fn remove_stale_output_reports_everything_but_an_absent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let file = dir.path().join("capture.stdout");
+        std::fs::write(&file, b"partial").unwrap();
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir_all(occupied.join("child")).unwrap();
+
+        assert!(remove_stale_output(&missing).is_ok());
+        assert!(remove_stale_output(&file).is_ok());
+        assert!(!file.exists());
+        assert!(remove_stale_output(&occupied).is_err());
+        assert!(occupied.exists());
     }
 
     #[cfg(unix)]
