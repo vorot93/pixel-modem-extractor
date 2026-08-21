@@ -277,15 +277,22 @@ fn opaque_skip(bytes: &[u8]) -> Option<crate::classify::BatteryStats> {
 }
 
 /// One image's `--run` result: analyzed (with the function count ExportDecomp
-/// recorded), `analyzeHeadless` exited non-zero, or skipped because the opaque
-/// battery was unanimously opaque (no Ghidra or Thumb-analyzer process was spawned;
-/// the carried stats are what the skip decision measured). Recorded per image
-/// so a full run reports every partition instead of aborting on the first
-/// failure.
+/// recorded), `analyzeHeadless` exited non-zero, the export was rejected by
+/// terminal/currentness validation, or skipped because the opaque battery was
+/// unanimously opaque (no Ghidra or Thumb-analyzer process was spawned; the
+/// carried stats are what the skip decision measured). Recorded per image so a
+/// full run reports every partition instead of aborting on the first failure.
 #[derive(Debug, Clone)]
 pub enum ImageOutcome {
     Analyzed(usize),
+    /// `analyzeHeadless` did not run to completion; carries its exit code.
     Failed(i32),
+    /// Ghidra completed but the terminal execution inventory or current-run
+    /// Thumb validation rejected the export. Distinct from `Failed` so a
+    /// successful Ghidra run with stale or failed Thumb output is never
+    /// reported as a Ghidra failure, and so the reason survives as
+    /// `ImageResult::terminal_error` instead of collapsing to `exit: -1`.
+    TerminalInvalid,
     SkippedOpaque(crate::classify::BatteryStats),
 }
 
@@ -327,6 +334,11 @@ pub struct ImageResult {
     pub(crate) image_len: u32,
     /// Reason-only Thumb-stage failure text; `label` already identifies the image.
     pub thumb_error: Option<String>,
+    /// Reason-only terminal-validation failure text: Ghidra completed but the
+    /// export pair could not be certified as this run's output. Always set
+    /// alongside `ImageOutcome::TerminalInvalid`; when the Thumb sidecar is the
+    /// stage that rejected it, `thumb_error` carries the reason too.
+    pub terminal_error: Option<String>,
     /// Pass-2 (symbolication) outcome: count of names `ApplySymbols.java`
     /// reported applying. `None` when no function-map invocation occurred
     /// (including a globals-only invocation) or no valid function summary was parsed.
@@ -602,6 +614,28 @@ fn validate_thumb_analysis_currentness(
     Ok(())
 }
 
+/// A rejected terminal export, tagged with the stage responsible. A Thumb-side
+/// rejection also means the Thumb stage left no current sidecar, so it feeds
+/// `thumb_error`; a Ghidra-side rejection is not a Thumb failure and must not
+/// be reported as one.
+pub(crate) struct TerminalValidationFailure {
+    pub thumb: bool,
+    pub error: Error,
+}
+
+impl TerminalValidationFailure {
+    fn ghidra(error: Error) -> Self {
+        Self {
+            thumb: false,
+            error,
+        }
+    }
+
+    fn thumb(error: Error) -> Self {
+        Self { thumb: true, error }
+    }
+}
+
 /// Validate one complete terminal Ghidra/optional-Thumb pair. When
 /// `expected_current` is supplied, every normalized tagged source record must
 /// match the already-validated current producer result before refresh.
@@ -613,12 +647,35 @@ pub(crate) fn validate_terminal_inventory_pair(
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
 ) -> Result<TerminalInventorySummary> {
-    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")?;
-    let ghidra_records = ghidra_json
-        .as_array()
-        .ok_or_else(|| Error::Serialize("Ghidra functions inventory must be an array".into()))?;
+    validate_terminal_inventory_pair_staged(
+        ghidra_functions_path,
+        thumb_functions_path,
+        image_start,
+        image_len,
+        expected_thumb_substantial,
+        expected_current,
+    )
+    .map_err(|failure| failure.error)
+}
+
+pub(crate) fn validate_terminal_inventory_pair_staged(
+    ghidra_functions_path: &Path,
+    thumb_functions_path: &Path,
+    image_start: u32,
+    image_len: u32,
+    expected_thumb_substantial: Option<usize>,
+    expected_current: Option<&TerminalInventorySummary>,
+) -> std::result::Result<TerminalInventorySummary, TerminalValidationFailure> {
+    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")
+        .map_err(TerminalValidationFailure::ghidra)?;
+    let ghidra_records = ghidra_json.as_array().ok_or_else(|| {
+        TerminalValidationFailure::ghidra(Error::Serialize(
+            "Ghidra functions inventory must be an array".into(),
+        ))
+    })?;
     let ghidra =
-        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)?;
+        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)
+            .map_err(TerminalValidationFailure::ghidra)?;
     let mut accepted_identities: BTreeSet<ExecutionIdentity> =
         ghidra.accepted_identities.iter().cloned().collect();
 
@@ -626,9 +683,9 @@ pub(crate) fn validate_terminal_inventory_pair(
     {
         None => {
             if thumb_functions_path.exists() {
-                return Err(Error::Serialize(
+                return Err(TerminalValidationFailure::thumb(Error::Serialize(
                     "unexpected Thumb inventory without a current producer result".into(),
-                ));
+                )));
             }
             (None, None, None, Vec::new())
         }
@@ -638,7 +695,8 @@ pub(crate) fn validate_terminal_inventory_pair(
                 image_start,
                 image_len,
                 expected_substantial,
-            )?;
+            )
+            .map_err(TerminalValidationFailure::thumb)?;
             let inventory = validated.inventory;
             let metadata = validated.metadata;
             accepted_identities.extend(inventory.accepted_identities.iter().cloned());
@@ -663,9 +721,18 @@ pub(crate) fn validate_terminal_inventory_pair(
     if let Some(expected) = expected_current
         && &summary != expected
     {
-        return Err(Error::Serialize(
-            "terminal execution inventory differs from the current producer result".into(),
-        ));
+        // The comparison spans both stages; a differing Thumb ledger is the
+        // only way this can be a Thumb-stage problem.
+        let thumb = summary.thumb_metadata != expected.thumb_metadata
+            || summary.thumb != expected.thumb
+            || summary.thumb_substantial != expected.thumb_substantial
+            || summary.thumb_records != expected.thumb_records;
+        return Err(TerminalValidationFailure {
+            thumb,
+            error: Error::Serialize(
+                "terminal execution inventory differs from the current producer result".into(),
+            ),
+        });
     }
     Ok(summary)
 }
@@ -686,7 +753,7 @@ pub(crate) fn validate_image_terminal_inventory(
     )?;
     let raw_functions = match image.outcome {
         ImageOutcome::Analyzed(raw) => raw,
-        ImageOutcome::Failed(_) => {
+        ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid => {
             return Err(Error::Serialize(
                 "failed image has no current terminal inventory".into(),
             ));
@@ -1365,6 +1432,7 @@ fn run_report_impl(
             image_start: u32,
             image_len: u32,
             thumb_error: Option<String>,
+            terminal_error: Option<String>,
             tighten_error: Option<String>,
             // When the tighten-watch kills the run, we re-spawn as datamark
             // and there is no `thumb_enrich` to run later; mark the count
@@ -1408,6 +1476,7 @@ fn run_report_impl(
                         image_start: e.load_addr,
                         image_len: e.size,
                         thumb_error: None,
+                        terminal_error: None,
                         tighten_error: None,
                         thumb_decompiled: None,
                     });
@@ -1441,6 +1510,7 @@ fn run_report_impl(
                     image_start: e.load_addr,
                     image_len: e.size,
                     thumb_error: None,
+                    terminal_error: None,
                     tighten_error: None,
                     thumb_decompiled: None,
                 });
@@ -1696,10 +1766,12 @@ fn run_report_impl(
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
             };
+            let mut thumb_error = thumb_error;
             let thumb_functions = thumb_summary.as_ref().map(|summary| summary.substantial);
+            let mut terminal_error = None;
             let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
                 let export = root.join("export").join(&label);
-                let validation = validate_terminal_inventory_pair(
+                let validation = validate_terminal_inventory_pair_staged(
                     &export.join("functions.json"),
                     &export.join("thumb_functions.json"),
                     e.load_addr,
@@ -1708,19 +1780,21 @@ fn run_report_impl(
                     None,
                 )
                 .and_then(|summary| {
-                    if let Some(expected) = &thumb_summary {
-                        let expected_tools = thumb_tools.ok_or_else(|| {
-                            Error::Serialize(
-                                "current Thumb analysis lost its injected tool identities".into(),
-                            )
-                        })?;
-                        validate_thumb_analysis_currentness(
-                            &summary,
-                            expected_tools,
-                            &regions,
-                            expected,
-                        )?;
-                    }
+                    let Some(expected) = &thumb_summary else {
+                        return Ok(summary);
+                    };
+                    let expected_tools = thumb_tools.ok_or_else(|| {
+                        TerminalValidationFailure::thumb(Error::Serialize(
+                            "current Thumb analysis lost its injected tool identities".into(),
+                        ))
+                    })?;
+                    validate_thumb_analysis_currentness(
+                        &summary,
+                        expected_tools,
+                        &regions,
+                        expected,
+                    )
+                    .map_err(TerminalValidationFailure::thumb)?;
                     Ok(summary)
                 });
                 match validation {
@@ -1728,11 +1802,20 @@ fn run_report_impl(
                         outcome = ImageOutcome::Analyzed(summary.ghidra.raw);
                         Some(summary)
                     }
-                    Err(error) => {
+                    Err(failure) => {
+                        let reason = failure.error.to_string();
                         tracing::warn!(
-                            "terminal execution inventory for {label} failed validation: {error}"
+                            "terminal execution inventory for {label} failed validation: {reason}"
                         );
-                        outcome = ImageOutcome::Failed(-1);
+                        // Ghidra ran to completion, so this is not a Ghidra
+                        // process failure. A Thumb-stage rejection also means
+                        // no current sidecar; keep any root-cause `thumb_error`
+                        // the analysis stage already recorded.
+                        if failure.thumb {
+                            thumb_error.get_or_insert_with(|| reason.clone());
+                        }
+                        terminal_error = Some(reason);
+                        outcome = ImageOutcome::TerminalInvalid;
                         None
                     }
                 }
@@ -1757,6 +1840,7 @@ fn run_report_impl(
                 image_start: e.load_addr,
                 image_len: e.size,
                 thumb_error,
+                terminal_error,
                 tighten_error,
                 thumb_decompiled: thumb_decompiled_override,
             });
@@ -1795,6 +1879,10 @@ fn run_report_impl(
                 }
                 ImageOutcome::Failed(code) => {
                     println!("  {:<11} FAILED (exit {code}){t}{k}", r.label)
+                }
+                ImageOutcome::TerminalInvalid => {
+                    let reason = r.terminal_error.as_deref().unwrap_or("unknown reason");
+                    println!("  {:<11} FAILED (terminal: {reason}){t}{k}", r.label)
                 }
                 ImageOutcome::SkippedOpaque(_) => {
                     println!(
@@ -1844,6 +1932,7 @@ fn run_report_impl(
                     image_start: r.image_start,
                     image_len: r.image_len,
                     thumb_error: r.thumb_error,
+                    terminal_error: r.terminal_error,
                     pass2_applied: None,
                     pass2_error: None,
                     thumb_decompiled: r.thumb_decompiled,
@@ -1885,9 +1974,12 @@ fn run_report_impl(
 /// Convert structured per-image outcomes into the standalone `decompile` failure,
 /// after every selected image has had a chance to run.
 fn report_failure(report: &DecompileReport) -> Option<Error> {
+    // Only a real `analyzeHeadless` failure is a Ghidra failure.
     if let Some(code) = report.images.iter().find_map(|r| match r.outcome {
         ImageOutcome::Failed(c) => Some(c),
-        ImageOutcome::Analyzed(_) | ImageOutcome::SkippedOpaque(_) => None,
+        ImageOutcome::Analyzed(_)
+        | ImageOutcome::TerminalInvalid
+        | ImageOutcome::SkippedOpaque(_) => None,
     }) {
         let failed: Vec<&str> = report
             .images
@@ -1901,22 +1993,32 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
             code,
         });
     }
-    let thumb_failed: Vec<String> = report
-        .images
-        .iter()
-        .filter_map(|r| {
-            r.thumb_error
-                .as_ref()
-                .map(|err| format!("{}: {err}", r.label))
-        })
-        .collect();
-    if !thumb_failed.is_empty() {
+    // Thumb-stage reasons come first: for a rejected export they are the root
+    // cause, and the terminal reason is its consequence.
+    if let Some(reasons) = labelled_reasons(report, |image| image.thumb_error.as_deref()) {
         return Some(Error::DecomposeIncomplete(format!(
-            "Thumb analysis failed on {}",
-            thumb_failed.join(", ")
+            "Thumb analysis failed on {reasons}"
+        )));
+    }
+    if let Some(reasons) = labelled_reasons(report, |image| image.terminal_error.as_deref()) {
+        return Some(Error::DecomposeIncomplete(format!(
+            "terminal inventory validation failed on {reasons}"
         )));
     }
     None
+}
+
+/// `"<label>: <reason>, …"` over every image carrying a reason, or `None`.
+fn labelled_reasons(
+    report: &DecompileReport,
+    reason: impl Fn(&ImageResult) -> Option<&str>,
+) -> Option<String> {
+    let labelled: Vec<String> = report
+        .images
+        .iter()
+        .filter_map(|image| reason(image).map(|reason| format!("{}: {reason}", image.label)))
+        .collect();
+    (!labelled.is_empty()).then(|| labelled.join(", "))
 }
 
 pub(crate) fn discover_configured_rizin(
@@ -4997,6 +5099,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 image_start: 0,
                 image_len: 0,
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5296,10 +5399,112 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .exists()
         );
 
+        // Rerunning over a tree that still holds the prior sidecar: Ghidra
+        // succeeds, the Thumb stage fails every region, and terminal validation
+        // rejects the retained sidecar as not current. That is a Thumb/terminal
+        // failure, never "Ghidra failed" with a fabricated `exit: -1`.
         let before = std::fs::read(&sidecar).unwrap();
         let failed = run_report_with_thumb_tools(&modem, &opts, &out, &failing_tools).unwrap();
-        assert!(failed.images[0].thumb_error.is_some());
+        let stale = &failed.images[0];
+        assert!(matches!(stale.outcome, ImageOutcome::TerminalInvalid));
+        assert!(
+            stale
+                .terminal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("without a current producer result")),
+            "{:?}",
+            stale.terminal_error
+        );
+        // The all-region failure stays the reported root cause.
+        assert!(
+            stale
+                .thumb_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed for every requested region"))
+        );
+        assert!(
+            matches!(
+                report_failure(&failed),
+                Some(Error::DecomposeIncomplete(ref reason))
+                    if reason.contains("Thumb analysis failed")
+            ),
+            "{:?}",
+            report_failure(&failed)
+        );
         assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
+    /// A current-run v3 ledger that disagrees with the retained sidecar is a
+    /// Thumb/terminal failure with an actionable reason, not `exit: -1` from a
+    /// Ghidra run that in fact succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn post_analysis_currentness_mismatch_is_terminal_not_a_ghidra_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_thumb_decompile = true;
+        opts.no_skip_opaque = true;
+        let radare2 = dir.path().join("tools/r2-success");
+        write_fake_radare2(&radare2, true);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: crate::thumb_analysis::ProducerIdentity {
+                producer: crate::thumb_analysis::ThumbProducer::Radare2,
+                executable: std::fs::canonicalize(radare2).unwrap(),
+                version: "radare2 currentness fixture".into(),
+                command: crate::thumb_analysis::ThumbProducer::Radare2.command(),
+            },
+            rizin: None,
+        };
+        let out = dir.path().join("mismatch");
+
+        let report = run_report_with_thumb_tools_and_analyzer(
+            &modem,
+            &opts,
+            &out,
+            &tools,
+            |tools, image, load_addr, regions, out_dir| {
+                // Produce a real v3 sidecar, then report a run ledger that
+                // claims one more radare2 run than the artifact records.
+                let mut summary = crate::thumb_analysis::run_thumb_analysis(
+                    tools, image, load_addr, regions, out_dir,
+                )?;
+                summary.radare2_runs += 1;
+                Ok(summary)
+            },
+        )
+        .unwrap();
+
+        let mismatched = &report.images[0];
+        assert!(matches!(mismatched.outcome, ImageOutcome::TerminalInvalid));
+        assert!(
+            mismatched
+                .terminal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("radare2_runs")),
+            "{:?}",
+            mismatched.terminal_error
+        );
+        assert_eq!(
+            mismatched.thumb_error.as_deref(),
+            mismatched.terminal_error.as_deref(),
+            "a Thumb-stage rejection must populate thumb_error"
+        );
+        assert!(
+            matches!(
+                report_failure(&report),
+                Some(Error::DecomposeIncomplete(ref reason))
+                    if reason.contains("Thumb analysis failed")
+            ),
+            "{:?}",
+            report_failure(&report)
+        );
     }
 
     /// Low-entropy ARM-ish pattern half for the partial-encryption guard
@@ -5354,6 +5559,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 image_start: 0,
                 image_len: 0,
                 thumb_error: None,
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5400,6 +5606,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     "1 Thumb region(s) left unanalyzed — radare2 (r2) not on PATH; Ghidra can't analyze them"
                         .into(),
                 ),
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5447,6 +5654,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,

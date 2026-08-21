@@ -106,6 +106,11 @@ pub struct ImageReport {
     pub thumb_execution_quarantined: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_error: Option<String>,
+    /// Reason-only terminal-validation failure: Ghidra completed but the export
+    /// pair could not be certified as this run's output. Present exactly when
+    /// the outcome is `ImageOutcome::TerminalInvalid`, which reports no `exit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,6 +198,9 @@ impl ImageReport {
                 None,
             ),
             ImageOutcome::Failed(code) => ("failed", None, None, None, Some(code)),
+            // Ghidra completed, so there is no analyzeHeadless exit code to
+            // report; `terminal_error` carries the actionable reason.
+            ImageOutcome::TerminalInvalid => ("failed", r.classification, None, None, None),
             // No analysis process ran for a unanimously opaque image.
             ImageOutcome::SkippedOpaque(_) => {
                 ("skipped", Some("opaque"), Some("opaque"), None, None)
@@ -215,6 +223,7 @@ impl ImageReport {
             thumb_execution_accepted: r.thumb_execution_accepted,
             thumb_execution_quarantined: r.thumb_execution_quarantined,
             thumb_error: r.thumb_error.clone(),
+            terminal_error: r.terminal_error.clone(),
             exit,
             pass2_applied: r.pass2_applied,
             pass2_error: r.pass2_error.clone(),
@@ -2295,7 +2304,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
             for ir in &rep.images {
-                let scatter_state = if matches!(ir.outcome, ImageOutcome::Failed(_)) {
+                // A rejected export is as unusable as a failed Ghidra run, so
+                // its runtime scatter map stays unmanaged either way.
+                let scatter_state = if matches!(
+                    ir.outcome,
+                    ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid
+                ) {
                     decompile::RuntimeScatterState::Unmanaged
                 } else {
                     rep.runtime_scatter_state(&ir.label)
@@ -2871,6 +2885,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -4726,6 +4741,7 @@ mod tests {
                         thumb_execution_accepted: None,
                         thumb_execution_quarantined: None,
                         thumb_error: None,
+                        terminal_error: None,
                         exit: None,
                         pass2_applied: None,
                         pass2_error: None,
@@ -4772,6 +4788,7 @@ mod tests {
                         thumb_execution_accepted: None,
                         thumb_execution_quarantined: None,
                         thumb_error: None,
+                        terminal_error: None,
                         exit: Some(1),
                         pass2_applied: None,
                         pass2_error: None,
@@ -5029,6 +5046,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -5081,6 +5099,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -5188,6 +5207,7 @@ mod tests {
                 image_start: 0,
                 image_len: 0,
                 thumb_error: None,
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5221,6 +5241,7 @@ mod tests {
                 image_start: 0,
                 image_len: 0,
                 thumb_error: None,
+                terminal_error: None,
                 pass2_applied: None,
                 pass2_error: None,
                 thumb_decompiled: None,
@@ -5293,6 +5314,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -5363,6 +5385,7 @@ mod tests {
             thumb_execution_accepted: None,
             thumb_execution_quarantined: None,
             thumb_error: None,
+            terminal_error: None,
             exit: None,
             pass2_applied: None,
             pass2_error: None,
@@ -5412,6 +5435,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: Some(81_763), // post-enrich
@@ -5483,6 +5507,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6277,6 +6302,7 @@ mod tests {
             image_start: 0x4000,
             image_len: 0x10,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6462,6 +6488,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6505,6 +6532,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: Some(3),
@@ -6547,6 +6575,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
@@ -6590,6 +6619,7 @@ mod tests {
             image_start: 0,
             image_len: 0,
             thumb_error: None,
+            terminal_error: None,
             pass2_applied: None,
             pass2_error: None,
             thumb_decompiled: None,
