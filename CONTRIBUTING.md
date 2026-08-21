@@ -368,7 +368,9 @@ module; when a file outgrows that, split it.
   remain readable and infer radare2; v3 resolves each function through validated runs. Source
   attribution and symbolication preserve `AnalysisTool::Rizin`; globals consumes Rizin-adapted
   `data_refs` through the same canonical record path; `global_shapes` validates provenance before
-  flattening execution identities. Whole-file consumers remain intentionally whole-file for now.
+  flattening execution identities. Typed source recovery and enrichment/symbolication mutations
+  stream function records; `global_shapes` intentionally retains the complete validated function
+  set because its decoder analyzes those records together.
 - **Report conservation.** Current runs copy `regions_requested`, `regions_succeeded`,
   `regions_failed`, `radare2_runs`, and `rizin_runs` into the five `thumb_*` image fields. Require
   requested = succeeded + failed and succeeded = radare2 runs + Rizin runs under the no-union policy.
