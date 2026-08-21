@@ -119,22 +119,47 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   and mixed ownership. `globals_golden::synthetic_rizin_v3_ownership_and_data_refs_reach_downstream_consumers`
   proves Rizin attribution and canonical `data_refs` without firmware or external tools. Do not
   move process-level fallback duplication into a Ghidra route test.
-- **Two-model Thumb acceptance:** use a release binary and four fresh, non-hidden, disk-backed
-  roots, running sequentially. Put an external audit wrapper named `rizin` first on `PATH`; it must
-  log argv and `exec /usr/bin/rizin "$@"` without changing behavior. Use that same wrapper for
-  default and enabled runs so an empty default log proves no discovery/probe/spawn rather than only
-  no analysis. Classify each enabled-log `-v` entry as a version probe and each `-c` entry as an
-  analyzer process; a configured-but-unused Rizin therefore has one probe and zero analyzer calls.
-  The standard command matrix is:
+- **Two-model Thumb acceptance:** choose one new, empty, model-independent acceptance root outside
+  git on a non-hidden, disk-backed path; its four model/mode output directories run sequentially.
+  Do not use `/tmp`, a dot-directory, a retained model tree, or any workspace/default Cargo target.
+  In particular, linked worktrees can overwrite a shared `target/release` or shared
+  `CARGO_TARGET_DIR`, so such a binary is invalid acceptance provenance. Put an audit wrapper named
+  `rizin` under the acceptance root and first on `PATH`; it must log argv and
+  `exec /usr/bin/rizin "$@"` without changing behavior. Use that same wrapper for default and
+  enabled runs so an empty default log proves no discovery/probe/spawn rather than only no analysis.
+  Classify each enabled-log `-v` entry as a version probe and each `-c` entry as an analyzer process;
+  a configured-but-unused Rizin therefore has one probe and zero analyzer calls. The root-creation,
+  isolated build, provenance gate, and standard command matrix are:
 
-      cargo build --release
-      PATH=<audit-bin>:$PATH PME_RIZIN_AUDIT_LOG=<root>/mustang-default.rizin.log /usr/bin/time -v target/release/pixel-modem-extractor decompose <mustang-radio.img> --out <root>/mustang-default
-      PATH=<audit-bin>:$PATH PME_RIZIN_AUDIT_LOG=<root>/mustang-fallback.rizin.log /usr/bin/time -v target/release/pixel-modem-extractor decompose <mustang-radio.img> --out <root>/mustang-fallback --rizin-fallback
-      PATH=<audit-bin>:$PATH PME_RIZIN_AUDIT_LOG=<root>/cheetah-default.rizin.log /usr/bin/time -v target/release/pixel-modem-extractor decompose <cheetah-radio.img> --out <root>/cheetah-default
-      PATH=<audit-bin>:$PATH PME_RIZIN_AUDIT_LOG=<root>/cheetah-fallback.rizin.log /usr/bin/time -v target/release/pixel-modem-extractor decompose <cheetah-radio.img> --out <root>/cheetah-fallback --rizin-fallback
+      ACCEPT_ROOT=/absolute/non-hidden/disk-backed/rizin-thumb-fallback-acceptance
+      MUSTANG_IMG=/absolute/path/to/mustang-radio.img
+      CHEETAH_IMG=/absolute/path/to/cheetah-radio.img
+      mkdir "$ACCEPT_ROOT"  # must create a new root; an existing or reused root is invalid
+      AUDIT_BIN="$ACCEPT_ROOT/audit-bin"  # create the wrapper described above here
+      test -x "$AUDIT_BIN/rizin"
+      CARGO_TARGET_DIR="$ACCEPT_ROOT/cargo-target" cargo build --release
+      BIN="$ACCEPT_ROOT/cargo-target/release/pixel-modem-extractor"
+      test -x "$BIN"
+      git rev-parse HEAD
+      git diff --binary HEAD | sha256sum
+      cargo pkgid
+      readlink -f "$BIN"
+      sha256sum "$BIN"
+      strings "$BIN" | rg -F 'pixel-modem-extractor-thumb-functions-v3'
+      strings "$BIN" | rg -F 'aaa;aflj;pdfj @@F;axlj'
+      "$BIN" decompose --help | rg -F -- '--rizin-fallback'
+      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/mustang-default.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/mustang-default.time" "$BIN" decompose "$MUSTANG_IMG" --out "$ACCEPT_ROOT/mustang-default"
+      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/mustang-fallback.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/mustang-fallback.time" "$BIN" decompose "$MUSTANG_IMG" --out "$ACCEPT_ROOT/mustang-fallback" --rizin-fallback
+      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/cheetah-default.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/cheetah-default.time" "$BIN" decompose "$CHEETAH_IMG" --out "$ACCEPT_ROOT/cheetah-default"
+      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/cheetah-fallback.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/cheetah-fallback.time" "$BIN" decompose "$CHEETAH_IMG" --out "$ACCEPT_ROOT/cheetah-fallback" --rizin-fallback
 
-  Keep inputs, trees, captures, logs, and `/usr/bin/time -v` output outside git. Record canonical
-  tool identities, wall time, and maximum RSS. For each fresh sidecar compare raw/substantial/
+  Never substitute a path selected by mtime. Record the isolated binary's resolved path, hash, source
+  HEAD/worktree-diff hash, package identity, and marker checks before the first leg. Before starting
+  the next leg, require the completed `report.json` to carry the expected package `tool_version`,
+  exact radare2 path/version,
+  `rizin_fallback` value, and (when enabled) exact Rizin path/version; require the v3 producer table
+  to agree. Keep inputs, trees, captures, logs, and `/usr/bin/time -v` output outside git. Record
+  canonical tool identities, wall time, and maximum RSS. For each fresh sidecar compare raw/substantial/
   accepted/quarantined counts and accepted execution identities with the retained pre-v3 tree;
   explain size changes from `realsz` and source-attribution changes from `decode_ranges`. Prove healthy
   regions and mustang's largest region remain radare2-owned. On cheetah, require `0x42310000` to show
@@ -307,12 +332,20 @@ module; when a file outgrows that, split it.
   BLAKE3 are accumulated. A successful attempt requires capture metadata. A failed attempt retains
   finalized partial stdout when possible; spawn/capture-finalization failures record `stdout: null`.
   `--prune` removes capture files, but v3 preserves their relative path, byte count, and hash.
-- **Process limits and cleanup are terminal contracts.** Both backends have a 4 GiB stdout cap and
-  a 16 GiB Unix `RLIMIT_AS`. Only Rizin has a 30-minute per-region runtime deadline. Each analyzer
-  runs in its own Unix process group; stdout drains concurrently, timeout/error cleanup signals the
-  anchored process tree, joins the drain, verifies termination, and reaps exactly once. If cleanup
-  cannot prove the launched tree is gone, the coordinator aborts the stage: it must not start Rizin
-  fallback or a later region after a potentially surviving analyzer.
+- **Analyzer runtime and pipe-finalization bounds are distinct.** Both backends have a 4 GiB stdout
+  cap and a 16 GiB Unix `RLIMIT_AS`. Rizin has a 30-minute per-region analysis deadline; radare2 has
+  no analysis deadline. After the immediate analyzer exit is observed, either backend may spend at
+  most 1 second idle (new bytes reset this window) and 30 seconds absolute finalizing inherited
+  stdout pipes (progress cannot extend this window). Reaching either post-exit bound forces pipe
+  finalization and fails the attempt; neither bound is an analyzer runtime deadline.
+- **Cleanup guarantees are platform-specific terminal contracts.** On Unix, each analyzer runs in
+  its own process group. Exit observation uses identity-stable `WNOWAIT` ordering so the leader
+  remains waitable while the anchored group is signaled; cleanup then reaps the leader exactly once
+  and verifies that the process group is absent. On non-Unix platforms, the portable contract is
+  limited to terminating/reaping the immediate child and cancelling/joining its stdout drain; it
+  does not claim descendant process-group cleanup. If the applicable cleanup proof fails, the
+  coordinator aborts the stage: it must not start Rizin fallback or a later region after a
+  potentially surviving analyzer.
 - **Rizin xrefs are bounded outgoing evidence.** The one trailing `axlj` array must be final and is
   streamed rather than materialized. Types are case-insensitive: include `data`, `str`, `string`,
   `mem`, `ptr`, or `read`; deny `code`, `call`, `jump`, or `exec`. Selected records require a u32
@@ -913,8 +946,13 @@ hardcoded. Two reference images exercise both models end-to-end:
   `global_load`/`string_load` only on the disasm-anchored path and does not
   backfill them onto Phase 3.0 entries. A future "unify the evidence shape"
   change is a separate decision; don't fold it into an unrelated fix.
-  (Current production total on `02_MAIN` is 915 Recovered across both
-  paths — see the Phase 3.0.1 production-state bullet.)
+  Fresh Task 11 acceptance on the retained Mustang/S5400 image with
+  pixel-modem-extractor 2.0.0, Ghidra 12.1.2_DEV, and radare2 6.1.4 measured
+  919 Recovered on `02_MAIN` and 925 stage-wide in both default and
+  `--rizin-fallback` runs; the fallback leg preflighted Rizin 0.8.2 but made no
+  Rizin analyzer call. These are corpus/tool-version observations, not universal invariants.
+  The 915 MAIN result below remains useful only as labeled historical pre-v3
+  evidence.
 - **Surface 3.0.1-A: visibility when disasm is unreadable/absent.** When
   `disasm.lst` is missing or its read returns `Err`, `globals.json` is still
   written with Phase 3.0-only content (strict-string-rule Recovered) plus a
@@ -959,7 +997,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   a comparison baseline, not a current inventory promise. The
   `phase3_0_1_recovered_exceeds_phase3_0_baseline` golden
   sentinel still asserts `> PHASE3_0_ARM_ONLY_BASELINE` (424) and is
-  env-gated (`PME_GOLDEN_DIR`); it holds under the verified 915 total.
+  env-gated (`PME_GOLDEN_DIR`); it held under the historical 915 total.
 - **Cross-path conflict characterization.** Of the 223
   same-address proposals dropped by strict-single-source on an earlier
   ARM-only production `02_MAIN`, **17 are genuine Phase-3.0-strict-vs-
@@ -967,8 +1005,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   conflicts). Strict-precedence would gain +11 Recovered; disasm-precedence
   +9; **both propagate clearly-wrong names** on the cases they flip. Current
   strict-drop (drop both on disagreement) is the right call — neither path
-  is reliable enough to arbitrate the other. The verified post-fix net
-  on `02_MAIN` is 915 Recovered (see the production-state bullet above).
+  is reliable enough to arbitrate the other. The historically verified pre-v3
+  post-fix net on `02_MAIN` was 915 Recovered (see the production-state bullet
+  above).
 - **Historical cap calibration remains valid for both backends.** The former 256 MiB
   in-memory cap blocked production radare2. A healthy mustang region emitted ~1.82 GiB and the
   complete old run emitted ~3.65 GiB across captures, grounding the current shared 4 GiB
