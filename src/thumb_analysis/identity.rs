@@ -108,6 +108,45 @@ enum VersionOutput {
     Version(String),
 }
 
+/// Incremental UTF-8 decoder: hands each complete prefix to a sink and carries
+/// a sequence split across reads into the next chunk.
+#[derive(Default)]
+struct Utf8Decoder {
+    tail: Vec<u8>,
+    invalid: bool,
+}
+
+impl Utf8Decoder {
+    fn push(&mut self, bytes: &[u8], on_text: impl FnOnce(&str)) {
+        if self.invalid {
+            return;
+        }
+        let mut input = Vec::with_capacity(self.tail.len() + bytes.len());
+        input.append(&mut self.tail);
+        input.extend_from_slice(bytes);
+        match std::str::from_utf8(&input) {
+            Ok(text) => on_text(text),
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                let valid =
+                    std::str::from_utf8(&input[..valid_up_to]).expect("UTF-8 error valid prefix");
+                on_text(valid);
+                if error.error_len().is_none() {
+                    self.tail.extend_from_slice(&input[valid_up_to..]);
+                } else {
+                    self.invalid = true;
+                }
+            }
+        }
+    }
+
+    /// Input is valid UTF-8 only when nothing was rejected and no sequence is
+    /// left incomplete at end of stream.
+    fn is_complete(&self) -> bool {
+        !self.invalid && self.tail.is_empty()
+    }
+}
+
 /// Incrementally trims one UTF-8 line while retaining at most the accepted
 /// version bytes. Trailing whitespace is committed only if content follows it.
 #[derive(Default)]
@@ -115,35 +154,15 @@ struct VersionLine {
     content: Vec<u8>,
     trailing_whitespace: Vec<u8>,
     trailing_whitespace_overflow: bool,
-    utf8_tail: Vec<u8>,
-    invalid_utf8: bool,
+    decoder: Utf8Decoder,
     oversized: bool,
 }
 
 impl VersionLine {
     fn push_bytes(&mut self, bytes: &[u8]) {
-        if self.invalid_utf8 {
-            return;
-        }
-
-        let mut input = Vec::with_capacity(self.utf8_tail.len() + bytes.len());
-        input.append(&mut self.utf8_tail);
-        input.extend_from_slice(bytes);
-        match std::str::from_utf8(&input) {
-            Ok(text) => self.push_str(text),
-            Err(error) => {
-                let valid_up_to = error.valid_up_to();
-                let incomplete = error.error_len().is_none();
-                let valid =
-                    std::str::from_utf8(&input[..valid_up_to]).expect("UTF-8 error valid prefix");
-                self.push_str(valid);
-                if incomplete {
-                    self.utf8_tail.extend_from_slice(&input[valid_up_to..]);
-                } else {
-                    self.invalid_utf8 = true;
-                }
-            }
-        }
+        let mut decoder = std::mem::take(&mut self.decoder);
+        decoder.push(bytes, |text| self.push_str(text));
+        self.decoder = decoder;
     }
 
     fn push_str(&mut self, text: &str) {
@@ -178,7 +197,7 @@ impl VersionLine {
     }
 
     fn finish(self) -> Option<VersionOutput> {
-        if self.invalid_utf8 || !self.utf8_tail.is_empty() {
+        if !self.decoder.is_complete() {
             Some(VersionOutput::InvalidUtf8)
         } else if self.oversized {
             Some(VersionOutput::Oversized)
@@ -196,34 +215,40 @@ fn read_version_stdout(mut stdout: impl Read) -> std::io::Result<VersionOutput> 
     let mut chunk = [0u8; 8 * 1_024];
     let mut line = VersionLine::default();
     let mut output = None;
+    // Preflight requires successful stdout to be UTF-8, so the bytes drained
+    // after the selected line are validated too — they are just not retained.
+    let mut drained = Utf8Decoder::default();
 
     loop {
         let read = stdout.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        if output.is_some() {
-            continue;
-        }
         let mut start = 0;
-        for (index, &byte) in chunk[..read].iter().enumerate() {
-            if byte == b'\n' {
-                line.push_bytes(&chunk[start..index]);
-                if let Some(parsed) = std::mem::take(&mut line).finish() {
-                    output = Some(parsed);
-                    break;
+        if output.is_none() {
+            for (index, &byte) in chunk[..read].iter().enumerate() {
+                if byte == b'\n' {
+                    line.push_bytes(&chunk[start..index]);
+                    start = index + 1;
+                    if let Some(parsed) = std::mem::take(&mut line).finish() {
+                        output = Some(parsed);
+                        break;
+                    }
                 }
-                start = index + 1;
+            }
+            if output.is_none() {
+                line.push_bytes(&chunk[start..read]);
+                start = read;
             }
         }
-        if output.is_none() {
-            line.push_bytes(&chunk[start..read]);
-        }
+        drained.push(&chunk[start..read], |_| {});
     }
 
-    Ok(output
-        .or_else(|| line.finish())
-        .unwrap_or(VersionOutput::Empty))
+    let output = output.or_else(|| line.finish());
+    if !drained.is_complete() {
+        return Ok(VersionOutput::InvalidUtf8);
+    }
+    Ok(output.unwrap_or(VersionOutput::Empty))
 }
 
 fn read_stderr_diagnostic(mut stderr: impl Read) -> std::io::Result<Vec<u8>> {
@@ -854,6 +879,28 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("UTF-8"), "{error}");
+    }
+
+    /// Preflight requires successful stdout to be UTF-8, not merely its first
+    /// non-empty line: bytes drained after the version line are still checked.
+    #[test]
+    fn probe_version_rejects_invalid_utf8_after_the_selected_line() {
+        for (case, body) in [
+            ("invalid sequence", "printf 'radare2 5.9.0\\n\\377\\n'"),
+            ("truncated sequence", "printf 'radare2 5.9.0\\n\\303'"),
+        ] {
+            let (_dir, script) = tool_script(body);
+
+            let error = probe_identity(
+                &script,
+                ThumbProducer::Radare2,
+                ThumbProducer::Radare2.command(),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("UTF-8"), "{case}: {error}");
+        }
     }
 
     #[test]
