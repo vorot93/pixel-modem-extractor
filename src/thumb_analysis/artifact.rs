@@ -137,15 +137,25 @@ pub(crate) struct ThumbDecodeRange {
 /// Typed function payload used by streaming consumers. Unlike the strict v3
 /// wire type, this accepts legacy enrichment fields and ignores unknown legacy
 /// fields while avoiding a document-sized `serde_json::Value` tree.
+///
+/// Only `name` and `entry` are required, because retained v1/v2 artifacts do
+/// not carry the v3 semantic contract and legacy symbolication defaulted the
+/// rest. V3 strictness is unaffected: v3 records are deserialized through
+/// `FunctionWire`, which requires the complete producer field set, and only
+/// then converted into this type.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ThumbFunctionRecord {
     pub name: String,
     #[serde(default)]
     pub original_name: Option<String>,
     pub entry: String,
+    #[serde(default)]
     pub end: String,
+    #[serde(default)]
     pub size: u64,
+    #[serde(default)]
     pub body_kind: String,
+    #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub data_refs: Vec<String>,
@@ -3875,6 +3885,51 @@ mod tests {
             assert!(function.legacy_range_semantics);
             assert_eq!(function.value["legacy"], true);
         }
+    }
+
+    /// Retained v1/v2 artifacts predate the v3 semantic contract, and legacy
+    /// symbolication defaulted `end`, `body`, and ignored `size`/`body_kind`.
+    /// Typed loading must keep reading them; v3 stays strict through
+    /// `FunctionWire`.
+    #[test]
+    fn typed_loading_defaults_legacy_fields_v3_still_requires() {
+        for format in [THUMB_V1_FORMAT, THUMB_V2_FORMAT] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("thumb_functions.json");
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"format\":\"{format}\",\"functions\":[{{\"name\":\"thumb_1000\",\"entry\":\"0x1000\"}}]}}"
+                ),
+            )
+            .unwrap();
+
+            let functions = read_thumb_functions_streaming(&path).unwrap();
+
+            assert_eq!(functions.len(), 1, "{format}");
+            let owned = &functions[0];
+            assert_eq!(owned.producer, ThumbProducer::Radare2);
+            assert!(owned.legacy_range_semantics);
+            assert_eq!(owned.function.name, "thumb_1000");
+            assert_eq!(owned.function.end, "");
+            assert_eq!(owned.function.size, 0);
+            assert_eq!(owned.function.body_kind, "");
+            assert_eq!(owned.function.body, "");
+        }
+
+        let mut incomplete = valid_v3();
+        incomplete["functions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("end");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb_functions.json");
+        std::fs::write(&path, canonical_v3(&incomplete)).unwrap();
+
+        assert!(
+            read_thumb_functions_streaming(&path).is_err(),
+            "v3 must still require the complete producer field set"
+        );
     }
 
     #[test]
