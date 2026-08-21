@@ -467,12 +467,32 @@ fn load_functions<'a>(decompiled: &Path, index: &DisasmIndex<'a>) -> Result<Vec<
     Ok(out)
 }
 
-fn load_thumb_functions<'a>(decompiled: &Path) -> Result<Vec<FuncRec<'a>>> {
+/// The mapped-image context for Thumb artifact validation, when the raw image
+/// and its load address are both available. `None` leaves the artifact checked
+/// without image context, exactly as when the image is missing.
+fn mapped_thumb_image(
+    image_and_load: Option<&(Vec<u8>, u64)>,
+) -> Result<Option<crate::thumb_analysis::MappedImage>> {
+    let Some((image, load_addr)) = image_and_load else {
+        return Ok(None);
+    };
+    let (Ok(start), Ok(len)) = (u32::try_from(*load_addr), u32::try_from(image.len())) else {
+        return Err(Error::Serialize(
+            "symbolicate: raw image mapping does not fit the canonical u32 domain".into(),
+        ));
+    };
+    crate::thumb_analysis::MappedImage::new(start, len).map(Some)
+}
+
+fn load_thumb_functions<'a>(
+    decompiled: &Path,
+    image: Option<crate::thumb_analysis::MappedImage>,
+) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("thumb_functions.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let functions = crate::thumb_analysis::read_thumb_functions_streaming(&path)?;
+    let functions = crate::thumb_analysis::read_thumb_functions_streaming(&path, image)?;
     let mut out = Vec::with_capacity(functions.len());
     for owned in functions {
         let f = owned.function;
@@ -900,7 +920,7 @@ fn rewrite_functions_json_whole(decompiled: &Path, symbols: &[Symbol]) -> Result
     // thumb_functions.json ({ "functions": [...] })
     let tpath = decompiled.join("thumb_functions.json");
     if tpath.exists() {
-        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&tpath)?;
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&tpath, None)?;
         apply(artifact.function_values_mut());
         artifact.write_atomic(&tpath)?;
     }
@@ -967,7 +987,7 @@ fn rewrite_body_c_in_thumb_functions_whole(decompiled: &Path, symbols: &[Symbol]
     if !path.exists() {
         return Ok(());
     }
-    let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path)?;
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path, None)?;
     let renames = build_rename_map(symbols);
     for function in artifact.function_values_mut() {
         let Some(obj) = function.as_object_mut() else {
@@ -1039,9 +1059,6 @@ pub(crate) fn build_map(
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
     let index = crate::disasm_index::DisasmIndex::new(&disasm);
 
-    let mut funcs = load_functions(&decompiled, &index)?;
-    funcs.extend(load_thumb_functions(&decompiled)?);
-
     let source_tree = image_dir.join("source_tree");
     let (file_occ, file_strings) = if source_tree.join("manifest.json").exists() {
         load_file_occurrences(&source_tree)?
@@ -1050,6 +1067,8 @@ pub(crate) fn build_map(
     };
     let attribution = load_attribution(&source_tree)?;
 
+    // Loaded before the function inventories so the Thumb artifact can be
+    // validated against the image it was produced for.
     let raw_image_path = image_dir.join(format!("{image_label}.bin"));
     let image_and_load: Option<(Vec<u8>, u64)> = match crate::manifest::load_addr_for_image(
         manifest,
@@ -1067,6 +1086,13 @@ pub(crate) fn build_map(
             None
         }
     };
+
+    let mut funcs = load_functions(&decompiled, &index)?;
+    funcs.extend(load_thumb_functions(
+        &decompiled,
+        mapped_thumb_image(image_and_load.as_ref())?,
+    )?);
+
     let string_map = match &image_and_load {
         Some((img, load_addr)) => build_string_map(img, *load_addr, 3),
         None => HashMap::new(),
@@ -1781,7 +1807,7 @@ mod tests {
         )
         .unwrap();
 
-        let funcs = load_thumb_functions(&dir).unwrap();
+        let funcs = load_thumb_functions(&dir, None).unwrap();
         let attribution = load_attribution(&dir).unwrap();
 
         assert_eq!(funcs.len(), 2);
@@ -2037,7 +2063,7 @@ mod tests {
         rewrite_functions_json(&dir, &[thumb_symbol()]).unwrap();
 
         let rewritten_bytes = std::fs::read(&path).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
         assert_eq!(after["format"], before["format"]);
         assert_eq!(after["producers"], before["producers"]);
@@ -2077,7 +2103,7 @@ mod tests {
             crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
         )
         .unwrap();
-        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path).unwrap();
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path, None).unwrap();
         artifact.function_values_mut()[0]["body_c"] =
             serde_json::json!("void thumb_4000(void) { thumb_4000(); }");
         artifact.write_atomic(&path).unwrap();
@@ -2087,7 +2113,7 @@ mod tests {
         rewrite_body_c_in_thumb_functions(&dir, &[thumb_symbol()]).unwrap();
 
         let rewritten_bytes = std::fs::read(&path).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
         assert_eq!(after["format"], before["format"]);
         assert_eq!(after["producers"], before["producers"]);

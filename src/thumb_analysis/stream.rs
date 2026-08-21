@@ -3490,7 +3490,7 @@ esac
             }
         );
         let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&bytes).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&bytes, None).unwrap();
         let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(artifact["format"], crate::thumb_analysis::THUMB_V3_FORMAT);
         assert_eq!(artifact["producers"].as_array().unwrap().len(), 1);
@@ -3574,9 +3574,11 @@ esac
 
         assert_eq!(summary.radare2_runs, 0);
         assert_eq!(summary.rizin_runs, 1);
-        let artifact =
-            crate::thumb_analysis::read_thumb_artifact(&dir.path().join("thumb_functions.json"))
-                .unwrap();
+        let artifact = crate::thumb_analysis::read_thumb_artifact(
+            &dir.path().join("thumb_functions.json"),
+            None,
+        )
+        .unwrap();
         let function = artifact.functions().next().unwrap();
         assert_eq!(
             function.producer,
@@ -3731,7 +3733,7 @@ esac
             }
         );
         let bytes = std::fs::read(dir.path().join("thumb_functions.json")).unwrap();
-        let artifact = crate::thumb_analysis::parse_thumb_artifact(&bytes).unwrap();
+        let artifact = crate::thumb_analysis::parse_thumb_artifact(&bytes, None).unwrap();
         let owned = artifact
             .functions()
             .map(|function| {

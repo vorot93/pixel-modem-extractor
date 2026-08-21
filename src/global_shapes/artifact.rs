@@ -88,7 +88,13 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
             (None, ParsedInventory::empty())
         }
         Some((substantial, accepted, quarantined)) => {
-            let artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path)?;
+            let artifact = crate::thumb_analysis::read_thumb_artifact(
+                &thumb_path,
+                Some(crate::thumb_analysis::MappedImage::new(
+                    load_address,
+                    image_len,
+                )?),
+            )?;
             let hash = artifact.source_blake3().to_owned();
             let parsed =
                 parse_thumb_inventory(artifact.function_values(), load_address, image_len)?;

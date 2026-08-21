@@ -421,7 +421,15 @@ pub fn run_with_evidence_projection(
 
     let thumb_path = decompiled.join("thumb_functions.json");
     if thumb_path.exists() {
-        let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path)?;
+        // The raw image is loaded above, so v3 region bounds and function
+        // envelopes are validated against the image they describe.
+        let mapped = crate::thumb_analysis::MappedImage::new(
+            u32::try_from(load_addr)
+                .map_err(|_| Error::Serialize("globals: load_addr does not fit u32".into()))?,
+            u32::try_from(image_bytes.len())
+                .map_err(|_| Error::Serialize("globals: image length does not fit u32".into()))?,
+        )?;
+        let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path, Some(mapped))?;
         for function in thumb_artifact.function_values() {
             if let Some(parsed) = parse_function(
                 function,
@@ -1416,6 +1424,7 @@ mod tests {
         );
         let artifact = crate::thumb_analysis::read_thumb_artifact(
             &img.image_dir().join("decompiled/thumb_functions.json"),
+            None,
         )
         .unwrap();
         assert!(
@@ -1429,7 +1438,21 @@ mod tests {
             serde_json::json!(["0x4020", "0x4060", "0x4070"])
         );
         img.write_manifest_load_addr("0x4000");
-        img.write_image_bin(&image_with_strings(0x4000, &[(0x4020, "g_thumb")]));
+        // Globals knows the load address and image length, so it validates the
+        // artifact against the image it was produced for: an image that does
+        // not span the fixture's 0x4000..0x4080 v3 region is a hard input
+        // error, not silently accepted evidence.
+        let mut image = image_with_strings(0x4000, &[(0x4020, "g_thumb")]);
+        img.write_image_bin(&image);
+        assert!(
+            run_no_names(&img)
+                .unwrap_err()
+                .to_string()
+                .contains("region 0 is outside mapped image")
+        );
+
+        image.resize(0x80, 0);
+        img.write_image_bin(&image);
 
         let report = run_no_names(&img).unwrap();
         assert_eq!(report.recovered_count, 1);

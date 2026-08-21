@@ -2748,7 +2748,7 @@ pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) 
 fn thumb_enrich_whole(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
     let c_text = std::fs::read_to_string(decompiled_c_path)?;
     let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
-    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path)?;
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path, None)?;
     let mut populated = 0usize;
     for function in artifact.function_values_mut() {
         let Some(entry) = function.get("entry").and_then(serde_json::Value::as_str) else {
@@ -5891,7 +5891,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
         assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
         let rewritten_bytes = std::fs::read(&thumb_path).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
         assert_eq!(after["format"], before["format"]);
         assert_eq!(after["producers"], before["producers"]);
@@ -5930,7 +5930,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
         )
         .unwrap();
-        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path).unwrap();
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path, None).unwrap();
         artifact.function_values_mut()[0]["body_c"] = serde_json::json!(body);
         artifact.write_atomic(&thumb_path).unwrap();
         let before = std::fs::read(&thumb_path).unwrap();

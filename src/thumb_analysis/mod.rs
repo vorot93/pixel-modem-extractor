@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 #[allow(unused_imports)]
 pub(crate) use artifact::{
-    AttemptRecord, AttemptStatus, CaptureRecord, FunctionRunRecord, OwnedFunctionRef,
+    AttemptRecord, AttemptStatus, CaptureRecord, FunctionRunRecord, MappedImage, OwnedFunctionRef,
     OwnedThumbFunction, ParsedThumbArtifact, RegionRecord, THUMB_V1_FORMAT, THUMB_V2_FORMAT,
     THUMB_V3_FORMAT, ThumbDecodeRange, ThumbFormat, ThumbFunctionRecord, ThumbTerminalMetadata,
     ValidatedThumbInventory, assemble_v3_atomic, assemble_v3_into, parse_thumb_artifact,

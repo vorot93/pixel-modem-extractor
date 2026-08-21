@@ -254,6 +254,7 @@ impl ParsedThumbArtifact {
             &self.document.producers,
             &self.document.regions,
             &self.document.functions,
+            None,
         )?;
         if owners != self.owners {
             return Err(invalid_artifact(
@@ -636,18 +637,38 @@ fn convert_regions(wires: Vec<RegionWire>) -> Result<Vec<RegionRecord>> {
         .collect()
 }
 
+/// The load address and length of the image a Thumb artifact was produced for.
+/// Every consumer that knows both must supply it: without it a v3 document can
+/// carry in-image decode ranges beside an out-of-image region or function
+/// envelope and still pass validation.
 #[derive(Clone, Copy)]
-struct MappedImage {
+pub(crate) struct MappedImage {
     start: u32,
     end: u32,
     len: u32,
 }
 
-fn mapped_image(start: u32, len: u32) -> Result<MappedImage> {
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| invalid_artifact("mapped image range overflows u32"))?;
-    Ok(MappedImage { start, end, len })
+impl MappedImage {
+    pub(crate) fn new(start: u32, len: u32) -> Result<Self> {
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| invalid_artifact("mapped image range overflows u32"))?;
+        Ok(Self { start, end, len })
+    }
+}
+
+/// V3 regions are the analyzer's request ledger, so they must lie inside the
+/// same image the functions were normalized against.
+fn validate_v3_regions_in_image(regions: &[RegionRecord], image: MappedImage) -> Result<()> {
+    match regions
+        .iter()
+        .position(|region| region.start < image.start || region.end > image.end)
+    {
+        Some(index) => Err(invalid_artifact(format!(
+            "region {index} is outside mapped image"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn validate_function_value(
@@ -970,11 +991,15 @@ fn validate_v3(
     producers: &[ProducerIdentity],
     regions: &[RegionRecord],
     functions: &[Value],
+    image: Option<MappedImage>,
 ) -> Result<Vec<ThumbProducer>> {
     if functions.is_empty() {
         return Err(invalid_artifact("v3 functions array must not be empty"));
     }
     let layout = validate_v3_metadata(producers, regions)?;
+    if let Some(image) = image {
+        validate_v3_regions_in_image(regions, image)?;
+    }
     if layout.function_count != functions.len() {
         return Err(invalid_artifact(
             "every v3 function must have exactly one run owner",
@@ -992,7 +1017,7 @@ fn validate_v3(
         let mut quarantined = 0usize;
         for (offset, function) in slice.iter().enumerate() {
             let (is_substantial, is_accepted, is_quarantined) =
-                validate_function_value(function, run.first_function + offset, None)?;
+                validate_function_value(function, run.first_function + offset, image)?;
             substantial += usize::from(is_substantial);
             accepted += usize::from(is_accepted);
             quarantined += usize::from(is_quarantined);
@@ -1008,7 +1033,13 @@ fn validate_v3(
     Ok(owners)
 }
 
-pub(crate) fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> {
+/// Parse a Thumb sidecar. `image` must be supplied wherever the caller knows
+/// the load address and image length; only then are v3 region bounds and
+/// function envelopes checked against the image they describe.
+pub(crate) fn parse_thumb_artifact(
+    bytes: &[u8],
+    image: Option<MappedImage>,
+) -> Result<ParsedThumbArtifact> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let wire = WireDocument::deserialize(&mut deserializer)
         .and_then(|wire| deserializer.end().map(|()| wire))
@@ -1033,7 +1064,7 @@ pub(crate) fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> 
         } => {
             let producers = convert_producers(producers)?;
             let regions = convert_regions(regions)?;
-            let owners = validate_v3(&producers, &regions, &functions)?;
+            let owners = validate_v3(&producers, &regions, &functions, image)?;
             (
                 ThumbFormat::V3,
                 ThumbDocument {
@@ -1055,17 +1086,26 @@ pub(crate) fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> 
     })
 }
 
-pub(crate) fn read_thumb_artifact(path: &Path) -> Result<ParsedThumbArtifact> {
-    parse_thumb_artifact(&std::fs::read(path)?)
+pub(crate) fn read_thumb_artifact(
+    path: &Path,
+    image: Option<MappedImage>,
+) -> Result<ParsedThumbArtifact> {
+    parse_thumb_artifact(&std::fs::read(path)?, image)
 }
 
 /// Load consumer-facing Thumb records directly from a buffered JSON reader.
 /// Metadata and run ownership are validated before records are exposed, and
 /// only typed records (not a document-wide `Value` tree) are retained.
-pub(crate) fn read_thumb_functions_streaming(path: &Path) -> Result<Vec<OwnedThumbFunction>> {
+pub(crate) fn read_thumb_functions_streaming(
+    path: &Path,
+    image: Option<MappedImage>,
+) -> Result<Vec<OwnedThumbFunction>> {
     let file = std::fs::File::open(path)?;
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
-    let mut scan = TypedFunctionScan::default();
+    let mut scan = TypedFunctionScan {
+        image,
+        ..TypedFunctionScan::default()
+    };
     let parsed = deserializer.deserialize_map(TypedFunctionVisitor { scan: &mut scan });
     parsed
         .and_then(|()| deserializer.end())
@@ -1075,6 +1115,7 @@ pub(crate) fn read_thumb_functions_streaming(path: &Path) -> Result<Vec<OwnedThu
 
 #[derive(Default)]
 struct TypedFunctionScan {
+    image: Option<MappedImage>,
     format: Option<ThumbFormat>,
     saw_producers: bool,
     saw_regions: bool,
@@ -1094,6 +1135,9 @@ impl TypedFunctionScan {
         let producers = convert_producers(producers)?;
         let regions = convert_regions(regions)?;
         let layout = validate_v3_metadata(&producers, &regions)?;
+        if let Some(image) = self.image {
+            validate_v3_regions_in_image(&regions, image)?;
+        }
         self.observed = vec![RunCounts::default(); layout.runs.len()];
         self.run_cursor = V3RunCursor::default();
         self.layout = Some(layout);
@@ -1116,7 +1160,7 @@ impl TypedFunctionScan {
             ))
         })?;
         let (substantial, accepted, quarantined) =
-            validate_function_value(&value, function_index, None)?;
+            validate_function_value(&value, function_index, self.image)?;
         let layout = self.layout.as_ref().ok_or_else(|| {
             invalid_artifact("v3 artifact lacks validated producer and region metadata")
         })?;
@@ -1567,21 +1611,15 @@ impl ThumbScan {
             self.shape_invalid("unsupported Thumb functions inventory format");
             return;
         };
-        let image = match mapped_image(self.image_start, self.image_len) {
+        let image = match MappedImage::new(self.image_start, self.image_len) {
             Ok(image) => image,
             Err(error) => {
                 self.artifact_invalid(error);
                 return;
             }
         };
-        if let Some((index, _)) = regions
-            .iter()
-            .enumerate()
-            .find(|(_, region)| region.start < image.start || region.end > image.end)
-        {
-            self.artifact_invalid(invalid_artifact(format!(
-                "region {index} is outside mapped image"
-            )));
+        if let Err(error) = validate_v3_regions_in_image(&regions, image) {
+            self.artifact_invalid(error);
             return;
         }
         match validate_v3_metadata(producers, &regions) {
@@ -1602,7 +1640,7 @@ impl ThumbScan {
             return;
         }
         if self.format == Some(ThumbFormat::V3) {
-            let image = match mapped_image(self.image_start, self.image_len) {
+            let image = match MappedImage::new(self.image_start, self.image_len) {
                 Ok(image) => image,
                 Err(error) => {
                     self.artifact_invalid(error);
@@ -2767,6 +2805,21 @@ pub(crate) fn assemble_v3_atomic(
 
 #[cfg(test)]
 mod tests {
+    /// Context-free shims: most cases assert document-shape rules that do not
+    /// depend on a mapped image. Image-aware cases call the real entry points
+    /// with an explicit `Some(MappedImage)`.
+    fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> {
+        super::parse_thumb_artifact(bytes, None)
+    }
+
+    fn read_thumb_functions_streaming(path: &Path) -> Result<Vec<OwnedThumbFunction>> {
+        super::read_thumb_functions_streaming(path, None)
+    }
+
+    fn read_thumb_artifact(path: &Path) -> Result<ParsedThumbArtifact> {
+        super::read_thumb_artifact(path, None)
+    }
+
     use super::*;
     use crate::thumb_analysis::ThumbProducer;
     use serde_json::{Value, json};
@@ -3096,6 +3149,61 @@ mod tests {
 
         document["producers"][1]["executable"] = json!(r"\\?\UNC\server\share\tools\rizin.exe");
         assert!(parse_thumb_artifact(&canonical_v3(&document)).is_ok());
+    }
+
+    /// A v3 document whose decode ranges are in-image but whose region ledger
+    /// or function envelope is not must fail for every consumer that knows the
+    /// load address and image length, not only terminal validation.
+    #[test]
+    fn image_aware_consumers_reject_out_of_image_regions_and_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = MappedImage::new(0x1000, 0x1100).unwrap();
+
+        let mut out_of_image_region = valid_v3();
+        out_of_image_region["regions"][1]["start"] = json!("0x9000");
+        out_of_image_region["regions"][1]["end"] = json!("0x9100");
+        out_of_image_region["regions"][1]["attempts"][1]["stdout"]["path"] =
+            json!("thumb/00009000.rizin.stdout");
+
+        let mut out_of_image_envelope = valid_v3();
+        out_of_image_envelope["functions"][1]["end"] = json!("0x9000");
+
+        for (case, document, expected) in [
+            (
+                "region ledger",
+                out_of_image_region,
+                "region 1 is outside mapped image",
+            ),
+            (
+                "function envelope",
+                out_of_image_envelope,
+                "function 1 end is outside mapped image",
+            ),
+        ] {
+            let bytes = canonical_v3(&document);
+            let path = dir.path().join(format!("{case}.json"));
+            std::fs::write(&path, &bytes).unwrap();
+
+            // The context-free parse cannot see the violation.
+            super::parse_thumb_artifact(&bytes, None)
+                .unwrap_or_else(|error| panic!("{case} must be a shape-valid document: {error}"));
+
+            for (api, error) in [
+                (
+                    "whole",
+                    super::parse_thumb_artifact(&bytes, Some(image)).unwrap_err(),
+                ),
+                (
+                    "typed",
+                    super::read_thumb_functions_streaming(&path, Some(image)).unwrap_err(),
+                ),
+            ] {
+                assert!(
+                    error.to_string().contains(expected),
+                    "{case}/{api}: {error}"
+                );
+            }
+        }
     }
 
     /// Discovery caps a version at the first 1,024 stdout bytes, so a longer

@@ -359,7 +359,10 @@ impl RecoveredFunctions {
             // Typed streaming load retains only consumer fields and function
             // bodies while strict v3 metadata resolves each run owner. It never
             // builds the former document-wide `serde_json::Value` tree.
-            for owned in crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path)? {
+            // Source recovery is handed only the decompiled directory, with no
+            // manifest load address or raw image, so it cannot supply the
+            // image-aware context; range matching uses validated decode ranges.
+            for owned in crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, None)? {
                 let Some(function) = recovered_thumb_function(
                     owned.function,
                     owned.producer.into(),
