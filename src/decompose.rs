@@ -340,6 +340,10 @@ pub struct Report {
     pub modem_generation: Option<String>,
     pub out: String,
     pub ghidra: AnalysisTools,
+    /// Whether `--prune` was requested.
+    pub prune_requested: bool,
+    /// Whether the leaves-only sweep actually completed. A failed sweep leaves
+    /// a partially cleaned tree, so automation must not read intent as state.
     pub pruned: bool,
     pub ok: bool,
     pub stages: Vec<StageReport>,
@@ -996,6 +1000,7 @@ fn run_stage(
 }
 
 /// Write `report.json`; return its path on full success, or `Err` if any stage failed.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     out: &Path,
     img: &Path,
@@ -1004,6 +1009,7 @@ fn finalize(
     thumb_tools: &crate::thumb_analysis::ThumbTools,
     stages: Vec<StageReport>,
     modem_generation: Option<String>,
+    pruned: bool,
 ) -> Result<PathBuf> {
     let ok = Report::is_ok(&stages);
     let report = Report {
@@ -1013,7 +1019,8 @@ fn finalize(
         modem_generation,
         out: out.display().to_string(),
         ghidra: analysis_tools(headless, opts, thumb_tools),
-        pruned: opts.prune,
+        prune_requested: opts.prune,
+        pruned,
         ok,
         stages,
     };
@@ -2263,6 +2270,8 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 &thumb_tools,
                 stages,
                 modem_label.clone(),
+                // These early returns precede the prune stage.
+                false,
             ); // nothing to analyze
         }
     }
@@ -2278,6 +2287,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 &thumb_tools,
                 stages,
                 modem_label.clone(),
+                false,
             );
         }
     };
@@ -2825,11 +2835,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     });
 
     // 6. Prune (opt-in) then write the report.
-    if opts.prune
-        && let Err(e) = prune(out)
-    {
-        stages.push(StageReport::failed("prune", e.to_string(), 0));
-    }
+    let pruned = run_prune_stage(&mut stages, opts.prune, || prune(out));
     finalize(
         out,
         img,
@@ -2838,7 +2844,28 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         &thumb_tools,
         stages,
         modem_label.clone(),
+        pruned,
     )
+}
+
+/// Run the opt-in leaves-only sweep, recording a failed stage when it does not
+/// complete. Returns whether the tree was actually pruned, so `report.json`
+/// reports successful state rather than intent.
+fn run_prune_stage(
+    stages: &mut Vec<StageReport>,
+    requested: bool,
+    prune: impl FnOnce() -> Result<()>,
+) -> bool {
+    if !requested {
+        return false;
+    }
+    match prune() {
+        Ok(()) => true,
+        Err(error) => {
+            stages.push(StageReport::failed("prune", error.to_string(), 0));
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4841,6 +4868,7 @@ mod tests {
                 &analysis_opts(true),
                 &thumb_tools,
             ),
+            prune_requested: false,
             pruned: false,
             ok: Report::is_ok(&stages),
             stages,
@@ -6386,6 +6414,9 @@ mod tests {
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
 
         prune(&out).unwrap();
+        // A second sweep over an already-pruned tree is a no-op, not an error:
+        // every removal treats an absent path as done.
+        prune(&out).unwrap();
 
         assert!(!out.join("modem.ext4").exists());
         assert!(!out.join("rootfs").exists());
@@ -6424,6 +6455,63 @@ mod tests {
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());
         assert!(out.join("manifest.json").exists());
+    }
+
+    /// `report.json` must describe the tree that exists, not the flag that was
+    /// passed: a failed sweep leaves a partially cleaned tree, so automation
+    /// reading `pruned: true` would act on artifacts that are still present.
+    #[test]
+    fn prune_report_distinguishes_request_from_successful_completion() {
+        let mut stages = Vec::new();
+        assert!(!run_prune_stage(&mut stages, false, || panic!(
+            "prune must not run unless requested"
+        )));
+        assert!(stages.is_empty());
+
+        assert!(run_prune_stage(&mut stages, true, || Ok(())));
+        assert!(stages.is_empty());
+
+        assert!(!run_prune_stage(&mut stages, true, || Err(
+            Error::Serialize("ghidra/ could not be removed".into())
+        )));
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].stage, "prune");
+        assert_eq!(stages[0].status, "failed");
+        assert!(
+            stages[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("could not be removed"))
+        );
+    }
+
+    #[test]
+    fn report_serializes_prune_request_and_completion_separately() {
+        let report = Report {
+            tool_version: "test".into(),
+            source_image: "radio.img".into(),
+            source_blake3: String::new(),
+            modem_generation: None,
+            out: "out".into(),
+            ghidra: AnalysisTools {
+                headless: "analyzeHeadless".into(),
+                radare2: "/usr/bin/r2".into(),
+                radare2_version: "radare2 6.1.4".into(),
+                rizin_fallback: false,
+                rizin: None,
+                rizin_version: None,
+            },
+            prune_requested: true,
+            pruned: false,
+            ok: false,
+            stages: Vec::new(),
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+
+        assert_eq!(json["prune_requested"], true);
+        assert_eq!(json["pruned"], false);
     }
 
     #[test]
