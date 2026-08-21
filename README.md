@@ -34,9 +34,11 @@ Rizin with `brew install rizin` when you intend to use `--rizin-fallback`.
 Ghidra is located, in order, from `--ghidra-home`, `$GHIDRA_INSTALL_DIR`, or `PATH` (its
 `ghidraRun` launcher), with `/opt/ghidra` as the final Linux fallback. Both the upstream
 release-tarball and Homebrew layouts are supported. Its bundled JDK is used unless you set
-`JAVA_HOME`. radare2 is always discovered, canonicalized, and version-probed before analysis.
-Rizin is not discovered or probed in the default mode; it is preflighted only when
-`--rizin-fallback` is present.
+`JAVA_HOME`. radare2 is discovered, canonicalized, and version-probed as a hard preflight: both
+`decompile --run` and `decompose` fail immediately when it is missing, before Rizin is probed and
+before any output is written, so a run can never succeed without its required primary. Rizin is not
+discovered or probed in the default mode; it is preflighted only when `--rizin-fallback` is
+present.
 
 **Dense Thumb policy:** radare2 runs `aaa;aflj;pdfj @@f` first for every detected region.
 With `--rizin-fallback`, and only after that region's radare2 attempt fails, Rizin runs
@@ -68,9 +70,10 @@ metadata when partial stdout can be finalized; spawn or capture-finalization fai
 `stdout: null`. `--prune` removes all captures and carved region inputs while v3 retains their
 recorded identity.
 
-**Memory:** the complete dense-Thumb Rust path is streaming. Each backend capture is parsed
-value-by-value, functions are normalized and spilled one at a time, and strict v3 is assembled
-atomically. The retained Mustang replay measured ~3.65 GiB of radare2 stdout, 151,411 functions,
+**Memory:** the dense-Thumb producer and every downstream mutation are streaming. Each backend
+capture is parsed value-by-value, functions are normalized and spilled one at a time, and strict v3
+is assembled atomically. One consumer is deliberately whole-file: `global_shapes` retains the
+complete validated function set because its decoder analyzes those records together. The retained Mustang replay measured ~3.65 GiB of radare2 stdout, 151,411 functions,
 582,543,970 output bytes, ~248 seconds, and ~2.8 GB peak RSS for replay plus comparison; capture
 production itself measured ~0.3 GB. `thumb_enrich` streams `decompiled.c` and rewrites one function
 at a time, bounded by its ~86 MB body map plus one record (632 MB artifact A/B: 130 seconds,
@@ -184,6 +187,14 @@ retains `thumb_functions.json` but removes `decompiled/thumb/` captures and carv
 run reports `thumb_regions_requested`, `thumb_regions_succeeded`, `thumb_regions_failed`,
 `thumb_radare2_runs`, and `thumb_rizin_runs`. The v3 sidecar, rather than the report's configured
 tool list, is the source of truth for producers actually attempted and functions they own.
+
+Failure reporting distinguishes its stages. `exit` appears only for an `analyzeHeadless` process
+failure. When Ghidra completes but the terminal execution inventory or the current-run Thumb
+validation rejects the export, the image is `failed` with no `exit` and a reason-only
+`terminal_error`; if the Thumb sidecar was the stage that rejected it, `thumb_error` carries a
+reason too. A stale or failed Thumb result is therefore never reported as "Ghidra failed".
+Top-level `prune_requested` records whether `--prune` was asked for and `pruned` whether the
+leaves-only sweep actually completed — a failed sweep also records a failed `prune` stage.
 
 ## Formats
 

@@ -119,53 +119,47 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   and mixed ownership. `globals_golden::synthetic_rizin_v3_ownership_and_data_refs_reach_downstream_consumers`
   proves Rizin attribution and canonical `data_refs` without firmware or external tools. Do not
   move process-level fallback duplication into a Ghidra route test.
-- **Two-model Thumb acceptance:** choose one new, empty, model-independent acceptance root outside
-  git on a non-hidden, disk-backed path; its four model/mode output directories run sequentially.
-  Do not use `/tmp`, a dot-directory, a retained model tree, or any workspace/default Cargo target.
-  In particular, linked worktrees can overwrite a shared `target/release` or shared
-  `CARGO_TARGET_DIR`, so such a binary is invalid acceptance provenance. Put an audit wrapper named
-  `rizin` under the acceptance root and first on `PATH`; it must log argv and
-  `exec /usr/bin/rizin "$@"` without changing behavior. Use that same wrapper for default and
-  enabled runs so an empty default log proves no discovery/probe/spawn rather than only no analysis.
-  Classify each enabled-log `-v` entry as a version probe and each `-c` entry as an analyzer process;
-  a configured-but-unused Rizin therefore has one probe and zero analyzer calls. The root-creation,
-  isolated build, provenance gate, and standard command matrix are:
+- **Two-model Thumb acceptance:** run `scripts/rizin-thumb-acceptance.sh`. It is the recipe — a
+  transcript of shell commands can fall through a reused root, a missing wrapper, or a failed
+  build and still look like it ran, so every provenance gate lives in one `set -euo pipefail`
+  script instead:
 
-      ACCEPT_ROOT=/absolute/non-hidden/disk-backed/rizin-thumb-fallback-acceptance
-      MUSTANG_IMG=/absolute/path/to/mustang-radio.img
-      CHEETAH_IMG=/absolute/path/to/cheetah-radio.img
-      mkdir "$ACCEPT_ROOT"  # must create a new root; an existing or reused root is invalid
-      AUDIT_BIN="$ACCEPT_ROOT/audit-bin"  # create the wrapper described above here
-      test -x "$AUDIT_BIN/rizin"
-      CARGO_TARGET_DIR="$ACCEPT_ROOT/cargo-target" cargo build --release
-      BIN="$ACCEPT_ROOT/cargo-target/release/pixel-modem-extractor"
-      test -x "$BIN"
-      git rev-parse HEAD
-      git diff --binary HEAD | sha256sum
-      cargo pkgid
-      readlink -f "$BIN"
-      sha256sum "$BIN"
-      strings "$BIN" | rg -F 'pixel-modem-extractor-thumb-functions-v3'
-      strings "$BIN" | rg -F 'aaa;aflj;pdfj @@F;axlj'
-      "$BIN" decompose --help | rg -F -- '--rizin-fallback'
-      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/mustang-default.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/mustang-default.time" "$BIN" decompose "$MUSTANG_IMG" --out "$ACCEPT_ROOT/mustang-default"
-      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/mustang-fallback.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/mustang-fallback.time" "$BIN" decompose "$MUSTANG_IMG" --out "$ACCEPT_ROOT/mustang-fallback" --rizin-fallback
-      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/cheetah-default.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/cheetah-default.time" "$BIN" decompose "$CHEETAH_IMG" --out "$ACCEPT_ROOT/cheetah-default"
-      PATH="$AUDIT_BIN:$PATH" PME_RIZIN_AUDIT_LOG="$ACCEPT_ROOT/cheetah-fallback.rizin.log" /usr/bin/time -v -o "$ACCEPT_ROOT/cheetah-fallback.time" "$BIN" decompose "$CHEETAH_IMG" --out "$ACCEPT_ROOT/cheetah-fallback" --rizin-fallback
+      scripts/rizin-thumb-acceptance.sh \
+          --root /absolute/non-hidden/disk-backed/rizin-thumb-fallback-acceptance \
+          --mustang /absolute/path/to/mustang-radio.img \
+          --cheetah /absolute/path/to/cheetah-radio.img
 
-  Never substitute a path selected by mtime. Record the isolated binary's resolved path, hash, source
-  HEAD/worktree-diff hash, package identity, and marker checks before the first leg. Before starting
-  the next leg, require the completed `report.json` to carry the expected package `tool_version`,
-  exact radare2 path/version,
-  `rizin_fallback` value, and (when enabled) exact Rizin path/version; require the v3 producer table
-  to agree. Keep inputs, trees, captures, logs, and `/usr/bin/time -v` output outside git. Record
-  canonical tool identities, wall time, and maximum RSS. For each fresh sidecar compare raw/substantial/
-  accepted/quarantined counts and accepted execution identities with the retained pre-v3 tree;
-  explain size changes from `realsz` and source-attribution changes from `decode_ranges`. Prove healthy
-  regions and mustang's largest region remain radare2-owned. On cheetah, require `0x42310000` to show
-  failed radare2 then successful Rizin, non-empty adapted refs, downstream `AnalysisTool::Rizin`, and
-  globals yield/conflicts against the valid no-xref baseline. Never infer a corpus pass from a clean
-  env-gated skip, and never hardcode analyzer-version-dependent inventory counts into unit tests.
+  `--print-legs` performs every gate and prints the four leg commands without running them; `--rizin`
+  overrides the wrapped executable. What the script enforces, and why each gate exists:
+
+  - The acceptance root must be absolute, outside the repository, non-hidden, not under `/tmp`, and
+    **must not already exist** — a reused root is invalid provenance.
+  - It creates the `rizin` audit wrapper under the root and puts it first on `PATH` for *all four*
+    legs, so an empty default log proves no discovery/probe/spawn rather than only no analysis. Each
+    enabled-log `-v` entry is a version probe and each `-c` entry an analyzer process, so a
+    configured-but-unused Rizin has one probe and zero analyzer calls.
+  - The binary is built `--release --locked` into an isolated `CARGO_TARGET_DIR` under the root, with
+    `--manifest-path` anchored to the worktree holding the script. Linked worktrees can overwrite a
+    shared `target/release` or shared `CARGO_TARGET_DIR`, so such a binary is invalid provenance, and
+    a path selected by mtime is never a substitute.
+  - Before the first leg it records HEAD, the worktree-diff hash, `cargo pkgid`, the resolved binary
+    path and its hash into `provenance.txt`, and checks the binary really carries this feature: the
+    strict-v3 format marker, the Rizin `aaa;aflj;pdfj @@F;axlj` command, and `--rizin-fallback` in
+    `decompose --help`.
+  - The four legs (mustang/cheetah × default/fallback) run sequentially under `/usr/bin/time -v`.
+    After each one, and before the next starts, the completed `report.json` must carry the audited
+    package `tool_version`, an exact radare2 path and version, the leg's `rizin_fallback` value, and
+    (when enabled) the wrapper as the Rizin executable plus its exact version.
+
+  The script stops at measurement; the analysis gates are still yours. Keep inputs, trees, captures,
+  logs, and `/usr/bin/time -v` output outside git. Record canonical tool identities, wall time, and
+  maximum RSS. For each fresh sidecar compare raw/substantial/accepted/quarantined counts and accepted
+  execution identities with the retained pre-v3 tree; explain size changes from `realsz` and
+  source-attribution changes from `decode_ranges`. Prove healthy regions and mustang's largest region
+  remain radare2-owned. On cheetah, require `0x42310000` to show failed radare2 then successful Rizin,
+  non-empty adapted refs, downstream `AnalysisTool::Rizin`, and globals yield/conflicts against the
+  valid no-xref baseline. Never infer a corpus pass from a clean env-gated skip, and never hardcode
+  analyzer-version-dependent inventory counts into unit tests.
 - Write the failing test first (TDD), then the minimal code to pass it.
 
 ### Hashing and golden identity
@@ -347,6 +341,21 @@ module; when a file outgrows that, split it.
   does not claim descendant process-group cleanup. If the applicable cleanup proof fails, the
   coordinator aborts the stage: it must not start Rizin fallback or a later region after a
   potentially surviving analyzer.
+- **One typed terminal path, and it is wider than "cleanup".** `FailedRegion::terminal` marks any
+  attempt that left unverified process or on-disk state; the coordinator then records **no attempt
+  record**, no fallback, no later region, and no publication. It covers pre-attempt housekeeping
+  (`FailedRegion::setup` — nothing was spawned, so recording an attempt would claim a process that
+  never ran), output that could not be removed (`remove_stale_output` treats only an absent path as
+  success), a drain that would not stop, and unverified process cleanup. The design's one *ordinary*
+  case is narrow and must stay so: a partial capture whose finalization failed but which was
+  **provably removed** records `stdout: null` and stays fallback-eligible.
+- **Declared bounds must bound the return, not the cancellation.** The 10-second version probe and
+  the post-exit pipe-finalization limits are meaningless if cleanup then blocks forever, so
+  `kill_and_reap`, `ProbeReaders::cancel_and_join`, and `AnalyzerProcess::cancel_drain_and_wait` are
+  all bounded and report their failures. A reader that never observes cancellation is **detached**,
+  not joined; `join_drain` on a detached drain is an error, so a detached reader can never yield a
+  capture identity. `CancelSynchronousIo` failures are reported except `ERROR_NOT_FOUND`, which just
+  means no synchronous read was pending.
 - **Rizin xrefs are bounded outgoing evidence.** The one trailing `axlj` array must be final and is
   streamed rather than materialized. Types are case-insensitive: include `data`, `str`, `string`,
   `mem`, `ptr`, or `read`; deny `code`, `call`, `jump`, or `exec`. Selected records require a u32
@@ -354,7 +363,11 @@ module; when a file outgrows that, split it.
   selected input records per region, checked before sorting/dedup so duplicate floods remain bounded.
   Binary searches assign each target only where `from` lies in an accepted `decode_range`; targets
   sort/dedup per function, overlapping functions each receive the edge, and quarantined/unmapped
-  records contribute no false function reference.
+  records contribute no false function reference. `RizinXrefIndex` records which sources an accepted
+  range claimed, so unmapped selected xrefs are counted and logged per region rather than failing
+  the attempt. Every `pdfj` body must carry an array-valued `ops` field: without that check, schema
+  drift emitting bare objects pairs positionally, quarantines every function as `empty_projection`,
+  and publishes an all-quarantined "successful" run.
 - **V3 owns provenance and mutation.** Canonical top-level order is `format`, `producers`, `regions`,
   `functions`. Producers are actually attempted identities; regions stay in request order; attempts
   stay in process order. Every successful attempt owns one non-empty contiguous `function_runs`
@@ -371,10 +384,44 @@ module; when a file outgrows that, split it.
   flattening execution identities. Typed source recovery and enrichment/symbolication mutations
   stream function records; `global_shapes` intentionally retains the complete validated function
   set because its decoder analyzes those records together.
+- **Ownership survives all the way to mutation.** `(AnalysisTool, entry)` is the record identity, not
+  the entry alone: a valid multi-run v3 region can hold a radare2 and a Rizin record at the same
+  entry. `Symbol` therefore carries its `tool`, `stream_rewrite_thumb_functions` hands the mutator
+  each record's validated run owner (v1/v2 report `radare2`), symbol application keys by
+  `(producer, entry)` with `functions.json` owned by Ghidra, and the globals evidence-name projection
+  routes each symbol into its own ISA only.
+- **Consumers that know the image must validate against it.** `parse_thumb_artifact`,
+  `read_thumb_artifact`, and `read_thumb_functions_streaming` take `Option<MappedImage>` so each call
+  site states whether it knows the load address and image length. Supplied, it checks v3 region
+  bounds and every function envelope, not only decode ranges — without it a document with in-image
+  decode ranges beside an out-of-image region passes. `global_shapes`, `globals`, and symbolication
+  supply it; `recover_source` is handed only a decompiled directory and cannot.
+- **Producer identity has two modes, and legacy records have neither.** One validator
+  (`identity::producer_identity_error`) serves both: `IdentityMode::Runtime` for identities the
+  coordinator will spawn (this host's path family, `canonicalize` equality with the recorded
+  spelling, an executable file) and `IdentityMode::Artifact` for retained artifacts, which record a
+  possibly foreign host and can only be checked lexically. Both reject what discovery cannot produce:
+  versions past the 1,024-byte probe bound, and Windows reserved device names, Win32-reserved
+  characters, trailing space/dot components, or an unusable verbatim prefix. Separately, the typed
+  consumer record requires only `name` and `entry`, because retained v1/v2 artifacts carry no v3
+  semantic contract and legacy symbolication defaulted the rest; v3 stays strict through
+  `FunctionWire`.
 - **Report conservation.** Current runs copy `regions_requested`, `regions_succeeded`,
   `regions_failed`, `radare2_runs`, and `rizin_runs` into the five `thumb_*` image fields. Require
   requested = succeeded + failed and succeeded = radare2 runs + Rizin runs under the no-union policy.
   The report's tool object describes configured identities; the sidecar describes actual attempts.
+- **Failures name their own stage.** `ImageOutcome::Failed(code)` is an `analyzeHeadless` process
+  failure and is the only outcome that reports `exit`; `ImageOutcome::TerminalInvalid` is a
+  completed Ghidra run whose export terminal/currentness validation rejected, and it reports
+  reason-only `terminal_error`. `TerminalValidationFailure` records which stage rejected the pair, so
+  a Thumb-side rejection also populates `thumb_error` (keeping any root-cause reason the analysis
+  stage already recorded) while a Ghidra-side one does not. `Error::GhidraFailed` is reserved for
+  real process failures. `report.json` likewise separates `prune_requested` (the flag) from `pruned`
+  (the sweep completed); a failed sweep records a failed `prune` stage and `pruned: false`.
+- **Both analyzers preflight before output.** radare2 discovery is a hard preflight on the
+  standalone `decompile --run` route as well as `decompose`: it propagates before Rizin discovery
+  and before any modem parsing, output creation, or Ghidra work. Deferring it once allowed an image
+  with no dense Thumb region to succeed without the required primary.
 
 ## Multiple models (model-agnostic design)
 
