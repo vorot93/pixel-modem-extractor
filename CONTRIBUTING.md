@@ -432,10 +432,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   finalize rewrites stream too (Stage 4: element-wise stamps and `body_c`
   renames through `r2_thumb::stream_rewrite_json_array` /
   `stream_rewrite_thumb_functions`, byte-identical to the whole-file
-  rewriters on the real production tree); the memory envelope now sits in
-  `symbolicate`'s ARM loader: a few pathological Ghidra function records
-  with ~37 MB `entry`–`end` ranges each copy ~190 MB of `disasm.lst` text
-  into per-function strings (~23 GB total) — see the radare2 streaming
+  rewriters on the real production tree); and the ARM loader holds zero-copy
+  borrowed views of `disasm.lst` (Stage 5), so the pathological wide-range
+  Ghidra records no longer copy ~190 MB each — see the radare2 streaming
   bullets; pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not
   raw literals, so a byte search won't find them).
@@ -1274,11 +1273,12 @@ hardcoded. Two reference images exercise both models end-to-end:
   `.bin` slices. The historical dense-Thumb memory envelope (~56 GiB RSS,
   former whole-buffer r2 path) is gone — the producer and `thumb_enrich`
   both stream now (see the radare2 streaming bullets below); plan per the
-   README's memory note — the full-`decompose` peak is currently a ~24 GB
-   accumulation in `symbolicate`'s ARM loader (pathological wide-range
-   Ghidra records each copying ~190 MB of `disasm.lst`; the next lever);
-   `recover_source` now loads
-   that file through a typed reader (~0.6 GB, measured in-pipeline), and
+   README's memory note — the full-`decompose` peak is ~7.7 GB, held by
+   Ghidra's own analyze/export phase (2026-08-21 probe; the Rust process
+   peaks at ~2.5 GB); every whole-file `Value` tree and owned disasm copy
+   on the dense-Thumb path is gone (Stages 1-5 of the memory-envelope
+   lever). `recover_source` loads
+   `thumb_functions.json` through a typed reader, and
    Ghidra's own phases peak ~8 GB. Do not parse Ghidra/radare2 disassembly
   text, infer ISA from alignment or inventory name, attribute an address to
   the nearest global, or leak decoder-crate enums outside `decoder.rs`.
@@ -1540,17 +1540,21 @@ hardcoded. Two reference images exercise both models end-to-end:
    no `serde_json::Value` tree, unknown fields (symbolicate stamps,
    `body_c`) ignored, a malformed record failing closed (~0.6 GB measured
    in-pipeline by the 2026-08-20 instrumented probe, down from ~20 GB). The
-   remaining full-`decompose` peak is a ~24 GB transient inside
-   `symbolicate`'s ARM loader: `load_functions` copies `disasm.lst` lines in
-   each function's `[entry, end)` range into owned `FuncRec.disasm` strings,
-   and a handful of pathological Ghidra records (bad `end` fields spanning
-   ~37 MB, e.g. the `guess_latency_*` set) each copy ~190 MB — ~23 GB total
-   (measured 2026-08-21 with VmHWM instrumentation on the real tree); the
-   standalone `symbolicate` subcommand peaked 24 GB from exactly this. The
-   next lever is a zero-copy disasm view (borrowed ranges over the loaded
-   `disasm.lst` buffer); Ghidra's own
-   phases peak ~8 GB, and the producer, streaming enrich, typed
-   attribution, and streaming finalize rewrites all sit below that.
+   last holder was `symbolicate`'s ARM loader: owned per-function copies of
+   `disasm.lst` ranges, where a handful of pathological Ghidra records
+   (bad `end` fields spanning ~37 MB, e.g. the `guess_latency_*` set) each
+   copied ~190 MB — ~23 GB total (measured 2026-08-21 with VmHWM
+   instrumentation on the real tree; the standalone `symbolicate`
+   subcommand peaked 24 GB from exactly this). Stage 5 closed it:
+   `FuncRec.disasm` is a `Cow` view — `DisasmIndex::slice_cow` borrows a
+   byte range from the one loaded `disasm.lst` buffer whenever that is
+   byte-identical to the joined form (Unix `\n` separators, trailing
+   newline) and degrades to the owned `slice_for` copy otherwise (CRLF,
+   missing final newline) — pinned equal by tests. Verified by a
+   full-tree A/B of the standalone `symbolicate` on the real golden tree
+   (byte-identical; 24 GB → 1.8 GB, 15 s faster). **A full `decompose`
+   now peaks at ~7.7 GB — Ghidra's own analyze/export phase; the Rust
+   process peaks at ~2.5 GB (mostly owned Thumb bodies, real data).**
 - **Finalize rewrites are streaming, atomic, and byte-identical (Stage 4 of
   the memory-envelope lever).** `symbolicate`'s stamping
   (`rewrite_functions_json`: `original_name`/`name`/`annotations` by entry
