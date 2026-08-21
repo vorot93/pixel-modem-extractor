@@ -1226,30 +1226,18 @@ fn run_report_with_discovery(
             opts,
             out,
             None,
-            None,
             crate::thumb_analysis::run_thumb_analysis,
         );
     }
 
-    let radare2 = discover_radare2();
+    // radare2 is the required dense-Thumb primary, so its discovery failure is
+    // a hard preflight: deferring it would probe Rizin, parse the modem, create
+    // the output tree, and spend a full Ghidra run before failing — and could
+    // even succeed for an image with no dense Thumb region.
+    let radare2 = discover_radare2()?;
     let rizin = discover_configured_rizin(opts.rizin_fallback, discover_rizin)?;
-    match &radare2 {
-        Ok(radare2) => {
-            let thumb_tools = crate::thumb_analysis::ThumbTools {
-                radare2: radare2.clone(),
-                rizin,
-            };
-            run_report_with_thumb_tools(modem_bin, opts, out, &thumb_tools)
-        }
-        Err(error) => run_report_impl(
-            modem_bin,
-            opts,
-            out,
-            None,
-            Some(error),
-            crate::thumb_analysis::run_thumb_analysis,
-        ),
-    }
+    let thumb_tools = crate::thumb_analysis::ThumbTools { radare2, rizin };
+    run_report_with_thumb_tools(modem_bin, opts, out, &thumb_tools)
 }
 
 /// Run with identities already retained by an orchestrator's preflight. This path performs no
@@ -1282,7 +1270,7 @@ fn run_report_with_thumb_tools_and_analyzer(
         &Path,
     ) -> Result<crate::thumb_analysis::ThumbAnalysisSummary>,
 ) -> Result<DecompileReport> {
-    run_report_impl(modem_bin, opts, out, Some(thumb_tools), None, analyze_thumb)
+    run_report_impl(modem_bin, opts, out, Some(thumb_tools), analyze_thumb)
 }
 
 fn run_report_impl(
@@ -1290,7 +1278,6 @@ fn run_report_impl(
     opts: &Opts,
     out: &Path,
     thumb_tools: Option<&crate::thumb_analysis::ThumbTools>,
-    radare2_error: Option<&Error>,
     mut analyze_thumb: impl FnMut(
         &crate::thumb_analysis::ThumbTools,
         &[u8],
@@ -1699,12 +1686,12 @@ fn run_report_impl(
                     }
                 }
             } else {
+                // Only the generation-only route reaches this: `--run` fails
+                // preflight when radare2 is missing, so no analyzed image can
+                // ever be published without its required primary.
                 let err = format!(
-                    "{} Thumb region(s) left unanalyzed because radare2 is unavailable: {}",
+                    "{} Thumb region(s) left unanalyzed because no analyzer was configured",
                     regions.len(),
-                    radare2_error
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "discovery result was not supplied".to_string())
                 );
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
@@ -5097,6 +5084,51 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(radare2_calls.get(), 1);
         assert_eq!(rizin_calls.get(), 1);
         assert!(!out.exists());
+    }
+
+    /// radare2 is the required primary for `--run`, so a discovery failure is a
+    /// hard preflight: no Rizin probe, no Ghidra work, no output tree, and no
+    /// chance of a "successful" run that simply found no dense region.
+    #[cfg(unix)]
+    #[test]
+    fn missing_radare2_fails_preflight_before_rizin_ghidra_or_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_fake_headless(&ghidra_home);
+        let image: Vec<u8> = (0u32..1536 * 1024).map(|value| value as u8).collect();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &image)])).unwrap();
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.rizin_fallback = true;
+        opts.ghidra_home = Some(ghidra_home.clone());
+        let rizin_calls = std::cell::Cell::new(0);
+
+        let error = run_report_with_discovery(
+            &modem,
+            &opts,
+            &out,
+            || Err(Error::ToolNotFound("radare2 (r2) not found on PATH".into())),
+            || {
+                rizin_calls.set(rizin_calls.get() + 1);
+                Ok(test_identity(
+                    crate::thumb_analysis::ThumbProducer::Rizin,
+                    "/tools/rizin",
+                    "rizin exact",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::ToolNotFound(reason) if reason.contains("radare2")),
+            "{error}"
+        );
+        assert_eq!(rizin_calls.get(), 0, "Rizin was discovered without radare2");
+        // The whole output tree — image slices, the import kit, and Ghidra's
+        // export root — lives under `out`, so its absence proves nothing ran.
+        assert!(!out.exists(), "preflight failure mutated the output tree");
     }
 
     #[cfg(unix)]
