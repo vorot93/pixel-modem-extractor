@@ -1725,7 +1725,7 @@ fn run_report_impl(
             };
             // After the Ghidra attempt, analyze dense Thumb through the configured
             // radare2-primary route regardless of tighten/datamark mode.
-            let (thumb_summary, thumb_error) = if regions.is_empty() {
+            let (thumb_summary, mut thumb_error) = if regions.is_empty() {
                 (None, None)
             } else if let Some(thumb_tools) = thumb_tools {
                 match analyze_thumb(
@@ -1766,7 +1766,6 @@ fn run_report_impl(
                 tracing::warn!("{label}: {err}");
                 (None, Some(err))
             };
-            let mut thumb_error = thumb_error;
             let thumb_functions = thumb_summary.as_ref().map(|summary| summary.substantial);
             let mut terminal_error = None;
             let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {

@@ -386,7 +386,8 @@ module; when a file outgrows that, split it.
   set because its decoder analyzes those records together.
 - **Ownership survives all the way to mutation.** `(AnalysisTool, entry)` is the record identity, not
   the entry alone: a valid multi-run v3 region can hold a radare2 and a Rizin record at the same
-  entry. `Symbol` therefore carries its `tool`, `stream_rewrite_thumb_functions` hands the mutator
+  entry. `Symbol` therefore carries its `tool` (and `symbols.json` records it),
+  `stream_rewrite_thumb_functions` hands the mutator
   each record's validated run owner (v1/v2 report `radare2`), symbol application keys by
   `(producer, entry)` with `functions.json` owned by Ghidra, and the globals evidence-name projection
   routes each symbol into its own ISA only.

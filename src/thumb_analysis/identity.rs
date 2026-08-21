@@ -15,7 +15,7 @@ use typed_path::{
 };
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-pub(super) const VERSION_LINE_MAX_BYTES: usize = 1_024;
+const VERSION_LINE_MAX_BYTES: usize = 1_024;
 const STDERR_DIAGNOSTIC_MAX_BYTES: usize = 4_096;
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Bound probe-child termination, reaping, and forced reader cancellation.
