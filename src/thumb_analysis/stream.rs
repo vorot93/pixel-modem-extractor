@@ -1874,6 +1874,9 @@ const ANALYZER_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 /// Bound the post-SIGKILL proof that no process remains in the analyzer group.
 #[cfg(unix)]
 const ANALYZER_GROUP_ABSENCE_VERIFICATION_LIMIT: Duration = Duration::from_secs(1);
+/// Bound forced stdout-drain cancellation. Without it the declared pipe
+/// finalization limits would only bound when cancellation starts.
+const ANALYZER_DRAIN_CANCELLATION_LIMIT: Duration = Duration::from_secs(5);
 
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2020,7 +2023,9 @@ impl AnalyzerProcess {
     fn join_drain(&mut self) -> std::io::Result<CaptureRecord> {
         self.drain
             .take()
-            .expect("analyzer stdout drain is present")
+            .ok_or_else(|| {
+                std::io::Error::other("analyzer stdout drain was detached before joining")
+            })?
             .join()
             .map_err(|_| std::io::Error::other("analyzer stdout drain thread panicked"))?
     }
@@ -2125,29 +2130,38 @@ impl AnalyzerProcess {
         }
     }
 
-    fn cancel_drain(&self) {
-        self.drain_control.cancel();
-        self.interrupt_drain();
-    }
-
     #[cfg(windows)]
-    fn interrupt_drain(&self) {
+    fn interrupt_drain(&self) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
 
-        if let Some(drain) = &self.drain {
-            // SAFETY: `drain` owns a live Windows thread handle. Repeated
-            // cancellation covers the race where no synchronous read is
-            // pending during one call.
-            unsafe {
-                let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
-                    drain.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
-                );
-            }
+        let Some(drain) = &self.drain else {
+            return Ok(());
+        };
+        // SAFETY: `drain` owns a live Windows thread handle. Repeated
+        // cancellation covers the race where no synchronous read is
+        // pending during one call.
+        let cancelled = unsafe {
+            windows_sys::Win32::System::IO::CancelSynchronousIo(
+                drain.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+            )
+        };
+        if cancelled != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // No synchronous read was pending, so the shared flag alone stops the
+        // reader on its next poll. Every other failure is real and reportable.
+        if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32) {
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 
     #[cfg(not(windows))]
-    fn interrupt_drain(&self) {}
+    fn interrupt_drain(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 
     #[cfg(unix)]
     fn terminate_and_reap(&mut self, policy: CleanupPolicy) -> std::io::Result<()> {
@@ -2332,16 +2346,41 @@ impl AnalyzerProcess {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn cancel_drain_and_wait(&mut self) {
-        self.cancel_drain();
+    /// Cancel the stdout drain and wait for its reader within `limit`. A reader
+    /// that never observes cancellation is detached and reported: joining it
+    /// would block the request forever, and its capture file must then never be
+    /// treated as finalized.
+    fn cancel_drain_and_wait(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.drain_control.cancel();
+        let started = std::time::Instant::now();
+        let mut first_error = None;
         while self
             .drain
             .as_ref()
             .is_some_and(|drain| !drain.is_finished())
         {
-            self.interrupt_drain();
+            if let Err(error) = self.interrupt_drain() {
+                preserve_cleanup_error(
+                    &mut first_error,
+                    "could not interrupt the analyzer stdout drain",
+                    error,
+                );
+            }
+            if started.elapsed() >= limit {
+                self.drain = None;
+                preserve_cleanup_error(
+                    &mut first_error,
+                    "could not stop the analyzer stdout drain",
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the reader did not observe cancellation before the deadline",
+                    ),
+                );
+                break;
+            }
             std::thread::sleep(ANALYZER_POLL_INTERVAL);
         }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -2355,7 +2394,11 @@ impl Drop for AnalyzerProcess {
             let _ = self.terminate_and_reap(CleanupPolicy::PRODUCTION);
         }
         if self.drain.is_some() {
-            self.cancel_drain_and_wait();
+            // Drop cannot propagate; the supervisor's own call is what makes an
+            // unstoppable drain terminal for the request.
+            if let Err(error) = self.cancel_drain_and_wait(ANALYZER_DRAIN_CANCELLATION_LIMIT) {
+                tracing::error!("analyzer stdout drain could not be stopped: {error}");
+            }
             let _ = self.join_drain();
         }
     }
@@ -2525,6 +2568,7 @@ struct RunnerLimits {
     rizin_timeout: Duration,
     pipe_finalization_idle: Duration,
     pipe_finalization_absolute: Duration,
+    drain_cancellation: Duration,
     cleanup: CleanupPolicy,
 }
 
@@ -2534,6 +2578,7 @@ impl RunnerLimits {
         rizin_timeout: RIZIN_REGION_TIMEOUT,
         pipe_finalization_idle: ANALYZER_PIPE_FINALIZATION_IDLE_LIMIT,
         pipe_finalization_absolute: ANALYZER_PIPE_FINALIZATION_ABSOLUTE_LIMIT,
+        drain_cancellation: ANALYZER_DRAIN_CANCELLATION_LIMIT,
         cleanup: CleanupPolicy::PRODUCTION,
     };
 }
@@ -3105,8 +3150,12 @@ fn supervise_spawned_analyzer(
                 };
             if let Some((limit_name, limit)) = finalization_limit {
                 let cleanup = process.terminate_and_reap(limits.cleanup);
-                process.cancel_drain_and_wait();
-                let stopped = finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+                let stopped = stop_and_finalize_capture(
+                    &mut process,
+                    capture.take(),
+                    stdout_path,
+                    limits.drain_cancellation,
+                );
                 let forced = format!(
                     "stdout remained open after analyzer exit for Thumb region 0x{addr:x}; forced pipe finalization after the {} ms {limit_name} limit",
                     limit.as_millis()
@@ -3145,9 +3194,12 @@ fn supervise_spawned_analyzer(
             SupervisionState::Running => {
                 if let Err(error) = process.observe_exit(limits.cleanup) {
                     let cleanup = process.terminate_and_reap(limits.cleanup);
-                    process.cancel_drain_and_wait();
-                    let stopped =
-                        finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+                    let stopped = stop_and_finalize_capture(
+                        &mut process,
+                        capture.take(),
+                        stdout_path,
+                        limits.drain_cancellation,
+                    );
                     let detail = format!(
                         "{producer_name} process supervision failed for Thumb region 0x{addr:x}: {error}"
                     );
@@ -3180,9 +3232,12 @@ fn supervise_spawned_analyzer(
                     }
                     RunningObservation::DeadlineExpired => {
                         let cleanup = process.terminate_and_reap(limits.cleanup);
-                        process.cancel_drain_and_wait();
-                        let stopped =
-                            finalize_stopped_capture(&mut process, capture.take(), stdout_path);
+                        let stopped = stop_and_finalize_capture(
+                            &mut process,
+                            capture.take(),
+                            stdout_path,
+                            limits.drain_cancellation,
+                        );
                         let detail = format!(
                             "{producer_name} timed out after {} ms for Thumb region 0x{addr:x}",
                             deadline.expect("elapsed deadline is present").as_millis()
@@ -3231,9 +3286,10 @@ struct StoppedCapture {
     /// The drain could not be joined, so the partial file was removed and the
     /// attempt truthfully records `stdout: null`. An ordinary failure.
     finalize_error: Option<std::io::Error>,
-    /// The partial file could not be removed, so unowned bytes remain beside
-    /// the sidecar. Terminal for the whole request.
-    cleanup_error: Option<std::io::Error>,
+    /// The capture's final state is unverified: the reader that owns it would
+    /// not stop, or the partial file could not be removed. Terminal for the
+    /// whole request.
+    terminal_error: Option<std::io::Error>,
 }
 
 impl StoppedCapture {
@@ -3249,36 +3305,41 @@ impl StoppedCapture {
             "cleanup failed",
             cleanup,
         );
-        if let Some(error) = self.cleanup_error {
-            failure.mark_terminal("partial stdout capture cleanup failed", error);
+        if let Some(error) = self.terminal_error {
+            failure.mark_terminal("partial stdout capture state is unverified", error);
         }
         failure
     }
 }
 
-fn finalize_stopped_capture(
+/// Stop the stdout drain, then finalize or remove whatever partial capture it
+/// produced.
+fn stop_and_finalize_capture(
     process: &mut AnalyzerProcess,
     capture: Option<CaptureRecord>,
     stdout_path: &Path,
+    drain_cancellation: Duration,
 ) -> StoppedCapture {
-    if let Some(capture) = capture {
-        return StoppedCapture {
-            retained: Some(capture),
-            finalize_error: None,
-            cleanup_error: None,
-        };
-    }
-    match process.join_drain() {
-        Ok(capture) => StoppedCapture {
-            retained: Some(capture),
-            finalize_error: None,
-            cleanup_error: None,
-        },
-        Err(error) => StoppedCapture {
-            retained: None,
-            finalize_error: Some(error),
-            cleanup_error: remove_stale_output(stdout_path).err(),
-        },
+    // The reader owns the capture file, so a reader that will not stop leaves
+    // the file's final state unverified exactly like a failed removal.
+    let mut terminal_error = process.cancel_drain_and_wait(drain_cancellation).err();
+    let (retained, finalize_error) = if let Some(capture) = capture {
+        (Some(capture), None)
+    } else {
+        match process.join_drain() {
+            Ok(capture) => (Some(capture), None),
+            Err(error) => {
+                if let Err(cleanup) = remove_stale_output(stdout_path) {
+                    terminal_error.get_or_insert(cleanup);
+                }
+                (None, Some(error))
+            }
+        }
+    };
+    StoppedCapture {
+        retained,
+        finalize_error,
+        terminal_error,
     }
 }
 
@@ -5285,6 +5346,46 @@ esac
         assert!(!rizin_sentinel.exists(), "the fallback was spawned");
         assert!(!later_region_sentinel.exists(), "a later region ran");
         assert_eq!(std::fs::read(artifact).unwrap(), stable_artifact);
+    }
+
+    /// The declared pipe-finalization limits must bound when supervision
+    /// returns, not only when cancellation starts. A drain that never observes
+    /// cancellation is detached and reported instead of waited on forever.
+    #[cfg(unix)]
+    #[test]
+    fn stuck_stdout_drain_is_detached_within_the_cancellation_bound() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut process = AnalyzerProcess::new(child, Arc::new(DrainControl::default()));
+        process.drain = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(CaptureRecord {
+                path: String::new(),
+                bytes: 0,
+                blake3: String::new(),
+            })
+        }));
+        let started = std::time::Instant::now();
+
+        let error = process
+            .cancel_drain_and_wait(Duration::from_millis(50))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            process.drain.is_none(),
+            "a drain that ignores cancellation must be detached, not joined"
+        );
+        assert!(
+            process.join_drain().is_err(),
+            "a detached drain must never yield a capture identity"
+        );
     }
 
     #[test]

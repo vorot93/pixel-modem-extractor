@@ -15,9 +15,13 @@ use typed_path::{
 };
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const VERSION_LINE_MAX_BYTES: usize = 1_024;
+pub(super) const VERSION_LINE_MAX_BYTES: usize = 1_024;
 const STDERR_DIAGNOSTIC_MAX_BYTES: usize = 4_096;
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Bound probe-child termination, reaping, and forced reader cancellation.
+/// Without it the declared 10-second probe deadline would only bound when
+/// cleanup starts, not when the probe returns.
+const PROBE_CLEANUP_LIMIT: Duration = Duration::from_secs(1);
 
 pub(super) fn is_canonical_executable_path(path: &Path) -> bool {
     let Some(spelling) = path.to_str() else {
@@ -284,9 +288,48 @@ fn make_pipe_cancellable<T>(_pipe: &T) -> std::io::Result<()> {
     Ok(())
 }
 
-fn reap_after_kill(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+/// Terminate a probe child and reap it, reporting both outcomes. Silently
+/// discarding them would leave an unverified probe process behind while the
+/// probe reports only its own failure.
+fn kill_and_reap(child: &mut std::process::Child) -> std::io::Result<()> {
+    kill_and_reap_within(child, PROBE_CLEANUP_LIMIT)
+}
+
+fn kill_and_reap_within(child: &mut std::process::Child, limit: Duration) -> std::io::Result<()> {
+    let mut first_error = None;
+    // An already-reaped child cannot be signalled; that is not a failure.
+    if let Err(error) = child.kill()
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        first_error = Some(error);
+    }
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return first_error.map_or(Ok(()), Err),
+            Ok(None) if started.elapsed() >= limit => {
+                return Err(first_error.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "version probe child was not reaped before the cleanup deadline",
+                    )
+                }));
+            }
+            Ok(None) => thread::sleep(PROBE_POLL_INTERVAL),
+            Err(error) => return Err(first_error.unwrap_or(error)),
+        }
+    }
+}
+
+/// Fold a probe-cleanup failure into the probe's own error so an unverified
+/// probe child or reader is never reported as a bare timeout or I/O failure.
+fn with_probe_cleanup(primary: Error, cleanup: std::io::Result<()>) -> Error {
+    match cleanup {
+        Ok(()) => primary,
+        Err(error) => {
+            Error::ToolNotFound(format!("{primary}; version probe cleanup failed: {error}"))
+        }
+    }
 }
 
 fn timeout_error(producer: ThumbProducer, timeout: Duration) -> Error {
@@ -307,15 +350,16 @@ fn wait_with_deadline(
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() >= timeout => {
-                reap_after_kill(child);
-                return Err(timeout_error(producer, timeout));
+                return Err(with_probe_cleanup(
+                    timeout_error(producer, timeout),
+                    kill_and_reap(child),
+                ));
             }
             Ok(None) => {
                 thread::sleep(PROBE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())))
             }
             Err(error) => {
-                reap_after_kill(child);
-                return Err(error.into());
+                return Err(with_probe_cleanup(error.into(), kill_and_reap(child)));
             }
         }
     }
@@ -366,21 +410,34 @@ where
 }
 
 #[cfg(windows)]
-fn interrupt_reader<T>(reader: &JoinHandle<T>) {
+fn interrupt_reader<T>(reader: &JoinHandle<T>) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
     // SAFETY: `reader` owns a live Windows thread handle. Cancellation is
     // retried until the thread observes the shared flag and exits, covering
     // the race where no synchronous read is pending during one call.
-    unsafe {
-        let _ = windows_sys::Win32::System::IO::CancelSynchronousIo(
+    let cancelled = unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(
             reader.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
-        );
+        )
+    };
+    if cancelled != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // No synchronous read was pending, so the shared flag alone stops the
+    // reader on its next poll. Every other failure is real and reportable.
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
 #[cfg(not(windows))]
-fn interrupt_reader<T>(_reader: &JoinHandle<T>) {}
+fn interrupt_reader<T>(_reader: &JoinHandle<T>) -> std::io::Result<()> {
+    Ok(())
+}
 
 struct ProbeReaders {
     stdout: Option<JoinHandle<std::io::Result<VersionOutput>>>,
@@ -424,7 +481,11 @@ impl ProbeReaders {
     ) -> Result<(VersionOutput, Vec<u8>)> {
         while !self.is_finished() {
             if started.elapsed() >= timeout {
-                return Err(timeout_error(producer, timeout));
+                let cleanup = self.cancel_and_join();
+                return Err(with_probe_cleanup(
+                    timeout_error(producer, timeout),
+                    cleanup,
+                ));
             }
             thread::sleep(PROBE_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
         }
@@ -437,29 +498,64 @@ impl ProbeReaders {
         Ok((stdout?, stderr?))
     }
 
-    fn cancel_and_join(&mut self) {
+    fn cancel_and_join(&mut self) -> std::io::Result<()> {
+        self.cancel_and_join_within(PROBE_CLEANUP_LIMIT)
+    }
+
+    /// Cancel both readers and join them within `limit`. A reader that never
+    /// observes cancellation is detached and reported: joining it would hang
+    /// the probe past its declared deadline.
+    fn cancel_and_join_within(&mut self, limit: Duration) -> std::io::Result<()> {
         self.cancelled.store(true, Ordering::Release);
+        let started = Instant::now();
+        let mut first_error = None;
         while !self.is_finished() {
-            if let Some(reader) = &self.stdout {
-                interrupt_reader(reader);
+            let interrupted = self
+                .stdout
+                .as_ref()
+                .map_or(Ok(()), interrupt_reader)
+                .and_then(|()| self.stderr.as_ref().map_or(Ok(()), interrupt_reader));
+            if let Err(error) = interrupted
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
-            if let Some(reader) = &self.stderr {
-                interrupt_reader(reader);
+            if started.elapsed() >= limit {
+                // Detach rather than join: a reader that ignores cancellation
+                // would otherwise block the probe past its declared deadline.
+                self.stdout = None;
+                self.stderr = None;
+                return Err(first_error.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "version probe output readers did not stop before the cleanup deadline",
+                    )
+                }));
             }
             thread::sleep(PROBE_POLL_INTERVAL);
         }
-        if let Some(reader) = self.stdout.take() {
-            let _ = reader.join();
+        let panicked = self
+            .stdout
+            .take()
+            .is_some_and(|reader| reader.join().is_err())
+            | self
+                .stderr
+                .take()
+                .is_some_and(|reader| reader.join().is_err());
+        if panicked && first_error.is_none() {
+            first_error = Some(std::io::Error::other(
+                "version probe output reader panicked",
+            ));
         }
-        if let Some(reader) = self.stderr.take() {
-            let _ = reader.join();
-        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for ProbeReaders {
     fn drop(&mut self) {
-        self.cancel_and_join();
+        if let Err(error) = self.cancel_and_join() {
+            tracing::error!("version probe output readers could not be stopped: {error}");
+        }
     }
 }
 
@@ -482,14 +578,12 @@ fn probe_identity_inner(
     let stderr = child.stderr.take().expect("piped stderr");
     if let Err(error) = make_pipe_cancellable(&stdout).and_then(|()| make_pipe_cancellable(&stderr))
     {
-        reap_after_kill(&mut child);
-        return Err(error.into());
+        return Err(with_probe_cleanup(error.into(), kill_and_reap(&mut child)));
     }
     let readers = match ProbeReaders::spawn(stdout, stderr, tracker) {
         Ok(readers) => readers,
         Err(error) => {
-            reap_after_kill(&mut child);
-            return Err(error.into());
+            return Err(with_probe_cleanup(error.into(), kill_and_reap(&mut child)));
         }
     };
 
@@ -863,6 +957,63 @@ mod tests {
 
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The declared probe deadline must bound when the API returns, not only
+    /// when cancellation starts. A reader that never observes cancellation is
+    /// detached and reported instead of looping forever.
+    #[test]
+    fn stuck_probe_readers_are_detached_within_the_cancellation_bound() {
+        let mut readers = super::ProbeReaders {
+            stdout: Some(std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(super::VersionOutput::Empty)
+            })),
+            stderr: Some(std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(Vec::new())
+            })),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let started = Instant::now();
+
+        let error = readers
+            .cancel_and_join_within(Duration::from_millis(50))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(readers.stdout.is_none() && readers.stderr.is_none());
+    }
+
+    #[test]
+    fn probe_cleanup_kills_reaps_and_reports_its_outcome() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        super::kill_and_reap(&mut child).unwrap();
+
+        assert!(child.try_wait().unwrap().is_some(), "child was not reaped");
+        // A second cleanup of the same reaped child is still verified, not an
+        // error: the kill can only report that the process is already gone.
+        super::kill_and_reap(&mut child).unwrap();
+    }
+
+    #[test]
+    fn probe_cleanup_failure_is_folded_into_the_probe_error() {
+        let folded = super::with_probe_cleanup(
+            super::timeout_error(ThumbProducer::Rizin, Duration::from_millis(10)),
+            Err(io::Error::other("child is unreapable")),
+        );
+        let message = folded.to_string();
+
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("child is unreapable"), "{message}");
     }
 
     #[test]
