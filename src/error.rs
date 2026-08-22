@@ -20,6 +20,8 @@ pub enum Error {
     BadScatter(String),
     #[error("bad token database: {0}")]
     BadTokenDb(String),
+    #[error("bad PAL task evidence: {0}")]
+    BadPalTasks(String),
     #[error("size mismatch for {name}: expected {expected}, got {actual}")]
     SizeMismatch {
         name: String,

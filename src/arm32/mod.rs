@@ -308,6 +308,14 @@ pub(crate) struct ItRangeState {
     remaining: u8,
 }
 
+impl ItRangeState {
+    /// Whether an IT block is currently open in this range state.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_open(&self) -> bool {
+        self.remaining != 0
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PureRustDecoder;
 

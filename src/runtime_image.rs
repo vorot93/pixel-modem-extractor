@@ -59,6 +59,16 @@ struct ResolvedSpan<'image, 'data> {
     size: u32,
 }
 
+/// One maximal contiguous byte-backed address range, in ascending order.
+/// Zero-fill storage and unmapped gaps break contiguity; bounded
+/// image-wide scans (such as the PAL anchor sweep) enumerate these ranges
+/// instead of probing the address space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ByteBackedRange {
+    pub start: u32,
+    pub end: u32,
+}
+
 #[derive(Clone, Copy)]
 struct DestinationRange {
     start: u32,
@@ -514,6 +524,23 @@ impl<'a> RuntimeImage<'a> {
             Ok(())
         })?;
         Ok(byte_backed)
+    }
+
+    pub(crate) fn byte_backed_ranges(&self) -> Vec<ByteBackedRange> {
+        let mut ranges: Vec<ByteBackedRange> = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            if segment.storage_kind() == StorageKind::ScatterZero {
+                continue;
+            }
+            match ranges.last_mut() {
+                Some(last) if last.end == segment.start => last.end = segment.end,
+                _ => ranges.push(ByteBackedRange {
+                    start: segment.start,
+                    end: segment.end,
+                }),
+            }
+        }
+        ranges
     }
 
     fn from_segments(mut segments: Vec<Segment<'a>>) -> Result<Self> {
