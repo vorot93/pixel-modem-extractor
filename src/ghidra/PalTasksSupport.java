@@ -20,15 +20,22 @@ import com.google.gson.stream.JsonToken;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.address.AddressRange;
+import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.CommentType;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.DataIterator;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
@@ -78,6 +85,9 @@ final class PalTasksSupport {
     static final byte[] LABELS_DOMAIN = ascii("pixel-modem-extractor-pal-labels-v1\0");
     static final byte[] PRIMARY_DOMAIN = ascii("pixel-modem-extractor-pal-primary-v1\0");
     static final byte[] COMMENT_DOMAIN = ascii("pixel-modem-extractor-pal-comment-v1\0");
+    static final byte[] CODE_UNITS_DOMAIN = ascii("pixel-modem-extractor-code-units-v1\0");
+    static final byte[] FUNCTION_BODIES_DOMAIN =
+            ascii("pixel-modem-extractor-function-bodies-v1\0");
 
     static final String COMMENT_OPEN_MARKER = "[[pixel-modem-extractor:pal-tasks:v1]]";
     static final String COMMENT_CLOSE_MARKER = "[[/pixel-modem-extractor:pal-tasks:v1]]";
@@ -97,6 +107,8 @@ final class PalTasksSupport {
     static final int MAX_ANNOTATION_UTF8_BYTES = 4096;
     static final long MAX_ANNOTATION_AGGREGATE_BYTES = 64L * 1024L * 1024L;
     static final long DESCRIPTOR_PROJECTION_OFFSET = 0x24;
+    static final int MAX_CODE_UNITS = 4_194_304;
+    static final int MAX_FUNCTIONS = 262_144;
 
     static final long UINT32_MAX = 0xffff_ffffL;
     static final long UINT32_END = 0x1_0000_0000L;
@@ -471,6 +483,225 @@ final class PalTasksSupport {
         updateLeU32(digest, encoded.length);
         digest.update(encoded, 0, encoded.length);
         return finishHash(digest);
+    }
+
+    // -------------------------------------------------------------------------
+    // Preservation digests (TameAnalysis datamark)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Canonical preservation digest over every defined code unit (instructions
+     * and defined data — Ghidra's listing iterators synthesize per-byte
+     * undefined pseudo-units, which are not units and never enter the digest)
+     * in address order: the domain, a little-endian u64 count, then per unit
+     * the tag (0x00 instruction / 0x01 data), little-endian u32 address,
+     * little-endian u32 byte length, exact bytes, and for data additionally
+     * the little-endian u32 UTF-8 data-type-path length plus exact path bytes.
+     * Units fully inside {@code exclude} (typically freshly data-marked gap
+     * arrays) are skipped entirely, so a rescan over the exclusion set must
+     * reproduce the preflight digest byte for byte.
+     */
+    static String codeUnitsDigestHex(Program program, AddressSetView exclude) throws Exception {
+        Blake3Digest digest = new Blake3Digest();
+        digest.update(CODE_UNITS_DOMAIN, 0, CODE_UNITS_DOMAIN.length);
+        updateLeU64(digest, countDefinedUnits(program, exclude));
+        DefinedUnitCursor units = new DefinedUnitCursor(program, exclude);
+        while (units.hasNext()) {
+            CodeUnit unit = units.next();
+            boolean isData = unit instanceof Data;
+            digest.update(isData ? (byte) 1 : (byte) 0);
+            updateLeU32(digest,
+                    checkedRange(unit.getAddress().getOffset(), 0, UINT32_MAX, "unit address"));
+            int length = (int) checkedRange(unit.getLength(), 0, Integer.MAX_VALUE,
+                    "unit length");
+            updateLeU32(digest, length);
+            byte[] bytes = new byte[length];
+            try {
+                if (length > 0 && program.getMemory().getBytes(unit.getAddress(), bytes)
+                        != length) {
+                    fail("a code unit's bytes could not be read at " + unit.getAddress());
+                }
+            }
+            catch (MemoryAccessException error) {
+                fail("a code unit's bytes could not be read at " + unit.getAddress());
+            }
+            digest.update(bytes, 0, length);
+            if (isData) {
+                byte[] path =
+                        ((Data) unit).getDataType().getPathName().getBytes(StandardCharsets.UTF_8);
+                updateLeU32(digest, path.length);
+                digest.update(path, 0, path.length);
+            }
+        }
+        return finishHash(digest);
+    }
+
+    /**
+     * Canonical preservation digest over every function in entry-point order:
+     * the domain, a little-endian u64 count, then per function the
+     * non-negative ID as a little-endian u64, the entry as a u32, the body
+     * range count as a u32, and each body range's start / exclusive-end u32
+     * pair. Bodies must stay inside the 32-bit address domain.
+     */
+    static String functionBodiesDigestHex(Program program) throws Exception {
+        FunctionIterator count = program.getFunctionManager().getFunctions(true);
+        long functions = 0;
+        while (count.hasNext()) {
+            count.next();
+            if (++functions > MAX_FUNCTIONS) {
+                fail("the program exceeds the 262,144 function digest limit");
+            }
+        }
+        Blake3Digest digest = new Blake3Digest();
+        digest.update(FUNCTION_BODIES_DOMAIN, 0, FUNCTION_BODIES_DOMAIN.length);
+        updateLeU64(digest, functions);
+        FunctionIterator iterator = program.getFunctionManager().getFunctions(true);
+        while (iterator.hasNext()) {
+            Function function = iterator.next();
+            long id = function.getID();
+            if (id < 0) {
+                fail("a function carries a negative ID");
+            }
+            updateLeU64(digest, id);
+            updateLeU32(digest, checkedRange(function.getEntryPoint().getOffset(), 0, UINT32_MAX,
+                    "function entry"));
+            AddressSetView body = function.getBody();
+            long ranges = 0;
+            for (AddressRange range : body) {
+                if (++ranges > UINT32_MAX) {
+                    fail("a function body carries too many ranges");
+                }
+            }
+            updateLeU32(digest, ranges);
+            for (AddressRange range : body) {
+                long end = range.getMaxAddress().getOffset() + 1;
+                if (range.getMinAddress().getOffset() < 0
+                        || range.getMinAddress().getOffset() > UINT32_MAX
+                        || end > UINT32_MAX) {
+                    fail("a function body range leaves the 32-bit address domain");
+                }
+                updateLeU32(digest, range.getMinAddress().getOffset());
+                updateLeU32(digest, end);
+            }
+        }
+        return finishHash(digest);
+    }
+
+    /**
+     * Streaming BLAKE3 over the raw memory bytes of [start, start + length).
+     * TameAnalysis hashes each planned undefined gap before mutation and must
+     * reproduce the exact hash after the gap is covered by byte arrays (array
+     * creation never rewrites memory bytes).
+     */
+    static String memoryDigestHex(Program program, long start, long length) {
+        checkedRange(start, 0, UINT32_MAX, "memory digest start");
+        checkedRange(length, 1, UINT32_MAX, "memory digest length");
+        Blake3Digest digest = new Blake3Digest();
+        byte[] buffer = new byte[HASH_BUFFER_SIZE];
+        Address cursor = programAddress(program, start);
+        long remaining = length;
+        try {
+            while (remaining > 0) {
+                int wanted = (int) Math.min(buffer.length, remaining);
+                int read = program.getMemory().getBytes(cursor, buffer, 0, wanted);
+                if (read != wanted) {
+                    fail("the gap bytes could not be read at " + cursor);
+                }
+                digest.update(buffer, 0, read);
+                remaining -= read;
+                if (remaining > 0) {
+                    cursor = cursor.add(read);
+                }
+            }
+        }
+        catch (MemoryAccessException | AddressOutOfBoundsException error) {
+            fail("the gap bytes could not be read at " + cursor);
+        }
+        return finishHash(digest);
+    }
+
+    private static long countDefinedUnits(Program program, AddressSetView exclude) {
+        long count = 0;
+        DefinedUnitCursor units = new DefinedUnitCursor(program, exclude);
+        while (units.hasNext()) {
+            units.next();
+            if (++count > MAX_CODE_UNITS) {
+                fail("the program exceeds the 4,194,304 code-unit digest limit");
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Merges the listing's instructions and defined-data iterators into one
+     * address-ordered stream of defined units, skipping units fully inside
+     * the exclusion set.
+     */
+    private static final class DefinedUnitCursor {
+        private final InstructionIterator instructions;
+        private final DataIterator dataUnits;
+        private final AddressSetView exclude;
+        private Instruction nextInstruction;
+        private Data nextData;
+
+        DefinedUnitCursor(Program program, AddressSetView exclude) {
+            this.instructions = program.getListing().getInstructions(true);
+            this.dataUnits = program.getListing().getDefinedData(true);
+            this.exclude = exclude;
+            advanceInstruction();
+            advanceData();
+        }
+
+        private void advanceInstruction() {
+            nextInstruction = null;
+            while (instructions.hasNext()) {
+                Instruction candidate = instructions.next();
+                if (!excluded(candidate)) {
+                    nextInstruction = candidate;
+                    return;
+                }
+            }
+        }
+
+        private void advanceData() {
+            nextData = null;
+            while (dataUnits.hasNext()) {
+                Data candidate = dataUnits.next();
+                if (!excluded(candidate)) {
+                    nextData = candidate;
+                    return;
+                }
+            }
+        }
+
+        private boolean excluded(CodeUnit unit) {
+            return exclude != null && exclude.contains(unit.getMinAddress(), unit.getMaxAddress());
+        }
+
+        boolean hasNext() {
+            return nextInstruction != null || nextData != null;
+        }
+
+        CodeUnit next() {
+            if (nextInstruction == null) {
+                Data data = nextData;
+                advanceData();
+                return data;
+            }
+            if (nextData == null) {
+                Instruction instruction = nextInstruction;
+                advanceInstruction();
+                return instruction;
+            }
+            if (nextInstruction.getAddress().compareTo(nextData.getAddress()) <= 0) {
+                Instruction instruction = nextInstruction;
+                advanceInstruction();
+                return instruction;
+            }
+            Data data = nextData;
+            advanceData();
+            return data;
+        }
     }
 
     private static byte isaByte(String isa) {

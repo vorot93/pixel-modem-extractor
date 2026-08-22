@@ -3817,3 +3817,703 @@ fn apply_pal_tasks_rejects_stale_registry() {
     );
     let _ = std::fs::remove_dir_all(&kit.dir);
 }
+
+// -------------------------------------------------------------------------
+// Task 10: transactional TameAnalysis datamark gap preservation
+// -------------------------------------------------------------------------
+
+/// Fixture image (0x1000 bytes at 0x40010000): two ARM instructions at the
+/// base (the seeded function body), eight undefined bytes, a seeded dword
+/// data unit at +0x10, then undefined bytes through +0x40 (with a nonzero
+/// marker word at +0x20 so the second gap's digest is not a zeros digest).
+fn tame_fixture_image() -> Vec<u8> {
+    let mut image = vec![0u8; 0x1000];
+    image[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0xa0, 0xe3]); // mov r0, #0
+    image[0x04..0x08].copy_from_slice(&[0x1e, 0xff, 0x2f, 0xe1]); // bx lr
+    image[0x10..0x14].copy_from_slice(&[0xef, 0xbe, 0xad, 0xde]); // seeded dword
+    image[0x20..0x24].copy_from_slice(&[0x5a, 0xc3, 0x3c, 0x5a]); // nonzero gap bytes
+    image
+}
+
+/// Rust-side pin of the `pixel-modem-extractor-code-units-v1` digest grammar:
+/// domain + NUL, LE u64 count, then per address-ordered unit tag 0x00
+/// instruction / 0x01 data, LE u32 address, LE u32 byte length, exact bytes,
+/// and for data the LE u32 UTF-8 data-type-path length plus exact path bytes.
+fn tame_code_units_digest(units: &[(bool, u32, &[u8], &str)]) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"pixel-modem-extractor-code-units-v1\0");
+    bytes.extend_from_slice(&(units.len() as u64).to_le_bytes());
+    for (is_data, address, data, path) in units {
+        bytes.push(u8::from(*is_data));
+        bytes.extend_from_slice(&address.to_le_bytes());
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        if *is_data {
+            bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+        }
+    }
+    pal_fixture::blake3_hex(&bytes)
+}
+
+/// One function for the digest pin: (ID, entry u32, body ranges as
+/// (start, exclusive-end) u32 pairs).
+type TameDigestFunction = (u64, u32, &'static [(u32, u32)]);
+
+/// Rust-side pin of the `pixel-modem-extractor-function-bodies-v1` digest
+/// grammar: domain + NUL, LE u64 count, then per address-ordered function the
+/// non-negative ID as LE u64, entry u32, range count u32, and each range's
+/// start / exclusive-end u32 pair.
+fn tame_function_bodies_digest(functions: &[TameDigestFunction]) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"pixel-modem-extractor-function-bodies-v1\0");
+    bytes.extend_from_slice(&(functions.len() as u64).to_le_bytes());
+    for (id, entry, ranges) in functions {
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&entry.to_le_bytes());
+        bytes.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
+        for (start, end_exclusive) in *ranges {
+            bytes.extend_from_slice(&start.to_le_bytes());
+            bytes.extend_from_slice(&end_exclusive.to_le_bytes());
+        }
+    }
+    pal_fixture::blake3_hex(&bytes)
+}
+
+/// Extracts the value printed after `marker` on its script log line, trimming
+/// Ghidra's `(GhidraScript)` suffix decoration.
+fn tame_script_value(stdout: &str, marker: &str) -> String {
+    let line = stdout
+        .lines()
+        .find(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("no {marker} line in:\n{stdout}"));
+    let start = line.find(marker).unwrap() + marker.len();
+    let end = line.rfind(" (GhidraScript)").unwrap_or(line.len());
+    line[start..end].trim().to_string()
+}
+
+/// Parses the single `TameAnalysis: {json}` datamark summary line.
+fn tame_summary(stdout: &str) -> serde_json::Value {
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("TameAnalysis: {"))
+        .unwrap_or_else(|| panic!("no TameAnalysis summary line in:\n{stdout}"));
+    let start = line.find("TameAnalysis: ").unwrap() + "TameAnalysis: ".len();
+    let end = line.rfind('}').unwrap();
+    serde_json::from_str(&line[start..=end])
+        .unwrap_or_else(|error| panic!("summary is not JSON ({error}): {}", &line[start..=end]))
+}
+
+/// Seeds the fixture state: two ARM instructions and a function at
+/// 0x40010000, a dword data unit at 0x40010010, and the Aggressive
+/// Instruction Finder options pinned ON so a rolled-back datamark run must
+/// restore them (and a successful one must disable them observably). Prints
+/// the canonical preflight digests for the Rust-side grammar pin.
+const TAME_SEED_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.framework.options.Options;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.data.DWordDataType;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.Program;
+
+public class TameSeed extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Address entry = toAddr(0x40010000L);
+        disassemble(entry);
+        Instruction second = currentProgram.getListing().getInstructionAt(entry.add(4));
+        if (second == null) {
+            throw new AssertionError("tame seed did not disassemble both instructions");
+        }
+        Function function = createFunction(entry, null);
+        if (function == null || !function.getBody().getMinAddress().equals(entry)
+                || function.getBody().getMaxAddress().compareTo(entry.add(7)) != 0) {
+            throw new AssertionError("tame seed function body is not the 8-byte entry run");
+        }
+        Data dword = createData(toAddr(0x40010010L), DWordDataType.dataType);
+        if (dword == null || dword.getLength() != 4
+                || !"/dword".equals(dword.getDataType().getPathName())) {
+            throw new AssertionError("tame seed dword is not exact");
+        }
+        if (currentProgram.getListing().getNumCodeUnits() != 3) {
+            throw new AssertionError("tame seed expects exactly three defined units");
+        }
+        Options opts = currentProgram.getOptions(Program.ANALYSIS_PROPERTIES);
+        opts.setBoolean("ARM Aggressive Instruction Finder", true);
+        opts.setBoolean("Aggressive Instruction Finder", true);
+        println("TameSeed: units_digest "
+                + PalTasksSupport.codeUnitsDigestHex(currentProgram, null));
+        println("TameSeed: function_id " + function.getID());
+        println("TameSeed: function_digest "
+                + PalTasksSupport.functionBodiesDigestHex(currentProgram));
+        println("TameSeed: ok");
+    }
+}
+"#;
+
+/// Postflight for a successful datamark run: the seeded instructions, dword,
+/// and function survive verbatim; the two maximal gaps carry exactly one byte
+/// array each (byte[8] and byte[44]); the total unit count is additive; the
+/// options were disabled; the PAL state stays absent; and the recomputed
+/// digests (excluding the created gap arrays) are printed for comparison.
+const INSPECT_DATAMARK_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.framework.options.Options;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.ByteDataType;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Listing;
+import ghidra.program.model.listing.Program;
+
+public class InspectDatamark extends GhidraScript {
+    private Data requireArray(long address, int length) {
+        Data array = currentProgram.getListing().getDefinedDataAt(toAddr(address));
+        if (array == null || array.getLength() != length || !array.getDataType()
+                .isEquivalent(new ArrayDataType(ByteDataType.dataType, length, 1))) {
+            throw new AssertionError("expected an exact byte[" + length + "] array at 0x"
+                    + Long.toHexString(address));
+        }
+        return array;
+    }
+
+    @Override
+    public void run() throws Exception {
+        Listing listing = currentProgram.getListing();
+        if (listing.getInstructionAt(toAddr(0x40010000L)) == null
+                || listing.getInstructionAt(toAddr(0x40010004L)) == null) {
+            throw new AssertionError("a seeded instruction was cleared");
+        }
+        Data dword = listing.getDefinedDataAt(toAddr(0x40010010L));
+        if (dword == null || dword.getLength() != 4
+                || !"/dword".equals(dword.getDataType().getPathName())) {
+            throw new AssertionError("the seeded dword was disturbed");
+        }
+        Function function = currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(0x40010000L));
+        if (function == null || !function.getBody().getMinAddress().equals(toAddr(0x40010000L))
+                || function.getBody().getMaxAddress().compareTo(toAddr(0x40010007L)) != 0) {
+            throw new AssertionError("the seeded function was disturbed");
+        }
+        requireArray(0x40010008L, 8);
+        requireArray(0x40010014L, 44);
+        if (listing.getDefinedDataAt(toAddr(0x4001000cL)) != null) {
+            throw new AssertionError("the first gap is not covered by one array");
+        }
+        if (listing.getNumCodeUnits() != 5) {
+            throw new AssertionError("the unit count is not additive: "
+                    + listing.getNumCodeUnits());
+        }
+        PalTasksSupport.validateAbsent(currentProgram);
+        Options opts = currentProgram.getOptions(Program.ANALYSIS_PROPERTIES);
+        if (opts.getBoolean("ARM Aggressive Instruction Finder", true)
+                || opts.getBoolean("Aggressive Instruction Finder", true)) {
+            throw new AssertionError("datamark did not disable the aggressive finders");
+        }
+        AddressSet gaps = new AddressSet(toAddr(0x40010008L), toAddr(0x4001000fL));
+        gaps.add(toAddr(0x40010014L), toAddr(0x4001003fL));
+        println("InspectDatamark: units_digest "
+                + PalTasksSupport.codeUnitsDigestHex(currentProgram, gaps));
+        println("InspectDatamark: function_id " + function.getID());
+        println("InspectDatamark: function_digest "
+                + PalTasksSupport.functionBodiesDigestHex(currentProgram));
+        println("InspectDatamark: ok");
+    }
+}
+"#;
+
+/// Postflight for a failed datamark run: no data-mark array survives (both
+/// gap starts are undefined), the seeded code/function/dword are intact, the
+/// unit count is back to three, the PAL state is absent, and the aggressive
+/// finder options were restored to the seeded ON state.
+const INSPECT_PRISTINE_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.framework.options.Options;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Listing;
+import ghidra.program.model.listing.Program;
+
+public class InspectPristine extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Listing listing = currentProgram.getListing();
+        if (listing.getInstructionAt(toAddr(0x40010000L)) == null
+                || listing.getInstructionAt(toAddr(0x40010004L)) == null) {
+            throw new AssertionError("a seeded instruction was lost");
+        }
+        Data dword = listing.getDefinedDataAt(toAddr(0x40010010L));
+        if (dword == null || dword.getLength() != 4
+                || !"/dword".equals(dword.getDataType().getPathName())) {
+            throw new AssertionError("the seeded dword was lost");
+        }
+        Function function = currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(0x40010000L));
+        if (function == null || !function.getBody().getMinAddress().equals(toAddr(0x40010000L))
+                || function.getBody().getMaxAddress().compareTo(toAddr(0x40010007L)) != 0) {
+            throw new AssertionError("the seeded function was lost");
+        }
+        if (listing.getDefinedDataAt(toAddr(0x40010008L)) != null
+                || listing.getDefinedDataAt(toAddr(0x40010014L)) != null) {
+            throw new AssertionError("a data-mark array survived the failed run");
+        }
+        if (listing.getNumCodeUnits() != 3) {
+            throw new AssertionError("the unit count did not roll back: "
+                    + listing.getNumCodeUnits());
+        }
+        PalTasksSupport.validateAbsent(currentProgram);
+        Options opts = currentProgram.getOptions(Program.ANALYSIS_PROPERTIES);
+        if (!opts.getBoolean("ARM Aggressive Instruction Finder", true)
+                || !opts.getBoolean("Aggressive Instruction Finder", true)) {
+            throw new AssertionError("the analyzer options did not roll back");
+        }
+        println("InspectPristine: ok");
+    }
+}
+"#;
+
+struct TameKit {
+    dir: std::path::PathBuf,
+    out: std::path::PathBuf,
+}
+
+/// Generates the TameAnalysis fixture kit: a real import kit for the fixture
+/// image plus the staged seed/inspector scripts.
+fn generate_tame_kit(home: &std::path::Path, case: &str) -> TameKit {
+    let dir = std::env::temp_dir().join(format!("pme_tame_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        craft_single_image_modem_bin("BOOT", 0x4001_0000, 1, &tame_fixture_image()),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        },
+        &out,
+    )
+    .unwrap();
+    assert!(
+        out.join("scripts/TameAnalysis.java").exists(),
+        "kit must stage TameAnalysis.java"
+    );
+    for (name, source) in [
+        ("TameSeed.java", TAME_SEED_JAVA),
+        ("InspectDatamark.java", INSPECT_DATAMARK_JAVA),
+        ("InspectPristine.java", INSPECT_PRISTINE_JAVA),
+    ] {
+        std::fs::write(out.join("scripts").join(name), source).unwrap();
+    }
+    std::fs::create_dir_all(out.join("ghidra_project")).unwrap();
+    for directory in ["ghidra_config", "ghidra_cache", "ghidra_tmp"] {
+        std::fs::create_dir_all(out.join(directory)).unwrap();
+    }
+    TameKit { dir, out }
+}
+
+fn tame_headless(home: &std::path::Path, kit: &TameKit, args: &[String]) -> std::process::Output {
+    let config = kit.out.join("ghidra_config");
+    let cache = kit.out.join("ghidra_cache");
+    let temp = kit.out.join("ghidra_tmp");
+    let java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        config.display(),
+        cache.display(),
+        temp.display(),
+        temp.display()
+    );
+    std::process::Command::new(
+        analyze_headless_in_home(home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(kit.out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .args(args)
+    .env("XDG_CONFIG_HOME", &config)
+    .env("XDG_CACHE_HOME", &cache)
+    .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+    .output()
+    .unwrap()
+}
+
+fn tame_stdout(output: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
+}
+
+/// The initial `-import` run, optionally seeding the fixture state.
+fn tame_import(home: &std::path::Path, kit: &TameKit, seed: bool) -> String {
+    let mut args: Vec<String> = [
+        "-import".to_string(),
+        kit.out
+            .join("images/00_BOOT")
+            .to_string_lossy()
+            .into_owned(),
+        "-processor".to_string(),
+        "ARM:LE:32:v7".to_string(),
+        "-loader".to_string(),
+        "BinaryLoader".to_string(),
+        "-loader-baseAddr".to_string(),
+        "40010000".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+    ]
+    .into();
+    if seed {
+        args.extend(["-postScript".to_string(), "TameSeed.java".to_string()]);
+    }
+    tame_stdout(&tame_headless(home, kit, &args))
+}
+
+/// A `-process` run driving TameAnalysis with the given script arguments
+/// (mode, identity, regions), optionally followed by one post-script. A
+/// pre-script failure makes Ghidra print `REPORT SCRIPT ERROR`, abort the
+/// rest of the run, and skip the post-script — while still exiting zero, so
+/// callers assert on the report text rather than the exit status.
+fn tame_datamark(
+    home: &std::path::Path,
+    kit: &TameKit,
+    script_args: &[&str],
+    post: Option<&str>,
+) -> String {
+    let mut args: Vec<String> = [
+        "-process".to_string(),
+        "00_BOOT".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-preScript".to_string(),
+        "TameAnalysis.java".to_string(),
+    ]
+    .into();
+    args.extend(script_args.iter().map(|arg| arg.to_string()));
+    if let Some(script) = post {
+        args.extend(["-postScript".to_string(), script.to_string()]);
+    }
+    tame_stdout(&tame_headless(home, kit, &args))
+}
+
+fn tame_inspect_pristine(home: &std::path::Path, kit: &TameKit) -> String {
+    let args: Vec<String> = [
+        "-process".to_string(),
+        "00_BOOT".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "InspectPristine.java".to_string(),
+    ]
+    .into();
+    tame_stdout(&tame_headless(home, kit, &args))
+}
+
+/// Patches the staged TameAnalysis source once per anchor pair.
+fn patch_tame_script(out: &std::path::Path, replacements: &[(&str, &str)]) {
+    let path = out.join("scripts/TameAnalysis.java");
+    let mut script = std::fs::read_to_string(&path).unwrap();
+    for (from, to) in replacements {
+        assert_eq!(
+            script.matches(from).count(),
+            1,
+            "patch anchor {from:?} must be unique"
+        );
+        script = script.replacen(from, to, 1);
+    }
+    std::fs::write(&path, script).unwrap();
+}
+
+#[test]
+fn datamark_preserves_code_functions_and_partitions_gaps() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let kit = generate_tame_kit(&home, "preserve");
+    let seeded = tame_import(&home, &kit, true);
+    assert!(
+        seeded.contains("TameSeed: ok"),
+        "seed run failed:\n{seeded}"
+    );
+
+    // Rust-side grammar pin: the digests printed by the seed run must equal
+    // the digests recomputed here from the fixture bytes alone.
+    let image = tame_fixture_image();
+    let expected_units = tame_code_units_digest(&[
+        (false, 0x4001_0000, &image[0x00..0x04], ""),
+        (false, 0x4001_0004, &image[0x04..0x08], ""),
+        (true, 0x4001_0010, &image[0x10..0x14], "/dword"),
+    ]);
+    assert_eq!(
+        tame_script_value(&seeded, "TameSeed: units_digest "),
+        expected_units,
+        "the Ghidra code-units digest does not match the Rust-side grammar pin"
+    );
+    let function_id: u64 = tame_script_value(&seeded, "TameSeed: function_id ")
+        .parse()
+        .unwrap();
+    let expected_functions =
+        tame_function_bodies_digest(&[(function_id, 0x4001_0000, &[(0x4001_0000, 0x4001_0008)])]);
+    assert_eq!(
+        tame_script_value(&seeded, "TameSeed: function_digest "),
+        expected_functions,
+        "the Ghidra function-bodies digest does not match the Rust-side grammar pin"
+    );
+
+    let run = tame_datamark(
+        &home,
+        &kit,
+        &["datamark", "none", "40010000:40"],
+        Some("InspectDatamark.java"),
+    );
+    assert!(
+        !run.contains("REPORT SCRIPT ERROR"),
+        "datamark run failed:\n{run}"
+    );
+    assert!(
+        run.contains("TameAnalysis: mode=datamark (Phase-1 fallback)"),
+        "the datamark mode line is missing:\n{run}"
+    );
+    let summary = tame_summary(&run);
+    assert_eq!(summary["mode"], "datamark");
+    assert_eq!(summary["identity"], "none");
+    assert_eq!(summary["regions"], 1);
+    assert_eq!(summary["region_bytes"], 0x40);
+    assert_eq!(summary["gaps"], 2);
+    assert_eq!(summary["gap_bytes"], 52);
+    assert_eq!(summary["arrays"], 2);
+    assert_eq!(summary["units_before"], 3);
+    assert_eq!(summary["units_after"], 5);
+    assert_eq!(summary["code_units_digest"], expected_units);
+    assert_eq!(summary["functions_before"], 1);
+    assert_eq!(summary["function_digest"], expected_functions);
+    let gap_digests = summary["gap_digests"].as_array().unwrap();
+    let expected_gap_digests = [
+        pal_fixture::blake3_hex(&image[0x08..0x10]),
+        pal_fixture::blake3_hex(&image[0x14..0x40]),
+    ];
+    assert_eq!(gap_digests.len(), expected_gap_digests.len());
+    for (actual, expected) in gap_digests.iter().zip(&expected_gap_digests) {
+        assert_eq!(
+            actual, expected,
+            "the gap digest does not reproduce the bytes"
+        );
+    }
+    assert!(
+        run.contains("InspectDatamark: ok"),
+        "postflight failed:\n{run}"
+    );
+    assert_eq!(
+        tame_script_value(&run, "InspectDatamark: units_digest "),
+        expected_units,
+        "the preserved code units changed during data-marking"
+    );
+    assert_eq!(
+        tame_script_value(&run, "InspectDatamark: function_digest "),
+        expected_functions,
+        "the function bodies changed during data-marking"
+    );
+    assert_eq!(
+        tame_script_value(&run, "InspectDatamark: function_id ")
+            .parse::<u64>()
+            .unwrap(),
+        function_id,
+        "the seeded function identity changed during data-marking"
+    );
+
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn datamark_rejects_strict_argument_contract_before_mutation() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let kit = generate_tame_kit(&home, "strict");
+    let seeded = tame_import(&home, &kit, true);
+    assert!(
+        seeded.contains("TameSeed: ok"),
+        "seed run failed:\n{seeded}"
+    );
+
+    let present_identity = format!("v1:{}:1:1", "a".repeat(64));
+    let mut regions_4097: Vec<&str> = vec!["datamark", "none"];
+    regions_4097.extend(
+        (0..4097).map(|index| {
+            Box::leak(format!("{:08x}:1", 0x4001_0000 + index).into_boxed_str()) as &str
+        }),
+    );
+    let over_aggregate = ["00000100:10000001", "10000200:10000001"];
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["explode", "none"], "unknown mode"),
+        (vec!["tighten"], "PAL identity"),
+        (vec!["datamark"], "PAL identity"),
+        (
+            vec!["tighten", "none", "40010000:4"],
+            "tighten mode accepts no region arguments",
+        ),
+        (
+            vec!["datamark", "bogus"],
+            "PAL identity is not the v1 grammar",
+        ),
+        (
+            vec!["datamark", &present_identity, "40010000:4"],
+            "stale PAL property",
+        ),
+        (vec!["datamark", "none", "40010000"], "malformed region"),
+        (vec!["datamark", "none", "4001000g:4"], "malformed region"),
+        (
+            vec!["datamark", "none", "40010000:0"],
+            "the region length is zero",
+        ),
+        (
+            vec!["datamark", "none", "ffffffff:2"],
+            "wraps the 32-bit address space",
+        ),
+        (
+            vec!["datamark", "none", "40010020:4", "40010010:4"],
+            "not sorted",
+        ),
+        (
+            vec!["datamark", "none", "40010000:20", "40010010:8"],
+            "overlap",
+        ),
+        (
+            vec!["datamark", "none", "50010000:4"],
+            "not fully inside initialized memory",
+        ),
+        (regions_4097, "region count exceeds"),
+        (
+            vec!["datamark", "none", over_aggregate[0], over_aggregate[1]],
+            "aggregate region bytes exceed",
+        ),
+    ];
+    for (script_args, expected) in &cases {
+        let run = tame_datamark(&home, &kit, script_args, None);
+        let shown = &script_args[..script_args.len().min(3)].join(" ");
+        assert!(
+            run.contains("REPORT SCRIPT ERROR"),
+            "case {shown:?} did not fail the headless run:\n{run}"
+        );
+        assert!(
+            run.contains(expected),
+            "case {shown:?} missed {expected:?}:\n{run}"
+        );
+        assert!(
+            !run.contains("TameAnalysis: mode="),
+            "case {shown:?} reached the mutation phase:\n{run}"
+        );
+    }
+
+    let inspected = tame_inspect_pristine(&home, &kit);
+    assert!(
+        inspected.contains("InspectPristine: ok"),
+        "a rejected run mutated the program:\n{inspected}"
+    );
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+fn assert_datamark_fails_pristine(
+    home: &std::path::Path,
+    case: &str,
+    patches: &[(&str, &str)],
+    expected_failure: &str,
+) {
+    let kit = generate_tame_kit(home, case);
+    let seeded = tame_import(home, &kit, true);
+    assert!(
+        seeded.contains("TameSeed: ok"),
+        "seed run failed for {case}:\n{seeded}"
+    );
+    patch_tame_script(&kit.out, patches);
+    let failed = tame_datamark(home, &kit, &["datamark", "none", "40010000:40"], None);
+    assert!(
+        failed.contains("REPORT SCRIPT ERROR"),
+        "patched datamark run for {case} did not fail the headless run:\n{failed}"
+    );
+    assert!(
+        failed.contains(expected_failure),
+        "patched run for {case} missed {expected_failure:?}:\n{failed}"
+    );
+    let inspected = tame_inspect_pristine(home, &kit);
+    assert!(
+        inspected.contains("InspectPristine: ok"),
+        "failed {case} run left partial state:\n{inspected}"
+    );
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn datamark_rolls_back_injected_partial_failure() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_datamark_fails_pristine(
+        &home,
+        "rollback",
+        &[(
+            "arraysCreated++;",
+            concat!(
+                "arraysCreated++;\n",
+                "                if (arraysCreated == 1) {\n",
+                "                    throw new IllegalStateException(\n",
+                "                            \"injected datamark failure after the first array\");\n",
+                "                }"
+            ),
+        )],
+        "injected datamark failure after the first array",
+    );
+}
+
+#[test]
+fn datamark_rejects_deadline_and_rolls_back() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_datamark_fails_pristine(
+        &home,
+        "deadline",
+        &[
+            ("PHASE_BUDGET_MS = 15 * 60_000L", "PHASE_BUDGET_MS = 1L"),
+            ("planGaps();", "Thread.sleep(50);\n            planGaps();"),
+        ],
+        "the TameAnalysis phase budget was exhausted",
+    );
+}
+
+#[test]
+fn datamark_rejects_aggregate_limit_and_rolls_back() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_datamark_fails_pristine(
+        &home,
+        "limit",
+        &[(
+            "MAX_REGION_AGGREGATE_BYTES = 512L * 1024L * 1024L",
+            "MAX_REGION_AGGREGATE_BYTES = 24L",
+        )],
+        "the aggregate region bytes exceed the limit",
+    );
+}

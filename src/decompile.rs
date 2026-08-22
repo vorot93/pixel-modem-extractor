@@ -153,7 +153,10 @@ pub fn build_load_spec(
 ///
 /// `mode` is "tighten" (Phase 2+ default — attempt Thumb) or "datamark" (Phase-1
 /// fallback — mark regions as data). When "tighten", the `thumb_regions` arg is
-/// ignored (no data-marks passed to the script).
+/// ignored (no data-marks passed to the script). Immediately after the mode the
+/// pre-script consumes the expected PAL identity — every current source passes
+/// `none` (the PAL task-inventory generation is the only future supplier of a
+/// present identity).
 ///
 /// `pal_task_map` is the relative PAL task-manifest path for this image. When
 /// present the pre-script order is `ApplyScatterLoad`, `ApplyPalTasks`,
@@ -208,13 +211,15 @@ fn headless_args(
         ]);
     }
     // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as its
-    // arg[0]. In `datamark` mode it also disables the Aggressive Instruction
+    // arg[0], then the expected PAL identity (`none` for every current
+    // caller). In `datamark` mode it also disables the Aggressive Instruction
     // Finder and marks the dense high-entropy regions passed below (each as
     // "addrHex:lenHex") as data. In `tighten` mode no regions are passed.
     args.extend([
         "-preScript".to_string(),
         "TameAnalysis.java".to_string(),
         mode.to_string(),
+        "none".to_string(),
     ]);
     if mode == "datamark" {
         for (addr, len) in thumb_regions {
@@ -3490,16 +3495,18 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let ps = args.iter().position(|a| a == "-postScript").unwrap();
         assert_eq!(args[ps + 1], "ExportDecomp.java");
         assert_eq!(args[ps + 2], "/out/export/02_MAIN");
-        // pre-script wires TameAnalysis.java, then mode, then the data-region args
-        // (only in datamark mode), before the post-script
+        // pre-script wires TameAnalysis.java, then mode, then the expected PAL
+        // identity (none), then the data-region args (only in datamark mode),
+        // before the post-script
         let pre = args.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(args[pre + 1], "TameAnalysis.java");
         assert_eq!(args[pre + 2], "datamark");
-        assert_eq!(args[pre + 3], "41090000:2880000"); // addrHex:lenHex
+        assert_eq!(args[pre + 3], "none"); // expected PAL identity
+        assert_eq!(args[pre + 4], "41090000:2880000"); // addrHex:lenHex
         assert!(pre < ps, "pre-script must precede post-script");
         assert!(args.iter().any(|a| a == "-overwrite"));
-        // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly
-        // follows the mode arg
+        // base 0 -> zero-padded "00000000"; no data regions -> -postScript
+        // directly follows the identity arg
         let z = headless_args(
             "/o",
             "00_BOOT",
@@ -3513,7 +3520,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let zpre = z.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(z[zpre + 1], "TameAnalysis.java");
         assert_eq!(z[zpre + 2], "datamark");
-        assert_eq!(z[zpre + 3], "-postScript");
+        assert_eq!(z[zpre + 3], "none");
+        assert_eq!(z[zpre + 4], "-postScript");
         let bz = z.iter().position(|a| a == "-loader-baseAddr").unwrap();
         assert_eq!(z[bz + 1], "00000000");
     }
@@ -3531,13 +3539,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "tighten",
         );
         let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
-        // The next arg after the script name is the mode.
+        // The next two args after the script name are the mode and the
+        // expected PAL identity.
         assert_eq!(args[pre_idx + 1], "tighten");
+        assert_eq!(args[pre_idx + 2], "none");
         // No addrHex:lenHex follows (tighten mode does not data-mark).
         assert!(
-            !args[pre_idx + 2..].iter().any(|a| a.contains(':')),
+            !args[pre_idx + 3..].iter().any(|a| a.contains(':')),
             "tighten mode must not pass region args: {:?}",
-            &args[pre_idx + 2..]
+            &args[pre_idx + 3..]
         );
     }
 
@@ -3555,7 +3565,127 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
         assert_eq!(args[pre_idx + 1], "datamark");
-        assert!(args[pre_idx + 2..].iter().any(|a| a == "40e12000:100000"));
+        assert_eq!(args[pre_idx + 2], "none");
+        assert!(args[pre_idx + 3..].iter().any(|a| a == "40e12000:100000"));
+    }
+
+    #[test]
+    fn tame_analysis_args_pass_none_identity_after_mode() {
+        // The strict TameAnalysis contract consumes mode then the expected PAL
+        // identity. Every current generated/in-process source passes `none`
+        // (the PAL task-inventory task is the only future supplier of a
+        // present identity); the identity must sit between the mode and any
+        // region arguments in both modes.
+        let datamark = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            None,
+            None,
+            &[(0x40e12000, 0x100000)],
+            "datamark",
+        );
+        let tame_at = datamark
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert_eq!(
+            &datamark[tame_at + 1..=tame_at + 3],
+            ["datamark", "none", "40e12000:100000"]
+        );
+        let tighten = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            None,
+            None,
+            &[(0x40e12000, 0x100000)],
+            "tighten",
+        );
+        let tame_at = tighten
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert_eq!(&tighten[tame_at + 1..=tame_at + 2], ["tighten", "none"]);
+
+        // The generated turnkey script (the other argument source) carries
+        // the same identity spelling for every image invocation.
+        let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0u8; 4])]);
+        let dir = std::env::temp_dir().join(format!("pme_tame_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem = dir.join("modem.bin");
+        std::fs::write(&modem, &buf).unwrap();
+        let out = dir.join("out");
+        run(&modem, &generation_opts(None), &out).unwrap();
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(
+            script.contains("'TameAnalysis.java' 'tighten' 'none'"),
+            "run_ghidra.sh must pass the none identity after the mode:\n{script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tame_analysis_source_contract_uses_pal_tasks_support() {
+        // TameAnalysis must run as a strict HeadlessScript transaction that
+        // delegates PAL property/absence validation and the preservation
+        // digests to the one shared support class — it may not own a second
+        // registry parser or a second copy of a digest domain.
+        for required in [
+            "extends HeadlessScript",
+            "PalTasksSupport.validateAbsent",
+            "PalTasksSupport.validateAppliedIdentity",
+            "PalTasksSupport.codeUnitsDigestHex",
+            "PalTasksSupport.functionBodiesDigestHex",
+            "PalTasksSupport.memoryDigestHex",
+        ] {
+            assert!(
+                TAME_ANALYSIS_JAVA.contains(required),
+                "TameAnalysis.java must use {required:?}"
+            );
+        }
+        for forbidden in [
+            "OWNERSHIP_MAP",
+            "PAL_PROPERTY",
+            "getStringPropertyMap",
+            "parseRegistry",
+            "pixel-modem-extractor-code-units-v1",
+            "pixel-modem-extractor-function-bodies-v1",
+        ] {
+            assert!(
+                !TAME_ANALYSIS_JAVA.contains(forbidden),
+                "TameAnalysis.java redefines the PalTasksSupport surface {forbidden:?}"
+            );
+        }
+        // The shared class owns the two new digest domains and their stream
+        // limits; TameAnalysis pins its own datamark limits.
+        for owned in [
+            "pixel-modem-extractor-code-units-v1",
+            "pixel-modem-extractor-function-bodies-v1",
+            "MAX_CODE_UNITS = 4_194_304",
+            "MAX_FUNCTIONS = 262_144",
+        ] {
+            assert!(
+                PAL_TASKS_SUPPORT_JAVA.contains(owned),
+                "PalTasksSupport.java must own {owned:?}"
+            );
+        }
+        for pinned in [
+            "PHASE_BUDGET_MS = 15 * 60_000L",
+            "MAX_REGIONS = 4096",
+            "MAX_REGION_AGGREGATE_BYTES = 512L * 1024L * 1024L",
+            "MAX_STREAM_RECORDS = 1_000_000",
+            "MAX_METADATA_BYTES = 64L * 1024L * 1024L",
+            "MAX_ARRAY_BYTES = 16 * 1024 * 1024",
+        ] {
+            assert!(
+                TAME_ANALYSIS_JAVA.contains(pinned),
+                "TameAnalysis.java must pin the exact limit {pinned:?}"
+            );
+        }
     }
 
     #[test]
@@ -3712,7 +3842,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert_eq!(args[pal_at + 4], "-");
         assert_eq!(args[tame_at + 1], "datamark");
-        assert!(args[tame_at + 2..].iter().any(|a| a == "40e12000:100000"));
+        assert_eq!(args[tame_at + 2], "none");
+        assert!(args[tame_at + 3..].iter().any(|a| a == "40e12000:100000"));
     }
 
     #[test]
