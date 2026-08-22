@@ -46,18 +46,8 @@ pub fn validate_artifact_files(
     let thumb_path = decompiled.join("thumb_functions.json");
 
     let image = std::fs::read(&image_path).expect("raw image readable");
-    let runtime_root = std::fs::canonicalize(image_dir).expect("image directory canonicalizable");
-    let runtime_map = runtime_root.join("scatter/load_map.json");
-    let runtime = RuntimeImage::from_artifact(
-        &image,
-        load_addr,
-        &runtime_root,
-        runtime_map
-            .try_exists()
-            .expect("scatter map existence query succeeds")
-            .then_some(runtime_map.as_path()),
-    )
-    .expect("runtime image valid");
+    let runtime =
+        RuntimeImage::for_image_dir(&image, load_addr, image_dir).expect("runtime image valid");
     let inputs = &artifact["inputs"];
     assert!(is_blake3_hex(require_str(inputs, "image_blake3")));
     assert!(is_blake3_hex(require_str(inputs, "globals_blake3")));

@@ -344,6 +344,17 @@ impl<'a> RuntimeImage<'a> {
         Self::from_segments(segments)
     }
 
+    /// Build the runtime view for an image directory using the decompose-tree
+    /// scatter convention: the map, when present, is
+    /// `<image_dir>/scatter/load_map.json` and its blocks live beside it.
+    /// This is the only constructor for that convention; consumers must not
+    /// re-derive the map path or existence probe themselves.
+    pub(crate) fn for_image_dir(raw: &'a [u8], base: u32, image_dir: &Path) -> Result<Self> {
+        let root = std::fs::canonicalize(image_dir)?;
+        let map = root.join("scatter/load_map.json");
+        Self::from_artifact(raw, base, &root, map.try_exists()?.then_some(map.as_path()))
+    }
+
     pub(crate) fn read_u8(&self, address: u32) -> Result<u8> {
         Ok(self.read_exact(address, 1)?[0])
     }
@@ -914,5 +925,95 @@ mod tests {
             MAX_EXACT_READ
         );
         assert_bad(image.read_exact(BASE, MAX_EXACT_READ + 1));
+    }
+
+    #[test]
+    fn for_image_dir_loads_the_image_dir_scatter_convention() {
+        const BYTES_DEST: u32 = 0x2000_0100;
+        const ZERO_DEST: u32 = 0x2000_0300;
+        let mut image = vec![0u8; 0x1000];
+        image[..16].copy_from_slice(&raw());
+        // A materializable variant of the shared plan: the table range must
+        // live inside the image (3 entries x 16 bytes), destinations must sit
+        // outside the raw image, and a Copy entry's byte output must match its
+        // source bytes.
+        let mut scatter_plan = plan();
+        scatter_plan.image_size = 0x1000;
+        scatter_plan.loader_address = BASE + 0x40;
+        scatter_plan.literal_pair_address = BASE + 0x80;
+        scatter_plan.table_start = BASE + 0x200;
+        scatter_plan.table_end = BASE + 0x230;
+        let copy = &mut scatter_plan.entries[1];
+        copy.descriptor.destination = BYTES_DEST;
+        copy.operation = Operation::Copy;
+        copy.compressed_size = None;
+        copy.descriptor.handler = scatter_plan.handlers.copy;
+        copy.output = PlannedOutput::Bytes(vec![0x55, 0x66, 0x77, 0x88]);
+        scatter_plan.entries[2].descriptor.destination = ZERO_DEST;
+        for (position, entry) in scatter_plan.entries.iter_mut().enumerate() {
+            entry.index = position;
+        }
+
+        let kit = tempfile::tempdir().unwrap();
+        crate::scatter::materialize(&scatter_plan, &image, "02_MAIN", kit.path()).unwrap();
+        let image_dir = tempfile::tempdir().unwrap();
+        // The decompose-tree convention keeps the materialized layout directly
+        // under the image directory: scatter/{load_map.json, blocks/}.
+        std::fs::rename(
+            kit.path().join("scatter").join("02_MAIN"),
+            image_dir.path().join("scatter"),
+        )
+        .unwrap();
+
+        let runtime = RuntimeImage::for_image_dir(&image, BASE, image_dir.path()).unwrap();
+        assert_eq!(
+            runtime.read_exact(BYTES_DEST, 4).unwrap().as_ref(),
+            [0x55, 0x66, 0x77, 0x88]
+        );
+        assert_eq!(
+            runtime.storage_spans(BASE, 4).unwrap(),
+            [StorageSpan {
+                kind: StorageKind::Raw,
+                address: BASE,
+                size: 4,
+                scatter_entry: None,
+            }]
+        );
+        assert_eq!(
+            runtime.storage_spans(BYTES_DEST, 4).unwrap(),
+            [StorageSpan {
+                kind: StorageKind::ScatterBytes,
+                address: BYTES_DEST,
+                size: 4,
+                scatter_entry: Some(1),
+            }]
+        );
+        assert_eq!(
+            runtime.storage_spans(ZERO_DEST, 4).unwrap(),
+            [StorageSpan {
+                kind: StorageKind::ScatterZero,
+                address: ZERO_DEST,
+                size: 4,
+                scatter_entry: Some(2),
+            }]
+        );
+
+        // Without a scatter map the same constructor yields the raw mapping.
+        let raw_only = tempfile::tempdir().unwrap();
+        let runtime = RuntimeImage::for_image_dir(&image, BASE, raw_only.path()).unwrap();
+        assert_eq!(
+            runtime.storage_spans(BASE, 4).unwrap(),
+            [StorageSpan {
+                kind: StorageKind::Raw,
+                address: BASE,
+                size: 4,
+                scatter_entry: None,
+            }]
+        );
+
+        // A map at the conventional path is always consulted and fail-closed.
+        std::fs::create_dir_all(image_dir.path().join("scatter")).unwrap();
+        std::fs::write(image_dir.path().join("scatter/load_map.json"), b"not json").unwrap();
+        assert_bad(RuntimeImage::for_image_dir(&image, BASE, image_dir.path()));
     }
 }

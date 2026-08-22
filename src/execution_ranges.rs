@@ -783,7 +783,11 @@ fn parse_claimed_range(value: &Value) -> Result<ClaimedDecodeRange> {
     })
 }
 
-fn parse_blake3(value: &str) -> Result<[u8; 32]> {
+/// The single digest grammar for execution evidence: exactly 64 lowercase
+/// hexadecimal characters decoded into 32 bytes. Every consumer that parses a
+/// BLAKE3 digest from function records must go through this parser so the
+/// acceptance grammar cannot drift between stages.
+pub(crate) fn parse_blake3(value: &str) -> Result<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()

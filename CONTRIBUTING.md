@@ -398,7 +398,11 @@ module; when a file outgrows that, split it.
   scatter mappings), rejecting gaps, zero-fill, or digest mismatches. Function `end` and `size`
   remain analyzer metadata and never expand the authenticated executable domain.
   `global_shapes`, `globals`, symbolication, and `recover_source` all construct and supply the same
-  runtime view; no consumer reconstructs executable coverage from `[entry,end)`.
+  runtime view; no consumer reconstructs executable coverage from `[entry,end)`. The per-image
+  `scatter/load_map.json` convention has exactly one constructor,
+  `RuntimeImage::for_image_dir(raw, base, image_dir)` — never re-derive the map path or existence
+  probe at a call site. Record digests parse through the one
+  `execution_ranges::parse_blake3` (64 lowercase hex) so acceptance cannot drift between stages.
 - **Producer identity has two modes, and legacy records have neither.** One validator
   (`identity::producer_identity_error`) serves both: `IdentityMode::Runtime` for identities the
   coordinator will spawn (this host's path family, `canonicalize` equality with the recorded

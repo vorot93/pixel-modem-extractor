@@ -450,15 +450,7 @@ pub fn run_with_evidence_projection(
     let image_bytes = std::fs::read(&bin_path)?;
     let runtime_load_addr = u32::try_from(load_addr)
         .map_err(|_| Error::Serialize("globals: load_addr does not fit u32".into()))?;
-    let runtime_root = std::fs::canonicalize(image_dir)?;
-    let relative_map = Path::new("scatter/load_map.json");
-    let runtime_map = runtime_root.join(relative_map);
-    let runtime = RuntimeImage::from_artifact(
-        &image_bytes,
-        runtime_load_addr,
-        &runtime_root,
-        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
-    )?;
+    let runtime = RuntimeImage::for_image_dir(&image_bytes, runtime_load_addr, image_dir)?;
 
     // 3. Build string_map: {vaddr -> string_content}.
     let mut string_map: HashMap<u64, String> = HashMap::new();

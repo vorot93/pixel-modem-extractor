@@ -844,13 +844,10 @@ fn run_thumb_enrich_per_image(
         let image_dir = images_dir.join(label);
         let runtime = (|| {
             let raw = std::fs::read(image_dir.join(format!("{label}.bin")))?;
-            let root = std::fs::canonicalize(&image_dir)?;
-            let map = root.join("scatter/load_map.json");
-            let runtime = crate::runtime_image::RuntimeImage::from_artifact(
+            let runtime = crate::runtime_image::RuntimeImage::for_image_dir(
                 &raw,
                 ir.image_start,
-                &root,
-                map.try_exists()?.then_some(map.as_path()),
+                &image_dir,
             )?;
             decompile::thumb_enrich(&decompiled_c, &thumb_json, &runtime)
         })();
@@ -2456,13 +2453,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     let load_address = u32::try_from(load_address).map_err(|_| {
                         Error::Serialize(format!("load_addr for {main_name} does not fit u32"))
                     })?;
-                    let runtime_root = std::fs::canonicalize(&main_img_dir)?;
-                    let runtime_map = runtime_root.join("scatter/load_map.json");
-                    let runtime = crate::runtime_image::RuntimeImage::from_artifact(
+                    let runtime = crate::runtime_image::RuntimeImage::for_image_dir(
                         &raw,
                         load_address,
-                        &runtime_root,
-                        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
+                        &main_img_dir,
                     )?;
                     recover_source::run(
                         &source_tree_dir,

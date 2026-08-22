@@ -72,15 +72,7 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
     let image = std::fs::read(&image_path)?;
     let image_blake3 = blake3_bytes(&image);
     mapped_image_len(load_address, image.len())?;
-    let runtime_root = std::fs::canonicalize(request.image_dir)?;
-    let relative_map = Path::new("scatter/load_map.json");
-    let runtime_map = runtime_root.join(relative_map);
-    let runtime = RuntimeImage::from_artifact(
-        &image,
-        load_address,
-        &runtime_root,
-        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
-    )?;
+    let runtime = RuntimeImage::for_image_dir(&image, load_address, request.image_dir)?;
 
     let (globals_blake3, globals_json) = read_json(&globals_path)?;
     let globals = parse_globals(&globals_json, request)?;

@@ -759,15 +759,7 @@ pub(crate) fn validate_image_terminal_inventory(
             "terminal raw image length does not match the producer report".into(),
         ));
     }
-    let runtime_root = std::fs::canonicalize(image_dir)?;
-    let relative_map = Path::new("scatter/load_map.json");
-    let runtime_map = runtime_root.join(relative_map);
-    let runtime = RuntimeImage::from_artifact(
-        &raw,
-        image.image_start,
-        &runtime_root,
-        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
-    )?;
+    let runtime = RuntimeImage::for_image_dir(&raw, image.image_start, image_dir)?;
     let summary = validate_terminal_inventory_pair(
         ghidra_functions_path,
         thumb_functions_path,
@@ -1794,15 +1786,17 @@ fn run_report_impl(
             let mut terminal_error = None;
             let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
                 let export = root.join("export").join(&label);
-                let runtime_root = std::fs::canonicalize(&root);
+                // `root` is already canonical; re-canonicalizing here (with a
+                // silent fallback) could only mask an I/O failure as a later,
+                // misleading digest-mismatch rejection.
                 let runtime = RuntimeImage::from_artifact(
                     img,
                     e.load_addr,
-                    runtime_root.as_deref().unwrap_or(&root),
+                    &root,
                     runtime_load_maps
                         .paths
                         .get(&label)
-                        .map(|path| runtime_root.as_deref().unwrap_or(&root).join(path))
+                        .map(|path| root.join(path))
                         .as_deref(),
                 );
                 let validation = runtime

@@ -456,24 +456,6 @@ fn parse_hex(s: &str) -> Result<u64> {
     u64::from_str_radix(t, 16).map_err(|e| Error::Serialize(format!("bad hex {s}: {e}")))
 }
 
-fn parse_execution_blake3(value: &str) -> Result<[u8; 32]> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(Error::Serialize(
-            "execution_blake3 must be 64 lowercase hexadecimal characters".into(),
-        ));
-    }
-    let mut digest = [0u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| Error::Serialize("execution_blake3 contains invalid hex".into()))?;
-    }
-    Ok(digest)
-}
-
 #[derive(Deserialize)]
 struct ArmFnJson {
     name: String,
@@ -543,19 +525,12 @@ fn thumb_runtime<'a>(
     image: &'a [u8],
     load_addr: u64,
 ) -> Result<crate::runtime_image::RuntimeImage<'a>> {
-    let Ok(start) = u32::try_from(load_addr) else {
-        return Err(Error::Serialize(
+    let start = u32::try_from(load_addr).map_err(|_| {
+        Error::Serialize(
             "symbolicate: raw image mapping does not fit the canonical u32 domain".into(),
-        ));
-    };
-    let root = std::fs::canonicalize(image_dir)?;
-    let map = root.join("scatter/load_map.json");
-    crate::runtime_image::RuntimeImage::from_artifact(
-        image,
-        start,
-        &root,
-        map.try_exists()?.then_some(map.as_path()),
-    )
+        )
+    })?;
+    crate::runtime_image::RuntimeImage::for_image_dir(image, start, image_dir)
 }
 
 fn load_thumb_functions<'a>(
@@ -699,7 +674,7 @@ fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, 
             let execution_blake3 = f
                 .execution_blake3
                 .as_deref()
-                .map(parse_execution_blake3)
+                .map(crate::execution_ranges::parse_blake3)
                 .transpose()?;
             let key = FunctionEvidenceKey {
                 owner,
