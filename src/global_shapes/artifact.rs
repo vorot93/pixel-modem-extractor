@@ -677,10 +677,10 @@ mod tests {
         AnalysisWire, DecoderWire, FunctionContextWire, GlobalShapesFile, InputHashesWire,
         load_inputs, serialize, write_atomic, write_atomic_with_before_commit,
     };
+    use crate::arm32::AccessKind;
     use crate::error::Error;
     use crate::execution_ranges::{AuthenticatedDecodeRange, DecodeIsa};
     use crate::global_shapes::aggregate::aggregate;
-    use crate::global_shapes::decoder::AccessKind;
     use crate::global_shapes::tracker::CandidateObservation;
     use crate::global_shapes::{
         FORMAT_V4, FunctionContext, RecoveredGlobal, RunRequest, SourceProjectionCounts,

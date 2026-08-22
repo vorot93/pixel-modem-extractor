@@ -4,9 +4,9 @@ use super::artifact::{
     AccessKindWire, AlternativeWire, CallHopWire, ConflictWire, FunctionContextWire, GlobalWire,
     IsaWire, ObservationWire, ProvisionalShape, Status, SummaryWire,
 };
-use super::decoder::AccessKind;
 use super::tracker::{CallHop, CandidateObservation};
 use super::{FunctionContext, RecoveredGlobal};
+use crate::arm32::AccessKind;
 use crate::error::{Error, Result};
 use crate::execution_ranges::DecodeIsa as Isa;
 use std::collections::{BTreeMap, BTreeSet};

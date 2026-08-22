@@ -1,5 +1,6 @@
 pub mod analysis_tool;
 pub mod archive;
+pub(crate) mod arm32;
 pub mod classify;
 pub mod cli;
 pub mod decode_rf;

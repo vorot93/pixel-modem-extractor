@@ -1,10 +1,11 @@
 // Conservative per-block fact tracking.
 
-use super::decoder::{
-    AccessKind, AddressBase, AddressExpr, AddressOffset, Block, CallTarget, ControlFlow,
-    DecodedFunction, DecodedInstruction, Operand, Register, SemanticEffect, Shift, ValueExpr,
-};
+use super::decoder::{Block, CallTarget, ControlFlow, DecodedFunction, DecodedInstruction};
 use super::{FunctionContext, FunctionExecution};
+use crate::arm32::{
+    AccessKind, AddressBase, AddressExpr, AddressOffset, Operand, Register, Shift, ValueEffect,
+    ValueExpr,
+};
 use crate::error::{Error, Result};
 use crate::execution_ranges::DecodeIsa as Isa;
 use std::collections::{BTreeMap, BTreeSet};
@@ -519,8 +520,8 @@ fn apply_instruction(
     let mut unbounded = false;
 
     match &insn.effect {
-        SemanticEffect::None => {}
-        SemanticEffect::RegisterWrite { dst, value } => {
+        ValueEffect::None => {}
+        ValueEffect::RegisterWrite { dst, value } => {
             let fact = eval_value(value, state, insn.isa, insn.pc, recovered);
             apply_write(
                 state,
@@ -532,7 +533,7 @@ fn apply_instruction(
                 &mut killed_known,
             );
         }
-        SemanticEffect::LiteralWordLoad { dst, address } => {
+        ValueEffect::LiteralWordLoad { dst, address } => {
             let addr_fact = eval_address(address, state, insn.isa, insn.pc, recovered);
             if let Some(fact) = &addr_fact
                 && let Some(observation) =
@@ -563,7 +564,7 @@ fn apply_instruction(
                 &mut killed_known,
             );
         }
-        SemanticEffect::Memory(effect) => {
+        ValueEffect::Memory(effect) => {
             for transfer in &effect.transfers {
                 if let Some(fact) =
                     eval_address(&transfer.address, state, insn.isa, insn.pc, recovered)
@@ -586,7 +587,11 @@ fn apply_instruction(
                 );
             }
         }
-        SemanticEffect::Unsupported => {
+        // Compare and shift effects arrive pre-projected from the shared
+        // semantics as Unsupported (identical reads/writes); the arm is
+        // kept explicit so a future direct consumption cannot silently
+        // change tracker behavior.
+        ValueEffect::Compare { .. } | ValueEffect::Shift { .. } | ValueEffect::Unsupported => {
             if is_unbounded(&insn.writes) {
                 unbounded = true;
                 if state.clear() {
@@ -604,7 +609,7 @@ fn apply_instruction(
         }
     }
 
-    if !matches!(insn.effect, SemanticEffect::Unsupported) {
+    if !matches!(insn.effect, ValueEffect::Unsupported) {
         for register in &insn.writes {
             if !exactly_updated.contains(register) && state.kill(*register) {
                 killed_known = true;
@@ -928,10 +933,10 @@ fn invalid(message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::super::decoder::{
-        CallTarget, ControlFlow, DecodeFailure, DecodedRange, MemoryEffect, MemoryTransfer,
-        reachable_blocks,
+        CallTarget, ControlFlow, DecodeFailure, DecodedRange, reachable_blocks,
     };
     use super::*;
+    use crate::arm32::{MemoryEffect, MemoryTransfer};
     use crate::execution_ranges::{AuthenticatedDecodeRange, ExecutionIdentity, FunctionOwner};
 
     const R0: Register = Register(0);
@@ -989,7 +994,7 @@ mod tests {
         length: u8,
         conditional: bool,
         writes: impl IntoIterator<Item = Register>,
-        effect: SemanticEffect,
+        effect: ValueEffect,
         flow: ControlFlow,
     ) -> DecodedInstruction {
         DecodedInstruction {
@@ -1007,7 +1012,7 @@ mod tests {
     fn arm(
         pc: u32,
         writes: impl IntoIterator<Item = Register>,
-        effect: SemanticEffect,
+        effect: ValueEffect,
     ) -> DecodedInstruction {
         insn(Isa::Arm, pc, 4, false, writes, effect, ControlFlow::Linear)
     }
@@ -1015,7 +1020,7 @@ mod tests {
     fn thumb(
         pc: u32,
         writes: impl IntoIterator<Item = Register>,
-        effect: SemanticEffect,
+        effect: ValueEffect,
     ) -> DecodedInstruction {
         insn(
             Isa::Thumb,
@@ -1028,8 +1033,8 @@ mod tests {
         )
     }
 
-    fn write(dst: Register, value: ValueExpr) -> SemanticEffect {
-        SemanticEffect::RegisterWrite { dst, value }
+    fn write(dst: Register, value: ValueExpr) -> ValueEffect {
+        ValueEffect::RegisterWrite { dst, value }
     }
 
     fn mov_imm(isa: Isa, pc: u32, dst: Register, value: u32) -> DecodedInstruction {
@@ -1092,14 +1097,15 @@ mod tests {
             address,
             kind,
             width,
+            value: None,
         }
     }
 
     fn memory(
         transfers: Vec<MemoryTransfer>,
         writeback: Option<(Register, AddressExpr)>,
-    ) -> SemanticEffect {
-        SemanticEffect::Memory(MemoryEffect {
+    ) -> ValueEffect {
+        ValueEffect::Memory(MemoryEffect {
             transfers,
             writeback,
         })
@@ -1111,7 +1117,7 @@ mod tests {
         kind: AccessKind,
         width: u8,
         dests: impl IntoIterator<Item = Register>,
-    ) -> (SemanticEffect, BTreeSet<Register>) {
+    ) -> (ValueEffect, BTreeSet<Register>) {
         (
             memory(vec![transfer(imm_addr(base, offset), kind, width)], None),
             dests.into_iter().collect(),
@@ -1688,7 +1694,7 @@ mod tests {
                 arm(
                     0x1000,
                     [R0],
-                    SemanticEffect::LiteralWordLoad {
+                    ValueEffect::LiteralWordLoad {
                         dst: R0,
                         address: AddressExpr {
                             base: AddressBase::ArchitecturalPc {
@@ -1718,7 +1724,7 @@ mod tests {
                 arm(
                     0x1004,
                     [R1],
-                    SemanticEffect::LiteralWordLoad {
+                    ValueEffect::LiteralWordLoad {
                         dst: R1,
                         address: imm_addr(R0, 0),
                     },
@@ -1745,7 +1751,7 @@ mod tests {
                 arm(
                     0x1004,
                     [R1],
-                    SemanticEffect::LiteralWordLoad {
+                    ValueEffect::LiteralWordLoad {
                         dst: R1,
                         address: imm_addr(R0, 0),
                     },
@@ -1771,7 +1777,7 @@ mod tests {
                 arm(
                     0x1000,
                     [R0],
-                    SemanticEffect::LiteralWordLoad {
+                    ValueEffect::LiteralWordLoad {
                         dst: R0,
                         address: AddressExpr {
                             base: AddressBase::ArchitecturalPc {
@@ -1799,7 +1805,7 @@ mod tests {
                 arm(
                     0x1000,
                     [R0],
-                    SemanticEffect::LiteralWordLoad {
+                    ValueEffect::LiteralWordLoad {
                         dst: R0,
                         address: AddressExpr {
                             base: AddressBase::ArchitecturalPc {
@@ -1827,7 +1833,7 @@ mod tests {
             vec![arm(
                 0x1000,
                 [R0],
-                SemanticEffect::LiteralWordLoad {
+                ValueEffect::LiteralWordLoad {
                     dst: R0,
                     address: AddressExpr {
                         base: AddressBase::ArchitecturalPc {
@@ -2208,7 +2214,7 @@ mod tests {
             4,
             true,
             [],
-            SemanticEffect::None,
+            ValueEffect::None,
             ControlFlow::DirectBranch {
                 target,
                 has_fallthrough: true,
@@ -2223,7 +2229,7 @@ mod tests {
             4,
             false,
             [],
-            SemanticEffect::None,
+            ValueEffect::None,
             ControlFlow::DirectBranch {
                 target,
                 has_fallthrough: false,
@@ -2259,7 +2265,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::Call { target: None },
                 ),
                 load(0x1008, R1, R0, 0, 4),
@@ -2470,7 +2476,7 @@ mod tests {
                     4,
                     true,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::DirectBranch {
                         target: 0x100c,
                         has_fallthrough: true,
@@ -2483,7 +2489,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::DirectBranch {
                         target: 0x100c,
                         has_fallthrough: false,
@@ -2509,7 +2515,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::DirectBranch {
                         target: 0x100c,
                         has_fallthrough: false,
@@ -2518,7 +2524,7 @@ mod tests {
                 arm(
                     0x1004,
                     [R0],
-                    SemanticEffect::LiteralWordLoad {
+                    ValueEffect::LiteralWordLoad {
                         dst: R0,
                         address: AddressExpr {
                             base: AddressBase::ArchitecturalPc {
@@ -2529,7 +2535,7 @@ mod tests {
                     },
                 ),
                 load(0x1008, R1, R0, 0, 4),
-                arm(0x100c, [], SemanticEffect::None),
+                arm(0x100c, [], ValueEffect::None),
             ],
             0x1010,
         );
@@ -2551,7 +2557,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::Stop,
                 ),
                 load(0x1008, R1, R0, 0, 4),
@@ -2688,14 +2694,14 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::DirectBranch {
                         target: 0x1008,
                         has_fallthrough: false,
                     },
                 ),
-                arm(0x1004, [], SemanticEffect::None),
-                arm(0x1008, [], SemanticEffect::None),
+                arm(0x1004, [], ValueEffect::None),
+                arm(0x1008, [], ValueEffect::None),
             ],
             0x100c,
         );
@@ -2710,7 +2716,7 @@ mod tests {
             vec![
                 mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
                 mov_imm(Isa::Arm, 0x1004, R1, GLOBAL),
-                arm(0x1008, [R0, R1], SemanticEffect::Unsupported),
+                arm(0x1008, [R0, R1], ValueEffect::Unsupported),
             ],
             &[GLOBAL],
         );
@@ -2723,7 +2729,7 @@ mod tests {
             vec![
                 mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
                 mov_imm(Isa::Arm, 0x1004, R1, OTHER),
-                arm(0x1008, [R0], SemanticEffect::Unsupported),
+                arm(0x1008, [R0], ValueEffect::Unsupported),
                 load(0x100c, R2, R1, 0, 4),
                 load(0x1010, R3, R0, 0, 4),
             ],
@@ -2746,7 +2752,7 @@ mod tests {
                     4,
                     false,
                     all_core_writes(),
-                    SemanticEffect::Unsupported,
+                    ValueEffect::Unsupported,
                     ControlFlow::Linear,
                 ),
                 load(0x100c, R2, R0, 0, 4),
@@ -2861,7 +2867,7 @@ mod tests {
             vec![
                 mov_imm(Isa::Arm, 0x1000, R0, GLOBAL),
                 mov_imm(Isa::Arm, 0x1004, R1, OTHER),
-                arm(0x1008, [R0], SemanticEffect::Unsupported),
+                arm(0x1008, [R0], ValueEffect::Unsupported),
             ],
             None,
         )]);
@@ -2896,7 +2902,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::Call {
                         target: Some(CallTarget {
                             entry: 0x1200,
@@ -2928,7 +2934,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::Call {
                         target: Some(CallTarget {
                             entry: 0x1200,
@@ -2949,7 +2955,7 @@ mod tests {
                     4,
                     false,
                     [],
-                    SemanticEffect::None,
+                    ValueEffect::None,
                     ControlFlow::Call { target: None },
                 ),
             ],

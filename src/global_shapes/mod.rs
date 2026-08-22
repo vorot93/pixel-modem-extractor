@@ -7,6 +7,7 @@ mod decoder;
 mod tracker;
 mod validate;
 
+use crate::arm32::{InstructionDecoder, PureRustDecoder, Register};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{DecodeIsa as Isa, ExecutionIdentity, OwnedExecutionIdentity};
 use aggregate::{Aggregation, aggregate};
@@ -14,7 +15,7 @@ use artifact::{
     AnalysisWire, DecoderWire, GlobalShapesFile, InputHashesWire, LoadedInputs, Status, serialize,
     write_atomic,
 };
-use decoder::{InstructionDecoder, Register, decode_function, reachable_blocks};
+use decoder::{decode_function, reachable_blocks};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -90,7 +91,7 @@ struct ImageAnalysis {
 }
 
 pub(crate) fn run_image(request: &RunRequest<'_>) -> Result<GlobalShapesReport> {
-    run_image_with_decoder(request, &decoder::PureRustDecoder)
+    run_image_with_decoder(request, &PureRustDecoder)
 }
 
 fn run_image_with_decoder(
@@ -676,12 +677,7 @@ fn analyze_to_bytes_without_commit(
 ) -> Result<(Vec<u8>, GlobalShapesReport)> {
     let inputs = artifact::load_inputs(request)?;
     let analysis = match catch_unwind(AssertUnwindSafe(|| {
-        analyze_loaded_inputs(
-            request.image_label,
-            &inputs,
-            &decoder::PureRustDecoder,
-            aggregate,
-        )
+        analyze_loaded_inputs(request.image_label, &inputs, &PureRustDecoder, aggregate)
     })) {
         Ok(result) => result?,
         Err(payload) => return Err(decoder_panic_error(payload)),
@@ -697,6 +693,11 @@ mod tests {
         commit_artifact_with, decoder_panic_error, run_image, run_image_with,
         run_image_with_decoder, validate_artifact, validate_artifact_files,
     };
+    use crate::arm32::{
+        AccessKind, AddressBase, AddressExpr, AddressOffset, DecodeError, DecoderIdentity,
+        InstructionDecoder, MemoryEffect, MemoryTransfer, PureRustDecoder, Register, ValueEffect,
+        ValueExpr,
+    };
     use crate::error::Error;
     use crate::execution_ranges::DecodeIsa as Isa;
     use crate::global_shapes::artifact::{
@@ -704,11 +705,7 @@ mod tests {
         GlobalWire, InputHashesWire, IsaWire, ObservationWire, ProvisionalShape, Status,
         SummaryWire, serialize, write_atomic, write_atomic_with_before_commit,
     };
-    use crate::global_shapes::decoder::{
-        AccessKind, AddressBase, AddressExpr, AddressOffset, CallTarget, ControlFlow, DecodeError,
-        DecodedInstruction, DecoderIdentity, InstructionDecoder, MemoryEffect, MemoryTransfer,
-        PureRustDecoder, Register, SemanticEffect, ValueExpr, decode_function,
-    };
+    use crate::global_shapes::decoder::decode_function;
     use crate::global_shapes::{FORMAT_V4, FunctionContext, FunctionExecution};
     use crate::manifest::blake3_bytes;
     use serde_json::{Value, json};
@@ -1062,7 +1059,8 @@ mod tests {
     // counts (`instructions_decoded`, `arm_functions`/`thumb_functions`,
     // ghidra/thumb accepted counts) against the golden
     // `synthetic_image_writes_complete_v2_sidecar` sidecar. A single accepted
-    // ARM caller and Thumb callee keep this fixture minimal and independent.
+    // Thumb caller and same-ISA Thumb callee keep this fixture minimal and
+    // independent (direct calls are same-ISA by construction).
     fn interproc_image_bytes() -> Vec<u8> {
         vec![0u8; 0x200]
     }
@@ -1081,7 +1079,7 @@ mod tests {
             &hex(INTERPROC_CALLER_ENTRY),
             &hex(INTERPROC_CALLER_ENTRY + 8),
             8,
-            vec![arm_range(
+            vec![ghidra_thumb_range(
                 &hex(INTERPROC_CALLER_ENTRY),
                 &hex(INTERPROC_CALLER_ENTRY + 8),
                 &image,
@@ -1112,32 +1110,40 @@ mod tests {
         pc: u32,
         length: u8,
         writes: impl IntoIterator<Item = Register>,
-        effect: SemanticEffect,
-        flow: ControlFlow,
-    ) -> DecodedInstruction {
-        DecodedInstruction {
+        effect: ValueEffect,
+        flow: crate::arm32::ControlFlow,
+    ) -> crate::arm32::DecodedInstruction {
+        crate::arm32::DecodedInstruction {
             isa,
             pc,
             length,
             conditional: false,
+            links_lr: false,
             reads: BTreeSet::new(),
             writes: writes.into_iter().collect(),
             effect,
+            flags: crate::arm32::FlagEffect::Preserved,
             flow,
         }
     }
 
-    fn mov_imm(isa: Isa, pc: u32, length: u8, dst: Register, value: u32) -> DecodedInstruction {
+    fn mov_imm(
+        isa: Isa,
+        pc: u32,
+        length: u8,
+        dst: Register,
+        value: u32,
+    ) -> crate::arm32::DecodedInstruction {
         insn(
             isa,
             pc,
             length,
             [dst],
-            SemanticEffect::RegisterWrite {
+            ValueEffect::RegisterWrite {
                 dst,
                 value: ValueExpr::Immediate(value),
             },
-            ControlFlow::Linear,
+            crate::arm32::ControlFlow::Linear,
         )
     }
 
@@ -1151,13 +1157,13 @@ mod tests {
         kind: AccessKind,
         width: u8,
         dests: impl IntoIterator<Item = Register>,
-    ) -> DecodedInstruction {
+    ) -> crate::arm32::DecodedInstruction {
         insn(
             isa,
             pc,
             length,
             dests,
-            SemanticEffect::Memory(MemoryEffect {
+            ValueEffect::Memory(MemoryEffect {
                 transfers: vec![MemoryTransfer {
                     address: AddressExpr {
                         base: AddressBase::Register(base),
@@ -1165,42 +1171,44 @@ mod tests {
                     },
                     kind,
                     width,
+                    value: None,
                 }],
                 writeback: None,
             }),
-            ControlFlow::Linear,
+            crate::arm32::ControlFlow::Linear,
         )
     }
 
-    fn branch(isa: Isa, pc: u32, length: u8, target: u32) -> DecodedInstruction {
+    fn branch(isa: Isa, pc: u32, length: u8, target: u32) -> crate::arm32::DecodedInstruction {
         insn(
             isa,
             pc,
             length,
             [],
-            SemanticEffect::None,
-            ControlFlow::DirectBranch {
+            ValueEffect::None,
+            crate::arm32::ControlFlow::DirectBranch {
                 target,
-                has_fallthrough: false,
+                fallthrough: None,
+                predicate: crate::arm32::BranchPredicate::Always,
             },
         )
     }
 
-    fn wrong_pc(isa: Isa, pc: u32) -> DecodedInstruction {
+    fn wrong_pc(isa: Isa, pc: u32) -> crate::arm32::DecodedInstruction {
         insn(
             isa,
             pc.wrapping_add(4),
             4,
             [],
-            SemanticEffect::None,
-            ControlFlow::Linear,
+            ValueEffect::None,
+            crate::arm32::ControlFlow::Linear,
         )
     }
 
     struct MapDecoder {
         crate_name: &'static str,
         version: &'static str,
-        insns: BTreeMap<(Isa, u32), DecodedInstruction>,
+        insns: BTreeMap<(Isa, u32), crate::arm32::DecodedInstruction>,
         errors: BTreeMap<(Isa, u32), &'static str>,
         panic_at: Option<(Isa, u32)>,
     }
@@ -1254,8 +1262,9 @@ mod tests {
         }
 
         /// A dedicated (non-`fixture`-derived) decoder for the depth-1
-        /// interprocedural coordinator test: an ARM caller does
-        /// `mov r0, &g_scalar` then a direct `bl` into a Thumb callee. The
+        /// interprocedural coordinator test: a Thumb caller does
+        /// `movw r0, &g_scalar` then a direct same-ISA `bl` into a Thumb
+        /// callee. The
         /// callee's entry block holds only an unconditional branch; the
         /// seeded `str [r0, #0]` sits in the successor block (mirroring
         /// `seeded_fact_flows_beyond_the_entry_block`), so the seeded fact
@@ -1269,22 +1278,19 @@ mod tests {
                 panic_at: None,
             };
             decoder.insns.insert(
-                (Isa::Arm, INTERPROC_CALLER_ENTRY),
-                mov_imm(Isa::Arm, INTERPROC_CALLER_ENTRY, 4, R0, SCALAR),
+                (Isa::Thumb, INTERPROC_CALLER_ENTRY),
+                mov_imm(Isa::Thumb, INTERPROC_CALLER_ENTRY, 4, R0, SCALAR),
             );
             decoder.insns.insert(
-                (Isa::Arm, INTERPROC_CALL_PC),
+                (Isa::Thumb, INTERPROC_CALL_PC),
                 insn(
-                    Isa::Arm,
+                    Isa::Thumb,
                     INTERPROC_CALL_PC,
                     4,
                     [],
-                    SemanticEffect::None,
-                    ControlFlow::Call {
-                        target: Some(CallTarget {
-                            entry: INTERPROC_CALLEE_ENTRY,
-                            isa: Isa::Thumb,
-                        }),
+                    ValueEffect::None,
+                    crate::arm32::ControlFlow::DirectCall {
+                        target: INTERPROC_CALLEE_ENTRY,
                     },
                 ),
             );
@@ -1332,7 +1338,7 @@ mod tests {
             isa: Isa,
             pc: u32,
             _bytes: &[u8],
-        ) -> std::result::Result<DecodedInstruction, DecodeError> {
+        ) -> std::result::Result<crate::arm32::DecodedInstruction, DecodeError> {
             if self.panic_at == Some((isa, pc)) {
                 panic!("deliberate decoder panic");
             }
@@ -1352,8 +1358,8 @@ mod tests {
                     Isa::Thumb => 2,
                 },
                 [],
-                SemanticEffect::None,
-                ControlFlow::Linear,
+                ValueEffect::None,
+                crate::arm32::ControlFlow::Linear,
             ))
         }
     }
@@ -1535,6 +1541,192 @@ mod tests {
         let expected = serialize(&expected_synthetic_file(&fixture)).unwrap();
         assert_eq!(fs::read(fixture.sidecar()).unwrap(), expected);
         assert!(!expected.ends_with(b"\n"));
+    }
+
+    // Task-3 pin: one representative ARM and Thumb function decoded by the
+    // production PureRustDecoder, byte-pinned end to end. The ARM function
+    // exercises movw/ldr/str/cmp/bne/bx-lr; the Thumb function a PC literal
+    // load, a store, and bx lr. Sharing semantics with `crate::arm32` must
+    // keep these exact bytes and verdicts.
+    fn pinned_decoder_image_bytes() -> Vec<u8> {
+        let mut image = vec![0u8; 0x100];
+        image[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x05, 0xe3]); // movw r0, #0x5000
+        image[0x04..0x08].copy_from_slice(&[0x00, 0x10, 0x90, 0xe5]); // ldr r1, [r0]
+        image[0x08..0x0c].copy_from_slice(&[0x04, 0x10, 0x80, 0xe5]); // str r1, [r0, #4]
+        image[0x0c..0x10].copy_from_slice(&[0x00, 0x00, 0x51, 0xe3]); // cmp r1, #0
+        image[0x10..0x14].copy_from_slice(&[0x00, 0x00, 0x00, 0x1a]); // bne 0x4018
+        image[0x14..0x18].copy_from_slice(&[0x1e, 0xff, 0x2f, 0xe1]); // bx lr
+        image[0x40..0x42].copy_from_slice(&[0x01, 0x48]); // ldr r0, [pc, #4]
+        image[0x42..0x44].copy_from_slice(&[0x00, 0x60]); // str r0, [r0]
+        image[0x44..0x46].copy_from_slice(&[0x70, 0x47]); // bx lr
+        image[0x48..0x4c].copy_from_slice(&0x5100u32.to_le_bytes()); // literal pool
+        image
+    }
+
+    fn write_pinned_decoder_sources(fixture: &Fixture) {
+        fixture.write_manifest();
+        let image = pinned_decoder_image_bytes();
+        fixture.write_image(&image);
+        fixture.write_globals(&globals_file(&synthetic_recovered()));
+        fixture.write_functions(&json!([ghidra_accepted(
+            "FUN_arm",
+            "0x4000",
+            "0x4018",
+            0x18,
+            vec![arm_range("0x4000", "0x4018", &image)],
+        )]));
+        fixture.write_thumb(&thumb_file(&[thumb_accepted(
+            "thumb_4040",
+            "0x4040",
+            32,
+            vec![legacy_thumb_range("0x4040", "0x4046")],
+        )]));
+    }
+
+    fn expected_pinned_decoder_file(fixture: &Fixture) -> GlobalShapesFile {
+        let (image_blake3, globals_blake3, functions_blake3, thumb_blake3) = fixture.hash_sources();
+        GlobalShapesFile {
+            format: FORMAT_V4,
+            image: LABEL.into(),
+            load_address: hex(LOAD_ADDR),
+            inputs: InputHashesWire {
+                image_blake3,
+                globals_blake3,
+                functions_blake3,
+                thumb_functions_blake3: Some(thumb_blake3),
+            },
+            decoder: DecoderWire {
+                crate_name: "scaleservers-arm32-assembly".into(),
+                version: "1.0.0".into(),
+            },
+            analysis: AnalysisWire {
+                arm_functions: 1,
+                thumb_functions: 1,
+                ghidra_records_quarantined: 0,
+                thumb_records_quarantined: 0,
+                quarantine_errors: 0,
+                instructions_decoded: 9,
+                decode_failures: 0,
+                state_barriers: 0,
+                observations: 3,
+                conflicts: 0,
+                direct_calls_resolved: 0,
+                call_facts_unresolved: 0,
+                seeded_callees: 0,
+                seed_vectors: 0,
+                interprocedural_observations: 0,
+                interprocedural_dropped: 0,
+                cross_block_join_kills: 0,
+                cross_block_join_facts: 1,
+                cross_block_entry_facts: 1,
+                cross_block_propagated_facts: 0,
+                cross_block_functions: 1,
+                cross_block_seeded_functions: 0,
+            },
+            globals: vec![
+                GlobalWire {
+                    address: hex(SCALAR),
+                    name: "g_scalar".into(),
+                    arch: "arm".into(),
+                    status: Status::Inferred,
+                    observations: vec![
+                        observation(
+                            IsaWire::Arm,
+                            0x4004,
+                            AccessKindWire::Read,
+                            4,
+                            0,
+                            0x4000,
+                            "FUN_arm",
+                            &[0x4000],
+                        ),
+                        observation(
+                            IsaWire::Arm,
+                            0x4008,
+                            AccessKindWire::Write,
+                            4,
+                            4,
+                            0x4000,
+                            "FUN_arm",
+                            &[0x4000],
+                        ),
+                    ],
+                    conflicts: vec![],
+                    summary: Some(SummaryWire {
+                        minimum_size: 8,
+                        observed_widths: vec![4],
+                        accessed_offsets: vec![0, 4],
+                        reads: 1,
+                        writes: 1,
+                        provisional_shape: ProvisionalShape::ArrayCandidate {
+                            element_width: 4,
+                            minimum_elements: 2,
+                        },
+                    }),
+                },
+                GlobalWire {
+                    address: hex(ARRAY),
+                    name: "g_array".into(),
+                    arch: "thumb".into(),
+                    status: Status::Inferred,
+                    observations: vec![observation(
+                        IsaWire::Thumb,
+                        0x4042,
+                        AccessKindWire::Write,
+                        4,
+                        0,
+                        0x4040,
+                        "thumb_4040",
+                        &[0x4040],
+                    )],
+                    conflicts: vec![],
+                    summary: Some(SummaryWire {
+                        minimum_size: 4,
+                        observed_widths: vec![4],
+                        accessed_offsets: vec![0],
+                        reads: 0,
+                        writes: 1,
+                        provisional_shape: ProvisionalShape::ScalarCandidate { width: 4 },
+                    }),
+                },
+                GlobalWire {
+                    address: hex(NONE),
+                    name: "g_none".into(),
+                    arch: "mixed".into(),
+                    status: Status::NoEvidence,
+                    observations: vec![],
+                    conflicts: vec![],
+                    summary: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pure_rust_decoder_arm_and_thumb_output_is_byte_pinned() {
+        let fixture = Fixture::new("pinned_decoder");
+        write_pinned_decoder_sources(&fixture);
+        let bound = BoundRequest::from_fixture(&fixture, 1, 1, 0, Some(1), Some(1), Some(0), 3);
+        let (bytes, report) =
+            analyze_to_bytes_without_commit(&bound.get()).expect("pinned decoder analysis");
+        assert_eq!(
+            report,
+            GlobalShapesReport {
+                inferred: 2,
+                no_evidence: 1,
+                conflicting: 0,
+                observations: 3,
+                ghidra_quarantined: 0,
+                thumb_quarantined: 0,
+                quarantine_errors: 0,
+                decode_failures: 0,
+                state_barriers: 0,
+                interprocedural_dropped: 0,
+            }
+        );
+        let expected = serialize(&expected_pinned_decoder_file(&fixture)).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(!bytes.ends_with(b"\n"));
     }
 
     #[test]
