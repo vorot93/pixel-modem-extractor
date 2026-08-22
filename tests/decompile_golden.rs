@@ -392,6 +392,65 @@ fn prepared_pass2_map(
     .unwrap()
 }
 
+/// Drives one saved-project `-process` run with an optional seeding
+/// post-script followed by the shipping `ExportDecomp.java` under its
+/// pass-1-style argv (`-`/`none`), asserting success.
+fn run_saved_project_export(
+    home: &std::path::Path,
+    out: &std::path::Path,
+    label: &str,
+    seed: Option<&str>,
+) -> std::process::Output {
+    let canonical_root = std::fs::canonicalize(out).unwrap();
+    let headless =
+        analyze_headless_in_home(home).expect("located Ghidra home still has analyzeHeadless");
+    let mut command = std::process::Command::new(headless);
+    command
+        .arg(out.join("ghidra_project"))
+        .arg("pixel-modem")
+        .arg("-process")
+        .arg(label)
+        .arg("-noanalysis")
+        .arg("-scriptPath")
+        .arg(out.join("scripts"));
+    if let Some(script) = seed {
+        command.arg("-postScript").arg(script);
+    }
+    command
+        .arg("-postScript")
+        .arg("ExportDecomp.java")
+        .arg(out.join("export").join(label))
+        .arg(&canonical_root)
+        .arg(label)
+        .arg("none")
+        .arg("-")
+        .arg("-")
+        .arg("-")
+        .arg("none")
+        .output()
+        .unwrap()
+}
+
+/// A `PreparedSymbolPass2Map` over the retained pass-1 files of a small
+/// synthesized image tree: `<dir>/<label>/{<label>.bin, decompiled/
+/// functions.json}` plus the written v2 map at `map_path`.
+fn prepared_symbol_map(
+    dir: &std::path::Path,
+    label: &str,
+    map_path: &std::path::Path,
+    execution_count: usize,
+) -> pixel_modem_extractor::decompile::PreparedSymbolPass2Map {
+    let image_dir = dir.join(label);
+    pixel_modem_extractor::decompile::PreparedSymbolPass2Map::new(
+        map_path,
+        &image_dir.join("decompiled/functions.json"),
+        &image_dir.join(format!("{label}.bin")),
+        label,
+        NonZeroUsize::new(execution_count).unwrap(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn run_drives_ghidra_end_to_end() {
     let Some(home) = find_ghidra_home() else {
@@ -708,17 +767,16 @@ fn generated_shell_rejects_partial_export_after_functions_json() {
 
     let script_path = out.join("scripts/ExportDecomp.java");
     let script = std::fs::read_to_string(&script_path).unwrap();
-    let mutation_point =
-        "        writeFunctionsJson(new File(outDir, \"functions.json\"), fm, listing);\n";
+    let mutation_point = "            publish(outDir, \"functions.json\", temporaries,\n";
     assert_eq!(script.matches(mutation_point).count(), 1);
     let injected = script.replacen(
         mutation_point,
         concat!(
-            "        writeFunctionsJson(new File(outDir, \"functions.json\"), fm, listing);\n",
-            "        if (outDir.isDirectory()) {\n",
-            "            throw new RuntimeException(\n",
-            "                    \"deterministic partial export fault after functions.json\");\n",
-            "        }\n"
+            "            if (true) {\n",
+            "                throw new RuntimeException(\n",
+            "                        \"deterministic partial export fault before functions.json\");\n",
+            "            }\n",
+            "            publish(outDir, \"functions.json\", temporaries,\n"
         ),
         1,
     );
@@ -731,7 +789,7 @@ fn generated_shell_rejects_partial_export_after_functions_json() {
         "generated shell accepted a partial current export:\n{diagnostics}"
     );
     assert!(
-        diagnostics.contains("deterministic partial export fault after functions.json"),
+        diagnostics.contains("deterministic partial export fault before functions.json"),
         "missing injected ExportDecomp failure:\n{diagnostics}"
     );
     assert!(!export.join("functions.json").exists());
@@ -754,14 +812,11 @@ fn generated_shell_rejects_suppressed_print_writer_error() {
 
     let script_path = out.join("scripts/ExportDecomp.java");
     let script = std::fs::read_to_string(&script_path).unwrap();
-    let mutation_point = "            w.println(\"[\");\n";
+    let mutation_point = "        w.println(\"[\");\n";
     assert_eq!(script.matches(mutation_point).count(), 1);
     let injected = script.replacen(
         mutation_point,
-        concat!(
-            "            w.close();\n",
-            "            w.println(\"[\");\n"
-        ),
+        concat!("        w.close();\n", "        w.println(\"[\");\n"),
         1,
     );
     std::fs::write(script_path, injected).unwrap();
@@ -997,7 +1052,7 @@ fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
     let opts = pixel_modem_extractor::decompile::Opts {
         run: true,
         image: None,
-        ghidra_home: Some(home),
+        ghidra_home: Some(home.clone()),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
         rizin_fallback: false,
@@ -1006,10 +1061,13 @@ fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
     };
     let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
 
-    // Fixture-only replacement: run_two_pass executes this against the saved
-    // temporary project before the shipping ExportDecomp.java post-script.
+    drop(pass1);
+    // Seed the mixed-ISA function directly, then drive the shipping
+    // ExportDecomp with its pass-1-style argv (`-`/`none`: no map, no
+    // SymbolPass2 property) — the strict exporter must derive the mixed
+    // execution identity from the current body.
     std::fs::write(
-        out.join("scripts/ApplySymbols.java"),
+        out.join("scripts/SeedMixedGap.java"),
         r#"//@category PixelModemTest
 import java.math.BigInteger;
 import ghidra.app.script.GhidraScript;
@@ -1022,7 +1080,7 @@ import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.ProgramContext;
 import ghidra.program.model.symbol.SourceType;
 
-public class ApplySymbols extends GhidraScript {
+public class SeedMixedGap extends GhidraScript {
     @Override
     public void run() throws Exception {
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -1044,27 +1102,41 @@ public class ApplySymbols extends GhidraScript {
         body.addRange(arm, toAddr(3));
         body.addRange(thumb, toAddr(9));
         functions.createFunction("mixed_gap", arm, body, SourceType.USER_DEFINED);
-        println("ApplySymbols: applied 1 names, 0 plate comments, skipped 0");
+        println("SeedMixedGap: ok");
     }
 }
 "#,
     )
     .unwrap();
-    let map = out.join("mixed-gap-map.json");
-    std::fs::write(&map, b"{}").unwrap();
-    let inputs = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_pass2_map(&map, 1)),
-            global_map: None,
-            global_types_map: None,
-        },
-    )]);
-    let pass2 =
-        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
-    assert_eq!(
-        pass2.outcomes["00_BOOT"],
-        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    let canonical_root = std::fs::canonicalize(&out).unwrap();
+    let seeded = std::process::Command::new(
+        analyze_headless_in_home(&home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .arg("-process")
+    .arg("00_BOOT")
+    .arg("-noanalysis")
+    .arg("-scriptPath")
+    .arg(out.join("scripts"))
+    .arg("-postScript")
+    .arg("SeedMixedGap.java")
+    .arg("-postScript")
+    .arg("ExportDecomp.java")
+    .arg(out.join("export/00_BOOT"))
+    .arg(&canonical_root)
+    .arg("00_BOOT")
+    .arg("none")
+    .arg("-")
+    .arg("-")
+    .arg("-")
+    .arg("none")
+    .output()
+    .unwrap();
+    assert!(
+        seeded.status.success(),
+        "mixed-gap export run failed:\n{}",
+        process_diagnostics(&seeded)
     );
 
     let functions: serde_json::Value =
@@ -1120,7 +1192,7 @@ fn saved_program_quarantines_when_same_isa_merge_makes_entry_interior() {
     let opts = pixel_modem_extractor::decompile::Opts {
         run: true,
         image: None,
-        ghidra_home: Some(home),
+        ghidra_home: Some(home.clone()),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
         rizin_fallback: false,
@@ -1129,8 +1201,9 @@ fn saved_program_quarantines_when_same_isa_merge_makes_entry_interior() {
     };
     let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
 
+    drop(pass1);
     std::fs::write(
-        out.join("scripts/ApplySymbols.java"),
+        out.join("scripts/SeedSavedProgram.java"),
         r#"//@category PixelModemTest
 import java.math.BigInteger;
 import ghidra.app.script.GhidraScript;
@@ -1142,7 +1215,7 @@ import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.ProgramContext;
 import ghidra.program.model.symbol.SourceType;
 
-public class ApplySymbols extends GhidraScript {
+public class SeedSavedProgram extends GhidraScript {
     @Override
     public void run() throws Exception {
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -1167,21 +1240,11 @@ public class ApplySymbols extends GhidraScript {
 "#,
     )
     .unwrap();
-    let map = out.join("entry-interior-map.json");
-    std::fs::write(&map, b"{}").unwrap();
-    let inputs = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_pass2_map(&map, 1)),
-            global_map: None,
-            global_types_map: None,
-        },
-    )]);
-    let pass2 =
-        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
-    assert_eq!(
-        pass2.outcomes["00_BOOT"],
-        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    let seeded = run_saved_project_export(&home, &out, "00_BOOT", Some("SeedSavedProgram.java"));
+    assert!(
+        seeded.status.success(),
+        "saved-project export run failed:\n{}",
+        process_diagnostics(&seeded)
     );
 
     let functions: serde_json::Value =
@@ -1201,7 +1264,7 @@ public class ApplySymbols extends GhidraScript {
 }
 
 #[test]
-fn saved_program_rejects_instruction_free_body_range_outside_u32() {
+fn saved_program_rejects_function_entry_outside_u32() {
     let Some(home) = find_ghidra_home() else {
         eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
         return;
@@ -1219,7 +1282,7 @@ fn saved_program_rejects_instruction_free_body_range_outside_u32() {
     let opts = pixel_modem_extractor::decompile::Opts {
         run: true,
         image: None,
-        ghidra_home: Some(home),
+        ghidra_home: Some(home.clone()),
         processor: "x86:LE:64:default".to_string(),
         no_thumb_decompile: false,
         rizin_fallback: false,
@@ -1228,8 +1291,9 @@ fn saved_program_rejects_instruction_free_body_range_outside_u32() {
     };
     let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
 
+    drop(pass1);
     std::fs::write(
-        out.join("scripts/ApplySymbols.java"),
+        out.join("scripts/SeedSavedProgram.java"),
         r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -1239,7 +1303,7 @@ import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.symbol.SourceType;
 
-public class ApplySymbols extends GhidraScript {
+public class SeedSavedProgram extends GhidraScript {
     @Override
     public void run() throws Exception {
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -1248,59 +1312,41 @@ public class ApplySymbols extends GhidraScript {
             Function function = iterator.next();
             functions.removeFunction(function.getEntryPoint());
         }
-        Address entry = toAddr(0);
-        clearListing(entry, entry);
-        if (!disassemble(entry)) throw new Exception("failed to disassemble x86 fixture");
         Address high = toAddr(0x1_0000_0000L);
-        currentProgram.getMemory().createInitializedBlock(
-            "outside_u32", high, 4, (byte) 0, monitor, false);
-        AddressSet body = new AddressSet(entry, entry);
-        body.addRange(high, high.add(3));
-        functions.createFunction(
-            "body_outside_u32", entry, body, SourceType.USER_DEFINED);
-        println("ApplySymbols: applied 1 names, 0 plate comments, skipped 0");
+        try {
+            currentProgram.getMemory().createInitializedBlock(
+                    "outside_u32", high, 4, (byte) 0, monitor, false);
+        }
+        catch (ghidra.program.model.mem.MemoryConflictException already) {
+            // The block persisted from the seed's transaction; reuse it.
+        }
+        if (!disassemble(high)) throw new Exception("failed to disassemble high fixture");
+        AddressSet body = new AddressSet(high, high.add(3));
+        if (functions.createFunction(
+                "entry_outside_u32", high, body, SourceType.USER_DEFINED) == null) {
+            throw new Exception("failed to create the high-entry function");
+        }
+        System.out.println("SeedSavedProgram: ok");
     }
 }
 "#,
     )
     .unwrap();
-    let map = out.join("body-outside-u32-map.json");
-    std::fs::write(&map, b"{}").unwrap();
-    let inputs = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_pass2_map(&map, 1)),
-            global_map: None,
-            global_types_map: None,
-        },
-    )]);
-    let pass2 =
-        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
+    let seeded = run_saved_project_export(&home, &out, "00_BOOT", Some("SeedSavedProgram.java"));
+    let diagnostics = process_diagnostics(&seeded);
     assert!(
-        matches!(
-            &pass2.outcomes["00_BOOT"],
-            pixel_modem_extractor::decompile::Pass2ProcessOutcome::Failed(reason)
-                if reason.contains("incomplete current export")
-        ),
-        "an instruction-free out-of-domain body range must fail pass 2: {:?}",
-        pass2.outcomes["00_BOOT"]
+        diagnostics.contains("REPORT SCRIPT ERROR")
+            && (diagnostics.contains("outside [0, 4294967295]")
+                || diagnostics.contains("outside the u32")),
+        "a function entry outside the u32 domain must fail the strict exporter:\n{diagnostics}"
     );
-    for path in [
-        out.join("export/00_BOOT/functions.json"),
-        out.join("export/00_BOOT/disasm.lst"),
-        out.join("export/00_BOOT/decompiled.c"),
-        out.join("export/00_BOOT.complete"),
-    ] {
-        assert!(
-            !path.exists(),
-            "failed pass-2 export survived: {}",
-            path.display()
-        );
-    }
-    let application_log = read_ghidra_application_log(&out);
-    assert!(
-        application_log.contains("unassignable producer address outside u32"),
-        "missing producer-integrity failure in application log:\n{application_log}"
+    // The pass-1 export (from the direct run, not invalidated by a
+    // `run_two_pass` wrapper) keeps its v3 marker; the failed re-export
+    // published nothing new.
+    let marker_after = std::fs::read(out.join("export/00_BOOT.complete")).unwrap();
+    assert_eq!(
+        marker_after,
+        pixel_modem_extractor::decompile::export_completion_marker("none", "none")
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1326,16 +1372,16 @@ fn saved_program_quarantines_complete_defective_records_and_continues() {
     let opts = pixel_modem_extractor::decompile::Opts {
         run: true,
         image: None,
-        ghidra_home: Some(home),
+        ghidra_home: Some(home.clone()),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
         rizin_fallback: false,
         tighten_wall_clock_budget_override: None,
         no_skip_opaque: false,
     };
-    let pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+    let _pass1 = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
     std::fs::write(
-        out.join("scripts/ApplySymbols.java"),
+        out.join("scripts/SeedSavedProgram.java"),
         r#"//@category PixelModemTest
 import java.math.BigInteger;
 import ghidra.app.script.GhidraScript;
@@ -1349,7 +1395,7 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.ProgramContext;
 import ghidra.program.model.symbol.SourceType;
 
-public class ApplySymbols extends GhidraScript {
+public class SeedSavedProgram extends GhidraScript {
     private AddressSet body(long min, long max) {
         AddressSet body = new AddressSet();
         body.addRange(toAddr(min), toAddr(max));
@@ -1388,21 +1434,11 @@ public class ApplySymbols extends GhidraScript {
 "#,
     )
     .unwrap();
-    let map = out.join("quarantine-map.json");
-    std::fs::write(&map, b"{}").unwrap();
-    let inputs = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_pass2_map(&map, 1)),
-            global_map: None,
-            global_types_map: None,
-        },
-    )]);
-    let pass2 =
-        pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();
-    assert_eq!(
-        pass2.outcomes["00_BOOT"],
-        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    let seeded = run_saved_project_export(&home, &out, "00_BOOT", Some("SeedSavedProgram.java"));
+    assert!(
+        seeded.status.success(),
+        "saved-project export run failed:\n{}",
+        process_diagnostics(&seeded)
     );
     let functions: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("export/00_BOOT/functions.json")).unwrap())
@@ -1478,6 +1514,10 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         arm.extend([0xfe, 0xff, 0xff, 0xea]); // b .
     }
     arm.extend([0x78, 0x56, 0x34, 0x12]);
+    // Ghidra's ARM vector analysis names the image-start functions with
+    // IMPORTED-sourced primaries; the strict pass-2 contract protects them
+    // (the token rename downgrades to preserve) while the decision's token
+    // annotation still applies as a plate comment.
     let modem = craft_modem_bin(&arm);
 
     let dir = std::env::temp_dir().join(format!("pme_decompile_p2_{}", std::process::id()));
@@ -1490,7 +1530,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let opts = pixel_modem_extractor::decompile::Opts {
         run: true,
         image: None,
-        ghidra_home: Some(home),
+        ghidra_home: Some(home.clone()),
         processor: "ARM:LE:32:v7".to_string(),
         no_thumb_decompile: false,
         rizin_fallback: false,
@@ -1566,97 +1606,59 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     )
     .unwrap();
 
-    // One-symbol map: rename entry 0x0 -> boot_reset_handler with one annotation.
-    // ApplySymbols.java reads `entry`, `name`, `tier=recovered`, and `annotations[]`.
+    // Build the strict v2 symbol map from the retained pass-1 tree. Token
+    // 0x20 (a genuine LDR data reference) drives one provisional rename; the
+    // retained file is hashed verbatim through the same builder the decompose
+    // pipeline uses.
+    let images_dir = dir.join("images");
+    let boot_dir = images_dir.join("00_BOOT");
+    std::fs::create_dir_all(boot_dir.join("decompiled")).unwrap();
+    std::fs::write(boot_dir.join("00_BOOT.bin"), &arm).unwrap();
+    std::fs::copy(
+        out.join("export/00_BOOT/functions.json"),
+        boot_dir.join("decompiled/functions.json"),
+    )
+    .unwrap();
+    std::fs::copy(
+        out.join("export/00_BOOT/disasm.lst"),
+        boot_dir.join("decompiled/disasm.lst"),
+    )
+    .unwrap();
+    let tree_manifest = dir.join("manifest.json");
+    std::fs::write(&tree_manifest, r#"{"toc":[{"name":"BOOT","load_addr":0}]}"#).unwrap();
+    let tokens = pixel_modem_extractor::symbolicate::token_map(&parse_token_db(&[(
+        0x20,
+        "■format♦reset handler (%d)■domain♦BOOT",
+    )]));
     let maps_dir = out.join("symbol_maps");
     std::fs::create_dir_all(&maps_dir).unwrap();
     let map_path = maps_dir.join("00_BOOT.json");
-    let annotation = "evidence: tier=recovered src=arm-db";
-    let symbol_map = serde_json::json!({
-        "tool_version": "test",
-        "image": "00_BOOT",
-        "source_blake3": "0",
-        "functions_blake3": "0",
-        "symbols": [
-            {
-                "entry": "0x0",
-                "arch": "a32",
-                "original_name": "FUN_00000000",
-                "name": "boot_reset_handler",
-                "tier": "recovered",
-                "annotations": [annotation],
-            },
-        ],
-    });
-    std::fs::write(
+    let bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(
         &map_path,
-        serde_json::to_string_pretty(&symbol_map).unwrap(),
+        &boot_dir,
+        "00_BOOT",
+        &tokens,
+        &tree_manifest,
+        None,
     )
     .unwrap();
+    assert!(
+        bundle.map.applied_decision_count >= 1,
+        "the token reference must schedule pass 2"
+    );
+    let symbol_map = prepared_symbol_map(
+        &images_dir,
+        "00_BOOT",
+        &map_path,
+        bundle.map.execution_count,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&map_path).unwrap(),
+        std::fs::read_to_string(&map_path).unwrap(),
+    );
+    let _ = symbol_map.map_blake3();
 
     let global_map_path = maps_dir.join("00_BOOT-globals.json");
-
-    // Characterize ApplyGlobals' fail-whole-map preflight before 0x20 has
-    // been renamed: numerically identical selected addresses in different
-    // hexadecimal spellings reject the entire map atomically. The script
-    // returns normally, so ExportDecomp still completes in this process.
-    let duplicate_global_map = serde_json::json!({
-        "format": "pixel-modem-extractor-globals-v1",
-        "image": "00_BOOT",
-        "globals": [
-            {
-                "address": "0x20",
-                "name": "duplicate_first_must_not_apply",
-                "tier": "recovered",
-            },
-            {
-                "address": "00000020",
-                "name": "duplicate_second_must_not_apply",
-                "tier": "recovered",
-            },
-        ],
-    });
-    std::fs::write(
-        &global_map_path,
-        serde_json::to_string_pretty(&duplicate_global_map).unwrap(),
-    )
-    .unwrap();
-    let duplicate_globals_only = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: None,
-            global_map: Some(prepared_pass2_map(&global_map_path, 2)),
-            global_types_map: None,
-        },
-    )]);
-    let duplicate_run = pixel_modem_extractor::decompile::run_two_pass(
-        pass1_report,
-        &opts,
-        &out,
-        &duplicate_globals_only,
-    )
-    .unwrap();
-    let duplicate_report = duplicate_run.report;
-    let boot = duplicate_report
-        .images
-        .iter()
-        .find(|r| r.label == "00_BOOT")
-        .unwrap();
-    assert!(boot.pass2_error.is_none());
-    assert!(boot.globals_applied.is_none());
-    assert!(boot.globals_apply_skipped.is_none());
-    assert!(
-        boot.globals_apply_error
-            .as_deref()
-            .is_some_and(|error| error.contains("duplicate selected address")),
-        "globals_apply_error: {:?}",
-        boot.globals_apply_error
-    );
-    let exp = out.join("export").join("00_BOOT");
-    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
-    assert!(!c.contains("duplicate_first_must_not_apply"));
-    assert!(!c.contains("duplicate_second_must_not_apply"));
-
     let global_map = serde_json::json!({
         "format": "pixel-modem-extractor-globals-v1",
         "image": "00_BOOT",
@@ -1687,19 +1689,27 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let inputs = HashMap::from([(
         "00_BOOT".to_string(),
         pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_pass2_map(&map_path, 1)),
+            function_map: Some(prepared_symbol_map(
+                &images_dir,
+                "00_BOOT",
+                &map_path,
+                bundle.map.execution_count,
+            )),
             global_map: Some(prepared_pass2_map(&global_map_path, 2)),
             global_types_map: None,
+            ..Default::default()
         },
     )]);
 
     // Pass 2: pass pass1_report in (do NOT re-run pass 1).
-    let rep2 =
-        pixel_modem_extractor::decompile::run_two_pass(duplicate_report, &opts, &out, &inputs)
-            .unwrap()
-            .report;
+    let rep2 = pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &inputs)
+        .unwrap()
+        .report;
+    let exp = out.join("export").join("00_BOOT");
 
-    // (c) pass2_applied == Some(1) — ApplySymbols reports 1 rename.
+    // (c) The imported-sourced vector primaries stay protected: the token
+    // rename downgrades to preserve (zero applied renames) while the
+    // decision's token annotation still lands as a plate comment.
     let boot = rep2
         .images
         .iter()
@@ -1707,8 +1717,8 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         .expect("00_BOOT in pass-2 report");
     assert_eq!(
         boot.pass2_applied,
-        Some(1),
-        "pass2_applied should be Some(1): {:?}",
+        Some(0),
+        "pass2_applied should be Some(0): {:?}",
         boot.pass2_error
     );
     assert!(
@@ -1724,11 +1734,21 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         boot.globals_apply_error
     );
 
-    // (a) renamed function appears in the regenerated decompiled.c.
     let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
     assert!(
-        c.contains("boot_reset_handler"),
-        "renamed function missing from decompiled.c:\n{c}"
+        c.contains("Reset"),
+        "the imported vector primary must survive pass 2:\n{c}"
+    );
+    assert!(
+        !c.contains("guess_boot_reset_handler"),
+        "a guess name displaced a protected imported primary:\n{c}"
+    );
+    let annotation = "logs: \"reset handler (%d)\" [BOOT]";
+    let block = format!("/* {annotation} */");
+    let line = format!("// {annotation}");
+    assert!(
+        c.lines().any(|l| l.trim() == block || l.trim() == line),
+        "the token annotation plate comment is missing:\n{c}"
     );
     assert!(
         c.contains("recovered_global_word"),
@@ -1737,110 +1757,47 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     assert!(!c.contains("provisional_must_not_apply"));
     assert!(!c.contains("outside_memory_global"));
 
-    // (b) annotation appears as a comment line. Ghidra 12's ExportDecomp
-    // renders plate comments as `/* ... */` blocks; accept the line-comment
-    // rendering as well so the test remains compatible with either exporter
-    // representation while requiring the exact annotation text.
-    let block = format!("/* {annotation} */");
-    let line = format!("// {annotation}");
-    assert!(
-        c.lines().any(|l| l.trim() == block || l.trim() == line),
-        "annotation plate comment missing from decompiled.c \
-         (looked for `{block}` or `{line}`):\n{c}"
-    );
-
-    // Second attempt: the exact symbol is now USER_DEFINED, so strict
-    // ownership preserves it and classifies the candidate as non-default.
-    let second_global_map = serde_json::json!({
-        "format": "pixel-modem-extractor-globals-v1",
-        "image": "00_BOOT",
-        "globals": [{
-            "address": "0x20",
-            "name": "second_attempt_must_not_replace",
-            "tier": "recovered",
-        }],
-    });
-    std::fs::write(
-        &global_map_path,
-        serde_json::to_string_pretty(&second_global_map).unwrap(),
-    )
-    .unwrap();
-    let globals_only = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: None,
-            global_map: Some(prepared_pass2_map(&global_map_path, 1)),
-            global_types_map: None,
-        },
-    )]);
-    let rep3 = pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &globals_only)
-        .unwrap()
-        .report;
-    let boot = rep3.images.iter().find(|r| r.label == "00_BOOT").unwrap();
-    assert_eq!(boot.globals_applied, Some(0));
-    assert_eq!(boot.globals_apply_skipped, Some(1));
-    assert!(boot.globals_apply_error.is_none());
-    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
-    assert!(c.contains("recovered_global_word"));
-    assert!(!c.contains("second_attempt_must_not_replace"));
-
-    // A fail-whole-map preflight error returns normally, allowing the
-    // independent function rename and final export to complete in this same
-    // process while applying zero globals.
-    let invalid_global_map = serde_json::json!({
-        "format": "wrong-format",
-        "image": "00_BOOT",
-        "globals": [{
-            "address": "0x20",
-            "name": "invalid_map_must_apply_zero",
-            "tier": "recovered",
-        }],
-    });
-    std::fs::write(
-        &global_map_path,
-        serde_json::to_string_pretty(&invalid_global_map).unwrap(),
-    )
-    .unwrap();
-    let third_function_map = serde_json::json!({
-        "image": "00_BOOT",
-        "symbols": [{
-            "entry": "0x0",
-            "name": "function_exported_despite_invalid_globals",
-            "tier": "recovered",
-            "annotations": [],
-        }],
-    });
-    std::fs::write(
-        &map_path,
-        serde_json::to_string_pretty(&third_function_map).unwrap(),
-    )
-    .unwrap();
-    let invalid_combined = HashMap::from([(
-        "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_pass2_map(&map_path, 1)),
-            global_map: Some(prepared_pass2_map(&global_map_path, 1)),
-            global_types_map: None,
-        },
-    )]);
-    let invalid_run =
-        pixel_modem_extractor::decompile::run_two_pass(rep3, &opts, &out, &invalid_combined)
-            .unwrap();
+    // The completion marker binds identity none and the exact map hash.
     assert_eq!(
-        invalid_run.outcomes["00_BOOT"],
-        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+        std::fs::read(exp.join("..").join("00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker("none", symbol_map.map_blake3()),
     );
-    let rep4 = invalid_run.report;
-    let boot = rep4.images.iter().find(|r| r.label == "00_BOOT").unwrap();
-    assert_eq!(boot.pass2_applied, Some(1));
-    assert!(boot.pass2_error.is_none());
-    assert!(boot.globals_applied.is_none());
-    assert!(boot.globals_apply_skipped.is_none());
-    assert!(boot.globals_apply_error.is_some());
-    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
-    assert!(c.contains("function_exported_despite_invalid_globals"));
-    assert!(c.contains("recovered_global_word"));
-    assert!(!c.contains("invalid_map_must_apply_zero"));
+
+    // The strict pass-2 property survived in the saved program.
+    let property_probe = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Program;
+
+public class ProbeProperty extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        System.out.println("ProbeProperty: " + currentProgram.getOptions(Program.PROGRAM_INFO)
+                .getString("PixelModemExtractor.SymbolPass2", null));
+    }
+}
+"#;
+    std::fs::write(out.join("scripts/ProbeProperty.java"), property_probe).unwrap();
+    let probed = inspect_saved_project(&home, &out, "00_BOOT", "ProbeProperty.java");
+    assert!(
+        probed.status.success(),
+        "property probe failed:\n{}",
+        process_diagnostics(&probed)
+    );
+    let stdout = String::from_utf8_lossy(&probed.stdout);
+    let reported_property = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ProbeProperty: "))
+        .unwrap_or_else(|| panic!("no property line:\n{stdout}"))
+        .trim_end_matches(" (GhidraScript)")
+        .to_string();
+    assert_eq!(
+        reported_property,
+        symbol_map.pass2_property(),
+        "the SymbolPass2 property must bind the map, functions hash, and count"
+    );
+
+    // The export's mandatory execution projections are unchanged from pass 1
+    // and the retained Thumb sidecar is preserved byte-for-byte.
     let final_functions: serde_json::Value =
         serde_json::from_slice(&std::fs::read(exp.join("functions.json")).unwrap()).unwrap();
     for function in final_functions.as_array().unwrap() {
@@ -1860,7 +1817,151 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         "pass 2 must preserve the retained tagged Thumb sidecar byte-for-byte"
     );
 
+    // Replay: the identical map re-applies cleanly (property already equal),
+    // reporting zero new renames.
+    let replay_inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: Some(prepared_symbol_map(
+                &images_dir,
+                "00_BOOT",
+                &map_path,
+                bundle.map.execution_count,
+            )),
+            global_map: None,
+            global_types_map: None,
+            ..Default::default()
+        },
+    )]);
+    let replay = pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &replay_inputs)
+        .unwrap()
+        .report;
+    let boot = replay.images.iter().find(|r| r.label == "00_BOOT").unwrap();
+    assert_eq!(boot.pass2_applied, Some(0), "{:?}", boot.pass2_error);
+    assert!(boot.pass2_error.is_none());
+    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
+    assert!(c.contains("Reset"));
+
+    // --- Second kit: the ApplyGlobals ownership battery without a function
+    // map (the SymbolPass2 property of the first kit would reject a
+    // map-less export in the same project).
+    let dir2 = std::env::temp_dir().join(format!("pme_decompile_p2g_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir2);
+    std::fs::create_dir_all(&dir2).unwrap();
+    let modem_path2 = dir2.join("modem.bin");
+    std::fs::write(&modem_path2, &modem).unwrap();
+    let out2 = dir2.join("out");
+    let pass1b = pixel_modem_extractor::decompile::run_report(&modem_path2, &opts, &out2).unwrap();
+    let global_map_path2 = out2.join("globals.json");
+
+    // First apply: the Recovered global lands as USER_DEFINED.
+    let first_globals = serde_json::json!({
+        "format": "pixel-modem-extractor-globals-v1",
+        "image": "00_BOOT",
+        "globals": [{
+            "address": "0x20",
+            "name": "recovered_global_word",
+            "tier": "recovered",
+        }],
+    });
+    std::fs::write(
+        &global_map_path2,
+        serde_json::to_string_pretty(&first_globals).unwrap(),
+    )
+    .unwrap();
+    let globals_only = HashMap::from([(
+        "00_BOOT".to_string(),
+        pixel_modem_extractor::decompile::Pass2Input {
+            function_map: None,
+            global_map: Some(prepared_pass2_map(&global_map_path2, 1)),
+            global_types_map: None,
+            ..Default::default()
+        },
+    )]);
+    let rep3 = pixel_modem_extractor::decompile::run_two_pass(pass1b, &opts, &out2, &globals_only)
+        .unwrap()
+        .report;
+    let boot = rep3.images.iter().find(|r| r.label == "00_BOOT").unwrap();
+    assert_eq!(boot.globals_applied, Some(1));
+    assert_eq!(boot.globals_apply_skipped, Some(0));
+    assert!(boot.globals_apply_error.is_none());
+
+    // Second attempt: the symbol is now USER_DEFINED, so strict ownership
+    // preserves it and classifies the candidate as non-default.
+    let second_globals = serde_json::json!({
+        "format": "pixel-modem-extractor-globals-v1",
+        "image": "00_BOOT",
+        "globals": [{
+            "address": "0x20",
+            "name": "second_attempt_must_not_replace",
+            "tier": "recovered",
+        }],
+    });
+    std::fs::write(
+        &global_map_path2,
+        serde_json::to_string_pretty(&second_globals).unwrap(),
+    )
+    .unwrap();
+    let rep4 = pixel_modem_extractor::decompile::run_two_pass(rep3, &opts, &out2, &globals_only)
+        .unwrap()
+        .report;
+    let boot = rep4.images.iter().find(|r| r.label == "00_BOOT").unwrap();
+    assert_eq!(boot.globals_applied, Some(0));
+    assert_eq!(boot.globals_apply_skipped, Some(1));
+    assert!(boot.globals_apply_error.is_none());
+    let c = std::fs::read_to_string(out2.join("export/00_BOOT/decompiled.c")).unwrap();
+    assert!(c.contains("recovered_global_word"));
+    assert!(!c.contains("second_attempt_must_not_replace"));
+
+    // A fail-whole-map preflight error returns normally, allowing the final
+    // export to complete in this same process while applying zero globals.
+    let invalid_global_map = serde_json::json!({
+        "format": "wrong-format",
+        "image": "00_BOOT",
+        "globals": [{
+            "address": "0x20",
+            "name": "invalid_map_must_apply_zero",
+            "tier": "recovered",
+        }],
+    });
+    std::fs::write(
+        &global_map_path2,
+        serde_json::to_string_pretty(&invalid_global_map).unwrap(),
+    )
+    .unwrap();
+    let invalid_run =
+        pixel_modem_extractor::decompile::run_two_pass(rep4, &opts, &out2, &globals_only).unwrap();
+    assert_eq!(
+        invalid_run.outcomes["00_BOOT"],
+        pixel_modem_extractor::decompile::Pass2ProcessOutcome::ProcessSucceeded
+    );
+    let rep5 = invalid_run.report;
+    let boot = rep5.images.iter().find(|r| r.label == "00_BOOT").unwrap();
+    assert!(boot.globals_applied.is_none());
+    assert!(boot.globals_apply_skipped.is_none());
+    assert!(boot.globals_apply_error.is_some());
+    let c = std::fs::read_to_string(out2.join("export/00_BOOT/decompiled.c")).unwrap();
+    assert!(c.contains("recovered_global_word"));
+    assert!(!c.contains("invalid_map_must_apply_zero"));
+
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// Build the raw pw_token DB byte stream the token parser accepts for
+/// `(token, string)` pairs (the decode_tokens fixture grammar).
+fn parse_token_db(entries: &[(u32, &str)]) -> pixel_modem_extractor::tokens::Database {
+    pixel_modem_extractor::tokens::Database {
+        reserved: 0,
+        entries: entries
+            .iter()
+            .map(|(token, string)| pixel_modem_extractor::tokens::Entry {
+                token: *token,
+                date_removed: None,
+                string: string.to_string(),
+            })
+            .collect(),
+    }
 }
 
 /// Pass-2 global-types end-to-end: proves `ApplyGlobalTypes.java` widens
@@ -1971,6 +2072,7 @@ fn pass2_applies_global_types_and_skips_span_collision() {
             function_map: None,
             global_map: None,
             global_types_map: Some(prepared_pass2_map(&map_path, 2)),
+            ..Default::default()
         },
     )]);
     let pass2 =
@@ -3352,6 +3454,7 @@ public class InspectAbsent extends GhidraScript {
 }
 "#;
 
+#[derive(Clone)]
 struct PalApplyKit {
     dir: PathBuf,
     out: PathBuf,
@@ -3361,14 +3464,32 @@ struct PalApplyKit {
     kit_root: PathBuf,
 }
 
-/// Generates the extended seven-task PAL kit (image, scatter map,
-/// manifest, staged scripts, helper seeds/inspectors) for one case.
+/// Generates the extended seven-task PAL kit for the canonical fixture
+/// image.
 fn generate_pal_apply_kit(home: &std::path::Path, case: &str) -> PalApplyKit {
+    let image = pal_fixture::craft_main_image();
+    generate_pal_apply_kit_manifests(home, case, &image, |scatter_hash| {
+        pal_fixture::extended_manifest(&image, scatter_hash)
+    })
+}
+
+/// Generates the PAL kit for an explicit fixture image; the manifest is
+/// built from the kit's own materialized scatter load-map hash.
+fn generate_pal_apply_kit_manifests(
+    home: &std::path::Path,
+    case: &str,
+    image: &[u8],
+    manifest_for: impl FnOnce(&str) -> String,
+) -> PalApplyKit {
     let dir = std::env::temp_dir().join(format!("pme_pal_apply_{case}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let modem_path = dir.join("modem.bin");
-    std::fs::write(&modem_path, pal_fixture::craft_pal_main_modem_bin()).unwrap();
+    let mut wrapped = pal_fixture::craft_pal_main_modem_bin();
+    // Rebuild the modem payload around the explicit image bytes.
+    wrapped.truncate(wrapped.len() - pal_fixture::craft_main_image().len());
+    wrapped.extend_from_slice(image);
+    std::fs::write(&modem_path, &wrapped).unwrap();
     let out = dir.join("out");
     pixel_modem_extractor::decompile::run_report(
         &modem_path,
@@ -3391,8 +3512,8 @@ fn generate_pal_apply_kit(home: &std::path::Path, case: &str) -> PalApplyKit {
         scatter_path.exists(),
         "kit must materialize the scatter load map"
     );
-    let scatter_hash = pal_fixture::blake3_hex(&std::fs::read(&scatter_path).unwrap());
-    let manifest = pal_fixture::extended_manifest(&pal_fixture::craft_main_image(), &scatter_hash);
+    let scatter_hash = blake3_of(&scatter_path);
+    let manifest = manifest_for(&scatter_hash);
     let manifest_dir = out.join("pal_tasks/02_MAIN");
     std::fs::create_dir_all(&manifest_dir).unwrap();
     let manifest_path = manifest_dir.join("tasks.json");
@@ -3423,6 +3544,21 @@ fn generate_pal_apply_kit(home: &std::path::Path, case: &str) -> PalApplyKit {
         out,
         identity,
     }
+}
+
+/// Patches the staged ApplySymbols source once per anchor pair.
+fn patch_apply_symbols_script(out: &std::path::Path, replacements: &[(&str, &str)]) {
+    let path = out.join("scripts/ApplySymbols.java");
+    let mut script = std::fs::read_to_string(&path).unwrap();
+    for (from, to) in replacements {
+        assert_eq!(
+            script.matches(from).count(),
+            1,
+            "patch anchor {from:?} must be unique"
+        );
+        script = script.replacen(from, to, 1);
+    }
+    std::fs::write(&path, script).unwrap();
 }
 
 fn pal_headless(home: &std::path::Path, kit: &PalApplyKit, args: &[String]) -> String {
@@ -4526,4 +4662,1563 @@ fn datamark_rejects_aggregate_limit_and_rolls_back() {
         )],
         "the aggregate region bytes exceed the limit",
     );
+}
+
+// -------------------------------------------------------------------------
+// Task 11: authenticated symbol pass 2 and export cutover
+// -------------------------------------------------------------------------
+
+/// The canonical pass-2 kit state: PAL applied, pass-1 export produced, and
+/// the strict v2 map built from the retained tree with the registration-rank
+/// rename of the alpha task primary.
+struct Pass2Kit {
+    kit: PalApplyKit,
+    map_path: PathBuf,
+    map_hash: String,
+    functions_path: PathBuf,
+    functions_hash: String,
+    image_hash: String,
+    execution_count: usize,
+}
+
+fn blake3_of(path: &std::path::Path) -> String {
+    blake3::hash(&std::fs::read(path).unwrap()).to_string()
+}
+
+/// Builds the retained images tree and derives the strict v2 symbol map with
+/// the PAL context from the fixture manifest geometry.
+fn build_pal_pass2_kit(
+    home: &std::path::Path,
+    case: &str,
+    image: &[u8],
+    manifest_for: impl FnOnce(&str) -> String,
+    seed: Option<&str>,
+    export_pass1: bool,
+) -> Pass2Kit {
+    let kit = generate_pal_apply_kit_manifests(home, case, image, manifest_for);
+    let manifest = std::fs::read_to_string(&kit.manifest_path).unwrap();
+    let identity = kit.identity.clone();
+    let scatter_hash = blake3_of(&kit.scatter_path);
+    let import = pal_import(home, &kit, seed);
+    assert!(
+        !import.contains("REPORT SCRIPT ERROR"),
+        "seeded import failed for {case}:\n{import}"
+    );
+    if let Some(script) = seed {
+        assert!(
+            import.contains(script.trim_end_matches(".java")),
+            "seed {script:?} did not run for {case}:\n{import}"
+        );
+    }
+    if export_pass1 {
+        // One -process run applies PAL transactionally and exports pass 1
+        // under the strict eight-argument contract.
+        // The seed (pre-existing meaningful/coincident primaries) ran at
+        // import time; this run only applies PAL and exports pass 1.
+        let args: Vec<String> = [
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-preScript".to_string(),
+            "ApplyPalTasks.java".to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".to_string(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            kit.scatter_path.to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+            kit.out
+                .join("export/02_MAIN")
+                .to_string_lossy()
+                .into_owned(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".to_string(),
+            kit.identity.clone(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            kit.scatter_path.to_string_lossy().into_owned(),
+            "-".to_string(),
+            "none".to_string(),
+        ]
+        .into();
+        let exported = pal_headless(home, &kit, &args);
+        let expected = if seed.is_some() {
+            pal_expected_summary(&kit, 4, 2, 4, 2)
+        } else {
+            pal_expected_summary(&kit, 6, 0, 6, 0)
+        };
+        assert!(
+            exported.contains(&expected),
+            "pass-1 PAL application failed for {case}:\n{exported}"
+        );
+        assert!(
+            !exported.contains("REPORT SCRIPT ERROR"),
+            "pass-1 export failed for {case}:\n{exported}"
+        );
+        assert!(
+            kit.out.join("export/02_MAIN/functions.json").exists(),
+            "pass-1 export produced no functions.json for {case}"
+        );
+        assert_eq!(
+            std::fs::read(kit.out.join("export/02_MAIN.complete")).unwrap(),
+            pixel_modem_extractor::decompile::export_completion_marker(&kit.identity, "none"),
+            "the pass-1 marker must bind the PAL identity and no symbol map"
+        );
+    }
+
+    // The retained tree the map binds: exact raw image bytes, the
+    // pass-1-exported functions.json (copied verbatim), and the scatter load
+    // map in the terminal-tree convention (`<image>/scatter/`) so the runtime
+    // authenticates the scatter-backed task execution.
+    let tree = kit.dir.join("tree");
+    let image_dir = tree.join("images/02_MAIN");
+    std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
+    std::fs::write(image_dir.join("02_MAIN.bin"), image).unwrap();
+    copy_dir(&kit.out.join("scatter/02_MAIN"), &image_dir.join("scatter"));
+    std::fs::copy(
+        kit.out.join("export/02_MAIN/functions.json"),
+        image_dir.join("decompiled/functions.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        tree.join("manifest.json"),
+        format!(
+            r#"{{"toc":[{{"name":"MAIN","load_addr":{}}}]}}"#,
+            pal_fixture::BASE
+        ),
+    )
+    .unwrap();
+
+    let mut applications = std::collections::BTreeMap::new();
+    for (entry, isa, desired, tasks) in pal_fixture::extended_application_summaries() {
+        let applied = std::fs::read(image_dir.join("decompiled/functions.json"))
+            .map(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|record| {
+                        record["entry"].as_str() == Some(&format!("0x{entry:08x}"))
+                            && record["name"].as_str() == Some(desired)
+                    })
+            })
+            .unwrap_or(false);
+        applications.insert(
+            entry,
+            pixel_modem_extractor::symbolicate::PalApplicationRef {
+                isa,
+                desired_primary: desired.to_string(),
+                applied,
+                tasks: tasks
+                    .into_iter()
+                    .map(|(index, name, slot, priority, stack)| {
+                        pixel_modem_extractor::symbolicate::PalTaskRef {
+                            manifest_blake3: blake3::hash(manifest.as_bytes()).to_string(),
+                            task_index: index,
+                            name: name.to_string(),
+                            slot,
+                            priority,
+                            stack_size: stack,
+                        }
+                    })
+                    .collect(),
+            },
+        );
+    }
+    let pal = pixel_modem_extractor::symbolicate::PalPass2Context {
+        identity: identity.to_string(),
+        manifest_blake3: blake3::hash(manifest.as_bytes()).to_string(),
+        scatter_load_map_blake3: Some(scatter_hash.to_string()),
+        applications,
+    };
+    let tokens = HashMap::new();
+    let map_path = kit.out.join("symbol_maps/02_MAIN.json");
+    std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
+    let bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(
+        &map_path,
+        &image_dir,
+        "02_MAIN",
+        &tokens,
+        &tree.join("manifest.json"),
+        Some(&pal),
+    )
+    .unwrap();
+
+    let functions_path = image_dir.join("decompiled/functions.json");
+    Pass2Kit {
+        map_hash: bundle.map.map_blake3.clone(),
+        functions_hash: bundle.map.functions_blake3.clone(),
+        functions_path,
+        image_hash: blake3_of(&kit.kit_root.join("images/02_MAIN")),
+        map_path,
+        execution_count: bundle.map.execution_count,
+        kit,
+    }
+}
+
+/// Recursive directory copy for fixture trees.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let destination = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&destination).unwrap();
+            copy_dir(&entry.path(), &destination);
+        } else {
+            std::fs::create_dir_all(to).unwrap();
+            std::fs::copy(entry.path(), destination).unwrap();
+        }
+    }
+}
+
+/// A `-process` run driving ApplySymbols with its ten canonical arguments,
+/// optionally followed by one extra post-script (with its own arguments) and
+/// the pass-2 ExportDecomp.
+fn pal_apply_symbols(
+    home: &std::path::Path,
+    state: &Pass2Kit,
+    extra_post: Option<(&str, Vec<String>)>,
+    with_export: bool,
+) -> String {
+    let kit = &state.kit;
+    let mut args: Vec<String> = [
+        "-process".to_string(),
+        "02_MAIN".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ApplySymbols.java".to_string(),
+        kit.kit_root.to_string_lossy().into_owned(),
+        "02_MAIN".to_string(),
+        state.image_hash.clone(),
+        kit.identity.clone(),
+        kit.manifest_path.to_string_lossy().into_owned(),
+        kit.scatter_path.to_string_lossy().into_owned(),
+        state.functions_path.to_string_lossy().into_owned(),
+        state.functions_hash.clone(),
+        state.map_path.to_string_lossy().into_owned(),
+        state.map_hash.clone(),
+    ]
+    .into();
+    if let Some((script, script_args)) = extra_post {
+        args.push("-postScript".to_string());
+        args.push(script.to_string());
+        args.extend(script_args);
+    }
+    if with_export {
+        args.extend([
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+            kit.out
+                .join("export/02_MAIN")
+                .to_string_lossy()
+                .into_owned(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".to_string(),
+            kit.identity.clone(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            kit.scatter_path.to_string_lossy().into_owned(),
+            state.map_path.to_string_lossy().into_owned(),
+            state.map_hash.clone(),
+        ]);
+    }
+    pal_headless(home, kit, &args)
+}
+
+/// A `-process` run driving only ExportDecomp with explicit map arguments.
+fn pal_export_only(home: &std::path::Path, state: &Pass2Kit, map: Option<(&str, &str)>) -> String {
+    let kit = &state.kit;
+    let (map_argument, map_hash) = match map {
+        Some((path, hash)) => (path.to_string(), hash.to_string()),
+        None => ("-".to_string(), "none".to_string()),
+    };
+    let args: Vec<String> = [
+        "-process".to_string(),
+        "02_MAIN".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+        kit.out
+            .join("export/02_MAIN")
+            .to_string_lossy()
+            .into_owned(),
+        kit.kit_root.to_string_lossy().into_owned(),
+        "02_MAIN".to_string(),
+        kit.identity.clone(),
+        kit.manifest_path.to_string_lossy().into_owned(),
+        kit.scatter_path.to_string_lossy().into_owned(),
+        map_argument,
+        map_hash,
+    ]
+    .into();
+    pal_headless(home, kit, &args)
+}
+
+/// Postflight inspector after a successful PAL-aware pass 2: the complete
+/// applied state still validates, the alpha primary was renamed by its
+/// registration evidence with the exact registry transition, the coincident
+/// ANALYSIS beta and meaningful zeta primaries were preserved, the property
+/// binds the exact v2 grammar, and every reserved label survived.
+const INSPECT_PASS2_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+
+public class InspectPass2 extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 7) {
+            throw new AssertionError("expected seven InspectPass2 arguments");
+        }
+        File kitRoot = new File(args[0]);
+        String label = args[1];
+        File palFile = new File(args[2]);
+        File scatterFile = new File(args[3]);
+        PalTasksSupport.PalManifest manifest =
+                PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile);
+        String identity = PalTasksSupport.expectedPalIdentity(manifest);
+        PalTasksSupport.AppliedState state =
+                PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        if (state.applications != 6 || state.palOwnedPrimaries != 3
+                || state.preservedPrimaries != 2 || state.pass2OwnedPrimaries != 1
+                || state.reservedLabels != 7) {
+            throw new AssertionError("post-pass-2 dispositions are wrong: "
+                    + state.palOwnedPrimaries + " pal_owned, "
+                    + state.preservedPrimaries + " preserved, "
+                    + state.pass2OwnedPrimaries + " pass2_owned");
+        }
+
+        FunctionManager functions = currentProgram.getFunctionManager();
+        Function alpha = functions.getFunctionAt(toAddr(0x4001_0400L));
+        if (alpha == null || !"alpha_task_fn".equals(alpha.getName())
+                || alpha.getSymbol().getSource() != SourceType.USER_DEFINED) {
+            throw new AssertionError("the registration rename of the pal_owned primary failed: "
+                    + (alpha == null ? "missing" : alpha.getName()));
+        }
+        if (!alpha.getRepeatableComment().contains("task index=0 name=\"alpha\"")) {
+            throw new AssertionError("the owned comment did not survive the stronger rename");
+        }
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        PalTasksSupport.RegistryEntry entry =
+                PalTasksSupport.parseRegistry(registry.getString(toAddr(0x4001_0400L)));
+        if (!"pass2_owned".equals(entry.primaryDisposition)
+                || !"user_defined".equals(entry.primarySource)
+                || !entry.primaryNameBlake3.equals(
+                        PalTasksSupport.primaryDigestHex("alpha_task_fn"))) {
+            throw new AssertionError("the registry transition subrecord is wrong");
+        }
+        PalTasksSupport.RegistryEntry beta =
+                PalTasksSupport.parseRegistry(registry.getString(toAddr(0x4001_0410L)));
+        if (!"preserved".equals(beta.primaryDisposition)) {
+            throw new AssertionError("the coincident ANALYSIS beta was reclassified");
+        }
+        Function betaFunction = functions.getFunctionAt(toAddr(0x4001_0410L));
+        if (!"pal_TaskEntry_beta".equals(betaFunction.getName())
+                || betaFunction.getSymbol().getSource() != SourceType.ANALYSIS) {
+            throw new AssertionError("the coincident ANALYSIS primary changed");
+        }
+        Function zeta = functions.getFunctionAt(toAddr(0x4001_0438L));
+        if (!"zetaKeptName".equals(zeta.getName())
+                || zeta.getSymbol().getSource() != SourceType.USER_DEFINED) {
+            throw new AssertionError("the meaningful primary did not survive pass 2");
+        }
+        PalTasksSupport.RegistryEntry zetaEntry =
+                PalTasksSupport.parseRegistry(registry.getString(toAddr(0x4001_0438L)));
+        if (!"preserved".equals(zetaEntry.primaryDisposition)) {
+            throw new AssertionError("the meaningful primary was reclassified");
+        }
+        if (!functions.getFunctionAt(toAddr(0x4001_0430L)).getName()
+                .equals("pal_TaskEntry_shared_40010430")) {
+            throw new AssertionError("the shared neutral primary changed");
+        }
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+        int labels = 0;
+        SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(namespace);
+        while (symbols.hasNext()) {
+            symbols.next();
+            labels++;
+        }
+        if (labels != 7) {
+            throw new AssertionError("a reserved label did not survive pass 2: " + labels);
+        }
+        String property = currentProgram.getOptions(Program.PROGRAM_INFO)
+                .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+        String expected = "v2:" + args[4] + ":" + args[5] + ":" + args[6];
+        if (!expected.equals(property)) {
+            throw new AssertionError("the SymbolPass2 property is " + property
+                    + ", expected " + expected);
+        }
+        System.out.println("InspectPass2: ok");
+    }
+}
+"#;
+
+/// Seeds a stale, different prior SymbolPass2 property.
+const PAL_SEED_STALE_PASS2_PROPERTY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Program;
+
+public class SeedStalePass2Property extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        currentProgram.getOptions(Program.PROGRAM_INFO).setString(
+                PalTasksSupport.SYMBOL_PASS2_PROPERTY,
+                "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:9:9");
+        System.out.println("SeedStalePass2Property: ok");
+    }
+}
+"#;
+
+/// Clears the SymbolPass2 property (test tooling between rejection cases).
+const PAL_SEED_CLEAR_PASS2_PROPERTY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Program;
+
+public class SeedClearPass2Property extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        currentProgram.getOptions(Program.PROGRAM_INFO)
+                .putObject("PixelModemExtractor.SymbolPass2", null);
+        System.out.println("SeedClearPass2Property: ok");
+    }
+}
+"#;
+
+/// Renames the alpha primary so the retained map's original no longer matches
+/// (the changed-primary rejection).
+const PAL_SEED_RENAME_ALPHA_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class SeedRenameAlpha extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Function alpha = currentProgram.getFunctionManager().getFunctionAt(toAddr(0x4001_0400L));
+        if (alpha == null) {
+            throw new AssertionError("rename seed lost the alpha function");
+        }
+        alpha.setName("drifted_alpha_name", SourceType.USER_DEFINED);
+        // Keep the registry self-consistent with the drift so the rejection
+        // under test is ApplySymbols' retained-original binding, not the
+        // shared registry validator.
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        PalTasksSupport.RegistryEntry previous = PalTasksSupport.parseRegistry(
+                registry.getString(alpha.getEntryPoint()));
+        registry.add(alpha.getEntryPoint(), PalTasksSupport.registryValue(
+                new PalTasksSupport.RegistryEntry(
+                        previous.manifestBlake3, previous.isa, previous.functionId,
+                        previous.functionDisposition, previous.commentBlake3,
+                        previous.primaryDisposition, previous.primarySymbolId,
+                        "user_defined",
+                        PalTasksSupport.primaryDigestHex("drifted_alpha_name"),
+                        previous.labelCount, previous.labelsBlake3)));
+        System.out.println("SeedRenameAlpha: ok");
+    }
+}
+"#;
+
+/// Clears the first instruction of the alpha body so its authenticated decode
+/// projection no longer matches the retained map (the changed-body rejection).
+const PAL_SEED_CLEAR_ALPHA_BODY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+
+public class SeedClearAlphaBody extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        currentProgram.getListing().clearCodeUnits(toAddr(0x4001_0400L), toAddr(0x4001_0403L), false);
+        System.out.println("SeedClearAlphaBody: ok");
+    }
+}
+"#;
+
+/// Mode-driven corruption seed for the export postflight battery. Each mode
+/// first restores the pristine applied state (as PalSupportProbe proved
+/// restorable) and then applies exactly one corruption.
+const PAL_SEED_CORRUPT_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.util.StringPropertyMap;
+import java.util.ArrayList;
+import java.util.List;
+
+public class SeedCorrupt extends GhidraScript {
+    private static final long ALPHA = 0x4001_0400L;
+
+    private StringPropertyMap registry() throws Exception {
+        StringPropertyMap map = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        if (map == null) {
+            throw new AssertionError("corrupt seed requires an applied registry");
+        }
+        return map;
+    }
+
+    private void restoreRegistryLabels(Address entry) throws Exception {
+        StringPropertyMap registry = registry();
+        PalTasksSupport.RegistryEntry previous =
+                PalTasksSupport.parseRegistry(registry.getString(entry));
+        List<PalTasksSupport.LabelEntry> current = new ArrayList<>();
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+        ghidra.program.model.symbol.SymbolIterator iterator =
+                currentProgram.getSymbolTable().getSymbols(namespace);
+        while (iterator.hasNext()) {
+            Symbol symbol = iterator.next();
+            if (symbol.getAddress().equals(entry)) {
+                current.add(new PalTasksSupport.LabelEntry(symbol.getID(), symbol.getName()));
+            }
+        }
+        registry.add(entry, PalTasksSupport.registryValue(new PalTasksSupport.RegistryEntry(
+                previous.manifestBlake3, previous.isa, previous.functionId,
+                previous.functionDisposition, previous.commentBlake3,
+                previous.primaryDisposition, previous.primarySymbolId, previous.primarySource,
+                previous.primaryNameBlake3, current.size(),
+                PalTasksSupport.labelsDigestHex(current))));
+    }
+
+    private void restoreBaseline() throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        Function alpha = functions.getFunctionAt(toAddr(ALPHA));
+        if (alpha == null) {
+            alpha = createFunction(toAddr(ALPHA), null);
+        }
+        if (!"pal_TaskEntry_alpha".equals(alpha.getName())) {
+            alpha.setName("pal_TaskEntry_alpha", SourceType.ANALYSIS);
+        }
+        if (currentProgram.getListing().getInstructionAt(toAddr(ALPHA)) == null) {
+            disassemble(toAddr(ALPHA));
+        }
+        alpha.setRepeatableComment(alpha.getRepeatableComment());
+        restoreRegistryLabels(toAddr(ALPHA));
+        // Remove any stray reserved-namespace label outside the registry.
+        StringPropertyMap registry = registry();
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+        if (namespace != null) {
+            List<Symbol> strangers = new ArrayList<>();
+            ghidra.program.model.symbol.SymbolIterator symbols =
+                    currentProgram.getSymbolTable().getSymbols(namespace);
+            while (symbols.hasNext()) {
+                Symbol symbol = symbols.next();
+                if (registry.getString(symbol.getAddress()) == null) {
+                    strangers.add(symbol);
+                }
+            }
+            for (Symbol stranger : strangers) {
+                stranger.delete();
+            }
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1) {
+            throw new AssertionError("expected the corruption mode argument");
+        }
+        String mode = args[0];
+        if (!"remove_function".equals(mode)) {
+            restoreBaseline();
+        }
+        SymbolTable symbols = currentProgram.getSymbolTable();
+        FunctionManager functions = currentProgram.getFunctionManager();
+        switch (mode) {
+            case "remove_function":
+                Function alpha = functions.getFunctionAt(toAddr(ALPHA));
+                if (alpha == null) {
+                    throw new AssertionError("corrupt seed lost the alpha function");
+                }
+                functions.removeFunction(toAddr(ALPHA));
+                break;
+            case "delete_label": {
+                Namespace namespace = symbols.getNamespace(
+                        PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+                Symbol label = symbols.getSymbol("pal_TaskEntry_alpha", toAddr(ALPHA), namespace);
+                if (label == null) {
+                    throw new AssertionError("corrupt seed lost the alpha label");
+                }
+                label.delete();
+                break;
+            }
+            case "tamper_registry": {
+                StringPropertyMap registry = registry();
+                String value = registry.getString(toAddr(ALPHA));
+                char digit = value.charAt(3);
+                char flipped = digit == '0' ? '1' : '0';
+                registry.add(toAddr(ALPHA),
+                        value.substring(0, 3) + flipped + value.substring(4));
+                break;
+            }
+            case "edit_comment": {
+                Function fn = functions.getFunctionAt(toAddr(ALPHA));
+                String comment = fn.getRepeatableComment();
+                fn.setRepeatableComment(comment.replace("priority=100", "priority=101"));
+                break;
+            }
+            case "rename_primary": {
+                Function fn = functions.getFunctionAt(toAddr(ALPHA));
+                fn.setName("probe_drifted_name", SourceType.USER_DEFINED);
+                break;
+            }
+            case "orphan_label": {
+                Namespace namespace = symbols.getNamespace(
+                        PalTasksSupport.RESERVED_NAMESPACE,
+                        currentProgram.getGlobalNamespace());
+                if (namespace == null) {
+                    throw new AssertionError("corrupt seed lost the reserved namespace");
+                }
+                symbols.createLabel(toAddr(0x4001_0480L), "pal_TaskEntry_stranger", namespace,
+                        SourceType.ANALYSIS);
+                break;
+            }
+            default:
+                throw new AssertionError("unknown corruption mode " + mode);
+        }
+        System.out.println("SeedCorrupt: " + mode + " ok");
+    }
+}
+"#;
+
+/// The end-to-end PAL-aware pass-2 battery: the registration-rank rename of
+/// the registry-bound alpha primary, preservation of the meaningful and
+/// coincident primaries, idempotent replay, and the preflight rejection
+/// matrix (argument contract, stale hashes, tampered decisions, changed
+/// bodies/primaries, prior property, unauthorized disposition) with a
+/// rollback after several mutations.
+#[test]
+fn apply_symbols_pal_ownership_transitions_are_transactional() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let image = pal_fixture::craft_main_image();
+
+    for (name, source) in [
+        ("InspectPass2.java", INSPECT_PASS2_JAVA),
+        (
+            "SeedStalePass2Property.java",
+            PAL_SEED_STALE_PASS2_PROPERTY_JAVA,
+        ),
+        (
+            "SeedClearPass2Property.java",
+            PAL_SEED_CLEAR_PASS2_PROPERTY_JAVA,
+        ),
+        ("SeedRenameAlpha.java", PAL_SEED_RENAME_ALPHA_JAVA),
+        ("SeedClearAlphaBody.java", PAL_SEED_CLEAR_ALPHA_BODY_JAVA),
+    ] {
+        std::fs::write(
+            {
+                // Staged later per kit; written into every kit's scripts dir.
+                let dir =
+                    std::env::temp_dir().join(format!("pme_task11_scripts_{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                dir.join(name)
+            },
+            source,
+        )
+        .unwrap();
+    }
+    let script_staging =
+        std::env::temp_dir().join(format!("pme_task11_scripts_{}", std::process::id()));
+
+    // --- The success path -----------------------------------------------
+    let state = build_pal_pass2_kit(
+        &home,
+        "pass2_ok",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        Some("PalSeedMeaningful.java"),
+        true,
+    );
+    for name in [
+        "InspectPass2.java",
+        "SeedStalePass2Property.java",
+        "SeedClearPass2Property.java",
+        "SeedRenameAlpha.java",
+        "SeedClearAlphaBody.java",
+    ] {
+        std::fs::copy(
+            script_staging.join(name),
+            state.kit.out.join("scripts").join(name),
+        )
+        .unwrap();
+    }
+
+    // The map itself carries the exact PAL binding and the authorized
+    // transition on the registration rename.
+    let map_text = std::fs::read_to_string(&state.map_path).unwrap();
+    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v2\""));
+    assert!(map_text.contains(&format!("\"identity\": \"{}\"", state.kit.identity)));
+    assert!(map_text.contains("\"from\": \"pal_owned\""));
+    assert!(map_text.contains("\"to\": \"pass2_owned\""));
+
+    let first = pal_apply_symbols(
+        &home,
+        &state,
+        Some((
+            "InspectPass2.java",
+            vec![
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".to_string(),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                state.map_hash.clone(),
+                state.functions_hash.clone(),
+                state.execution_count.to_string(),
+            ],
+        )),
+        true,
+    );
+    assert!(
+        first.contains("InspectPass2: ok"),
+        "pass-2 application/inspection failed:\n{first}"
+    );
+    assert!(
+        first.contains("ApplySymbols: image=02_MAIN applied 1 names"),
+        "unexpected pass-2 summary:\n{first}"
+    );
+    // The pass-2 export published under the v3 marker binding PAL and map.
+    assert_eq!(
+        std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &state.kit.identity,
+            &state.map_hash
+        )
+    );
+
+    // Idempotent replay: the identical map re-applies with zero renames and
+    // the same property.
+    let replay = pal_apply_symbols(
+        &home,
+        &state,
+        Some((
+            "InspectPass2.java",
+            vec![
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".to_string(),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                state.map_hash.clone(),
+                state.functions_hash.clone(),
+                state.execution_count.to_string(),
+            ],
+        )),
+        true,
+    );
+    assert!(
+        replay.contains("ApplySymbols: image=02_MAIN applied 0 names"),
+        "replay summary mismatch:\n{replay}"
+    );
+    assert!(
+        replay.contains("InspectPass2: ok"),
+        "replay inspection failed:\n{replay}"
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+
+    // --- The rejection matrix (all preflight, no state change) ----------
+    let state = build_pal_pass2_kit(
+        &home,
+        "pass2_reject",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        None,
+        true,
+    );
+    for name in [
+        "SeedStalePass2Property.java",
+        "SeedClearPass2Property.java",
+        "SeedRenameAlpha.java",
+        "SeedClearAlphaBody.java",
+    ] {
+        std::fs::copy(
+            script_staging.join(name),
+            state.kit.out.join("scripts").join(name),
+        )
+        .unwrap();
+    }
+    let functions_arg = state.functions_path.to_string_lossy().into_owned();
+    let map_arg = state.map_path.to_string_lossy().into_owned();
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        // Malformed ten-arg input: nine arguments.
+        (
+            vec![
+                "-postScript".into(),
+                "ApplySymbols.java".into(),
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".into(),
+                state.image_hash.clone(),
+                state.kit.identity.clone(),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                functions_arg.clone(),
+                state.functions_hash.clone(),
+                map_arg.clone(),
+            ],
+            "expected exactly ten arguments",
+        ),
+        // Stale image BLAKE3.
+        (
+            vec![
+                "-postScript".into(),
+                "ApplySymbols.java".into(),
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".into(),
+                "0".repeat(64),
+                state.kit.identity.clone(),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                functions_arg.clone(),
+                state.functions_hash.clone(),
+                map_arg.clone(),
+                state.map_hash.clone(),
+            ],
+            "image BLAKE3 does not match the symbol map",
+        ),
+        // Stale functions BLAKE3.
+        (
+            vec![
+                "-postScript".into(),
+                "ApplySymbols.java".into(),
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".into(),
+                state.image_hash.clone(),
+                state.kit.identity.clone(),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                functions_arg.clone(),
+                "0".repeat(64),
+                map_arg.clone(),
+                state.map_hash.clone(),
+            ],
+            "functions.json BLAKE3 does not match",
+        ),
+        // Stale map BLAKE3.
+        (
+            vec![
+                "-postScript".into(),
+                "ApplySymbols.java".into(),
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".into(),
+                state.image_hash.clone(),
+                state.kit.identity.clone(),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                functions_arg.clone(),
+                state.functions_hash.clone(),
+                map_arg.clone(),
+                "0".repeat(64),
+            ],
+            "symbol map BLAKE3 does not match",
+        ),
+    ];
+    for (mut tail, expected) in cases {
+        let mut args: Vec<String> = [
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+        ]
+        .into();
+        args.append(&mut tail);
+        let failed = pal_headless(&home, &state.kit, &args);
+        assert!(
+            failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
+            "rejection case missed {expected:?}:\n{failed}"
+        );
+    }
+
+    // A dangling decision (an execution index beyond the map's executions)
+    // is a strict-parse failure; a duplicate decision the same way.
+    {
+        let needle = "\"execution\": 1,\n      \"original_primary\"";
+        let expected = "symbol decisions are not the exact execution order";
+        let tampered_path = state.kit.out.join("symbol_maps/tampered.json");
+        let mut text = map_text.clone();
+        assert!(
+            text.matches(needle).count() >= 1,
+            "tamper anchor {needle:?} not found"
+        );
+        text = text.replacen(needle, "\"execution\": 9,\n      \"original_primary\"", 1);
+        std::fs::write(&tampered_path, text).unwrap();
+        let tampered_arg = tampered_path.to_string_lossy().into_owned();
+        let args: Vec<String> = [
+            "-process".into(),
+            "02_MAIN".into(),
+            "-noanalysis".into(),
+            "-scriptPath".into(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".into(),
+            "ApplySymbols.java".into(),
+            state.kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".into(),
+            state.image_hash.clone(),
+            state.kit.identity.clone(),
+            state.kit.manifest_path.to_string_lossy().into_owned(),
+            state.kit.scatter_path.to_string_lossy().into_owned(),
+            functions_arg.clone(),
+            state.functions_hash.clone(),
+            tampered_arg,
+            blake3_of(&tampered_path),
+        ]
+        .into();
+        let failed = pal_headless(&home, &state.kit, &args);
+        assert!(
+            failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
+            "tampered-decision case missed {expected:?}:\n{failed}"
+        );
+        // A duplicated decision (the index repeated) fails the same way.
+        let duplicated_path = state.kit.out.join("symbol_maps/duplicated.json");
+        let mut text = map_text.clone();
+        assert!(
+            text.matches(needle).count() >= 1,
+            "duplicate anchor not found"
+        );
+        text = text.replacen(needle, "\"execution\": 0,\n      \"original_primary\"", 1);
+        std::fs::write(&duplicated_path, text).unwrap();
+        let duplicated_arg = duplicated_path.to_string_lossy().into_owned();
+        let args: Vec<String> = [
+            "-process".into(),
+            "02_MAIN".into(),
+            "-noanalysis".into(),
+            "-scriptPath".into(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".into(),
+            "ApplySymbols.java".into(),
+            state.kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".into(),
+            state.image_hash.clone(),
+            state.kit.identity.clone(),
+            state.kit.manifest_path.to_string_lossy().into_owned(),
+            state.kit.scatter_path.to_string_lossy().into_owned(),
+            functions_arg.clone(),
+            state.functions_hash.clone(),
+            duplicated_arg,
+            blake3_of(&duplicated_path),
+        ]
+        .into();
+        let failed = pal_headless(&home, &state.kit, &args);
+        assert!(
+            failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
+            "duplicate-decision case missed {expected:?}:\n{failed}"
+        );
+    }
+
+    // A different prior SymbolPass2 property is stale, never overwritten.
+    let seeded = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedStalePass2Property.java".to_string(),
+        ],
+    );
+    assert!(
+        seeded.contains("SeedStalePass2Property: ok"),
+        "stale-property seed did not run:\n{seeded}"
+    );
+    let failed = pal_apply_symbols(&home, &state, None, false);
+    assert!(
+        failed.contains("stale SymbolPass2 property"),
+        "a different prior property was not rejected:\n{failed}"
+    );
+    // Clear the stale property so the remaining cases run from absence.
+    let cleared = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedClearPass2Property.java".to_string(),
+        ],
+    );
+    assert!(
+        cleared.contains("SeedClearPass2Property: ok"),
+        "property-clear seed did not run:\n{cleared}"
+    );
+
+    // A changed current primary (renamed after pass 1) fails the retained
+    // map's original binding.
+    let seeded = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedRenameAlpha.java".to_string(),
+        ],
+    );
+    assert!(
+        seeded.contains("SeedRenameAlpha: ok"),
+        "rename seed did not run:\n{seeded}"
+    );
+    let failed = pal_apply_symbols(&home, &state, None, false);
+    assert!(
+        failed.contains("current primary changed")
+            || failed.contains("primary symbol binding does not match the registry")
+            || failed.contains("no longer carries the desired task name"),
+        "a changed primary was not rejected:\n{failed}"
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+
+    // A changed current body (cleared instruction bytes) fails the map's
+    // authenticated execution identity.
+    let state = build_pal_pass2_kit(
+        &home,
+        "pass2_body",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        None,
+        true,
+    );
+    std::fs::copy(
+        script_staging.join("SeedClearAlphaBody.java"),
+        state.kit.out.join("scripts/SeedClearAlphaBody.java"),
+    )
+    .unwrap();
+    let seeded = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedClearAlphaBody.java".to_string(),
+        ],
+    );
+    assert!(
+        seeded.contains("SeedClearAlphaBody: ok"),
+        "body seed did not run:\n{seeded}"
+    );
+    let failed = pal_apply_symbols(&home, &state, None, false);
+    assert!(
+        failed.contains("decode projection")
+            || failed.contains("decode range")
+            || failed.contains("no instruction exists at the task entry")
+            || failed.contains("quarantined"),
+        "a changed body was not rejected:\n{failed}"
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+
+    // --- Rollback after several mutations -------------------------------
+    let state = build_pal_pass2_kit(
+        &home,
+        "pass2_rollback",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        Some("PalSeedMeaningful.java"),
+        true,
+    );
+    patch_apply_symbols_script(
+        &state.kit.out,
+        &[(
+            "                    comments++;",
+            concat!(
+                "                    comments++;",
+                "\n                    if (comments == 1) {",
+                "\n                        throw new IllegalStateException(",
+                "\n                                \"injected pass-2 failure after several mutations\");",
+                "\n                    }"
+            ),
+        )],
+    );
+    let failed = pal_apply_symbols(&home, &state, None, false);
+    assert!(
+        failed.contains("injected pass-2 failure after several mutations"),
+        "injected pass-2 failure did not fire:\n{failed}"
+    );
+    // The applied PAL state is completely undisturbed: names, labels,
+    // comments, registry, and no pass-2 property.
+    let inspected = pal_apply(&home, &state.kit, Some("InspectApplied.java"));
+    assert!(
+        inspected.contains("InspectApplied: ok"),
+        "a failed pass 2 left partial state:\n{inspected}"
+    );
+    let property_probe = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Program;
+
+public class ProbeProperty extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        System.out.println("ProbeProperty: " + currentProgram.getOptions(Program.PROGRAM_INFO)
+                .getString("PixelModemExtractor.SymbolPass2", null));
+    }
+}
+"#;
+    std::fs::write(
+        state.kit.out.join("scripts/ProbeProperty.java"),
+        property_probe,
+    )
+    .unwrap();
+    let probed = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ProbeProperty.java".to_string(),
+        ],
+    );
+    assert!(
+        probed.contains("ProbeProperty: null"),
+        "a failed pass 2 left the property set:\n{probed}"
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+
+    // --- Unauthorized disposition: a hand-crafted map renaming the
+    // registry-preserved meaningful zeta primary (no transition, the exact
+    // shape the Rust writer never emits) ------------------------------------
+    {
+        let state = build_pal_pass2_kit(
+            &home,
+            "pass2_unauthorized",
+            &image,
+            |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+            Some("PalSeedMeaningful.java"),
+            true,
+        );
+        let unauthorized_path = state.kit.out.join("symbol_maps/unauthorized.json");
+        let mut text = std::fs::read_to_string(&state.map_path).unwrap();
+        let final_needle = "\"final_primary\": \"zetaKeptName\"";
+        let action_needle = "\"final_source\": \"user_defined\",\n      \"action\": \"preserve\"";
+        assert_eq!(text.matches(final_needle).count(), 1);
+        assert_eq!(text.matches(action_needle).count(), 1);
+        text = text.replacen(final_needle, "\"final_primary\": \"zeta_task_fn\"", 1);
+        text = text.replacen(
+            action_needle,
+            "\"final_source\": \"user_defined\",\n      \"action\": \"rename\"",
+            1,
+        );
+        std::fs::write(&unauthorized_path, text).unwrap();
+        let unauthorized = Pass2Kit {
+            map_path: unauthorized_path.clone(),
+            map_hash: blake3_of(&unauthorized_path),
+            kit: state.kit.clone(),
+            functions_path: state.functions_path.clone(),
+            functions_hash: state.functions_hash.clone(),
+            image_hash: state.image_hash.clone(),
+            execution_count: state.execution_count,
+        };
+        let failed = pal_apply_symbols(&home, &unauthorized, None, false);
+        assert!(
+            failed.contains("registry preserved primary is not replaceable"),
+            "an unauthorized disposition was not rejected:\n{failed}"
+        );
+        let inspected = pal_apply(&home, &state.kit, Some("InspectApplied.java"));
+        assert!(
+            inspected.contains("InspectApplied: ok"),
+            "the rejected map disturbed the applied state:\n{inspected}"
+        );
+        let _ = std::fs::remove_dir_all(&state.kit.dir);
+    }
+    let _ = std::fs::remove_dir_all(&script_staging);
+}
+
+/// The v3 marker binds PAL and map exactly: pass 1 writes
+/// `pal_tasks=<identity>`/`symbol_map=none`, pass 2 the exact map BLAKE3, and
+/// the stale-input rejections (wrong map hash, map-less run under a set
+/// property, identity none under an applied state) never publish.
+#[test]
+fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let image = pal_fixture::craft_main_image();
+    let state = build_pal_pass2_kit(
+        &home,
+        "export_marker",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        None,
+        true,
+    );
+
+    // Pass 1 marker: identity bound, no symbol map.
+    assert_eq!(
+        std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(&state.kit.identity, "none")
+    );
+
+    // Pass 2: ApplySymbols then the map-bound export; the marker now carries
+    // the exact lowercase map BLAKE3.
+    let applied = pal_apply_symbols(&home, &state, None, true);
+    assert!(
+        !applied.contains("REPORT SCRIPT ERROR"),
+        "pass-2 export failed:\n{applied}"
+    );
+    assert!(applied.contains("ApplySymbols: image=02_MAIN applied"));
+    assert_eq!(
+        std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &state.kit.identity,
+            &state.map_hash
+        )
+    );
+    let export_dir = state.kit.out.join("export/02_MAIN");
+    for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+        assert!(export_dir.join(name).is_file(), "{name} missing");
+    }
+
+    // A wrong expected map hash never publishes a new export.
+    let map_arg = state.map_path.to_string_lossy().into_owned();
+    let wrong = pal_export_only(&home, &state, Some((&map_arg, &"0".repeat(64))));
+    assert!(
+        wrong.contains("REPORT SCRIPT ERROR")
+            && wrong.contains("symbol map BLAKE3 does not match the expected value"),
+        "a stale map hash was not rejected:\n{wrong}"
+    );
+    // A map-less export under the set property is rejected.
+    let dashed = pal_export_only(&home, &state, None);
+    assert!(
+        dashed.contains("REPORT SCRIPT ERROR")
+            && dashed.contains("requires the SymbolPass2 property absent"),
+        "a pass-1 export under a set property was not rejected:\n{dashed}"
+    );
+    // Identity none under the applied PAL state scans every detectable
+    // surface and fails.
+    let none_identity = {
+        let kit = &state.kit;
+        let args: Vec<String> = [
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+            kit.out
+                .join("export/02_MAIN")
+                .to_string_lossy()
+                .into_owned(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".to_string(),
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "none".to_string(),
+        ]
+        .into();
+        pal_headless(&home, kit, &args)
+    };
+    assert!(
+        none_identity.contains("REPORT SCRIPT ERROR")
+            && none_identity.contains("PAL property is not absent or none"),
+        "identity none did not scan the applied surfaces:\n{none_identity}"
+    );
+    // None of the rejected runs republished the export: the marker still
+    // binds the pass-2 values.
+    assert_eq!(
+        std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &state.kit.identity,
+            &state.map_hash
+        )
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+}
+
+/// The export postflight re-validates the complete PAL state: a removed task
+/// function, a deleted reserved label, a tampered registry, an edited owned
+/// comment, a renamed task primary, an orphan reserved label, a drifted
+/// non-task body under the pass-2 comparison, and the task-body/deadline
+/// limits each fail before any output is published.
+#[test]
+fn export_pal_postflight_rejects_program_drift() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let image = pal_fixture::craft_main_image();
+    let corrupt_dir = {
+        let staging =
+            std::env::temp_dir().join(format!("pme_task11_corrupt_{}", std::process::id()));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("SeedCorrupt.java"), PAL_SEED_CORRUPT_JAVA).unwrap();
+        staging
+    };
+
+    // Each corruption mutates the applied state in its own kit; every run
+    // drives the pass-1-style export (identity present, no map).
+    for (case, mode, expected) in [
+        (
+            "remove_function",
+            "remove_function",
+            "no function at its entry",
+        ),
+        (
+            "delete_label",
+            "delete_label",
+            "the reserved label set does not match",
+        ),
+        (
+            "tamper_registry",
+            "tamper_registry",
+            "registry entry binds a different manifest",
+        ),
+        (
+            "edit_comment",
+            "edit_comment",
+            "owned comment digest does not match the registry",
+        ),
+        (
+            "rename_primary",
+            "rename_primary",
+            "primary symbol binding does not match the registry",
+        ),
+        (
+            "orphan_label",
+            "orphan_label",
+            "an unregistered reserved label is stale state",
+        ),
+    ] {
+        let state = build_pal_pass2_kit(
+            &home,
+            &format!("drift_{case}"),
+            &image,
+            |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+            None,
+            true,
+        );
+        std::fs::copy(
+            corrupt_dir.join("SeedCorrupt.java"),
+            state.kit.out.join("scripts/SeedCorrupt.java"),
+        )
+        .unwrap();
+        let kit = &state.kit;
+        let failed = pal_headless(
+            &home,
+            kit,
+            &[
+                "-process".to_string(),
+                "02_MAIN".to_string(),
+                "-noanalysis".to_string(),
+                "-scriptPath".to_string(),
+                kit.out.join("scripts").to_string_lossy().into_owned(),
+                "-postScript".to_string(),
+                "SeedCorrupt.java".to_string(),
+                mode.to_string(),
+                "-postScript".to_string(),
+                "ExportDecomp.java".to_string(),
+                kit.out
+                    .join("export/02_MAIN")
+                    .to_string_lossy()
+                    .into_owned(),
+                kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".to_string(),
+                kit.identity.clone(),
+                kit.manifest_path.to_string_lossy().into_owned(),
+                kit.scatter_path.to_string_lossy().into_owned(),
+                "-".to_string(),
+                "none".to_string(),
+            ],
+        );
+        assert!(
+            failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
+            "corruption {case} missed {expected:?}:\n{failed}"
+        );
+        let _ = std::fs::remove_dir_all(&state.kit.dir);
+    }
+
+    // A drifted body under the pass-2 comparison: seed a fresh non-task
+    // function after pass 2; every current function must match the map
+    // exactly, so the export fails.
+    let state = build_pal_pass2_kit(
+        &home,
+        "drift_pass2_body",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        None,
+        true,
+    );
+    std::fs::write(
+        state.kit.out.join("scripts/SeedExtraFunction.java"),
+        r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+
+public class SeedExtraFunction extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        disassemble(toAddr(0x4001_0500L));
+        Function created = createFunction(toAddr(0x4001_0500L), "drift_extra_fn");
+        if (created == null) {
+            throw new AssertionError("extra-function seed failed");
+        }
+        created.getSymbol().setSource(SourceType.USER_DEFINED);
+        System.out.println("SeedExtraFunction: ok");
+    }
+}
+"#,
+    )
+    .unwrap();
+    let applied = pal_apply_symbols(&home, &state, None, false);
+    assert!(
+        !applied.contains("REPORT SCRIPT ERROR"),
+        "pass-2 application failed:\n{applied}"
+    );
+    let seeded = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedExtraFunction.java".to_string(),
+        ],
+    );
+    assert!(
+        seeded.contains("SeedExtraFunction: ok"),
+        "extra-function seed did not run:\n{seeded}"
+    );
+    let map_arg = state.map_path.to_string_lossy().into_owned();
+    let map_hash = state.map_hash.clone();
+    let failed = pal_export_only(&home, &state, Some((&map_arg, &map_hash)));
+    assert!(
+        failed.contains("REPORT SCRIPT ERROR")
+            && (failed.contains("no pass-1 execution identity")
+                || failed.contains("drifted from the pass-1 identity")),
+        "a drifted body was not rejected under the pass-2 comparison:\n{failed}"
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+
+    // The task-body and deadline limits fail before publication (patched
+    // constants; the program state itself is pristine).
+    for (case, patches, expected) in [
+        (
+            "body_limit",
+            [(
+                "TASK_BODY_BYTES = PalTasksSupport.MAX_TASK_BODY_BYTES",
+                "TASK_BODY_BYTES = 4L",
+            )],
+            "task-function-body bytes exceed",
+        ),
+        (
+            "deadline",
+            [(
+                "VALIDATION_BUDGET_MS =\n            PalTasksSupport.EXPORT_VALIDATION_BUDGET_MS",
+                "VALIDATION_BUDGET_MS = 1L",
+            )],
+            "deadline was exhausted",
+        ),
+    ] {
+        let state = build_pal_pass2_kit(
+            &home,
+            &format!("limit_{case}"),
+            &image,
+            |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+            None,
+            true,
+        );
+        let script_path = state.kit.out.join("scripts/ExportDecomp.java");
+        let mut script = std::fs::read_to_string(&script_path).unwrap();
+        for (from, to) in patches {
+            assert_eq!(
+                script.matches(from).count(),
+                1,
+                "patch anchor {from:?} must be unique"
+            );
+            script = script.replacen(from, to, 1);
+        }
+        if case == "deadline" {
+            // Burn the 1ms budget before the first deadline check.
+            script = script.replacen(
+                "        deadline = Math.addExact(System.currentTimeMillis(), VALIDATION_BUDGET_MS);",
+                concat!(
+                    "        deadline = Math.addExact(System.currentTimeMillis(), VALIDATION_BUDGET_MS);",
+                    "\n        Thread.sleep(50);"
+                ),
+                1,
+            );
+        }
+        std::fs::write(&script_path, script).unwrap();
+        let kit = &state.kit;
+        let failed = pal_headless(
+            &home,
+            kit,
+            &[
+                "-process".to_string(),
+                "02_MAIN".to_string(),
+                "-noanalysis".to_string(),
+                "-scriptPath".to_string(),
+                kit.out.join("scripts").to_string_lossy().into_owned(),
+                "-preScript".to_string(),
+                "ApplyPalTasks.java".to_string(),
+                kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".to_string(),
+                kit.manifest_path.to_string_lossy().into_owned(),
+                kit.scatter_path.to_string_lossy().into_owned(),
+                "-postScript".to_string(),
+                "ExportDecomp.java".to_string(),
+                kit.out
+                    .join("export/02_MAIN")
+                    .to_string_lossy()
+                    .into_owned(),
+                kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".to_string(),
+                kit.identity.clone(),
+                kit.manifest_path.to_string_lossy().into_owned(),
+                kit.scatter_path.to_string_lossy().into_owned(),
+                "-".to_string(),
+                "none".to_string(),
+            ],
+        );
+        assert!(
+            failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
+            "limit {case} missed {expected:?}:\n{failed}"
+        );
+        let _ = std::fs::remove_dir_all(&state.kit.dir);
+    }
+    let _ = std::fs::remove_dir_all(&corrupt_dir);
 }

@@ -46,7 +46,18 @@ fn test_runtime() -> RuntimeImage<'static> {
 /// (`-process`) so the two argument vectors never drift on a rename.
 const GHIDRA_PROJECT_NAME: &str = "pixel-modem";
 const GHIDRA_EXPORT_FILES: [&str; 3] = ["functions.json", "disasm.lst", "decompiled.c"];
-const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v1";
+const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v3";
+
+/// The exact v3 completion marker bytes: three lines, each newline-terminated.
+/// `pal_identity` is the PAL task identity or `none`; `symbol_map` is the
+/// lowercase pass-2 symbol-map BLAKE3 or `none`. Both Rust and the generated
+/// `run_ghidra.sh` construct these bytes from current generation state and
+/// compare the marker exactly — it is a postflight attestation, not an echo
+/// of the program property.
+pub fn export_completion_marker(pal_identity: &str, symbol_map: &str) -> Vec<u8> {
+    format!("{GHIDRA_EXPORT_COMPLETION}\npal_tasks={pal_identity}\nsymbol_map={symbol_map}\n")
+        .into_bytes()
+}
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -146,6 +157,14 @@ pub fn build_load_spec(
     })
 }
 
+/// A scheduled PAL invocation for one image: the task-manifest path relative
+/// to `root` plus the exact expected PAL identity the scripts must agree on.
+#[derive(Debug, Clone, Copy)]
+pub struct PalScriptPlan<'a> {
+    pub manifest: &'a str,
+    pub identity: &'a str,
+}
+
 /// The `analyzeHeadless` argument vector for one image — the single source of
 /// truth used both to serialize `run_ghidra.sh` and to spawn under `--run`.
 /// `root` is the path prefix (an absolute out dir for `--run`, or `$HERE` in the
@@ -158,11 +177,12 @@ pub fn build_load_spec(
 /// `none` (the PAL task-inventory generation is the only future supplier of a
 /// present identity).
 ///
-/// `pal_task_map` is the relative PAL task-manifest path for this image. When
+/// `pal` schedules the PAL task-manifest application for this image. When
 /// present the pre-script order is `ApplyScatterLoad`, `ApplyPalTasks`,
-/// `TameAnalysis`; a PAL map without a scatter map passes `-` as
-/// `ApplyPalTasks`'s scatter argument. Production callers stay on `None`
-/// (identity `none`) until generation state is coherent.
+/// `TameAnalysis`, and `TameAnalysis`/`ExportDecomp` receive the plan's
+/// identity; a PAL map without a scatter map passes `-` as `ApplyPalTasks`'s
+/// scatter argument. Production callers stay on `None` (identity `none`) until
+/// generation state is coherent.
 #[allow(clippy::too_many_arguments)]
 fn headless_args(
     root: &str,
@@ -170,7 +190,7 @@ fn headless_args(
     processor: &str,
     base_addr: u32,
     runtime_load_map: Option<&str>,
-    pal_task_map: Option<&str>,
+    pal: Option<PalScriptPlan<'_>>,
     thumb_regions: &[(u32, u32)],
     mode: &str,
 ) -> Vec<String> {
@@ -197,7 +217,7 @@ fn headless_args(
             format!("{root}/{relative_path}"),
         ]);
     }
-    if let Some(relative_path) = pal_task_map {
+    if let Some(plan) = pal {
         let scatter_argument = runtime_load_map
             .map(|scatter_relative| format!("{root}/{scatter_relative}"))
             .unwrap_or_else(|| "-".to_string());
@@ -206,7 +226,7 @@ fn headless_args(
             "ApplyPalTasks.java".to_string(),
             root.to_string(),
             label.to_string(),
-            format!("{root}/{relative_path}"),
+            format!("{root}/{}", plan.manifest),
             scatter_argument,
         ]);
     }
@@ -219,17 +239,42 @@ fn headless_args(
         "-preScript".to_string(),
         "TameAnalysis.java".to_string(),
         mode.to_string(),
-        "none".to_string(),
+        pal.map(|plan| plan.identity.to_string())
+            .unwrap_or_else(|| "none".to_string()),
     ]);
     if mode == "datamark" {
         for (addr, len) in thumb_regions {
             args.push(format!("{addr:08x}:{len:x}"));
         }
     }
+    // ExportDecomp (post): the strict eight-argument contract — output
+    // directory, canonical kit root, image label, PAL identity (`none` for
+    // every current caller), task manifest (`-` under the same nullability
+    // rule as ApplyPalTasks), scatter manifest when ApplyScatterLoad was
+    // scheduled (`-` otherwise), pass-1 symbol map (`-` for pass 1 and
+    // generated single-pass kits), and the expected map BLAKE3 (literal
+    // `none` with `-`).
+    let scatter_argument = runtime_load_map
+        .map(|scatter_relative| format!("{root}/{scatter_relative}"))
+        .unwrap_or_else(|| "-".to_string());
+    let (pal_identity, pal_manifest) = match pal {
+        Some(plan) => (
+            plan.identity.to_string(),
+            format!("{root}/{}", plan.manifest),
+        ),
+        None => ("none".to_string(), "-".to_string()),
+    };
     args.extend([
         "-postScript".to_string(),
         "ExportDecomp.java".to_string(),
         format!("{root}/export/{label}"),
+        root.to_string(),
+        label.to_string(),
+        pal_identity,
+        pal_manifest,
+        scatter_argument,
+        "-".to_string(),
+        "none".to_string(),
         "-overwrite".to_string(),
     ]);
     args
@@ -874,7 +919,11 @@ impl GhidraExportRun {
         }
     }
 
-    fn validate_current(&self) -> std::result::Result<(), String> {
+    fn validate_current(
+        &self,
+        pal_identity: &str,
+        symbol_map: &str,
+    ) -> std::result::Result<(), String> {
         for name in GHIDRA_EXPORT_FILES {
             let path = self.directory.join(name);
             let metadata = std::fs::symlink_metadata(&path)
@@ -887,8 +936,8 @@ impl GhidraExportRun {
         }
         let marker = std::fs::read(&self.completion)
             .map_err(|error| format!("current Ghidra export lacks completion marker: {error}"))?;
-        let expected = format!("{GHIDRA_EXPORT_COMPLETION}\n");
-        if marker != expected.as_bytes() {
+        let expected = export_completion_marker(pal_identity, symbol_map);
+        if marker != expected {
             return Err("current Ghidra export has an invalid completion marker".to_string());
         }
         Ok(())
@@ -1247,9 +1296,18 @@ fn write_run_script(
                 shell_arg(&format!("{export_dir}/{name}"))
             ));
         }
+        // The exact three-line v3 marker, constructed from the same current
+        // generation state (a PAL-none single-pass kit) the script compares
+        // against — no map-v1/marker-v1 compatibility branch remains.
+        let marker = export_completion_marker("none", "none");
+        let marker_lines: Vec<String> = String::from_utf8(marker)
+            .expect("the completion marker is ASCII")
+            .lines()
+            .map(shell_quote)
+            .collect();
         s.push_str(&format!(
             " && printf '%s\\n' {} | cmp -s - {}; then\n",
-            shell_quote(GHIDRA_EXPORT_COMPLETION),
+            marker_lines.join(" "),
             shell_arg(&completion)
         ));
         s.push_str("  :\n");
@@ -1763,13 +1821,17 @@ fn run_report_impl(
                 )
             };
             let mut outcome = match status.as_ref() {
-                Some(status) if status.success() => match export_attempt.validate_current() {
-                    Ok(()) => ImageOutcome::Analyzed(count_functions(&export_attempt.directory)),
-                    Err(error) => {
-                        tracing::warn!("ghidra: {label} current export is incomplete: {error}");
-                        ImageOutcome::Failed(-1)
+                Some(status) if status.success() => {
+                    match export_attempt.validate_current("none", "none") {
+                        Ok(()) => {
+                            ImageOutcome::Analyzed(count_functions(&export_attempt.directory))
+                        }
+                        Err(error) => {
+                            tracing::warn!("ghidra: {label} current export is incomplete: {error}");
+                            ImageOutcome::Failed(-1)
+                        }
                     }
-                },
+                }
                 Some(status) => {
                     let code = status.code().unwrap_or(-1);
                     tracing::warn!("ghidra: {label} failed (analyzeHeadless exit {code})");
@@ -2101,12 +2163,145 @@ pub(crate) fn discover_configured_rizin(
     }
 }
 
-/// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
-/// `-process` mode on the existing project so there is no re-import and no
-/// re-analysis: the requested `ApplySymbols.java`, `ApplyGlobals.java`, and
-/// `ApplyGlobalTypes.java` scripts run in that order, then `ExportDecomp.java`
-/// regenerates the export with applied function names, global names, and
-/// global types baked in.
+/// A canonical retained file (absolute path + the BLAKE3 the driver computed
+/// over its exact bytes at preparation time).
+#[derive(Debug, Clone)]
+pub struct RetainedPass2File {
+    absolute_path: PathBuf,
+    blake3: String,
+}
+
+impl RetainedPass2File {
+    pub fn prepare(path: &Path, what: &str) -> Result<Self> {
+        let absolute_path = std::fs::canonicalize(path)?;
+        if !absolute_path.is_file() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "{what} is not a regular file: {}",
+                absolute_path.display()
+            )));
+        }
+        let bytes = std::fs::read(&absolute_path)?;
+        Ok(Self {
+            absolute_path,
+            blake3: crate::manifest::blake3_bytes(&bytes),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.absolute_path
+    }
+
+    pub fn blake3(&self) -> &str {
+        &self.blake3
+    }
+
+    fn validate_for_spawn(&self, what: &str) -> Result<()> {
+        if !self.absolute_path.is_absolute() || !self.absolute_path.is_file() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "{what} is no longer an absolute regular file: {}",
+                self.absolute_path.display()
+            )));
+        }
+        let canonical = std::fs::canonicalize(&self.absolute_path)?;
+        if canonical != self.absolute_path {
+            return Err(Error::DecomposeIncomplete(format!(
+                "{what} canonical identity changed: {} -> {}",
+                self.absolute_path.display(),
+                canonical.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The authenticated function-map input for pass 2: the strict v2 symbol map
+/// and the retained pass-1 files it binds, plus the image identity the
+/// ten-argument `ApplySymbols` and eight-argument `ExportDecomp` contracts
+/// consume. The PAL identity and its manifest paths live on
+/// [`Pass2Input`] — a pass-2 run may carry PAL state without a function map.
+/// The driver computes every expected hash from retained current inputs
+/// before spawning pass 2.
+#[derive(Debug, Clone)]
+pub struct PreparedSymbolPass2Map {
+    map: RetainedPass2File,
+    functions: RetainedPass2File,
+    image: RetainedPass2File,
+    image_label: String,
+    execution_count: NonZeroUsize,
+}
+
+impl PreparedSymbolPass2Map {
+    pub fn new(
+        map_path: &Path,
+        functions_path: &Path,
+        image_path: &Path,
+        image_label: &str,
+        execution_count: NonZeroUsize,
+    ) -> Result<Self> {
+        Ok(Self {
+            map: RetainedPass2File::prepare(map_path, "pass-2 symbol map")?,
+            functions: RetainedPass2File::prepare(
+                functions_path,
+                "retained pass-1 functions.json",
+            )?,
+            image: RetainedPass2File::prepare(image_path, "raw image")?,
+            image_label: image_label.to_string(),
+            execution_count,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.map.path()
+    }
+
+    pub fn map_blake3(&self) -> &str {
+        self.map.blake3()
+    }
+
+    pub fn functions_blake3(&self) -> &str {
+        self.functions.blake3()
+    }
+
+    pub fn image_blake3(&self) -> &str {
+        self.image.blake3()
+    }
+
+    /// The image label this map was built for; the spawn boundary refuses to
+    /// mix maps across labels.
+    pub fn image_label(&self) -> &str {
+        &self.image_label
+    }
+
+    /// The number of accepted Ghidra executions the map covers (also the
+    /// decision count).
+    pub fn execution_count(&self) -> usize {
+        self.execution_count.get()
+    }
+
+    /// The exact `PixelModemExtractor.SymbolPass2` property value
+    /// `ApplySymbols` sets on success:
+    /// `v2:<symbol-map-blake3>:<pass1-functions-blake3>:<execution-count>`.
+    pub fn pass2_property(&self) -> String {
+        format!(
+            "v2:{}:{}:{}",
+            self.map.blake3(),
+            self.functions.blake3(),
+            self.execution_count.get()
+        )
+    }
+
+    fn validate_for_spawn(&self) -> Result<()> {
+        self.map.validate_for_spawn("pass-2 symbol map")?;
+        self.functions
+            .validate_for_spawn("retained pass-1 functions.json")?;
+        self.image.validate_for_spawn("raw image")?;
+        Ok(())
+    }
+}
+
+/// The simpler path/count map type consumed by `ApplyGlobals` and
+/// `ApplyGlobalTypes`; the authenticated function-map contract above is
+/// deliberately not forced onto those unrelated maps.
 #[derive(Debug, Clone)]
 pub struct PreparedPass2Map {
     absolute_path: PathBuf,
@@ -2157,11 +2352,41 @@ impl PreparedPass2Map {
 
 #[derive(Debug, Clone, Default)]
 pub struct Pass2Input {
-    pub function_map: Option<PreparedPass2Map>,
+    pub function_map: Option<PreparedSymbolPass2Map>,
     pub global_map: Option<PreparedPass2Map>,
     pub global_types_map: Option<PreparedPass2Map>,
+    /// The PAL identity the scripts must agree on (`none` for every current
+    /// production run) plus the canonical task/scatter manifest paths when a
+    /// PAL state is present.
+    pub pal_identity: String,
+    pub pal_manifest: Option<PathBuf>,
+    pub scatter_manifest: Option<PathBuf>,
 }
 
+impl Pass2Input {
+    fn pal_identity_or_none(&self) -> &str {
+        if self.pal_identity.is_empty() {
+            "none"
+        } else {
+            &self.pal_identity
+        }
+    }
+}
+
+/// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
+/// `-process` mode on the existing project so there is no re-import and no
+/// re-analysis: the requested `ApplySymbols.java`, `ApplyGlobals.java`, and
+/// `ApplyGlobalTypes.java` scripts run in that order, then `ExportDecomp.java`
+/// regenerates the export with applied function names, global names, and
+/// global types baked in.
+///
+/// `ApplySymbols` consumes exactly ten arguments (kit root, image label,
+/// image BLAKE3, PAL identity, task manifest, scatter manifest, retained
+/// pass-1 functions.json, its BLAKE3, symbol map, its BLAKE3) and
+/// `ExportDecomp` exactly eight (output directory, kit root, image label,
+/// PAL identity, task manifest, scatter manifest, pass-1 symbol map, expected
+/// map BLAKE3); both hashes are computed by the driver from retained current
+/// inputs before the spawn.
 fn headless_process_args(
     root: &str,
     label: &str,
@@ -2184,6 +2409,18 @@ fn headless_process_args(
         map.validate_for_spawn()?;
     }
 
+    let pal_identity = input.pal_identity_or_none().to_string();
+    let pal_manifest = input
+        .pal_manifest
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_string());
+    let scatter_manifest = input
+        .scatter_manifest
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_string());
+
     let mut args = vec![
         format!("{root}/ghidra_project"),
         GHIDRA_PROJECT_NAME.to_string(),
@@ -2194,10 +2431,25 @@ fn headless_process_args(
         format!("{root}/scripts"),
     ];
     if let Some(map) = function_map {
+        if map.image_label() != label {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 symbol map was built for image {:?}, not {label:?}",
+                map.image_label()
+            )));
+        }
         args.extend([
             "-postScript".to_string(),
             "ApplySymbols.java".to_string(),
+            root.to_string(),
+            map.image_label().to_string(),
+            map.image_blake3().to_string(),
+            pal_identity.clone(),
+            pal_manifest.clone(),
+            scatter_manifest.clone(),
+            map.functions.path().to_string_lossy().into_owned(),
+            map.functions_blake3().to_string(),
             map.path().to_string_lossy().into_owned(),
+            map.map_blake3().to_string(),
         ]);
     }
     if let Some(map) = global_map {
@@ -2214,10 +2466,23 @@ fn headless_process_args(
             map.path().to_string_lossy().into_owned(),
         ]);
     }
+    let map_argument = function_map
+        .map(|map| map.path().to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_string());
+    let map_hash = function_map
+        .map(|map| map.map_blake3().to_string())
+        .unwrap_or_else(|| "none".to_string());
     args.extend([
         "-postScript".to_string(),
         "ExportDecomp.java".to_string(),
         format!("{root}/export/{label}"),
+        root.to_string(),
+        label.to_string(),
+        pal_identity,
+        pal_manifest,
+        scatter_manifest,
+        map_argument,
+        map_hash,
     ]);
     Ok(Some(args))
 }
@@ -2591,7 +2856,13 @@ pub fn run_two_pass(
             }
         };
         if output.status.success() {
-            if let Err(error) = export_attempt.validate_current() {
+            let symbol_map_hash = input
+                .function_map
+                .as_ref()
+                .map(|map| map.map_blake3().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let pal_identity = input.pal_identity_or_none().to_string();
+            if let Err(error) = export_attempt.validate_current(&pal_identity, &symbol_map_hash) {
                 let reason = format!("incomplete current export: {error}");
                 ir.pass2_error = Some(reason.clone());
                 outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
@@ -3431,29 +3702,39 @@ mod tests {
         let headless = home.join("support/analyzeHeadless");
         write_executable(
             &headless,
-            &format!(
-                r#"#!/bin/sh
+            r#"#!/bin/sh
 set -eu
 export_dir=
+pal_identity=none
+map_hash=none
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "ExportDecomp.java" ]; then
     shift
     export_dir=$1
+    shift
+    shift
+    shift
+    pal_identity=$1
+    shift
+    shift
+    shift
+    shift
+    map_hash=$1
     break
   fi
   shift
 done
 test -n "$export_dir"
 mkdir -p "$export_dir"
-printf '%s\n' '[]' > "$export_dir/functions.json"
+printf '%s
+' '[]' > "$export_dir/functions.json"
 : > "$export_dir/disasm.lst"
 : > "$export_dir/decompiled.c"
 export_root=$(dirname "$export_dir")
 label=$(basename "$export_dir")
-printf '%s\n' '{}' > "$export_root/$label.complete"
+printf '%s
+' 'pixel-modem-extractor-ghidra-export-v3' "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
 "#,
-                GHIDRA_EXPORT_COMPLETION
-            ),
         );
     }
 
@@ -3735,7 +4016,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn pal_pre_script_order_and_nullability() {
-        let pal_map = "pal_tasks/02_MAIN/tasks.json";
+        let pal_plan = PalScriptPlan {
+            manifest: "pal_tasks/02_MAIN/tasks.json",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+        };
         // Present PAL map plus a scatter map: the pre-script order is
         // ApplyScatterLoad, ApplyPalTasks, TameAnalysis, and ApplyPalTasks
         // consumes the four canonical arguments verbatim.
@@ -3745,7 +4029,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             SCATTER_BASE,
             Some("scatter/02_MAIN/load_map.json"),
-            Some(pal_map),
+            Some(pal_plan),
             &[],
             "tighten",
         );
@@ -3782,7 +4066,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             SCATTER_BASE,
             None,
-            Some(pal_map),
+            Some(pal_plan),
             &[],
             "tighten",
         );
@@ -3796,6 +4080,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .unwrap();
         assert!(pal_only_at < tame_only_at);
         assert!(!pal_only.iter().any(|arg| arg == "ApplyScatterLoad.java"));
+        assert_eq!(
+            pal_only[tame_only_at + 2],
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
+        );
         assert_eq!(pal_only[pal_only_at + 4], "-");
 
         // Current-none paths omit ApplyPalTasks entirely.
@@ -3817,13 +4105,17 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // --no-thumb-decompile suppresses dense-Thumb discovery, not
         // firmware-authoritative task entries: datamark mode still schedules
         // ApplyPalTasks ahead of TameAnalysis, with `-` when scatter is absent.
+        let plan = PalScriptPlan {
+            manifest: "pal_tasks/02_MAIN/tasks.json",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+        };
         let args = headless_args(
             "$HERE",
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
             None,
-            Some("pal_tasks/02_MAIN/tasks.json"),
+            Some(plan),
             &[(0x40e12000, 0x100000)],
             "datamark",
         );
@@ -3842,7 +4134,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert_eq!(args[pal_at + 4], "-");
         assert_eq!(args[tame_at + 1], "datamark");
-        assert_eq!(args[tame_at + 2], "none");
+        assert_eq!(
+            args[tame_at + 2],
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
+        );
         assert!(args[tame_at + 3..].iter().any(|a| a == "40e12000:100000"));
     }
 
@@ -3858,17 +4153,26 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         let function_path = root.join("functions.json");
         let global_path = root.join("globals.json");
+        let map_path = root.join("symbol_map.json");
+        let image_path = root.join("02_MAIN.bin");
         std::fs::write(&function_path, b"functions").unwrap();
         std::fs::write(&global_path, b"globals").unwrap();
+        std::fs::write(&map_path, b"map").unwrap();
+        std::fs::write(&image_path, b"image").unwrap();
         let relative_function_path = relative_spelling_from_current_dir(&function_path);
         let relative_global_path = relative_spelling_from_current_dir(&global_path);
+        let relative_map_path = relative_spelling_from_current_dir(&map_path);
         assert!(relative_function_path.is_relative());
         assert!(relative_global_path.is_relative());
+        assert!(relative_map_path.is_relative());
 
         let input = Pass2Input {
             function_map: Some(
-                PreparedPass2Map::new(
+                PreparedSymbolPass2Map::new(
+                    &relative_map_path,
                     &relative_function_path,
+                    &image_path,
+                    "02_MAIN",
                     std::num::NonZeroUsize::new(1).unwrap(),
                 )
                 .unwrap(),
@@ -3881,15 +4185,19 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .unwrap(),
             ),
             global_types_map: None,
+            ..Pass2Input::default()
         };
         let args = headless_process_args("/out", "02_MAIN", &input)
             .unwrap()
             .expect("typed maps schedule pass two");
-        let function_argument = &args[args
+        // ApplySymbols' seventh argument is the retained functions.json; the
+        // map itself is the ninth.
+        let apply_at = args
             .iter()
             .position(|arg| arg == "ApplySymbols.java")
-            .unwrap()
-            + 1];
+            .unwrap();
+        let function_argument = &args[apply_at + 7];
+        let map_argument = &args[apply_at + 9];
         let global_argument = &args[args
             .iter()
             .position(|arg| arg == "ApplyGlobals.java")
@@ -3901,12 +4209,18 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             std::fs::canonicalize(&function_path).unwrap()
         );
         assert_eq!(
+            Path::new(map_argument),
+            std::fs::canonicalize(&map_path).unwrap()
+        );
+        assert_eq!(
             Path::new(global_argument),
             std::fs::canonicalize(&global_path).unwrap()
         );
         assert!(Path::new(function_argument).is_absolute());
+        assert!(Path::new(map_argument).is_absolute());
         assert!(Path::new(global_argument).is_absolute());
         assert!(Path::new(function_argument).is_file());
+        assert!(Path::new(map_argument).is_file());
         assert!(Path::new(global_argument).is_file());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3928,7 +4242,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn validated_headless_process_args_rejects_late_disappearance() {
-        for missing_map in ["functions.json", "globals.json"] {
+        for missing_map in ["functions.json", "globals.json", "symbol_map.json"] {
             let root = std::env::temp_dir().join(format!(
                 "pmetask8rlatemap{}{}",
                 missing_map.trim_end_matches(".json"),
@@ -3938,12 +4252,19 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             std::fs::create_dir_all(&root).unwrap();
             let function_path = root.join("functions.json");
             let global_path = root.join("globals.json");
+            let map_path = root.join("symbol_map.json");
+            let image_path = root.join("02_MAIN.bin");
             std::fs::write(&function_path, b"functions").unwrap();
             std::fs::write(&global_path, b"globals").unwrap();
+            std::fs::write(&map_path, b"map").unwrap();
+            std::fs::write(&image_path, b"image").unwrap();
             let input = Pass2Input {
                 function_map: Some(
-                    PreparedPass2Map::new(
+                    PreparedSymbolPass2Map::new(
+                        &map_path,
                         &relative_spelling_from_current_dir(&function_path),
+                        &image_path,
+                        "02_MAIN",
                         NonZeroUsize::new(1).unwrap(),
                     )
                     .unwrap(),
@@ -3956,6 +4277,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     .unwrap(),
                 ),
                 global_types_map: None,
+                ..Pass2Input::default()
             };
             std::fs::remove_file(root.join(missing_map)).unwrap();
             let mut spawn_called = false;
@@ -3970,14 +4292,11 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 !spawn_called,
                 "invalid combined input reached the spawn boundary"
             );
-            assert!(
-                root.join(if missing_map == "functions.json" {
-                    "globals.json"
-                } else {
-                    "functions.json"
-                })
-                .is_file()
-            );
+            for survivor in ["functions.json", "globals.json", "symbol_map.json"] {
+                if survivor != missing_map {
+                    assert!(root.join(survivor).is_file());
+                }
+            }
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -4021,87 +4340,289 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         Some(PreparedPass2Map::new(&path, count).unwrap())
     }
 
+    /// A `PreparedSymbolPass2Map` over three dummy retained files; the hashes
+    /// are computed from the dummy bytes so argv pins can assert them.
+    fn pass2_symbol_test_map(tag: &str, label: &str) -> PreparedSymbolPass2Map {
+        let dir = PathBuf::from("target").join(format!("pme_task11_pass2_args_{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let map_path = dir.join(format!("{tag}_map.json"));
+        let functions_path = dir.join(format!("{tag}_functions.json"));
+        let image_path = dir.join(format!("{tag}_image.bin"));
+        std::fs::write(&map_path, format!("{tag} map bytes")).unwrap();
+        std::fs::write(&functions_path, format!("{tag} functions bytes")).unwrap();
+        std::fs::write(&image_path, format!("{tag} image bytes")).unwrap();
+        PreparedSymbolPass2Map::new(
+            &map_path,
+            &functions_path,
+            &image_path,
+            label,
+            NonZeroUsize::new(3).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn pass2_input(function_count: usize, global_count: usize) -> Pass2Input {
         Pass2Input {
-            function_map: pass2_test_map("functions.json", function_count),
+            function_map: (function_count > 0).then(|| pass2_symbol_test_map("input", "02_MAIN")),
             global_map: pass2_test_map("globals.json", global_count),
             global_types_map: None,
+            ..Pass2Input::default()
         }
     }
 
     #[test]
-    fn headless_process_args_wires_functions_then_globals_then_export() {
-        let input = pass2_input(1, 1);
+    fn pass2_args_wire_ten_apply_symbols_and_eight_export_arguments() {
+        let symbol_map = pass2_symbol_test_map("wired", "02_MAIN");
+        let input = Pass2Input {
+            function_map: Some(symbol_map.clone()),
+            global_map: pass2_test_map("globals.json", 1),
+            global_types_map: None,
+            ..Pass2Input::default()
+        };
         let args = headless_process_args("/out", "02_MAIN", &input)
             .unwrap()
             .expect("non-empty prepared input must invoke pass two");
-        let function_path = input
-            .function_map
-            .as_ref()
-            .unwrap()
-            .path()
-            .to_string_lossy();
-        let global_path = input.global_map.as_ref().unwrap().path().to_string_lossy();
+        let functions_path = symbol_map.functions.path().to_string_lossy().into_owned();
+        let map_path = symbol_map.path().to_string_lossy().into_owned();
 
+        let apply_at = args
+            .iter()
+            .position(|arg| arg == "ApplySymbols.java")
+            .unwrap();
+        let expected_apply = [
+            "/out",
+            "02_MAIN",
+            symbol_map.image_blake3(),
+            "none",
+            "-",
+            "-",
+            &functions_path,
+            symbol_map.functions_blake3(),
+            &map_path,
+            symbol_map.map_blake3(),
+        ];
         assert_eq!(
-            args,
-            vec![
-                "/out/ghidra_project",
-                "pixel-modem",
-                "-process",
-                "02_MAIN",
-                "-noanalysis",
-                "-scriptPath",
-                "/out/scripts",
-                "-postScript",
-                "ApplySymbols.java",
-                function_path.as_ref(),
-                "-postScript",
-                "ApplyGlobals.java",
-                global_path.as_ref(),
-                "-postScript",
-                "ExportDecomp.java",
-                "/out/export/02_MAIN",
-            ]
+            &args[apply_at + 1..=apply_at + 10],
+            expected_apply,
+            "ApplySymbols must consume exactly its ten arguments"
+        );
+        assert_eq!(args[apply_at + 11], "-postScript");
+
+        let export_at = args
+            .iter()
+            .position(|arg| arg == "ExportDecomp.java")
+            .unwrap();
+        let expected_export = [
+            "/out/export/02_MAIN",
+            "/out",
+            "02_MAIN",
+            "none",
+            "-",
+            "-",
+            &map_path,
+            symbol_map.map_blake3(),
+        ];
+        assert_eq!(
+            &args[export_at + 1..=export_at + 8],
+            expected_export,
+            "ExportDecomp must consume exactly its eight arguments"
+        );
+        let apply_position = apply_at;
+        assert!(
+            args.iter()
+                .position(|arg| arg == "ApplyGlobals.java")
+                .is_some_and(|globals| globals > apply_position)
+                && apply_position < export_at,
+            "order must be ApplySymbols -> ApplyGlobals -> ExportDecomp"
         );
     }
 
     #[test]
-    fn headless_process_args_wires_functions_only_then_export() {
-        let input = pass2_input(1, 0);
-        let args = headless_process_args("/out", "02_MAIN", &input)
-            .unwrap()
-            .expect("prepared function input must invoke pass two");
-        let function_path = input
-            .function_map
-            .as_ref()
-            .unwrap()
-            .path()
-            .to_string_lossy();
-
-        assert_eq!(
-            args,
-            vec![
-                "/out/ghidra_project",
-                "pixel-modem",
-                "-process",
-                "02_MAIN",
-                "-noanalysis",
-                "-scriptPath",
-                "/out/scripts",
-                "-postScript",
-                "ApplySymbols.java",
-                function_path.as_ref(),
-                "-postScript",
-                "ExportDecomp.java",
-                "/out/export/02_MAIN",
-            ]
+    fn pass2_args_pass1_export_argv_is_dash_none_in_every_mode() {
+        // Pass 1 and the generated single-pass script receive `-`/`none`: no
+        // symbol map, literal `none` hash, identity `none`, manifest `-`; the
+        // scatter argument mirrors ApplyScatterLoad scheduling.
+        for (mode, scatter) in [("tighten", None), ("datamark", None)] {
+            let args = headless_args(
+                "/out",
+                "00_BOOT",
+                "ARM:LE:32:v7",
+                0,
+                scatter,
+                None,
+                &[],
+                mode,
+            );
+            let export_at = args
+                .iter()
+                .position(|arg| arg == "ExportDecomp.java")
+                .unwrap();
+            assert_eq!(
+                &args[export_at + 1..=export_at + 8],
+                [
+                    "/out/export/00_BOOT",
+                    "/out",
+                    "00_BOOT",
+                    "none",
+                    "-",
+                    "-",
+                    "-",
+                    "none",
+                ]
+            );
+        }
+        // A scheduled scatter map is passed through to ExportDecomp.
+        let args = headless_args(
+            "/out",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            SCATTER_BASE,
+            Some("scatter/02_MAIN/load_map.json"),
+            None,
+            &[],
+            "tighten",
         );
-        assert!(!args.iter().any(|argument| argument == "ApplyGlobals.java"));
+        let export_at = args
+            .iter()
+            .position(|arg| arg == "ExportDecomp.java")
+            .unwrap();
+        assert_eq!(args[export_at + 6], "/out/scatter/02_MAIN/load_map.json");
     }
 
     #[test]
-    fn headless_process_args_wires_globals_only_then_export() {
+    fn completion_marker_v3_binds_pal_and_symbol_map() {
+        assert_eq!(
+            export_completion_marker("none", "none"),
+            b"pixel-modem-extractor-ghidra-export-v3\npal_tasks=none\nsymbol_map=none\n",
+        );
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:1";
+        assert_eq!(
+            export_completion_marker(identity, "none"),
+            format!(
+                "pixel-modem-extractor-ghidra-export-v3\npal_tasks={identity}\nsymbol_map=none\n"
+            )
+            .as_bytes(),
+        );
+        let hash = "b".repeat(64);
+        assert_eq!(
+            export_completion_marker(identity, &hash),
+            format!(
+                "pixel-modem-extractor-ghidra-export-v3\npal_tasks={identity}\nsymbol_map={hash}\n"
+            )
+            .as_bytes(),
+        );
+
+        // The generated turnkey script constructs the same expected bytes for
+        // its PAL-none single-pass invocations.
+        let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0u8; 4])]);
+        let dir = std::env::temp_dir().join(format!("pme_marker_v3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem = dir.join("modem.bin");
+        std::fs::write(&modem, &buf).unwrap();
+        let out = dir.join("out");
+        run(&modem, &generation_opts(None), &out).unwrap();
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(
+            script.contains(
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v3' 'pal_tasks=none' 'symbol_map=none'"
+            ),
+            "run_ghidra.sh must compare the exact v3 marker:\n{script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_marker_rejects_stale_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let run = GhidraExportRun::new(root.path(), "02_MAIN");
+        std::fs::create_dir_all(&run.directory).unwrap();
+        for name in GHIDRA_EXPORT_FILES {
+            std::fs::write(run.directory.join(name), b"current\n").unwrap();
+        }
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0";
+        let hash = "c".repeat(64);
+
+        // A stale PAL identity under a marker that binds a map hash.
+        std::fs::write(&run.completion, export_completion_marker(identity, &hash)).unwrap();
+        assert!(run.validate_current(identity, &hash).is_ok());
+        assert!(run.validate_current("none", &hash).is_err());
+        assert!(run.validate_current(identity, "none").is_err());
+        // A truncated or extended marker never normalizes through.
+        let exact = export_completion_marker("none", "none");
+        std::fs::write(&run.completion, &exact[..exact.len() - 1]).unwrap();
+        assert!(run.validate_current("none", "none").is_err());
+        std::fs::write(&run.completion, [exact.as_slice(), b"trailing\n"].concat()).unwrap();
+        assert!(run.validate_current("none", "none").is_err());
+    }
+
+    #[test]
+    fn pass2_args_pass2_property_binds_map_functions_and_execution_count() {
+        let symbol_map = pass2_symbol_test_map("property", "02_MAIN");
+        assert_eq!(
+            symbol_map.pass2_property(),
+            format!(
+                "v2:{}:{}:3",
+                symbol_map.map_blake3(),
+                symbol_map.functions_blake3()
+            )
+        );
+    }
+
+    #[test]
+    fn pass2_args_reject_map_built_for_a_different_label() {
+        let mismatched = pass2_symbol_test_map("label", "03_APM");
+        let input = Pass2Input {
+            function_map: Some(mismatched),
+            ..Pass2Input::default()
+        };
+        let error = headless_process_args("/out", "02_MAIN", &input)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("03_APM"), "{error}");
+    }
+
+    #[test]
+    fn pass2_args_pass_pal_identity_and_manifests_through() {
+        let root = pass2_test_root("pal_args");
+        let manifest = root.join("tasks.json");
+        let scatter = root.join("load_map.json");
+        std::fs::write(&manifest, b"manifest").unwrap();
+        std::fs::write(&scatter, b"scatter").unwrap();
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:1";
+        let manifest_arg = manifest.to_string_lossy().into_owned();
+        let scatter_arg = scatter.to_string_lossy().into_owned();
+        let input = Pass2Input {
+            function_map: Some(pass2_symbol_test_map("palwired", "02_MAIN")),
+            pal_identity: identity.to_string(),
+            pal_manifest: Some(manifest.clone()),
+            scatter_manifest: Some(scatter.clone()),
+            ..Pass2Input::default()
+        };
+        let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
+            .unwrap()
+            .unwrap();
+        let apply_at = args
+            .iter()
+            .position(|arg| arg == "ApplySymbols.java")
+            .unwrap();
+        assert_eq!(
+            &args[apply_at + 4..=apply_at + 6],
+            [identity, manifest_arg.as_str(), scatter_arg.as_str()]
+        );
+        let export_at = args
+            .iter()
+            .position(|arg| arg == "ExportDecomp.java")
+            .unwrap();
+        assert_eq!(
+            &args[export_at + 4..=export_at + 6],
+            [identity, manifest_arg.as_str(), scatter_arg.as_str()]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pass2_args_wires_globals_only_then_export() {
         let input = pass2_input(0, 1);
         let args = headless_process_args("/out", "02_MAIN", &input)
             .unwrap()
@@ -4124,6 +4645,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 "-postScript",
                 "ExportDecomp.java",
                 "/out/export/02_MAIN",
+                "/out",
+                "02_MAIN",
+                "none",
+                "-",
+                "-",
+                "-",
+                "none",
             ]
         );
         assert!(!args.iter().any(|argument| argument == "ApplySymbols.java"));
@@ -4142,9 +4670,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     fn pass2_args_insert_apply_global_types_between_globals_and_export() {
         let root = pass2_test_root("gt_args");
         let input = Pass2Input {
-            function_map: pass2_test_map("functions.json", 1),
+            function_map: Some(pass2_symbol_test_map("gt", "02_MAIN")),
             global_map: pass2_test_map("globals.json", 1),
             global_types_map: pass2_test_map("global_types.json", 1),
+            ..Pass2Input::default()
         };
         let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
             .unwrap()
@@ -4167,6 +4696,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             function_map: None,
             global_map: None,
             global_types_map: pass2_test_map("global_types.json", 1),
+            ..Pass2Input::default()
         };
         assert!(
             headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
@@ -6451,7 +6981,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         for name in GHIDRA_EXPORT_FILES {
             std::fs::write(run.directory.join(name), format!("stale {name}\n")).unwrap();
         }
-        std::fs::write(&run.completion, format!("{GHIDRA_EXPORT_COMPLETION}\n")).unwrap();
+        std::fs::write(&run.completion, export_completion_marker("none", "none")).unwrap();
 
         run.invalidate().unwrap();
 
@@ -6459,15 +6989,32 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         for name in GHIDRA_EXPORT_FILES {
             assert!(!run.directory.join(name).exists());
         }
-        assert!(run.validate_current().is_err());
+        assert!(run.validate_current("none", "none").is_err());
 
         for name in GHIDRA_EXPORT_FILES {
             std::fs::write(run.directory.join(name), b"current\n").unwrap();
         }
         std::fs::write(&run.completion, b"wrong generation\n").unwrap();
-        assert!(run.validate_current().is_err());
-        std::fs::write(&run.completion, format!("{GHIDRA_EXPORT_COMPLETION}\n")).unwrap();
-        run.validate_current().unwrap();
+        assert!(run.validate_current("none", "none").is_err());
+        // A v1-shaped marker is stale, not normalized.
+        std::fs::write(&run.completion, b"pixel-modem-extractor-ghidra-export-v1\n").unwrap();
+        assert!(run.validate_current("none", "none").is_err());
+        std::fs::write(&run.completion, export_completion_marker("none", "none")).unwrap();
+        run.validate_current("none", "none").unwrap();
+        // Stale identity or map binding values are rejected exactly.
+        let bound = export_completion_marker(
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+            "none",
+        );
+        std::fs::write(&run.completion, &bound).unwrap();
+        assert!(run.validate_current("none", "none").is_err());
+        assert!(
+            run.validate_current(
+                "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+                "none"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -6477,7 +7024,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::create_dir_all(run.directory.join("functions.json")).unwrap();
         std::fs::write(run.directory.join("disasm.lst"), b"stale\n").unwrap();
         std::fs::write(run.directory.join("decompiled.c"), b"stale\n").unwrap();
-        std::fs::write(&run.completion, format!("{GHIDRA_EXPORT_COMPLETION}\n")).unwrap();
+        std::fs::write(&run.completion, export_completion_marker("none", "none")).unwrap();
 
         run.invalidate().unwrap_err();
 

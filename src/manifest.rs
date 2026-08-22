@@ -9,6 +9,11 @@ pub fn blake3_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// Lowercase hex for a fixed 32-byte BLAKE3 digest.
+pub fn blake3_fixed(digest: [u8; 32]) -> String {
+    blake3::Hash::from(digest).to_hex().to_string()
+}
+
 /// Stream a reader into a blake3 hex digest. Handles short reads (any
 /// `read` returning 0..=buf.len()) without requiring a full-buffer fill.
 fn blake3_reader(mut reader: impl Read) -> Result<String> {

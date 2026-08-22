@@ -52,6 +52,14 @@ const SCATTER_TASK_OFF: usize = IMAGE_LEN;
 const SCATTER_COPY_SIZE: usize = 8;
 const SCATTER_COPY_SOURCE_OFF: usize = 0x710;
 
+/// Task 11: the registration-table fixture — an `alpha_task_fn\0` name at
+/// 0x780 and a three-record {name, fn} table at 0x790 (the scanner's minimum
+/// run) whose pointers resolve to the alpha entry.
+const REG_NAME: &[u8; 14] = b"alpha_task_fn\0";
+const REG_NAME_OFF: usize = 0x780;
+const REG_TABLE_OFF: usize = 0x790;
+const REG_TABLE_RECORDS: usize = 3;
+
 pub(super) fn entry_a() -> u32 {
     BASE + ENTRY_A_OFF as u32
 }
@@ -62,6 +70,100 @@ pub(super) fn entry_b() -> u32 {
 
 pub(super) fn entry_d() -> u32 {
     BASE + ENTRY_D_OFF as u32
+}
+
+pub(super) fn entry_e() -> u32 {
+    BASE + ENTRY_E_OFF as u32
+}
+
+/// One `(entry, isa, desired_primary, tasks)` application summary for the
+/// pass-2 PAL context, where each task is `(index, name, slot, priority,
+/// stack)`. Mirrors the extended manifest's application partition exactly.
+pub(super) type PalAppSummary = (
+    u32,
+    &'static str,
+    &'static str,
+    Vec<(u32, &'static str, u32, u8, u32)>,
+);
+
+pub(super) fn extended_application_summaries() -> Vec<PalAppSummary> {
+    vec![
+        (
+            entry_a(),
+            "arm",
+            "pal_TaskEntry_alpha",
+            vec![(0, "alpha", BASE + SLOT_BASE_OFF as u32, 100, 512)],
+        ),
+        (
+            entry_b(),
+            "arm",
+            "pal_TaskEntry_beta",
+            vec![(
+                1,
+                "beta",
+                BASE + (SLOT_BASE_OFF + STRIDE) as u32,
+                255,
+                33000,
+            )],
+        ),
+        (
+            BASE + ENTRY_C_OFF as u32,
+            "thumb",
+            "pal_TaskEntry_gamma",
+            vec![(
+                2,
+                "gamma",
+                BASE + (SLOT_BASE_OFF + 2 * STRIDE) as u32,
+                7,
+                1024,
+            )],
+        ),
+        (
+            entry_d(),
+            "arm",
+            "pal_TaskEntry_shared_40010430",
+            vec![
+                (
+                    3,
+                    "delta_one",
+                    BASE + (SLOT_BASE_OFF + 3 * STRIDE) as u32,
+                    3,
+                    2048,
+                ),
+                (
+                    4,
+                    "delta_two",
+                    BASE + (SLOT_BASE_OFF + 4 * STRIDE) as u32,
+                    4,
+                    4096,
+                ),
+            ],
+        ),
+        (
+            entry_e(),
+            "arm",
+            "pal_TaskEntry_zeta",
+            vec![(
+                6,
+                "zeta",
+                BASE + (SLOT_BASE_OFF + 6 * STRIDE) as u32,
+                5,
+                2048,
+            )],
+        ),
+        (
+            BASE + SCATTER_TASK_OFF as u32,
+            "arm",
+            "pal_TaskEntry_epsilon",
+            vec![(
+                5,
+                "epsilon",
+                BASE + (SLOT_BASE_OFF + 5 * STRIDE) as u32,
+                9,
+                8192,
+            )],
+        ),
+    ]
 }
 
 fn put_u32(image: &mut [u8], offset: usize, value: u32) {
@@ -168,6 +270,15 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     image[NAME_DELTA_TWO_OFF..NAME_DELTA_TWO_OFF + 10].copy_from_slice(b"delta_two\0");
     image[NAME_EPSILON_OFF..NAME_EPSILON_OFF + 8].copy_from_slice(b"epsilon\0");
     image[NAME_ZETA_OFF..NAME_ZETA_OFF + 5].copy_from_slice(b"zeta\0");
+    // Task 11: a {name, fn} registration table entry whose pointer resolves
+    // to the alpha task entry, so registration-rank evidence can displace the
+    // applied PAL primary in the pass-2 map battery.
+    image[REG_NAME_OFF..REG_NAME_OFF + REG_NAME.len()].copy_from_slice(REG_NAME);
+    for record in 0..REG_TABLE_RECORDS {
+        let offset = REG_TABLE_OFF + record * 8;
+        put_u32(&mut image, offset, BASE + REG_NAME_OFF as u32);
+        put_u32(&mut image, offset + 4, entry_a());
+    }
     image
 }
 

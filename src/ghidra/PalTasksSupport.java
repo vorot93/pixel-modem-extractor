@@ -21,6 +21,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressRange;
+import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.CodeUnit;
@@ -32,6 +33,7 @@ import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.RegisterValue;
@@ -42,6 +44,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.symbol.SymbolUtilities;
 import ghidra.program.model.util.StringPropertyMap;
+import ghidra.util.task.TaskMonitor;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -58,6 +61,7 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -65,6 +69,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 import org.bouncycastle.crypto.digests.Blake3Digest;
 
@@ -109,10 +114,295 @@ final class PalTasksSupport {
     static final long DESCRIPTOR_PROJECTION_OFFSET = 0x24;
     static final int MAX_CODE_UNITS = 4_194_304;
     static final int MAX_FUNCTIONS = 262_144;
+    /** Aggregate task-function-body bytes the export postflight may walk. */
+    static final long MAX_TASK_BODY_BYTES = 64L * 1024L * 1024L;
+    /** One deadline covering the export preflight/verification walk. */
+    static final long EXPORT_VALIDATION_BUDGET_MS = 15 * 60_000L;
+    /** Compact Java preflight metadata retained by ApplySymbols. */
+    static final long MAX_APPLY_PREFLIGHT_METADATA = 128L * 1024L * 1024L;
 
     static final long UINT32_MAX = 0xffff_ffffL;
     static final long UINT32_END = 0x1_0000_0000L;
     private static final int HASH_BUFFER_SIZE = 64 * 1024;
+
+    // -------------------------------------------------------------------------
+    // Authenticated decode projection (shared by ApplySymbols and ExportDecomp)
+    // -------------------------------------------------------------------------
+
+    /** One authenticated decode range: ISA, u32 bounds, memory BLAKE3. */
+    static final class DecodeRange implements Comparable<DecodeRange> {
+        final long start;
+        long end;
+        final String isa;
+        final String blake3;
+
+        DecodeRange(long start, long end, String isa, String blake3) {
+            this.start = start;
+            this.end = end;
+            this.isa = isa;
+            this.blake3 = blake3;
+        }
+
+        @Override
+        public int compareTo(DecodeRange other) {
+            int byStart = Long.compare(start, other.start);
+            if (byStart != 0) return byStart;
+            int byEnd = Long.compare(end, other.end);
+            if (byEnd != 0) return byEnd;
+            return isa.compareTo(other.isa);
+        }
+    }
+
+    /** One canonical decode-range defect that quarantines a record. */
+    static final class DecodeError implements Comparable<DecodeError> {
+        final String kind;
+        final long address;
+        final Long end;
+
+        DecodeError(String kind, long address, Long end) {
+            this.kind = kind;
+            this.address = address;
+            this.end = end;
+        }
+
+        @Override
+        public int compareTo(DecodeError other) {
+            int byAddress = Long.compare(address, other.address);
+            if (byAddress != 0) return byAddress;
+            int byKind = kind.compareTo(other.kind);
+            if (byKind != 0) return byKind;
+            if (end == null) return other.end == null ? 0 : -1;
+            if (other.end == null) return 1;
+            return Long.compare(end, other.end);
+        }
+    }
+
+    /** The accepted authenticated ranges, or the canonical error list. */
+    static final class DecodeProjection {
+        final List<DecodeRange> ranges;
+        final List<DecodeError> errors;
+
+        DecodeProjection(List<DecodeRange> ranges, List<DecodeError> errors) {
+            this.ranges = ranges;
+            this.errors = errors;
+        }
+    }
+
+    /**
+     * Derives the authenticated decode projection for one function from the
+     * current program: instruction extents under the TMode context, canonical
+     * geometry checks, and per-range BLAKE3 over current program memory. The
+     * domain-separated {@link #executionDigestHex} is then recomputed rather
+     * than copied. Shared by the pass-2 apply map and both export passes; no
+     * script may grow a second copy.
+     */
+    static DecodeProjection decodeProjection(Program program, TaskMonitor monitor, Function fn)
+            throws Exception {
+        Listing listing = program.getListing();
+        long entry = checkedRange(fn.getEntryPoint().getOffset(), 0, UINT32_MAX,
+                "function entry");
+        Register tMode = program.getLanguage().getRegister("TMode");
+        List<DecodeRange> extents = new ArrayList<DecodeRange>();
+        TreeSet<DecodeError> errors = new TreeSet<DecodeError>();
+        InstructionIterator instructions = listing.getInstructions(fn.getBody(), true);
+        while (instructions.hasNext()) {
+            if (monitor.isCancelled()) {
+                throw new Exception("the decode projection walk was cancelled");
+            }
+            Instruction instruction = instructions.next();
+            Address startAddress = instruction.getMinAddress();
+            long start = checkedRange(startAddress.getOffset(), 0, UINT32_MAX,
+                    "instruction address");
+            int length = instruction.getLength();
+            Long end = null;
+            if (length <= 0 || start > UINT32_MAX - length) {
+                errors.add(new DecodeError("invalid_instruction_length", start, null));
+            } else {
+                end = start + length;
+            }
+            if (instruction.isLengthOverridden()) {
+                errors.add(new DecodeError("overridden_instruction_length", start, end));
+            }
+
+            String isa = null;
+            RegisterValue value = tMode == null ? null : instruction.getRegisterValue(tMode);
+            if (value == null || !value.hasValue()) {
+                errors.add(new DecodeError("missing_isa_context", start, end));
+            } else {
+                BigInteger unsigned = value.getUnsignedValue();
+                if (BigInteger.ZERO.equals(unsigned)) {
+                    isa = "arm";
+                } else if (BigInteger.ONE.equals(unsigned)) {
+                    isa = "thumb";
+                } else {
+                    errors.add(new DecodeError("invalid_isa_context", start, end));
+                }
+            }
+
+            if (end == null) {
+                continue;
+            }
+            Address endInclusive = startAddress.addNoWrap(length - 1L);
+            if (!fn.getBody().contains(startAddress, endInclusive)) {
+                errors.add(new DecodeError("extent_outside_function", start, end));
+            }
+            if (!program.getMemory().getLoadedAndInitializedAddressSet()
+                    .contains(startAddress, endInclusive)) {
+                errors.add(new DecodeError("extent_outside_image", start, end));
+            }
+            if (isa != null) {
+                long alignment = isa.equals("arm") ? 4L : 2L;
+                if (start % alignment != 0 || length % alignment != 0) {
+                    errors.add(new DecodeError("misaligned_instruction", start, end));
+                }
+                extents.add(new DecodeRange(start, end, isa, null));
+            }
+        }
+
+        Collections.sort(extents);
+        DecodeRange maximalPrior = null;
+        for (int index = 0; index < extents.size(); index++) {
+            DecodeRange current = extents.get(index);
+            if (index > 0) {
+                DecodeRange previous = extents.get(index - 1);
+                if (current.start == previous.start && current.end == previous.end) {
+                    errors.add(new DecodeError("duplicate_extent", current.start, current.end));
+                }
+                if (maximalPrior != null && current.start < maximalPrior.end) {
+                    errors.add(new DecodeError(
+                        "overlapping_extent", maximalPrior.start, maximalPrior.end));
+                    errors.add(new DecodeError(
+                        "overlapping_extent", current.start, current.end));
+                }
+            }
+            if (maximalPrior == null || current.end > maximalPrior.end) {
+                maximalPrior = current;
+            }
+        }
+
+        List<DecodeRange> ranges = new ArrayList<DecodeRange>();
+        for (DecodeRange extent : extents) {
+            if (!ranges.isEmpty()) {
+                DecodeRange previous = ranges.get(ranges.size() - 1);
+                if (previous.end == extent.start && previous.isa.equals(extent.isa)) {
+                    previous.end = extent.end;
+                    continue;
+                }
+            }
+            ranges.add(new DecodeRange(extent.start, extent.end, extent.isa, null));
+        }
+
+        if (ranges.isEmpty()) {
+            errors.add(new DecodeError("empty_projection", entry, null));
+        } else {
+            boolean entryStartsRange = false;
+            boolean entryInsideRange = false;
+            for (DecodeRange range : ranges) {
+                entryStartsRange |= range.start == entry;
+                entryInsideRange |= range.start < entry && entry < range.end;
+            }
+            if (!entryStartsRange) {
+                errors.add(new DecodeError(
+                    entryInsideRange ? "entry_not_range_start" : "missing_instruction_at_entry",
+                    entry,
+                    null));
+            }
+        }
+
+        if (!errors.isEmpty()) {
+            return new DecodeProjection(
+                Collections.<DecodeRange>emptyList(),
+                new ArrayList<DecodeError>(errors));
+        }
+
+        List<DecodeRange> authenticated = new ArrayList<DecodeRange>();
+        for (DecodeRange range : ranges) {
+            authenticated.add(new DecodeRange(
+                range.start,
+                range.end,
+                range.isa,
+                hashMemory(program, monitor, range.start, range.end)));
+        }
+        return new DecodeProjection(authenticated, Collections.<DecodeError>emptyList());
+    }
+
+    /**
+     * Streaming BLAKE3 over the current program memory of
+     * [start, start + length). Fails when any byte is unreadable.
+     */
+    static String hashMemory(Program program, TaskMonitor monitor, long start, long end)
+            throws Exception {
+        checkedRange(start, 0, UINT32_MAX, "memory hash start");
+        checkedRange(end, start + 1, UINT32_END, "memory hash end");
+        Blake3Digest digest = new Blake3Digest();
+        byte[] bytes = new byte[HASH_BUFFER_SIZE];
+        Address address = programAddress(program, start);
+        long remaining = end - start;
+        long offset = 0;
+        try {
+            while (remaining > 0) {
+                if (monitor.isCancelled()) {
+                    throw new Exception("the memory hash walk was cancelled");
+                }
+                int wanted = (int) Math.min(bytes.length, remaining);
+                int read = program.getMemory().getBytes(
+                    address.addNoWrap(offset), bytes, 0, wanted);
+                if (read != wanted) {
+                    throw new Exception("the execution range is not fully initialized");
+                }
+                digest.update(bytes, 0, read);
+                offset += read;
+                remaining -= read;
+            }
+        }
+        catch (MemoryAccessException error) {
+            throw new Exception("the execution range could not be read", error);
+        }
+        byte[] output = new byte[digest.getDigestSize()];
+        digest.doFinal(output, 0);
+        StringBuilder text = new StringBuilder(output.length * 2);
+        for (byte value : output) {
+            text.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+        }
+        return text.toString();
+    }
+
+    /** The exclusive u32 end of a function body's address ranges. */
+    static long functionEnd(Program program, Function fn) throws Exception {
+        long end = checkedRange(fn.getEntryPoint().getOffset(), 0, UINT32_MAX,
+                "function entry");
+        AddressRangeIterator ranges = fn.getBody().getAddressRanges();
+        while (ranges.hasNext()) {
+            AddressRange range = ranges.next();
+            checkedRange(range.getMinAddress().getOffset(), 0, UINT32_MAX,
+                    "function body start");
+            long exclusiveEnd = checkedRange(range.getMaxAddress().getOffset() + 1, 1,
+                    UINT32_END, "function body end");
+            if (exclusiveEnd > end) {
+                end = exclusiveEnd;
+            }
+        }
+        return end;
+    }
+
+    /**
+     * Computes the domain-separated execution digest for a function's current
+     * accepted projection; a quarantined projection fails. Shared by
+     * ApplySymbols' body verification and the pass-2 export comparison.
+     */
+    static String currentExecutionDigest(Program program, TaskMonitor monitor, Function fn)
+            throws Exception {
+        DecodeProjection projection = decodeProjection(program, monitor, fn);
+        if (!projection.errors.isEmpty()) {
+            fail("the current decode projection is quarantined at " + fn.getEntryPoint());
+        }
+        List<ExecutionRangeWire> wire = new ArrayList<ExecutionRangeWire>();
+        for (DecodeRange range : projection.ranges) {
+            wire.add(new ExecutionRangeWire(range.isa, range.start, range.end, range.blake3));
+        }
+        return executionDigestHex(
+            checkedRange(fn.getEntryPoint().getOffset(), 0, UINT32_MAX, "function entry"), wire);
+    }
 
     private static final Pattern ADDRESS_TEXT = Pattern.compile("^0x[0-9a-f]{8}$");
     private static final Pattern HASH_TEXT = Pattern.compile("^[0-9a-f]{64}$");
@@ -1345,7 +1635,7 @@ final class PalTasksSupport {
         }
     }
 
-    private static Address programAddress(Program program, long value) {
+    static Address programAddress(Program program, long value) {
         if (value < 0 || value > UINT32_MAX) {
             fail("address is outside the u32 domain");
         }
@@ -1397,6 +1687,36 @@ final class PalTasksSupport {
             fail("functions.json BLAKE3 does not match the map dependency");
         }
         return parsed;
+    }
+
+    /**
+     * The export-side map read: the map file itself is hashed from one
+     * retained handle and strictly parsed. The retained pass-1
+     * functions.json binding is not re-read here — ApplySymbols owns that
+     * check, and the pass-2 export pins the map's own functions digest
+     * through the exact SymbolPass2 property instead.
+     */
+    static SymbolMap readSymbolMapForExport(File map, String mapHash) throws Exception {
+        assertGhidraSymbolLimit();
+        requireHashText(mapHash, "expected symbol map BLAKE3");
+        File mapFile = requireCanonicalFileArgument(map, "symbol map");
+        try (FileInputStream input = new FileInputStream(mapFile)) {
+            long mapSize = input.getChannel().size();
+            if (mapSize > MAX_SYMBOL_MAP_BYTES) {
+                fail("symbol map exceeds the 256 MiB ceiling");
+            }
+            String actualMapHash = hashExact(input, mapSize, "symbol map");
+            if (!actualMapHash.equals(mapHash)) {
+                fail("symbol map BLAKE3 does not match the expected value");
+            }
+            input.getChannel().position(0);
+            return parseSymbolMap(new InputStreamReader(input, StandardCharsets.UTF_8
+                    .newDecoder().onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)), actualMapHash);
+        }
+        catch (IOException error) {
+            throw new Exception("symbol map could not be read: " + error.getMessage(), error);
+        }
     }
 
     // -------------------------------------------------------------------------

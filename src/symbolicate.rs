@@ -51,21 +51,131 @@ pub enum Tier {
     None,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Evidence {
-    pub kind: &'static str, // "func" | "token" | "file"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub class: Option<&'static str>,
+/// `symbols.json` format tag (v2 introduced the tagged evidence model and
+/// `name_conflicts`).
+pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v2";
+
+/// Strict pass-2 map format name shared with the Java reader.
+pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v2";
+
+/// Interface limits for the strict map (mirrored by `PalTasksSupport.java`).
+pub const MAX_MAP_ANNOTATIONS_PER_DECISION: usize = 256;
+pub const MAX_MAP_ANNOTATION_UTF8_BYTES: usize = 4096;
+pub const MAX_MAP_ANNOTATION_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_PRIMARY_CHARS: usize = 2000;
+
+/// Explicit naming authority. Lower rank (ordinal) is stronger; the order is
+/// the pinned precedence `__func__ > registration > pal_task > token >
+/// string_ref`. `file` evidence carries no authority (annotation-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    Func,
+    Registration,
+    PalTask,
+    Token,
+    StringRef,
+}
+
+impl Authority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Func => "func",
+            Self::Registration => "registration",
+            Self::PalTask => "pal_task",
+            Self::Token => "token",
+            Self::StringRef => "string_ref",
+        }
+    }
+}
+
+/// One firmware task attached to a function entry, as evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PalTaskRef {
+    pub manifest_blake3: String,
+    pub task_index: u32,
+    pub name: String,
+    pub slot: u32,
+    pub priority: u8,
+    pub stack_size: u32,
+}
+
+/// One PAL application group at a normalized entry: the applied desired
+/// primary plus every attached task (role identities, in table order).
+/// `applied` is true only when the retained primary already IS the desired
+/// task primary (ApplyPalTasks applied it); a preserved meaningful name
+/// leaves the rank present but proposal-less.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PalApplicationRef {
+    /// The application's declared ISA ("arm" | "thumb"): only records in the
+    /// same ISA at this entry carry the evidence.
+    pub isa: &'static str,
+    pub desired_primary: String,
+    pub applied: bool,
+    pub tasks: Vec<PalTaskRef>,
+}
+
+/// The PAL state a pass-2 map binds: identity, dependency hashes, and the
+/// application groups keyed by normalized entry.
+#[derive(Debug, Clone)]
+pub struct PalPass2Context {
+    pub identity: String,
+    pub manifest_blake3: String,
+    pub scatter_load_map_blake3: Option<String>,
+    pub applications: BTreeMap<u32, PalApplicationRef>,
+}
+
+/// Tagged evidence variant. Every kind serializes with a `kind` tag plus its
+/// own exact fields — no bag of unrelated optional members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaggedEvidence {
+    Func {
+        value: String,
+    },
+    Registration {
+        value: String,
+    },
+    PalTask {
+        #[serde(flatten)]
+        task: PalTaskRef,
+    },
+    Token {
+        token: String,
+        format: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        domain: Option<String>,
+    },
+    File {
+        path: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        strings: Vec<String>,
+    },
+    StringRef {
+        value: String,
+        class: &'static str,
+    },
+}
+
+impl TaggedEvidence {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Func { .. } => "func",
+            Self::Registration { .. } => "registration",
+            Self::PalTask { .. } => "pal_task",
+            Self::Token { .. } => "token",
+            Self::File { .. } => "file",
+            Self::StringRef { .. } => "string_ref",
+        }
+    }
+}
+
+/// One unresolved same-rank naming candidate: no name was applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NameConflict {
+    pub authority: Authority,
+    pub kind: &'static str,
+    pub proposed_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,14 +189,62 @@ pub struct Symbol {
     pub tool: Tool,
     #[serde(skip)]
     pub(crate) owner: FunctionOwner,
-    #[serde(skip)]
+    /// Validated execution identity digest for the record this symbol
+    /// describes, when the record carries an accepted decode projection.
+    /// Serialized as lowercase hex so `symbols.json` binds the symbol to its
+    /// exact execution identity.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_execution_digest"
+    )]
     pub(crate) execution_blake3: Option<[u8; 32]>,
+    /// The record's validated decode ranges (empty when absent/unaccepted).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub decode_ranges: Vec<DecodeRangeWire>,
     pub original_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub tier: Tier,
-    pub evidence: Vec<Evidence>,
+    pub evidence: Vec<TaggedEvidence>,
     pub annotations: Vec<String>,
+    /// Same-rank unresolved naming candidates; empty when one ranked decision
+    /// exists. No name is applied while this is non-empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub name_conflicts: Vec<NameConflict>,
+}
+
+/// One validated decode range as serialized in `symbols.json` and the strict
+/// pass-2 map: exact ISA, u32 bounds, and lowercase BLAKE3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecodeRangeWire {
+    pub isa: &'static str,
+    pub start: String,
+    pub end: String,
+    pub blake3: String,
+}
+
+impl DecodeRangeWire {
+    fn from_authenticated(range: &crate::execution_ranges::AuthenticatedDecodeRange) -> Self {
+        Self {
+            isa: match range.isa {
+                crate::execution_ranges::DecodeIsa::Arm => "arm",
+                crate::execution_ranges::DecodeIsa::Thumb => "thumb",
+            },
+            start: format!("0x{:08x}", range.start),
+            end: format!("0x{:08x}", range.end),
+            blake3: crate::manifest::blake3_fixed(range.blake3),
+        }
+    }
+}
+
+fn serialize_execution_digest<S: serde::Serializer>(
+    digest: &Option<[u8; 32]>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match digest {
+        Some(digest) => serializer.serialize_str(&crate::manifest::blake3_fixed(*digest)),
+        None => serializer.serialize_none(),
+    }
 }
 
 pub struct RawEvidence {
@@ -96,8 +254,12 @@ pub struct RawEvidence {
     pub file_strings: Vec<String>,  // that file's attributed_strings
     pub ident_guess: Option<(String, name_guess::Class)>, // string_ref_guess output
     /// Authoritative name recovered from a `{name, fn}` registration table
-    /// (`reg_table::scan`). Outranks tokens and string-ref; only `__func__` wins.
+    /// (`reg_table::scan`). Outranks pal_task, token, and string-ref; only
+    /// `__func__` wins.
     pub registration: Option<String>,
+    /// The PAL application at this entry, when the PAL task manifest claims
+    /// it. Occupies the `pal_task` authority rank.
+    pub pal: Option<PalApplicationRef>,
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
@@ -118,7 +280,7 @@ pub struct FuncRec<'a> {
     /// owner and execution digest below form the source-attribution key.
     pub tool: Tool,
     pub(crate) owner: FunctionOwner,
-    pub(crate) execution_blake3: Option<[u8; 32]>,
+    pub(crate) execution: Option<ExecutionIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -307,36 +469,59 @@ fn sanitize_ident(s: &str) -> String {
     out
 }
 
-/// Apply the tiered, fail-closed naming policy for one function. Only `func_name`
-/// yields a real rename; only a token yields a `guess_…_<addr>`; file/strings are
-/// comments. Returns `(name, tier, evidence, annotations)`. `addr_hex` is bare
+/// One ranked naming candidate derived from the evidence.
+struct NameCandidate {
+    authority: Authority,
+    kind: &'static str,
+    proposed_name: String,
+}
+
+/// Apply the ranked, fail-closed naming policy for one function. Ranks are
+/// the pinned precedence `__func__ > registration > pal_task > token >
+/// string_ref`; the strongest rank with a proposal wins and every weaker
+/// candidate is retained as evidence. Two distinct names at the winning rank
+/// apply neither: the sorted candidates are serialized as `name_conflicts`.
+/// Shared task roles (multiple tasks at one entry) block every weaker rank
+/// while proposing no name of their own. Returns
+/// `(name, tier, evidence, annotations, conflicts)`. `addr_hex` is bare
 /// (e.g. "40e1bff4").
+#[allow(clippy::type_complexity)]
 pub fn decide(
     addr_hex: &str,
     raw: &RawEvidence,
-) -> (Option<String>, Tier, Vec<Evidence>, Vec<String>) {
+) -> (
+    Option<String>,
+    Tier,
+    Vec<TaggedEvidence>,
+    Vec<String>,
+    Vec<NameConflict>,
+) {
     let mut ev = Vec::new();
     let mut ann = Vec::new();
+    let mut candidates: Vec<NameCandidate> = Vec::new();
 
     for (tok, s) in &raw.tokens {
         let (fmt, dom) = parse_token_string(s);
-        ev.push(Evidence {
-            kind: "token",
-            token: Some(format!("0x{tok:08x}")),
+        ev.push(TaggedEvidence::Token {
+            token: format!("0x{tok:08x}"),
+            format: fmt.clone(),
             domain: dom.clone(),
-            format: Some(fmt.clone()),
-            ..Default::default()
         });
         ann.push(match &dom {
             Some(d) => format!("logs: {fmt:?} [{d}]"),
             None => format!("logs: {fmt:?}"),
         });
+        let name = format!("{GUESS_PREFIX}{}_{addr_hex}", slugify(&fmt, dom.as_deref()));
+        candidates.push(NameCandidate {
+            authority: Authority::Token,
+            kind: "token",
+            proposed_name: name,
+        });
     }
     if let Some(f) = &raw.file {
-        ev.push(Evidence {
-            kind: "file",
-            path: Some(f.clone()),
-            ..Default::default()
+        ev.push(TaggedEvidence::File {
+            path: f.clone(),
+            strings: raw.file_strings.clone(),
         });
         ann.push(format!("file: {f}"));
     }
@@ -351,53 +536,151 @@ pub fn decide(
         ann.push(format!("file-strings: {joined}"));
     }
 
-    // Registration evidence is always recorded (even when `__func__` outranks it
-    // for the name), so the table provenance survives in `symbols.json`.
+    // Registration evidence is always recorded (even when `__func__` outranks
+    // it for the name), so the table provenance survives in `symbols.json`.
     if let Some(reg) = &raw.registration {
-        ev.push(Evidence {
-            kind: "registration",
-            value: Some(reg.clone()),
-            ..Default::default()
-        });
+        ev.push(TaggedEvidence::Registration { value: reg.clone() });
         ann.push(format!("registration: {reg:?}"));
+    }
+
+    // PAL task evidence: one variant plus one annotation line per attached
+    // task, retained regardless of which rank wins the name.
+    if let Some(app) = &raw.pal {
+        for task in &app.tasks {
+            ev.push(TaggedEvidence::PalTask { task: task.clone() });
+            ann.push(format!(
+                "pal task: {} slot={:#010x} priority={} stack={}",
+                task.name, task.slot, task.priority, task.stack_size
+            ));
+        }
+        // A single-task application whose desired primary was applied
+        // re-proposes it as a role identity (a preserve against weaker
+        // tiers); a shared entry or an unapplied (preserved) primary proposes
+        // nothing but still occupies the rank so token/string-ref guesses
+        // cannot displace the task identity.
+        if app.tasks.len() == 1 && app.applied {
+            candidates.push(NameCandidate {
+                authority: Authority::PalTask,
+                kind: "pal_task",
+                proposed_name: app.desired_primary.clone(),
+            });
+        }
     }
 
     if let Some(fname) = &raw.func_name {
         ev.insert(
             0,
-            Evidence {
-                kind: "func",
-                value: Some(fname.clone()),
-                ..Default::default()
+            TaggedEvidence::Func {
+                value: fname.clone(),
             },
         );
-        return (Some(sanitize_ident(fname)), Tier::Recovered, ev, ann);
+        candidates.insert(
+            0,
+            NameCandidate {
+                authority: Authority::Func,
+                kind: "func",
+                proposed_name: sanitize_ident(fname),
+            },
+        );
     }
-    // Authoritative table-recovered name: bare, `Recovered`, below `__func__`
-    // but above every guess tier.
     if let Some(reg) = &raw.registration {
-        return (Some(sanitize_ident(reg)), Tier::Recovered, ev, ann);
-    }
-    if let Some((_tok, s)) = raw.tokens.first() {
-        let (fmt, dom) = parse_token_string(s);
-        let name = format!("{GUESS_PREFIX}{}_{addr_hex}", slugify(&fmt, dom.as_deref()));
-        return (Some(name), Tier::Provisional, ev, ann);
+        candidates.push(NameCandidate {
+            authority: Authority::Registration,
+            kind: "registration",
+            proposed_name: sanitize_ident(reg),
+        });
     }
     if let Some((id, class)) = &raw.ident_guess {
-        ev.push(Evidence {
-            kind: "string_ref",
-            value: Some(id.clone()),
-            class: Some(class.as_str()),
-            ..Default::default()
+        ev.push(TaggedEvidence::StringRef {
+            value: id.clone(),
+            class: class.as_str(),
         });
         ann.push(match class {
             name_guess::Class::TypeLabel => format!("handles-type: {id:?}"),
             name_guess::Class::FnName => format!("ident-ref: {id:?}"),
         });
-        let name = format!("{GUESS_PREFIX}{}_{addr_hex}", sanitize_ident(id));
-        return (Some(name), Tier::Provisional, ev, ann);
+        candidates.push(NameCandidate {
+            authority: Authority::StringRef,
+            kind: "string_ref",
+            proposed_name: format!("{GUESS_PREFIX}{}_{addr_hex}", sanitize_ident(id)),
+        });
     }
-    (None, Tier::None, ev, ann)
+
+    // Resolve by rank. Duplicate proposals at one rank collapse; distinct
+    // proposals at the winning rank are an unresolved conflict. A shared
+    // multi-task application contributes an empty blocking rank: it proposes
+    // no name, yet no weaker tier may displace the neutral shared primary.
+    candidates.sort_by_key(|candidate| candidate.authority);
+    if let Some(app) = &raw.pal
+        && (app.tasks.len() > 1 || !app.applied)
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.authority == Authority::PalTask)
+    {
+        let position = candidates
+            .iter()
+            .position(|candidate| candidate.authority > Authority::PalTask)
+            .unwrap_or(candidates.len());
+        candidates.insert(
+            position,
+            NameCandidate {
+                authority: Authority::PalTask,
+                kind: "pal_task",
+                proposed_name: String::new(),
+            },
+        );
+    }
+    let mut by_rank: Vec<(Authority, Vec<NameCandidate>)> = Vec::new();
+    for candidate in candidates {
+        if candidate.proposed_name.is_empty() {
+            // The blocking marker contributes its rank but never a proposal.
+            match by_rank.last_mut() {
+                Some((authority, _)) if *authority == candidate.authority => {}
+                _ => by_rank.push((candidate.authority, Vec::new())),
+            }
+            continue;
+        }
+        match by_rank.last_mut() {
+            Some((authority, group)) if *authority == candidate.authority => {
+                if !group
+                    .iter()
+                    .any(|existing| existing.proposed_name == candidate.proposed_name)
+                {
+                    group.push(candidate);
+                }
+            }
+            _ => by_rank.push((candidate.authority, vec![candidate])),
+        }
+    }
+
+    let Some((authority, group)) = by_rank.first() else {
+        return (None, Tier::None, ev, ann, Vec::new());
+    };
+    if group.is_empty() {
+        // A blocking rank with no proposal (shared task roles): no name.
+        return (None, Tier::None, ev, ann, Vec::new());
+    }
+    if group.len() > 1 {
+        let mut conflicts: Vec<NameConflict> = group
+            .iter()
+            .map(|candidate| NameConflict {
+                authority: *authority,
+                kind: candidate.kind,
+                proposed_name: candidate.proposed_name.clone(),
+            })
+            .collect();
+        conflicts.sort_by(|a, b| {
+            (a.authority, a.kind, &a.proposed_name).cmp(&(b.authority, b.kind, &b.proposed_name))
+        });
+        return (None, Tier::None, ev, ann, conflicts);
+    }
+    let winner = &group[0];
+    let name = winner.proposed_name.clone();
+    let tier = match winner.authority {
+        Authority::Func | Authority::Registration | Authority::PalTask => Tier::Recovered,
+        Authority::Token | Authority::StringRef => Tier::Provisional,
+    };
+    (Some(name), tier, ev, ann, Vec::new())
 }
 
 /// Disambiguate duplicate `recovered` names by appending `_<addr>`. Provisional
@@ -514,7 +797,7 @@ fn load_functions<'a>(
             disasm,
             tool: Tool::Ghidra,
             owner: FunctionOwner::Ghidra,
-            execution_blake3: execution.map(|execution| execution.execution_blake3),
+            execution,
         });
     }
     Ok(out)
@@ -565,10 +848,7 @@ fn load_thumb_functions<'a>(
             disasm: std::borrow::Cow::Owned(f.body),
             tool: owned.owner.analysis_tool(),
             owner: owned.owner,
-            execution_blake3: owned
-                .execution
-                .as_ref()
-                .map(|execution| execution.execution_blake3),
+            execution: owned.execution,
         });
     }
     Ok(out)
@@ -737,6 +1017,7 @@ fn counts(symbols: &[Symbol]) -> Counts {
 
 #[derive(Serialize)]
 struct SymbolsFile<'a> {
+    format: &'static str,
     tool_version: &'static str,
     image: &'a str,
     inputs: HashMap<String, String>,
@@ -752,6 +1033,7 @@ fn write_symbols_json(
     inputs: HashMap<String, String>,
 ) -> Result<PathBuf> {
     let file = SymbolsFile {
+        format: SYMBOLS_FORMAT,
         tool_version: env!("CARGO_PKG_VERSION"),
         image,
         inputs,
@@ -764,58 +1046,449 @@ fn write_symbols_json(
     Ok(path)
 }
 
-/// Serializable shape of `<out>/ghidra/symbol_maps/<label>.json`, consumed by
-/// `ApplySymbols.java` during pass 2. Field order matches the schema in the
-/// Phase-1 design spec.
-#[derive(Debug, Serialize)]
+/// Serializable shape of the strict pass-2 symbol map
+/// (`pixel-modem-extractor-symbol-map-v2`), consumed by `ApplySymbols.java`
+/// (application) and `ExportDecomp.java` (postflight identity comparison)
+/// through the shared `PalTasksSupport` reader. Field order below is the
+/// canonical wire order; the Java reader enforces it exactly.
+#[derive(Serialize)]
 struct SymbolMapFile<'a> {
-    tool_version: &'static str,
-    image: &'a str,
-    source_blake3: &'a str,
+    format: &'static str,
+    image: ImageBlock<'a>,
+    pal: PalBlock<'a>,
     functions_blake3: &'a str,
-    symbols: Vec<SymbolMapEntry<'a>>,
+    executions: Vec<ExecutionBlock<'a>>,
+    symbols: Vec<DecisionBlock<'a>>,
 }
 
-#[derive(Debug, Serialize)]
-struct SymbolMapEntry<'a> {
+#[derive(Serialize)]
+struct ImageBlock<'a> {
+    label: &'a str,
+    base_addr: String,
+    size: u64,
+    blake3: &'a str,
+}
+
+#[derive(Serialize)]
+struct PalBlock<'a> {
+    identity: &'a str,
+    manifest_blake3: Option<&'a str>,
+    scatter_load_map_blake3: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ExecutionBlock<'a> {
+    producer: &'static str,
     entry: &'a str,
-    arch: &'a str,
-    original_name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<&'a str>,
-    tier: &'a Tier,
-    annotations: &'a [String],
+    execution_blake3: &'a str,
+    decode_ranges: Vec<DecodeRangeWire>,
 }
 
-/// Serialize a per-image symbol map to `out_path`. Returns `out_path` on success.
-pub fn write_symbol_map(
+#[derive(Serialize)]
+struct DecisionBlock<'a> {
+    execution: usize,
+    original_primary: &'a str,
+    original_source: &'a str,
+    final_primary: &'a str,
+    final_source: &'a str,
+    action: &'static str,
+    annotations: &'a [String],
+    pal_transition: Option<PalTransition>,
+}
+
+#[derive(Serialize)]
+struct PalTransition {
+    from: &'static str,
+    to: &'static str,
+}
+
+/// One authenticated Ghidra execution plus its retained record identity (the
+/// pass-1 primary the map binds as `original_primary`).
+struct GhidraExecutionRecord {
+    entry: u32,
+    entry_text: String,
+    execution_blake3: String,
+    decode_ranges: Vec<DecodeRangeWire>,
+    original_primary: String,
+    original_source: String,
+    /// First decode-range ISA ("arm" | "thumb") for the sort key.
+    first_isa: &'static str,
+    execution_digest: [u8; 32],
+}
+
+/// The result of one successfully written pass-2 map.
+#[derive(Debug)]
+pub struct WrittenSymbolMap {
+    pub path: PathBuf,
+    /// BLAKE3 over the exact written map bytes.
+    pub map_blake3: String,
+    /// Plain BLAKE3 over the exact retained pass-1 `functions.json` bytes.
+    pub functions_blake3: String,
+    /// Accepted Ghidra executions covered (== decisions).
+    pub execution_count: usize,
+    /// Decisions that apply anything (a rename or at least one annotation) —
+    /// the pass-2 scheduling gate.
+    pub applied_decision_count: usize,
+}
+
+fn map_string_check(value: &str, what: &str) -> Result<()> {
+    if value.contains('\0') {
+        return Err(Error::Serialize(format!(
+            "symbol map {what} contains a NUL byte"
+        )));
+    }
+    if value.contains('\u{fffd}') {
+        // A replacement character means a lossy UTF-8 conversion upstream
+        // (unpaired surrogates cannot exist in a Rust `str`, but lossy
+        // decoding can smuggle the sentinel through).
+        return Err(Error::Serialize(format!(
+            "symbol map {what} contains an unpaired-surrogate sentinel"
+        )));
+    }
+    Ok(())
+}
+
+fn check_map_limits(symbols: &[Symbol]) -> Result<()> {
+    let mut aggregate: u64 = 0;
+    for symbol in symbols {
+        if symbol.annotations.len() > MAX_MAP_ANNOTATIONS_PER_DECISION {
+            return Err(Error::Serialize(format!(
+                "a symbol map decision carries {} annotations above the \
+                 {MAX_MAP_ANNOTATIONS_PER_DECISION}-annotation limit",
+                symbol.annotations.len()
+            )));
+        }
+        for annotation in &symbol.annotations {
+            let size = annotation.len();
+            if size > MAX_MAP_ANNOTATION_UTF8_BYTES {
+                return Err(Error::Serialize(format!(
+                    "an annotation is {size} UTF-8 bytes above the \
+                     {MAX_MAP_ANNOTATION_UTF8_BYTES}-byte limit"
+                )));
+            }
+            map_string_check(annotation, "annotation")?;
+            aggregate = aggregate
+                .checked_add(size as u64)
+                .ok_or_else(|| Error::Serialize("annotation aggregate overflow".into()))?;
+            if aggregate > MAX_MAP_ANNOTATION_AGGREGATE_BYTES {
+                return Err(Error::Serialize(
+                    "symbol map annotations exceed the 64 MiB aggregate limit".into(),
+                ));
+            }
+        }
+        for name in [
+            &symbol.original_name,
+            symbol.name.as_deref().unwrap_or_default(),
+        ] {
+            if name.chars().count() > MAX_PRIMARY_CHARS {
+                return Err(Error::Serialize(format!(
+                    "a primary exceeds the {MAX_PRIMARY_CHARS}-character limit"
+                )));
+            }
+            map_string_check(name, "primary")?;
+        }
+    }
+    Ok(())
+}
+
+/// Assemble and atomically write the strict pass-2 symbol map for one image.
+///
+/// `image_dir` is the image's tree directory (`images/<label>` with
+/// `decompiled/functions.json`); `functions_bytes` are the exact retained
+/// pass-1 `functions.json` bytes (hashed verbatim, whitespace and terminal
+/// newline included). Every accepted Ghidra execution is recomputed through
+/// the `runtime` (`RuntimeImage` revalidates each declared range hash against
+/// runtime storage, and `execution_identity` recomputes the domain-separated
+/// digest), sorted by `(entry, first-ISA, execution_blake3)`, and covered by
+/// exactly one decision in the same order. `symbols` are the ranked decisions
+/// from [`build_map`]; each Ghidra-owned symbol's original name is
+/// cross-checked against its retained record before publication.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_pass2_symbol_map(
     out_path: &Path,
+    image_dir: &Path,
     image_label: &str,
+    load_addr: u64,
+    image_bytes: &[u8],
     symbols: &[Symbol],
-    source_blake3: &str,
-    functions_blake3: &str,
-) -> Result<PathBuf> {
-    let entries: Vec<SymbolMapEntry<'_>> = symbols
+    pal: Option<&PalPass2Context>,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+) -> Result<WrittenSymbolMap> {
+    check_map_limits(symbols)?;
+
+    let functions_path = image_dir.join("decompiled").join("functions.json");
+    let functions_bytes = std::fs::read(&functions_path)?;
+    let functions_blake3 = crate::manifest::blake3_bytes(&functions_bytes);
+    let records: Vec<serde_json::Value> = serde_json::from_slice(&functions_bytes)
+        .map_err(|e| Error::Serialize(format!("parse {}: {e}", functions_path.display())))?;
+
+    // Recompute every accepted execution through the runtime and pair it with
+    // its retained record identity (original primary + source).
+    #[derive(Deserialize)]
+    struct RecordIdentity {
+        name: String,
+        #[serde(default)]
+        original_name: Option<String>,
+        #[serde(default)]
+        primary_source: Option<String>,
+    }
+    let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
+        &records,
+        records.len(),
+        runtime,
+    )?;
+    let mut executions: Vec<GhidraExecutionRecord> = Vec::new();
+    for (value, tagged) in records.iter().zip(&inventory.records) {
+        let identity: RecordIdentity = serde_json::from_value(value.clone())
+            .map_err(|e| Error::Serialize(format!("parse retained function record: {e}")))?;
+        let Some(execution) =
+            crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)?
+        else {
+            // Quarantined record: no accepted projection, no execution, no
+            // decision. Every accepted execution is covered exactly once.
+            continue;
+        };
+        let original_source = match identity.primary_source.as_deref() {
+            Some("default") | Some("analysis") | Some("imported") | Some("user_defined") => {
+                identity.primary_source.as_deref().unwrap()
+            }
+            other => {
+                return Err(Error::Serialize(format!(
+                    "retained function record carries an unknown primary source {other:?}"
+                )));
+            }
+        };
+        executions.push(GhidraExecutionRecord {
+            entry: execution.entry,
+            entry_text: format!("0x{:08x}", execution.entry),
+            execution_blake3: crate::manifest::blake3_fixed(execution.execution_blake3),
+            decode_ranges: execution
+                .decode_ranges
+                .iter()
+                .map(DecodeRangeWire::from_authenticated)
+                .collect(),
+            original_primary: identity.original_name.unwrap_or(identity.name),
+            original_source: original_source.to_string(),
+            first_isa: match execution
+                .decode_ranges
+                .first()
+                .map(|range| range.isa)
+                .unwrap_or(crate::execution_ranges::DecodeIsa::Arm)
+            {
+                crate::execution_ranges::DecodeIsa::Arm => "arm",
+                crate::execution_ranges::DecodeIsa::Thumb => "thumb",
+            },
+            execution_digest: execution.execution_blake3,
+        });
+    }
+    executions.sort_by(|a, b| {
+        (a.entry, a.first_isa, &a.execution_blake3).cmp(&(
+            b.entry,
+            b.first_isa,
+            &b.execution_blake3,
+        ))
+    });
+
+    // One decision per execution, cross-checked against the Ghidra-owned
+    // symbol for that exact execution identity.
+    let mut decisions: Vec<DecisionBlock<'_>> = Vec::with_capacity(executions.len());
+    let mut applied_decision_count = 0usize;
+    for (index, execution) in executions.iter().enumerate() {
+        let symbol = symbols
+            .iter()
+            .find(|symbol| {
+                symbol.owner == FunctionOwner::Ghidra
+                    && symbol.execution_blake3 == Some(execution.execution_digest)
+            })
+            .ok_or_else(|| {
+                Error::Serialize(format!(
+                    "no symbol covers the accepted Ghidra execution at 0x{:08x}",
+                    execution.entry
+                ))
+            })?;
+        if symbol.original_name != execution.original_primary {
+            return Err(Error::Serialize(format!(
+                "symbol original primary {:?} does not match the retained record {:?} at 0x{:08x}",
+                symbol.original_name, execution.original_primary, execution.entry
+            )));
+        }
+        let pal_transition = match pal
+            .and_then(|ctx| ctx.applications.get(&execution.entry))
+            .filter(|app| app.desired_primary == execution.original_primary)
+        {
+            // Only an exact rename of the applied task primary by a rank
+            // above pal_task (a Recovered func/registration name differing
+            // from the original) may transition; a pal-rank preserve never
+            // does.
+            Some(app)
+                if symbol
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name != execution.original_primary)
+                    && symbol.tier == Tier::Recovered =>
+            {
+                if app.isa != symbol.arch {
+                    return Err(Error::Serialize(
+                        "PAL application ISA does not match the symbol arch".into(),
+                    ));
+                }
+                Some(PalTransition {
+                    from: "pal_owned",
+                    to: "pass2_owned",
+                })
+            }
+            _ => None,
+        };
+        // Authorization envelope, mirrored by ApplySymbols: a rename may
+        // displace only a default- or analysis-sourced primary, or an exact
+        // registry-bound pal_owned task primary (the transition above).
+        // Genuine imported and user-defined names stay protected — their
+        // decisions downgrade to preserve (the evidence survives in
+        // symbols.json).
+        let rename_authorized = pal_transition.is_some()
+            || matches!(execution.original_source.as_str(), "default" | "analysis");
+        let (final_primary, final_source, action) = match &symbol.name {
+            Some(name) if name != &execution.original_primary && rename_authorized => {
+                let source = match symbol.tier {
+                    Tier::Recovered => "user_defined",
+                    Tier::Provisional | Tier::None => "analysis",
+                };
+                applied_decision_count += 1;
+                (name.as_str(), source, "rename")
+            }
+            _ => (
+                execution.original_primary.as_str(),
+                execution.original_source.as_str(),
+                "preserve",
+            ),
+        };
+        if !symbol.annotations.is_empty() {
+            applied_decision_count += 1;
+        }
+        decisions.push(DecisionBlock {
+            execution: index,
+            original_primary: &execution.original_primary,
+            original_source: &execution.original_source,
+            final_primary,
+            final_source,
+            action,
+            annotations: &symbol.annotations,
+            pal_transition,
+        });
+    }
+
+    let (pal_identity, manifest_blake3, scatter_blake3) = match pal {
+        None => ("none", None, None),
+        Some(ctx) => (
+            ctx.identity.as_str(),
+            Some(ctx.manifest_blake3.as_str()),
+            ctx.scatter_load_map_blake3.as_deref(),
+        ),
+    };
+    let image_size = u64::try_from(image_bytes.len())
+        .map_err(|_| Error::Serialize("image size does not fit the map domain".into()))?;
+    let file = SymbolMapFile {
+        format: SYMBOL_MAP_FORMAT,
+        image: ImageBlock {
+            label: image_label,
+            base_addr: format!("0x{load_addr:08x}"),
+            size: image_size,
+            blake3: &crate::manifest::blake3_bytes(image_bytes),
+        },
+        pal: PalBlock {
+            identity: pal_identity,
+            manifest_blake3,
+            scatter_load_map_blake3: scatter_blake3,
+        },
+        functions_blake3: &functions_blake3,
+        executions: executions
+            .iter()
+            .map(|execution| ExecutionBlock {
+                producer: "ghidra",
+                entry: &execution.entry_text,
+                execution_blake3: &execution.execution_blake3,
+                decode_ranges: execution.decode_ranges.clone(),
+            })
+            .collect(),
+        symbols: decisions,
+    };
+    let mut bytes =
+        serde_json::to_vec_pretty(&file).map_err(|e| Error::Serialize(e.to_string()))?;
+    bytes.push(b'\n');
+    let map_blake3 = crate::manifest::blake3_bytes(&bytes);
+    let mut writer = atomic_write_file::AtomicWriteFile::open(out_path)?;
+    use std::io::Write as _;
+    writer
+        .write_all(&bytes)
+        .map_err(|e| Error::Serialize(format!("atomic symbol map write failed: {e}")))?;
+    writer
+        .commit()
+        .map_err(|e| Error::Serialize(format!("atomic symbol map commit failed: {e}")))?;
+
+    Ok(WrittenSymbolMap {
+        path: out_path.to_path_buf(),
+        map_blake3,
+        functions_blake3,
+        execution_count: executions.len(),
+        applied_decision_count,
+    })
+}
+
+/// The complete result of preparing one image's pass-2 symbol map: the
+/// written map plus the downstream orchestration indexes derived from the
+/// same symbol set.
+pub struct Pass2MapBundle {
+    pub map: WrittenSymbolMap,
+    pub symbols: Vec<Symbol>,
+    /// Canonical (bare-lowercase-hex) entry -> final name, for globals
+    /// recovery.
+    pub function_names: HashMap<String, String>,
+    pub evidence_name_projection: crate::globals::FunctionEvidenceNameProjection,
+}
+
+/// Build the ranked symbol set for one image and write its strict pass-2 map
+/// to `map_out_path`. One call covers: `build_map` (ranked decisions), the
+/// exact retained-file hash, the runtime-recomputed execution inventory, the
+/// decision cross-checks, and the atomic v2 write.
+pub fn prepare_pass2_symbol_map(
+    map_out_path: &Path,
+    image_dir: &Path,
+    image_label: &str,
+    tokens: &HashMap<u32, String>,
+    manifest: &Path,
+    pal: Option<&PalPass2Context>,
+) -> Result<Pass2MapBundle> {
+    let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
+        .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
+    let image_bytes = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
+    let symbols = build_map(image_dir, image_label, tokens, manifest, pal)?;
+    let runtime = thumb_runtime(image_dir, &image_bytes, load_addr)?;
+    let map = write_pass2_symbol_map(
+        map_out_path,
+        image_dir,
+        image_label,
+        load_addr,
+        &image_bytes,
+        &symbols,
+        pal,
+        &runtime,
+    )?;
+    let function_names = symbols
         .iter()
-        .map(|s| SymbolMapEntry {
-            entry: &s.address,
-            arch: s.arch,
-            original_name: &s.original_name,
-            name: s.name.as_deref(),
-            tier: &s.tier,
-            annotations: &s.annotations,
+        .filter_map(|symbol| {
+            let name = symbol.name.as_ref()?;
+            let entry = u64::from_str_radix(symbol.address.trim_start_matches("0x"), 16).ok()?;
+            Some((format!("{entry:x}"), name.clone()))
         })
         .collect();
-    let file = SymbolMapFile {
-        tool_version: env!("CARGO_PKG_VERSION"),
-        image: image_label,
-        source_blake3,
-        functions_blake3,
-        symbols: entries,
-    };
-    let json = serde_json::to_string_pretty(&file).map_err(|e| Error::Serialize(e.to_string()))?;
-    std::fs::write(out_path, json)?;
-    Ok(out_path.to_path_buf())
+    let evidence_name_projection =
+        crate::globals::FunctionEvidenceNameProjection::from_symbols(&symbols);
+    Ok(Pass2MapBundle {
+        map,
+        symbols,
+        function_names,
+        evidence_name_projection,
+    })
 }
 
 const SENTINEL: &str = "// pixel-modem-extractor: symbolicated\n";
@@ -1201,11 +1874,16 @@ fn load_global_names(path: &Path) -> HashSet<String> {
 type StringRefPrecompute = (Vec<Option<String>>, HashMap<String, usize>);
 
 /// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
+/// `pal` supplies the authenticated PAL task state when the generation claims
+/// one; it attaches `pal_task` evidence per exact entry and lets the
+/// registration rank displace an applied task primary (which is a "real"
+/// name every other tier must defer to).
 pub(crate) fn build_map(
     image_dir: &Path,
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
+    pal: Option<&PalPass2Context>,
 ) -> Result<Vec<Symbol>> {
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
@@ -1331,11 +2009,20 @@ pub(crate) fn build_map(
         hits.sort_by_key(|(t, _)| *t);
 
         let func_name = recovered_names[i].clone();
+        let pal_app = pal
+            .and_then(|ctx| ctx.applications.get(&u32::try_from(f.entry).ok()?))
+            .filter(|app| app.isa == f.arch)
+            .map(|app| PalApplicationRef {
+                isa: app.isa,
+                desired_primary: app.desired_primary.clone(),
+                applied: app.desired_primary == f.name,
+                tasks: app.tasks.clone(),
+            });
         let file = attribution
             .get(&FunctionEvidenceKey {
                 owner: f.owner,
                 entry: f.entry,
-                execution_blake3: f.execution_blake3,
+                execution_blake3: f.execution.as_ref().map(|e| e.execution_blake3),
             })
             .cloned();
         let fstrings = file
@@ -1360,32 +2047,45 @@ pub(crate) fn build_map(
             None
         };
 
+        // A PAL-applied primary is a real name every weaker rank defers to —
+        // but registration (rank above pal_task) may still displace it.
+        let pal_applied = pal_app.is_some();
         let raw = RawEvidence {
             func_name,
             tokens: hits,
             file,
             file_strings: fstrings,
             ident_guess,
-            // Authoritative, but must not clobber a pre-existing real (non-FUN_)
-            // name (e.g. a Ghidra FID match) — like the string-ref tier, defer.
-            registration: if is_real_name(&f.name) {
+            registration: if is_real_name(&f.name) && !pal_applied {
                 None
             } else {
                 reg_names.get(&f.entry).cloned()
             },
+            pal: pal_app,
         };
-        let (name, tier, evidence, annotations) = decide(&addr_hex, &raw);
+        let (name, tier, evidence, annotations, name_conflicts) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
             address: format!("0x{addr_hex}"),
             arch: f.arch,
             tool: f.tool,
             owner: f.owner,
-            execution_blake3: f.execution_blake3,
+            execution_blake3: f.execution.as_ref().map(|e| e.execution_blake3),
+            decode_ranges: f
+                .execution
+                .as_ref()
+                .map(|e| {
+                    e.decode_ranges
+                        .iter()
+                        .map(DecodeRangeWire::from_authenticated)
+                        .collect()
+                })
+                .unwrap_or_default(),
             original_name: f.name.clone(),
             name,
             tier,
             evidence,
             annotations,
+            name_conflicts,
         });
     }
     finalize_names(&mut symbols);
@@ -1429,7 +2129,7 @@ fn symbolicate_image(
     tokens: &HashMap<u32, String>,
     manifest: &Path,
 ) -> Result<PathBuf> {
-    let symbols = build_map(image_dir, image_label, tokens, manifest)?;
+    let symbols = build_map(image_dir, image_label, tokens, manifest, None)?;
     let image = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
@@ -1469,7 +2169,7 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
         if !dir.join("decompiled").join("functions.json").exists() {
             continue;
         }
-        let symbols = build_map(&dir, &label, &tokens, &manifest)?;
+        let symbols = build_map(&dir, &label, &tokens, &manifest, None)?;
         let image = std::fs::read(dir.join(format!("{label}.bin")))?;
         let load_addr = crate::manifest::load_addr_for_image(&manifest, &label)?
             .ok_or_else(|| Error::Serialize(format!("load_addr missing for {label}")))?;
@@ -1532,7 +2232,9 @@ mod tests {
         )
         .unwrap();
         load_functions(dir, &DisasmIndex::new(""), &test_runtime()).unwrap()[0]
-            .execution_blake3
+            .execution
+            .as_ref()
+            .map(|e| e.execution_blake3)
             .unwrap()
     }
 
@@ -1736,6 +2438,7 @@ mod tests {
             file_strings: vec![],
             ident_guess: None,
             registration: None,
+            pal: None,
         }
     }
 
@@ -1745,10 +2448,10 @@ mod tests {
             func_name: Some("LteRrc_Reestab".into()),
             ..raw()
         };
-        let (name, tier, ev, _ann) = decide("40e1bff4", &r);
+        let (name, tier, ev, _ann, _) = decide("40e1bff4", &r);
         assert_eq!(name.as_deref(), Some("LteRrc_Reestab"));
         assert_eq!(tier, Tier::Recovered);
-        assert_eq!(ev[0].kind, "func");
+        assert_eq!(ev[0].kind(), "func");
     }
 
     #[test]
@@ -1760,7 +2463,7 @@ mod tests {
             )],
             ..raw()
         };
-        let (name, tier, _ev, ann) = decide("40e1bff4", &r);
+        let (name, tier, _ev, ann, _) = decide("40e1bff4", &r);
         let name = name.unwrap();
         assert!(name.starts_with(GUESS_PREFIX), "not marked: {name}");
         assert!(name.ends_with("40e1bff4"), "no address: {name}");
@@ -1778,7 +2481,7 @@ mod tests {
             file_strings: vec!["reest_reason".into()],
             ..raw()
         };
-        let (name, tier, _ev, ann) = decide("40e1bff4", &r);
+        let (name, tier, _ev, ann, _) = decide("40e1bff4", &r);
         assert_eq!(name, None);
         assert_eq!(tier, Tier::None);
         assert!(ann.iter().any(|a| a.starts_with("file: HEDGE/LteRrc.c")));
@@ -1791,14 +2494,20 @@ mod tests {
             ident_guess: Some(("RF_SM_Set_ET_Voltage".into(), name_guess::Class::FnName)),
             ..raw()
         };
-        let (name, tier, ev, ann) = decide("40e1bff4", &r);
+        let (name, tier, ev, ann, _) = decide("40e1bff4", &r);
         let name = name.unwrap();
         assert!(name.starts_with(GUESS_PREFIX), "not marked: {name}");
         assert!(name.contains("RF_SM_Set_ET_Voltage"));
         assert!(name.ends_with("40e1bff4"), "no address: {name}");
         assert_eq!(tier, Tier::Provisional);
-        let e = ev.iter().find(|e| e.kind == "string_ref").unwrap();
-        assert_eq!(e.class, Some("fn_name"));
+        let e = ev
+            .iter()
+            .find_map(|e| match e {
+                TaggedEvidence::StringRef { value, class } => Some((value, *class)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(e.1, "fn_name");
         assert!(ann.iter().any(|a| a.contains("RF_SM_Set_ET_Voltage")));
     }
 
@@ -1809,7 +2518,7 @@ mod tests {
             ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
             ..raw()
         };
-        let (name, tier, _ev, _ann) = decide("40e1bff4", &r);
+        let (name, tier, _ev, _ann, _) = decide("40e1bff4", &r);
         assert_eq!(name.as_deref(), Some("Real_Name"));
         assert_eq!(tier, Tier::Recovered);
     }
@@ -1821,10 +2530,13 @@ mod tests {
             ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
             ..raw()
         };
-        let (_name, tier, ev, _ann) = decide("40e1bff4", &r);
+        let (name, tier, ev, _ann, _) = decide("40e1bff4", &r);
+        let name = name.unwrap();
+        assert!(name.contains("hi"), "token must outrank string_ref: {name}");
         assert_eq!(tier, Tier::Provisional);
-        assert!(ev.iter().any(|e| e.kind == "token"));
-        assert!(!ev.iter().any(|e| e.kind == "string_ref"));
+        // Lower-rank evidence is retained, never dropped.
+        assert!(ev.iter().any(|e| e.kind() == "token"));
+        assert!(ev.iter().any(|e| e.kind() == "string_ref"));
     }
 
     #[test]
@@ -1833,10 +2545,10 @@ mod tests {
             registration: Some("AtiParsePlusCOPS".into()),
             ..raw()
         };
-        let (name, tier, ev, _ann) = decide("411b8f04", &r);
+        let (name, tier, ev, _ann, _) = decide("411b8f04", &r);
         assert_eq!(name.as_deref(), Some("AtiParsePlusCOPS")); // bare, no guess_ prefix
         assert_eq!(tier, Tier::Recovered);
-        assert!(ev.iter().any(|e| e.kind == "registration"));
+        assert!(ev.iter().any(|e| e.kind() == "registration"));
     }
 
     #[test]
@@ -1846,11 +2558,11 @@ mod tests {
             registration: Some("Registered_Name".into()),
             ..raw()
         };
-        let (name, tier, ev, _ann) = decide("411b8f04", &r);
+        let (name, tier, ev, _ann, _) = decide("411b8f04", &r);
         assert_eq!(name.as_deref(), Some("Real_Name"));
         assert_eq!(tier, Tier::Recovered);
         // the registration name is still recorded as evidence
-        assert!(ev.iter().any(|e| e.kind == "registration"));
+        assert!(ev.iter().any(|e| e.kind() == "registration"));
     }
 
     #[test]
@@ -1861,7 +2573,7 @@ mod tests {
             ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
             ..raw()
         };
-        let (name, tier, _ev, _ann) = decide("437436f0", &r);
+        let (name, tier, _ev, _ann, _) = decide("437436f0", &r);
         assert_eq!(name.as_deref(), Some("PICH_HISR")); // bare authoritative name wins
         assert_eq!(tier, Tier::Recovered);
     }
@@ -1875,6 +2587,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: FunctionOwner::Ghidra,
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_aa".into(),
                 name: Some("dup".into()),
                 tier: Tier::Recovered,
@@ -1887,6 +2601,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: FunctionOwner::Ghidra,
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_bb".into(),
                 name: Some("dup".into()),
                 tier: Tier::Recovered,
@@ -1950,7 +2666,7 @@ mod tests {
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].arch, "arm");
         assert_eq!(fns[0].entry, 0x10);
-        assert!(fns[0].execution_blake3.is_some());
+        assert!(fns[0].execution.is_some());
         assert_eq!(fns[0].data_refs, vec![0x200]);
         assert!(fns[0].disasm.contains("movw") && fns[0].disasm.contains("movt"));
         assert!(!fns[0].disasm.contains("0x20: other")); // out of [entry,end)
@@ -2059,14 +2775,14 @@ mod tests {
                         "tool": "radare2",
                         "region_index": 0,
                         "run_index": 0,
-                        "execution_blake3": digest(funcs[0].execution_blake3.unwrap()),
+                        "execution_blake3": digest(funcs[0].execution.as_ref().unwrap().execution_blake3),
                         "entry": "0x1000"
                     }]},
                     "rizin/b.c": {"functions": [{
                         "tool": "rizin",
                         "region_index": 0,
                         "run_index": 1,
-                        "execution_blake3": digest(funcs[1].execution_blake3.unwrap()),
+                        "execution_blake3": digest(funcs[1].execution.as_ref().unwrap().execution_blake3),
                         "entry": "0x1000"
                     }]}
                 }
@@ -2101,7 +2817,7 @@ mod tests {
                 .get(&FunctionEvidenceKey {
                     owner: funcs[0].owner,
                     entry: funcs[0].entry,
-                    execution_blake3: funcs[0].execution_blake3,
+                    execution_blake3: funcs[0].execution.as_ref().map(|e| e.execution_blake3),
                 })
                 .map(String::as_str),
             Some("r2/a.c")
@@ -2111,7 +2827,7 @@ mod tests {
                 .get(&FunctionEvidenceKey {
                     owner: funcs[1].owner,
                     entry: funcs[1].entry,
-                    execution_blake3: funcs[1].execution_blake3,
+                    execution_blake3: funcs[1].execution.as_ref().map(|e| e.execution_blake3),
                 })
                 .map(String::as_str),
             Some("rizin/b.c")
@@ -2146,6 +2862,8 @@ mod tests {
             tool,
             owner: executions[index].0,
             execution_blake3: Some(executions[index].1),
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: format!("original_{name}"),
             name: Some(name.to_string()),
             tier: Tier::Recovered,
@@ -2256,6 +2974,8 @@ mod tests {
             tool: crate::recover_source::Tool::Rizin,
             owner: function.owner,
             execution_blake3: Some(function.execution.unwrap().execution_blake3),
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: "thumb_4000".into(),
             name: Some("recovered_thumb".into()),
             tier: Tier::Recovered,
@@ -2275,6 +2995,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: FunctionOwner::Ghidra,
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_10".into(),
                 name: Some("real".into()),
                 tier: Tier::Recovered,
@@ -2289,6 +3011,8 @@ mod tests {
                     producer: Tool::Radare2,
                 },
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "thumb_20".into(),
                 name: Some("guess_x_20".into()),
                 tier: Tier::Provisional,
@@ -2301,6 +3025,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: FunctionOwner::Ghidra,
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_30".into(),
                 name: None,
                 tier: Tier::None,
@@ -2325,6 +3051,8 @@ mod tests {
             tool: crate::recover_source::Tool::Ghidra,
             owner: FunctionOwner::Ghidra,
             execution_blake3: None,
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: "FUN_40e1bff4".into(),
             name: Some("real_fn".into()),
             tier: Tier::Recovered,
@@ -2352,6 +3080,8 @@ mod tests {
                     producer: Tool::Radare2,
                 },
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "thumb_40e1200".into(),
                 name: Some("guess_short_040e1200".into()),
                 tier: Tier::Provisional,
@@ -2366,6 +3096,8 @@ mod tests {
                     producer: Tool::Radare2,
                 },
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "thumb_40e12000".into(),
                 name: Some("guess_long_40e12000".into()),
                 tier: Tier::Provisional,
@@ -2397,13 +3129,17 @@ mod tests {
         .unwrap();
         let execution_blake3 = load_functions(&dir, &DisasmIndex::new(""), &test_runtime())
             .unwrap()[0]
-            .execution_blake3;
+            .execution
+            .as_ref()
+            .map(|e| e.execution_blake3);
         let syms = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
             owner: FunctionOwner::Ghidra,
             execution_blake3,
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2433,13 +3169,17 @@ mod tests {
         .unwrap();
         let execution_blake3 = load_functions(&dir, &DisasmIndex::new(""), &test_runtime())
             .unwrap()[0]
-            .execution_blake3;
+            .execution
+            .as_ref()
+            .map(|e| e.execution_blake3);
         let syms = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
             owner: FunctionOwner::Ghidra,
             execution_blake3,
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: "FUN_10".into(), // the true original
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2660,8 +3400,14 @@ mod tests {
         let manifest = root.join("manifest.json");
         std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
 
-        let symbols =
-            build_map(&root.join("images/02_MAIN"), "02_MAIN", &tokmap, &manifest).unwrap();
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &tokmap,
+            &manifest,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert!(symbols[0].name.as_deref().unwrap().starts_with("guess_"));
@@ -2705,13 +3451,14 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
         )
         .unwrap();
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].tier, Tier::Provisional);
         let name = symbols[0].name.as_deref().unwrap();
         assert!(name.starts_with("guess_MyMod_DoInit_"), "got {name}");
-        assert!(symbols[0].evidence.iter().any(|e| e.kind == "string_ref"));
+        assert!(symbols[0].evidence.iter().any(|e| e.kind() == "string_ref"));
     }
 
     #[test]
@@ -2787,6 +3534,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
         )
         .unwrap();
 
@@ -2794,7 +3542,7 @@ mod tests {
         let s = by_addr("0x40000200");
         assert_eq!(s.name.as_deref(), Some("Handler_One"));
         assert_eq!(s.tier, Tier::Recovered);
-        assert!(s.evidence.iter().any(|e| e.kind == "registration"));
+        assert!(s.evidence.iter().any(|e| e.kind() == "registration"));
         assert_eq!(by_addr("0x40000280").name.as_deref(), Some("Handler_Three"));
     }
 
@@ -2871,6 +3619,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
         )
         .unwrap();
 
@@ -2878,7 +3627,7 @@ mod tests {
         let real = by_addr("0x40000200");
         assert_eq!(real.tier, Tier::None, "real name must not be overridden");
         assert!(real.name.is_none());
-        assert!(!real.evidence.iter().any(|e| e.kind == "registration"));
+        assert!(!real.evidence.iter().any(|e| e.kind() == "registration"));
         // the unnamed (FUN_) entries are still recovered
         assert_eq!(by_addr("0x40000280").name.as_deref(), Some("Handler_Three"));
     }
@@ -2921,6 +3670,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
         )
         .unwrap();
         assert_eq!(symbols.len(), 1);
@@ -2966,6 +3716,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
         )
         .unwrap();
         assert_eq!(symbols[0].tier, Tier::None);
@@ -2984,6 +3735,8 @@ mod tests {
             tool: crate::recover_source::Tool::Ghidra,
             owner: FunctionOwner::Ghidra,
             execution_blake3: Some(execution_blake3),
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -3011,61 +3764,6 @@ mod tests {
     }
 
     #[test]
-    fn write_symbol_map_round_trips() {
-        let dir = tmp("pme_sym_map_rt");
-        std::fs::create_dir_all(&dir).unwrap();
-        let symbols = vec![
-            Symbol {
-                address: "0x40e1bff4".into(),
-                arch: "arm",
-                tool: crate::recover_source::Tool::Ghidra,
-                owner: FunctionOwner::Ghidra,
-                execution_blake3: None,
-                original_name: "FUN_40e1bff4".into(),
-                name: Some("LteRrc_Reestab".into()),
-                tier: Tier::Recovered,
-                evidence: vec![],
-                annotations: vec!["logs: \"RRC Reestab (%d)\" [LTE_RRC_METRICS]".into()],
-            },
-            Symbol {
-                address: "0x40e1c000".into(),
-                arch: "arm",
-                tool: crate::recover_source::Tool::Ghidra,
-                owner: FunctionOwner::Ghidra,
-                execution_blake3: None,
-                original_name: "FUN_40e1c000".into(),
-                name: None, // Tier::None — no rename
-                tier: Tier::None,
-                evidence: vec![],
-                annotations: vec![],
-            },
-        ];
-        let path =
-            write_symbol_map(&dir.join("m.json"), "02_MAIN", &symbols, "abc", "def").unwrap();
-
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(parsed["tool_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(parsed["image"], "02_MAIN");
-        assert_eq!(parsed["source_blake3"], "abc");
-        assert_eq!(parsed["functions_blake3"], "def");
-        let syms = parsed["symbols"].as_array().unwrap();
-        assert_eq!(syms.len(), 2);
-        assert_eq!(syms[0]["entry"], "0x40e1bff4");
-        assert_eq!(syms[0]["arch"], "arm");
-        assert_eq!(syms[0]["original_name"], "FUN_40e1bff4");
-        assert_eq!(syms[0]["name"], "LteRrc_Reestab");
-        assert_eq!(syms[0]["tier"], "recovered");
-        assert_eq!(
-            syms[0]["annotations"][0],
-            "logs: \"RRC Reestab (%d)\" [LTE_RRC_METRICS]"
-        );
-        // name omitted on Tier::None entries via skip_serializing_if
-        assert!(syms[1].get("name").is_none() || syms[1]["name"].is_null());
-        assert_eq!(syms[1]["tier"], "none");
-    }
-
-    #[test]
     fn finalize_image_with_rewrite_false_leaves_decompiled_c_untouched() {
         let root = tmp("pme_sym_no_rewrite");
         let dec = root.join("images/02_MAIN/decompiled");
@@ -3078,6 +3776,8 @@ mod tests {
             tool: crate::recover_source::Tool::Ghidra,
             owner: FunctionOwner::Ghidra,
             execution_blake3: Some(execution_blake3),
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -3137,6 +3837,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: FunctionOwner::Ghidra,
                 execution_blake3: Some(execution_blake3),
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_10".into(),
                 name: None,
                 tier: Tier::Recovered,
@@ -3302,15 +4004,15 @@ mod tests {
         let image_dir = dir.join("images/02_MAIN");
         // Empty token map isolates the string-ref tier from token guesses.
         // build_map does not write, so the retained tree is not mutated.
-        let symbols = build_map(&image_dir, "02_MAIN", &HashMap::new(), &manifest).unwrap();
+        let symbols = build_map(&image_dir, "02_MAIN", &HashMap::new(), &manifest, None).unwrap();
         let string_ref = symbols
             .iter()
-            .filter(|s| s.evidence.iter().any(|e| e.kind == "string_ref"))
+            .filter(|s| s.evidence.iter().any(|e| e.kind() == "string_ref"))
             .count();
         eprintln!("02_MAIN string_ref guesses: {string_ref}");
         for s in symbols
             .iter()
-            .filter(|s| s.evidence.iter().any(|e| e.kind == "string_ref"))
+            .filter(|s| s.evidence.iter().any(|e| e.kind() == "string_ref"))
             .take(15)
         {
             eprintln!("  {} {}", s.address, s.name.as_deref().unwrap_or("?"));
@@ -3318,6 +4020,849 @@ mod tests {
         assert!(
             string_ref > 4000,
             "string-ref yield unexpectedly low: {string_ref}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Task 11: ranked authority + strict symbol-map v2
+    // ------------------------------------------------------------------
+
+    fn pal_ref(name: &str, index: u32) -> PalTaskRef {
+        PalTaskRef {
+            manifest_blake3: "a".repeat(64),
+            task_index: index,
+            name: name.to_string(),
+            slot: 0x4001_0100,
+            priority: 30,
+            stack_size: 4096,
+        }
+    }
+
+    fn pal_app(desired: &str, tasks: &[(&str, u32)]) -> PalApplicationRef {
+        PalApplicationRef {
+            isa: "arm",
+            desired_primary: desired.to_string(),
+            applied: true,
+            tasks: tasks
+                .iter()
+                .map(|&(name, index)| pal_ref(name, index))
+                .collect(),
+        }
+    }
+
+    fn raw_with_pal(pal: Option<PalApplicationRef>) -> RawEvidence {
+        RawEvidence { pal, ..raw() }
+    }
+
+    #[test]
+    fn ranked_authority_orders_func_registration_pal_task_token_string_ref() {
+        // Pairwise: each stronger rank wins over every weaker rank.
+        let func = Some("Func_Winner".to_string());
+        let registration = Some("Reg_Winner".to_string());
+        let token = vec![(0x3c2a, "■format♦tok■domain♦D".into())];
+        let ident = Some(("StringRef_Guess".to_string(), name_guess::Class::FnName));
+        let pal = Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]));
+
+        let (name, tier, _, _, _) = decide(
+            "40e1bff4",
+            &RawEvidence {
+                func_name: func.clone(),
+                registration: registration.clone(),
+                tokens: token.clone(),
+                ident_guess: ident.clone(),
+                pal: pal.clone(),
+                ..raw()
+            },
+        );
+        assert_eq!(name.as_deref(), Some("Func_Winner"));
+        assert_eq!(tier, Tier::Recovered);
+
+        let (name, tier, _, _, _) = decide(
+            "40e1bff4",
+            &RawEvidence {
+                registration,
+                tokens: token.clone(),
+                ident_guess: ident,
+                pal: pal.clone(),
+                ..raw()
+            },
+        );
+        assert_eq!(name.as_deref(), Some("Reg_Winner"));
+        assert_eq!(tier, Tier::Recovered);
+
+        let (name, tier, _, _, _) = decide(
+            "40e1bff4",
+            &RawEvidence {
+                tokens: token,
+                ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+                pal,
+                ..raw()
+            },
+        );
+        // pal_task outranks token: the task primary wins, never the guess.
+        assert_eq!(name.as_deref(), Some("pal_TaskEntry_alpha"));
+        assert_eq!(tier, Tier::Recovered);
+        assert!(!name.unwrap().starts_with(GUESS_PREFIX));
+
+        let (name, tier, _, _, _) = decide(
+            "40e1bff4",
+            &RawEvidence {
+                tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+                ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+                ..raw()
+            },
+        );
+        // token outranks string_ref: a guess_ name, but from the token slug.
+        let name = name.unwrap();
+        assert!(name.starts_with(GUESS_PREFIX) && name.contains("tok"));
+        assert_eq!(tier, Tier::Provisional);
+    }
+
+    #[test]
+    fn lower_rank_evidence_is_retained_under_stronger_names() {
+        let r = raw_with_pal(Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])));
+        let r = RawEvidence {
+            func_name: Some("Func_Winner".into()),
+            registration: Some("Reg_Loser".into()),
+            tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+            file: Some("HEDGE/x.c".into()),
+            ..r
+        };
+        let (name, _, ev, _, _) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Func_Winner"));
+        let kinds: Vec<&str> = ev.iter().map(TaggedEvidence::kind).collect();
+        for expected in ["func", "registration", "token", "file", "pal_task"] {
+            assert!(
+                kinds.contains(&expected),
+                "evidence lost the {expected} rank: {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_rank_conflict_applies_no_name() {
+        // Two tokens whose distinct format strings yield distinct names.
+        let r = RawEvidence {
+            tokens: vec![
+                (0x1, "■format♦first_name■domain♦D".into()),
+                (0x2, "■format♦second_name■domain♦D".into()),
+            ],
+            ..raw()
+        };
+        let (name, tier, _, _, conflicts) = decide("40e1bff4", &r);
+        assert!(
+            name.is_none(),
+            "a same-rank conflict applied a name: {name:?}"
+        );
+        assert_eq!(tier, Tier::None);
+        assert_eq!(conflicts.len(), 2, "both candidates must be serialized");
+        let names: Vec<&str> = conflicts.iter().map(|c| c.proposed_name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "conflict candidates are not sorted");
+        assert!(
+            conflicts
+                .iter()
+                .all(|c| c.authority == Authority::Token && c.kind == "token")
+        );
+        // Same slug from two tokens is one proposal, not a conflict.
+        let r = RawEvidence {
+            tokens: vec![
+                (0x1, "■format♦same_name■domain♦D".into()),
+                (0x2, "■format♦same_name■domain♦D".into()),
+            ],
+            ..raw()
+        };
+        let (name, tier, _, _, conflicts) = decide("40e1bff4", &r);
+        assert!(conflicts.is_empty());
+        assert!(name.as_deref().unwrap().contains("same_name"));
+        assert_eq!(tier, Tier::Provisional);
+    }
+
+    #[test]
+    fn shared_task_roles_propose_no_pal_name_and_block_lower_ranks() {
+        let shared = pal_app(
+            "pal_TaskEntry_shared_40010430",
+            &[("delta_one", 3), ("delta_two", 4)],
+        );
+        // Token guesses must not rename a shared task entry.
+        let r = RawEvidence {
+            tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+            pal: Some(shared),
+            ..raw()
+        };
+        let (name, tier, _, _, _) = decide("40e1bff4", &r);
+        assert!(
+            name.is_none(),
+            "shared task roles proposed a name: {name:?}"
+        );
+        assert_eq!(tier, Tier::None);
+        // A stronger rank still wins over the shared role blocker.
+        let r = RawEvidence {
+            func_name: Some("Func_Winner".into()),
+            pal: Some(pal_app(
+                "pal_TaskEntry_shared_40010430",
+                &[("delta_one", 3), ("delta_two", 4)],
+            )),
+            ..raw()
+        };
+        let (name, tier, _, _, _) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Func_Winner"));
+        assert_eq!(tier, Tier::Recovered);
+    }
+
+    #[test]
+    fn pal_annotation_survives_stronger_rename() {
+        let r = RawEvidence {
+            func_name: Some("Func_Winner".into()),
+            pal: Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])),
+            ..raw()
+        };
+        let (name, _, _, ann, _) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Func_Winner"));
+        assert!(
+            ann.iter().any(|a| a.starts_with("pal task: alpha")),
+            "PAL annotation lost under a stronger rename: {ann:?}"
+        );
+    }
+
+    #[test]
+    fn provisional_evidence_never_replaces_a_pal_primary() {
+        let r = RawEvidence {
+            tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+            ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
+            pal: Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])),
+            ..raw()
+        };
+        let (name, tier, _, _, _) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("pal_TaskEntry_alpha"));
+        assert_eq!(tier, Tier::Recovered);
+    }
+
+    // A fixture image directory with a valid single-argument Ghidra inventory
+    // (`primary_source` per record), for the map writer tests.
+    fn map_fixture_tree(tag: &str) -> PathBuf {
+        let dir = tmp(&format!("pme_sym_v2_map_{tag}_{}", std::process::id()));
+        let dec = dir.join("decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        dir
+    }
+
+    fn write_map_functions(dir: &Path, records: &[serde_json::Value]) -> Vec<u8> {
+        let bytes = serde_json::to_vec_pretty(records).unwrap();
+        std::fs::write(dir.join("decompiled/functions.json"), &bytes).unwrap();
+        bytes
+    }
+
+    fn ghidra_symbol_at(entry: u32, execution: [u8; 32], name: Option<&str>) -> Symbol {
+        Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "arm",
+            tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: Some(execution),
+            decode_ranges: Vec::new(),
+            original_name: format!("FUN_{entry:08x}"),
+            name: name.map(str::to_string),
+            tier: Tier::Recovered,
+            evidence: Vec::new(),
+            annotations: Vec::new(),
+            name_conflicts: Vec::new(),
+        }
+    }
+
+    fn identity_for(
+        dir: &Path,
+        entry: u32,
+        image: &[u8],
+        load_addr: u32,
+    ) -> (ExecutionIdentity, String) {
+        let runtime =
+            crate::runtime_image::RuntimeImage::from_plan(image, load_addr, None).unwrap();
+        let bytes = std::fs::read(dir.join("decompiled/functions.json")).unwrap();
+        let records: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
+            &records,
+            records.len(),
+            &runtime,
+        )
+        .unwrap();
+        let tagged = inventory.records.iter().find(|r| r.entry == entry).unwrap();
+        let identity =
+            crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)
+                .unwrap()
+                .unwrap();
+        let digest = identity
+            .execution_blake3
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        (identity, digest)
+    }
+
+    fn runtime_for(image: &[u8], load_addr: u32) -> crate::runtime_image::RuntimeImage<'_> {
+        crate::runtime_image::RuntimeImage::from_plan(image, load_addr, None).unwrap()
+    }
+
+    /// Two-entry fixture: writes functions.json, derives each execution
+    /// identity through the test runtime, and returns the symbols + records.
+    type ExecutionFixture = (u32, ExecutionIdentity, String, &'static str);
+
+    fn two_execution_fixture(
+        dir: &Path,
+        image: &[u8],
+        load_addr: u32,
+        sources: [&'static str; 2],
+    ) -> (Vec<Symbol>, Vec<ExecutionFixture>) {
+        let first = ghidra_function_in_image(
+            &format!("FUN_{:08x}", load_addr + 0x100),
+            load_addr + 0x100,
+            load_addr + 0x108,
+            &[],
+            image,
+            load_addr,
+        );
+        let mut first = first;
+        first["primary_source"] = serde_json::json!(sources[0]);
+        let second = ghidra_function_in_image(
+            &format!("FUN_{:08x}", load_addr + 0x200),
+            load_addr + 0x200,
+            load_addr + 0x208,
+            &[],
+            image,
+            load_addr,
+        );
+        let mut second = second;
+        second["primary_source"] = serde_json::json!(sources[1]);
+        write_map_functions(dir, &[second, first]); // deliberately unsorted
+
+        let mut out = Vec::new();
+        for entry in [load_addr + 0x100, load_addr + 0x200] {
+            let (identity, digest) = identity_for(dir, entry, image, load_addr);
+            let source = if entry == load_addr + 0x100 {
+                sources[0]
+            } else {
+                sources[1]
+            };
+            out.push((entry, identity, digest, source));
+        }
+        let symbols = vec![
+            ghidra_symbol_at(load_addr + 0x100, out[0].1.execution_blake3, None),
+            ghidra_symbol_at(load_addr + 0x200, out[1].1.execution_blake3, None),
+        ];
+        (symbols, out)
+    }
+
+    #[test]
+    fn map_v2_field_order_is_exact_and_functions_blake3_covers_retained_bytes() {
+        let dir = map_fixture_tree("order");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let (symbols, _) = two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&map_path).unwrap();
+        // Top-level order: format,image,pal,functions_blake3,executions,symbols.
+        let top: Vec<&str> = [
+            "format",
+            "image",
+            "pal",
+            "functions_blake3",
+            "executions",
+            "symbols",
+        ]
+        .to_vec();
+        let mut positions: Vec<usize> = Vec::new();
+        for key in &top {
+            let needle = format!("\"{key}\":");
+            let at = text
+                .find(&needle)
+                .unwrap_or_else(|| panic!("no {key} in map"));
+            positions.push(at);
+            assert_eq!(
+                text[..at].matches('{').count() - text[..at].matches('}').count(),
+                1,
+                "key {key} is not top-level"
+            );
+        }
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "top-level keys out of order: {top:?}"
+        );
+        // image block: label,base_addr,size,blake3.
+        let image_block = text
+            .split("\"image\": {")
+            .nth(1)
+            .unwrap()
+            .split("},")
+            .next()
+            .unwrap();
+        let mut positions: Vec<usize> = Vec::new();
+        for key in ["label", "base_addr", "size", "blake3"] {
+            positions.push(image_block.find(&format!("\"{key}\":")).unwrap());
+        }
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+        // pal block for none: identity + null hashes.
+        let pal_block = text
+            .split("\"pal\": {")
+            .nth(1)
+            .unwrap()
+            .split("},")
+            .next()
+            .unwrap();
+        assert!(pal_block.contains("\"identity\": \"none\""));
+        assert!(pal_block.contains("\"manifest_blake3\": null"));
+        assert!(pal_block.contains("\"scatter_load_map_blake3\": null"));
+        // Execution records: producer,entry,execution_blake3,decode_ranges.
+        let execution_block = text
+            .split("\"executions\": [")
+            .nth(1)
+            .unwrap()
+            .split("],\n  \"symbols\"")
+            .next()
+            .unwrap();
+        for key in ["producer", "entry", "execution_blake3", "decode_ranges"] {
+            assert!(execution_block.contains(&format!("\"{key}\":")));
+        }
+        // Decisions: execution,original_primary,original_source,final_primary,final_source,action,annotations,pal_transition.
+        let symbols_block = text.split("\"symbols\": [").nth(1).unwrap();
+        let mut positions: Vec<usize> = Vec::new();
+        for key in [
+            "execution",
+            "original_primary",
+            "original_source",
+            "final_primary",
+            "final_source",
+            "action",
+            "annotations",
+            "pal_transition",
+        ] {
+            positions.push(symbols_block.find(&format!("\"{key}\":")).unwrap());
+        }
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+
+        // functions_blake3 is the plain BLAKE3 over the exact retained bytes,
+        // including the pretty-print whitespace and terminal newline we wrote.
+        let retained = std::fs::read(dir.join("decompiled/functions.json")).unwrap();
+        assert_eq!(
+            written.functions_blake3,
+            crate::manifest::blake3_bytes(&retained)
+        );
+        assert_eq!(written.execution_count, 2);
+        assert_eq!(
+            written.map_blake3,
+            crate::manifest::blake3_bytes(std::fs::read(&map_path).unwrap().as_slice())
+        );
+    }
+
+    #[test]
+    fn map_covers_every_accepted_ghidra_execution_once_in_sorted_order() {
+        let dir = map_fixture_tree("coverage");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        // Third record: quarantined (decode errors, no accepted projection).
+        let mut quarantined = ghidra_function_in_image(
+            "FUN_00000300",
+            load_addr + 0x300,
+            load_addr + 0x308,
+            &[],
+            &image,
+            load_addr,
+        );
+        quarantined["decode_ranges"] = serde_json::json!([]);
+        quarantined["decode_range_errors"] = serde_json::json!([{
+            "kind": "missing_isa_context",
+            "address": format!("0x{:08x}", load_addr + 0x300),
+            "end": format!("0x{:08x}", load_addr + 0x308),
+        }]);
+
+        let (symbols, executions) =
+            two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        let bytes = std::fs::read(dir.join("decompiled/functions.json")).unwrap();
+        let mut records: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        records.push(quarantined);
+        write_map_functions(&dir, &records);
+
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.execution_count, 2, "quarantined record leaked in");
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        let executions_json = parsed["executions"].as_array().unwrap();
+        let entries: Vec<u64> = executions_json
+            .iter()
+            .map(|e| {
+                u64::from_str_radix(e["entry"].as_str().unwrap().trim_start_matches("0x"), 16)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![u64::from(load_addr + 0x100), u64::from(load_addr + 0x200)],
+            "executions are not sorted by entry"
+        );
+        assert!(executions_json.iter().all(|e| e["producer"] == "ghidra"));
+        let decisions = parsed["symbols"].as_array().unwrap();
+        assert_eq!(decisions.len(), 2);
+        for (index, decision) in decisions.iter().enumerate() {
+            assert_eq!(decision["execution"], index as u64);
+        }
+        // Every declared execution_blake3 matches the recomputed identity.
+        for (execution, json) in executions.iter().zip(executions_json) {
+            assert_eq!(json["execution_blake3"], execution.2);
+        }
+    }
+
+    #[test]
+    fn map_preserves_all_four_primary_sources_and_action_rules() {
+        for source in ["default", "analysis", "imported", "user_defined"] {
+            let dir = map_fixture_tree(&format!("source_{source}"));
+            let image = vec![0u8; 0x400];
+            let load_addr = 0x4000_0000u32;
+            let (mut symbols, _) =
+                two_execution_fixture(&dir, &image, load_addr, [source, "default"]);
+            // First execution: a recovered rename; second: plain preserve.
+            symbols[0].name = Some("Recovered_Name".into());
+            symbols[0].tier = Tier::Recovered;
+            let map_path = dir.join("map.json");
+            write_pass2_symbol_map(
+                &map_path,
+                &dir,
+                "02_MAIN",
+                u64::from(load_addr),
+                &image,
+                &symbols,
+                None,
+                &runtime_for(&image, load_addr),
+            )
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+            let decisions = parsed["symbols"].as_array().unwrap();
+            assert_eq!(decisions[0]["original_source"], source);
+            assert_eq!(decisions[0]["pal_transition"], serde_json::Value::Null);
+            match source {
+                // A recovered rename displaces default and analysis primaries.
+                "default" | "analysis" => {
+                    assert_eq!(decisions[0]["action"], "rename");
+                    assert_eq!(decisions[0]["final_source"], "user_defined");
+                }
+                // Genuine imported and user-defined names stay protected: the
+                // decision downgrades to preserve with identical fields.
+                "imported" | "user_defined" => {
+                    assert_eq!(decisions[0]["action"], "preserve");
+                    assert_eq!(decisions[0]["final_source"], source);
+                    assert_eq!(
+                        decisions[0]["final_primary"],
+                        decisions[0]["original_primary"]
+                    );
+                }
+                other => panic!("unknown source {other}"),
+            }
+            assert_eq!(decisions[1]["action"], "preserve");
+            assert_eq!(decisions[1]["original_source"], "default");
+            assert_eq!(decisions[1]["final_source"], "default");
+            assert_eq!(
+                decisions[1]["final_primary"],
+                decisions[1]["original_primary"]
+            );
+        }
+    }
+
+    fn pal_ctx(identity: &str, applications: Vec<(u32, PalApplicationRef)>) -> PalPass2Context {
+        PalPass2Context {
+            identity: identity.to_string(),
+            manifest_blake3: "b".repeat(64),
+            scatter_load_map_blake3: Some("c".repeat(64)),
+            applications: applications.into_iter().collect(),
+        }
+    }
+
+    /// Rewrite the first record's primary name in the retained functions.json
+    /// (the PAL-applied-primary fixture state) and return the updated bytes.
+    fn retitle_first_record(dir: &Path, name: &str) {
+        let bytes = std::fs::read(dir.join("decompiled/functions.json")).unwrap();
+        let mut records: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let index = records
+            .iter()
+            .position(|record| {
+                record["entry"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x")
+                    .parse::<u32>()
+                    .map(|entry| format!("{entry:08x}").contains("100"))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                records
+                    .iter()
+                    .position(|record| record["name"].as_str().is_some_and(|n| n.ends_with("100")))
+            })
+            .expect("fixture record at +0x100");
+        records[index]["name"] = serde_json::json!(name);
+        std::fs::write(
+            dir.join("decompiled/functions.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn map_pal_transition_only_on_authorized_pal_rename() {
+        let dir = map_fixture_tree("transition");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let (mut symbols, executions) =
+            two_execution_fixture(&dir, &image, load_addr, ["analysis", "default"]);
+        retitle_first_record(&dir, "pal_TaskEntry_alpha");
+
+        // Entry +0x100 is the PAL-applied primary (original name == desired);
+        // a recovered rename over it carries the exact transition. Entry +0x200
+        // has a provisional rename: never a transition.
+        symbols[0].original_name = "pal_TaskEntry_alpha".into();
+        symbols[0].name = Some("Func_Winner".into());
+        symbols[0].tier = Tier::Recovered;
+        symbols[1].name = Some("guess_tok_00000200".into());
+        symbols[1].tier = Tier::Provisional;
+
+        let pal = pal_ctx(
+            "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:2:1",
+            vec![(
+                load_addr + 0x100,
+                pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]),
+            )],
+        );
+        let map_path = dir.join("map.json");
+        write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            Some(&pal),
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        assert_eq!(parsed["pal"]["identity"], pal.identity);
+        assert_eq!(parsed["pal"]["manifest_blake3"], "b".repeat(64));
+        assert_eq!(parsed["pal"]["scatter_load_map_blake3"], "c".repeat(64));
+        let decisions = parsed["symbols"].as_array().unwrap();
+        assert_eq!(
+            decisions[0]["pal_transition"],
+            serde_json::json!({"from": "pal_owned", "to": "pass2_owned"})
+        );
+        // A provisional rename never carries a transition.
+        assert_eq!(decisions[1]["action"], "rename");
+        assert_eq!(decisions[1]["final_source"], "analysis");
+        assert_eq!(decisions[1]["pal_transition"], serde_json::Value::Null);
+
+        // A rename of an entry whose original primary is NOT the desired PAL
+        // primary carries no transition even under a present PAL context.
+        let dir2 = map_fixture_tree("transition_nonmatching");
+        let (mut symbols2, _) =
+            two_execution_fixture(&dir2, &image, load_addr, ["analysis", "default"]);
+        retitle_first_record(&dir2, "unrelated_existing");
+        symbols2[0].original_name = "unrelated_existing".into();
+        symbols2[0].name = Some("Func_Winner".into());
+        symbols2[0].tier = Tier::Recovered;
+        let map_path2 = dir2.join("map.json");
+        write_pass2_symbol_map(
+            &map_path2,
+            &dir2,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols2,
+            Some(&pal),
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        let parsed2: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path2).unwrap()).unwrap();
+        assert_eq!(
+            parsed2["symbols"][0]["pal_transition"],
+            serde_json::Value::Null
+        );
+        let _ = executions;
+    }
+
+    #[test]
+    fn map_rejects_annotation_and_primary_limits() {
+        let dir = map_fixture_tree("limits");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let base = |symbols: Vec<Symbol>| {
+            let dir = dir.clone();
+            let map_path = dir.join("map.json");
+            write_pass2_symbol_map(
+                &map_path,
+                &dir,
+                "02_MAIN",
+                u64::from(load_addr),
+                &image,
+                &symbols,
+                None,
+                &runtime_for(&image, load_addr),
+            )
+        };
+
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        symbols[0].annotations = (0..257).map(|i| format!("ann{i}")).collect();
+        let err = base(symbols.clone()).unwrap_err().to_string();
+        assert!(err.contains("256"), "{err}");
+
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        symbols[0].annotations = vec!["x".repeat(4097)];
+        let err = base(symbols.clone()).unwrap_err().to_string();
+        assert!(err.contains("4096"), "{err}");
+
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        symbols[0].name = Some("n".repeat(2001));
+        let err = base(symbols).unwrap_err().to_string();
+        assert!(err.contains("2000"), "{err}");
+    }
+
+    #[test]
+    fn map_rejects_nul_and_unpaired_surrogates() {
+        let dir = map_fixture_tree("strings");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        symbols[0].annotations = vec!["bad\u{0}nul".into()];
+        let err = write_pass2_symbol_map(
+            &dir.join("map.json"),
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("NUL"), "{err}");
+    }
+
+    #[test]
+    fn map_cross_checks_symbol_original_name_against_retained_record() {
+        let dir = map_fixture_tree("crosscheck");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        symbols[0].original_name = "NOT_THE_RECORD_NAME".into();
+        let err = write_pass2_symbol_map(
+            &dir.join("map.json"),
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("original primary"), "{err}");
+    }
+
+    #[test]
+    fn build_map_attaches_pal_evidence_without_merging_identities() {
+        let root = tmp(&format!("pme_sym_pal_build_{}", std::process::id()));
+        let dec = root.join("decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let mut image = vec![0u8; 0x300];
+        image[0x100..0x104].copy_from_slice(&[0x01, 0x00, 0x80, 0xe0]);
+        image[0x104..0x108].copy_from_slice(&[0x1e, 0xff, 0x2f, 0xe1]);
+        std::fs::write(root.join("02_MAIN.bin"), &image).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "pal_TaskEntry_alpha",
+                0x100,
+                0x108,
+                &[],
+                &image,
+                0,
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
+
+        let pal = pal_ctx(
+            "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:0",
+            vec![(0x100, pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]))],
+        );
+        let symbols = build_map(&root, "02_MAIN", &HashMap::new(), &manifest, Some(&pal)).unwrap();
+
+        // The Ghidra record at the application entry carries pal_task evidence
+        // and the recovered task primary; the Thumb records (same tree, other
+        // owners) carry none.
+        let ghidra_symbol = symbols
+            .iter()
+            .find(|s| s.owner == FunctionOwner::Ghidra && s.address == "0x00000100")
+            .unwrap();
+        assert!(
+            ghidra_symbol
+                .evidence
+                .iter()
+                .any(|e| matches!(&e, TaggedEvidence::PalTask { task } if task.name == "alpha"))
+        );
+        assert_eq!(ghidra_symbol.name.as_deref(), Some("pal_TaskEntry_alpha"));
+        assert_eq!(ghidra_symbol.tier, Tier::Recovered);
+        // The PAL annotation line survives every stronger rename (decide()
+        // attaches it whenever pal evidence exists, regardless of winner).
+        assert!(
+            ghidra_symbol
+                .annotations
+                .iter()
+                .any(|annotation| annotation.starts_with("pal task: alpha")),
+            "PAL annotation missing: {:?}",
+            ghidra_symbol.annotations
+        );
+        assert!(
+            symbols
+                .iter()
+                .filter(|s| s.owner != FunctionOwner::Ghidra)
+                .all(|s| !s
+                    .evidence
+                    .iter()
+                    .any(|e| matches!(&e, TaggedEvidence::PalTask { .. }))),
+            "pal evidence must attach per exact entry"
         );
     }
 
@@ -3348,11 +4893,12 @@ mod tests {
             &main,
             &HashMap::new(),
             &dir.join("manifest.json"),
+            None,
         )
         .unwrap();
         let regs: Vec<&Symbol> = symbols
             .iter()
-            .filter(|s| s.evidence.iter().any(|e| e.kind == "registration"))
+            .filter(|s| s.evidence.iter().any(|e| e.kind() == "registration"))
             .collect();
         let named = regs.iter().filter(|s| s.tier == Tier::Recovered).count();
         eprintln!(

@@ -1051,7 +1051,7 @@ fn finalize(
 /// A successfully written function symbol map and the canonical name index
 /// retained for downstream orchestration.
 struct PreparedFunctionMap {
-    pass2_map: Option<decompile::PreparedPass2Map>,
+    pass2_map: Option<decompile::PreparedSymbolPass2Map>,
     function_names: HashMap<String, String>,
     evidence_name_projection: globals::FunctionEvidenceNameProjection,
 }
@@ -1207,7 +1207,7 @@ fn symbol_map_stage(
     let total: usize = function_maps
         .values()
         .filter_map(|prepared| prepared.pass2_map.as_ref())
-        .map(decompile::PreparedPass2Map::count)
+        .map(|map| map.execution_count())
         .sum();
     if !errors.is_empty() {
         errors.sort();
@@ -1233,39 +1233,45 @@ fn symbol_map_stage(
     }
 }
 
-/// Prepare the in-memory result for a function symbol map that was written from
-/// `symbols`. Every non-null name is retained regardless of tier; malformed
-/// addresses are excluded with the same acceptance rules as `symbols.json`.
+/// Prepare the in-memory result for a function symbol map that was written by
+/// `symbolicate::prepare_pass2_symbol_map`. The pass-2 map is retained only
+/// when at least one decision applies something (a rename or an annotation).
 fn prepare_function_map(
-    map_path: &Path,
-    symbols: &[symbolicate::Symbol],
+    label: &str,
+    image_dir: &Path,
+    _map_path: &Path,
+    bundle: symbolicate::Pass2MapBundle,
 ) -> (PreparedFunctionMap, Option<String>) {
-    let named_count = symbols
-        .iter()
-        .filter(|symbol| symbol.name.is_some())
-        .count();
-    let function_names = symbols
-        .iter()
-        .filter_map(|symbol| {
-            let name = symbol.name.as_ref()?;
-            let address = canonical_function_address(&symbol.address)?;
-            Some((address, name.clone()))
-        })
-        .collect();
-    let (pass2_map, validation_error) = match NonZeroUsize::new(named_count) {
-        Some(count) => match decompile::PreparedPass2Map::new(map_path, count) {
-            Ok(map) => (Some(map), None),
+    let symbolicate::Pass2MapBundle {
+        map,
+        symbols,
+        function_names,
+        evidence_name_projection,
+    } = bundle;
+    let (pass2_map, validation_error) = if map.applied_decision_count > 0
+        && let Some(execution_count) = NonZeroUsize::new(map.execution_count)
+    {
+        let functions_path = image_dir.join("decompiled").join("functions.json");
+        let image_path = image_dir.join(format!("{label}.bin"));
+        match decompile::PreparedSymbolPass2Map::new(
+            &map.path,
+            &functions_path,
+            &image_path,
+            label,
+            execution_count,
+        ) {
+            Ok(prepared) => (Some(prepared), None),
             Err(error) => (None, Some(format!("function map validation: {error}"))),
-        },
-        None => (None, None),
+        }
+    } else {
+        (None, None)
     };
+    let _ = symbols;
     (
         PreparedFunctionMap {
             pass2_map,
             function_names,
-            evidence_name_projection: globals::FunctionEvidenceNameProjection::from_symbols(
-                symbols,
-            ),
+            evidence_name_projection,
         },
         validation_error,
     )
@@ -2146,7 +2152,7 @@ fn record_globals_stage(
 /// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(successes, errors)`:
 /// each success is `(label, PreparedFunctionMap)`; each error is `(label,
 /// message)`. Surfaces
-/// I/O / parse failures (token DB, build_map, write_symbol_map) so the caller
+/// I/O / parse failures (token DB, build_map, the v2 map write) so the caller
 /// can distinguish "no symbols recovered" from "stage errored" — the previous
 /// all-`unwrap_or_default` / `.is_ok()` shape silently swallowed real failures
 /// into a benign-looking `symbol_map: skipped`.
@@ -2206,33 +2212,25 @@ fn build_and_write_symbol_maps(
         if !dir.join("decompiled").join("functions.json").exists() {
             continue;
         }
-        let funcs_blake3 = std::fs::read(dir.join("decompiled").join("functions.json"))
-            .ok()
-            .map(|b| crate::manifest::blake3_bytes(&b))
-            .unwrap_or_default();
-        let image_blake3 = std::fs::read(dir.join(format!("{label}.bin")))
-            .ok()
-            .map(|b| crate::manifest::blake3_bytes(&b))
-            .unwrap_or_default();
-        let symbols = match symbolicate::build_map(&dir, &label, &tokens, manifest) {
-            Ok(s) => s,
+        let map_path = maps_dir.join(format!("{label}.json"));
+        // No production caller supplies a present PAL identity yet: the PAL
+        // task-inventory generation wires that state. Identity is `none`
+        // until then, and the map binds null PAL hashes.
+        let bundle =
+            symbolicate::prepare_pass2_symbol_map(&map_path, &dir, &label, &tokens, manifest, None);
+        match bundle {
+            Ok(bundle) => {
+                let (prepared, validation_error) =
+                    prepare_function_map(&label, &dir, &map_path, bundle);
+                if let Some(error) = validation_error {
+                    errors.push((label.clone(), error));
+                }
+                out_maps.insert(label, prepared);
+            }
             Err(e) => {
                 errors.push((label.clone(), format!("build_map: {e}")));
-                continue;
             }
-        };
-        let map_path = maps_dir.join(format!("{label}.json"));
-        if let Err(e) =
-            symbolicate::write_symbol_map(&map_path, &label, &symbols, &image_blake3, &funcs_blake3)
-        {
-            errors.push((label.clone(), format!("write_symbol_map: {e}")));
-            continue;
         }
-        let (prepared, validation_error) = prepare_function_map(&map_path, &symbols);
-        if let Some(error) = validation_error {
-            errors.push((label.clone(), error));
-        }
-        out_maps.insert(label, prepared);
     }
     (out_maps, errors)
 }
@@ -2919,6 +2917,8 @@ mod tests {
                 crate::execution_ranges::FunctionOwner::Ghidra
             },
             execution_blake3: None,
+            decode_ranges: Vec::new(),
+            name_conflicts: Vec::new(),
             original_name: format!("original_{address}"),
             name: name.map(str::to_string),
             tier,
@@ -3168,6 +3168,63 @@ mod tests {
         decompile::PreparedPass2Map::new(&path, NonZeroUsize::new(count).unwrap()).unwrap()
     }
 
+    fn prepared_symbol_test_map(
+        name: &str,
+        label: &str,
+        count: usize,
+    ) -> decompile::PreparedSymbolPass2Map {
+        let dir = PathBuf::from("target").join("pme_task11_decompose_maps");
+        std::fs::create_dir_all(&dir).unwrap();
+        let map_path = dir.join(format!("{name}-map.json"));
+        let functions_path = dir.join(format!("{name}-functions.json"));
+        let image_path = dir.join(format!("{name}-image.bin"));
+        std::fs::write(&map_path, name.as_bytes()).unwrap();
+        std::fs::write(&functions_path, b"functions").unwrap();
+        std::fs::write(&image_path, b"image").unwrap();
+        decompile::PreparedSymbolPass2Map::new(
+            &map_path,
+            &functions_path,
+            &image_path,
+            label,
+            NonZeroUsize::new(count).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A fabricated [`symbolicate::Pass2MapBundle`] with the same
+    /// function-name index and evidence projection the real preparation
+    /// derives from `symbols`.
+    fn test_bundle(
+        map_path: &Path,
+        symbols: Vec<symbolicate::Symbol>,
+        execution_count: usize,
+        applied_decision_count: usize,
+    ) -> symbolicate::Pass2MapBundle {
+        let function_names = symbols
+            .iter()
+            .filter_map(|symbol| {
+                let name = symbol.name.as_ref()?;
+                let entry =
+                    u64::from_str_radix(symbol.address.trim_start_matches("0x"), 16).ok()?;
+                Some((format!("{entry:x}"), name.clone()))
+            })
+            .collect();
+        let evidence_name_projection =
+            globals::FunctionEvidenceNameProjection::from_symbols(&symbols);
+        symbolicate::Pass2MapBundle {
+            map: symbolicate::WrittenSymbolMap {
+                path: map_path.to_path_buf(),
+                map_blake3: "0".repeat(64),
+                functions_blake3: "1".repeat(64),
+                execution_count,
+                applied_decision_count,
+            },
+            symbols,
+            function_names,
+            evidence_name_projection,
+        }
+    }
+
     fn prepared_global_map(name: &str, count: usize) -> PreparedGlobalMap {
         PreparedGlobalMap {
             pass2_map: prepared_test_map(name, count),
@@ -3186,6 +3243,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: crate::execution_ranges::FunctionOwner::Ghidra,
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_abcd".into(),
                 name: Some("recovered_name".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -3200,6 +3259,8 @@ mod tests {
                     producer: crate::recover_source::Tool::Radare2,
                 },
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "thumb_ef".into(),
                 name: Some("provisional_name".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -3212,6 +3273,8 @@ mod tests {
                 tool: crate::recover_source::Tool::Ghidra,
                 owner: crate::execution_ranges::FunctionOwner::Ghidra,
                 execution_blake3: None,
+                decode_ranges: Vec::new(),
+                name_conflicts: Vec::new(),
                 original_name: "FUN_12".into(),
                 name: None,
                 tier: symbolicate::Tier::None,
@@ -3220,13 +3283,22 @@ mod tests {
             },
         ];
 
-        let map_path = PathBuf::from("target/pme_task8r_decompose_maps/function-index.json");
+        let image_dir = PathBuf::from("target/pme_task11_function_index_image");
+        let map_path = PathBuf::from("target/pme_task11_decompose_maps/function-index.json");
+        std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
         std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
         std::fs::write(&map_path, b"map").unwrap();
-        let (prepared, validation_error) = prepare_function_map(&map_path, &symbols);
+        std::fs::write(image_dir.join("decompiled/functions.json"), b"functions").unwrap();
+        std::fs::write(image_dir.join("02_MAIN.bin"), b"image").unwrap();
+        let (prepared, validation_error) = prepare_function_map(
+            "02_MAIN",
+            &image_dir,
+            &map_path,
+            test_bundle(&map_path, symbols, 4, 2),
+        );
 
         assert!(validation_error.is_none());
-        assert_eq!(prepared.pass2_map.as_ref().unwrap().count(), 2);
+        assert_eq!(prepared.pass2_map.as_ref().unwrap().execution_count(), 4);
         assert_eq!(
             prepared.function_names,
             HashMap::from([
@@ -3275,10 +3347,19 @@ mod tests {
             ),
         ];
 
-        let map_path = PathBuf::from("target/pme_task8r_decompose_maps/function-projection.json");
+        let image_dir = PathBuf::from("target/pme_task11_function_projection_image");
+        let map_path = PathBuf::from("target/pme_task11_decompose_maps/function-projection.json");
+        std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
         std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
         std::fs::write(&map_path, b"map").unwrap();
-        let (prepared, validation_error) = prepare_function_map(&map_path, &symbols);
+        std::fs::write(image_dir.join("decompiled/functions.json"), b"functions").unwrap();
+        std::fs::write(image_dir.join("02_MAIN.bin"), b"image").unwrap();
+        let (prepared, validation_error) = prepare_function_map(
+            "02_MAIN",
+            &image_dir,
+            &map_path,
+            test_bundle(&map_path, symbols, 4, 4),
+        );
 
         assert!(validation_error.is_none());
         assert_eq!(
@@ -3321,7 +3402,7 @@ mod tests {
             (
                 "02_MAIN".to_string(),
                 PreparedFunctionMap {
-                    pass2_map: Some(prepared_test_map("functions-02_MAIN.json", 3)),
+                    pass2_map: Some(prepared_symbol_test_map("functions-02_MAIN", "02_MAIN", 3)),
                     function_names: HashMap::new(),
                     evidence_name_projection: Default::default(),
                 },
@@ -3329,7 +3410,7 @@ mod tests {
             (
                 "03_APM".to_string(),
                 PreparedFunctionMap {
-                    pass2_map: Some(prepared_test_map("functions-03_APM.json", 2)),
+                    pass2_map: Some(prepared_symbol_test_map("functions-03_APM", "03_APM", 2)),
                     function_names: HashMap::new(),
                     evidence_name_projection: Default::default(),
                 },
@@ -3349,9 +3430,23 @@ mod tests {
         let inputs = prepare_pass2_inputs(&function_maps, &global_maps, &HashMap::new());
 
         assert_eq!(inputs.len(), 3);
-        assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
+        assert_eq!(
+            inputs["02_MAIN"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            3
+        );
         assert_eq!(inputs["02_MAIN"].global_map.as_ref().unwrap().count(), 5);
-        assert_eq!(inputs["03_APM"].function_map.as_ref().unwrap().count(), 2);
+        assert_eq!(
+            inputs["03_APM"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            2
+        );
         assert!(inputs["03_APM"].global_map.is_none());
         assert!(inputs["04_VSS"].function_map.is_none());
         assert_eq!(inputs["04_VSS"].global_map.as_ref().unwrap().count(), 7);
@@ -3397,8 +3492,21 @@ mod tests {
         // An invalid function map omits only that component. Its names and
         // writer-faithful projection survive, while the valid global sibling
         // and both components of an unaffected image remain schedulable.
-        let (invalid_function, function_error) =
-            prepare_function_map(&root.join("missing-functions.json"), &main_symbols);
+        std::fs::create_dir_all(root.join("decompiled")).unwrap();
+        std::fs::write(
+            root.join("decompiled/functions.json"),
+            b"retained functions",
+        )
+        .unwrap();
+        std::fs::write(root.join("02_MAIN.bin"), b"image main").unwrap();
+        std::fs::write(root.join("03_APM.bin"), b"image other").unwrap();
+        let missing_map = root.join("missing-functions.json");
+        let (invalid_function, function_error) = prepare_function_map(
+            "02_MAIN",
+            &root,
+            &missing_map,
+            test_bundle(&missing_map, main_symbols.clone(), 1, 1),
+        );
         assert!(function_error.is_some());
         assert!(invalid_function.pass2_map.is_none());
         assert_eq!(invalid_function.function_names["40"], "RecoveredMain");
@@ -3411,10 +3519,10 @@ mod tests {
 
         let main_globals_path = root.join("globals-main.json");
         let other_globals_path = root.join("globals-other.json");
-        let other_functions_path = root.join("functions-other.json");
         std::fs::write(&main_globals_path, b"globals main").unwrap();
         std::fs::write(&other_globals_path, b"globals other").unwrap();
-        std::fs::write(&other_functions_path, b"functions other").unwrap();
+        let other_map_path = root.join("functions-other.json");
+        std::fs::write(&other_map_path, b"functions other map").unwrap();
         let valid_main_global = PreparedGlobalMap {
             pass2_map: decompile::PreparedPass2Map::new(
                 &main_globals_path,
@@ -3429,8 +3537,12 @@ mod tests {
             )
             .unwrap(),
         };
-        let (valid_other_function, other_function_error) =
-            prepare_function_map(&other_functions_path, &other_symbols);
+        let (valid_other_function, other_function_error) = prepare_function_map(
+            "03_APM",
+            &root,
+            &other_map_path,
+            test_bundle(&other_map_path, other_symbols.clone(), 1, 1),
+        );
         assert!(other_function_error.is_none());
         let inputs = prepare_pass2_inputs(
             &HashMap::from([
@@ -3445,21 +3557,36 @@ mod tests {
         );
         assert!(inputs["02_MAIN"].function_map.is_none());
         assert_eq!(inputs["02_MAIN"].global_map.as_ref().unwrap().count(), 1);
-        assert_eq!(inputs["03_APM"].function_map.as_ref().unwrap().count(), 1);
+        assert_eq!(
+            inputs["03_APM"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            1
+        );
         assert_eq!(inputs["03_APM"].global_map.as_ref().unwrap().count(), 2);
 
         // A valid function map survives a global-map validation failure. The
         // failed image retains its counts and labelled error, while a second
         // image retains its independently valid global map and accounting.
-        let main_functions_path = root.join("functions-main.json");
-        std::fs::write(&main_functions_path, b"functions main").unwrap();
-        let (valid_main_function, main_function_error) =
-            prepare_function_map(&main_functions_path, &main_symbols);
+        let main_map_path = root.join("functions-main.json");
+        std::fs::write(&main_map_path, b"functions main map").unwrap();
+        let (valid_main_function, main_function_error) = prepare_function_map(
+            "02_MAIN",
+            &root,
+            &main_map_path,
+            test_bundle(&main_map_path, main_symbols.clone(), 1, 1),
+        );
         assert!(main_function_error.is_none());
-        let other_functions_path = root.join("functions-other-second.json");
-        std::fs::write(&other_functions_path, b"functions other second").unwrap();
-        let (valid_other_function, other_function_error) =
-            prepare_function_map(&other_functions_path, &other_symbols);
+        let other_map_path = root.join("functions-other-second.json");
+        std::fs::write(&other_map_path, b"functions other second map").unwrap();
+        let (valid_other_function, other_function_error) = prepare_function_map(
+            "03_APM",
+            &root,
+            &other_map_path,
+            test_bundle(&other_map_path, other_symbols.clone(), 1, 1),
+        );
         assert!(other_function_error.is_none());
         let images_dir = root.join("images");
         for label in ["02_MAIN", "03_APM"] {
@@ -3513,9 +3640,23 @@ mod tests {
             &outcome.maps,
             &HashMap::new(),
         );
-        assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 1);
+        assert_eq!(
+            inputs["02_MAIN"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            1
+        );
         assert!(inputs["02_MAIN"].global_map.is_none());
-        assert_eq!(inputs["03_APM"].function_map.as_ref().unwrap().count(), 1);
+        assert_eq!(
+            inputs["03_APM"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            1
+        );
         assert_eq!(inputs["03_APM"].global_map.as_ref().unwrap().count(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3526,7 +3667,7 @@ mod tests {
         let function_maps = HashMap::from([(
             "02_MAIN".to_string(),
             PreparedFunctionMap {
-                pass2_map: Some(prepared_test_map("mixed-survivor.json", 3)),
+                pass2_map: Some(prepared_symbol_test_map("mixed-survivor", "02_MAIN", 3)),
                 function_names: HashMap::new(),
                 evidence_name_projection: Default::default(),
             },
@@ -3560,7 +3701,14 @@ mod tests {
         assert!(!Report::is_ok(&[stage]));
 
         let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new(), &HashMap::new());
-        assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
+        assert_eq!(
+            inputs["02_MAIN"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            3
+        );
     }
 
     #[test]
@@ -4270,7 +4418,11 @@ mod tests {
         let mut function_maps = HashMap::from([(
             "02_MAIN".to_string(),
             PreparedFunctionMap {
-                pass2_map: Some(prepared_test_map("globals-stage-functions.json", 2)),
+                pass2_map: Some(prepared_symbol_test_map(
+                    "globals-stage-functions",
+                    "02_MAIN",
+                    2,
+                )),
                 function_names: HashMap::from([
                     ("40".to_string(), "RecoveredMain".to_string()),
                     ("44".to_string(), "guess_main_44".to_string()),
@@ -4390,7 +4542,7 @@ mod tests {
         let mut function_maps = HashMap::from([(
             "02_MAIN".to_string(),
             PreparedFunctionMap {
-                pass2_map: Some(prepared_test_map("failure-functions.json", 1)),
+                pass2_map: Some(prepared_symbol_test_map("failure-functions", "02_MAIN", 1)),
                 function_names: HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
                 evidence_name_projection: Default::default(),
             },
@@ -4419,7 +4571,11 @@ mod tests {
         );
 
         assert_eq!(
-            function_maps["02_MAIN"].pass2_map.as_ref().unwrap().count(),
+            function_maps["02_MAIN"]
+                .pass2_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
             1
         );
         assert!(!outcome.maps.contains_key("02_MAIN"));
@@ -4444,7 +4600,14 @@ mod tests {
         );
 
         let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
-        assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 1);
+        assert_eq!(
+            inputs["02_MAIN"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            1
+        );
         assert!(inputs["02_MAIN"].function_map.is_some());
         assert!(inputs["02_MAIN"].global_map.is_none());
         images[1].globals_applied = Some(0);
@@ -4477,7 +4640,11 @@ mod tests {
         let mut function_maps = HashMap::from([(
             "02_MAIN".to_string(),
             PreparedFunctionMap {
-                pass2_map: Some(prepared_test_map("sole-failure-functions.json", 3)),
+                pass2_map: Some(prepared_symbol_test_map(
+                    "sole-failure-functions",
+                    "02_MAIN",
+                    3,
+                )),
                 function_names: HashMap::new(),
                 evidence_name_projection: Default::default(),
             },
@@ -4497,7 +4664,14 @@ mod tests {
 
         assert_eq!(outcome.stage.status, "failed");
         assert!(outcome.maps.is_empty());
-        assert_eq!(inputs["02_MAIN"].function_map.as_ref().unwrap().count(), 3);
+        assert_eq!(
+            inputs["02_MAIN"]
+                .function_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
+            3
+        );
         assert!(inputs["02_MAIN"].function_map.is_some());
         assert!(inputs["02_MAIN"].global_map.is_none());
         assert_eq!(apply_stage.status, "skipped");
@@ -4800,7 +4974,7 @@ mod tests {
         let mut function_maps = HashMap::from([(
             "02_MAIN".to_string(),
             PreparedFunctionMap {
-                pass2_map: Some(prepared_test_map("moved-functions.json", 1)),
+                pass2_map: Some(prepared_symbol_test_map("moved-functions", "02_MAIN", 1)),
                 function_names: HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
                 evidence_name_projection: globals::FunctionEvidenceNameProjection::default(),
             },
@@ -4821,7 +4995,11 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            function_maps["02_MAIN"].pass2_map.as_ref().unwrap().count(),
+            function_maps["02_MAIN"]
+                .pass2_map
+                .as_ref()
+                .unwrap()
+                .execution_count(),
             1
         );
     }

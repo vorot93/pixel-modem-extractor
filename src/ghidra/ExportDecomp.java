@@ -1,5 +1,31 @@
 // ExportDecomp.java — Ghidra headless post-script for pixel-modem-extractor.
-// Arg[0] = output directory. Writes decompiled.c, disasm.lst, functions.json.
+//
+// Arg[0] = output directory.
+// Arg[1] = canonical import-kit root.
+// Arg[2] = expected image label.
+// Arg[3] = expected PAL identity or "none".
+// Arg[4] = canonical task manifest or "-" under the ApplyPalTasks rule.
+// Arg[5] = canonical scatter manifest or "-" under the same rule.
+// Arg[6] = canonical pass-1 symbol map or "-" for pass 1 and generated
+//          single-pass kits.
+// Arg[7] = expected lowercase symbol-map BLAKE3, or literal "none" with "-".
+//
+// A strict HeadlessScript: before any export output or marker is written it
+// validates the retained map/properties through PalTasksSupport (a present
+// PAL manifest re-authenticates the manifest, raw/scatter memory, and the
+// complete applied state; identity none requires every PAL surface absent),
+// derives the current execution identities from the current function bodies
+// with per-range BLAKE3 over current program memory, and — in pass 2 —
+// compares every current body to the retained pass-1 map exactly (a changed
+// range boundary, ISA, byte, or hash fails). The verification walk runs under
+// one 15-minute deadline and, for a present manifest, a 64-MiB aggregate
+// task-function-body ceiling. Outputs are published atomically (temporary
+// files moved into place) and the exact three-line v3 marker is replaced
+// LAST:
+//
+// pixel-modem-extractor-ghidra-export-v3
+// pal_tasks=<identity-or-none>
+// symbol_map=<lowercase-map-blake3-or-none>
 //
 // FIDELITY POSTURE (Phase 1+): this script intentionally does NOT call
 // DecompInterface.setOptions(...). Ghidra's decompiler defaults are already a
@@ -18,112 +44,132 @@
 //   - UseHexadecimal: TRUE (default). Display-only; matches disasm.lst.
 //
 // Pass 2 of `decompose` re-runs this script unchanged after the applicable
-// ApplySymbols.java and/or ApplyGlobals.java application — getC() then emits
+// ApplySymbols/ApplyGlobals/ApplyGlobalTypes application — getC() then emits
 // regenerated C with names + plate comments baked in.
 //@category PixelModem
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.math.BigInteger;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import ghidra.app.script.GhidraScript;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
-import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
-import ghidra.program.model.lang.Register;
-import ghidra.program.model.lang.RegisterValue;
-import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
-import ghidra.program.model.symbol.SourceType;
-import org.bouncycastle.crypto.digests.Blake3Digest;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 
-public class ExportDecomp extends GhidraScript {
-    private static final long U32_END = 0x1_0000_0000L;
-    private static final long U32_MAX = U32_END - 1L;
-    private static final int HASH_BUFFER_SIZE = 64 * 1024;
-    private static final String COMPLETION = "pixel-modem-extractor-ghidra-export-v1\n";
+public class ExportDecomp extends HeadlessScript {
+    private static final String COMPLETION_FORMAT = "pixel-modem-extractor-ghidra-export-v3";
+    private static final long TASK_BODY_BYTES = PalTasksSupport.MAX_TASK_BODY_BYTES;
+    private static final long VALIDATION_BUDGET_MS =
+            PalTasksSupport.EXPORT_VALIDATION_BUDGET_MS;
 
-    private static class DecodeRange implements Comparable<DecodeRange> {
-        final long start;
-        long end;
-        final String isa;
-        final String blake3;
-
-        DecodeRange(long start, long end, String isa, String blake3) {
-            this.start = start;
-            this.end = end;
-            this.isa = isa;
-            this.blake3 = blake3;
-        }
-
-        @Override
-        public int compareTo(DecodeRange other) {
-            int byStart = Long.compare(start, other.start);
-            if (byStart != 0) return byStart;
-            int byEnd = Long.compare(end, other.end);
-            if (byEnd != 0) return byEnd;
-            return isa.compareTo(other.isa);
-        }
+    private static void fail(String message) {
+        throw new PalTasksSupport.PalError(message);
     }
 
-    private static class DecodeError implements Comparable<DecodeError> {
-        final String kind;
-        final long address;
-        final Long end;
-
-        DecodeError(String kind, long address, Long end) {
-            this.kind = kind;
-            this.address = address;
-            this.end = end;
-        }
-
-        @Override
-        public int compareTo(DecodeError other) {
-            int byAddress = Long.compare(address, other.address);
-            if (byAddress != 0) return byAddress;
-            int byKind = kind.compareTo(other.kind);
-            if (byKind != 0) return byKind;
-            if (end == null) return other.end == null ? 0 : -1;
-            if (other.end == null) return 1;
-            return Long.compare(end, other.end);
-        }
-    }
-
-    private static class DecodeProjection {
-        final List<DecodeRange> ranges;
-        final List<DecodeError> errors;
-
-        DecodeProjection(List<DecodeRange> ranges, List<DecodeError> errors) {
-            this.ranges = ranges;
-            this.errors = errors;
-        }
-    }
+    private long deadline;
+    private long taskBodyBytes;
 
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length < 1) {
-            println("ExportDecomp: missing output directory argument");
-            return;
+        if (args.length != 8) {
+            fail("expected exactly eight arguments: output directory, kit root, image label, "
+                    + "PAL identity, task manifest, scatter manifest, pass-1 symbol map, "
+                    + "expected map BLAKE3");
         }
+        deadline = Math.addExact(System.currentTimeMillis(), VALIDATION_BUDGET_MS);
         File outDir = new File(args[0]);
-        outDir.mkdirs();
+        File kitRoot = new File(args[1]);
+        String label = args[2];
+        String palIdentity = args[3];
+        File taskManifest = "-".equals(args[4]) ? null : new File(args[4]);
+        File scatterManifest = "-".equals(args[5]) ? null : new File(args[5]);
+        File mapFile = "-".equals(args[6]) ? null : new File(args[6]);
+        String mapHash = args[7];
+
+        File canonicalRoot = requireCanonicalDirectory(kitRoot);
+        if (!label.equals(currentProgram.getName())) {
+            fail("the expected image label does not match the current program name");
+        }
+
+        // PAL state: a present manifest is fully re-authenticated after
+        // analysis; identity none requires every PAL surface absent.
+        boolean palPresent = !PalTasksSupport.NONE_IDENTITY.equals(palIdentity);
+        if (palPresent) {
+            if (taskManifest == null) {
+                fail("a present PAL identity requires the task manifest argument");
+            }
+            PalTasksSupport.PalManifest manifest =
+                    PalTasksSupport.readPal(canonicalRoot, label, taskManifest, scatterManifest);
+            String identity = PalTasksSupport.expectedPalIdentity(manifest);
+            if (!identity.equals(palIdentity)) {
+                fail("the expected PAL identity does not match the manifest");
+            }
+            PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+            chargeTaskBodies(manifest);
+        }
+        else {
+            if (taskManifest != null) {
+                fail("identity none requires the literal '-' task manifest");
+            }
+            PalTasksSupport.validateAbsent(currentProgram);
+        }
+
+        // Symbol map / pass-2 property contract.
+        PalTasksSupport.SymbolMap map = null;
+        String symbolMapArgument = "none";
+        if (mapFile == null) {
+            if (!"none".equals(mapHash)) {
+                fail("an absent symbol map requires the literal 'none' hash");
+            }
+            String property = currentProgram.getOptions(
+                    ghidra.program.model.listing.Program.PROGRAM_INFO)
+                    .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+            if (property != null) {
+                fail("a pass-1/single-pass export requires the SymbolPass2 property absent");
+            }
+        }
+        else {
+            if ("none".equals(mapHash)) {
+                fail("a present symbol map requires its expected BLAKE3");
+            }
+            map = PalTasksSupport.readSymbolMapForExport(mapFile, mapHash);
+            if (!map.imageLabel.equals(label)) {
+                fail("the symbol map was built for image " + map.imageLabel);
+            }
+            if (!palIdentity.equals(map.palIdentity)) {
+                fail("the symbol map PAL identity does not match the invocation");
+            }
+            String expectedProperty = "v2:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":"
+                    + map.executions.size();
+            String property = currentProgram.getOptions(
+                    ghidra.program.model.listing.Program.PROGRAM_INFO)
+                    .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+            if (!expectedProperty.equals(property)) {
+                fail("stale SymbolPass2 property: expected " + expectedProperty
+                        + " but found " + property);
+            }
+            verifyBodiesAgainstMap(map);
+            symbolMapArgument = map.mapBlake3;
+        }
 
         FunctionManager fm = currentProgram.getFunctionManager();
         Listing listing = currentProgram.getListing();
@@ -134,20 +180,134 @@ public class ExportDecomp extends GhidraScript {
             try {
                 disassemble(base);
                 createFunction(base, null);
-            } catch (Exception e) {
-                println("ExportDecomp: entry-function fallback failed: " + e.getMessage());
+            }
+            catch (Exception e) {
+                fail("the entry-function fallback failed: " + e.getMessage());
             }
         }
 
-        writeFunctionsJson(new File(outDir, "functions.json"), fm, listing);
-        writeDisassembly(new File(outDir, "disasm.lst"), listing);
-        writeDecompiledC(new File(outDir, "decompiled.c"), fm);
-        writeCompletionMarker(outDir);
+        outDir.mkdirs();
+        List<File> temporaries = new ArrayList<File>();
+        try {
+            publish(outDir, "functions.json", temporaries,
+                    (w) -> writeFunctionsJson(w, fm, listing));
+            publish(outDir, "disasm.lst", temporaries, (w) -> writeDisassembly(w, listing));
+            publish(outDir, "decompiled.c", temporaries, (w) -> writeDecompiledC(w, fm));
+            writeCompletionMarker(outDir, palIdentity, symbolMapArgument);
+        }
+        finally {
+            for (File temporary : temporaries) {
+                Files.deleteIfExists(temporary.toPath());
+            }
+        }
 
         println("ExportDecomp: wrote export to " + outDir.getAbsolutePath());
     }
 
-    private static void writeCompletionMarker(File outDir) throws Exception {
+    private interface Writer {
+        void write(PrintWriter writer) throws Exception;
+    }
+
+    private static File requireCanonicalDirectory(File file) throws IOException {
+        File canonical = file == null ? null : file.getCanonicalFile();
+        if (canonical == null || !file.isAbsolute() || !canonical.getPath().equals(file.getPath())
+                || !canonical.isDirectory()) {
+            fail("the import-kit root is not a canonical directory");
+        }
+        return canonical;
+    }
+
+    /** Charge each task function's current body bytes once against the cap. */
+    private void chargeTaskBodies(PalTasksSupport.PalManifest manifest) throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        for (PalTasksSupport.PalApplication application : manifest.applications) {
+            checkDeadline();
+            Address entry = PalTasksSupport.programAddress(currentProgram, application.entry);
+            Function function = functions.getFunctionAt(entry);
+            if (function == null) {
+                fail("a task application has no function at its entry " + entry);
+            }
+            long bytes = 0;
+            AddressRangeIterator ranges = function.getBody().getAddressRanges();
+            while (ranges.hasNext()) {
+                ghidra.program.model.address.AddressRange range = ranges.next();
+                bytes = Math.addExact(bytes, range.getLength());
+            }
+            taskBodyBytes = Math.addExact(taskBodyBytes, bytes);
+            if (taskBodyBytes > TASK_BODY_BYTES) {
+                fail("the aggregate task-function-body bytes exceed the 64 MiB ceiling");
+            }
+        }
+    }
+
+    /**
+     * Pass-2 identity comparison: every current function's authenticated
+     * execution must appear in the retained map with the exact digest, and
+     * every map execution must still exist — program drift fails closed.
+     */
+    private void verifyBodiesAgainstMap(PalTasksSupport.SymbolMap map) throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        Map<Long, String> expected = new HashMap<Long, String>();
+        for (PalTasksSupport.MapExecution execution : map.executions) {
+            expected.put(execution.entry, execution.executionBlake3);
+        }
+        FunctionIterator iterator = functions.getFunctions(true);
+        int compared = 0;
+        while (iterator.hasNext()) {
+            checkDeadline();
+            Function function = iterator.next();
+            PalTasksSupport.DecodeProjection projection =
+                    PalTasksSupport.decodeProjection(currentProgram, monitor, function);
+            if (!projection.errors.isEmpty()) {
+                continue; // a quarantined record carries no execution identity
+            }
+            String digest = PalTasksSupport.currentExecutionDigest(currentProgram, monitor,
+                    function);
+            long entry = function.getEntryPoint().getOffset();
+            String expectedDigest = expected.remove(entry);
+            if (expectedDigest == null) {
+                fail("a current function has no pass-1 execution identity at "
+                        + function.getEntryPoint());
+            }
+            if (!expectedDigest.equals(digest)) {
+                fail("the current body drifted from the pass-1 identity at "
+                        + function.getEntryPoint());
+            }
+            compared++;
+        }
+        if (!expected.isEmpty() || compared != map.executions.size()) {
+            fail("the current function set does not cover every pass-1 execution exactly once");
+        }
+    }
+
+    private void checkDeadline() {
+        if (System.currentTimeMillis() >= deadline) {
+            fail("the export verification deadline was exhausted");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Atomic publication
+    // ---------------------------------------------------------------------
+
+    /** Writes one output through a sibling temporary and moves it into place. */
+    private void publish(File outDir, String name, List<File> temporaries, Writer writer)
+            throws Exception {
+        File temporary = File.createTempFile(name + ".", ".tmp", outDir);
+        temporaries.add(temporary);
+        PrintWriter w = new PrintWriter(new FileWriter(temporary));
+        try (w) {
+            writer.write(w);
+        }
+        checkWriter(w, temporary);
+        File destination = new File(outDir, name);
+        Files.move(temporary.toPath(), destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        temporaries.remove(temporary);
+    }
+
+    private void writeCompletionMarker(File outDir, String palIdentity, String symbolMap)
+            throws Exception {
         File parent = outDir.getParentFile();
         if (parent == null) {
             throw new Exception("export directory has no parent for completion marker");
@@ -156,7 +316,9 @@ public class ExportDecomp extends GhidraScript {
         File temporary = File.createTempFile(outDir.getName() + ".complete.", ".tmp", parent);
         try {
             try (FileWriter writer = new FileWriter(temporary, false)) {
-                writer.write(COMPLETION);
+                writer.write(COMPLETION_FORMAT + "\n");
+                writer.write("pal_tasks=" + palIdentity + "\n");
+                writer.write("symbol_map=" + symbolMap + "\n");
             }
             Files.move(temporary.toPath(), marker.toPath(),
                     StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -165,6 +327,10 @@ public class ExportDecomp extends GhidraScript {
             Files.deleteIfExists(temporary.toPath());
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Export writers
+    // ---------------------------------------------------------------------
 
     // Minimal RFC 8259 string escaping: backslash, quote, and control chars.
     private static String jsonEscape(String s) {
@@ -190,166 +356,10 @@ public class ExportDecomp extends GhidraScript {
         return b.toString();
     }
 
-    private long functionEnd(Function fn) throws Exception {
-        long end = u32ExclusiveEnd(fn.getEntryPoint());
-        AddressRangeIterator ranges = fn.getBody().getAddressRanges();
-        while (ranges.hasNext()) {
-            AddressRange range = ranges.next();
-            u32Offset(range.getMinAddress());
-            long exclusiveEnd = u32ExclusiveEnd(range.getMaxAddress());
-            if (exclusiveEnd > end) {
-                end = exclusiveEnd;
-            }
-        }
-        return end;
-    }
-
-    private static long u32Offset(Address address) throws Exception {
-        if (address == null || !address.isMemoryAddress()) {
-            throw new Exception("unassignable non-memory producer address");
-        }
-        long offset = address.getOffset();
-        if (offset < 0 || offset >= U32_END) {
-            throw new Exception("unassignable producer address outside u32");
-        }
-        return offset;
-    }
-
-    private static long u32ExclusiveEnd(Address inclusiveEnd) throws Exception {
-        long offset = u32Offset(inclusiveEnd);
-        if (offset == U32_MAX) {
-            throw new Exception("unassignable producer body exclusive end outside u32");
-        }
-        return offset + 1L;
-    }
-
-    private DecodeProjection decodeProjection(Function fn, Listing listing) throws Exception {
-        long entry = u32Offset(fn.getEntryPoint());
-        Register tMode = currentProgram.getLanguage().getRegister("TMode");
-        List<DecodeRange> extents = new ArrayList<DecodeRange>();
-        TreeSet<DecodeError> errors = new TreeSet<DecodeError>();
-        InstructionIterator instructions = listing.getInstructions(fn.getBody(), true);
-        while (instructions.hasNext()) {
-            Instruction instruction = instructions.next();
-            Address startAddress = instruction.getMinAddress();
-            long start = u32Offset(startAddress);
-            int length = instruction.getLength();
-            Long end = null;
-            if (length <= 0 || start > U32_MAX - length) {
-                errors.add(new DecodeError("invalid_instruction_length", start, null));
-            } else {
-                end = start + length;
-            }
-            if (instruction.isLengthOverridden()) {
-                errors.add(new DecodeError("overridden_instruction_length", start, end));
-            }
-
-            String isa = null;
-            RegisterValue value = tMode == null ? null : instruction.getRegisterValue(tMode);
-            if (value == null || !value.hasValue()) {
-                errors.add(new DecodeError("missing_isa_context", start, end));
-            } else {
-                BigInteger unsigned = value.getUnsignedValue();
-                if (BigInteger.ZERO.equals(unsigned)) {
-                    isa = "arm";
-                } else if (BigInteger.ONE.equals(unsigned)) {
-                    isa = "thumb";
-                } else {
-                    errors.add(new DecodeError("invalid_isa_context", start, end));
-                }
-            }
-
-            if (end == null) {
-                continue;
-            }
-            Address endInclusive = startAddress.addNoWrap(length - 1L);
-            if (!fn.getBody().contains(startAddress, endInclusive)) {
-                errors.add(new DecodeError("extent_outside_function", start, end));
-            }
-            if (!currentProgram.getMemory().getLoadedAndInitializedAddressSet()
-                    .contains(startAddress, endInclusive)) {
-                errors.add(new DecodeError("extent_outside_image", start, end));
-            }
-            if (isa != null) {
-                long alignment = isa.equals("arm") ? 4L : 2L;
-                if (start % alignment != 0 || length % alignment != 0) {
-                    errors.add(new DecodeError("misaligned_instruction", start, end));
-                }
-                extents.add(new DecodeRange(start, end, isa, null));
-            }
-        }
-
-        Collections.sort(extents);
-        DecodeRange maximalPrior = null;
-        for (int index = 0; index < extents.size(); index++) {
-            DecodeRange current = extents.get(index);
-            if (index > 0) {
-                DecodeRange previous = extents.get(index - 1);
-                if (current.start == previous.start && current.end == previous.end) {
-                    errors.add(new DecodeError("duplicate_extent", current.start, current.end));
-                }
-                if (maximalPrior != null && current.start < maximalPrior.end) {
-                    errors.add(new DecodeError(
-                        "overlapping_extent", maximalPrior.start, maximalPrior.end));
-                    errors.add(new DecodeError(
-                        "overlapping_extent", current.start, current.end));
-                }
-            }
-            if (maximalPrior == null || current.end > maximalPrior.end) {
-                maximalPrior = current;
-            }
-        }
-
-        List<DecodeRange> ranges = new ArrayList<DecodeRange>();
-        for (DecodeRange extent : extents) {
-            if (!ranges.isEmpty()) {
-                DecodeRange previous = ranges.get(ranges.size() - 1);
-                if (previous.end == extent.start && previous.isa.equals(extent.isa)) {
-                    previous.end = extent.end;
-                    continue;
-                }
-            }
-            ranges.add(new DecodeRange(extent.start, extent.end, extent.isa, null));
-        }
-
-        if (ranges.isEmpty()) {
-            errors.add(new DecodeError("empty_projection", entry, null));
-        } else {
-            boolean entryStartsRange = false;
-            boolean entryInsideRange = false;
-            for (DecodeRange range : ranges) {
-                entryStartsRange |= range.start == entry;
-                entryInsideRange |= range.start < entry && entry < range.end;
-            }
-            if (!entryStartsRange) {
-                errors.add(new DecodeError(
-                    entryInsideRange ? "entry_not_range_start" : "missing_instruction_at_entry",
-                    entry,
-                    null));
-            }
-        }
-
-        if (!errors.isEmpty()) {
-            return new DecodeProjection(
-                Collections.<DecodeRange>emptyList(),
-                new ArrayList<DecodeError>(errors));
-        }
-
-        List<DecodeRange> authenticated = new ArrayList<DecodeRange>();
-        for (DecodeRange range : ranges) {
-            authenticated.add(new DecodeRange(
-                range.start,
-                range.end,
-                range.isa,
-                hashMemory(range.start, range.end)));
-        }
-        return new DecodeProjection(authenticated, Collections.<DecodeError>emptyList());
-    }
-
-    private String decodeRangesJson(List<DecodeRange> ranges) {
+    private String decodeRangesJson(List<PalTasksSupport.DecodeRange> ranges) {
         StringBuilder out = new StringBuilder("[");
         boolean first = true;
-        for (DecodeRange range : ranges) {
+        for (PalTasksSupport.DecodeRange range : ranges) {
             if (!first) out.append(", ");
             first = false;
             out.append(String.format(
@@ -363,10 +373,10 @@ public class ExportDecomp extends GhidraScript {
         return out.toString();
     }
 
-    private String decodeErrorsJson(List<DecodeError> errors) {
+    private String decodeErrorsJson(List<PalTasksSupport.DecodeError> errors) {
         StringBuilder out = new StringBuilder("[");
         boolean first = true;
-        for (DecodeError error : errors) {
+        for (PalTasksSupport.DecodeError error : errors) {
             if (!first) out.append(", ");
             first = false;
             out.append(String.format(
@@ -424,121 +434,73 @@ public class ExportDecomp extends GhidraScript {
         }
     }
 
-    private String hashMemory(long start, long end) throws Exception {
-        Blake3Digest digest = new Blake3Digest();
-        byte[] bytes = new byte[HASH_BUFFER_SIZE];
-        Address address = toAddr(start);
-        long remaining = end - start;
-        long offset = 0;
-        try {
-            while (remaining > 0) {
-                monitor.checkCancelled();
-                int wanted = (int) Math.min(bytes.length, remaining);
-                int read = currentProgram.getMemory().getBytes(
-                    address.addNoWrap(offset), bytes, 0, wanted);
-                if (read != wanted) {
-                    throw new Exception("execution range is not fully initialized");
-                }
-                digest.update(bytes, 0, read);
-                offset += read;
-                remaining -= read;
-            }
-        } catch (MemoryAccessException e) {
-            throw new Exception("execution range could not be read", e);
-        }
-        byte[] output = new byte[digest.getDigestSize()];
-        digest.doFinal(output, 0);
-        StringBuilder text = new StringBuilder(output.length * 2);
-        for (byte value : output) {
-            text.append(String.format("%02x", value & 0xff));
-        }
-        return text.toString();
-    }
-
-    private static String primarySource(Function fn) throws Exception {
-        SourceType source = fn.getSymbol().getSource();
-        switch (source) {
-            case DEFAULT: return "default";
-            case ANALYSIS: return "analysis";
-            case IMPORTED: return "imported";
-            case USER_DEFINED: return "user_defined";
-            default: throw new Exception("unknown function primary source " + source);
-        }
-    }
-
-    private void writeFunctionsJson(File f, FunctionManager fm, Listing listing) throws Exception {
-        PrintWriter w = new PrintWriter(new FileWriter(f));
-        try (w) {
-            w.println("[");
-            boolean first = true;
-            for (Function fn : fm.getFunctions(true)) {
-                if (!first) {
-                    w.println(",");
-                }
-                first = false;
-                String name = jsonEscape(fn.getName());
-                long entry = fn.getEntryPoint().getOffset();
-                long end = functionEnd(fn);
-                DecodeProjection projection = decodeProjection(fn, listing);
-                w.print(String.format(
-                    "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s}",
-                    name,
-                    primarySource(fn),
-                    entry,
-                    end,
-                    fn.getBody().getNumAddresses(),
-                    decodeRangesJson(projection.ranges),
-                    decodeErrorsJson(projection.errors),
-                    dataRefsJson(fn)));
-            }
+    private void writeFunctionsJson(PrintWriter w, FunctionManager fm, Listing listing)
+            throws Exception {
+        w.println("[");
+        boolean first = true;
+        for (Function fn : fm.getFunctions(true)) {
+            checkDeadline();
             if (!first) {
-                w.println();
+                w.println(",");
             }
-            w.println("]");
+            first = false;
+            String name = jsonEscape(fn.getName());
+            long entry = fn.getEntryPoint().getOffset();
+            long end = PalTasksSupport.functionEnd(currentProgram, fn);
+            PalTasksSupport.DecodeProjection projection =
+                    PalTasksSupport.decodeProjection(currentProgram, monitor, fn);
+            w.print(String.format(
+                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s}",
+                name,
+                PalTasksSupport.primarySource(fn.getSymbol().getSource()),
+                entry,
+                end,
+                fn.getBody().getNumAddresses(),
+                decodeRangesJson(projection.ranges),
+                decodeErrorsJson(projection.errors),
+                dataRefsJson(fn)));
         }
-        checkWriter(w, f);
+        if (!first) {
+            w.println();
+        }
+        w.println("]");
     }
 
-    private void writeDisassembly(File f, Listing listing) throws Exception {
-        PrintWriter w = new PrintWriter(new FileWriter(f));
-        try (w) {
-            InstructionIterator it = listing.getInstructions(true);
-            while (it.hasNext()) {
-                Instruction ins = it.next();
-                // Format: "address: bytes  mnemonic operands" (spec §5.3).
-                StringBuilder hex = new StringBuilder();
-                try {
-                    for (byte b : ins.getBytes()) {
-                        hex.append(String.format("%02x", b & 0xff));
-                    }
-                } catch (Exception e) {
-                    hex.append("??");
+    private void writeDisassembly(PrintWriter w, Listing listing) throws Exception {
+        InstructionIterator it = listing.getInstructions(true);
+        while (it.hasNext()) {
+            checkDeadline();
+            Instruction ins = it.next();
+            // Format: "address: bytes  mnemonic operands" (spec §5.3).
+            StringBuilder hex = new StringBuilder();
+            try {
+                for (byte b : ins.getBytes()) {
+                    hex.append(String.format("%02x", b & 0xff));
                 }
-                w.println(ins.getAddress().toString() + ": " + hex + "  " + ins.toString());
+            } catch (Exception e) {
+                hex.append("??");
             }
+            w.println(ins.getAddress().toString() + ": " + hex + "  " + ins.toString());
         }
-        checkWriter(w, f);
     }
 
-    private void writeDecompiledC(File f, FunctionManager fm) throws Exception {
+    private void writeDecompiledC(PrintWriter w, FunctionManager fm) throws Exception {
         DecompInterface dif = new DecompInterface();
         try {
             dif.openProgram(currentProgram);
-            PrintWriter w = new PrintWriter(new FileWriter(f));
-            try (w) {
-                for (Function fn : fm.getFunctions(true)) {
-                    w.println("// " + fn.getName() + " @ " + fn.getEntryPoint());
-                    DecompileResults res = dif.decompileFunction(fn, 60, monitor);
-                    if (res != null && res.decompileCompleted() && res.getDecompiledFunction() != null) {
-                        w.println(res.getDecompiledFunction().getC());
-                    } else {
-                        w.println("// <decompilation failed>");
-                    }
-                    w.println();
+            for (Function fn : fm.getFunctions(true)) {
+                checkDeadline();
+                w.println("// " + fn.getName() + " @ " + fn.getEntryPoint());
+                DecompileResults res = dif.decompileFunction(fn, 60, monitor);
+                if (res != null && res.decompileCompleted() && res.getDecompiledFunction() != null) {
+                    w.println(res.getDecompiledFunction().getC());
+                } else {
+                    w.println("// <decompilation failed>");
                 }
+                w.println();
             }
-            checkWriter(w, f);
-        } finally {
+        }
+        finally {
             dif.dispose();
         }
     }
