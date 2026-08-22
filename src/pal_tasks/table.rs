@@ -576,10 +576,14 @@ fn suffixed_leaf(
     Ok(format!("{base}{suffix}"))
 }
 
-/// Allocate every leaf in both namespaces: unique preferred leaves are
-/// protected exactly as preferred; every duplicate group member is
+/// Allocate every leaf in both namespaces. The forbidden set is every
+/// preferred leaf in the domain — unique and duplicate-group members
+/// alike — plus every already assigned leaf. Unique preferreds keep
+/// their exact strings; every duplicate-group member is
 /// suffix-allocated in identity-key order, trying exactly nonces
-/// `0..=2*N` against the preferred and already-assigned leaves.
+/// `0..=2*N`: with N identities the forbidden set holds at most
+/// `N + N = 2*N` members against `2*N + 1` candidates distinct by
+/// nonce, so one allocation must exist.
 fn allocate_leaves(
     identities: &[LeafIdentity],
 ) -> std::result::Result<BTreeMap<LeafIdentityKey, String>, PalTaskError> {
@@ -595,7 +599,13 @@ fn allocate_leaves(
         for identity in &domain {
             *occurrences.entry(identity.preferred.as_str()).or_insert(0) += 1;
         }
-        let mut taken: BTreeSet<String> = BTreeSet::new();
+        // Seed the forbidden set with every preferred leaf in the
+        // domain, not only the unique ones: a suffix candidate must
+        // also avoid each duplicate group's (unassigned) preferred.
+        let mut taken: BTreeSet<String> = domain
+            .iter()
+            .map(|identity| identity.preferred.clone())
+            .collect();
         for identity in &domain {
             if occurrences[identity.preferred.as_str()] != 1 {
                 continue;
@@ -605,7 +615,6 @@ fn allocate_leaves(
                     "unique preferred leaf exceeds the {MAX_SYMBOL_LEAF_BYTES}-character limit"
                 )));
             }
-            taken.insert(identity.preferred.clone());
             assigned.insert(identity.key.clone(), identity.preferred.clone());
         }
         let Some(count32) = u32::try_from(count).ok() else {
@@ -2207,6 +2216,94 @@ mod tests {
         for leaf in leaves.values() {
             assert!(seen.insert(leaf.clone()), "duplicate leaf {leaf}");
         }
+    }
+
+    #[test]
+    fn allocator_forbids_suffix_collisions_with_duplicate_group_preferreds() {
+        // C's nonce-0 candidate is exactly the preferred leaf of the
+        // duplicate group D/E (an unprotected preferred under the
+        // brief's letter): the design's forbidden set covers every
+        // preferred in the domain, so C must skip that nonce and take
+        // the next one.
+        let leaves = allocate_leaves(&[
+            ident(
+                LabelNamespace::Reserved,
+                0x2000,
+                TaskIsa::Thumb,
+                0,
+                LeafKind::Role,
+                "x",
+            ),
+            ident(
+                LabelNamespace::Reserved,
+                0x2100,
+                TaskIsa::Thumb,
+                1,
+                LeafKind::Role,
+                "x",
+            ),
+            ident(
+                LabelNamespace::Reserved,
+                0x2200,
+                TaskIsa::Thumb,
+                2,
+                LeafKind::Role,
+                "x",
+            ),
+            ident(
+                LabelNamespace::Reserved,
+                0x3000,
+                TaskIsa::Thumb,
+                3,
+                LeafKind::Role,
+                "x_pme_00002200_00000002_00000000",
+            ),
+            ident(
+                LabelNamespace::Reserved,
+                0x3100,
+                TaskIsa::Thumb,
+                4,
+                LeafKind::Role,
+                "x_pme_00002200_00000002_00000000",
+            ),
+        ])
+        .unwrap();
+        let of = |entry: u32, lowest: u32| {
+            leaves
+                .get(&LeafIdentityKey {
+                    namespace: LabelNamespace::Reserved,
+                    entry,
+                    isa: TaskIsa::Thumb,
+                    lowest_index: lowest,
+                    kind: LeafKind::Role,
+                })
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            of(0x2200, 2),
+            "x_pme_00002200_00000002_00000001",
+            "C skips its nonce-0 collision with the D/E group's preferred"
+        );
+        assert_eq!(of(0x2000, 0), "x_pme_00002000_00000000_00000000");
+        assert_eq!(of(0x2100, 1), "x_pme_00002100_00000001_00000000");
+        // D/E suffix their own full preferred base.
+        assert_eq!(
+            of(0x3000, 3),
+            "x_pme_00002200_00000002_00000000_pme_00003000_00000003_00000000"
+        );
+        assert_eq!(
+            of(0x3100, 4),
+            "x_pme_00002200_00000002_00000000_pme_00003100_00000004_00000000"
+        );
+        // Every final leaf stays distinct from every preferred and
+        // from the other assignments.
+        let mut seen = BTreeSet::new();
+        for leaf in leaves.values() {
+            assert!(seen.insert(leaf.clone()), "duplicate leaf {leaf}");
+        }
+        assert!(!seen.contains("x"));
+        assert!(!seen.contains("x_pme_00002200_00000002_00000000"));
     }
 
     #[test]
