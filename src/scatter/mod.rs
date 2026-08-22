@@ -1,6 +1,8 @@
+#[cfg_attr(not(test), allow(dead_code))]
 mod artifact;
 mod decompress;
 
+pub(crate) use self::artifact::{ArtifactSegment, MaterializedScatter, read_materialized};
 pub use self::artifact::{LOAD_MAP_FORMAT, MaterializedLoadMap, clear_materialized, materialize};
 use self::decompress::{DecodeBudget, Decoded, decompress1};
 use scaleservers_arm32_assembly::{
@@ -13,7 +15,7 @@ pub const MAX_ENTRIES: usize = 256;
 pub const MAX_LOGICAL_OUTPUT: u64 = 512 * 1024 * 1024;
 pub const MAX_DECODED_WORK: u64 = 512 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Null,

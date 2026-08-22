@@ -19,6 +19,8 @@ pub mod manifest;
 pub mod model;
 pub mod pipeline;
 pub mod recover_source;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod runtime_image;
 pub mod scatter;
 pub mod source_tree;
 pub mod symbolicate;
