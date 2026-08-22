@@ -2,7 +2,9 @@
 mod artifact;
 mod decompress;
 
-pub(crate) use self::artifact::{ArtifactSegment, MaterializedScatter, read_materialized};
+pub(crate) use self::artifact::{
+    ArtifactSegment, MaterializedScatter, TrustedDirectory, read_materialized,
+};
 pub use self::artifact::{LOAD_MAP_FORMAT, MaterializedLoadMap, clear_materialized, materialize};
 use self::decompress::{DecodeBudget, Decoded, decompress1};
 use scaleservers_arm32_assembly::{

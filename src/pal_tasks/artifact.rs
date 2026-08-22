@@ -12,23 +12,15 @@ use crate::execution_ranges::parse_blake3;
 use crate::pal_tasks::{
     ANCHOR_PATTERN, AnchorProofPath, AnchorProvenance, AnchorReference, AnchorReferenceKind,
     AnchorReferenceKind::{Adr, Literal, MovwMovt},
-    CapacityGuard, DESCRIPTOR_PROJECTION_OFFSET, InitializerEvidence, MAX_SYMBOL_LEAF_BYTES,
-    MAX_TABLE_CAPACITY, MAX_TABLE_STRIDE, MAX_TASK_NAME_BYTES, PalTaskError, TaskApplication,
-    TaskIsa, TaskLabelApplication, TaskPlan, TaskRecord, TaskTable, TerminalRecord,
+    CapacityGuard, DESCRIPTOR_PROJECTION_OFFSET, InitializerEvidence, MAX_TABLE_CAPACITY,
+    MAX_TABLE_STRIDE, MAX_TASK_NAME_BYTES, PalTaskError, SlotDefinition, TaskApplication, TaskIsa,
+    TaskPlan, TaskRecord, TaskTable, TerminalRecord,
 };
 use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
 use atomic_write_file::AtomicWriteFile;
-use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
-use std::ffi::{CString, OsStr};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt as _;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-pal-tasks-v1";
@@ -606,11 +598,19 @@ fn serialize(plan: &TaskPlan, context: &TaskArtifactContext<'_>) -> Result<Vec<u
     json.key(false, "slot_definition");
     json.open_object();
     json.key(true, "root");
-    json.string_value(&address(plan.initializer.slot_definition));
+    json.string_value(&address(plan.initializer.slot_definition.root));
     json.key(false, "definitions");
     json.open_array();
-    json.element(true);
-    json.string_value(&address(plan.initializer.slot_definition));
+    for (definition_index, definition) in plan
+        .initializer
+        .slot_definition
+        .definitions
+        .iter()
+        .enumerate()
+    {
+        json.element(definition_index == 0);
+        json.string_value(&address(*definition));
+    }
     json.close_array();
     json.close_object();
     json.key(false, "normal_exit");
@@ -1790,7 +1790,7 @@ fn revalidate(
     revalidate_initializer(&wire, runtime)?;
     let tasks = revalidate_table_and_tasks(&wire, runtime)?;
     revalidate_used_entry_union(&wire)?;
-    let applications = revalidate_applications(&wire)?;
+    let applications = revalidate_applications(&wire, &tasks)?;
 
     let initializer = &wire.initializer;
     let used = wire.scatter_entries_used.clone();
@@ -1829,7 +1829,10 @@ fn revalidate(
             code_storage: storage_of(&initializer.code_storage),
             loop_start: initializer.loop_start,
             count_zero_definition: initializer.count_zero_definition,
-            slot_definition: initializer.slot_definition_root,
+            slot_definition: SlotDefinition {
+                root: initializer.slot_definition_root,
+                definitions: initializer.slot_definition_definitions.clone(),
+            },
             normal_exit: initializer.normal_exit,
             capacity_exit: initializer.capacity_exit,
             // The wire carries the semantic guard result; the
@@ -2409,240 +2412,28 @@ fn revalidate_used_entry_union(wire: &WireManifest) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic application recomputation (mirrors `table`'s allocator)
+// Deterministic application recomputation through `table`'s allocator
 // ---------------------------------------------------------------------------
 
-/// Preserve alphanumerics and underscores, replace each maximal run of
-/// other bytes with one underscore, prefix an underscore for a digit
-/// start, and reject an empty result — the same grammar `table`'s
-/// allocator applies, so the wire decision can be recomputed exactly.
-fn sanitize_task_name(name: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut pending_underscore = false;
-    for byte in name.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'_' {
-            if pending_underscore {
-                out.push('_');
-                pending_underscore = false;
-            }
-            out.push(char::from(byte));
-        } else {
-            pending_underscore = true;
-        }
-    }
-    if pending_underscore {
-        out.push('_');
-    }
-    if out.is_empty() {
-        return None;
-    }
-    if out.starts_with(|character: char| character.is_ascii_digit()) {
-        out.insert(0, '_');
-    }
-    Some(out)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LabelNamespace {
-    Reserved,
-    Global,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LeafKind {
-    Role,
-    Primary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct LeafIdentityKey {
-    namespace: LabelNamespace,
-    entry: u32,
-    isa: TaskIsa,
-    lowest_index: u32,
-    kind: LeafKind,
-}
-
-#[derive(Debug, Clone)]
-struct LeafIdentity {
-    key: LeafIdentityKey,
-    preferred: String,
-}
-
-fn suffixed_leaf(preferred: &str, entry: u32, lowest_index: u32, nonce: u32) -> Result<String> {
-    let suffix = format!("_pme_{entry:08x}_{lowest_index:08x}_{nonce:08x}");
-    let keep = MAX_SYMBOL_LEAF_BYTES
-        .checked_sub(suffix.len())
-        .ok_or_else(|| invalid("collision suffix cannot fit the symbol leaf limit"))?;
-    let base = &preferred[..preferred.len().min(keep)];
-    Ok(format!("{base}{suffix}"))
-}
-
-fn allocate_leaves(identities: &[LeafIdentity]) -> Result<BTreeMap<LeafIdentityKey, String>> {
-    let mut assigned: BTreeMap<LeafIdentityKey, String> = BTreeMap::new();
-    for namespace in [LabelNamespace::Reserved, LabelNamespace::Global] {
-        let mut domain: Vec<&LeafIdentity> = identities
-            .iter()
-            .filter(|identity| identity.key.namespace == namespace)
-            .collect();
-        domain.sort_by(|left, right| left.key.cmp(&right.key));
-        let count = domain.len();
-        let mut occurrences: BTreeMap<&str, usize> = BTreeMap::new();
-        for identity in &domain {
-            *occurrences.entry(identity.preferred.as_str()).or_insert(0) += 1;
-        }
-        let mut taken: BTreeSet<String> = domain
-            .iter()
-            .map(|identity| identity.preferred.clone())
-            .collect();
-        for identity in &domain {
-            if occurrences[identity.preferred.as_str()] != 1 {
-                continue;
-            }
-            if identity.preferred.len() > MAX_SYMBOL_LEAF_BYTES {
-                return Err(invalid(
-                    "unique preferred leaf exceeds the 2000-character limit",
-                ));
-            }
-            assigned.insert(identity.key.clone(), identity.preferred.clone());
-        }
-        let count32 = u32::try_from(count)
-            .map_err(|_| invalid("leaf identity count overflows the nonce bound"))?;
-        let max_nonce = count32
-            .checked_mul(2)
-            .ok_or_else(|| invalid("leaf identity count overflows the nonce bound"))?;
-        for identity in &domain {
-            if occurrences[identity.preferred.as_str()] == 1 {
-                continue;
-            }
-            let mut allocated = None;
-            for nonce in 0..=max_nonce {
-                let candidate = suffixed_leaf(
-                    &identity.preferred,
-                    identity.key.entry,
-                    identity.key.lowest_index,
-                    nonce,
-                )?;
-                if !taken.contains(&candidate) {
-                    allocated = Some(candidate);
-                    break;
-                }
-            }
-            let Some(leaf) = allocated else {
-                return Err(invalid(
-                    "collision suffix allocation exhausted nonces 0..=2*N",
-                ));
-            };
-            taken.insert(leaf.clone());
-            assigned.insert(identity.key.clone(), leaf);
-        }
-    }
-    Ok(assigned)
-}
-
 /// Recompute the complete deterministic application decision from the
-/// task records — groups, preferred leaves, collision suffixes, label
-/// partitions, and ordering — exactly as `table` allocated them, and
-/// require the serialized decision to equal the recomputation.
-fn revalidate_applications(wire: &WireManifest) -> Result<Vec<TaskApplication>> {
-    let tasks = &wire.tasks;
-    let mut entry_isas: BTreeMap<u32, BTreeSet<TaskIsa>> = BTreeMap::new();
-    for task in tasks {
-        entry_isas.entry(task.entry).or_default().insert(task.isa);
-    }
-    for (entry, isas) in &entry_isas {
-        if isas.len() > 1 {
-            return Err(invalid(format!(
-                "cross-ISA alias at {entry:#010x}: one entry cannot carry both ISAs"
-            )));
-        }
-    }
+/// revalidated task records through the same allocator `table` used —
+/// groups, preferred leaves, collision suffixes, label partitions, and
+/// ordering — and require the serialized decision to equal it.
+fn revalidate_applications(
+    wire: &WireManifest,
+    records: &[TaskRecord],
+) -> Result<Vec<TaskApplication>> {
+    // Recompute the allocation through the one deterministic allocator
+    // `table` owns: it fills every record's `task_label` and returns the
+    // applications; any allocator-level rejection is a wire violation.
+    let mut recomputed = records.to_vec();
+    let applications =
+        super::table::allocate_applications(&mut recomputed, wire.initializer.cfg_entry)
+            .map_err(|error| invalid(error.to_string()))?;
 
-    let mut label_members: BTreeMap<(String, u32, TaskIsa), Vec<u32>> = BTreeMap::new();
-    for task in tasks {
-        label_members
-            .entry((task.name.clone(), task.entry, task.isa))
-            .or_default()
-            .push(task.index);
-    }
-    let mut identities: Vec<LeafIdentity> = Vec::new();
-    for ((name, entry, isa), indices) in &label_members {
-        let sanitized = sanitize_task_name(name)
-            .ok_or_else(|| invalid(format!("task name {name:?} sanitizes to an empty portion")))?;
-        let lowest_index = *indices
-            .first()
-            .ok_or_else(|| invalid("label identity without member indices"))?;
-        identities.push(LeafIdentity {
-            key: LeafIdentityKey {
-                namespace: LabelNamespace::Reserved,
-                entry: *entry,
-                isa: *isa,
-                lowest_index,
-                kind: LeafKind::Role,
-            },
-            preferred: format!("pal_TaskEntry_{sanitized}"),
-        });
-    }
-
-    let mut groups: BTreeMap<(u32, TaskIsa), Vec<u32>> = BTreeMap::new();
-    for task in tasks {
-        groups
-            .entry((task.entry, task.isa))
-            .or_default()
-            .push(task.index);
-    }
-    for ((entry, isa), indices) in &groups {
-        let distinct = label_members
-            .keys()
-            .filter(|(_, label_entry, label_isa)| label_entry == entry && label_isa == isa)
-            .count();
-        let lowest_index = *indices
-            .first()
-            .ok_or_else(|| invalid("application identity without member indices"))?;
-        let preferred = if distinct == 1 {
-            let name = label_members
-                .keys()
-                .find(|(_, label_entry, label_isa)| label_entry == entry && label_isa == isa)
-                .map(|(name, _, _)| name.as_str())
-                .ok_or_else(|| invalid("application group lost its identity"))?;
-            let sanitized = sanitize_task_name(name).ok_or_else(|| {
-                invalid(format!("task name {name:?} sanitizes to an empty portion"))
-            })?;
-            format!("pal_TaskEntry_{sanitized}")
-        } else {
-            format!("pal_TaskEntry_shared_{entry:08x}")
-        };
-        identities.push(LeafIdentity {
-            key: LeafIdentityKey {
-                namespace: LabelNamespace::Global,
-                entry: *entry,
-                isa: *isa,
-                lowest_index,
-                kind: LeafKind::Primary,
-            },
-            preferred,
-        });
-    }
-
-    let leaves = allocate_leaves(&identities)?;
-    let label_of = |name: &str, entry: u32, isa: TaskIsa| -> Option<String> {
-        let indices = label_members.get(&(name.to_string(), entry, isa))?;
-        let lowest = *indices.first()?;
-        leaves
-            .get(&LeafIdentityKey {
-                namespace: LabelNamespace::Reserved,
-                entry,
-                isa,
-                lowest_index: lowest,
-                kind: LeafKind::Role,
-            })
-            .cloned()
-    };
-    for task in tasks {
-        let Some(label) = label_of(&task.name, task.entry, task.isa) else {
-            return Err(invalid("task record lost its allocated label"));
-        };
-        if task.task_label != label {
+    // The serialized per-record labels must equal the recomputation.
+    for (task, record) in wire.tasks.iter().zip(&recomputed) {
+        if task.task_label != record.task_label {
             return Err(invalid(format!(
                 "task {} label does not match the deterministic allocation",
                 task.index
@@ -2650,46 +2441,8 @@ fn revalidate_applications(wire: &WireManifest) -> Result<Vec<TaskApplication>> 
         }
     }
 
-    let mut applications = Vec::new();
-    for ((entry, isa), indices) in &groups {
-        let lowest = *indices
-            .first()
-            .ok_or_else(|| invalid("application identity without member indices"))?;
-        let desired_primary = leaves
-            .get(&LeafIdentityKey {
-                namespace: LabelNamespace::Global,
-                entry: *entry,
-                isa: *isa,
-                lowest_index: lowest,
-                kind: LeafKind::Primary,
-            })
-            .ok_or_else(|| invalid("application lost its allocated primary"))?
-            .clone();
-        let mut labels: Vec<TaskLabelApplication> = Vec::new();
-        for ((name, label_entry, label_isa), member_indices) in label_members.iter() {
-            if label_entry != entry || label_isa != isa {
-                continue;
-            }
-            let Some(label) = label_of(name, *entry, *isa) else {
-                return Err(invalid("label allocation gap"));
-            };
-            labels.push(TaskLabelApplication {
-                label,
-                task_indices: member_indices.clone(),
-            });
-        }
-        labels.sort_by(|left, right| left.task_indices.first().cmp(&right.task_indices.first()));
-        applications.push(TaskApplication {
-            entry: *entry,
-            isa: *isa,
-            desired_primary,
-            task_indices: indices.clone(),
-            labels,
-        });
-    }
-    applications.sort_by_key(|application| (application.entry, application.isa));
-
-    // The serialized decision must equal the recomputation exactly.
+    // The serialized application decision must equal the recomputation
+    // exactly.
     if wire.applications.len() != applications.len() {
         return Err(invalid(
             "applications do not cover exactly the distinct entry groups",
@@ -2729,100 +2482,31 @@ fn revalidate_applications(wire: &WireManifest) -> Result<Vec<TaskApplication>> 
 // Secure manifest open
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+/// Open the manifest through scatter's handle-anchored
+/// `TrustedDirectory`: the parent directory is opened without following
+/// links and the leaf is opened relative to that retained capability,
+/// with a regular-file check — the same proven containment the scatter
+/// artifact reader uses, on every supported platform.
 fn open_manifest_file(path: &Path) -> Result<File> {
     if !path.is_absolute() {
         return Err(invalid("manifest path is not absolute"));
     }
-    let Some(file_name) = path.file_name() else {
-        return Err(invalid("manifest path has no file name"));
-    };
-    if file_name.to_str() != Some(ARTIFACT_FILE_NAME) {
+    if path.file_name().and_then(|name| name.to_str()) != Some(ARTIFACT_FILE_NAME) {
         return Err(invalid("manifest file name is not tasks.json"));
     }
-    let Some(parent) = path.parent() else {
-        return Err(invalid("manifest path has no parent directory"));
-    };
-    let canonical = fs::canonicalize(parent)
-        .map_err(|error| invalid(format!("manifest parent cannot be canonicalized: {error}")))?;
-
-    // Handle-anchored traversal: every component from the filesystem root
-    // is opened without following links, so no intermediate replacement
-    // can redirect the open.
-    let mut current = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(Path::new("/"))
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("manifest path has no parent directory"))?;
+    let trusted = crate::scatter::TrustedDirectory::new(parent, "pal task manifest parent")
         .map_err(|error| {
             invalid(format!(
-                "filesystem root cannot be opened securely: {error}"
+                "manifest parent cannot be opened securely: {error}"
             ))
         })?;
-    for component in canonical.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(name) => {
-                current = open_unix_component(
-                    &current,
-                    name,
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                    "manifest directory component",
-                    true,
-                )?;
-            }
-            _ => return Err(invalid("manifest parent is not canonical form")),
-        }
-    }
-    let file = open_unix_component(
-        &current,
-        file_name,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        "manifest file",
-        false,
-    )?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| invalid(format!("manifest metadata is unavailable: {error}")))?;
-    if metadata.file_type().is_symlink() {
-        return Err(invalid("manifest is a symlink"));
-    }
-    if !metadata.is_file() {
-        return Err(invalid("manifest is not a regular file"));
-    }
+    let (file, _) = trusted
+        .open_regular_file_with_parent(Path::new(ARTIFACT_FILE_NAME), "pal task manifest")
+        .map_err(|error| invalid(error.to_string()))?;
     Ok(file)
-}
-
-#[cfg(unix)]
-fn open_unix_component(
-    parent: &File,
-    name: &OsStr,
-    flags: libc::c_int,
-    context: &str,
-    directory: bool,
-) -> Result<File> {
-    let name =
-        CString::new(name.as_bytes()).map_err(|_| invalid(format!("{context} contains NUL")))?;
-    // SAFETY: `parent` is a live directory descriptor and `name` is a
-    // NUL-terminated single component.
-    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if descriptor < 0 {
-        let error = std::io::Error::last_os_error();
-        if !directory && error.raw_os_error() == Some(libc::ELOOP) {
-            return Err(invalid(format!("{context} is a symlink")));
-        }
-        return Err(invalid(format!(
-            "{context} cannot be opened without following links: {error}"
-        )));
-    }
-    // SAFETY: `openat` returned a fresh owned descriptor on success.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
-}
-
-#[cfg(not(unix))]
-fn open_manifest_file(_path: &Path) -> Result<File> {
-    Err(invalid(
-        "strict PAL manifest reading is not supported on this platform",
-    ))
 }
 
 #[cfg(test)]
@@ -2833,7 +2517,7 @@ mod tests {
     };
     use crate::pal_tasks::{
         ANCHOR_PATTERN, AnchorProofPath, AnchorProvenance, AnchorReference, AnchorReferenceKind,
-        CapacityGuard, InitializerEvidence, PalTaskError, TaskApplication, TaskIsa,
+        CapacityGuard, InitializerEvidence, PalTaskError, SlotDefinition, TaskApplication, TaskIsa,
         TaskLabelApplication, TaskPlan, TaskRecord, TaskTable, TerminalRecord,
     };
     use crate::pal_tasks::{
@@ -3022,7 +2706,13 @@ mod tests {
         ]
     }
 
-    fn synthetic_plan(image: &RuntimeImage<'_>) -> TaskPlan {
+    /// The plan frame shared by every synthetic fixture: the fixed
+    /// initializer/table/terminal geometry over the fixture image.
+    fn synthetic_frame(
+        image: &RuntimeImage<'_>,
+        tasks: Vec<TaskRecord>,
+        applications: Vec<TaskApplication>,
+    ) -> TaskPlan {
         let anchors = [ANCHOR_A, ANCHOR_B]
             .into_iter()
             .map(|address| AnchorProvenance {
@@ -3037,7 +2727,13 @@ mod tests {
             code_storage: image.storage_spans(CODE_BASE, CODE_LEN).unwrap(),
             loop_start: LOOP_START,
             count_zero_definition: COUNT_ZERO_DEFINITION,
-            slot_definition: SLOT_DEFINITION_ROOT,
+            // The fixture image carries no real MOVW/MOVT pair, so the
+            // chain is the bare immediate root; the leaf-call and copy
+            // chains are pinned by the discovery-side fixtures.
+            slot_definition: SlotDefinition {
+                root: SLOT_DEFINITION_ROOT,
+                definitions: vec![SLOT_DEFINITION_ROOT],
+            },
             normal_exit: NORMAL_EXIT,
             capacity_exit: CAPACITY_EXIT,
             // The wire carries the semantic guard {start,branch,fallthrough};
@@ -3060,6 +2756,36 @@ mod tests {
             stride: STRIDE,
             capacity: CAPACITY,
         };
+        let (image_base, image_size) = image.image_bounds();
+        TaskPlan {
+            image_base,
+            image_size,
+            initializer,
+            table: TaskTable {
+                slot_base: SLOT_BASE,
+                name_offset: NAME_OFFSET,
+                index_offset: INDEX_OFFSET,
+                stride: STRIDE,
+                capacity: CAPACITY,
+                count: 2,
+                descriptor_projection_offset: NAME_OFFSET - 0x24,
+                priority_offset: NAME_OFFSET + 4,
+                stack_size_offset: NAME_OFFSET + 8,
+                entry_offset: NAME_OFFSET + 12,
+                callback_offset: NAME_OFFSET + 16,
+                unknown_pointer_offset: NAME_OFFSET + 20,
+            },
+            tasks,
+            applications,
+            terminal: TerminalRecord {
+                slot: TERMINAL_SLOT,
+                slot_blake3: image.hash_range(TERMINAL_SLOT, STRIDE).unwrap(),
+                storage: image.storage_spans(TERMINAL_SLOT, STRIDE).unwrap(),
+            },
+        }
+    }
+
+    fn synthetic_plan(image: &RuntimeImage<'_>) -> TaskPlan {
         let tasks = vec![
             TaskRecord {
                 index: 0,
@@ -3124,33 +2850,7 @@ mod tests {
                 }],
             },
         ];
-        let (image_base, image_size) = image.image_bounds();
-        TaskPlan {
-            image_base,
-            image_size,
-            initializer,
-            table: TaskTable {
-                slot_base: SLOT_BASE,
-                name_offset: NAME_OFFSET,
-                index_offset: INDEX_OFFSET,
-                stride: STRIDE,
-                capacity: CAPACITY,
-                count: 2,
-                descriptor_projection_offset: NAME_OFFSET - 0x24,
-                priority_offset: NAME_OFFSET + 4,
-                stack_size_offset: NAME_OFFSET + 8,
-                entry_offset: NAME_OFFSET + 12,
-                callback_offset: NAME_OFFSET + 16,
-                unknown_pointer_offset: NAME_OFFSET + 20,
-            },
-            tasks,
-            applications,
-            terminal: TerminalRecord {
-                slot: TERMINAL_SLOT,
-                slot_blake3: image.hash_range(TERMINAL_SLOT, STRIDE).unwrap(),
-                storage: image.storage_spans(TERMINAL_SLOT, STRIDE).unwrap(),
-            },
-        }
+        synthetic_frame(image, tasks, applications)
     }
 
     fn raw_fixture() -> (Vec<u8>, RuntimeImage<'static>) {
@@ -3538,6 +3238,134 @@ mod tests {
         assert_eq!(artifact.scatter_load_map_blake3, None);
         assert_eq!(hex(artifact.manifest_blake3), map.blake3);
         assert_eq!(artifact.identity, map.identity);
+        assert_eq!(artifact.plan, plan);
+    }
+
+    #[test]
+    fn reader_recomputes_collision_suffixed_allocations_through_one_allocator() {
+        // Two distinct exact names ("al.pha" and "al--pha") that sanitize
+        // to one preferred leaf `pal_TaskEntry_al_pha` at two entries:
+        // both namespaces hit the duplicate-group path, so every label
+        // and primary is nonce-suffixed. The hand-pinned strings below
+        // are the allocator's identity-key-ordered nonce-0 decisions;
+        // read() recomputes them through the same `table` allocator.
+        const NAME_DOT: u32 = BASE + 0x510;
+        const NAME_DASHES: u32 = BASE + 0x518;
+        let label_a = format!("pal_TaskEntry_al_pha_pme_{ENTRY_A:08x}_00000000_00000000");
+        let label_b = format!("pal_TaskEntry_al_pha_pme_{ENTRY_B:08x}_00000001_00000000");
+
+        let mut image = ImageBuilder::new();
+        for offset in 0..CODE_LEN {
+            image.write_u8(CODE_BASE + offset, 0xa5);
+        }
+        image.write(GUARD_BRANCH, &enc(&T32::B_T1(Arm32Condition::NotEqual, 4)));
+        image.write(ANCHOR_A, ANCHOR_PATTERN);
+        image.write(ANCHOR_B, ANCHOR_PATTERN);
+        image.write(NAME_ALPHA, b"alpha\0");
+        image.write(NAME_DOT, b"al.pha\0");
+        image.write(NAME_DASHES, b"al--pha\0");
+        image.write(ENTRY_A, &enc(&T32::Push_T1(vec![gpr(4), gpr(14)])));
+        image.write(ENTRY_B, &enc(&T32::Mov_Immediate_T3(gpr(0), 0x1234)));
+        write_slot(
+            &mut image,
+            SLOT_ALPHA,
+            0x5a,
+            NAME_DOT,
+            100,
+            0x200,
+            ENTRY_A | 1,
+            0,
+            0,
+        );
+        write_slot(
+            &mut image,
+            SLOT_BETA,
+            0xc7,
+            NAME_DASHES,
+            0xff,
+            0x80e8,
+            ENTRY_B | 1,
+            0,
+            0,
+        );
+        write_terminal(&mut image, TERMINAL_SLOT, 0x33);
+        image.ensure(IMAGE_END);
+        let raw = image.bytes;
+        let runtime = raw_image(&raw);
+
+        let task = |index: u32,
+                    slot: u32,
+                    name_pointer: u32,
+                    name: &str,
+                    label: &str,
+                    entry: u32,
+                    size: u8,
+                    priority: u8,
+                    stack_size: u32| TaskRecord {
+            index,
+            slot,
+            slot_blake3: runtime.hash_range(slot, STRIDE).unwrap(),
+            name_pointer,
+            name: name.to_string(),
+            task_label: label.to_string(),
+            priority,
+            stack_size,
+            entry_pointer: entry | 1,
+            entry,
+            isa: TaskIsa::Thumb,
+            instruction_size: size,
+            instruction_blake3: runtime.hash_range(entry, u32::from(size)).unwrap(),
+            callback: 0,
+            unknown_pointer: 0,
+            slot_storage: runtime.storage_spans(slot, STRIDE).unwrap(),
+            name_storage: runtime
+                .storage_spans(name_pointer, u32::try_from(name.len()).unwrap() + 1)
+                .unwrap(),
+            entry_storage: runtime.storage_spans(entry, u32::from(size)).unwrap(),
+        };
+        let tasks = vec![
+            task(
+                0, SLOT_ALPHA, NAME_DOT, "al.pha", &label_a, ENTRY_A, 2, 100, 0x200,
+            ),
+            task(
+                1,
+                SLOT_BETA,
+                NAME_DASHES,
+                "al--pha",
+                &label_b,
+                ENTRY_B,
+                4,
+                0xff,
+                0x80e8,
+            ),
+        ];
+        let application = |entry: u32, label: &str, index: u32| TaskApplication {
+            entry,
+            isa: TaskIsa::Thumb,
+            desired_primary: label.to_string(),
+            task_indices: vec![index],
+            labels: vec![TaskLabelApplication {
+                label: label.to_string(),
+                task_indices: vec![index],
+            }],
+        };
+        let applications = vec![
+            application(ENTRY_A, &label_a, 0),
+            application(ENTRY_B, &label_b, 1),
+        ];
+        let plan = synthetic_frame(&runtime, tasks, applications);
+
+        let context = raw_context(*blake3::hash(&raw).as_bytes());
+        let root = tempdir().unwrap();
+        materialize(&plan, context, root.path()).unwrap();
+
+        let artifact: ValidatedTaskArtifact =
+            read(&manifest_path(root.path()), &runtime, context).unwrap();
+
+        assert_eq!(artifact.plan.tasks[0].task_label, label_a);
+        assert_eq!(artifact.plan.tasks[1].task_label, label_b);
+        assert_eq!(artifact.plan.applications[0].desired_primary, label_a);
+        assert_eq!(artifact.plan.applications[1].desired_primary, label_b);
         assert_eq!(artifact.plan, plan);
     }
 
@@ -3981,7 +3809,7 @@ mod tests {
     #[test]
     fn clear_rejects_unsafe_labels() {
         let root = tempdir().unwrap();
-        for label in ["", ".", "..", "a/b", "a\\b", "a b", "$(id)", "é"] {
+        for label in ["", ".", "..", "a/b", "a\\b", "a b", "$(id)", "\u{e9}"] {
             assert!(
                 matches!(
                     clear_materialized(root.path(), label),

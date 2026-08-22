@@ -658,8 +658,10 @@ fn allocate_leaves(
 
 /// Reject cross-ISA aliases, allocate every task label and application
 /// primary, fill the per-record labels, and prove the exact
-/// task-index/label partitions.
-fn allocate_applications(
+/// task-index/label partitions. Also the artifact reader's recomputation
+/// path: it must reproduce the serialized allocation decision through
+/// this one implementation.
+pub(super) fn allocate_applications(
     tasks: &mut [TaskRecord],
     initializer: u32,
 ) -> std::result::Result<Vec<TaskApplication>, PalTaskError> {
@@ -1085,7 +1087,10 @@ mod tests {
                 code_storage: vec![],
                 loop_start: 0x1110,
                 count_zero_definition: 0x1104,
-                slot_definition: 0x1108,
+                slot_definition: crate::pal_tasks::SlotDefinition {
+                    root: 0x1108,
+                    definitions: vec![0x1108],
+                },
                 normal_exit: 0x1120,
                 capacity_exit: 0x111c,
                 capacity_guard: CapacityGuard {

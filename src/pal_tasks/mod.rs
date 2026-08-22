@@ -322,6 +322,17 @@ pub(crate) struct CapacityGuard {
     pub compare_value: u32,
 }
 
+/// The complete root-anchored slot-base definition chain: the direct
+/// immediate materialization (MOVW root, its MOVT high-half replacement,
+/// and any copies that carry the value onward) or the leaf call and its
+/// move, exactly as the dataflow preserved it. `definitions` begins at
+/// `root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotDefinition {
+    pub root: u32,
+    pub definitions: Vec<u32>,
+}
+
 /// The complete initializer proof: canonical proof paths, the loop and
 /// induction roots, both exits with the shared count global, the
 /// capacity guard, the suffix loop, the join, and the derived table
@@ -334,7 +345,7 @@ pub(crate) struct InitializerEvidence {
     pub code_storage: Vec<StorageSpan>,
     pub loop_start: u32,
     pub count_zero_definition: u32,
-    pub slot_definition: u32,
+    pub slot_definition: SlotDefinition,
     pub normal_exit: u32,
     pub capacity_exit: u32,
     pub capacity_guard: CapacityGuard,
@@ -352,12 +363,14 @@ impl InitializerEvidence {
     /// Whether two proofs carry the same semantic tuple: identical CFG
     /// entry, loop start, count/slot roots, geometry, count global,
     /// exits, guard, suffix loop, and join. Proof paths and storage
-    /// provenance aggregate instead of distinguishing candidates.
+    /// provenance aggregate instead of distinguishing candidates, and
+    /// the slot-definition chain follows from the shared CFG root, so
+    /// only its root is compared.
     fn same_semantics(&self, other: &Self) -> bool {
         self.cfg_entry == other.cfg_entry
             && self.loop_start == other.loop_start
             && self.count_zero_definition == other.count_zero_definition
-            && self.slot_definition == other.slot_definition
+            && self.slot_definition.root == other.slot_definition.root
             && self.slot_base == other.slot_base
             && self.name_offset == other.name_offset
             && self.index_offset == other.index_offset

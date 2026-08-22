@@ -22,7 +22,7 @@ use crate::pal_tasks::{
     InitializerCandidate, InitializerEvidence, MAX_ANCHOR_OCCURRENCES,
     MAX_ANCHOR_REFERENCE_DISTANCE, MAX_ANCHOR_REFERENCES, MAX_CANDIDATE_TUPLES,
     MAX_MOVW_MOVT_SPAN_INSTRUCTIONS, MAX_SLOT_LEAF_INSTRUCTIONS, PROLOGUE_WINDOW_BYTES,
-    PalTaskError, TaskPlan, TaskTableGeometry,
+    PalTaskError, SlotDefinition, TaskPlan, TaskTableGeometry,
 };
 use crate::runtime_image::{MAX_EXACT_READ, RuntimeImage, StorageSpan};
 use scaleservers_arm32_assembly::Arm32Condition;
@@ -236,7 +236,7 @@ fn prove_initializer(
         code_storage: code_storage_spans(image, label, cfg)?,
         loop_start: counting.loop_start,
         count_zero_definition: counting.count_zero_definition,
-        slot_definition: slot_fact.root,
+        slot_definition: slot_definition(cfg, &slot_fact),
         normal_exit: counting.terminal,
         capacity_exit: counting.capacity_exit,
         capacity_guard: exits.guard,
@@ -754,6 +754,77 @@ fn slot_base_form_supported(
             )
         }
         _ => false,
+    }
+}
+
+/// The complete root-anchored slot-base definition chain: the root, then
+/// every consecutive unconditional instruction that carries its value
+/// onward — a same-register MOVT high-half replacement or a copy of the
+/// register currently holding it — through the fact's concrete
+/// definition. For the leaf-call form the chain is the call and its
+/// move.
+fn slot_definition(cfg: &LocalCfg, slot_fact: &ValueFact) -> SlotDefinition {
+    let mut definitions = vec![slot_fact.root];
+    if slot_fact.definition == slot_fact.root {
+        return SlotDefinition {
+            root: slot_fact.root,
+            definitions,
+        };
+    }
+    // The register that currently carries the root value: the root's
+    // destination, or R0 for a leaf-call root.
+    let Some(root) = cfg.instruction(slot_fact.root) else {
+        return SlotDefinition {
+            root: slot_fact.root,
+            definitions,
+        };
+    };
+    let mut carrier = match &root.effect {
+        ValueEffect::RegisterWrite { dst, .. } => *dst,
+        _ if matches!(root.flow, ControlFlow::DirectCall { .. }) => Register(0),
+        _ => {
+            return SlotDefinition {
+                root: slot_fact.root,
+                definitions,
+            };
+        }
+    };
+    let mut pc = slot_fact.root;
+    while pc < slot_fact.definition {
+        let Some(instruction) = cfg.instruction(pc) else {
+            break;
+        };
+        let Some(next) = pc.checked_add(u32::from(instruction.length)) else {
+            break;
+        };
+        pc = next;
+        let Some(instruction) = cfg.instruction(pc) else {
+            break;
+        };
+        if !matches!(instruction.flow, ControlFlow::Linear) || instruction.conditional {
+            break;
+        }
+        match &instruction.effect {
+            ValueEffect::RegisterWrite { dst, value } => match value {
+                ValueExpr::ReplaceHighHalf { source, .. }
+                    if *source == carrier && *dst == carrier =>
+                {
+                    definitions.push(pc);
+                }
+                ValueExpr::Register(source) if *source == carrier => {
+                    carrier = *dst;
+                    definitions.push(pc);
+                }
+                _ if instruction.writes.contains(&carrier) => break,
+                _ => {}
+            },
+            _ if instruction.writes.contains(&carrier) => break,
+            _ => {}
+        }
+    }
+    SlotDefinition {
+        root: slot_fact.root,
+        definitions,
     }
 }
 
@@ -1822,7 +1893,7 @@ mod tests {
         ANCHOR_PATTERN, AnchorProofPath, AnchorProvenance, AnchorReference, AnchorReferenceKind,
         CandidateBudget, CapacityGuard, InitializerCandidate, InitializerEvidence,
         MAX_ANCHOR_REFERENCE_DISTANCE, MAX_CANDIDATE_TUPLES, MAX_CANDIDATE_VALIDATION_BYTES,
-        MAX_SLOT_LEAF_INSTRUCTIONS, PalTaskError, TaskTableGeometry,
+        MAX_SLOT_LEAF_INSTRUCTIONS, PalTaskError, SlotDefinition, TaskTableGeometry,
     };
     use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
     use scaleservers_arm32_assembly::{Arm32Condition, ArmT32Instruction as T32};
@@ -2355,7 +2426,10 @@ mod tests {
                 code_storage: vec![],
                 loop_start: 0x1010,
                 count_zero_definition: 0x1004,
-                slot_definition: 0x1008,
+                slot_definition: SlotDefinition {
+                    root: 0x1008,
+                    definitions: vec![0x1008],
+                },
                 normal_exit: 0x1020,
                 capacity_exit: 0x101c,
                 capacity_guard: CapacityGuard {
@@ -2420,7 +2494,10 @@ mod tests {
                 }],
                 loop_start: at["load"],
                 count_zero_definition: at["zero"],
-                slot_definition: at["slotlo"],
+                slot_definition: SlotDefinition {
+                    root: at["slotlo"],
+                    definitions: vec![at["slotlo"], at["slothi"]],
+                },
                 normal_exit: at["term"],
                 capacity_exit: at["cap"],
                 capacity_guard: CapacityGuard {
@@ -2463,7 +2540,13 @@ mod tests {
         assert_eq!(candidate.evidence.cfg_entry, BASE);
         assert_eq!(candidate.evidence.loop_start, at["load"]);
         assert_eq!(candidate.evidence.count_zero_definition, at["zero"]);
-        assert_eq!(candidate.evidence.slot_definition, at["slotlo"]);
+        assert_eq!(
+            candidate.evidence.slot_definition,
+            SlotDefinition {
+                root: at["slotlo"],
+                definitions: vec![at["slotlo"], at["slothi"], at["scopy"]],
+            }
+        );
         assert_eq!(candidate.evidence.slot_base, 0x4800);
         assert_eq!(candidate.evidence.name_offset, 0x24);
         assert_eq!(candidate.evidence.index_offset, 4);
@@ -2475,13 +2558,20 @@ mod tests {
         assert_eq!(candidate.evidence.join, at["join"]);
         assert_eq!(candidate.evidence.count_global, at["globals"]);
 
-        // Leaf-accessor slot base: `bl leaf; mov r4, r0`.
+        // Leaf-accessor slot base: `bl leaf; mov r4, r0`. The complete
+        // call/move chain flows into the plan's slot definition.
         let (bytes, at) = assemble(BASE, &leaf_slot_items());
         let candidates = discover_initializer_candidates(&raw_image(&bytes), "fixture").unwrap();
         let [candidate] = candidates.as_slice() else {
             panic!("expected exactly one candidate, got {candidates:#?}")
         };
-        assert_eq!(candidate.evidence.slot_definition, at["call"]);
+        assert_eq!(
+            candidate.evidence.slot_definition,
+            SlotDefinition {
+                root: at["call"],
+                definitions: vec![at["call"], at["move"]],
+            }
+        );
         assert_eq!(candidate.evidence.slot_base, 0x1234);
         assert_eq!(candidate.geometry.slot_base, 0x1234);
     }

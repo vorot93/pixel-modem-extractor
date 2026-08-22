@@ -132,20 +132,20 @@ struct WindowsObjectProof {
 
 #[cfg(unix)]
 #[derive(Debug)]
-struct TrustedDirectory {
+pub(crate) struct TrustedDirectory {
     // Descendant traversal is always relative to this retained capability.
     file: File,
 }
 
 #[cfg(unix)]
 impl TrustedDirectory {
-    fn new(path: &Path, context: &str) -> Result<Self> {
+    pub(crate) fn new(path: &Path, context: &str) -> Result<Self> {
         let canonical = fs::canonicalize(path)
             .map_err(|error| bad(format!("{context} cannot be canonicalized: {error}")))?;
         open_unix_absolute_directory(&canonical, context)
     }
 
-    fn open_regular_file_with_parent(
+    pub(crate) fn open_regular_file_with_parent(
         &self,
         relative: &Path,
         context: &str,
@@ -362,13 +362,13 @@ fn open_windows_component(
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct TrustedDirectory {
+pub(crate) struct TrustedDirectory {
     directory: WindowsDirectoryHandle,
 }
 
 #[cfg(windows)]
 impl TrustedDirectory {
-    fn new(path: &Path, context: &str) -> Result<Self> {
+    pub(crate) fn new(path: &Path, context: &str) -> Result<Self> {
         let canonical = fs::canonicalize(path)
             .map_err(|error| bad(format!("{context} cannot be canonicalized: {error}")))?;
         let (namespace_root, components) =
@@ -383,7 +383,7 @@ impl TrustedDirectory {
         Ok(Self { directory })
     }
 
-    fn open_regular_file_with_parent(
+    pub(crate) fn open_regular_file_with_parent(
         &self,
         relative: &Path,
         context: &str,
@@ -763,13 +763,13 @@ struct TrustedDirectory;
 
 #[cfg(not(any(unix, windows)))]
 impl TrustedDirectory {
-    fn new(_path: &Path, context: &str) -> Result<Self> {
+    pub(crate) fn new(_path: &Path, context: &str) -> Result<Self> {
         Err(bad(format!(
             "{context} trusted-directory validation is unsupported on this platform"
         )))
     }
 
-    fn open_regular_file_with_parent(
+    pub(crate) fn open_regular_file_with_parent(
         &self,
         _relative: &Path,
         context: &str,
