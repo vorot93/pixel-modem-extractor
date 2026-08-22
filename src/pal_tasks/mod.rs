@@ -5,7 +5,9 @@
 // proofs live in `cfg`. The counting-loop, dual-exit, suffix, and
 // slot-base proofs assemble the initializer candidates defined here;
 // `table` validates their slots and allocates deterministic
-// applications, and `discover` returns the final plan boundary.
+// applications, `discover` returns the final plan boundary, and
+// `artifact` publishes and strictly revalidates the canonical
+// authenticated manifest of one complete plan.
 
 use crate::arm32::Register;
 use crate::error::Error;
@@ -13,9 +15,18 @@ use crate::runtime_image::{RuntimeImage, StorageSpan};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+mod artifact;
 mod cfg;
 mod discover;
 mod table;
+
+// The Task 8+ Ghidra and generation consumers import this surface; until
+// they land only the artifact tests exercise it.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use artifact::{
+    FORMAT, MaterializedTaskMap, TaskArtifactContext, ValidatedTaskArtifact, clear_materialized,
+    materialize, read,
+};
 
 /// Discover every anchor-reference candidate: one entry per semantic
 /// reference that survives unique-prologue root selection and bounded
