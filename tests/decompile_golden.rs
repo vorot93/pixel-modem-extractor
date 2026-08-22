@@ -2273,3 +2273,706 @@ fn run_report_skips_opaque_image_without_spawning_ghidra() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Shared PAL support (Task 8): non-proprietary fixture + real-Ghidra probe
+// ---------------------------------------------------------------------------
+
+#[path = "support/pal_fixture.rs"]
+mod pal_fixture;
+
+/// Drives `PalTasksSupport` inside real Ghidra against the canonical
+/// fixture kit and malformed variants: digest vectors, strict parsing,
+/// path containment, raw/scatter byte tampering, storage/task/application
+/// partition rejections, the v2 symbol-map reader, and the applied-state
+/// registry lifecycle (absence, application, identity-only, corruptions).
+const PAL_SUPPORT_PROBE_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolTable;
+import ghidra.program.model.util.StringPropertyMap;
+
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class PalSupportProbe extends GhidraScript {
+    private interface IoAction {
+        void run() throws Exception;
+    }
+
+    private int passed = 0;
+
+    private void ok(String what) {
+        println("PalSupportProbe ok " + what);
+        passed++;
+    }
+
+    private void expectFail(String what, String expected, IoAction action) {
+        try {
+            action.run();
+        }
+        catch (Exception failure) {
+            String message = String.valueOf(failure.getMessage());
+            if (!message.contains(expected)) {
+                throw new AssertionError(what + ": wrong rejection, expected ["
+                        + expected + "] in: " + message);
+            }
+            ok(what + " [" + expected + "]");
+            return;
+        }
+        throw new AssertionError(what + ": unexpectedly accepted");
+    }
+
+    private static String readTrimmed(File file) throws Exception {
+        return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8).trim();
+    }
+
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 4) {
+            throw new AssertionError("expected exactly four probe arguments");
+        }
+        File kitRoot = new File(args[0]);
+        String label = args[1];
+        File caseRoot = new File(args[2]);
+        int caseCount = Integer.parseInt(args[3]);
+
+        digestVectors();
+        sanitizeVectors();
+
+        File palFile = new File(kitRoot, "pal_tasks/" + label + "/tasks.json");
+        File scatterFile = new File(kitRoot, "scatter/" + label + "/load_map.json");
+        File rawFile = new File(kitRoot, "images/" + label);
+
+        PalTasksSupport.PalManifest manifest =
+                PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile);
+        if (manifest.taskRecords != 2 || manifest.distinctEntries != 0
+                || manifest.applications.size() != 2) {
+            throw new AssertionError("canonical manifest shape is wrong");
+        }
+        String identity = PalTasksSupport.expectedPalIdentity(manifest);
+        if (!identity.startsWith("v1:") || !identity.endsWith(":2:0")) {
+            throw new AssertionError("identity grammar is wrong: " + identity);
+        }
+        ok("readPal canonical");
+
+        for (int index = 0; index < caseCount; index++) {
+            File dir = new File(caseRoot, "case" + index);
+            final File casePal = new File(readTrimmed(new File(dir, "pal_path.txt")));
+            String scatterMode = readTrimmed(new File(dir, "scatter_mode.txt"));
+            final File caseScatter = "none".equals(scatterMode) ? null : scatterFile;
+            String expected = readTrimmed(new File(dir, "expected.txt"));
+            expectFail("case" + index, expected,
+                    () -> PalTasksSupport.readPal(kitRoot, label, casePal, caseScatter));
+        }
+
+        tamperByte(rawFile, () -> expectFail("changed raw bytes", "image BLAKE3",
+                () -> PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile)));
+        tamperByte(scatterFile, () -> expectFail("changed scatter bytes", "scatter",
+                () -> PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile)));
+        PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile);
+        ok("restored canonical still reads");
+
+        symbolMapChecks(caseRoot, identity);
+        appliedStateChecks(manifest, identity);
+
+        println("PalSupportProbe: all " + passed + " checks passed");
+    }
+
+    private void digestVectors() throws Exception {
+        byte[] empty = new byte[0];
+        // The four Rust golden digest vectors, byte for byte.
+        if (!PalTasksSupport.blake3Hex(empty, new byte[] {1, 2, 3, 4})
+                .equals("63781d171425a36312fa058d8712d5d05135a991ec20351ce9d65cdb19a05432")) {
+            throw new AssertionError("plain BLAKE3 vector mismatch");
+        }
+        PalTasksSupport.ExecutionRangeWire range = new PalTasksSupport.ExecutionRangeWire(
+                "thumb", 0x4001_0400L, 0x4001_0404L,
+                "63781d171425a36312fa058d8712d5d05135a991ec20351ce9d65cdb19a05432");
+        if (!PalTasksSupport.executionDigestHex(0x4001_0400L, Arrays.asList(range))
+                .equals("1383ca88fa4bb8d58aedbac50f7e298be9dd15ad8553eb565ac14848cfd771dd")) {
+            throw new AssertionError("execution digest vector mismatch");
+        }
+        List<PalTasksSupport.LabelEntry> labels = new ArrayList<>();
+        labels.add(new PalTasksSupport.LabelEntry(3L, "pal_TaskEntry_beta"));
+        labels.add(new PalTasksSupport.LabelEntry(7L, "pal_TaskEntry_alpha"));
+        if (!PalTasksSupport.labelsDigestHex(labels)
+                .equals("77747c233b288a5f01b755c5307f19f190fc342952891c39f5bd813923a27052")) {
+            throw new AssertionError("label-set digest vector mismatch");
+        }
+        if (!PalTasksSupport.primaryDigestHex("pal_TaskEntry_alpha")
+                .equals("8538942936387e769666d449ac837a35a0c7bbeac557c8e2467bc7b75bf0edba")) {
+            throw new AssertionError("primary-name digest vector mismatch");
+        }
+        String manifestHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        String section = "[[pixel-modem-extractor:pal-tasks:v1]]\nmanifest=" + manifestHex
+                + " tasks=1\n"
+                + "task index=0 name=\"alpha\" slot=0x40010800 priority=30 stack=4096\n"
+                + "[[/pixel-modem-extractor:pal-tasks:v1]]";
+        if (!PalTasksSupport.commentDigestHex(section)
+                .equals("dcf724f43e1550d495b847e96e2ce17d00eb4674fb988a908f2e956142550c2b")) {
+            throw new AssertionError("owned-comment digest vector mismatch");
+        }
+        String surrounded = "kept user text\n" + section + "\nkept suffix";
+        if (!PalTasksSupport.findOwnedSection(surrounded).equals(section)) {
+            throw new AssertionError("owned-comment extraction mismatch");
+        }
+        expectFail("duplicate owned markers", "owned comment",
+                () -> PalTasksSupport.findOwnedSection(section + "\n" + section));
+        expectFail("unterminated owned marker", "owned comment",
+                () -> PalTasksSupport.findOwnedSection("prefix\n" + section.substring(0, 40)));
+        ok("four golden digest vectors");
+    }
+
+    private void sanitizeVectors() throws Exception {
+        String[][] vectors = {
+            {"alpha_9", "alpha_9"},
+            {"a--b", "a_b"},
+            {"a.b c", "a_b_c"},
+            {"!lead", "_lead"},
+            {"9lives", "_9lives"},
+            {"!!", "_"},
+            {"\u00e9x", "_x"},
+        };
+        for (String[] vector : vectors) {
+            if (!vector[1].equals(PalTasksSupport.sanitizeTaskName(vector[0]))) {
+                throw new AssertionError("sanitize mismatch for " + vector[0]);
+            }
+        }
+        if (PalTasksSupport.sanitizeTaskName("") != null) {
+            throw new AssertionError("empty name must sanitize to null");
+        }
+        ok("sanitization rule matches Rust");
+    }
+
+    private void symbolMapChecks(File caseRoot, String palIdentity) throws Exception {
+        File functionsFile = new File(caseRoot, "functions.json");
+        File mapFile = new File(caseRoot, "symbol_map.json");
+        File badMapFile = new File(caseRoot, "symbol_map_bad.json");
+        byte[] empty = new byte[0];
+        String functionsHash = PalTasksSupport.blake3Hex(empty,
+                Files.readAllBytes(functionsFile.toPath()));
+        String mapHash = PalTasksSupport.blake3Hex(empty, Files.readAllBytes(mapFile.toPath()));
+        String badMapHash = PalTasksSupport.blake3Hex(empty,
+                Files.readAllBytes(badMapFile.toPath()));
+
+        PalTasksSupport.SymbolMap map =
+                PalTasksSupport.readSymbolMap(functionsFile, functionsHash, mapFile, mapHash);
+        if (!palIdentity.equals(map.palIdentity) || map.executions.size() != 2
+                || map.decisions.size() != 2 || !map.functionsBlake3.equals(functionsHash)) {
+            throw new AssertionError("symbol map shape is wrong");
+        }
+        // Cross-language vector: the parsed execution digest must equal the
+        // digest recomputed through the Java framing.
+        PalTasksSupport.MapExecution execution = map.executions.get(0);
+        if (!execution.executionBlake3.equals(
+                PalTasksSupport.executionDigestHex(execution.entry, execution.decodeRanges))) {
+            throw new AssertionError("execution digest cross-check failed");
+        }
+        ok("readSymbolMap canonical");
+
+        expectFail("wrong functions hash", "functions.json BLAKE3",
+                () -> PalTasksSupport.readSymbolMap(functionsFile,
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                        mapFile, mapHash));
+        expectFail("wrong map hash", "symbol map BLAKE3",
+                () -> PalTasksSupport.readSymbolMap(functionsFile, functionsHash, mapFile,
+                        "0000000000000000000000000000000000000000000000000000000000000000"));
+        expectFail("unknown map key", "expected key",
+                () -> PalTasksSupport.readSymbolMap(functionsFile, functionsHash, badMapFile,
+                        badMapHash));
+    }
+
+    private void appliedStateChecks(PalTasksSupport.PalManifest manifest, String identity)
+            throws Exception {
+        SymbolTable symbols = currentProgram.getSymbolTable();
+        FunctionManager functions = currentProgram.getFunctionManager();
+
+        PalTasksSupport.validateAbsent(currentProgram);
+        ok("validateAbsent pristine program");
+
+        StringPropertyMap registry = buildAppliedState(manifest, identity);
+
+        PalTasksSupport.AppliedState state =
+                PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        if (state.applications != 2 || state.createdFunctions != 2
+                || state.preexistingFunctions != 0 || state.palOwnedPrimaries != 2
+                || state.preservedPrimaries != 0 || state.pass2OwnedPrimaries != 0
+                || state.reservedLabels != 2) {
+            throw new AssertionError("applied state counts are wrong: " + state.applications
+                    + " applications, " + state.createdFunctions + " created");
+        }
+        ok("validateApplied canonical");
+
+        PalTasksSupport.validateAppliedIdentity(currentProgram, identity);
+        ok("validateAppliedIdentity canonical");
+
+        expectFail("validateAbsent with applied state", "PAL property",
+                () -> PalTasksSupport.validateAbsent(currentProgram));
+
+        // (a) A registered reserved label is deleted: digest and enumeration fail.
+        Address entryA = toAddr(manifest.applications.get(0).entry);
+        Symbol labelA = symbols.getSymbol(
+                manifest.applications.get(0).labels.get(0).label, entryA,
+                reservedNamespace());
+        if (labelA == null) {
+            throw new AssertionError("probe lost the reserved label");
+        }
+        int tx = currentProgram.startTransaction("probe-corrupt-a");
+        try {
+            labelA.delete();
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        expectFail("deleted reserved label", "label",
+                () -> PalTasksSupport.validateAppliedIdentity(currentProgram, identity));
+        tx = currentProgram.startTransaction("probe-restore-a");
+        try {
+            symbols.createLabel(entryA, manifest.applications.get(0).labels.get(0).label,
+                    reservedNamespace(), SourceType.ANALYSIS);
+            refreshRegistryLabels(entryA);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        ok("label corruption restored");
+
+        // (b) The primary name drifts without a registry update.
+        Function functionA = functions.getFunctionAt(entryA);
+        tx = currentProgram.startTransaction("probe-corrupt-b");
+        try {
+            functionA.setName("probe_drifted_name", SourceType.USER_DEFINED);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        expectFail("renamed primary without registry update", "primary",
+                () -> PalTasksSupport.validateAppliedIdentity(currentProgram, identity));
+        tx = currentProgram.startTransaction("probe-restore-b");
+        try {
+            functionA.setName(manifest.applications.get(0).desiredPrimary, SourceType.ANALYSIS);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        ok("primary corruption restored");
+
+        // (c) An unregistered reserved label appears at another address.
+        Address stranger = toAddr(0x4001_0480L);
+        tx = currentProgram.startTransaction("probe-corrupt-c");
+        try {
+            symbols.createLabel(stranger, "pal_TaskEntry_stranger", reservedNamespace(),
+                    SourceType.ANALYSIS);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        expectFail("unregistered reserved label", "unregistered",
+                () -> PalTasksSupport.validateAppliedIdentity(currentProgram, identity));
+        for (Symbol strangerSymbol : symbols.getSymbols(stranger)) {
+            strangerSymbol.delete();
+        }
+        PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        ok("orphan label corruption restored");
+
+        // (d) The owned comment section is edited in place.
+        String original = functionA.getRepeatableComment();
+        tx = currentProgram.startTransaction("probe-corrupt-d");
+        try {
+            functionA.setRepeatableComment(original.replace("priority=100", "priority=101"));
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        expectFail("tampered owned comment", "owned comment",
+                () -> PalTasksSupport.validateAppliedIdentity(currentProgram, identity));
+        tx = currentProgram.startTransaction("probe-restore-d");
+        try {
+            functionA.setRepeatableComment(original);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        ok("comment corruption restored");
+
+        // (e) A stale foreign program property is rejected, not overwritten.
+        tx = currentProgram.startTransaction("probe-corrupt-e");
+        try {
+            currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO).setString(PalTasksSupport.PAL_PROPERTY,
+                    "v1:0000000000000000000000000000000000000000000000000000000000000000:9:9");
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        expectFail("stale program property", "stale PAL property",
+                () -> PalTasksSupport.validateApplied(currentProgram, manifest, identity));
+        tx = currentProgram.startTransaction("probe-restore-e");
+        try {
+            currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO).setString(PalTasksSupport.PAL_PROPERTY, identity);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        PalTasksSupport.validateAppliedIdentity(currentProgram, identity);
+        ok("stale property corruption restored");
+
+        // (f) An orphan registry entry names an address without a function.
+        tx = currentProgram.startTransaction("probe-corrupt-f");
+        try {
+            registry.add(stranger, registry.get(entryA));
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        expectFail("orphan registry entry", "registry",
+                () -> PalTasksSupport.validateAppliedIdentity(currentProgram, identity));
+        tx = currentProgram.startTransaction("probe-restore-f");
+        try {
+            registry.remove(stranger);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        ok("registry corruption restored");
+    }
+
+    // Re-binds the registry's label digest to the current namespace symbols:
+    // a deleted-and-recreated label carries a new symbol ID, and a legitimate
+    // restoration must re-publish the registry exactly like a reapplication.
+    private void refreshRegistryLabels(Address entry) throws Exception {
+        ghidra.program.model.util.PropertyMapManager manager =
+                currentProgram.getUsrPropertyManager();
+        StringPropertyMap registry = manager.getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        PalTasksSupport.RegistryEntry previous =
+                PalTasksSupport.parseRegistry(registry.getString(entry));
+        List<PalTasksSupport.LabelEntry> current = new ArrayList<>();
+        ghidra.program.model.symbol.SymbolIterator iterator =
+                currentProgram.getSymbolTable().getSymbols(reservedNamespace());
+        while (iterator.hasNext()) {
+            Symbol symbol = iterator.next();
+            if (symbol.getAddress().equals(entry)) {
+                current.add(new PalTasksSupport.LabelEntry(symbol.getID(), symbol.getName()));
+            }
+        }
+        registry.add(entry, PalTasksSupport.registryValue(new PalTasksSupport.RegistryEntry(
+                previous.manifestBlake3, previous.isa, previous.functionId,
+                previous.functionDisposition, previous.commentBlake3,
+                previous.primaryDisposition, previous.primarySymbolId, previous.primarySource,
+                previous.primaryNameBlake3, current.size(),
+                PalTasksSupport.labelsDigestHex(current))));
+    }
+
+    private Namespace reservedNamespace() throws Exception {
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+        if (namespace == null) {
+            throw new AssertionError("reserved namespace is missing");
+        }
+        return namespace;
+    }
+
+    private StringPropertyMap buildAppliedState(PalTasksSupport.PalManifest manifest,
+            String identity) throws Exception {
+        SymbolTable symbols = currentProgram.getSymbolTable();
+        StringPropertyMap registry;
+        try {
+            registry = currentProgram.getUsrPropertyManager()
+                    .createStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        }
+        catch (Exception duplicate) {
+            throw new AssertionError("probe expected a fresh ownership map", duplicate);
+        }
+        int tx = currentProgram.startTransaction("probe-apply");
+        try {
+            Namespace namespace = symbols.createNameSpace(currentProgram.getGlobalNamespace(),
+                    PalTasksSupport.RESERVED_NAMESPACE, SourceType.ANALYSIS);
+            for (PalTasksSupport.PalApplication application : manifest.applications) {
+                Address entry = toAddr(application.entry);
+                disassemble(entry);
+                Function function = createFunction(entry, null);
+                if (function == null) {
+                    throw new AssertionError("probe could not create the function at " + entry);
+                }
+                function.setName(application.desiredPrimary, SourceType.ANALYSIS);
+                List<PalTasksSupport.PalTask> attached = new ArrayList<>();
+                for (long index : application.taskIndices) {
+                    attached.add(manifest.tasks.get((int) index));
+                }
+                List<PalTasksSupport.LabelEntry> created = new ArrayList<>();
+                for (PalTasksSupport.PalLabel label : application.labels) {
+                    Symbol symbol = symbols.createLabel(entry, label.label, namespace,
+                            SourceType.ANALYSIS);
+                    created.add(new PalTasksSupport.LabelEntry(symbol.getID(), label.label));
+                }
+                String comment = PalTasksSupport.ownedCommentSection(manifest.manifestBlake3,
+                        attached);
+                function.setRepeatableComment(comment);
+                Symbol primary = function.getSymbol();
+                registry.add(entry, PalTasksSupport.registryValue(new PalTasksSupport.RegistryEntry(
+                        manifest.manifestBlake3, application.isa, primary.getID(), "created",
+                        PalTasksSupport.commentDigestHex(comment), "pal_owned", primary.getID(),
+                        PalTasksSupport.primarySource(primary.getSource()),
+                        PalTasksSupport.primaryDigestHex(primary.getName()), created.size(),
+                        PalTasksSupport.labelsDigestHex(created))));
+            }
+            currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO).setString(PalTasksSupport.PAL_PROPERTY, identity);
+        }
+        finally {
+            currentProgram.endTransaction(tx, true);
+        }
+        return registry;
+    }
+
+    private void tamperByte(File file, IoAction action) throws Exception {
+        byte[] original = Files.readAllBytes(file.toPath());
+        byte[] mutated = original.clone();
+        mutated[mutated.length - 1] ^= 0x5a;
+        Files.write(file.toPath(), mutated);
+        try {
+            action.run();
+        }
+        finally {
+            Files.write(file.toPath(), original);
+        }
+    }
+}
+"#;
+
+fn replace_once(text: &str, from: &str, to: &str) -> String {
+    let count = text.matches(from).count();
+    assert_eq!(count, 1, "mutation source {from:?} matched {count} times");
+    text.replacen(from, to, 1)
+}
+
+#[test]
+fn pal_support_strict_parsers_registry_and_digests() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+
+    let dir = std::env::temp_dir().join(format!("pme_pal_support_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, pal_fixture::craft_pal_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.clone()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        },
+        &out,
+    )
+    .unwrap();
+
+    let scatter_path = out.join("scatter/02_MAIN/load_map.json");
+    assert!(
+        scatter_path.exists(),
+        "kit must materialize the scatter load map"
+    );
+    let scatter_hash = pal_fixture::blake3_hex(&std::fs::read(&scatter_path).unwrap());
+
+    let image = pal_fixture::craft_main_image();
+    let manifest = pal_fixture::canonical_manifest(&image, &scatter_hash);
+    let manifest_dir = out.join("pal_tasks/02_MAIN");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::write(manifest_dir.join("tasks.json"), &manifest).unwrap();
+    let identity = pal_fixture::identity(&manifest);
+    let manifest_blake3 = &identity[3..67];
+
+    // Malformed variants: each case directory carries the manifest path to
+    // parse, the scatter mode, and the required failure substring.
+    let overlap_slot_storage = replace_once(
+        &manifest,
+        "\"slot_storage\": [\n        {\n          \"kind\": \"raw\",\n          \"address\": \"0x40010100\",\n          \"size\": 64\n        }\n      ]",
+        "\"slot_storage\": [\n        {\n          \"kind\": \"raw\",\n          \"address\": \"0x40010100\",\n          \"size\": 64\n        },\n        {\n          \"kind\": \"raw\",\n          \"address\": \"0x40010120\",\n          \"size\": 64\n        }\n      ]",
+    );
+    let cases: Vec<(String, &str)> = vec![
+        (
+            replace_once(
+                &manifest,
+                "\"schema_version\": 1,",
+                "\"schema_version\": 1,\n  \"unexpected\": true,",
+            ),
+            "expected key",
+        ),
+        (
+            replace_once(&manifest, "\"capacity\": 8", "\"capacity\": 8.0"),
+            "canonical unsigned decimal",
+        ),
+        (
+            replace_once(
+                &manifest,
+                "\"kind\": \"raw\",\n          \"address\": \"0x40010500\",",
+                "\"kind\": \"scatter_bytes\",\n          \"address\": \"0x40010500\",",
+            ),
+            "scatter_entry",
+        ),
+        (
+            replace_once(
+                &manifest,
+                "\"scatter_entries_used\": []",
+                "\"scatter_entries_used\": [0]",
+            ),
+            "scatter_entries_used",
+        ),
+        (overlap_slot_storage, "sorted or overlap"),
+        (
+            replace_once(
+                &manifest,
+                "\"labels\": [\n        {\n          \"label\": \"pal_TaskEntry_beta\",\n          \"task_indices\": [\n            1\n          ]\n        }\n      ]",
+                "\"labels\": []",
+            ),
+            "partition",
+        ),
+        (
+            replace_once(&manifest, "\"count\": 2", "\"count\": 3"),
+            "task count",
+        ),
+    ];
+    let case_root = out.join("pal_malformed");
+    let outside_root = dir.join("pal_outside");
+    let probe_case_count = cases.len() + 1;
+    for (index, (bytes, expected)) in cases.iter().enumerate() {
+        let case_dir = case_root.join(format!("case{index}"));
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let path = case_dir.join("tasks.json");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(
+            case_dir.join("pal_path.txt"),
+            std::fs::canonicalize(&path).unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(case_dir.join("scatter_mode.txt"), "canonical").unwrap();
+        std::fs::write(case_dir.join("expected.txt"), expected).unwrap();
+    }
+    {
+        let index = cases.len();
+        let case_dir = case_root.join(format!("case{index}"));
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let outside_dir = outside_root.join("tasks");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let path = outside_dir.join("tasks.json");
+        std::fs::write(&path, &manifest).unwrap();
+        std::fs::write(
+            case_dir.join("pal_path.txt"),
+            std::fs::canonicalize(&path).unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(case_dir.join("scatter_mode.txt"), "canonical").unwrap();
+        std::fs::write(case_dir.join("expected.txt"), "escapes the import-kit root").unwrap();
+    }
+
+    // The strict v2 symbol-map fixtures.
+    let functions_bytes = b"[{\"name\": \"FUN_40010400\"}]\n".as_slice();
+    let functions_hash = pal_fixture::blake3_hex(functions_bytes);
+    std::fs::write(case_root.join("functions.json"), functions_bytes).unwrap();
+    let symbol_map = pal_fixture::canonical_symbol_map(
+        &image,
+        &identity,
+        manifest_blake3,
+        &scatter_hash,
+        &functions_hash,
+    );
+    std::fs::write(case_root.join("symbol_map.json"), &symbol_map).unwrap();
+    let bad_symbol_map = replace_once(
+        &symbol_map,
+        "\"format\": \"pixel-modem-extractor-symbol-map-v2\",",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v2\",\n  \"unexpected\": true,",
+    );
+    std::fs::write(case_root.join("symbol_map_bad.json"), &bad_symbol_map).unwrap();
+
+    std::fs::write(
+        out.join("scripts/PalSupportProbe.java"),
+        PAL_SUPPORT_PROBE_JAVA,
+    )
+    .unwrap();
+
+    let config = out.join("ghidra_config");
+    let cache = out.join("ghidra_cache");
+    let temp = out.join("ghidra_tmp");
+    std::fs::create_dir_all(out.join("ghidra_project")).unwrap();
+    for directory in [&config, &cache, &temp] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let kit_root = std::fs::canonicalize(&out).unwrap();
+    let case_root_canonical = std::fs::canonicalize(&case_root).unwrap();
+    let java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        config.display(),
+        cache.display(),
+        temp.display(),
+        temp.display()
+    );
+    let output = std::process::Command::new(
+        analyze_headless_in_home(&home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .arg("-import")
+    .arg(out.join("images/02_MAIN"))
+    .arg("-processor")
+    .arg("ARM:LE:32:v7")
+    .arg("-loader")
+    .arg("BinaryLoader")
+    .arg("-loader-baseAddr")
+    .arg("40010000")
+    .arg("-noanalysis")
+    .arg("-scriptPath")
+    .arg(out.join("scripts"))
+    .arg("-postScript")
+    .arg("PalSupportProbe.java")
+    .arg(&kit_root)
+    .arg("02_MAIN")
+    .arg(&case_root_canonical)
+    .arg(probe_case_count.to_string())
+    .arg("-overwrite")
+    .env("XDG_CONFIG_HOME", &config)
+    .env("XDG_CACHE_HOME", &cache)
+    .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+    .output()
+    .unwrap();
+    let diagnostics = process_diagnostics(&output);
+    assert!(
+        output.status.success(),
+        "PalSupportProbe run failed:\n{diagnostics}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PalSupportProbe: all "),
+        "probe did not summarize:\n{diagnostics}"
+    );
+    let passed: usize = stdout
+        .lines()
+        .filter(|line| line.contains("PalSupportProbe ok "))
+        .count();
+    assert_eq!(
+        passed, 36,
+        "expected the full probe battery, got {passed}:\n{diagnostics}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

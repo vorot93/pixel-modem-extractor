@@ -29,6 +29,7 @@ const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
 const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
+const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 #[cfg(test)]
@@ -1378,16 +1379,20 @@ fn run_report_impl(
 
     let runtime_load_maps = materialize_runtime_load_maps(&toc, &data, out)?;
 
-    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
+    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,PalTasksSupport,TameAnalysis,
+    //    ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplySymbols,
-    //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application.)
+    //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
+    //    PalTasksSupport is the package-private strict PAL support class every
+    //    PAL-aware script shares - no script may grow a second parser.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(
         scripts.join("ApplyScatterLoad.java"),
         APPLY_SCATTER_LOAD_JAVA,
     )?;
+    std::fs::write(scripts.join("PalTasksSupport.java"), PAL_TASKS_SUPPORT_JAVA)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
@@ -5778,6 +5783,114 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             sh.contains("GHIDRA_HEADLESS_JAVA_OPTIONS=\"$GHIDRA_HEADLESS_JAVA_OPTIONS $GHIDRA_LOCAL_JAVA_OPTIONS\""),
             "run_ghidra.sh must preserve caller-provided headless Java options:\n{sh}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_kit_stages_pal_support() {
+        // The Rust-side Ghidra leaf limit and the Java-side runtime
+        // assertion must pin the same 2000-character ceiling.
+        assert_eq!(crate::pal_tasks::MAX_SYMBOL_LEAF_BYTES, 2000);
+
+        let buf = craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &[0u8; 8])]);
+        let dir = std::env::temp_dir().join(format!("pme_pal_support_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem = dir.join("modem.bin");
+        std::fs::write(&modem, &buf).unwrap();
+        let out = dir.join("out");
+        let opts = Opts {
+            run: false,
+            image: None,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".into(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        };
+        run(&modem, &opts, &out).unwrap();
+
+        let staged_path = out.join("scripts").join("PalTasksSupport.java");
+        let staged = std::fs::read(&staged_path).unwrap_or_default();
+        assert_eq!(
+            staged,
+            PAL_TASKS_SUPPORT_JAVA.as_bytes(),
+            "generated kits must stage the exact PalTasksSupport source"
+        );
+
+        // Source contract: the support class owns the one copy of every
+        // PAL parser/digest/registry constant. Each literal below must
+        // appear in PalTasksSupport.java (and pin the Java-side
+        // SymbolUtilities.MAX_SYMBOL_NAME_LENGTH == 2000 assertion), and
+        // must not be redefined by any other staged script.
+        let source = PAL_TASKS_SUPPORT_JAVA;
+        for owned in [
+            "pixel-modem-extractor-pal-tasks-v1",
+            "pixel-modem-extractor-symbol-map-v2",
+            "PixelModemExtractor_PalTasks_v1",
+            "PixelModemExtractor.PalTasks.v1.Ownership",
+            "PixelModemExtractor.PalTasks\"",
+            "PixelModemExtractor.SymbolPass2",
+            "pixel-modem-extractor-execution-v1",
+            "pixel-modem-extractor-pal-labels-v1",
+            "pixel-modem-extractor-pal-primary-v1",
+            "pixel-modem-extractor-pal-comment-v1",
+            "MAX_SYMBOL_NAME_LENGTH != 2000",
+        ] {
+            assert!(
+                source.contains(owned),
+                "PalTasksSupport.java must own the constant {owned:?}"
+            );
+        }
+
+        let mut staged_scripts = std::fs::read_dir(out.join("scripts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "java")
+            })
+            .collect::<Vec<_>>();
+        staged_scripts.sort();
+        assert_eq!(
+            staged_scripts
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>(),
+            vec![
+                out.join("scripts/ApplyGlobalTypes.java").to_string_lossy(),
+                out.join("scripts/ApplyGlobals.java").to_string_lossy(),
+                out.join("scripts/ApplyScatterLoad.java").to_string_lossy(),
+                out.join("scripts/ApplySymbols.java").to_string_lossy(),
+                out.join("scripts/ExportDecomp.java").to_string_lossy(),
+                out.join("scripts/PalTasksSupport.java").to_string_lossy(),
+                out.join("scripts/TameAnalysis.java").to_string_lossy(),
+            ]
+        );
+        for path in &staged_scripts {
+            if path
+                .file_name()
+                .is_some_and(|name| name == "PalTasksSupport.java")
+            {
+                continue;
+            }
+            let other = std::fs::read_to_string(path).unwrap();
+            for owned in [
+                "PixelModemExtractor_PalTasks_v1",
+                "PixelModemExtractor.PalTasks.v1.Ownership",
+                "pixel-modem-extractor-pal-labels-v1",
+                "pixel-modem-extractor-pal-primary-v1",
+                "pixel-modem-extractor-pal-comment-v1",
+            ] {
+                assert!(
+                    !other.contains(owned),
+                    "{} redefines the PAL constant {owned:?} owned by PalTasksSupport",
+                    path.display()
+                );
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
