@@ -1,5 +1,9 @@
 use super::{LoadPlan, Operation, PlannedEntry, PlannedOutput, PlannedStorage};
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
+#[cfg(windows)]
+use cap_std::fs::{Dir as CapDirectory, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 #[cfg(unix)]
@@ -26,7 +30,8 @@ use std::sync::Mutex;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-    GetFileInformationByHandle, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    VOLUME_NAME_DOS,
 };
 
 pub const LOAD_MAP_FORMAT: &str = "pixel-modem-extractor-scatter-load-v1";
@@ -102,11 +107,18 @@ enum ArtifactBacking {
     Zero,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     volume: u64,
     file: u64,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsObjectProof {
+    resolved_path: PathBuf,
+    identity: FileIdentity,
 }
 
 #[cfg(unix)]
@@ -170,15 +182,13 @@ impl TrustedDirectory {
 #[cfg(windows)]
 #[derive(Debug)]
 struct WindowsDirectoryHandle {
-    file: File,
-    resolved_path: PathBuf,
-    identity: FileIdentity,
+    directory: CapDirectory,
+    proof: WindowsObjectProof,
 }
 
 #[cfg(windows)]
 impl WindowsDirectoryHandle {
-    fn open(path: &Path, context: &str) -> Result<Self> {
-        let file = open_windows_directory(path, context)?;
+    fn from_namespace_root(file: File, expected_path: &Path, context: &str) -> Result<Self> {
         let metadata = file
             .metadata()
             .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
@@ -187,63 +197,94 @@ impl WindowsDirectoryHandle {
         }
         let information = windows_file_information(&file, context)?;
         require_windows_directory(&information, context)?;
-        let resolved_path = windows_resolved_path(&file, context)?;
-        let identity = windows_file_identity(&information, context)?;
-        let directory = Self {
-            file,
-            resolved_path,
-            identity,
-        };
-        directory.verify_current(context)?;
-        Ok(directory)
+        let proof = windows_object_proof(&file, &information, context)?;
+        validate_windows_root_binding(expected_path, &proof, context)?;
+        Ok(Self {
+            directory: CapDirectory::from_std_file(file),
+            proof,
+        })
     }
 
     fn try_clone(&self, context: &str) -> Result<Self> {
         Ok(Self {
-            file: self.file.try_clone().map_err(|error| {
+            directory: self.directory.try_clone().map_err(|error| {
                 bad(format!(
                     "{context} directory handle cannot be retained: {error}"
                 ))
             })?,
-            resolved_path: self.resolved_path.clone(),
-            identity: self.identity,
+            proof: self.proof.clone(),
         })
     }
 
-    fn verify_current(&self, context: &str) -> Result<()> {
-        let information = windows_file_information(&self.file, context)?;
-        require_windows_directory(&information, context)?;
-        if windows_file_identity(&information, context)? != self.identity
-            || windows_resolved_path(&self.file, context)? != self.resolved_path
-        {
-            return Err(bad(format!("{context} directory identity changed")));
-        }
-
-        let reopened = open_windows_directory(&self.resolved_path, context)?;
-        let metadata = reopened
+    fn open_directory(&self, name: &std::ffi::OsStr, context: &str) -> Result<Self> {
+        let mut options = CapOpenOptions::new();
+        options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .maybe_dir(true);
+        let file = self
+            .directory
+            .open_with(Path::new(name), &options)
+            .map_err(|error| {
+                bad(format!(
+                    "{context} directory component cannot be opened relative to its retained parent: {error}"
+                ))
+            })?
+            .into_std();
+        let metadata = file
             .metadata()
             .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
         if !metadata.is_dir() {
             return Err(bad(format!("{context} is not a directory")));
         }
-        let information = windows_file_information(&reopened, context)?;
+        let information = windows_file_information(&file, context)?;
         require_windows_directory(&information, context)?;
-        if windows_file_identity(&information, context)? != self.identity
-            || windows_resolved_path(&reopened, context)? != self.resolved_path
-        {
-            return Err(bad(format!(
-                "{context} directory name no longer identifies its handle"
-            )));
-        }
-        Ok(())
+        let proof = windows_object_proof(&file, &information, context)?;
+        let expected_path = self.proof.resolved_path.join(name);
+        validate_windows_child_binding(
+            &self.proof,
+            &expected_path,
+            self.proof.identity,
+            &proof,
+            context,
+        )?;
+        Ok(Self {
+            directory: CapDirectory::from_std_file(file),
+            proof,
+        })
+    }
+
+    fn open_regular_file(&self, name: &std::ffi::OsStr, context: &str) -> Result<File> {
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = self
+            .directory
+            .open_with(Path::new(name), &options)
+            .map_err(|error| {
+                bad(format!(
+                    "{context} cannot be opened relative to its retained parent: {error}"
+                ))
+            })?
+            .into_std();
+        let information = windows_file_information(&file, context)?;
+        require_windows_regular_file(&file, &information, context)?;
+        let proof = windows_object_proof(&file, &information, context)?;
+        let expected_path = self.proof.resolved_path.join(name);
+        validate_windows_child_binding(
+            &self.proof,
+            &expected_path,
+            self.proof.identity,
+            &proof,
+            context,
+        )?;
+        Ok(file)
     }
 }
 
 #[cfg(windows)]
 #[derive(Debug)]
 struct TrustedDirectory {
-    // Windows has no openat equivalent in std, so retain and re-prove the full chain.
-    chain: Vec<WindowsDirectoryHandle>,
+    directory: WindowsDirectoryHandle,
 }
 
 #[cfg(windows)]
@@ -251,11 +292,16 @@ impl TrustedDirectory {
     fn new(path: &Path, context: &str) -> Result<Self> {
         let canonical = fs::canonicalize(path)
             .map_err(|error| bad(format!("{context} cannot be canonicalized: {error}")))?;
-        let directory = Self {
-            chain: vec![WindowsDirectoryHandle::open(&canonical, context)?],
-        };
-        directory.verify_chain(context)?;
-        Ok(directory)
+        let (namespace_root, components) =
+            windows_namespace_root_and_components(&canonical, context)?;
+        let file = open_windows_namespace_root(&namespace_root, context)?;
+        let mut directory =
+            WindowsDirectoryHandle::from_namespace_root(file, &namespace_root, context)?;
+        for component in components {
+            directory = directory.open_directory(&component, context)?;
+        }
+        validate_windows_root_binding(&canonical, &directory.proof, context)?;
+        Ok(Self { directory })
     }
 
     fn open_regular_file_with_parent(
@@ -270,18 +316,7 @@ impl TrustedDirectory {
             .ok_or_else(|| bad(format!("{context} path has no file name")))?;
         let parent =
             self.open_directory(relative.parent().unwrap_or_else(|| Path::new("")), context)?;
-        parent.verify_chain(context)?;
-        let parent_path = &parent.current().resolved_path;
-        let candidate = parent_path.join(file_name);
-        let file = open_windows_regular_file(&candidate, context)?;
-        let information = windows_file_information(&file, context)?;
-        require_windows_regular_file(&file, &information, context)?;
-        let identity = windows_file_identity(&information, context)?;
-        let resolved_path = windows_resolved_path(&file, context)?;
-        require_windows_direct_child(parent_path, &resolved_path, context)?;
-        parent.verify_chain(context)?;
-        verify_windows_regular_file(&file, identity, &resolved_path, context)?;
-        parent.verify_chain(context)?;
+        let file = parent.directory.open_regular_file(file_name, context)?;
         Ok((file, parent))
     }
 
@@ -291,52 +326,16 @@ impl TrustedDirectory {
     }
 
     fn open_directory(&self, relative: &Path, context: &str) -> Result<Self> {
-        let mut directory = self.try_clone(context)?;
+        let mut directory = self.directory.try_clone(context)?;
         for component in relative.components() {
             let std::path::Component::Normal(name) = component else {
                 return Err(bad(format!(
                     "{context} path is not canonical relative form"
                 )));
             };
-            directory.verify_chain(context)?;
-            let parent_path = directory.current().resolved_path.clone();
-            let child = WindowsDirectoryHandle::open(&parent_path.join(name), context)?;
-            require_windows_direct_child(&parent_path, &child.resolved_path, context)?;
-            directory.verify_chain(context)?;
-            directory.chain.push(child);
+            directory = directory.open_directory(name, context)?;
         }
-        directory.verify_chain(context)?;
-        Ok(directory)
-    }
-
-    fn try_clone(&self, context: &str) -> Result<Self> {
-        let mut chain = Vec::new();
-        chain
-            .try_reserve_exact(self.chain.len())
-            .map_err(|_| bad(format!("{context} directory proof allocation failed")))?;
-        for directory in &self.chain {
-            chain.push(directory.try_clone(context)?);
-        }
-        Ok(Self { chain })
-    }
-
-    fn current(&self) -> &WindowsDirectoryHandle {
-        self.chain
-            .last()
-            .expect("a trusted Windows directory always retains its root")
-    }
-
-    fn verify_chain(&self, context: &str) -> Result<()> {
-        for directory in &self.chain {
-            directory.verify_current(context)?;
-        }
-        for adjacent in self.chain.windows(2) {
-            let [parent, child] = adjacent else {
-                continue;
-            };
-            require_windows_direct_child(&parent.resolved_path, &child.resolved_path, context)?;
-        }
-        Ok(())
+        Ok(Self { directory })
     }
 }
 
@@ -359,6 +358,51 @@ fn validate_relative_path(path: &Path, context: &str) -> Result<()> {
     {
         return Err(bad(format!(
             "{context} path is not canonical relative form"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_windows_root_binding(
+    expected_path: &Path,
+    opened: &WindowsObjectProof,
+    context: &str,
+) -> Result<()> {
+    if opened.identity.file == 0 {
+        return Err(bad(format!("{context} identity is unavailable")));
+    }
+    if opened.resolved_path != expected_path {
+        return Err(bad(format!(
+            "{context} resolved handle does not match the requested canonical path"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_windows_child_binding(
+    retained_parent: &WindowsObjectProof,
+    expected_path: &Path,
+    opened_from: FileIdentity,
+    opened: &WindowsObjectProof,
+    context: &str,
+) -> Result<()> {
+    if opened_from != retained_parent.identity {
+        return Err(bad(format!(
+            "{context} was not opened from the retained parent"
+        )));
+    }
+    if expected_path.parent() != Some(retained_parent.resolved_path.as_path())
+        || opened.resolved_path != expected_path
+    {
+        return Err(bad(format!(
+            "{context} resolved handle is not the expected direct child"
+        )));
+    }
+    if opened.identity.file == 0 || opened.identity.volume != retained_parent.identity.volume {
+        return Err(bad(format!(
+            "{context} identity is unavailable or outside the parent volume"
         )));
     }
     Ok(())
@@ -393,6 +437,65 @@ fn windows_file_identity(
         volume: u64::from(information.dwVolumeSerialNumber),
         file,
     })
+}
+
+#[cfg(windows)]
+fn windows_object_proof(
+    file: &File,
+    information: &BY_HANDLE_FILE_INFORMATION,
+    context: &str,
+) -> Result<WindowsObjectProof> {
+    Ok(WindowsObjectProof {
+        resolved_path: windows_resolved_path(file, context)?,
+        identity: windows_file_identity(information, context)?,
+    })
+}
+
+#[cfg(windows)]
+fn windows_namespace_root_and_components(
+    canonical: &Path,
+    context: &str,
+) -> Result<(PathBuf, Vec<OsString>)> {
+    let mut components = canonical.components();
+    let prefix = match components.next() {
+        Some(std::path::Component::Prefix(prefix)) => prefix,
+        _ => {
+            return Err(bad(format!(
+                "{context} canonical path has no Windows prefix"
+            )));
+        }
+    };
+    if !matches!(
+        prefix.kind(),
+        std::path::Prefix::Disk(_)
+            | std::path::Prefix::UNC(_, _)
+            | std::path::Prefix::VerbatimDisk(_)
+            | std::path::Prefix::VerbatimUNC(_, _)
+    ) {
+        return Err(bad(format!(
+            "{context} canonical path has an unsupported Windows prefix"
+        )));
+    }
+    let root = match components.next() {
+        Some(component @ std::path::Component::RootDir) => component,
+        _ => {
+            return Err(bad(format!(
+                "{context} canonical path has no namespace root"
+            )));
+        }
+    };
+    let mut namespace_root = PathBuf::from(prefix.as_os_str());
+    namespace_root.push(root.as_os_str());
+    let mut relative = Vec::new();
+    for component in components {
+        let std::path::Component::Normal(name) = component else {
+            return Err(bad(format!(
+                "{context} canonical path has an ambiguous component"
+            )));
+        };
+        relative.push(name.to_os_string());
+    }
+    Ok((namespace_root, relative))
 }
 
 #[cfg(unix)]
@@ -486,27 +589,15 @@ fn open_unix_component(
 }
 
 #[cfg(windows)]
-fn open_windows_directory(path: &Path, context: &str) -> Result<File> {
+fn open_windows_namespace_root(path: &Path, context: &str) -> Result<File> {
     OpenOptions::new()
         .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|error| {
             bad(format!(
-                "{context} directory component cannot be opened without following reparse points: {error}"
-            ))
-        })
-}
-
-#[cfg(windows)]
-fn open_windows_regular_file(path: &Path, context: &str) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| {
-            bad(format!(
-                "{context} cannot be opened without following reparse points: {error}"
+                "{context} Windows namespace root cannot be opened without rename sharing or reparse traversal: {error}"
             ))
         })
 }
@@ -585,44 +676,6 @@ fn require_windows_regular_file(
         .metadata()
         .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
     require_regular_file(&metadata, context)
-}
-
-#[cfg(windows)]
-fn require_windows_direct_child(parent: &Path, child: &Path, context: &str) -> Result<()> {
-    if child == parent || child.parent() != Some(parent) {
-        return Err(bad(format!(
-            "{context} resolved path escapes its trusted directory"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_windows_regular_file(
-    file: &File,
-    identity: FileIdentity,
-    resolved_path: &Path,
-    context: &str,
-) -> Result<()> {
-    let information = windows_file_information(file, context)?;
-    require_windows_regular_file(file, &information, context)?;
-    if windows_file_identity(&information, context)? != identity
-        || windows_resolved_path(file, context)? != resolved_path
-    {
-        return Err(bad(format!("{context} identity changed after open")));
-    }
-
-    let reopened = open_windows_regular_file(resolved_path, context)?;
-    let information = windows_file_information(&reopened, context)?;
-    require_windows_regular_file(&reopened, &information, context)?;
-    if windows_file_identity(&information, context)? != identity
-        || windows_resolved_path(&reopened, context)? != resolved_path
-    {
-        return Err(bad(format!(
-            "{context} resolved path no longer identifies its retained handle"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2469,6 +2522,74 @@ mod tests {
             trusted.open_regular_file(Path::new("payload.bin"), "test payload"),
             "is a symlink",
         );
+    }
+
+    #[test]
+    fn windows_root_binding_rejects_redirected_handle_proof() {
+        let opened = super::WindowsObjectProof {
+            resolved_path: PathBuf::from("/outside/root"),
+            identity: super::FileIdentity { volume: 7, file: 9 },
+        };
+
+        assert_bad_reader(
+            super::validate_windows_root_binding(Path::new("/trusted/root"), &opened, "test root"),
+            "does not match the requested canonical path",
+        );
+    }
+
+    #[test]
+    fn windows_child_binding_rejects_replaced_parent_authority() {
+        let retained_parent = super::WindowsObjectProof {
+            resolved_path: PathBuf::from("/trusted/root"),
+            identity: super::FileIdentity { volume: 7, file: 9 },
+        };
+        let opened = super::WindowsObjectProof {
+            resolved_path: PathBuf::from("/trusted/root/child"),
+            identity: super::FileIdentity {
+                volume: 7,
+                file: 10,
+            },
+        };
+
+        assert_bad_reader(
+            super::validate_windows_child_binding(
+                &retained_parent,
+                Path::new("/trusted/root/child"),
+                super::FileIdentity {
+                    volume: 7,
+                    file: 99,
+                },
+                &opened,
+                "test child",
+            ),
+            "was not opened from the retained parent",
+        );
+    }
+
+    #[test]
+    fn windows_binding_accepts_exact_handle_bound_proofs() {
+        let root = super::WindowsObjectProof {
+            resolved_path: PathBuf::from("/trusted/root"),
+            identity: super::FileIdentity { volume: 7, file: 9 },
+        };
+        let child = super::WindowsObjectProof {
+            resolved_path: PathBuf::from("/trusted/root/child"),
+            identity: super::FileIdentity {
+                volume: 7,
+                file: 10,
+            },
+        };
+
+        super::validate_windows_root_binding(Path::new("/trusted/root"), &root, "test root")
+            .unwrap();
+        super::validate_windows_child_binding(
+            &root,
+            Path::new("/trusted/root/child"),
+            root.identity,
+            &child,
+            "test child",
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]

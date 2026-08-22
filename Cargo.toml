@@ -39,6 +39,9 @@ typed-path = "0.12.3"
 libc = "0.2.188"
 
 [target."cfg(windows)".dependencies]
+# Handle-relative no-follow traversal for authenticated scatter artifacts.
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 # Cancel blocking version-probe reads and identify retained artifact handles.
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
