@@ -16,6 +16,7 @@
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::disasm_index::DisasmIndex;
 use crate::error::{Error, Result};
+use crate::execution_ranges::{ExecutionIdentity, FunctionOwner};
 use crate::recover_source::Tool;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -25,6 +26,14 @@ pub mod name_guess;
 pub mod reg_table;
 
 pub const GUESS_PREFIX: &str = "guess_";
+
+#[cfg(test)]
+static TEST_IMAGE: [u8; 0x10_000] = [0; 0x10_000];
+
+#[cfg(test)]
+fn test_runtime() -> crate::runtime_image::RuntimeImage<'static> {
+    crate::runtime_image::RuntimeImage::from_plan(&TEST_IMAGE, 0, None).unwrap()
+}
 
 pub struct Opts {
     pub token_db: Option<PathBuf>,
@@ -68,6 +77,10 @@ pub struct Symbol {
     /// the same entry, so `(tool, address)` — not the address alone — is what
     /// identifies the record a symbol belongs to.
     pub tool: Tool,
+    #[serde(skip)]
+    pub(crate) owner: FunctionOwner,
+    #[serde(skip)]
+    pub(crate) execution_blake3: Option<[u8; 32]>,
     pub original_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -101,9 +114,18 @@ pub struct FuncRec<'a> {
     /// `thumb_functions.json`.
     pub disasm: std::borrow::Cow<'a, str>,
     /// Which recovery tool produced this function record. ARM/`functions.json`
-    /// is Ghidra; each Thumb record retains its artifact run owner. Used to look up
-    /// source attribution keyed by `(tool, entry)`.
+    /// is Ghidra; each Thumb record retains its artifact run owner. The concrete
+    /// owner and execution digest below form the source-attribution key.
     pub tool: Tool,
+    pub(crate) owner: FunctionOwner,
+    pub(crate) execution_blake3: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct FunctionEvidenceKey {
+    owner: FunctionOwner,
+    entry: u64,
+    execution_blake3: Option<[u8; 32]>,
 }
 
 /// 32-bit constants materialized by `movw`/`movt` (and lone `movw`) in a block
@@ -434,6 +456,24 @@ fn parse_hex(s: &str) -> Result<u64> {
     u64::from_str_radix(t, 16).map_err(|e| Error::Serialize(format!("bad hex {s}: {e}")))
 }
 
+fn parse_execution_blake3(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Serialize(
+            "execution_blake3 must be 64 lowercase hexadecimal characters".into(),
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| Error::Serialize("execution_blake3 contains invalid hex".into()))?;
+    }
+    Ok(digest)
+}
+
 #[derive(Deserialize)]
 struct ArmFnJson {
     name: String,
@@ -445,59 +485,88 @@ struct ArmFnJson {
     data_refs: Vec<String>,
 }
 
-fn load_functions<'a>(decompiled: &Path, index: &DisasmIndex<'a>) -> Result<Vec<FuncRec<'a>>> {
+fn load_functions<'a>(
+    decompiled: &Path,
+    index: &DisasmIndex<'a>,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("functions.json");
     let bytes = std::fs::read(&path)?;
-    let raw: Vec<ArmFnJson> =
+    let raw: Vec<serde_json::Value> =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
+    let inventory =
+        crate::execution_ranges::validate_ghidra_inventory_records(&raw, raw.len(), runtime)?;
     let mut out = Vec::with_capacity(raw.len());
-    for f in raw {
+    for (value, tagged) in raw.into_iter().zip(inventory.records) {
+        let f: ArmFnJson =
+            serde_json::from_value(value).map_err(|e| Error::Serialize(e.to_string()))?;
         let entry = parse_hex(&f.entry)?;
         let end = parse_hex(&f.end)?;
+        let execution =
+            crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)?;
         let data_refs = f
             .data_refs
             .iter()
             .map(|r| parse_hex(r))
             .collect::<Result<Vec<_>>>()?;
+        let disasm = match &execution {
+            Some(execution) if execution.decode_ranges.len() == 1 => {
+                let range = execution.decode_ranges[0];
+                index.slice_cow(u64::from(range.start), u64::from(range.end))
+            }
+            Some(execution) => {
+                let mut text = String::new();
+                for range in &execution.decode_ranges {
+                    text.push_str(&index.slice_cow(u64::from(range.start), u64::from(range.end)));
+                }
+                std::borrow::Cow::Owned(text)
+            }
+            None => std::borrow::Cow::Borrowed(""),
+        };
         out.push(FuncRec {
             arch: "arm",
             name: f.original_name.unwrap_or(f.name),
             entry,
             end,
             data_refs,
-            disasm: index.slice_cow(entry, end),
+            disasm,
             tool: Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: execution.map(|execution| execution.execution_blake3),
         });
     }
     Ok(out)
 }
 
-/// The mapped-image context for Thumb artifact validation, when the raw image
-/// and its load address are both available. `None` leaves the artifact checked
-/// without image context, exactly as when the image is missing.
-fn mapped_thumb_image(
-    image_and_load: Option<&(Vec<u8>, u64)>,
-) -> Result<Option<crate::thumb_analysis::MappedImage>> {
-    let Some((image, load_addr)) = image_and_load else {
-        return Ok(None);
-    };
-    let (Ok(start), Ok(len)) = (u32::try_from(*load_addr), u32::try_from(image.len())) else {
+fn thumb_runtime<'a>(
+    image_dir: &Path,
+    image: &'a [u8],
+    load_addr: u64,
+) -> Result<crate::runtime_image::RuntimeImage<'a>> {
+    let Ok(start) = u32::try_from(load_addr) else {
         return Err(Error::Serialize(
             "symbolicate: raw image mapping does not fit the canonical u32 domain".into(),
         ));
     };
-    crate::thumb_analysis::MappedImage::new(start, len).map(Some)
+    let root = std::fs::canonicalize(image_dir)?;
+    let map = root.join("scatter/load_map.json");
+    crate::runtime_image::RuntimeImage::from_artifact(
+        image,
+        start,
+        &root,
+        map.try_exists()?.then_some(map.as_path()),
+    )
 }
 
 fn load_thumb_functions<'a>(
     decompiled: &Path,
-    image: Option<crate::thumb_analysis::MappedImage>,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
 ) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("thumb_functions.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let functions = crate::thumb_analysis::read_thumb_functions_streaming(&path, image)?;
+    let functions = crate::thumb_analysis::read_thumb_functions_streaming(&path, runtime)?;
     let mut out = Vec::with_capacity(functions.len());
     for owned in functions {
         let f = owned.function;
@@ -519,7 +588,12 @@ fn load_thumb_functions<'a>(
             end,
             data_refs,
             disasm: std::borrow::Cow::Owned(f.body),
-            tool: owned.producer.into(),
+            tool: owned.owner.analysis_tool(),
+            owner: owned.owner,
+            execution_blake3: owned
+                .execution
+                .as_ref()
+                .map(|execution| execution.execution_blake3),
         });
     }
     Ok(out)
@@ -575,14 +649,20 @@ struct RiSource {
 #[derive(Deserialize)]
 struct RiFn {
     tool: Tool,
+    #[serde(default)]
+    region_index: Option<usize>,
+    #[serde(default)]
+    run_index: Option<usize>,
+    #[serde(default)]
+    execution_blake3: Option<String>,
     entry: String,
 }
 
-/// `(tool, entry-vaddr) -> attributed source path` from `recovered_index.json`.
-/// Distinct tools may claim the same entry; the same tool naming two paths is
-/// a hard failure. Returned as a `BTreeMap` (not `HashMap`) so repeated loads
-/// and conflict path order are deterministic under Debug / iteration.
-fn load_attribution(source_tree: &Path) -> Result<BTreeMap<(Tool, u64), String>> {
+/// `(owner, entry-vaddr, execution digest) -> attributed source path` from
+/// `recovered_index.json`. Distinct executions may claim the same entry; one
+/// exact identity naming two paths is a hard failure. Returned as a `BTreeMap`
+/// (not `HashMap`) so repeated loads and conflict path order are deterministic.
+fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, String>> {
     let path = source_tree.join("recovered_index.json");
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -596,9 +676,38 @@ fn load_attribution(source_tree: &Path) -> Result<BTreeMap<(Tool, u64), String>>
     for (src, s) in sources {
         for f in s.functions {
             let entry = parse_hex(&f.entry)?;
-            let key = (f.tool, entry);
+            let owner = match (f.tool, f.region_index, f.run_index) {
+                (Tool::Ghidra, None, None) => FunctionOwner::Ghidra,
+                (Tool::Ghidra, _, _) => {
+                    return Err(Error::Serialize(
+                        "Ghidra source attribution cannot have Thumb run coordinates".into(),
+                    ));
+                }
+                (producer, None, None) => FunctionOwner::Legacy { producer },
+                (producer, Some(region_index), Some(run_index)) => FunctionOwner::Run {
+                    producer,
+                    region_index,
+                    run_index,
+                },
+                (_, _, _) => {
+                    return Err(Error::Serialize(
+                        "source attribution run coordinates must be both present or both absent"
+                            .into(),
+                    ));
+                }
+            };
+            let execution_blake3 = f
+                .execution_blake3
+                .as_deref()
+                .map(parse_execution_blake3)
+                .transpose()?;
+            let key = FunctionEvidenceKey {
+                owner,
+                entry,
+                execution_blake3,
+            };
             match m.get(&key) {
-                Some(prev) if prev == &src => {} // same (tool, entry) + same path: idempotent
+                Some(prev) if prev == &src => {} // same identity + same path: idempotent
                 Some(prev) => {
                     let tool = match f.tool {
                         Tool::Ghidra => "ghidra",
@@ -790,25 +899,41 @@ fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
 }
 
 /// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
-/// and `thumb_functions.json` (matched by entry address), preserving all other
-/// fields. Both files are rewritten element-by-element through the shared
+/// and `thumb_functions.json`, matched by concrete owner, entry, and execution
+/// digest. Both files are rewritten element-by-element through the shared
 /// streaming rewriters (`thumb_analysis::stream_rewrite_json_array` /
-/// `stream_rewrite_thumb_functions`) — no whole-document `Value` tree, and
-/// unknown fields survive by construction because each element stays a
-/// `Value`. The retired whole-file implementation is kept test-only as
+/// `stream_rewrite_thumb_functions`) with no whole-document mutation tree. The
+/// retired whole-file implementation is kept test-only as
 /// `rewrite_functions_json_whole`, the differential oracle.
 /// `pub(crate)` so `decompose`'s route tests can drive the real finalize
 /// rewriter when modeling the symbol-route input-rewrite sequence.
-pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
-    // (producer, entry vaddr) -> symbol. Numeric, so "0x10" and "0x00000010"
-    // match; producer-keyed, so same-entry records from different analyzers
-    // each receive their own symbol instead of whichever one wins.
-    let by_owner: HashMap<(Tool, u64), &Symbol> = symbols
+pub(crate) fn rewrite_functions_json(
+    decompiled: &Path,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
+    // Numeric address spelling does not matter, while concrete ownership and
+    // authenticated execution remain identity-bearing.
+    let by_owner: HashMap<FunctionEvidenceKey, &Symbol> = symbols
         .iter()
-        .filter_map(|s| parse_hex(&s.address).ok().map(|a| ((s.tool, a), s)))
+        .filter_map(|symbol| {
+            parse_hex(&symbol.address).ok().map(|entry| {
+                (
+                    FunctionEvidenceKey {
+                        owner: symbol.owner,
+                        entry,
+                        execution_blake3: symbol.execution_blake3,
+                    },
+                    symbol,
+                )
+            })
+        })
         .collect();
 
-    let stamp = |tool: Tool, item: &mut serde_json::Value| -> Result<()> {
+    let stamp = |owner: FunctionOwner,
+                 execution: Option<&ExecutionIdentity>,
+                 item: &mut serde_json::Value|
+     -> Result<()> {
         let Some(addr) = item
             .get("entry")
             .and_then(|v| v.as_str())
@@ -816,7 +941,12 @@ pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> R
         else {
             return Ok(());
         };
-        let Some(sym) = by_owner.get(&(tool, addr)) else {
+        let key = FunctionEvidenceKey {
+            owner,
+            entry: addr,
+            execution_blake3: execution.map(|execution| execution.execution_blake3),
+        };
+        let Some(sym) = by_owner.get(&key) else {
             return Ok(());
         };
         let Some(obj) = item.as_object_mut() else {
@@ -852,16 +982,45 @@ pub(crate) fn rewrite_functions_json(decompiled: &Path, symbols: &[Symbol]) -> R
     // functions.json (a bare array) is always Ghidra's inventory.
     let fpath = decompiled.join("functions.json");
     if fpath.exists() {
-        crate::thumb_analysis::stream_rewrite_json_array(&fpath, |item| stamp(Tool::Ghidra, item))?;
+        let source = std::fs::read(&fpath)?;
+        let records: Vec<serde_json::Value> = serde_json::from_slice(&source)
+            .map_err(|error| Error::Serialize(format!("parse {}: {error}", fpath.display())))?;
+        let validated = crate::execution_ranges::validate_ghidra_inventory_records(
+            &records,
+            records.len(),
+            runtime,
+        )?;
+        let executions = validated
+            .records
+            .iter()
+            .map(|record| {
+                crate::execution_ranges::execution_identity(record.entry, &record.projection)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut function_index = 0usize;
+        crate::thumb_analysis::stream_rewrite_json_array(&fpath, &source, |item| {
+            let execution = executions.get(function_index).ok_or_else(|| {
+                Error::Serialize("Ghidra function count changed during mutation".into())
+            })?;
+            function_index += 1;
+            stamp(FunctionOwner::Ghidra, execution.as_ref(), item)
+        })?;
+        if function_index != executions.len() {
+            return Err(Error::Serialize(
+                "Ghidra function count changed during mutation".into(),
+            ));
+        }
     }
 
     // thumb_functions.json ({ "functions": [...] }); the mutator resolves each
     // record's validated run owner.
     let tpath = decompiled.join("thumb_functions.json");
     if tpath.exists() {
-        crate::thumb_analysis::stream_rewrite_thumb_functions(&tpath, |producer, item| {
-            stamp(producer.into(), item)
-        })?;
+        crate::thumb_analysis::stream_rewrite_thumb_functions(
+            &tpath,
+            runtime,
+            |owner, execution, item| stamp(owner, execution, item),
+        )?;
     }
     Ok(())
 }
@@ -930,7 +1089,7 @@ fn rewrite_functions_json_whole(decompiled: &Path, symbols: &[Symbol]) -> Result
     // thumb_functions.json ({ "functions": [...] })
     let tpath = decompiled.join("thumb_functions.json");
     if tpath.exists() {
-        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&tpath, None)?;
+        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&tpath, &test_runtime())?;
         apply(artifact.function_values_mut());
         artifact.write_atomic(&tpath)?;
     }
@@ -942,7 +1101,11 @@ fn rewrite_functions_json_whole(decompiled: &Path, symbols: &[Symbol]) -> Result
 /// (when present) using the same rename map — symmetric with `decompiled.c`
 /// since `body_c` is sourced from it. Gated at the call site by
 /// `FinalizeOpts::rewrite_decompiled_c`.
-fn rewrite_text_files(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
+fn rewrite_text_files(
+    decompiled: &Path,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
     for name in ["decompiled.c", "disasm.lst"] {
         let p = decompiled.join(name);
         if p.exists() {
@@ -950,7 +1113,7 @@ fn rewrite_text_files(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
             std::fs::write(&p, rewrite_text(&text, symbols))?;
         }
     }
-    rewrite_body_c_in_thumb_functions(decompiled, symbols)?;
+    rewrite_body_c_in_thumb_functions(decompiled, runtime, symbols)?;
     Ok(())
 }
 
@@ -968,13 +1131,17 @@ fn rewrite_text_files(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
 /// rewrite_decompiled_c` is `false` on that path, skipping this rewrite. Live
 /// on the standalone `symbolicate` subcommand and on `decompose
 /// --no-symbol-pass` (where `rewrite_decompiled_c` is `true`).
-fn rewrite_body_c_in_thumb_functions(decompiled: &Path, symbols: &[Symbol]) -> Result<()> {
+fn rewrite_body_c_in_thumb_functions(
+    decompiled: &Path,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
     let path = decompiled.join("thumb_functions.json");
     if !path.exists() {
         return Ok(());
     }
     let renames = build_rename_map(symbols);
-    crate::thumb_analysis::stream_rewrite_thumb_functions(&path, |_, func| {
+    crate::thumb_analysis::stream_rewrite_thumb_functions(&path, runtime, |_, _, func| {
         let Some(obj) = func.as_object_mut() else {
             return Ok(());
         };
@@ -997,7 +1164,7 @@ fn rewrite_body_c_in_thumb_functions_whole(decompiled: &Path, symbols: &[Symbol]
     if !path.exists() {
         return Ok(());
     }
-    let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path, None)?;
+    let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path, &test_runtime())?;
     let renames = build_rename_map(symbols);
     for function in artifact.function_values_mut() {
         let Some(obj) = function.as_object_mut() else {
@@ -1097,11 +1264,19 @@ pub(crate) fn build_map(
         }
     };
 
-    let mut funcs = load_functions(&decompiled, &index)?;
-    funcs.extend(load_thumb_functions(
-        &decompiled,
-        mapped_thumb_image(image_and_load.as_ref())?,
-    )?);
+    let runtime = image_and_load
+        .as_ref()
+        .map(|(image, load_addr)| thumb_runtime(image_dir, image, *load_addr))
+        .transpose()?
+        .ok_or_else(|| {
+            Error::Serialize(
+                "symbolicate: function inventory requires its raw image and load address".into(),
+            )
+        })?;
+    let mut funcs = load_functions(&decompiled, &index, &runtime)?;
+    if decompiled.join("thumb_functions.json").exists() {
+        funcs.extend(load_thumb_functions(&decompiled, &runtime)?);
+    }
 
     let string_map = match &image_and_load {
         Some((img, load_addr)) => build_string_map(img, *load_addr, 3),
@@ -1181,7 +1356,13 @@ pub(crate) fn build_map(
         hits.sort_by_key(|(t, _)| *t);
 
         let func_name = recovered_names[i].clone();
-        let file = attribution.get(&(f.tool, f.entry)).cloned();
+        let file = attribution
+            .get(&FunctionEvidenceKey {
+                owner: f.owner,
+                entry: f.entry,
+                execution_blake3: f.execution_blake3,
+            })
+            .cloned();
         let fstrings = file
             .as_ref()
             .and_then(|p| file_strings.get(p))
@@ -1223,6 +1404,8 @@ pub(crate) fn build_map(
             address: format!("0x{addr_hex}"),
             arch: f.arch,
             tool: f.tool,
+            owner: f.owner,
+            execution_blake3: f.execution_blake3,
             original_name: f.name.clone(),
             name,
             tier,
@@ -1241,6 +1424,7 @@ pub(crate) fn build_map(
 fn finalize_image(
     image_dir: &Path,
     image_label: &str,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
     symbols: &[Symbol],
     opts: &FinalizeOpts,
 ) -> Result<PathBuf> {
@@ -1253,9 +1437,9 @@ fn finalize_image(
         );
     }
 
-    rewrite_functions_json(&decompiled, symbols)?;
+    rewrite_functions_json(&decompiled, runtime, symbols)?;
     if opts.rewrite_decompiled_c {
-        rewrite_text_files(&decompiled, symbols)?;
+        rewrite_text_files(&decompiled, runtime, symbols)?;
     }
     write_symbols_json(&decompiled, image_label, symbols, inputs)
 }
@@ -1271,9 +1455,14 @@ fn symbolicate_image(
     manifest: &Path,
 ) -> Result<PathBuf> {
     let symbols = build_map(image_dir, image_label, tokens, manifest)?;
+    let image = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
+    let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
+        .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
+    let runtime = thumb_runtime(image_dir, &image, load_addr)?;
     finalize_image(
         image_dir,
         image_label,
+        &runtime,
         &symbols,
         &FinalizeOpts {
             rewrite_decompiled_c: true,
@@ -1306,9 +1495,14 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
             continue;
         }
         let symbols = build_map(&dir, &label, &tokens, &manifest)?;
+        let image = std::fs::read(dir.join(format!("{label}.bin")))?;
+        let load_addr = crate::manifest::load_addr_for_image(&manifest, &label)?
+            .ok_or_else(|| Error::Serialize(format!("load_addr missing for {label}")))?;
+        let runtime = thumb_runtime(&dir, &image, load_addr)?;
         let out = finalize_image(
             &dir,
             &label,
+            &runtime,
             &symbols,
             &FinalizeOpts {
                 rewrite_decompiled_c: opts.rewrite_decompiled_c,
@@ -1324,6 +1518,48 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ghidra_function(name: &str, entry: u32, end: u32, data_refs: &[u32]) -> serde_json::Value {
+        ghidra_function_in_image(name, entry, end, data_refs, &TEST_IMAGE, 0)
+    }
+
+    fn ghidra_function_in_image(
+        name: &str,
+        entry: u32,
+        end: u32,
+        data_refs: &[u32],
+        image: &[u8],
+        load_addr: u32,
+    ) -> serde_json::Value {
+        let start = (entry - load_addr) as usize;
+        let finish = (end - load_addr) as usize;
+        serde_json::json!({
+            "name": name,
+            "primary_source": "default",
+            "entry": format!("0x{entry:x}"),
+            "end": format!("0x{end:x}"),
+            "size": u64::from(end - entry),
+            "decode_ranges": [{
+                "isa": "arm",
+                "start": format!("0x{entry:x}"),
+                "end": format!("0x{end:x}"),
+                "blake3": blake3::hash(&image[start..finish]).to_hex().to_string(),
+            }],
+            "decode_range_errors": [],
+            "data_refs": data_refs.iter().map(|address| format!("0x{address:x}")).collect::<Vec<_>>(),
+        })
+    }
+
+    fn write_test_ghidra_function(dir: &Path, name: &str, entry: u32, end: u32) -> [u8; 32] {
+        std::fs::write(
+            dir.join("functions.json"),
+            serde_json::to_vec(&vec![ghidra_function(name, entry, end, &[])]).unwrap(),
+        )
+        .unwrap();
+        load_functions(dir, &DisasmIndex::new(""), &test_runtime()).unwrap()[0]
+            .execution_blake3
+            .unwrap()
+    }
 
     #[test]
     fn tier_serializes_snake_case() {
@@ -1662,6 +1898,8 @@ mod tests {
                 address: "0xaa".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_aa".into(),
                 name: Some("dup".into()),
                 tier: Tier::Recovered,
@@ -1672,6 +1910,8 @@ mod tests {
                 address: "0xbb".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_bb".into(),
                 name: Some("dup".into()),
                 tier: Tier::Recovered,
@@ -1726,15 +1966,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("functions.json"),
-            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":["0x200"]}]"#,
+            serde_json::to_vec(&vec![ghidra_function("FUN_10", 0x10, 0x18, &[0x200])]).unwrap(),
         )
         .unwrap();
         let disasm = "0x10: 41f2 movw r0, 0x1\n0x14: c0f2 movt r0, 0x2\n0x20: other\n";
         let index = DisasmIndex::new(disasm);
-        let fns = load_functions(&dir, &index).unwrap();
+        let fns = load_functions(&dir, &index, &test_runtime()).unwrap();
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].arch, "arm");
         assert_eq!(fns[0].entry, 0x10);
+        assert!(fns[0].execution_blake3.is_some());
         assert_eq!(fns[0].data_refs, vec![0x200]);
         assert!(fns[0].disasm.contains("movw") && fns[0].disasm.contains("movt"));
         assert!(!fns[0].disasm.contains("0x20: other")); // out of [entry,end)
@@ -1745,13 +1986,16 @@ mod tests {
         let dir = tmp("pme_sym_orig");
         std::fs::create_dir_all(&dir).unwrap();
         // functions.json as left by a prior symbolicate run: `name` renamed, `original_name` kept
+        let mut function = ghidra_function("guess_x_10", 0x10, 0x18, &[]);
+        function["original_name"] = serde_json::json!("FUN_10");
+        function["annotations"] = serde_json::json!([]);
         std::fs::write(
             dir.join("functions.json"),
-            r#"[{"name":"guess_x_10","original_name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![function]).unwrap(),
         )
         .unwrap();
         let index = DisasmIndex::new("");
-        let fns = load_functions(&dir, &index).unwrap();
+        let fns = load_functions(&dir, &index, &test_runtime()).unwrap();
         assert_eq!(fns[0].name, "FUN_10"); // true original recovered, not the renamed value
     }
 
@@ -1771,8 +2015,12 @@ mod tests {
         assert_eq!(strs["A/x.c"], vec!["reest".to_string()]);
         let attr = load_attribution(&dir).unwrap();
         assert_eq!(
-            attr.get(&(crate::recover_source::Tool::Ghidra, 0x10))
-                .map(String::as_str),
+            attr.get(&FunctionEvidenceKey {
+                owner: FunctionOwner::Ghidra,
+                entry: 0x10,
+                execution_blake3: None,
+            })
+            .map(String::as_str),
             Some("A/x.c")
         );
     }
@@ -1791,13 +2039,23 @@ mod tests {
         .unwrap();
         let attr = load_attribution(&dir).unwrap();
         assert_eq!(
-            attr.get(&(crate::recover_source::Tool::Ghidra, 0x10))
-                .map(String::as_str),
+            attr.get(&FunctionEvidenceKey {
+                owner: FunctionOwner::Ghidra,
+                entry: 0x10,
+                execution_blake3: None,
+            })
+            .map(String::as_str),
             Some("ghidra/a.c")
         );
         assert_eq!(
-            attr.get(&(crate::recover_source::Tool::Radare2, 0x10))
-                .map(String::as_str),
+            attr.get(&FunctionEvidenceKey {
+                owner: FunctionOwner::Legacy {
+                    producer: Tool::Radare2,
+                },
+                entry: 0x10,
+                execution_blake3: None,
+            })
+            .map(String::as_str),
             Some("r2/b.c")
         );
     }
@@ -1811,16 +2069,36 @@ mod tests {
             crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
         )
         .unwrap();
+        let funcs = load_thumb_functions(&dir, &test_runtime()).unwrap();
+        let digest = |digest: [u8; 32]| {
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
         std::fs::write(
             dir.join("recovered_index.json"),
-            r#"{"sources":{
-              "r2/a.c":{"functions":[{"tool":"radare2","entry":"0x1000"}]},
-              "rizin/b.c":{"functions":[{"tool":"rizin","entry":"0x1000"}]}
-            }}"#,
+            serde_json::json!({
+                "sources": {
+                    "r2/a.c": {"functions": [{
+                        "tool": "radare2",
+                        "region_index": 0,
+                        "run_index": 0,
+                        "execution_blake3": digest(funcs[0].execution_blake3.unwrap()),
+                        "entry": "0x1000"
+                    }]},
+                    "rizin/b.c": {"functions": [{
+                        "tool": "rizin",
+                        "region_index": 0,
+                        "run_index": 1,
+                        "execution_blake3": digest(funcs[1].execution_blake3.unwrap()),
+                        "entry": "0x1000"
+                    }]}
+                }
+            })
+            .to_string(),
         )
         .unwrap();
-
-        let funcs = load_thumb_functions(&dir, None).unwrap();
         let attribution = load_attribution(&dir).unwrap();
 
         assert_eq!(funcs.len(), 2);
@@ -1828,14 +2106,38 @@ mod tests {
         assert_eq!(funcs[0].tool, Tool::Radare2);
         assert_eq!(funcs[1].tool, Tool::Rizin);
         assert_eq!(
+            funcs[0].owner,
+            FunctionOwner::Run {
+                producer: Tool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            }
+        );
+        assert_eq!(
+            funcs[1].owner,
+            FunctionOwner::Run {
+                producer: Tool::Rizin,
+                region_index: 0,
+                run_index: 1,
+            }
+        );
+        assert_eq!(
             attribution
-                .get(&(funcs[0].tool, funcs[0].entry))
+                .get(&FunctionEvidenceKey {
+                    owner: funcs[0].owner,
+                    entry: funcs[0].entry,
+                    execution_blake3: funcs[0].execution_blake3,
+                })
                 .map(String::as_str),
             Some("r2/a.c")
         );
         assert_eq!(
             attribution
-                .get(&(funcs[1].tool, funcs[1].entry))
+                .get(&FunctionEvidenceKey {
+                    owner: funcs[1].owner,
+                    entry: funcs[1].entry,
+                    execution_blake3: funcs[1].execution_blake3,
+                })
                 .map(String::as_str),
             Some("rizin/b.c")
         );
@@ -1854,10 +2156,21 @@ mod tests {
             crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
         )
         .unwrap();
-        let symbol = |tool: Tool, name: &str| Symbol {
+        let artifact = crate::thumb_analysis::parse_thumb_artifact(
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+            &test_runtime(),
+        )
+        .unwrap();
+        let executions = artifact
+            .functions()
+            .map(|function| (function.owner, function.execution.unwrap().execution_blake3))
+            .collect::<Vec<_>>();
+        let symbol = |index: usize, tool: Tool, name: &str| Symbol {
             address: "0x1000".into(),
             arch: "thumb",
             tool,
+            owner: executions[index].0,
+            execution_blake3: Some(executions[index].1),
             original_name: format!("original_{name}"),
             name: Some(name.to_string()),
             tier: Tier::Recovered,
@@ -1867,9 +2180,10 @@ mod tests {
 
         rewrite_functions_json(
             &dir,
+            &test_runtime(),
             &[
-                symbol(Tool::Radare2, "from_radare2"),
-                symbol(Tool::Rizin, "from_rizin"),
+                symbol(0, Tool::Radare2, "from_radare2"),
+                symbol(1, Tool::Rizin, "from_rizin"),
             ],
         )
         .unwrap();
@@ -1890,7 +2204,11 @@ mod tests {
             serde_json::json!(["annotation_from_rizin"])
         );
         // The rewrite must preserve run ownership and every provenance field.
-        crate::thumb_analysis::parse_thumb_artifact(&std::fs::read(&path).unwrap(), None).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(
+            &std::fs::read(&path).unwrap(),
+            &test_runtime(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1951,10 +2269,18 @@ mod tests {
 
     /// A symbol for the Rizin-owned record at 0x4000 in `consumer_v3_fixture`.
     fn thumb_symbol() -> Symbol {
+        let artifact = crate::thumb_analysis::parse_thumb_artifact(
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+            &test_runtime(),
+        )
+        .unwrap();
+        let function = artifact.functions().next().unwrap();
         Symbol {
             address: "0x4000".into(),
             arch: "thumb",
             tool: crate::recover_source::Tool::Rizin,
+            owner: function.owner,
+            execution_blake3: Some(function.execution.unwrap().execution_blake3),
             original_name: "thumb_4000".into(),
             name: Some("recovered_thumb".into()),
             tier: Tier::Recovered,
@@ -1972,6 +2298,8 @@ mod tests {
                 address: "0x10".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_10".into(),
                 name: Some("real".into()),
                 tier: Tier::Recovered,
@@ -1982,6 +2310,10 @@ mod tests {
                 address: "0x20".into(),
                 arch: "thumb",
                 tool: crate::recover_source::Tool::Radare2,
+                owner: FunctionOwner::Legacy {
+                    producer: Tool::Radare2,
+                },
+                execution_blake3: None,
                 original_name: "thumb_20".into(),
                 name: Some("guess_x_20".into()),
                 tier: Tier::Provisional,
@@ -1992,6 +2324,8 @@ mod tests {
                 address: "0x30".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_30".into(),
                 name: None,
                 tier: Tier::None,
@@ -2014,6 +2348,8 @@ mod tests {
             address: "0x40e1bff4".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: None,
             original_name: "FUN_40e1bff4".into(),
             name: Some("real_fn".into()),
             tier: Tier::Recovered,
@@ -2037,6 +2373,10 @@ mod tests {
                 address: "0x40e1200".into(),
                 arch: "thumb",
                 tool: crate::recover_source::Tool::Radare2,
+                owner: FunctionOwner::Legacy {
+                    producer: Tool::Radare2,
+                },
+                execution_blake3: None,
                 original_name: "thumb_40e1200".into(),
                 name: Some("guess_short_040e1200".into()),
                 tier: Tier::Provisional,
@@ -2047,6 +2387,10 @@ mod tests {
                 address: "0x40e12000".into(),
                 arch: "thumb",
                 tool: crate::recover_source::Tool::Radare2,
+                owner: FunctionOwner::Legacy {
+                    producer: Tool::Radare2,
+                },
+                execution_blake3: None,
                 original_name: "thumb_40e12000".into(),
                 name: Some("guess_long_40e12000".into()),
                 tier: Tier::Provisional,
@@ -2073,20 +2417,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("functions.json"),
-            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![ghidra_function("FUN_10", 0x10, 0x18, &[])]).unwrap(),
         )
         .unwrap();
+        let execution_blake3 = load_functions(&dir, &DisasmIndex::new(""), &test_runtime())
+            .unwrap()[0]
+            .execution_blake3;
         let syms = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3,
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
             evidence: vec![],
             annotations: vec!["logs: \"hi\"".into()],
         }];
-        rewrite_functions_json(&dir, &syms).unwrap();
+        rewrite_functions_json(&dir, &test_runtime(), &syms).unwrap();
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("functions.json")).unwrap()).unwrap();
         assert_eq!(v[0]["name"], "real");
@@ -2100,23 +2449,29 @@ mod tests {
         // recovered name, but the Symbol still carries the true original.
         let dir = tmp("pme_sym_prov");
         std::fs::create_dir_all(&dir).unwrap();
+        let function = ghidra_function("real", 0x10, 0x18, &[]);
         std::fs::write(
             dir.join("functions.json"),
             // pass-2 state: name was renamed to "real" already; no original_name field yet.
-            r#"[{"name":"real","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![function]).unwrap(),
         )
         .unwrap();
+        let execution_blake3 = load_functions(&dir, &DisasmIndex::new(""), &test_runtime())
+            .unwrap()[0]
+            .execution_blake3;
         let syms = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3,
             original_name: "FUN_10".into(), // the true original
             name: Some("real".into()),
             tier: Tier::Recovered,
             evidence: vec![],
             annotations: vec![],
         }];
-        rewrite_functions_json(&dir, &syms).unwrap();
+        rewrite_functions_json(&dir, &test_runtime(), &syms).unwrap();
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("functions.json")).unwrap()).unwrap();
         assert_eq!(v[0]["name"], "real");
@@ -2135,10 +2490,10 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let before: serde_json::Value = serde_json::from_slice(original).unwrap();
 
-        rewrite_functions_json(&dir, &[thumb_symbol()]).unwrap();
+        rewrite_functions_json(&dir, &test_runtime(), &[thumb_symbol()]).unwrap();
 
         let rewritten_bytes = std::fs::read(&path).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, &test_runtime()).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
         assert_eq!(after["format"], before["format"]);
         assert_eq!(after["producers"], before["producers"]);
@@ -2178,17 +2533,18 @@ mod tests {
             crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
         )
         .unwrap();
-        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&path, None).unwrap();
+        let mut artifact =
+            crate::thumb_analysis::read_thumb_artifact(&path, &test_runtime()).unwrap();
         artifact.function_values_mut()[0]["body_c"] =
             serde_json::json!("void thumb_4000(void) { thumb_4000(); }");
         artifact.write_atomic(&path).unwrap();
         let before_bytes = std::fs::read(&path).unwrap();
         let before: serde_json::Value = serde_json::from_slice(&before_bytes).unwrap();
 
-        rewrite_body_c_in_thumb_functions(&dir, &[thumb_symbol()]).unwrap();
+        rewrite_body_c_in_thumb_functions(&dir, &test_runtime(), &[thumb_symbol()]).unwrap();
 
         let rewritten_bytes = std::fs::read(&path).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, &test_runtime()).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
         assert_eq!(after["format"], before["format"]);
         assert_eq!(after["producers"], before["producers"]);
@@ -2222,7 +2578,7 @@ mod tests {
         let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
         std::fs::write(&path, original).unwrap();
 
-        rewrite_functions_json(&dir, &[]).unwrap();
+        rewrite_functions_json(&dir, &test_runtime(), &[]).unwrap();
 
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
@@ -2235,7 +2591,7 @@ mod tests {
         let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
         std::fs::write(&path, original).unwrap();
 
-        rewrite_body_c_in_thumb_functions(&dir, &[]).unwrap();
+        rewrite_body_c_in_thumb_functions(&dir, &test_runtime(), &[]).unwrap();
 
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
@@ -2245,10 +2601,19 @@ mod tests {
         let root = tmp("pme_sym_e2e");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
+        let image = vec![0u8; 0x20];
         // one ARM function that materializes token 0x00000cc9 via movw
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "FUN_10",
+                0x10,
+                0x18,
+                &[],
+                &image,
+                0,
+            )])
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(
@@ -2257,6 +2622,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dec.join("decompiled.c"), "void FUN_10(void){}\n").unwrap();
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &image).unwrap();
         // token DB with token 0xcc9 -> a format string
         let db = crate::tokens::Database {
             reserved: 0,
@@ -2268,11 +2634,7 @@ mod tests {
         };
         let tokmap = token_map(&db);
         let manifest = root.join("manifest.json");
-        std::fs::write(
-            &manifest,
-            r#"{"toc":[{"name":"MAIN","load_addr":1073807360}]}"#,
-        )
-        .unwrap();
+        std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
 
         symbolicate_image(&root.join("images/02_MAIN"), "02_MAIN", &tokmap, &manifest).unwrap();
 
@@ -2291,11 +2653,21 @@ mod tests {
         let root = tmp("pme_sym_build_map");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
+        let image = vec![0u8; 0x20];
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "FUN_10",
+                0x10,
+                0x18,
+                &[],
+                &image,
+                0,
+            )])
+            .unwrap(),
         )
         .unwrap();
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &image).unwrap();
         std::fs::write(
             dec.join("disasm.lst"),
             "0x10: 41f2 movw r0, 0xcc9\n0x14: 4770 bx lr\n",
@@ -2333,10 +2705,18 @@ mod tests {
         std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"FUN_100","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "FUN_40000020",
+                0x4000_0020,
+                0x4000_0028,
+                &[0x4000_0010],
+                &img,
+                0x4000_0000,
+            )])
+            .unwrap(),
         )
         .unwrap();
-        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x40000020: 4770 bx lr\n").unwrap();
         std::fs::write(dec.join("globals.json"), r#"{"globals":[]}"#).unwrap();
         let manifest = root.join("manifest.json");
         std::fs::write(
@@ -2390,9 +2770,33 @@ mod tests {
         std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"FUN_200","entry":"0x40000200","end":"0x40000208","data_refs":[]},
-                {"name":"FUN_240","entry":"0x40000240","end":"0x40000248","data_refs":[]},
-                {"name":"FUN_280","entry":"0x40000280","end":"0x40000288","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![
+                ghidra_function_in_image(
+                    "FUN_200",
+                    0x4000_0200,
+                    0x4000_0208,
+                    &[],
+                    &img,
+                    0x4000_0000,
+                ),
+                ghidra_function_in_image(
+                    "FUN_240",
+                    0x4000_0240,
+                    0x4000_0248,
+                    &[],
+                    &img,
+                    0x4000_0000,
+                ),
+                ghidra_function_in_image(
+                    "FUN_280",
+                    0x4000_0280,
+                    0x4000_0288,
+                    &[],
+                    &img,
+                    0x4000_0000,
+                ),
+            ])
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(dec.join("disasm.lst"), "0x40000200: 4770 bx lr\n").unwrap();
@@ -2450,9 +2854,33 @@ mod tests {
         // clobber it; the two FUN_ entries are still named.
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"OS_Delete_Semaphore","entry":"0x40000200","end":"0x40000208","data_refs":[]},
-                {"name":"FUN_240","entry":"0x40000240","end":"0x40000248","data_refs":[]},
-                {"name":"FUN_280","entry":"0x40000280","end":"0x40000288","data_refs":[]}]"#,
+            serde_json::to_vec(&vec![
+                ghidra_function_in_image(
+                    "OS_Delete_Semaphore",
+                    0x4000_0200,
+                    0x4000_0208,
+                    &[],
+                    &img,
+                    0x4000_0000,
+                ),
+                ghidra_function_in_image(
+                    "FUN_240",
+                    0x4000_0240,
+                    0x4000_0248,
+                    &[],
+                    &img,
+                    0x4000_0000,
+                ),
+                ghidra_function_in_image(
+                    "FUN_280",
+                    0x4000_0280,
+                    0x4000_0288,
+                    &[],
+                    &img,
+                    0x4000_0000,
+                ),
+            ])
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(dec.join("disasm.lst"), "0x40000200: 4770 bx lr\n").unwrap();
@@ -2493,10 +2921,18 @@ mod tests {
         // (e.g. a Ghidra-FID match) — the string-ref tier must not displace it.
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"MyRealFn","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "MyRealFn",
+                0x4000_0020,
+                0x4000_0028,
+                &[0x4000_0010],
+                &img,
+                0x4000_0000,
+            )])
+            .unwrap(),
         )
         .unwrap();
-        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x40000020: 4770 bx lr\n").unwrap();
         std::fs::write(dec.join("globals.json"), r#"{"globals":[]}"#).unwrap();
         let manifest = root.join("manifest.json");
         std::fs::write(
@@ -2530,10 +2966,18 @@ mod tests {
         std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
         std::fs::write(
             dec.join("functions.json"),
-            r#"[{"name":"FUN_100","entry":"0x100","end":"0x108","data_refs":["0x40000010"]}]"#,
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "FUN_40000020",
+                0x4000_0020,
+                0x4000_0028,
+                &[0x4000_0010],
+                &img,
+                0x4000_0000,
+            )])
+            .unwrap(),
         )
         .unwrap();
-        std::fs::write(dec.join("disasm.lst"), "0x100: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x40000020: 4770 bx lr\n").unwrap();
         // no globals.json
         let manifest = root.join("manifest.json");
         std::fs::write(
@@ -2558,15 +3002,13 @@ mod tests {
         let root = tmp("pme_sym_finalize");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
-        std::fs::write(
-            dec.join("functions.json"),
-            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
-        )
-        .unwrap();
+        let execution_blake3 = write_test_ghidra_function(&dec, "FUN_10", 0x10, 0x18);
         let symbols = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: Some(execution_blake3),
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2576,8 +3018,14 @@ mod tests {
         let opts = FinalizeOpts {
             rewrite_decompiled_c: true,
         };
-        let path =
-            finalize_image(&root.join("images/02_MAIN"), "02_MAIN", &symbols, &opts).unwrap();
+        let path = finalize_image(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &test_runtime(),
+            &symbols,
+            &opts,
+        )
+        .unwrap();
         assert!(path.ends_with("symbols.json"));
         assert!(dec.join("symbols.json").exists());
         // functions.json was rewritten with original_name.
@@ -2596,6 +3044,8 @@ mod tests {
                 address: "0x40e1bff4".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_40e1bff4".into(),
                 name: Some("LteRrc_Reestab".into()),
                 tier: Tier::Recovered,
@@ -2606,6 +3056,8 @@ mod tests {
                 address: "0x40e1c000".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_40e1c000".into(),
                 name: None, // Tier::None — no rename
                 tier: Tier::None,
@@ -2643,16 +3095,14 @@ mod tests {
         let root = tmp("pme_sym_no_rewrite");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
-        std::fs::write(
-            dec.join("functions.json"),
-            r#"[{"name":"FUN_10","entry":"0x10","end":"0x18","data_refs":[]}]"#,
-        )
-        .unwrap();
+        let execution_blake3 = write_test_ghidra_function(&dec, "FUN_10", 0x10, 0x18);
         std::fs::write(dec.join("decompiled.c"), "void FUN_10(void) {}\n").unwrap();
         let symbols = vec![Symbol {
             address: "0x10".into(),
             arch: "arm",
             tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: Some(execution_blake3),
             original_name: "FUN_10".into(),
             name: Some("real".into()),
             tier: Tier::Recovered,
@@ -2662,6 +3112,7 @@ mod tests {
         finalize_image(
             &root.join("images/02_MAIN"),
             "02_MAIN",
+            &test_runtime(),
             &symbols,
             &FinalizeOpts {
                 rewrite_decompiled_c: false,
@@ -2677,37 +3128,40 @@ mod tests {
         assert!(dec.join("symbols.json").exists());
     }
 
-    fn write_thumb_functions_v2_with_body_c(dec: &std::path::Path) {
-        // v2 with one body_c already populated; the function name appears
-        // verbatim in body_c so the test can detect a rewrite (or its absence).
-        let original_json = r#"{
-            "format": "pixel-modem-extractor-thumb-functions-v2",
-            "functions": [
-                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
-                 "body_kind": "thumb_disassembly", "body": "bx lr",
-                 "body_c": "void thumb_40e1200(void) { return; }",
-                 "data_refs": []}
-            ]
-        }"#;
-        std::fs::write(dec.join("thumb_functions.json"), original_json).unwrap();
+    fn write_thumb_functions_v3_with_body_c(dec: &std::path::Path) {
+        let path = dec.join("thumb_functions.json");
+        std::fs::write(
+            &path,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        )
+        .unwrap();
+        let mut artifact =
+            crate::thumb_analysis::read_thumb_artifact(&path, &test_runtime()).unwrap();
+        artifact.function_values_mut()[0]["body_c"] =
+            serde_json::json!("void thumb_4000(void) { thumb_4000(); }");
+        artifact.write_atomic(&path).unwrap();
     }
 
     fn stamping_symbols() -> Vec<Symbol> {
+        let mut thumb = thumb_symbol();
+        thumb.name = Some("RealName".into());
+        thumb.annotations = vec!["log: boot".into()];
+        let function = ghidra_function("FUN_10", 0x10, 0x18, &[]);
+        let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
+            std::slice::from_ref(&function),
+            1,
+            &test_runtime(),
+        )
+        .unwrap();
+        let execution_blake3 = inventory.accepted_executions[0].identity.execution_blake3;
         vec![
-            Symbol {
-                address: "0x40e1200".into(),
-                arch: "thumb",
-                tool: crate::recover_source::Tool::Radare2,
-                original_name: "thumb_40e1200".into(),
-                name: Some("RealName".into()),
-                tier: Tier::Recovered,
-                evidence: vec![],
-                annotations: vec!["log: boot".into()],
-            },
+            thumb,
             Symbol {
                 address: "0x00000010".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: Some(execution_blake3),
                 original_name: "FUN_10".into(),
                 name: None,
                 tier: Tier::Recovered,
@@ -2720,27 +3174,16 @@ mod tests {
     fn write_stamping_fixtures(dec: &std::path::Path) {
         std::fs::write(
             dec.join("functions.json"),
-            r#"[
-  {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8},
-  {"entry": "0x10", "name": "FUN_10", "size": 4},
-  {"entry": "0x9999", "name": "unmatched", "size": 4},
-  {"name": "no_entry", "size": 4}
-]"#,
+            serde_json::to_vec(&vec![
+                ghidra_function("FUN_10", 0x10, 0x18, &[]),
+                ghidra_function("FUN_20", 0x20, 0x28, &[]),
+            ])
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(
             dec.join("thumb_functions.json"),
-            r#"{
-  "format": "pixel-modem-extractor-thumb-functions-v2",
-  "functions": [
-    {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
-     "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []},
-    {"entry": "0x40e1200", "name": "already", "original_name": "thumb_x",
-     "size": 8, "body_kind": "thumb_disassembly", "body": "", "data_refs": []},
-    {"entry": "0x9999", "name": "unmatched", "size": 4,
-     "body_kind": "thumb_disassembly", "body": "", "data_refs": []}
-  ]
-}"#,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
         )
         .unwrap();
     }
@@ -2756,7 +3199,7 @@ mod tests {
             dirs.push(dec);
         }
         let symbols = stamping_symbols();
-        rewrite_functions_json(&dirs[0], &symbols).unwrap();
+        rewrite_functions_json(&dirs[0], &test_runtime(), &symbols).unwrap();
         rewrite_functions_json_whole(&dirs[1], &symbols).unwrap();
         for name in ["functions.json", "thumb_functions.json"] {
             assert_eq!(
@@ -2767,7 +3210,7 @@ mod tests {
         }
         // Idempotent re-run: stable bytes.
         let before = std::fs::read(dirs[0].join("thumb_functions.json")).unwrap();
-        rewrite_functions_json(&dirs[0], &symbols).unwrap();
+        rewrite_functions_json(&dirs[0], &test_runtime(), &symbols).unwrap();
         assert_eq!(
             before,
             std::fs::read(dirs[0].join("thumb_functions.json")).unwrap()
@@ -2781,24 +3224,11 @@ mod tests {
             let root = tmp(&format!("pme_sym_bodyc_ab_{}", std::process::id()));
             let dec = root.join("decompiled");
             std::fs::create_dir_all(&dec).unwrap();
-            std::fs::write(
-                dec.join("thumb_functions.json"),
-                r#"{
-  "format": "pixel-modem-extractor-thumb-functions-v2",
-  "functions": [
-    {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
-     "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": [],
-     "body_c": "void thumb_40e1200(void) { thumb_40e1200(); }"},
-    {"entry": "0x5000", "name": "no_body_c", "size": 4,
-     "body_kind": "thumb_disassembly", "body": "", "data_refs": []}
-  ]
-}"#,
-            )
-            .unwrap();
+            write_thumb_functions_v3_with_body_c(&dec);
             dirs.push(dec);
         }
-        let symbols = vec![real_name_symbol_for_40e1200()];
-        rewrite_body_c_in_thumb_functions(&dirs[0], &symbols).unwrap();
+        let symbols = vec![real_name_symbol_for_4000()];
+        rewrite_body_c_in_thumb_functions(&dirs[0], &test_runtime(), &symbols).unwrap();
         rewrite_body_c_in_thumb_functions_whole(&dirs[1], &symbols).unwrap();
         assert_eq!(
             std::fs::read(dirs[0].join("thumb_functions.json")).unwrap(),
@@ -2808,17 +3238,11 @@ mod tests {
         assert!(after.contains("RealName(void)"), "body_c renamed: {after}");
     }
 
-    fn real_name_symbol_for_40e1200() -> Symbol {
-        Symbol {
-            address: "0x40e1200".into(),
-            arch: "thumb",
-            tool: crate::recover_source::Tool::Radare2,
-            original_name: "thumb_40e1200".into(),
-            name: Some("RealName".into()),
-            tier: Tier::Recovered,
-            evidence: vec![],
-            annotations: vec![],
-        }
+    fn real_name_symbol_for_4000() -> Symbol {
+        let mut symbol = thumb_symbol();
+        symbol.name = Some("RealName".into());
+        symbol.annotations.clear();
+        symbol
     }
 
     #[test]
@@ -2826,12 +3250,13 @@ mod tests {
         let root = tmp("pme_sym_body_c_preserve");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
-        write_thumb_functions_v2_with_body_c(&dec);
+        write_thumb_functions_v3_with_body_c(&dec);
 
-        let symbols = vec![real_name_symbol_for_40e1200()];
+        let symbols = vec![real_name_symbol_for_4000()];
         finalize_image(
             &root.join("images/02_MAIN"),
             "02_MAIN",
+            &test_runtime(),
             &symbols,
             &FinalizeOpts {
                 rewrite_decompiled_c: false,
@@ -2840,11 +3265,11 @@ mod tests {
         .unwrap();
 
         let after = std::fs::read_to_string(dec.join("thumb_functions.json")).unwrap();
-        // body_c-specific: `thumb_40e1200(void)` appears only inside body_c text,
+        // body_c-specific: `thumb_4000(void)` appears only inside body_c text,
         // never as a field value (the `name` field legitimately becomes RealName
         // via the ungated rewrite_functions_json pass).
         assert!(
-            after.contains("thumb_40e1200(void)"),
+            after.contains("thumb_4000(void)"),
             "body_c must be byte-identical when rewrite_decompiled_c=false: {after}"
         );
         assert!(
@@ -2858,12 +3283,13 @@ mod tests {
         let root = tmp("pme_sym_body_c_rename");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
-        write_thumb_functions_v2_with_body_c(&dec);
+        write_thumb_functions_v3_with_body_c(&dec);
 
-        let symbols = vec![real_name_symbol_for_40e1200()];
+        let symbols = vec![real_name_symbol_for_4000()];
         finalize_image(
             &root.join("images/02_MAIN"),
             "02_MAIN",
+            &test_runtime(),
             &symbols,
             &FinalizeOpts {
                 rewrite_decompiled_c: true,
@@ -2877,7 +3303,7 @@ mod tests {
             "body_c must be renamed when rewrite_decompiled_c=true: {after}"
         );
         assert!(
-            !after.contains("thumb_40e1200(void)"),
+            !after.contains("thumb_4000(void)"),
             "original name must be gone from body_c after rewrite: {after}"
         );
     }

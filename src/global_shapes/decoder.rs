@@ -3,7 +3,7 @@
 
 use super::FunctionExecution;
 use crate::error::{Error, Result};
-use crate::execution_ranges::{DecodeIsa as Isa, DecodeRange};
+use crate::execution_ranges::{AuthenticatedDecodeRange, DecodeIsa as Isa};
 use scaleservers_arm32_assembly::{
     Arm32BlockAddressMode, Arm32Condition, Arm32GeneralPurposeRegister, Arm32IndexMode,
     Arm32LowGeneralPurposeRegister, Arm32MemoryOffset, Arm32MemoryOffset8, Arm32RegisterShift,
@@ -209,7 +209,7 @@ pub(crate) struct DecodeFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedRange {
-    pub range: DecodeRange,
+    pub range: AuthenticatedDecodeRange,
     pub instructions: BTreeMap<u32, DecodedInstruction>,
     pub decode_failure: Option<DecodeFailure>,
 }
@@ -384,7 +384,7 @@ pub(crate) fn reachable_blocks(
 
 fn decode_range(
     decoder: &impl InstructionDecoder,
-    range: DecodeRange,
+    range: AuthenticatedDecodeRange,
     bytes: &[u8],
     load_address: u32,
 ) -> Result<DecodedRange> {
@@ -431,7 +431,7 @@ fn decode_range(
 
 fn check_adapter_invariants(
     instruction: &DecodedInstruction,
-    range: DecodeRange,
+    range: AuthenticatedDecodeRange,
     requested_pc: u32,
     seen: &BTreeMap<u32, DecodedInstruction>,
     range_end: u32,
@@ -472,7 +472,7 @@ fn valid_isa_length(isa: Isa, length: u8) -> bool {
     }
 }
 
-fn range_bytes(bytes: &[u8], load_address: u32, range: DecodeRange) -> Result<&[u8]> {
+fn range_bytes(bytes: &[u8], load_address: u32, range: AuthenticatedDecodeRange) -> Result<&[u8]> {
     if range.end <= range.start {
         return Err(invalid("decode range is empty"));
     }
@@ -5080,29 +5080,33 @@ mod tests {
         assert!(matches!(bx.flow, ControlFlow::Stop));
     }
 
-    fn function(entry: u32, ranges: Vec<DecodeRange>) -> FunctionExecution {
+    fn function(entry: u32, ranges: Vec<AuthenticatedDecodeRange>) -> FunctionExecution {
         FunctionExecution {
+            owner: crate::execution_ranges::FunctionOwner::Ghidra,
             identity: ExecutionIdentity {
                 entry,
                 decode_ranges: ranges,
+                execution_blake3: [0; 32],
             },
             contexts: BTreeSet::new(),
         }
     }
 
-    fn arm_range(start: u32, end: u32) -> DecodeRange {
-        DecodeRange {
+    fn arm_range(start: u32, end: u32) -> AuthenticatedDecodeRange {
+        AuthenticatedDecodeRange {
             start,
             end,
             isa: Isa::Arm,
+            blake3: [0; 32],
         }
     }
 
-    fn thumb_range(start: u32, end: u32) -> DecodeRange {
-        DecodeRange {
+    fn thumb_range(start: u32, end: u32) -> AuthenticatedDecodeRange {
+        AuthenticatedDecodeRange {
             start,
             end,
             isa: Isa::Thumb,
+            blake3: [0; 32],
         }
     }
 
@@ -5437,10 +5441,11 @@ mod tests {
                 let bytes = vec![fill; length];
                 for isa in [Isa::Arm, Isa::Thumb] {
                     let end = 0x1000 + u32::try_from(length).expect("length fits");
-                    let range = DecodeRange {
+                    let range = AuthenticatedDecodeRange {
                         start: 0x1000,
                         end: end.max(0x1002),
                         isa,
+                        blake3: [0; 32],
                     };
                     let result = catch_unwind(AssertUnwindSafe(|| {
                         decode_function(&decoder, &function(0x1000, vec![range]), &bytes, 0x1000)
@@ -5490,7 +5495,7 @@ mod tests {
 
     fn decoded_from(
         _function: &FunctionExecution,
-        instructions: Vec<(DecodeRange, Vec<DecodedInstruction>)>,
+        instructions: Vec<(AuthenticatedDecodeRange, Vec<DecodedInstruction>)>,
     ) -> DecodedFunction {
         DecodedFunction {
             ranges: instructions

@@ -1,7 +1,11 @@
 //! Shared v4 artifact checks for env-gated goldens and retained-tree replay.
 
 use super::FORMAT_V4;
+use crate::execution_ranges::{
+    ExecutionProjection, ValidatedInventory, validate_ghidra_inventory_records,
+};
 use crate::manifest::blake3_file;
+use crate::runtime_image::RuntimeImage;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -41,8 +45,19 @@ pub fn validate_artifact_files(
     let functions_path = decompiled.join("functions.json");
     let thumb_path = decompiled.join("thumb_functions.json");
 
-    let image_len = u32::try_from(std::fs::metadata(&image_path).unwrap().len())
-        .expect("image length fits u32");
+    let image = std::fs::read(&image_path).expect("raw image readable");
+    let runtime_root = std::fs::canonicalize(image_dir).expect("image directory canonicalizable");
+    let runtime_map = runtime_root.join("scatter/load_map.json");
+    let runtime = RuntimeImage::from_artifact(
+        &image,
+        load_addr,
+        &runtime_root,
+        runtime_map
+            .try_exists()
+            .expect("scatter map existence query succeeds")
+            .then_some(runtime_map.as_path()),
+    )
+    .expect("runtime image valid");
     let inputs = &artifact["inputs"];
     assert!(is_blake3_hex(require_str(inputs, "image_blake3")));
     assert!(is_blake3_hex(require_str(inputs, "globals_blake3")));
@@ -140,7 +155,11 @@ pub fn validate_artifact_files(
     let functions_json: Value =
         serde_json::from_slice(&std::fs::read(&functions_path).expect("functions.json readable"))
             .expect("functions.json valid JSON");
-    let ghidra = parse_inventory(ghidra_records(&functions_json), load_addr, image_len);
+    let ghidra_records = ghidra_records(&functions_json);
+    let ghidra = inventory_counts(
+        &validate_ghidra_inventory_records(ghidra_records, ghidra_records.len(), &runtime)
+            .expect("Ghidra execution inventory valid"),
+    );
     assert_eq!(
         ghidra.raw,
         report_image["functions"].as_u64().unwrap() as usize
@@ -161,16 +180,22 @@ pub fn validate_artifact_files(
     );
 
     let thumb = if report_has_thumb {
-        let thumb_json: Value =
-            serde_json::from_slice(&std::fs::read(&thumb_path).expect("thumb_functions readable"))
-                .expect("thumb_functions valid JSON");
-        let parsed = parse_inventory(thumb_records(&thumb_json), load_addr, image_len);
+        let expected_substantial = report_image["thumb_functions"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .expect("Thumb substantial count fits usize");
+        let parsed = inventory_counts(
+            &crate::thumb_analysis::validate_thumb_inventory_streaming(
+                &thumb_path,
+                &runtime,
+                expected_substantial,
+            )
+            .expect("Thumb execution inventory valid")
+            .inventory,
+        );
         assert_eq!(
-            parsed.accepted + parsed.quarantined,
+            parsed.accepted,
             report_image["thumb_execution_accepted"].as_u64().unwrap() as usize
-                + report_image["thumb_execution_quarantined"]
-                    .as_u64()
-                    .unwrap() as usize
         );
         assert_eq!(
             parsed.quarantined,
@@ -537,52 +562,26 @@ struct InventoryCounts {
     quarantine_errors: usize,
 }
 
-fn parse_inventory(records: &[Value], image_start: u32, image_len: u32) -> InventoryCounts {
-    let image_end = image_start
-        .checked_add(image_len)
-        .expect("mapped image end overflows u32");
-    let mut counts = InventoryCounts {
-        raw: records.len(),
-        ..InventoryCounts::default()
-    };
-    for record in records {
-        let ranges = require_array(record, "decode_ranges");
-        let errors = require_array(record, "decode_range_errors");
-        match (ranges.is_empty(), errors.is_empty()) {
-            (false, true) => {
-                counts.accepted += 1;
-                for range in ranges {
-                    let start = parse_canonical_hex(require_str(range, "start"));
-                    let end = parse_canonical_hex(require_str(range, "end"));
-                    assert!(
-                        start >= image_start && end <= image_end && end > start,
-                        "accepted range [{start:#x}, {end:#x}) is not image-contained in [{image_start:#x}, {image_end:#x})"
-                    );
-                }
-            }
-            (true, false) => {
-                counts.quarantined += 1;
-                counts.quarantine_errors += errors.len();
-            }
-            _ => panic!("inventory record is not a single tagged state: {record}"),
-        }
+fn inventory_counts(inventory: &ValidatedInventory) -> InventoryCounts {
+    InventoryCounts {
+        raw: inventory.raw_count,
+        accepted: inventory.accepted,
+        quarantined: inventory.quarantined,
+        quarantine_errors: inventory
+            .records
+            .iter()
+            .map(|record| match &record.projection {
+                ExecutionProjection::Accepted(_) => 0,
+                ExecutionProjection::Quarantined(errors) => errors.len(),
+            })
+            .sum(),
     }
-    assert_eq!(
-        counts.raw,
-        counts.accepted + counts.quarantined,
-        "raw inventory count must equal accepted plus quarantined"
-    );
-    counts
 }
 
 fn ghidra_records(functions_json: &Value) -> &[Value] {
     functions_json
         .as_array()
         .expect("functions.json must be an array")
-}
-
-fn thumb_records(thumb_json: &Value) -> &[Value] {
-    require_array(thumb_json, "functions")
 }
 
 fn parse_global_address(value: &str) -> u32 {

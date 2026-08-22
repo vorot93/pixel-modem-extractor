@@ -261,7 +261,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `thumb_analysis/mod.rs` | Stable producer/tool types, public configuration and summaries, and subsystem exports |
 | `thumb_analysis/identity.rs` | Canonical cross-platform executable identity, discovery, bounded version probing, and probe-process cleanup |
 | `thumb_analysis/stream.rs` | Request validation, fallback coordination, process supervision, bounded capture/scanning, normalization, and spills |
-| `thumb_analysis/artifact.rs` | Sole v1/v2/v3 parser, strict run ownership, typed consumer streaming, canonical assembly, terminal validation, and streaming atomic mutation |
+| `thumb_analysis/artifact.rs` | Sole v1/v2/v3 parser, read-only legacy replay, strict run ownership, typed consumer streaming, canonical assembly, terminal validation, and v3 streaming atomic mutation |
 | `thumb_analysis/radare2.rs` | radare2 command profile, inventory aliases/bounds, and per-operation reference adaptation |
 | `thumb_analysis/rizin.rs` | Rizin command profile, inventory aliases/bounds, trailing `axlj` streaming, filtering, and range assignment |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
@@ -302,8 +302,9 @@ module; when a file outgrows that, split it.
   the live modern/legacy `addr|offset` aliases. V3 radare2 bounds require `maxaddr`; Rizin bounds
   require `maxbound`; both require positive `realsz`. Normalized `end` is that exclusive bound and
   normalized `size` is `realsz`; never derive either from `entry +` raw `aflj.size`. Raw `size` is
-  diagnostic bounding span only. `decode_ranges` are byte-validated executable coverage and remain
-  authoritative for execution identity and v3 source-range attribution.
+  diagnostic bounding span only. Each v3 `decode_range` carries a lowercase BLAKE3 over its exact
+  runtime bytes; the authenticated ranges and aggregate execution digest are authoritative for
+  execution identity and source-range attribution.
 - **Body integrity fails the attempt.** Pair inventory and `pdfj` by entry before positional
   fallback. A non-empty inventory with zero paired bodies is a region failure; an empty inventory,
   orphan bodies, malformed boundaries, projection errors that break conservation, and unusable
@@ -384,19 +385,20 @@ module; when a file outgrows that, split it.
   flattening execution identities. Typed source recovery and enrichment/symbolication mutations
   stream function records; `global_shapes` intentionally retains the complete validated function
   set because its decoder analyzes those records together.
-- **Ownership survives all the way to mutation.** `(AnalysisTool, entry)` is the record identity, not
-  the entry alone: a valid multi-run v3 region can hold a radare2 and a Rizin record at the same
-  entry. `Symbol` therefore carries its `tool` (and `symbols.json` records it),
-  `stream_rewrite_thumb_functions` hands the mutator
-  each record's validated run owner (v1/v2 report `radare2`), symbol application keys by
-  `(producer, entry)` with `functions.json` owned by Ghidra, and the globals evidence-name projection
-  routes each symbol into its own ISA only.
-- **Consumers that know the image must validate against it.** `parse_thumb_artifact`,
-  `read_thumb_artifact`, and `read_thumb_functions_streaming` take `Option<MappedImage>` so each call
-  site states whether it knows the load address and image length. Supplied, it checks v3 region
-  bounds and every function envelope, not only decode ranges — without it a document with in-image
-  decode ranges beside an out-of-image region passes. `global_shapes`, `globals`, and symbolication
-  supply it; `recover_source` is handed only a decompiled directory and cannot.
+- **Ownership survives all the way to mutation.** `(FunctionOwner, entry, execution_blake3)` is the
+  record identity, not the entry or producer alone: a valid v3 artifact can hold two records from
+  different region/run coordinates at the same entry, including two runs from the same producer.
+  `Symbol` and recovered-function evidence carry the concrete owner and execution digest;
+  `stream_rewrite_thumb_functions` hands the mutator that validated owner; Ghidra records use
+  `FunctionOwner::Ghidra`; and attribution/name projections fail closed rather than collapsing an
+  ambiguous address.
+- **Every execution consumer validates through `RuntimeImage`.** `parse_thumb_artifact`,
+  `read_thumb_artifact`, and `read_thumb_functions_streaming` require the runtime mapping. They check
+  v3 region bounds and authenticate every accepted range against byte-backed storage (including
+  scatter mappings), rejecting gaps, zero-fill, or digest mismatches. Function `end` and `size`
+  remain analyzer metadata and never expand the authenticated executable domain.
+  `global_shapes`, `globals`, symbolication, and `recover_source` all construct and supply the same
+  runtime view; no consumer reconstructs executable coverage from `[entry,end)`.
 - **Producer identity has two modes, and legacy records have neither.** One validator
   (`identity::producer_identity_error`) serves both: `IdentityMode::Runtime` for identities the
   coordinator will spawn (this host's path family, `canonicalize` equality with the recorded
@@ -1187,8 +1189,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   `invalid_operation_bytes`, `raw_byte_mismatch`, `duplicate_extent`,
   `overlapping_extent`, `entry_not_range_start`, `empty_projection`.
   Each inventory conserves `raw = accepted + quarantined`. Execution
-  identity is entry plus the complete ordered range list; identical
-  identities union `(entry, name)` contexts and are decoded once. Distinct
+  identity is entry plus the complete ordered authenticated range list and its
+  framed aggregate BLAKE3; identical identities union `(entry, name)` contexts
+  and are decoded once. Distinct
   identities coexist even when their bytes overlap across ISAs — no
   source, alignment, decoder result, order, or support count wins.
   Quarantined records never reach the decoder. Quarantine counters stay
@@ -1686,9 +1689,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   2).** `decompile::thumb_enrich` collects `decompiled.c` bodies line-by-line
   (~86 MB map on `02_MAIN`) and delegates the artifact rewrite to
   `thumb_analysis::artifact`, which retains one function `Value` at a time.
-  Strict v3 metadata and producer-written fields are validated and preserved;
-  a changed v1 file promotes to v2, v2/v3 keep their format, and a semantic
-  no-op leaves the original bytes untouched. The production A/B over a 632 MB
+  Strict v3 metadata, concrete run ownership, and authenticated execution fields
+  are validated and preserved. Retained v1/v2 artifacts are read-only replay
+  inputs: enrichment rejects them before opening the atomic writer. A semantic
+  v3 no-op leaves the original bytes untouched. The production A/B over a 632 MB
   artifact plus 86 MB C file measured 130 seconds and 2.29 GB peak RSS with
   byte-identical output and equal populated counts versus the whole-file oracle.
 - **Typed source loading and zero-copy ARM disassembly complete Stages 3 and
@@ -1707,8 +1711,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   `stream_rewrite_thumb_functions`. The latter validates metadata-first v3,
   ordered run ownership and derived counts, rejects producer-field or unknown
   field changes, and writes canonical metadata plus one function at a time.
-  Every rewrite is atomic and a no-op is byte-identical. Legacy mutation keeps
-  the established v1-to-v2 promotion. Differential whole-file oracles remain
+  Every rewrite is atomic and a no-op is byte-identical. Legacy mutation is
+  rejected before writer creation. Differential whole-file oracles remain
   test-only; the production-scale enrich replay is
   `streaming_enrich_ab_matches_oracle_on_production_inputs`.
 - **Golden/production `body_c` embeds TWO enrich generations.** A completed

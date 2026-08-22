@@ -3,11 +3,15 @@
 
 use super::identity::{IdentityMode, producer_identity_error};
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer};
+use crate::analysis_tool::AnalysisTool;
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
-    ExecutionIdentity, ExecutionProjection, TaggedExecutionRecord, ValidatedInventory,
-    canonicalize_errors, invalid, parse_projection, validate_inventory_record,
+    DecodeExtent, ExecutionBudget, ExecutionIdentity, ExecutionProjection, FunctionOwner,
+    OwnedExecutionIdentity, TaggedExecutionRecord, ValidatedInventory, invalid,
+    legacy_non_execution_projection, validate_inventory_record, validate_legacy_execution,
+    validate_projection_shape,
 };
+use crate::runtime_image::RuntimeImage;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -115,23 +119,27 @@ struct ThumbDocument {
 pub(crate) struct ParsedThumbArtifact {
     format: ThumbFormat,
     document: ThumbDocument,
-    owners: Vec<ThumbProducer>,
+    owners: Vec<FunctionOwner>,
+    executions: Vec<Option<ExecutionIdentity>>,
     original_functions: Vec<Value>,
     source_blake3: String,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OwnedFunctionRef<'a> {
-    pub producer: ThumbProducer,
-    pub legacy_range_semantics: bool,
+    pub owner: FunctionOwner,
+    pub execution: Option<&'a ExecutionIdentity>,
     pub value: &'a Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ThumbDecodeRange {
-    pub end: String,
     pub isa: String,
     pub start: String,
+    pub end: String,
+    #[serde(default)]
+    pub blake3: Option<String>,
 }
 
 /// Typed function payload used by streaming consumers. Unlike the strict v3
@@ -143,7 +151,7 @@ pub(crate) struct ThumbDecodeRange {
 /// rest. V3 strictness is unaffected: v3 records are deserialized through
 /// `FunctionWire`, which requires the complete producer field set, and only
 /// then converted into this type.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ThumbFunctionRecord {
     pub name: String,
     #[serde(default)]
@@ -165,21 +173,21 @@ pub(crate) struct ThumbFunctionRecord {
 
 #[derive(Debug)]
 pub(crate) struct OwnedThumbFunction {
-    pub producer: ThumbProducer,
-    pub legacy_range_semantics: bool,
+    pub owner: FunctionOwner,
+    pub execution: Option<ExecutionIdentity>,
     pub function: ThumbFunctionRecord,
 }
 
 impl ParsedThumbArtifact {
     pub fn functions(&self) -> impl ExactSizeIterator<Item = OwnedFunctionRef<'_>> {
-        let legacy_range_semantics = self.format != ThumbFormat::V3;
         self.document
             .functions
             .iter()
             .zip(self.owners.iter().copied())
-            .map(move |(value, producer)| OwnedFunctionRef {
-                producer,
-                legacy_range_semantics,
+            .zip(self.executions.iter())
+            .map(move |((value, owner), execution)| OwnedFunctionRef {
+                owner,
+                execution: execution.as_ref(),
                 value,
             })
     }
@@ -216,22 +224,20 @@ impl ParsedThumbArtifact {
         if self.document.functions == self.original_functions {
             return Ok(());
         }
-        if self.format == ThumbFormat::V3 {
-            self.validate_v3_mutation()?;
+        if self.format != ThumbFormat::V3 {
+            return Err(invalid_artifact(
+                "legacy Thumb artifacts are read-only replay inputs",
+            ));
         }
+        self.validate_v3_mutation()?;
 
         let mut file = atomic_write_file::AtomicWriteFile::open(path)?;
-        match self.format {
-            ThumbFormat::V1 | ThumbFormat::V2 => {
-                write_legacy_into(&mut file, ThumbFormat::V2, &self.document.functions)?
-            }
-            ThumbFormat::V3 => write_v3_values_into(
-                &mut file,
-                &self.document.producers,
-                &self.document.regions,
-                &self.document.functions,
-            )?,
-        }
+        write_v3_values_into(
+            &mut file,
+            &self.document.producers,
+            &self.document.regions,
+            &self.document.functions,
+        )?;
         file.commit()?;
         Ok(())
     }
@@ -260,11 +266,10 @@ impl ParsedThumbArtifact {
         {
             validate_v3_function_mutation(original, current, index, &IMMUTABLE_FIELDS)?;
         }
-        let owners = validate_v3(
+        let owners = validate_v3_shape(
             &self.document.producers,
             &self.document.regions,
             &self.document.functions,
-            None,
         )?;
         if owners != self.owners {
             return Err(invalid_artifact(
@@ -301,7 +306,7 @@ fn validate_v3_function_mutation(
             )));
         }
     }
-    validate_function_value(current, index, None)?;
+    validate_function_value(current, index)?;
     Ok(())
 }
 
@@ -335,9 +340,10 @@ struct RegionWire {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecodeRangeWire {
-    end: String,
     isa: String,
     start: String,
+    end: String,
+    blake3: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -429,9 +435,10 @@ impl From<FunctionWire> for ThumbFunctionRecord {
                 .decode_ranges
                 .into_iter()
                 .map(|range| ThumbDecodeRange {
-                    end: range.end,
                     isa: range.isa,
                     start: range.start,
+                    end: range.end,
+                    blake3: Some(range.blake3),
                 })
                 .collect(),
         }
@@ -558,6 +565,19 @@ fn canonical_hex_u64(value: &str, label: &str) -> Result<u64> {
     Ok(parsed)
 }
 
+fn canonical_blake3(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid_artifact(format!(
+            "{label} must be lowercase BLAKE3 hex"
+        )));
+    }
+    Ok(())
+}
+
 fn invalid_artifact(message: impl Into<String>) -> Error {
     Error::Serialize(format!("invalid Thumb artifact: {}", message.into()))
 }
@@ -647,45 +667,32 @@ fn convert_regions(wires: Vec<RegionWire>) -> Result<Vec<RegionRecord>> {
         .collect()
 }
 
-/// The load address and length of the image a Thumb artifact was produced for.
-/// Every consumer that knows both must supply it: without it a v3 document can
-/// carry in-image decode ranges beside an out-of-image region or function
-/// envelope and still pass validation.
-#[derive(Clone, Copy)]
-pub(crate) struct MappedImage {
-    start: u32,
-    end: u32,
-    len: u32,
-}
-
-impl MappedImage {
-    pub(crate) fn new(start: u32, len: u32) -> Result<Self> {
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| invalid_artifact("mapped image range overflows u32"))?;
-        Ok(Self { start, end, len })
-    }
-}
-
 /// V3 regions are the analyzer's request ledger, so they must lie inside the
-/// same image the functions were normalized against.
-fn validate_v3_regions_in_image(regions: &[RegionRecord], image: MappedImage) -> Result<()> {
-    match regions
-        .iter()
-        .position(|region| region.start < image.start || region.end > image.end)
-    {
-        Some(index) => Err(invalid_artifact(format!(
-            "region {index} is outside mapped image"
-        ))),
-        None => Ok(()),
+/// authenticated byte-backed runtime view used for the records.
+fn validate_v3_regions_in_runtime(
+    regions: &[RegionRecord],
+    runtime: &RuntimeImage<'_>,
+) -> Result<()> {
+    for (index, region) in regions.iter().enumerate() {
+        let size = region
+            .end
+            .checked_sub(region.start)
+            .ok_or_else(|| invalid_artifact(format!("region {index} range wraps")))?;
+        if !runtime
+            .is_byte_backed(region.start, size)
+            .map_err(|error| {
+                invalid_artifact(format!("region {index} is outside runtime image: {error}"))
+            })?
+        {
+            return Err(invalid_artifact(format!(
+                "region {index} crosses virtual zero-fill storage"
+            )));
+        }
     }
+    Ok(())
 }
 
-fn validate_function_value(
-    function: &Value,
-    index: usize,
-    image: Option<MappedImage>,
-) -> Result<(bool, bool, bool)> {
+fn validate_function_value(function: &Value, index: usize) -> Result<(bool, bool, bool)> {
     let wire: FunctionWire = serde_json::from_value(function.clone())
         .map_err(|error| invalid_artifact(format!("invalid v3 function {index}: {error}")))?;
     let entry = canonical_hex_u32(&wire.entry, &format!("function {index} entry"))?;
@@ -699,23 +706,6 @@ fn validate_function_value(
         return Err(invalid_artifact(format!(
             "function {index} size must be positive"
         )));
-    }
-    if let Some(image) = image {
-        if entry < image.start || entry >= image.end {
-            return Err(invalid_artifact(format!(
-                "function {index} entry is outside mapped image"
-            )));
-        }
-        if end > image.end {
-            return Err(invalid_artifact(format!(
-                "function {index} end is outside mapped image"
-            )));
-        }
-        if wire.size > u64::from(image.len) {
-            return Err(invalid_artifact(format!(
-                "function {index} size exceeds mapped image length"
-            )));
-        }
     }
     if wire.body_kind != "thumb_disassembly" {
         return Err(invalid_artifact(format!(
@@ -749,6 +739,10 @@ fn validate_function_value(
                 "function {index} decode range ISA must be thumb"
             )));
         }
+        canonical_blake3(
+            &range.blake3,
+            &format!("function {index} decode_ranges[{range_index}].blake3"),
+        )?;
     }
     for (error_index, error) in wire.decode_range_errors.iter().enumerate() {
         canonical_hex_u32(
@@ -762,59 +756,69 @@ fn validate_function_value(
             )?;
         }
     }
-    let projection = parse_projection(function).map_err(|error| {
+    let accepted = validate_projection_shape(function, entry).map_err(|error| {
         invalid_artifact(format!("invalid v3 function {index} projection: {error}"))
     })?;
-    let accepted = match &projection {
-        ExecutionProjection::Accepted(ranges) => {
-            if !ranges.iter().any(|range| range.start == entry) {
+    if accepted {
+        for (range_index, range) in wire.decode_ranges.iter().enumerate() {
+            let range_start = canonical_hex_u32(
+                &range.start,
+                &format!("function {index} decode_ranges[{range_index}].start"),
+            )?;
+            let range_end = canonical_hex_u32(
+                &range.end,
+                &format!("function {index} decode_ranges[{range_index}].end"),
+            )?;
+            if range_end > end {
                 return Err(invalid_artifact(format!(
-                    "function {index} decode_ranges lack an entry-start range"
+                    "function {index} decode range {range_index} exceeds function end"
                 )));
             }
-            for (range_index, range) in ranges.iter().enumerate() {
-                if range.end > end {
-                    return Err(invalid_artifact(format!(
-                        "function {index} decode range {range_index} exceeds function end"
-                    )));
-                }
-                if image.is_some_and(|image| range.start < image.start || range.end > image.end) {
-                    return Err(invalid_artifact(format!(
-                        "function {index} decode range {range_index} is outside mapped image"
-                    )));
-                }
-                let length = range.end.checked_sub(range.start);
-                if !range.start.is_multiple_of(2)
-                    || length.is_none_or(|length| length == 0 || !length.is_multiple_of(2))
-                {
-                    return Err(invalid_artifact(format!(
-                        "function {index} decode range {range_index} is not canonical Thumb coverage"
-                    )));
-                }
-                if range_index > 0 && range.start <= ranges[range_index - 1].end {
-                    return Err(invalid_artifact(format!(
-                        "function {index} decode_ranges are not sorted, disjoint, and maximally merged"
-                    )));
-                }
-            }
-            true
-        }
-        ExecutionProjection::Quarantined(errors) => {
-            if errors != &canonicalize_errors(errors.clone()) {
+            let length = range_end.checked_sub(range_start);
+            if !range_start.is_multiple_of(2)
+                || length.is_none_or(|length| length == 0 || !length.is_multiple_of(2))
+            {
                 return Err(invalid_artifact(format!(
-                    "function {index} decode_range_errors are not sorted and deduplicated"
+                    "function {index} decode range {range_index} is not canonical Thumb coverage"
                 )));
             }
-            false
         }
-    };
+    }
     Ok((wire.size >= 32, accepted, !accepted))
+}
+
+fn authenticate_function_value(
+    function: &Value,
+    index: usize,
+    owner: FunctionOwner,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<(TaggedExecutionRecord, Option<ExecutionIdentity>)> {
+    let (tagged, _, identity) = validate_inventory_record(function, owner, runtime, budget)
+        .map_err(|error| {
+            invalid_artifact(format!("invalid v3 function {index} execution: {error}"))
+        })?;
+    Ok((tagged, identity))
 }
 
 #[derive(Debug, Clone)]
 struct V3Layout {
-    runs: Vec<FunctionRunRecord>,
+    runs: Vec<V3RunDescriptor>,
     function_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct V3RunDescriptor {
+    record: FunctionRunRecord,
+    owner: FunctionOwner,
+}
+
+impl std::ops::Deref for V3RunDescriptor {
+    type Target = FunctionRunRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
 }
 
 #[derive(Default)]
@@ -825,7 +829,7 @@ struct V3RunCursor {
 }
 
 impl V3RunCursor {
-    fn owner_index(&mut self, runs: &[FunctionRunRecord], function_index: usize) -> Option<usize> {
+    fn owner_index(&mut self, runs: &[V3RunDescriptor], function_index: usize) -> Option<usize> {
         while let Some(run) = runs.get(self.run_index) {
             #[cfg(test)]
             {
@@ -978,7 +982,14 @@ fn validate_v3_metadata(
             next_function = next_function
                 .checked_add(run.function_count)
                 .ok_or_else(|| invalid_artifact("function run index overflow"))?;
-            runs.push(run.clone());
+            runs.push(V3RunDescriptor {
+                record: run.clone(),
+                owner: FunctionOwner::Run {
+                    producer: AnalysisTool::from(run.producer),
+                    region_index,
+                    run_index,
+                },
+            });
         }
     }
     if attempted != declared {
@@ -1001,15 +1012,32 @@ fn validate_v3(
     producers: &[ProducerIdentity],
     regions: &[RegionRecord],
     functions: &[Value],
-    image: Option<MappedImage>,
-) -> Result<Vec<ThumbProducer>> {
+    runtime: &RuntimeImage<'_>,
+) -> Result<(Vec<FunctionOwner>, Vec<Option<ExecutionIdentity>>)> {
+    let owners = validate_v3_shape(producers, regions, functions)?;
+    validate_v3_regions_in_runtime(regions, runtime)?;
+    let mut budget = ExecutionBudget::default();
+    let mut executions = Vec::new();
+    executions
+        .try_reserve_exact(functions.len())
+        .map_err(|_| invalid_artifact("v3 execution allocation failed"))?;
+    for (index, (function, owner)) in functions.iter().zip(&owners).enumerate() {
+        let (_, identity) =
+            authenticate_function_value(function, index, *owner, runtime, &mut budget)?;
+        executions.push(identity);
+    }
+    Ok((owners, executions))
+}
+
+fn validate_v3_shape(
+    producers: &[ProducerIdentity],
+    regions: &[RegionRecord],
+    functions: &[Value],
+) -> Result<Vec<FunctionOwner>> {
     if functions.is_empty() {
         return Err(invalid_artifact("v3 functions array must not be empty"));
     }
     let layout = validate_v3_metadata(producers, regions)?;
-    if let Some(image) = image {
-        validate_v3_regions_in_image(regions, image)?;
-    }
     if layout.function_count != functions.len() {
         return Err(invalid_artifact(
             "every v3 function must have exactly one run owner",
@@ -1027,11 +1055,11 @@ fn validate_v3(
         let mut quarantined = 0usize;
         for (offset, function) in slice.iter().enumerate() {
             let (is_substantial, is_accepted, is_quarantined) =
-                validate_function_value(function, run.first_function + offset, image)?;
+                validate_function_value(function, run.first_function + offset)?;
             substantial += usize::from(is_substantial);
             accepted += usize::from(is_accepted);
             quarantined += usize::from(is_quarantined);
-            owners.push(run.producer);
+            owners.push(run.owner);
         }
         if (run.substantial, run.accepted, run.quarantined) != (substantial, accepted, quarantined)
         {
@@ -1043,20 +1071,86 @@ fn validate_v3(
     Ok(owners)
 }
 
-/// Parse a Thumb sidecar. `image` must be supplied wherever the caller knows
-/// the load address and image length; only then are v3 region bounds and
-/// function envelopes checked against the image they describe.
+fn legacy_execution(
+    function: &Value,
+    index: usize,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<Option<ExecutionIdentity>> {
+    let object = function
+        .as_object()
+        .ok_or_else(|| invalid_artifact(format!("legacy function {index} must be an object")))?;
+    let entry = object.get("entry").and_then(Value::as_str).ok_or_else(|| {
+        invalid_artifact(format!("legacy function {index} entry must be a string"))
+    })?;
+    let entry = canonical_hex_u32(entry, &format!("legacy function {index} entry"))?;
+    let decode_ranges = match object.get("decode_ranges") {
+        Some(Value::Array(ranges)) => ranges.as_slice(),
+        Some(_) => {
+            return Err(invalid_artifact(format!(
+                "legacy function {index} decode_ranges must be an array"
+            )));
+        }
+        None => &[],
+    };
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(decode_ranges.len())
+        .map_err(|_| invalid_artifact("legacy decode-range allocation failed"))?;
+    for (range_index, range) in decode_ranges.iter().enumerate() {
+        let range: ThumbDecodeRange = serde_json::from_value(range.clone()).map_err(|error| {
+            invalid_artifact(format!(
+                "invalid legacy function {index} decode range {range_index}: {error}"
+            ))
+        })?;
+        if range.blake3.is_some() {
+            return Err(invalid_artifact(format!(
+                "legacy function {index} decode range {range_index} contains a fresh hash"
+            )));
+        }
+        let isa = match range.isa.as_str() {
+            "arm" => crate::execution_ranges::DecodeIsa::Arm,
+            "thumb" => crate::execution_ranges::DecodeIsa::Thumb,
+            _ => return Err(invalid_artifact("legacy decode range has unknown ISA")),
+        };
+        extents.push(DecodeExtent {
+            isa,
+            start: canonical_hex_u32(
+                &range.start,
+                &format!("legacy function {index} decode range {range_index} start"),
+            )?,
+            end: canonical_hex_u32(
+                &range.end,
+                &format!("legacy function {index} decode range {range_index} end"),
+            )?,
+        });
+    }
+    validate_legacy_execution(entry, extents, runtime, budget)
+        .map_err(|error| invalid_artifact(format!("legacy function {index} execution: {error}")))
+}
+
+/// Parse a Thumb sidecar and authenticate every explicit execution range
+/// against the supplied raw-plus-scatter runtime view.
 pub(crate) fn parse_thumb_artifact(
     bytes: &[u8],
-    image: Option<MappedImage>,
+    runtime: &RuntimeImage<'_>,
 ) -> Result<ParsedThumbArtifact> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let wire = WireDocument::deserialize(&mut deserializer)
         .and_then(|wire| deserializer.end().map(|()| wire))
         .map_err(|error| Error::Serialize(format!("parse Thumb artifact: {error}")))?;
-    let (format, document, owners) = match wire {
+    let (format, document, owners, executions) = match wire {
         WireDocument::Legacy { format, functions } => {
-            let owners = vec![ThumbProducer::Radare2; functions.len()];
+            let owner = FunctionOwner::Legacy {
+                producer: AnalysisTool::Radare2,
+            };
+            let owners = vec![owner; functions.len()];
+            let mut budget = ExecutionBudget::default();
+            let executions = functions
+                .iter()
+                .enumerate()
+                .map(|(index, function)| legacy_execution(function, index, runtime, &mut budget))
+                .collect::<Result<Vec<_>>>()?;
             (
                 format,
                 ThumbDocument {
@@ -1065,6 +1159,7 @@ pub(crate) fn parse_thumb_artifact(
                     functions,
                 },
                 owners,
+                executions,
             )
         }
         WireDocument::V3 {
@@ -1074,7 +1169,7 @@ pub(crate) fn parse_thumb_artifact(
         } => {
             let producers = convert_producers(producers)?;
             let regions = convert_regions(regions)?;
-            let owners = validate_v3(&producers, &regions, &functions, image)?;
+            let (owners, executions) = validate_v3(&producers, &regions, &functions, runtime)?;
             (
                 ThumbFormat::V3,
                 ThumbDocument {
@@ -1083,6 +1178,7 @@ pub(crate) fn parse_thumb_artifact(
                     functions,
                 },
                 owners,
+                executions,
             )
         }
     };
@@ -1091,6 +1187,7 @@ pub(crate) fn parse_thumb_artifact(
         format,
         document,
         owners,
+        executions,
         original_functions,
         source_blake3: crate::manifest::blake3_bytes(bytes),
     })
@@ -1098,9 +1195,9 @@ pub(crate) fn parse_thumb_artifact(
 
 pub(crate) fn read_thumb_artifact(
     path: &Path,
-    image: Option<MappedImage>,
+    runtime: &RuntimeImage<'_>,
 ) -> Result<ParsedThumbArtifact> {
-    parse_thumb_artifact(&std::fs::read(path)?, image)
+    parse_thumb_artifact(&std::fs::read(path)?, runtime)
 }
 
 /// Load consumer-facing Thumb records directly from a buffered JSON reader.
@@ -1108,14 +1205,11 @@ pub(crate) fn read_thumb_artifact(
 /// only typed records (not a document-wide `Value` tree) are retained.
 pub(crate) fn read_thumb_functions_streaming(
     path: &Path,
-    image: Option<MappedImage>,
+    runtime: &RuntimeImage<'_>,
 ) -> Result<Vec<OwnedThumbFunction>> {
     let file = std::fs::File::open(path)?;
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
-    let mut scan = TypedFunctionScan {
-        image,
-        ..TypedFunctionScan::default()
-    };
+    let mut scan = TypedFunctionScan::new(runtime);
     let parsed = deserializer.deserialize_map(TypedFunctionVisitor { scan: &mut scan });
     parsed
         .and_then(|()| deserializer.end())
@@ -1123,9 +1217,9 @@ pub(crate) fn read_thumb_functions_streaming(
     scan.finish()
 }
 
-#[derive(Default)]
-struct TypedFunctionScan {
-    image: Option<MappedImage>,
+struct TypedFunctionScan<'runtime, 'data> {
+    runtime: &'runtime RuntimeImage<'data>,
+    budget: ExecutionBudget,
     format: Option<ThumbFormat>,
     saw_producers: bool,
     saw_regions: bool,
@@ -1136,7 +1230,22 @@ struct TypedFunctionScan {
     functions: Vec<OwnedThumbFunction>,
 }
 
-impl TypedFunctionScan {
+impl<'runtime, 'data> TypedFunctionScan<'runtime, 'data> {
+    fn new(runtime: &'runtime RuntimeImage<'data>) -> Self {
+        Self {
+            runtime,
+            budget: ExecutionBudget::default(),
+            format: None,
+            saw_producers: false,
+            saw_regions: false,
+            saw_functions: false,
+            layout: None,
+            run_cursor: V3RunCursor::default(),
+            observed: Vec::new(),
+            functions: Vec::new(),
+        }
+    }
+
     fn set_v3_metadata(
         &mut self,
         producers: Vec<ProducerWire>,
@@ -1145,21 +1254,29 @@ impl TypedFunctionScan {
         let producers = convert_producers(producers)?;
         let regions = convert_regions(regions)?;
         let layout = validate_v3_metadata(&producers, &regions)?;
-        if let Some(image) = self.image {
-            validate_v3_regions_in_image(&regions, image)?;
-        }
+        validate_v3_regions_in_runtime(&regions, self.runtime)?;
         self.observed = vec![RunCounts::default(); layout.runs.len()];
         self.run_cursor = V3RunCursor::default();
         self.layout = Some(layout);
         Ok(())
     }
 
-    fn push_legacy(&mut self, function: ThumbFunctionRecord) {
+    fn push_legacy(&mut self, function: ThumbFunctionRecord) -> Result<()> {
+        let function_index = self.functions.len();
+        let value = serde_json::to_value(&function).map_err(|error| {
+            invalid_artifact(format!(
+                "legacy function {function_index} cannot be rendered: {error}"
+            ))
+        })?;
+        let execution = legacy_execution(&value, function_index, self.runtime, &mut self.budget)?;
         self.functions.push(OwnedThumbFunction {
-            producer: ThumbProducer::Radare2,
-            legacy_range_semantics: true,
+            owner: FunctionOwner::Legacy {
+                producer: AnalysisTool::Radare2,
+            },
+            execution,
             function,
         });
+        Ok(())
     }
 
     fn push_v3(&mut self, function: FunctionWire) -> Result<()> {
@@ -1169,8 +1286,7 @@ impl TypedFunctionScan {
                 "v3 function {function_index} cannot be rendered: {error}"
             ))
         })?;
-        let (substantial, accepted, quarantined) =
-            validate_function_value(&value, function_index, self.image)?;
+        let (substantial, accepted, quarantined) = validate_function_value(&value, function_index)?;
         let layout = self.layout.as_ref().ok_or_else(|| {
             invalid_artifact("v3 artifact lacks validated producer and region metadata")
         })?;
@@ -1181,13 +1297,20 @@ impl TypedFunctionScan {
             ));
         };
         let run = &layout.runs[run_index];
+        let (_, execution) = authenticate_function_value(
+            &value,
+            function_index,
+            run.owner,
+            self.runtime,
+            &mut self.budget,
+        )?;
         let observed = &mut self.observed[run_index];
         observed.substantial += usize::from(substantial);
         observed.accepted += usize::from(accepted);
         observed.quarantined += usize::from(quarantined);
         self.functions.push(OwnedThumbFunction {
-            producer: run.producer,
-            legacy_range_semantics: false,
+            owner: run.owner,
+            execution,
             function: function.into(),
         });
         Ok(())
@@ -1227,11 +1350,11 @@ impl TypedFunctionScan {
     }
 }
 
-struct TypedFunctionVisitor<'a> {
-    scan: &'a mut TypedFunctionScan,
+struct TypedFunctionVisitor<'scan, 'runtime, 'data> {
+    scan: &'scan mut TypedFunctionScan<'runtime, 'data>,
 }
 
-impl<'de> Visitor<'de> for TypedFunctionVisitor<'_> {
+impl<'de> Visitor<'de> for TypedFunctionVisitor<'_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1320,11 +1443,11 @@ impl<'de> Visitor<'de> for TypedFunctionVisitor<'_> {
     }
 }
 
-struct TypedLegacyFunctions<'a> {
-    scan: &'a mut TypedFunctionScan,
+struct TypedLegacyFunctions<'scan, 'runtime, 'data> {
+    scan: &'scan mut TypedFunctionScan<'runtime, 'data>,
 }
 
-impl<'de> DeserializeSeed<'de> for TypedLegacyFunctions<'_> {
+impl<'de> DeserializeSeed<'de> for TypedLegacyFunctions<'_, '_, '_> {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
@@ -1335,7 +1458,7 @@ impl<'de> DeserializeSeed<'de> for TypedLegacyFunctions<'_> {
     }
 }
 
-impl<'de> Visitor<'de> for TypedLegacyFunctions<'_> {
+impl<'de> Visitor<'de> for TypedLegacyFunctions<'_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1347,17 +1470,17 @@ impl<'de> Visitor<'de> for TypedLegacyFunctions<'_> {
         A: SeqAccess<'de>,
     {
         while let Some(function) = seq.next_element::<ThumbFunctionRecord>()? {
-            self.scan.push_legacy(function);
+            self.scan.push_legacy(function).map_err(de::Error::custom)?;
         }
         Ok(())
     }
 }
 
-struct TypedV3Functions<'a> {
-    scan: &'a mut TypedFunctionScan,
+struct TypedV3Functions<'scan, 'runtime, 'data> {
+    scan: &'scan mut TypedFunctionScan<'runtime, 'data>,
 }
 
-impl<'de> DeserializeSeed<'de> for TypedV3Functions<'_> {
+impl<'de> DeserializeSeed<'de> for TypedV3Functions<'_, '_, '_> {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
@@ -1368,7 +1491,7 @@ impl<'de> DeserializeSeed<'de> for TypedV3Functions<'_> {
     }
 }
 
-impl<'de> Visitor<'de> for TypedV3Functions<'_> {
+impl<'de> Visitor<'de> for TypedV3Functions<'_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1390,13 +1513,12 @@ impl<'de> Visitor<'de> for TypedV3Functions<'_> {
 /// value at a time. V3 metadata is fully validated before the function stream.
 pub(crate) fn validate_thumb_inventory_streaming(
     path: &Path,
-    image_start: u32,
-    image_len: u32,
+    runtime: &RuntimeImage<'_>,
     expected_substantial: usize,
 ) -> Result<ValidatedThumbInventory> {
     let file = std::fs::File::open(path)?;
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
-    let mut scan = ThumbScan::new(image_start, image_len);
+    let mut scan = ThumbScan::new(runtime);
     let parsed = deserializer.deserialize_any(ThumbInventoryVisitor { scan: &mut scan });
     match parsed.and_then(|()| deserializer.end()) {
         Ok(()) => scan.finish(expected_substantial),
@@ -1473,7 +1595,8 @@ impl ParsedThumbArtifact {
         {
           "end": "0x4008",
           "isa": "thumb",
-          "start": "0x4000"
+          "start": "0x4000",
+          "blake3": "71e0a99173564931c0b8acc52d2685a8e39c64dc52e3d02390fdac2a12b155cb"
         }
       ],
       "end": "0x4020",
@@ -1532,15 +1655,15 @@ impl ParsedThumbArtifact {
             {
               "name":"r2_same_entry","entry":"0x1000","end":"0x1002","size":2,
               "body_kind":"thumb_disassembly","body":"0x1000 bx lr\n","data_refs":[],
-              "decode_ranges":[{"end":"0x1002","isa":"thumb","start":"0x1000"}],
+              "decode_ranges":[{"end":"0x1002","isa":"thumb","start":"0x1000","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"}],
               "decode_range_errors":[]
             },
             {
               "name":"rizin_same_entry","entry":"0x1000","end":"0x1100","size":256,
               "body_kind":"thumb_disassembly","body":"0x1000 push {lr}\n0x1080 bx lr\n","data_refs":[],
               "decode_ranges":[
-                {"end":"0x1010","isa":"thumb","start":"0x1000"},
-                {"end":"0x1090","isa":"thumb","start":"0x1080"}
+                {"end":"0x1010","isa":"thumb","start":"0x1000","blake3":"e572dff82304700b856a555ac3a4558d0df3646a3727816500270a93c66aac1e"},
+                {"end":"0x1090","isa":"thumb","start":"0x1080","blake3":"e572dff82304700b856a555ac3a4558d0df3646a3727816500270a93c66aac1e"}
               ],
               "decode_range_errors":[]
             }
@@ -1556,14 +1679,14 @@ struct RunCounts {
     quarantined: usize,
 }
 
-struct ThumbScan {
-    image_start: u32,
-    image_len: u32,
+struct ThumbScan<'runtime, 'data> {
+    runtime: &'runtime RuntimeImage<'data>,
+    budget: ExecutionBudget,
     raw_count: usize,
     substantial: usize,
     accepted: usize,
     quarantined: usize,
-    accepted_identities: BTreeSet<ExecutionIdentity>,
+    accepted_executions: BTreeSet<OwnedExecutionIdentity>,
     records: Vec<TaggedExecutionRecord>,
     format: Option<ThumbFormat>,
     saw_producers: bool,
@@ -1579,16 +1702,16 @@ struct ThumbScan {
     validation_error: Option<Error>,
 }
 
-impl ThumbScan {
-    fn new(image_start: u32, image_len: u32) -> Self {
+impl<'runtime, 'data> ThumbScan<'runtime, 'data> {
+    fn new(runtime: &'runtime RuntimeImage<'data>) -> Self {
         Self {
-            image_start,
-            image_len,
+            runtime,
+            budget: ExecutionBudget::default(),
             raw_count: 0,
             substantial: 0,
             accepted: 0,
             quarantined: 0,
-            accepted_identities: BTreeSet::new(),
+            accepted_executions: BTreeSet::new(),
             records: Vec::new(),
             format: None,
             saw_producers: false,
@@ -1621,14 +1744,7 @@ impl ThumbScan {
             self.shape_invalid("unsupported Thumb functions inventory format");
             return;
         };
-        let image = match MappedImage::new(self.image_start, self.image_len) {
-            Ok(image) => image,
-            Err(error) => {
-                self.artifact_invalid(error);
-                return;
-            }
-        };
-        if let Err(error) = validate_v3_regions_in_image(&regions, image) {
+        if let Err(error) = validate_v3_regions_in_runtime(&regions, self.runtime) {
             self.artifact_invalid(error);
             return;
         }
@@ -1645,19 +1761,16 @@ impl ThumbScan {
 
     fn record(&mut self, record: Value) {
         let function_index = self.raw_count;
-        self.raw_count += 1;
+        let Some(raw_count) = self.raw_count.checked_add(1) else {
+            self.validation_error = Some(invalid("Thumb function count overflow"));
+            return;
+        };
+        self.raw_count = raw_count;
         if self.shape_error.is_some() {
             return;
         }
-        if self.format == Some(ThumbFormat::V3) {
-            let image = match MappedImage::new(self.image_start, self.image_len) {
-                Ok(image) => image,
-                Err(error) => {
-                    self.artifact_invalid(error);
-                    return;
-                }
-            };
-            match validate_function_value(&record, function_index, Some(image)) {
+        let owner = if self.format == Some(ThumbFormat::V3) {
+            match validate_function_value(&record, function_index) {
                 Ok((substantial, accepted, quarantined)) => {
                     let run_index = self.v3_layout.as_ref().and_then(|layout| {
                         self.v3_run_cursor.owner_index(&layout.runs, function_index)
@@ -1670,13 +1783,18 @@ impl ThumbScan {
                     observed.substantial += usize::from(substantial);
                     observed.accepted += usize::from(accepted);
                     observed.quarantined += usize::from(quarantined);
+                    self.v3_layout.as_ref().unwrap().runs[run_index].owner
                 }
                 Err(error) => {
                     self.artifact_invalid(error);
                     return;
                 }
             }
-        }
+        } else {
+            FunctionOwner::Legacy {
+                producer: AnalysisTool::Radare2,
+            }
+        };
         if self.size_error.is_none() {
             let Some(size) = record.get("size").and_then(Value::as_u64) else {
                 self.size_error = Some(Error::Serialize(
@@ -1696,12 +1814,39 @@ impl ThumbScan {
         if self.validation_error.is_some() {
             return;
         }
-        match validate_inventory_record(&record, self.image_start, self.image_len) {
+        let validated = if self.format == Some(ThumbFormat::V3) {
+            validate_inventory_record(&record, owner, self.runtime, &mut self.budget)
+        } else {
+            let identity =
+                legacy_execution(&record, function_index, self.runtime, &mut self.budget);
+            identity.and_then(|identity| {
+                let entry = record
+                    .get("entry")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_artifact("legacy function entry must be a string"))
+                    .and_then(|entry| canonical_hex_u32(entry, "legacy function entry"))?;
+                let projection = match &identity {
+                    Some(identity) => ExecutionProjection::Accepted(identity.decode_ranges.clone()),
+                    None => legacy_non_execution_projection(&record, entry)?,
+                };
+                Ok((
+                    TaggedExecutionRecord {
+                        owner,
+                        entry,
+                        projection: projection.clone(),
+                    },
+                    projection,
+                    identity,
+                ))
+            })
+        };
+        match validated {
             Ok((tagged, _, identity)) => match identity {
                 Some(identity) => match self.accepted.checked_add(1) {
                     Some(accepted) => {
                         self.accepted = accepted;
-                        self.accepted_identities.insert(identity);
+                        self.accepted_executions
+                            .insert(OwnedExecutionIdentity { owner, identity });
                         self.records.push(tagged);
                     }
                     None => {
@@ -1817,7 +1962,7 @@ impl ThumbScan {
                 raw_count: self.raw_count,
                 accepted: self.accepted,
                 quarantined: self.quarantined,
-                accepted_identities: self.accepted_identities.into_iter().collect(),
+                accepted_executions: self.accepted_executions.into_iter().collect(),
                 records: self.records,
             },
             metadata: ThumbTerminalMetadata {
@@ -1830,11 +1975,11 @@ impl ThumbScan {
     }
 }
 
-struct ThumbInventoryVisitor<'a> {
-    scan: &'a mut ThumbScan,
+struct ThumbInventoryVisitor<'scan, 'runtime, 'data> {
+    scan: &'scan mut ThumbScan<'runtime, 'data>,
 }
 
-impl<'de, 'a> Visitor<'de> for ThumbInventoryVisitor<'a> {
+impl<'de> Visitor<'de> for ThumbInventoryVisitor<'_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1960,12 +2105,12 @@ impl<'de, 'a> Visitor<'de> for ThumbInventoryVisitor<'a> {
     }
 }
 
-struct FunctionsSeq<'a> {
-    scan: &'a mut ThumbScan,
+struct FunctionsSeq<'scan, 'runtime, 'data> {
+    scan: &'scan mut ThumbScan<'runtime, 'data>,
     strict_v3: bool,
 }
 
-impl<'de, 'a> DeserializeSeed<'de> for FunctionsSeq<'a> {
+impl<'de> DeserializeSeed<'de> for FunctionsSeq<'_, '_, '_> {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
@@ -1976,7 +2121,7 @@ impl<'de, 'a> DeserializeSeed<'de> for FunctionsSeq<'a> {
     }
 }
 
-impl<'de, 'a> Visitor<'de> for FunctionsSeq<'a> {
+impl<'de> Visitor<'de> for FunctionsSeq<'_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2064,8 +2209,20 @@ pub(super) fn render_fragment(value: &Value) -> Result<String> {
 /// Validate one normalized v3 function after backend-specific evidence has
 /// been injected, then render it for a fragment spill.
 pub(super) fn render_v3_fragment(value: &Value, function_index: usize) -> Result<String> {
-    validate_function_value(value, function_index, None)?;
-    render_fragment(value)
+    validate_function_value(value, function_index)?;
+    render_v3_function(value)
+}
+
+fn render_v3_function(value: &Value) -> Result<String> {
+    let function: FunctionWire = serde_json::from_value(value.clone())
+        .map_err(|error| invalid_artifact(format!("invalid v3 function: {error}")))?;
+    let pretty = serde_json::to_string_pretty(&function)
+        .map_err(|error| Error::Serialize(error.to_string()))?;
+    Ok(pretty
+        .split('\n')
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// One spill slot is stored as `[u32 LE index][u32 LE length][fragment]`.
@@ -2173,27 +2330,6 @@ struct ProducerOutput<'a> {
     command: &'a str,
 }
 
-#[derive(Serialize)]
-struct LegacyOutput<'a> {
-    format: &'static str,
-    functions: &'a [Value],
-}
-
-fn write_legacy_into<W: Write>(
-    writer: &mut W,
-    format: ThumbFormat,
-    functions: &[Value],
-) -> Result<()> {
-    serde_json::to_writer_pretty(
-        writer,
-        &LegacyOutput {
-            format: format.as_str(),
-            functions,
-        },
-    )
-    .map_err(|error| Error::Serialize(error.to_string()))
-}
-
 fn producer_output(producers: &[ProducerIdentity]) -> Result<Vec<ProducerOutput<'_>>> {
     producers
         .iter()
@@ -2249,28 +2385,67 @@ fn write_v3_values_into<W: Write>(
         if index != 0 {
             writer.write_all(b",\n")?;
         }
-        writer.write_all(render_fragment(function)?.as_bytes())?;
+        writer.write_all(render_v3_function(function)?.as_bytes())?;
     }
     writer.write_all(b"\n  ]\n}")?;
     Ok(())
 }
 
-/// Atomically rewrite a Thumb artifact one function at a time. V3 metadata,
-/// ownership, function order, and producer fields are validated and preserved;
-/// legacy mutations retain the established v1-to-v2 promotion. A semantic
-/// no-op drops the temporary file and leaves the source bytes untouched.
-/// Atomically rewrite each function record in place, handing the mutator the
-/// record's validated run owner: a v3 region may hold same-entry records from
-/// different producers, so an address-only mutation cannot identify them.
-/// V1/v2 records report `radare2`, the owner their format implies.
-pub(crate) fn stream_rewrite_thumb_functions<F>(path: &Path, on_function: F) -> Result<()>
-where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
-{
+struct FormatProbe;
+
+impl<'de> Visitor<'de> for FormatProbe {
+    type Value = ThumbFormat;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Thumb artifact object beginning with format")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        expect_key(&mut map, "format")?;
+        let raw_format = map.next_value::<String>()?;
+        let format = ThumbFormat::parse(&raw_format)
+            .ok_or_else(|| de::Error::custom("unsupported Thumb artifact format"))?;
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value::<IgnoredAny>()?;
+        }
+        Ok(format)
+    }
+}
+
+fn probe_thumb_format(path: &Path) -> Result<ThumbFormat> {
     let input = std::fs::File::open(path)?;
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
-    let mut scan =
-        ThumbRewriteScan::new(atomic_write_file::AtomicWriteFile::open(path)?, on_function);
+    deserializer
+        .deserialize_map(FormatProbe)
+        .and_then(|format| deserializer.end().map(|()| format))
+        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))
+}
+
+/// Atomically rewrite a current v3 artifact one function at a time. The format
+/// preflight rejects retained v1/v2 before an `AtomicWriteFile` is opened.
+pub(crate) fn stream_rewrite_thumb_functions<F>(
+    path: &Path,
+    runtime: &RuntimeImage<'_>,
+    on_function: F,
+) -> Result<()>
+where
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
+{
+    if probe_thumb_format(path)? != ThumbFormat::V3 {
+        return Err(invalid_artifact(
+            "legacy Thumb artifacts are read-only replay inputs",
+        ));
+    }
+    let input = std::fs::File::open(path)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
+    let mut scan = ThumbRewriteScan::new(
+        atomic_write_file::AtomicWriteFile::open(path)?,
+        runtime,
+        on_function,
+    );
     let parsed = deserializer.deserialize_map(ThumbRewriteVisitor { scan: &mut scan });
     parsed
         .and_then(|()| deserializer.end())
@@ -2293,8 +2468,10 @@ const V3_IMMUTABLE_FUNCTION_FIELDS: [&str; 8] = [
     "decode_range_errors",
 ];
 
-struct ThumbRewriteScan<F> {
+struct ThumbRewriteScan<'runtime, 'data, F> {
     output: atomic_write_file::AtomicWriteFile,
+    runtime: &'runtime RuntimeImage<'data>,
+    budget: ExecutionBudget,
     on_function: F,
     format: Option<ThumbFormat>,
     producers: Vec<ProducerIdentity>,
@@ -2307,13 +2484,19 @@ struct ThumbRewriteScan<F> {
     wrote_function: bool,
 }
 
-impl<F> ThumbRewriteScan<F>
+impl<'runtime, 'data, F> ThumbRewriteScan<'runtime, 'data, F>
 where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
-    fn new(output: atomic_write_file::AtomicWriteFile, on_function: F) -> Self {
+    fn new(
+        output: atomic_write_file::AtomicWriteFile,
+        runtime: &'runtime RuntimeImage<'data>,
+        on_function: F,
+    ) -> Self {
         Self {
             output,
+            runtime,
+            budget: ExecutionBudget::default(),
             on_function,
             format: None,
             producers: Vec::new(),
@@ -2335,17 +2518,11 @@ where
         self.producers = convert_producers(producers)?;
         self.regions = convert_regions(regions)?;
         let layout = validate_v3_metadata(&self.producers, &self.regions)?;
+        validate_v3_regions_in_runtime(&self.regions, self.runtime)?;
         self.observed = vec![RunCounts::default(); layout.runs.len()];
         self.run_cursor = V3RunCursor::default();
         self.layout = Some(layout);
         Ok(())
-    }
-
-    fn rewrite_legacy(&mut self, mut function: Value) -> Result<()> {
-        let original = function.clone();
-        (self.on_function)(ThumbProducer::Radare2, &mut function)?;
-        self.changed |= function != original;
-        self.write_function(&function)
     }
 
     fn rewrite_v3(&mut self, function: FunctionWire) -> Result<()> {
@@ -2357,7 +2534,7 @@ where
         })?;
         let original = function.clone();
         // Ownership is resolved before the mutation so the callback can key by
-        // producer; the cursor stays monotonic because `write_function`
+        // the concrete run; the cursor stays monotonic because `write_function`
         // advances `function_count` exactly once per record.
         let layout = self.layout.as_ref().ok_or_else(|| {
             invalid_artifact("v3 artifact lacks validated producer and region metadata")
@@ -2370,8 +2547,15 @@ where
                 "every v3 function must have exactly one run owner",
             ));
         };
-        let producer = layout.runs[run_index].producer;
-        (self.on_function)(producer, &mut function)?;
+        let owner = layout.runs[run_index].owner;
+        let (_, identity) = authenticate_function_value(
+            &function,
+            self.function_count,
+            owner,
+            self.runtime,
+            &mut self.budget,
+        )?;
+        (self.on_function)(owner, identity.as_ref(), &mut function)?;
         validate_v3_function_mutation(
             &original,
             &function,
@@ -2379,7 +2563,7 @@ where
             &V3_IMMUTABLE_FUNCTION_FIELDS,
         )?;
         let (substantial, accepted, quarantined) =
-            validate_function_value(&function, self.function_count, None)?;
+            validate_function_value(&function, self.function_count)?;
         let observed = &mut self.observed[run_index];
         observed.substantial += usize::from(substantial);
         observed.accepted += usize::from(accepted);
@@ -2392,30 +2576,23 @@ where
         if self.wrote_function {
             self.output.write_all(b",\n")?;
         } else {
-            match self
-                .format
-                .ok_or_else(|| invalid_artifact("missing Thumb artifact format"))?
-            {
-                ThumbFormat::V1 | ThumbFormat::V2 => {
-                    self.output.write_all(b"{\n  \"format\": \"")?;
-                    self.output.write_all(THUMB_V2_FORMAT.as_bytes())?;
-                    self.output.write_all(b"\",\n  \"functions\": [\n")?;
-                }
-                ThumbFormat::V3 => {
-                    let producer_output = producer_output(&self.producers)?;
-                    self.output.write_all(b"{\n  \"format\": \"")?;
-                    self.output.write_all(THUMB_V3_FORMAT.as_bytes())?;
-                    self.output.write_all(b"\",\n  \"producers\": ")?;
-                    write_pretty_value(&mut self.output, &producer_output, "  ")?;
-                    self.output.write_all(b",\n  \"regions\": ")?;
-                    write_pretty_value(&mut self.output, &self.regions, "  ")?;
-                    self.output.write_all(b",\n  \"functions\": [\n")?;
-                }
+            if self.format != Some(ThumbFormat::V3) {
+                return Err(invalid_artifact(
+                    "legacy Thumb artifacts are read-only replay inputs",
+                ));
             }
+            let producer_output = producer_output(&self.producers)?;
+            self.output.write_all(b"{\n  \"format\": \"")?;
+            self.output.write_all(THUMB_V3_FORMAT.as_bytes())?;
+            self.output.write_all(b"\",\n  \"producers\": ")?;
+            write_pretty_value(&mut self.output, &producer_output, "  ")?;
+            self.output.write_all(b",\n  \"regions\": ")?;
+            write_pretty_value(&mut self.output, &self.regions, "  ")?;
+            self.output.write_all(b",\n  \"functions\": [\n")?;
             self.wrote_function = true;
         }
         self.output
-            .write_all(render_fragment(function)?.as_bytes())?;
+            .write_all(render_v3_function(function)?.as_bytes())?;
         self.function_count = self
             .function_count
             .checked_add(1)
@@ -2457,13 +2634,13 @@ where
     }
 }
 
-struct ThumbRewriteVisitor<'a, F> {
-    scan: &'a mut ThumbRewriteScan<F>,
+struct ThumbRewriteVisitor<'a, 'runtime, 'data, F> {
+    scan: &'a mut ThumbRewriteScan<'runtime, 'data, F>,
 }
 
-impl<'de, F> Visitor<'de> for ThumbRewriteVisitor<'_, F>
+impl<'de, F> Visitor<'de> for ThumbRewriteVisitor<'_, '_, '_, F>
 where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2490,17 +2667,9 @@ where
 
         match format {
             ThumbFormat::V1 | ThumbFormat::V2 => {
-                let key = map
-                    .next_key::<String>()?
-                    .ok_or_else(|| de::Error::missing_field("functions"))?;
-                if key != "functions" {
-                    return Err(de::Error::custom(format!(
-                        "expected top-level field \"functions\", found {key:?}"
-                    )));
-                }
-                map.next_value_seed(RewriteLegacyFunctions {
-                    scan: &mut *self.scan,
-                })?;
+                return Err(de::Error::custom(
+                    "legacy Thumb artifacts are read-only replay inputs",
+                ));
             }
             ThumbFormat::V3 => {
                 let key = map
@@ -2546,13 +2715,13 @@ where
     }
 }
 
-struct RewriteLegacyFunctions<'a, F> {
-    scan: &'a mut ThumbRewriteScan<F>,
+struct RewriteV3Functions<'a, 'runtime, 'data, F> {
+    scan: &'a mut ThumbRewriteScan<'runtime, 'data, F>,
 }
 
-impl<'de, F> DeserializeSeed<'de> for RewriteLegacyFunctions<'_, F>
+impl<'de, F> DeserializeSeed<'de> for RewriteV3Functions<'_, '_, '_, F>
 where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2564,50 +2733,9 @@ where
     }
 }
 
-impl<'de, F> Visitor<'de> for RewriteLegacyFunctions<'_, F>
+impl<'de, F> Visitor<'de> for RewriteV3Functions<'_, '_, '_, F>
 where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
-{
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a Thumb functions array")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while let Some(function) = seq.next_element::<Value>()? {
-            self.scan
-                .rewrite_legacy(function)
-                .map_err(de::Error::custom)?;
-        }
-        Ok(())
-    }
-}
-
-struct RewriteV3Functions<'a, F> {
-    scan: &'a mut ThumbRewriteScan<F>,
-}
-
-impl<'de, F> DeserializeSeed<'de> for RewriteV3Functions<'_, F>
-where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
-{
-    type Value = ();
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_seq(self)
-    }
-}
-
-impl<'de, F> Visitor<'de> for RewriteV3Functions<'_, F>
-where
-    F: FnMut(ThumbProducer, &mut Value) -> Result<()>,
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
     type Value = ();
 
@@ -2626,14 +2754,14 @@ where
     }
 }
 
-/// Atomically rewrite a top-level JSON array while retaining at most one
-/// element at a time. A no-op leaves the original bytes untouched.
-pub(crate) fn stream_rewrite_json_array<F>(path: &Path, on_element: F) -> Result<()>
+/// Atomically rewrite a supplied top-level JSON array snapshot while retaining
+/// at most one element at a time. The caller can validate that exact snapshot
+/// before mutation; a no-op leaves the destination bytes untouched.
+pub(crate) fn stream_rewrite_json_array<F>(path: &Path, source: &[u8], on_element: F) -> Result<()>
 where
     F: FnMut(&mut Value) -> Result<()>,
 {
-    let input = std::fs::File::open(path)?;
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
+    let mut deserializer = serde_json::Deserializer::from_slice(source);
     let mut scan = ArrayRewriteScan {
         output: atomic_write_file::AtomicWriteFile::open(path)?,
         on_element,
@@ -2753,7 +2881,7 @@ fn validate_v3_assembly_layout(
             let bytes = spill.read_slot(slot)?;
             let function = parse_v3_fragment(&bytes, run_index, slot_index)?;
             let (substantial, accepted, quarantined) =
-                validate_function_value(&function, run.first_function + slot_index, None)?;
+                validate_function_value(&function, run.first_function + slot_index)?;
             observed.substantial += usize::from(substantial);
             observed.accepted += usize::from(accepted);
             observed.quarantined += usize::from(quarantined);
@@ -2798,7 +2926,7 @@ pub(crate) fn assemble_v3_into<W: Write>(
             first = false;
             let bytes = spill.read_slot(slot)?;
             let function = parse_v3_fragment(&bytes, run_index, slot_index)?;
-            writer.write_all(render_fragment(&function)?.as_bytes())?;
+            writer.write_all(render_v3_function(&function)?.as_bytes())?;
         }
     }
     writer.write_all(b"\n  ]\n}")?;
@@ -2823,32 +2951,48 @@ pub(crate) fn assemble_v3_atomic(
 
 #[cfg(test)]
 mod tests {
-    /// Context-free shims: most cases assert document-shape rules that do not
-    /// depend on a mapped image. Image-aware cases call the real entry points
-    /// with an explicit `Some(MappedImage)`.
+    static TEST_IMAGE: [u8; 0x10_000] = [0; 0x10_000];
+
+    fn test_runtime() -> RuntimeImage<'static> {
+        RuntimeImage::from_plan(&TEST_IMAGE, 0x1000, None).unwrap()
+    }
+
     fn parse_thumb_artifact(bytes: &[u8]) -> Result<ParsedThumbArtifact> {
-        super::parse_thumb_artifact(bytes, None)
+        super::parse_thumb_artifact(bytes, &test_runtime())
     }
 
     fn read_thumb_functions_streaming(path: &Path) -> Result<Vec<OwnedThumbFunction>> {
-        super::read_thumb_functions_streaming(path, None)
+        super::read_thumb_functions_streaming(path, &test_runtime())
     }
 
     fn read_thumb_artifact(path: &Path) -> Result<ParsedThumbArtifact> {
-        super::read_thumb_artifact(path, None)
+        super::read_thumb_artifact(path, &test_runtime())
+    }
+
+    fn validate_test_inventory(
+        path: &Path,
+        expected_substantial: usize,
+    ) -> Result<ValidatedThumbInventory> {
+        super::validate_thumb_inventory_streaming(path, &test_runtime(), expected_substantial)
     }
 
     use super::*;
+    use crate::analysis_tool::AnalysisTool;
+    use crate::execution_ranges::FunctionOwner;
+    use crate::runtime_image::RuntimeImage;
     use crate::thumb_analysis::ThumbProducer;
     use serde_json::{Value, json};
 
     fn function(entry: &str, end: &str, size: u64) -> Value {
+        let start = canonical_hex_u32(entry, "test function entry").unwrap();
+        let end_address = canonical_hex_u32(end, "test function end").unwrap();
+        let digest = blake3::hash(&vec![0; usize::try_from(end_address - start).unwrap()]);
         json!({
             "body": "bx lr\n",
             "body_kind": "thumb_disassembly",
             "data_refs": [],
             "decode_range_errors": [],
-            "decode_ranges": [{"end": end, "isa": "thumb", "start": entry}],
+            "decode_ranges": [{"end": end, "isa": "thumb", "start": entry, "blake3": digest.to_hex().to_string()}],
             "end": end,
             "entry": entry,
             "name": format!("fcn.{}", entry.trim_start_matches("0x")),
@@ -2945,6 +3089,151 @@ mod tests {
         .into_bytes()
     }
 
+    fn authenticated_v3(runtime_bytes: &[u8]) -> Value {
+        let mut document = valid_v3();
+        for function in document["functions"].as_array_mut().unwrap() {
+            for range in function["decode_ranges"].as_array_mut().unwrap() {
+                let start =
+                    canonical_hex_u32(range["start"].as_str().unwrap(), "test start").unwrap();
+                let end = canonical_hex_u32(range["end"].as_str().unwrap(), "test end").unwrap();
+                let start = usize::try_from(start - 0x1000).unwrap();
+                let end = usize::try_from(end - 0x1000).unwrap();
+                range["blake3"] = json!(
+                    blake3::hash(&runtime_bytes[start..end])
+                        .to_hex()
+                        .to_string()
+                );
+            }
+        }
+        document
+    }
+
+    #[test]
+    fn v3_function_exposes_region_and_run_owner() {
+        let runtime_bytes = vec![0u8; 0x1100];
+        let runtime = RuntimeImage::from_plan(&runtime_bytes, 0x1000, None).unwrap();
+        let bytes = canonical_v3(&authenticated_v3(&runtime_bytes));
+
+        let artifact = super::parse_thumb_artifact(&bytes, &runtime).unwrap();
+        let owners = artifact
+            .functions()
+            .map(|function| function.owner)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            owners,
+            [
+                FunctionOwner::Run {
+                    producer: AnalysisTool::Radare2,
+                    region_index: 0,
+                    run_index: 0,
+                },
+                FunctionOwner::Run {
+                    producer: AnalysisTool::Rizin,
+                    region_index: 1,
+                    run_index: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn v3_missing_or_wrong_range_hash_is_rejected() {
+        let runtime_bytes = vec![0u8; 0x1100];
+        let runtime = RuntimeImage::from_plan(&runtime_bytes, 0x1000, None).unwrap();
+        let mut missing = valid_v3();
+        missing["functions"][0]["decode_ranges"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("blake3");
+        let missing = canonical_v3(&missing);
+        assert!(super::parse_thumb_artifact(&missing, &runtime).is_err());
+
+        let mut wrong = authenticated_v3(&runtime_bytes);
+        wrong["functions"][0]["decode_ranges"][0]["blake3"] = json!("00".repeat(32));
+        assert!(super::parse_thumb_artifact(&canonical_v3(&wrong), &runtime).is_err());
+    }
+
+    #[test]
+    fn legacy_explicit_ranges_are_hashed_in_memory_through_runtime_image() {
+        let runtime_bytes = [1u8, 2, 3, 4];
+        let runtime = RuntimeImage::from_plan(&runtime_bytes, 0x1000, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb_functions.json");
+        std::fs::write(
+            &path,
+            br#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[{"name":"thumb_1000","entry":"0x1000","end":"0x1004","size":4,"body_kind":"thumb_disassembly","body":"","data_refs":[],"decode_ranges":[{"isa":"thumb","start":"0x1000","end":"0x1004"}]}]}"#,
+        )
+        .unwrap();
+
+        let functions = super::read_thumb_functions_streaming(&path, &runtime).unwrap();
+        let function = &functions[0];
+        let execution = function.execution.as_ref().unwrap();
+        assert_eq!(
+            function.owner,
+            FunctionOwner::Legacy {
+                producer: AnalysisTool::Radare2
+            }
+        );
+        assert_eq!(
+            execution.decode_ranges[0].blake3,
+            *blake3::hash(&runtime_bytes).as_bytes()
+        );
+        assert_ne!(execution.execution_blake3, [0; 32]);
+    }
+
+    #[test]
+    fn legacy_enrichment_is_rejected_without_rewriting_source_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb_functions.json");
+        let source = br#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[{"name":"thumb_1000","entry":"0x1000"}]}"#;
+        std::fs::write(&path, source).unwrap();
+
+        let error = stream_rewrite_thumb_functions(&path, &test_runtime(), |_, _, function| {
+            function["body_c"] = json!("void thumb_1000(void) {}");
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(std::fs::read(path).unwrap(), source);
+    }
+
+    #[test]
+    fn v3_mutation_preserves_owner_and_authenticated_ranges() {
+        let runtime_bytes = vec![0u8; 0x1100];
+        let runtime = RuntimeImage::from_plan(&runtime_bytes, 0x1000, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb_functions.json");
+        std::fs::write(&path, canonical_v3(&authenticated_v3(&runtime_bytes))).unwrap();
+        let before = super::read_thumb_functions_streaming(&path, &runtime).unwrap();
+        let expected = before
+            .iter()
+            .map(|function| (function.owner, function.execution.clone()))
+            .collect::<Vec<_>>();
+        let mut seen = Vec::new();
+
+        stream_rewrite_thumb_functions(&path, &runtime, |owner, _, function| {
+            seen.push(owner);
+            function["annotations"] = json!(["generated fixture"]);
+            Ok(())
+        })
+        .unwrap();
+
+        let after = super::read_thumb_functions_streaming(&path, &runtime).unwrap();
+        assert_eq!(
+            seen,
+            expected.iter().map(|(owner, _)| *owner).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after
+                .iter()
+                .map(|function| (function.owner, function.execution.clone()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
     #[test]
     fn v3_run_totals_are_derived_from_validated_metadata() {
         let artifact = parse_thumb_artifact(ParsedThumbArtifact::consumer_v3_fixture()).unwrap();
@@ -2967,19 +3256,33 @@ mod tests {
         let artifact = parse_thumb_artifact(&bytes).unwrap();
         let owned: Vec<_> = artifact
             .functions()
-            .map(|function| (function.producer, function.value["entry"].as_str().unwrap()))
+            .map(|function| (function.owner, function.value["entry"].as_str().unwrap()))
             .collect();
         assert_eq!(
             owned,
             vec![
-                (ThumbProducer::Radare2, "0x1000"),
-                (ThumbProducer::Rizin, "0x2000")
+                (
+                    FunctionOwner::Run {
+                        producer: AnalysisTool::Radare2,
+                        region_index: 0,
+                        run_index: 0,
+                    },
+                    "0x1000",
+                ),
+                (
+                    FunctionOwner::Run {
+                        producer: AnalysisTool::Rizin,
+                        region_index: 1,
+                        run_index: 0,
+                    },
+                    "0x2000",
+                )
             ]
         );
         assert!(
             artifact
                 .functions()
-                .all(|function| !function.legacy_range_semantics)
+                .all(|function| function.execution.is_some())
         );
     }
 
@@ -2988,17 +3291,27 @@ mod tests {
         const RUNS: usize = 4_096;
         let layout = V3Layout {
             runs: (0..RUNS)
-                .map(|index| FunctionRunRecord {
-                    producer: if index.is_multiple_of(2) {
+                .map(|index| {
+                    let producer = if index.is_multiple_of(2) {
                         ThumbProducer::Radare2
                     } else {
                         ThumbProducer::Rizin
-                    },
-                    first_function: index,
-                    function_count: 1,
-                    substantial: 0,
-                    accepted: 1,
-                    quarantined: 0,
+                    };
+                    V3RunDescriptor {
+                        record: FunctionRunRecord {
+                            producer,
+                            first_function: index,
+                            function_count: 1,
+                            substantial: 0,
+                            accepted: 1,
+                            quarantined: 0,
+                        },
+                        owner: FunctionOwner::Run {
+                            producer: AnalysisTool::from(producer),
+                            region_index: index,
+                            run_index: 0,
+                        },
+                    }
                 })
                 .collect(),
             function_count: RUNS,
@@ -3169,13 +3482,13 @@ mod tests {
         assert!(parse_thumb_artifact(&canonical_v3(&document)).is_ok());
     }
 
-    /// A v3 document whose decode ranges are in-image but whose region ledger
-    /// or function envelope is not must fail for every consumer that knows the
-    /// load address and image length, not only terminal validation.
+    /// Region ledgers describe analyzer input and must be byte-backed. Function
+    /// envelopes are metadata only; execution authority comes from exact ranges.
     #[test]
-    fn image_aware_consumers_reject_out_of_image_regions_and_envelopes() {
+    fn image_aware_consumers_reject_unmapped_regions_not_metadata_envelopes() {
         let dir = tempfile::tempdir().unwrap();
-        let image = MappedImage::new(0x1000, 0x1100).unwrap();
+        let runtime_bytes = vec![0u8; 0x1100];
+        let runtime = RuntimeImage::from_plan(&runtime_bytes, 0x1000, None).unwrap();
 
         let mut out_of_image_region = valid_v3();
         out_of_image_region["regions"][1]["start"] = json!("0x9000");
@@ -3186,42 +3499,25 @@ mod tests {
         let mut out_of_image_envelope = valid_v3();
         out_of_image_envelope["functions"][1]["end"] = json!("0x9000");
 
-        for (case, document, expected) in [
-            (
-                "region ledger",
-                out_of_image_region,
-                "region 1 is outside mapped image",
-            ),
-            (
-                "function envelope",
-                out_of_image_envelope,
-                "function 1 end is outside mapped image",
-            ),
+        let bytes = canonical_v3(&out_of_image_region);
+        let path = dir.path().join("region-ledger.json");
+        std::fs::write(&path, &bytes).unwrap();
+        for error in [
+            super::parse_thumb_artifact(&bytes, &runtime).unwrap_err(),
+            super::read_thumb_functions_streaming(&path, &runtime).unwrap_err(),
         ] {
-            let bytes = canonical_v3(&document);
-            let path = dir.path().join(format!("{case}.json"));
-            std::fs::write(&path, &bytes).unwrap();
-
-            // The context-free parse cannot see the violation.
-            super::parse_thumb_artifact(&bytes, None)
-                .unwrap_or_else(|error| panic!("{case} must be a shape-valid document: {error}"));
-
-            for (api, error) in [
-                (
-                    "whole",
-                    super::parse_thumb_artifact(&bytes, Some(image)).unwrap_err(),
-                ),
-                (
-                    "typed",
-                    super::read_thumb_functions_streaming(&path, Some(image)).unwrap_err(),
-                ),
-            ] {
-                assert!(
-                    error.to_string().contains(expected),
-                    "{case}/{api}: {error}"
-                );
-            }
+            assert!(
+                error
+                    .to_string()
+                    .contains("region 1 is outside runtime image")
+            );
         }
+
+        let bytes = canonical_v3(&out_of_image_envelope);
+        let path = dir.path().join("function-envelope.json");
+        std::fs::write(&path, &bytes).unwrap();
+        super::parse_thumb_artifact(&bytes, &runtime).unwrap();
+        super::read_thumb_functions_streaming(&path, &runtime).unwrap();
     }
 
     /// Discovery caps a version at the first 1,024 stdout bytes, so a longer
@@ -3392,9 +3688,11 @@ mod tests {
     #[test]
     fn v3_parser_accepts_discontiguous_ranges_below_the_entry() {
         let mut document = valid_v3();
+        document["functions"][0]["entry"] = json!("0x1010");
+        document["functions"][0]["end"] = json!("0x1012");
         document["functions"][0]["decode_ranges"] = json!([
-            {"end":"0xff2","isa":"thumb","start":"0xff0"},
-            {"end":"0x1002","isa":"thumb","start":"0x1000"}
+            {"end":"0x1002","isa":"thumb","start":"0x1000","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"},
+            {"end":"0x1012","isa":"thumb","start":"0x1010","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"}
         ]);
         let artifact = parse_thumb_artifact(&canonical_v3(&document)).unwrap();
         assert_eq!(
@@ -3465,9 +3763,9 @@ mod tests {
         assert_eq!(
             artifact
                 .functions()
-                .map(|function| function.producer)
+                .map(|function| function.owner.analysis_tool())
                 .collect::<Vec<_>>(),
-            vec![ThumbProducer::Radare2, ThumbProducer::Rizin]
+            vec![AnalysisTool::Radare2, AnalysisTool::Rizin]
         );
 
         document["regions"][0]["attempts"][1]["status"] = json!("failed");
@@ -3482,9 +3780,9 @@ mod tests {
         assert_eq!(
             artifact
                 .functions()
-                .map(|function| function.producer)
+                .map(|function| function.owner.analysis_tool())
                 .collect::<Vec<_>>(),
-            vec![ThumbProducer::Radare2]
+            vec![AnalysisTool::Radare2]
         );
     }
 
@@ -3556,21 +3854,22 @@ mod tests {
   ],
   "functions": [
     {
-      "body": "bx lr\n",
+      "name": "fcn.1000",
+      "entry": "0x1000",
+      "end": "0x1002",
+      "size": 2,
       "body_kind": "thumb_disassembly",
+      "body": "bx lr\n",
       "data_refs": [],
-      "decode_range_errors": [],
       "decode_ranges": [
         {
-          "end": "0x1002",
           "isa": "thumb",
-          "start": "0x1000"
+          "start": "0x1000",
+          "end": "0x1002",
+          "blake3": "1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"
         }
       ],
-      "end": "0x1002",
-      "entry": "0x1000",
-      "name": "fcn.1000",
-      "size": 2
+      "decode_range_errors": []
     }
   ]
 }"#;
@@ -3674,38 +3973,40 @@ mod tests {
   ],
   "functions": [
     {
-      "body": "bx lr\n",
+      "name": "fcn.1000",
+      "entry": "0x1000",
+      "end": "0x1002",
+      "size": 2,
       "body_kind": "thumb_disassembly",
+      "body": "bx lr\n",
       "data_refs": [],
-      "decode_range_errors": [],
       "decode_ranges": [
         {
-          "end": "0x1002",
           "isa": "thumb",
-          "start": "0x1000"
+          "start": "0x1000",
+          "end": "0x1002",
+          "blake3": "1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"
         }
       ],
-      "end": "0x1002",
-      "entry": "0x1000",
-      "name": "fcn.1000",
-      "size": 2
+      "decode_range_errors": []
     },
     {
-      "body": "bx lr\n",
+      "name": "fcn.2000",
+      "entry": "0x2000",
+      "end": "0x2020",
+      "size": 32,
       "body_kind": "thumb_disassembly",
+      "body": "bx lr\n",
       "data_refs": [],
-      "decode_range_errors": [],
       "decode_ranges": [
         {
-          "end": "0x2020",
           "isa": "thumb",
-          "start": "0x2000"
+          "start": "0x2000",
+          "end": "0x2020",
+          "blake3": "2ada83c1819a5372dae1238fc1ded123c8104fdaa15862aaee69428a1820fcda"
         }
       ],
-      "end": "0x2020",
-      "entry": "0x2000",
-      "name": "fcn.2000",
-      "size": 32
+      "decode_range_errors": []
     }
   ]
 }"#;
@@ -3789,7 +4090,7 @@ mod tests {
         writer
             .push(
                 0,
-                r#"{"size":2,"name":"fcn.1000","entry":"0x1000","end":"0x1002","decode_ranges":[{"start":"0x1000","isa":"thumb","end":"0x1002"}],"decode_range_errors":[],"data_refs":[],"body_kind":"thumb_disassembly","body":"bx lr\n"}"#,
+                r#"{"size":2,"name":"fcn.1000","entry":"0x1000","end":"0x1002","decode_ranges":[{"start":"0x1000","isa":"thumb","end":"0x1002","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"}],"decode_range_errors":[],"data_refs":[],"body_kind":"thumb_disassembly","body":"bx lr\n"}"#,
             )
             .unwrap();
         let spill = writer.finish().unwrap();
@@ -3808,21 +4109,22 @@ mod tests {
         assert_eq!(
             function_suffix,
             r#"    {
-      "body": "bx lr\n",
+      "name": "fcn.1000",
+      "entry": "0x1000",
+      "end": "0x1002",
+      "size": 2,
       "body_kind": "thumb_disassembly",
+      "body": "bx lr\n",
       "data_refs": [],
-      "decode_range_errors": [],
       "decode_ranges": [
         {
-          "end": "0x1002",
           "isa": "thumb",
-          "start": "0x1000"
+          "start": "0x1000",
+          "end": "0x1002",
+          "blake3": "1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"
         }
       ],
-      "end": "0x1002",
-      "entry": "0x1000",
-      "name": "fcn.1000",
-      "size": 2
+      "decode_range_errors": []
     }
   ]
 }"#
@@ -3889,8 +4191,13 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
             let artifact = read_thumb_artifact(&path).unwrap();
             let function = artifact.functions().next().unwrap();
-            assert_eq!(function.producer, ThumbProducer::Radare2);
-            assert!(function.legacy_range_semantics);
+            assert_eq!(
+                function.owner,
+                FunctionOwner::Legacy {
+                    producer: AnalysisTool::Radare2,
+                }
+            );
+            assert!(function.execution.is_none());
             assert_eq!(function.value["legacy"], true);
         }
     }
@@ -3916,8 +4223,13 @@ mod tests {
 
             assert_eq!(functions.len(), 1, "{format}");
             let owned = &functions[0];
-            assert_eq!(owned.producer, ThumbProducer::Radare2);
-            assert!(owned.legacy_range_semantics);
+            assert_eq!(
+                owned.owner,
+                FunctionOwner::Legacy {
+                    producer: AnalysisTool::Radare2,
+                }
+            );
+            assert!(owned.execution.is_none());
             assert_eq!(owned.function.name, "thumb_1000");
             assert_eq!(owned.function.end, "");
             assert_eq!(owned.function.size, 0);
@@ -4049,20 +4361,37 @@ mod tests {
     }
 
     #[test]
-    fn atomic_legacy_mutation_promotes_v1_and_preserves_v2() {
+    fn atomic_legacy_mutation_is_rejected_without_replacing_source() {
         for format in [THUMB_V1_FORMAT, THUMB_V2_FORMAT] {
             let original =
                 format!("{{\"format\":\"{format}\",\"functions\":[{{\"entry\":\"0x1000\"}}]}}");
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("thumb_functions.json");
-            std::fs::write(&path, original).unwrap();
+            std::fs::write(&path, &original).unwrap();
             let mut artifact = read_thumb_artifact(&path).unwrap();
             artifact.function_values_mut()[0]["body_c"] = json!("void f(void) {}");
-            artifact.write_atomic(&path).unwrap();
-            let rewritten: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(rewritten["format"], THUMB_V2_FORMAT);
-            assert_eq!(rewritten["functions"][0]["body_c"], "void f(void) {}");
+            assert!(artifact.write_atomic(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
         }
+    }
+
+    #[test]
+    fn array_rewrite_uses_the_validated_source_snapshot() {
+        let source = br#"[{"entry":"0x1000","name":"validated"}]"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(&path, br#"[{"entry":"0x2000","name":"replacement"}]"#).unwrap();
+
+        stream_rewrite_json_array(&path, source, |function| {
+            function["annotations"] = json!(["authenticated"]);
+            Ok(())
+        })
+        .unwrap();
+
+        let rewritten: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(rewritten[0]["entry"], "0x1000");
+        assert_eq!(rewritten[0]["name"], "validated");
+        assert_eq!(rewritten[0]["annotations"], json!(["authenticated"]));
     }
 
     #[test]
@@ -4070,7 +4399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&valid_v3())).unwrap();
-        let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        let validated = validate_test_inventory(&path, 1).unwrap();
         assert_eq!(validated.metadata.format, ThumbFormat::V3);
         assert_eq!(
             validated
@@ -4125,7 +4454,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&document)).unwrap();
-        let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        let validated = validate_test_inventory(&path, 1).unwrap();
         assert_eq!(validated.inventory.raw_count, 2);
         assert_eq!(validated.metadata.summary.substantial, 1);
         assert_eq!(validated.metadata.summary.regions_requested, 1);
@@ -4141,7 +4470,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&document)).unwrap();
-        assert!(validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).is_err());
+        assert!(validate_test_inventory(&path, 1).is_err());
     }
 
     #[test]
@@ -4149,11 +4478,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&valid_v3())).unwrap();
-        let error = validate_thumb_inventory_streaming(&path, 0x1000, 0x100, 1).unwrap_err();
+        let image = [0u8; 0x100];
+        let runtime = RuntimeImage::from_plan(&image, 0x1000, None).unwrap();
+        let error = validate_thumb_inventory_streaming(&path, &runtime, 1).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("region 1 is outside mapped image"),
+                .contains("region 1 is outside runtime image"),
             "{error}"
         );
     }
@@ -4163,24 +4494,15 @@ mod tests {
         let cases = [
             (
                 "accepted entry outside image",
-                "function 0 entry is outside mapped image",
+                "bad scatter load map: runtime range crosses unmapped memory",
             ),
-            (
-                "end outside image",
-                "function 0 end is outside mapped image",
-            ),
-            (
-                "size exceeds image length",
-                "function 0 size exceeds mapped image length",
-            ),
+            ("end outside image", "accepted"),
+            ("size exceeds image length", "accepted"),
             (
                 "accepted range exceeds function end",
                 "function 0 decode range 0 exceeds function end",
             ),
-            (
-                "quarantined entry outside image",
-                "function 0 entry is outside mapped image",
-            ),
+            ("quarantined entry outside image", "accepted"),
         ];
         let mut mismatches = Vec::new();
 
@@ -4190,8 +4512,7 @@ mod tests {
                 "accepted entry outside image" => {
                     document["functions"][0]["entry"] = json!("0x3000");
                     document["functions"][0]["end"] = json!("0x3002");
-                    document["functions"][0]["decode_ranges"] =
-                        json!([{"end":"0x3002","isa":"thumb","start":"0x3000"}]);
+                    document["functions"][0]["decode_ranges"] = json!([{"end":"0x3002","isa":"thumb","start":"0x3000","blake3":"00".repeat(32)}]);
                     1
                 }
                 "end outside image" => {
@@ -4205,6 +4526,8 @@ mod tests {
                 }
                 "accepted range exceeds function end" => {
                     document["functions"][0]["decode_ranges"][0]["end"] = json!("0x1004");
+                    document["functions"][0]["decode_ranges"][0]["blake3"] =
+                        json!("ec2bd03bf86b935fa34d71ad7ebb049f1f10f87d343e521511d8f9e6625620cd");
                     1
                 }
                 "quarantined entry outside image" => {
@@ -4225,16 +4548,19 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("thumb_functions.json");
             std::fs::write(&path, canonical_v3(&document)).unwrap();
-            let actual = match validate_thumb_inventory_streaming(
-                &path,
-                0x1000,
-                0x2000,
-                expected_substantial,
-            ) {
-                Ok(_) => "accepted".to_owned(),
-                Err(error) => error.to_string(),
-            };
-            let expected = format!("serialize: invalid Thumb artifact: {expected}");
+            let image = vec![0u8; 0x2000];
+            let runtime = RuntimeImage::from_plan(&image, 0x1000, None).unwrap();
+            let actual =
+                match validate_thumb_inventory_streaming(&path, &runtime, expected_substantial) {
+                    Ok(_) => "accepted".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+            let expected =
+                if expected == "accepted" || expected.starts_with("bad scatter load map:") {
+                    expected.to_owned()
+                } else {
+                    format!("serialize: invalid Thumb artifact: {expected}")
+                };
             if actual != expected {
                 mismatches.push(format!("{case}: expected {expected:?}, found {actual:?}"));
             }
@@ -4249,14 +4575,14 @@ mod tests {
         document["functions"][0]["entry"] = json!("0x1100");
         document["functions"][0]["end"] = json!("0x1102");
         document["functions"][0]["decode_ranges"] = json!([
-            {"end":"0x1002","isa":"thumb","start":"0x1000"},
-            {"end":"0x1102","isa":"thumb","start":"0x1100"}
+            {"end":"0x1002","isa":"thumb","start":"0x1000","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"},
+            {"end":"0x1102","isa":"thumb","start":"0x1100","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"}
         ]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("thumb_functions.json");
         std::fs::write(&path, canonical_v3(&document)).unwrap();
 
-        let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x2000, 1).unwrap();
+        let validated = validate_test_inventory(&path, 1).unwrap();
         assert_eq!(
             (
                 validated.inventory.accepted,
@@ -4268,7 +4594,11 @@ mod tests {
 
     #[test]
     fn v1_and_v2_streaming_validation_remain_supported() {
-        let function = function("0x1000", "0x1002", 2);
+        let mut function = function("0x1000", "0x1002", 2);
+        function["decode_ranges"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("blake3");
         for format in [THUMB_V1_FORMAT, THUMB_V2_FORMAT] {
             let document = format!(
                 "{{\"format\":\"{format}\",\"functions\":[{}]}}",
@@ -4277,7 +4607,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("thumb_functions.json");
             std::fs::write(&path, document).unwrap();
-            let validated = validate_thumb_inventory_streaming(&path, 0x1000, 0x100, 0).unwrap();
+            let validated = validate_test_inventory(&path, 0).unwrap();
             assert_eq!(validated.metadata.format.as_str(), format);
             assert!(validated.metadata.producers.is_empty());
             assert!(validated.metadata.regions.is_empty());
@@ -4304,7 +4634,7 @@ mod tests {
   ]
 }"#;
         let path = write_thumb_doc(dir.path(), document);
-        let validated = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 1).unwrap();
+        let validated = validate_test_inventory(&path, 1).unwrap();
         assert_eq!(validated.metadata.summary.substantial, 1);
         assert_eq!(validated.inventory.raw_count, 2);
         assert_eq!(validated.inventory.accepted, 1);
@@ -4352,8 +4682,7 @@ mod tests {
         ];
         for (index, (document, message, expected)) in cases.iter().enumerate() {
             let path = write_thumb_doc(dir.path(), document);
-            let error =
-                validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, *expected).unwrap_err();
+            let error = validate_test_inventory(&path, *expected).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 format!("serialize: {message}"),
@@ -4361,7 +4690,7 @@ mod tests {
             );
         }
         let path = write_thumb_doc(dir.path(), "[1,2]");
-        let error = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 0).unwrap_err();
+        let error = validate_test_inventory(&path, 0).unwrap_err();
         assert_eq!(
             error.to_string(),
             "serialize: Thumb functions inventory must be an object"
@@ -4370,8 +4699,6 @@ mod tests {
 
     fn legacy_whole_file_validation(
         path: &Path,
-        image_start: u32,
-        image_len: u32,
         expected_substantial: usize,
     ) -> Result<(ValidatedInventory, usize)> {
         let bytes = std::fs::read(path)?;
@@ -4409,12 +4736,45 @@ mod tests {
                 "Thumb substantial count mismatch: expected {expected_substantial}, found {substantial}"
             )));
         }
-        let inventory = crate::execution_ranges::validate_inventory_records(
-            records,
-            records.len(),
-            image_start,
-            image_len,
-        )?;
+        let artifact = super::parse_thumb_artifact(&bytes, &test_runtime())?;
+        let mut accepted_executions = BTreeSet::new();
+        let mut tagged = Vec::with_capacity(records.len());
+        let mut accepted = 0usize;
+        let mut quarantined = 0usize;
+        for function in artifact.functions() {
+            let entry = canonical_hex_u32(
+                function.value["entry"]
+                    .as_str()
+                    .ok_or_else(|| invalid_artifact("legacy function entry must be a string"))?,
+                "legacy function entry",
+            )?;
+            let projection = match function.execution {
+                Some(identity) => {
+                    accepted += 1;
+                    accepted_executions.insert(OwnedExecutionIdentity {
+                        owner: function.owner,
+                        identity: identity.clone(),
+                    });
+                    ExecutionProjection::Accepted(identity.decode_ranges.clone())
+                }
+                None => {
+                    quarantined += 1;
+                    legacy_non_execution_projection(function.value, entry)?
+                }
+            };
+            tagged.push(TaggedExecutionRecord {
+                owner: function.owner,
+                entry,
+                projection,
+            });
+        }
+        let inventory = ValidatedInventory {
+            raw_count: records.len(),
+            accepted,
+            quarantined,
+            accepted_executions: accepted_executions.into_iter().collect(),
+            records: tagged,
+        };
         Ok((inventory, substantial))
     }
 
@@ -4429,8 +4789,8 @@ mod tests {
   ]
 }"#;
         let path = write_thumb_doc(dir.path(), valid);
-        let whole = legacy_whole_file_validation(&path, 0x4000, 0x2000, 1).unwrap();
-        let streaming = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 1)
+        let whole = legacy_whole_file_validation(&path, 1).unwrap();
+        let streaming = validate_test_inventory(&path, 1)
             .map(|validated| (validated.inventory, validated.metadata.summary.substantial))
             .unwrap();
         assert_eq!(whole, streaming);
@@ -4456,9 +4816,9 @@ mod tests {
         ];
         for (index, (document, expected)) in cases.iter().enumerate() {
             let path = write_thumb_doc(dir.path(), document);
-            let whole = legacy_whole_file_validation(&path, 0x4000, 0x2000, *expected)
-                .map_err(|error| error.to_string());
-            let streaming = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, *expected)
+            let whole =
+                legacy_whole_file_validation(&path, *expected).map_err(|error| error.to_string());
+            let streaming = validate_test_inventory(&path, *expected)
                 .map(|validated| (validated.inventory, validated.metadata.summary.substantial))
                 .map_err(|error| error.to_string());
             assert_eq!(whole, streaming, "case {index}");
@@ -4472,7 +4832,7 @@ mod tests {
             dir.path(),
             r#"{"functions":[],"format":"pixel-modem-extractor-thumb-functions-v2"}"#,
         );
-        let error = validate_thumb_inventory_streaming(&path, 0x4000, 0x2000, 0).unwrap_err();
+        let error = validate_test_inventory(&path, 0).unwrap_err();
         assert_eq!(
             error.to_string(),
             "serialize: unsupported Thumb functions inventory format"

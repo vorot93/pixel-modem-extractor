@@ -15,9 +15,11 @@ use super::rizin::{
 use super::{ProducerIdentity, ThumbAnalysisSummary, ThumbProducer, ThumbTools};
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
-    DecodeIsa, DecodeRange, DecodeRangeErrorKind, ExecutionProjection, canonicalize_errors,
-    canonicalize_instruction_extents, error, projection_to_json,
+    DecodeExtent, DecodeIsa, DecodeRangeErrorKind, ExecutionBudget, ExecutionProjection,
+    canonicalize_errors, canonicalize_instruction_extents, error, projection_to_json,
+    validate_execution,
 };
+use crate::runtime_image::RuntimeImage;
 #[cfg(test)]
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -541,18 +543,23 @@ impl<R: Read + Seek> ValueScanner<R> {
 /// Sentinel aborting a seq probe when an element disqualifies the array as
 /// the aflj inventory (non-object element, or an object carrying `ops`).
 const NOT_INVENTORY: &str = "\u{0}pme-not-inventory";
+const INVENTORY_FUNCTION_LIMIT: &str = "pme-inventory-function-limit";
 
 fn parse_inventory_value_with(
     bytes: &[u8],
     adapt: fn(&serde_json::Value) -> FunctionRecord,
-) -> Option<Vec<FunctionRecord>> {
+) -> Result<Option<Vec<FunctionRecord>>> {
     use serde::Deserializer;
 
     let text = String::from_utf8_lossy(bytes);
     let mut de = serde_json::Deserializer::from_str(&text);
     match de.deserialize_seq(InventoryProbe { adapt }) {
-        Ok(records) if !records.is_empty() => Some(records),
-        _ => None,
+        Ok(records) if !records.is_empty() => Ok(Some(records)),
+        Ok(_) => Ok(None),
+        Err(error) if error.to_string().contains(INVENTORY_FUNCTION_LIMIT) => Err(
+            Error::Serialize("execution function count exceeds the supported limit".into()),
+        ),
+        Err(_) => Ok(None),
     }
 }
 
@@ -563,7 +570,7 @@ pub(super) fn scan_rizin_inventory<R: Read>(
     let bytes = scanner
         .next_value()?
         .ok_or_else(|| Error::Serialize("Rizin capture lacks a function inventory".to_string()))?;
-    parse_inventory_value_with(bytes, adapt).ok_or_else(|| {
+    parse_inventory_value_with(bytes, adapt)?.ok_or_else(|| {
         Error::Serialize(
             "Rizin capture inventory must be a non-empty object array without ops".to_string(),
         )
@@ -618,6 +625,9 @@ impl<'de> serde::de::Visitor<'de> for InventoryProbe {
     ) -> std::result::Result<Self::Value, A::Error> {
         let mut records = Vec::new();
         while let Some(element) = seq.next_element::<serde_json::Value>()? {
+            if records.len() == crate::execution_ranges::MAX_EXECUTION_FUNCTIONS {
+                return Err(serde::de::Error::custom(INVENTORY_FUNCTION_LIMIT));
+            }
             let disqualified = match element.as_object() {
                 None => true,
                 Some(object) => object.contains_key("ops"),
@@ -650,8 +660,10 @@ fn scan_for_inventory_with<R: Read>(
     let mut values = 0usize;
     while let Some(bytes) = scanner.next_value()? {
         values += 1;
-        if let Some(records) = parse_inventory_value_with(bytes, adapt) {
-            return Ok((values, Some(records)));
+        match parse_inventory_value_with(bytes, adapt) {
+            Ok(Some(records)) => return Ok((values, Some(records))),
+            Ok(None) => {}
+            Err(error) => return Err(std::io::Error::other(error.to_string())),
         }
     }
     Ok((values, None))
@@ -998,6 +1010,7 @@ fn process_region_inner(
         substantial: 0,
         accepted: 0,
     };
+    let mut execution_budget = ExecutionBudget::default();
 
     // B1 — entry-matching on the same scanner. Greedy first-unpaired-fn
     // assignment is equivalent to the legacy fn-outer scan: per entry key
@@ -1026,6 +1039,7 @@ fn process_region_inner(
                 addr,
                 producer,
                 xrefs,
+                &mut execution_budget,
             )?;
         }
         Ok(())
@@ -1069,6 +1083,7 @@ fn process_region_inner(
                 addr,
                 producer,
                 xrefs,
+                &mut execution_budget,
             )?;
         }
         Ok(())
@@ -1100,7 +1115,17 @@ fn process_region_inner(
     for (fn_idx, rec) in fns.iter().enumerate() {
         if !paired[fn_idx] {
             normalize_and_spill(
-                &mut spill, &mut stats, fn_idx, rec, None, image, load_addr, addr, producer, xrefs,
+                &mut spill,
+                &mut stats,
+                fn_idx,
+                rec,
+                None,
+                image,
+                load_addr,
+                addr,
+                producer,
+                xrefs,
+                &mut execution_budget,
             )?;
         }
     }
@@ -1129,14 +1154,26 @@ fn normalize_and_spill(
     addr: u32,
     producer: ThumbProducer,
     xrefs: &mut RizinXrefIndex,
+    execution_budget: &mut ExecutionBudget,
 ) -> Result<()> {
     let normalized = match producer {
-        ThumbProducer::Radare2 => {
-            normalize_radare2_record_checked(rec, pdfj, image, load_addr, addr)?
-        }
-        ThumbProducer::Rizin => {
-            normalize_rizin_record_checked(rec, pdfj, xrefs, image, load_addr, addr)?
-        }
+        ThumbProducer::Radare2 => normalize_radare2_record_with_budget(
+            rec,
+            pdfj,
+            image,
+            load_addr,
+            addr,
+            execution_budget,
+        )?,
+        ThumbProducer::Rizin => normalize_rizin_record_with_budget(
+            rec,
+            pdfj,
+            xrefs,
+            image,
+            load_addr,
+            addr,
+            execution_budget,
+        )?,
     };
     stats.substantial += usize::from(
         normalized
@@ -1380,12 +1417,31 @@ fn normalize_radare2_function_checked(
     normalize_radare2_record_checked(&function_record(raw), pdfj, image, load_addr, region_addr)
 }
 
+#[cfg(test)]
 fn normalize_radare2_record_checked(
     record: &FunctionRecord,
     pdfj: Option<&serde_json::Value>,
     image: &[u8],
     load_addr: u32,
     region_addr: u32,
+) -> Result<serde_json::Value> {
+    normalize_radare2_record_with_budget(
+        record,
+        pdfj,
+        image,
+        load_addr,
+        region_addr,
+        &mut ExecutionBudget::default(),
+    )
+}
+
+fn normalize_radare2_record_with_budget(
+    record: &FunctionRecord,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+    region_addr: u32,
+    execution_budget: &mut ExecutionBudget,
 ) -> Result<serde_json::Value> {
     let (mut output, _) = normalize_function_record_checked(
         ThumbProducer::Radare2,
@@ -1394,6 +1450,7 @@ fn normalize_radare2_record_checked(
         image,
         load_addr,
         region_addr,
+        execution_budget,
     )?;
     output["data_refs"] = serde_json::json!(pdfj.map(data_refs_from_pdfj).unwrap_or_default());
     Ok(output)
@@ -1420,6 +1477,7 @@ fn normalize_rizin_function_checked(
     )
 }
 
+#[cfg(test)]
 fn normalize_rizin_record_checked(
     record: &FunctionRecord,
     pdfj: Option<&serde_json::Value>,
@@ -1428,6 +1486,27 @@ fn normalize_rizin_record_checked(
     load_addr: u32,
     region_addr: u32,
 ) -> Result<serde_json::Value> {
+    normalize_rizin_record_with_budget(
+        record,
+        pdfj,
+        xrefs,
+        image,
+        load_addr,
+        region_addr,
+        &mut ExecutionBudget::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_rizin_record_with_budget(
+    record: &FunctionRecord,
+    pdfj: Option<&serde_json::Value>,
+    xrefs: &mut RizinXrefIndex,
+    image: &[u8],
+    load_addr: u32,
+    region_addr: u32,
+    execution_budget: &mut ExecutionBudget,
+) -> Result<serde_json::Value> {
     let (mut output, projection) = normalize_function_record_checked(
         ThumbProducer::Rizin,
         record,
@@ -1435,6 +1514,7 @@ fn normalize_rizin_record_checked(
         image,
         load_addr,
         region_addr,
+        execution_budget,
     )?;
     let data_refs = match &projection {
         ExecutionProjection::Accepted(ranges) => xrefs.refs_for_ranges(ranges),
@@ -1451,6 +1531,7 @@ fn normalize_function_record_checked(
     image: &[u8],
     load_addr: u32,
     region_addr: u32,
+    execution_budget: &mut ExecutionBudget,
 ) -> Result<(serde_json::Value, ExecutionProjection)> {
     let producer_name = producer.as_str();
     let bound_name = match producer {
@@ -1518,7 +1599,8 @@ fn normalize_function_record_checked(
         .name
         .clone()
         .unwrap_or_else(|| format!("thumb_{entry_u64:x}"));
-    let projection = execution_projection(entry, pdfj, image, load_addr);
+    let projection =
+        execution_projection_with_budget(entry, pdfj, image, load_addr, execution_budget)?;
     if let ExecutionProjection::Accepted(ranges) = &projection
         && ranges.iter().any(|range| range.end > end)
     {
@@ -1557,25 +1639,44 @@ fn strict_hex_bytes(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+#[cfg(test)]
 fn execution_projection(
     entry: u32,
     pdfj: Option<&serde_json::Value>,
     image: &[u8],
     load_addr: u32,
-) -> ExecutionProjection {
+) -> Result<ExecutionProjection> {
+    execution_projection_with_budget(
+        entry,
+        pdfj,
+        image,
+        load_addr,
+        &mut ExecutionBudget::default(),
+    )
+}
+
+fn execution_projection_with_budget(
+    entry: u32,
+    pdfj: Option<&serde_json::Value>,
+    image: &[u8],
+    load_addr: u32,
+    execution_budget: &mut ExecutionBudget,
+) -> Result<ExecutionProjection> {
     let Some(pdfj) = pdfj else {
-        return ExecutionProjection::Quarantined(vec![error(
+        execution_budget.charge_function()?;
+        return Ok(ExecutionProjection::Quarantined(vec![error(
             DecodeRangeErrorKind::MissingOperationBody,
             entry,
             None,
-        )]);
+        )]));
     };
     let Some(ops) = pdfj.get("ops").and_then(serde_json::Value::as_array) else {
-        return ExecutionProjection::Quarantined(vec![error(
+        execution_budget.charge_function()?;
+        return Ok(ExecutionProjection::Quarantined(vec![error(
             DecodeRangeErrorKind::EmptyProjection,
             entry,
             None,
-        )]);
+        )]));
     };
     let mut extents = Vec::new();
     let mut errors = Vec::new();
@@ -1621,7 +1722,7 @@ fn execution_projection(
             ));
             continue;
         };
-        extents.push(DecodeRange {
+        extents.push(DecodeExtent {
             isa: DecodeIsa::Thumb,
             start: address,
             end,
@@ -1644,21 +1745,24 @@ fn execution_projection(
             }
         }
     }
-    match canonicalize_instruction_extents(
-        entry,
-        extents,
-        load_addr,
-        image.len().try_into().unwrap_or(u32::MAX),
-    ) {
-        ExecutionProjection::Accepted(ranges) if errors.is_empty() => {
-            ExecutionProjection::Accepted(ranges)
+    match canonicalize_instruction_extents(entry, extents) {
+        Ok(extents) if errors.is_empty() => {
+            let runtime = RuntimeImage::from_plan(image, load_addr, None)?;
+            let identity = validate_execution(entry, extents, &runtime, execution_budget)?;
+            Ok(ExecutionProjection::Accepted(identity.decode_ranges))
         }
-        ExecutionProjection::Accepted(_) => {
-            ExecutionProjection::Quarantined(canonicalize_errors(errors))
+        Ok(_) => {
+            execution_budget.charge_function()?;
+            Ok(ExecutionProjection::Quarantined(canonicalize_errors(
+                errors,
+            )))
         }
-        ExecutionProjection::Quarantined(mut canonical_errors) => {
+        Err(mut canonical_errors) => {
             canonical_errors.extend(errors);
-            ExecutionProjection::Quarantined(canonicalize_errors(canonical_errors))
+            execution_budget.charge_function()?;
+            Ok(ExecutionProjection::Quarantined(canonicalize_errors(
+                canonical_errors,
+            )))
         }
     }
 }
@@ -3490,7 +3594,8 @@ esac
             }
         );
         let bytes = std::fs::read(out.join("thumb_functions.json")).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&bytes, None).unwrap();
+        let runtime = RuntimeImage::from_plan(&image, 0x4000, None).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&bytes, &runtime).unwrap();
         let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(artifact["format"], crate::thumb_analysis::THUMB_V3_FORMAT);
         assert_eq!(artifact["producers"].as_array().unwrap().len(), 1);
@@ -3574,15 +3679,17 @@ esac
 
         assert_eq!(summary.radare2_runs, 0);
         assert_eq!(summary.rizin_runs, 1);
+        let image = [0x70, 0x47];
+        let runtime = RuntimeImage::from_plan(&image, 0x4000, None).unwrap();
         let artifact = crate::thumb_analysis::read_thumb_artifact(
             &dir.path().join("thumb_functions.json"),
-            None,
+            &runtime,
         )
         .unwrap();
         let function = artifact.functions().next().unwrap();
         assert_eq!(
-            function.producer,
-            crate::thumb_analysis::ThumbProducer::Rizin
+            function.owner.analysis_tool(),
+            crate::analysis_tool::AnalysisTool::Rizin
         );
         assert_eq!(function.value["data_refs"], json!(["0x5000"]));
     }
@@ -3733,12 +3840,13 @@ esac
             }
         );
         let bytes = std::fs::read(dir.path().join("thumb_functions.json")).unwrap();
-        let artifact = crate::thumb_analysis::parse_thumb_artifact(&bytes, None).unwrap();
+        let runtime = RuntimeImage::from_plan(&image, 0x4000, None).unwrap();
+        let artifact = crate::thumb_analysis::parse_thumb_artifact(&bytes, &runtime).unwrap();
         let owned = artifact
             .functions()
             .map(|function| {
                 (
-                    function.producer,
+                    function.owner.analysis_tool(),
                     function.value["name"].as_str().unwrap().to_owned(),
                 )
             })
@@ -3747,15 +3855,15 @@ esac
             owned,
             vec![
                 (
-                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    crate::analysis_tool::AnalysisTool::Radare2,
                     "r2.accepted".to_string()
                 ),
                 (
-                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    crate::analysis_tool::AnalysisTool::Radare2,
                     "r2.quarantined".to_string()
                 ),
                 (
-                    crate::thumb_analysis::ThumbProducer::Rizin,
+                    crate::analysis_tool::AnalysisTool::Rizin,
                     "rizin.accepted".to_string()
                 ),
             ]
@@ -5701,7 +5809,12 @@ esac
         assert_eq!(entry["data_refs"][1], "0x9004");
         assert_eq!(
             entry["decode_ranges"],
-            serde_json::json!([{"isa":"thumb", "start":"0x4120", "end":"0x4124"}]),
+            serde_json::json!([{
+                "isa":"thumb",
+                "start":"0x4120",
+                "end":"0x4124",
+                "blake3":"ac6a95eb5686e10323a7626706d954217ba183b8e7f8301cd524c19d067d9ce6"
+            }]),
             "out-of-order pdfj operations must normalize into an exact tagged Thumb range"
         );
         assert_eq!(entry["decode_range_errors"], serde_json::json!([]));
@@ -5876,8 +5989,8 @@ esac
         assert_eq!(
             normalized["decode_ranges"],
             json!([
-                {"isa":"thumb", "start":"0x4000", "end":"0x4004"},
-                {"isa":"thumb", "start":"0x4006", "end":"0x4008"}
+                {"isa":"thumb", "start":"0x4000", "end":"0x4004", "blake3":"a3d517dd4692556677d7e2688ebbabed22ed8472e9ff0918e9afa1bb39aa8472"},
+                {"isa":"thumb", "start":"0x4006", "end":"0x4008", "blake3":"1ebc25810942bc5c0f5ed3ddade44a9546a9be6d3df45142bf7bd45a32511d72"}
             ])
         );
         assert_eq!(normalized["decode_range_errors"], json!([]));
@@ -6034,7 +6147,12 @@ esac
         .unwrap();
         assert_eq!(
             normalized["decode_ranges"],
-            json!([{"isa":"thumb", "start":"0x4000", "end":"0x4004"}])
+            json!([{
+                "isa":"thumb",
+                "start":"0x4000",
+                "end":"0x4004",
+                "blake3":"a3d517dd4692556677d7e2688ebbabed22ed8472e9ff0918e9afa1bb39aa8472"
+            }])
         );
         assert_eq!(normalized["data_refs"], json!(["0x9000"]));
 
@@ -6204,7 +6322,7 @@ esac
             {"offset": 0x4003u64, "bytes": "00bf"},
             {"offset": 0x4010u64, "bytes": "00bf"}
         ]});
-        let projection = execution_projection(0x4000, Some(&pdfj), &[0; 8], 0x4000);
+        let projection = execution_projection(0x4000, Some(&pdfj), &[0; 8], 0x4000).unwrap();
         let ExecutionProjection::Quarantined(errors) = projection else {
             panic!("invalid operation must quarantine the entire record")
         };
@@ -6232,16 +6350,12 @@ esac
             {"offset": 0x4002u64, "bytes": "f0b50000"},
             {"offset": 0x4000u64, "bytes": "00bf"}
         ]});
-        let projection = execution_projection(
-            0x4000,
-            Some(&pdfj),
-            &[0x00, 0xbf, 0xf0, 0xb5, 0x00, 0x00],
-            0x4000,
-        );
+        let image = [0x00, 0xbf, 0xf0, 0xb5, 0x00, 0x00];
+        let projection = execution_projection(0x4000, Some(&pdfj), &image, 0x4000).unwrap();
         assert_eq!(
             projection_to_json(&projection).unwrap(),
             serde_json::json!({
-                "decode_ranges": [{"isa":"thumb", "start":"0x4000", "end":"0x4006"}],
+                "decode_ranges": [{"isa":"thumb", "start":"0x4000", "end":"0x4006", "blake3":blake3::hash(&image).to_hex().to_string()}],
                 "decode_range_errors": [],
             })
         );
@@ -6272,8 +6386,8 @@ esac
         assert_eq!(
             entry["decode_ranges"],
             serde_json::json!([
-                {"isa":"thumb", "start":"0x4000", "end":"0x4002"},
-                {"isa":"thumb", "start":"0x4004", "end":"0x4006"}
+                {"isa":"thumb", "start":"0x4000", "end":"0x4002", "blake3":"1ebc25810942bc5c0f5ed3ddade44a9546a9be6d3df45142bf7bd45a32511d72"},
+                {"isa":"thumb", "start":"0x4004", "end":"0x4006", "blake3":"1ebc25810942bc5c0f5ed3ddade44a9546a9be6d3df45142bf7bd45a32511d72"}
             ])
         );
     }
@@ -6320,7 +6434,7 @@ esac
         ];
         for (pdfj, entry, image, kind) in cases {
             let ExecutionProjection::Quarantined(errors) =
-                execution_projection(entry, Some(&pdfj), image, 0x4000)
+                execution_projection(entry, Some(&pdfj), image, 0x4000).unwrap()
             else {
                 panic!("fault must quarantine")
             };
@@ -6333,7 +6447,7 @@ esac
 
     #[test]
     fn radare2_missing_pdfj_body_is_a_tagged_quarantine() {
-        let projection = execution_projection(0x4000, None, &[0, 0], 0x4000);
+        let projection = execution_projection(0x4000, None, &[0, 0], 0x4000).unwrap();
         assert_eq!(
             projection_to_json(&projection).unwrap(),
             serde_json::json!({
@@ -7168,6 +7282,30 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
+    fn inventory_scan_rejects_more_than_execution_function_limit() {
+        use std::fmt::Write as _;
+
+        let count = crate::execution_ranges::MAX_EXECUTION_FUNCTIONS + 1;
+        let mut payload = String::with_capacity(count * 48);
+        payload.push('[');
+        for index in 0..count {
+            if index != 0 {
+                payload.push(',');
+            }
+            write!(payload, r#"{{"offset":4096,"maxaddr":4098,"realsz":2}}"#).unwrap();
+        }
+        payload.push(']');
+        let mut scanner = ValueScanner::new(std::io::Cursor::new(payload.into_bytes()));
+
+        let error = scan_for_inventory(&mut scanner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("function count exceeds"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn inventory_records_adapt_radare2_boundary_fields() {
         let (_, records) = inventory_of(
             b"[{\"name\":\"f0\",\"offset\":16384,\"size\":64,\"realsz\":32,\"maxaddr\":16400},{\"offset\":\"0x40\"}]",
@@ -7263,15 +7401,18 @@ INFO: second pdfj body was noisy and not parseable
         Ok(all)
     }
 
-    fn legacy_region_fragments(
+    fn in_memory_region_fragments(
         stdout: &[u8],
         image: &[u8],
         load_addr: u32,
         addr: u32,
     ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        for function in legacy_region_functions(stdout, image, load_addr, addr)? {
-            out.extend_from_slice(render_fragment(&function)?.as_bytes());
+        for (index, function) in legacy_region_functions(stdout, image, load_addr, addr)?
+            .into_iter()
+            .enumerate()
+        {
+            out.extend_from_slice(render_v3_fragment(&function, index)?.as_bytes());
         }
         Ok(out)
     }
@@ -7292,7 +7433,7 @@ INFO: second pdfj body was noisy and not parseable
     }
 
     #[test]
-    fn streaming_region_matches_legacy_oracle_on_all_fixtures() {
+    fn streaming_region_matches_in_memory_oracle_on_all_fixtures() {
         let fixtures: Vec<&[u8]> = vec![
             // normal pair
             b"[{\"name\":\"sym.a\",\"offset\":16384,\"size\":64,\"realsz\":64,\"maxaddr\":16386},{\"name\":\"sym.b\",\"offset\":16448,\"size\":64,\"realsz\":64,\"maxaddr\":16450}]\n{\"addr\":16384,\"ops\":[{\"offset\":16384,\"bytes\":\"b5f0\",\"disasm\":\"push {r4, lr}\"}]}\n{\"addr\":16448,\"ops\":[{\"offset\":16448,\"bytes\":\"4770\",\"disasm\":\"bx lr\"}]}\n",
@@ -7314,11 +7455,11 @@ INFO: second pdfj body was noisy and not parseable
             for (_, pdfj) in radare2_thumb_function_pdfjs(stdout) {
                 populate_test_image_from_pdfj(&mut image, &pdfj);
             }
-            let legacy = legacy_region_fragments(stdout, &image, 0, 0x4000)
-                .unwrap_or_else(|e| panic!("fixture {i} legacy: {e}"));
+            let expected = in_memory_region_fragments(stdout, &image, 0, 0x4000)
+                .unwrap_or_else(|e| panic!("fixture {i} in-memory: {e}"));
             let streaming = streaming_region_fragments(stdout, &image, 0, 0x4000)
                 .unwrap_or_else(|e| panic!("fixture {i} streaming: {e}"));
-            assert_eq!(legacy, streaming, "fixture {i} must be byte-identical");
+            assert_eq!(expected, streaming, "fixture {i} must be byte-identical");
         }
     }
 

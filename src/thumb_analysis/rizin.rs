@@ -6,7 +6,7 @@ use super::radare2::FunctionRecord;
 use super::stream::{ValueScanner, read_rizin_pdfj_value, scan_rizin_inventory};
 use super::{ProducerIdentity, ThumbProducer};
 use crate::error::{Error, Result};
-use crate::execution_ranges::DecodeRange;
+use crate::execution_ranges::AuthenticatedDecodeRange;
 use serde::Deserializer;
 use serde::de::{self, SeqAccess, Visitor};
 use serde_json::Value;
@@ -188,7 +188,7 @@ impl RizinXrefIndex {
 
     /// Canonical ascending targets for every selected xref whose source falls
     /// in one of `ranges`, recording those sources as mapped.
-    pub(crate) fn refs_for_ranges(&mut self, ranges: &[DecodeRange]) -> Vec<String> {
+    pub(crate) fn refs_for_ranges(&mut self, ranges: &[AuthenticatedDecodeRange]) -> Vec<String> {
         let mut targets = std::collections::BTreeSet::new();
         for range in ranges {
             let start = self.xrefs.partition_point(|xref| xref.from < range.start);
@@ -221,7 +221,7 @@ pub fn discover_rizin() -> Result<ProducerIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution_ranges::{DecodeIsa, DecodeRange};
+    use crate::execution_ranges::{AuthenticatedDecodeRange, DecodeIsa};
     use std::path::PathBuf;
 
     fn capture(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -676,24 +676,26 @@ DEBUG: [false diagnostic] collecting outgoing references
         assert_eq!(index.selected(), 3);
         assert_eq!(index.unmapped(), 3);
 
-        let targets = index.refs_for_ranges(&[DecodeRange {
+        let targets = index.refs_for_ranges(&[AuthenticatedDecodeRange {
             isa: DecodeIsa::Thumb,
             start: 0x1000,
             end: 0x1002,
+            blake3: [0; 32],
         }]);
 
         assert_eq!(targets, vec!["0x9000"]);
         assert_eq!(index.unmapped(), 2);
         // Re-selecting the same source does not double-count it as mapped.
-        index.refs_for_ranges(&[DecodeRange {
+        index.refs_for_ranges(&[AuthenticatedDecodeRange {
             isa: DecodeIsa::Thumb,
             start: 0x1000,
             end: 0x1002,
+            blake3: [0; 32],
         }]);
         assert_eq!(index.unmapped(), 2);
     }
 
-    fn refs_for_ranges(xrefs: &[RizinXref], ranges: &[DecodeRange]) -> Vec<String> {
+    fn refs_for_ranges(xrefs: &[RizinXref], ranges: &[AuthenticatedDecodeRange]) -> Vec<String> {
         RizinXrefIndex::new(xrefs.to_vec()).refs_for_ranges(ranges)
     }
 
@@ -733,15 +735,17 @@ DEBUG: [false diagnostic] collecting outgoing references
                 to: u64::MAX,
             },
         ];
-        let first = [DecodeRange {
+        let first = [AuthenticatedDecodeRange {
             isa: DecodeIsa::Thumb,
             start: 0x1000,
             end: 0x1004,
+            blake3: [0; 32],
         }];
-        let second = [DecodeRange {
+        let second = [AuthenticatedDecodeRange {
             isa: DecodeIsa::Thumb,
             start: 0x1002,
             end: 0x1006,
+            blake3: [0; 32],
         }];
         let discontiguous = [first[0], second[0]];
 

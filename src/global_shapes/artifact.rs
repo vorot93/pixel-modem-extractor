@@ -5,10 +5,11 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
-    ExecutionIdentity, ExecutionProjection, execution_identity, parse_projection,
-    validate_inventory_projection,
+    ExecutionIdentity, FunctionOwner, OwnedExecutionIdentity, execution_identity,
+    validate_ghidra_inventory_records,
 };
-use crate::manifest::{blake3_bytes, load_addr_for_image};
+use crate::manifest::{blake3_bytes, blake3_file, load_addr_for_image};
+use crate::runtime_image::RuntimeImage;
 use atomic_write_file::AtomicWriteFile;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -41,7 +42,7 @@ struct ParsedInventory {
     quarantined: usize,
     quarantine_errors: usize,
     substantial: usize,
-    identities: BTreeMap<ExecutionIdentity, BTreeSet<FunctionContext>>,
+    identities: BTreeMap<OwnedExecutionIdentity, BTreeSet<FunctionContext>>,
 }
 
 impl ParsedInventory {
@@ -70,14 +71,23 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
 
     let image = std::fs::read(&image_path)?;
     let image_blake3 = blake3_bytes(&image);
-    let image_len = mapped_image_len(load_address, image.len())?;
+    mapped_image_len(load_address, image.len())?;
+    let runtime_root = std::fs::canonicalize(request.image_dir)?;
+    let relative_map = Path::new("scatter/load_map.json");
+    let runtime_map = runtime_root.join(relative_map);
+    let runtime = RuntimeImage::from_artifact(
+        &image,
+        load_address,
+        &runtime_root,
+        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
+    )?;
 
     let (globals_blake3, globals_json) = read_json(&globals_path)?;
     let globals = parse_globals(&globals_json, request)?;
     drop(globals_json);
 
     let (functions_blake3, functions_json) = read_json(&functions_path)?;
-    let ghidra = parse_ghidra_inventory(&functions_json, request, load_address, image_len)?;
+    let ghidra = parse_ghidra_inventory(&functions_json, request, &runtime)?;
     drop(functions_json);
 
     let (thumb_functions_blake3, thumb) = match thumb_expected {
@@ -88,26 +98,15 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
             (None, ParsedInventory::empty())
         }
         Some((substantial, accepted, quarantined)) => {
-            let artifact = crate::thumb_analysis::read_thumb_artifact(
+            let validated = crate::thumb_analysis::validate_thumb_inventory_streaming(
                 &thumb_path,
-                Some(crate::thumb_analysis::MappedImage::new(
-                    load_address,
-                    image_len,
-                )?),
+                &runtime,
+                substantial,
             )?;
-            let hash = artifact.source_blake3().to_owned();
-            let parsed =
-                parse_thumb_inventory(artifact.function_values(), load_address, image_len)?;
-            if artifact
-                .validated_v3_run_totals()
-                .is_some_and(|run_totals| {
-                    (parsed.substantial, parsed.accepted, parsed.quarantined) != run_totals
-                })
-            {
-                return Err(invalid(
-                    "thumb projection counts do not match validated v3 run totals",
-                ));
-            }
+            let functions =
+                crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, &runtime)?;
+            let hash = blake3_file(&thumb_path)?;
+            let parsed = parse_thumb_inventory(&functions, &validated.inventory)?;
             if parsed.substantial != substantial
                 || parsed.accepted != accepted
                 || parsed.quarantined != quarantined
@@ -137,7 +136,11 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
         globals,
         functions: identities
             .into_iter()
-            .map(|(identity, contexts)| FunctionExecution { identity, contexts })
+            .map(|(execution, contexts)| FunctionExecution {
+                owner: execution.owner,
+                identity: execution.identity,
+                contexts,
+            })
             .collect(),
         source_counts: SourceProjectionCounts {
             ghidra_accepted: ghidra.accepted,
@@ -270,8 +273,7 @@ fn parse_globals(value: &Value, request: &RunRequest<'_>) -> Result<Vec<Recovere
 fn parse_ghidra_inventory(
     value: &Value,
     request: &RunRequest<'_>,
-    image_start: u32,
-    image_len: u32,
+    runtime: &RuntimeImage<'_>,
 ) -> Result<ParsedInventory> {
     let records = value
         .as_array()
@@ -281,7 +283,13 @@ fn parse_ghidra_inventory(
             "raw ghidra count does not match the current-run request",
         ));
     }
-    let parsed = parse_inventory_records(records, true, image_start, image_len)?;
+    let inventory = validate_ghidra_inventory_records(records, records.len(), runtime)?;
+    let mut parsed = ParsedInventory::empty();
+    for (record, tagged) in records.iter().zip(&inventory.records) {
+        let execution = execution_identity(tagged.entry, &tagged.projection)?;
+        add_inventory_record(&mut parsed, record, tagged.owner, execution.as_ref(), true)?;
+    }
+    validate_inventory_count(&parsed, records.len())?;
     if parsed.accepted != request.expected_ghidra_accepted
         || parsed.quarantined != request.expected_ghidra_quarantined
     {
@@ -293,66 +301,130 @@ fn parse_ghidra_inventory(
 }
 
 fn parse_thumb_inventory(
-    records: &[Value],
-    image_start: u32,
-    image_len: u32,
+    functions: &[crate::thumb_analysis::OwnedThumbFunction],
+    validated: &crate::execution_ranges::ValidatedInventory,
 ) -> Result<ParsedInventory> {
-    parse_inventory_records(records, false, image_start, image_len)
-}
-
-fn parse_inventory_records(
-    records: &[Value],
-    require_end: bool,
-    image_start: u32,
-    image_len: u32,
-) -> Result<ParsedInventory> {
-    let mut parsed = ParsedInventory::empty();
-    for record in records {
-        let object = record
-            .as_object()
-            .ok_or_else(|| invalid("inventory record must be an object"))?;
-        let name = required_string(object, "name")?.to_owned();
-        let entry = parse_canonical_hex(required_string(object, "entry")?)?;
-        if require_end {
-            let _end = parse_canonical_hex(required_string(object, "end")?)?;
-        }
-        let size = parse_positive_size(object.get("size").ok_or_else(|| invalid("missing size"))?)?;
+    if functions.len() != validated.raw_count {
+        return Err(invalid(
+            "typed Thumb function count does not match terminal validation",
+        ));
+    }
+    let mut parsed = ParsedInventory {
+        accepted: validated.accepted,
+        quarantined: validated.quarantined,
+        quarantine_errors: validated
+            .records
+            .iter()
+            .map(|record| match &record.projection {
+                crate::execution_ranges::ExecutionProjection::Accepted(_) => 0,
+                crate::execution_ranges::ExecutionProjection::Quarantined(errors) => errors.len(),
+            })
+            .sum(),
+        substantial: 0,
+        identities: BTreeMap::new(),
+    };
+    let mut accepted = 0usize;
+    for function in functions {
+        let entry = parse_canonical_hex(&function.function.entry)?;
+        let size = parse_positive_size(&Value::from(function.function.size))?;
         if size >= 32 {
             parsed.substantial = parsed
                 .substantial
                 .checked_add(1)
                 .ok_or_else(|| invalid("thumb substantial count overflow"))?;
         }
-        let projection = parse_projection(record)?;
-        validate_inventory_projection(entry, &projection, image_start, image_len)?;
-        match execution_identity(entry, &projection)? {
-            Some(identity) => {
-                parsed.accepted = parsed
-                    .accepted
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("accepted inventory count overflow"))?;
-                parsed
-                    .identities
-                    .entry(identity)
-                    .or_default()
-                    .insert(FunctionContext { entry, name });
+        if let Some(identity) = &function.execution {
+            if identity.entry != entry {
+                return Err(invalid(
+                    "inventory execution entry does not match its record",
+                ));
             }
-            None => {
-                parsed.quarantined = parsed
-                    .quarantined
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
-                let ExecutionProjection::Quarantined(errors) = &projection else {
-                    return Err(invalid("quarantined record missing error list"));
-                };
-                parsed.quarantine_errors = parsed
-                    .quarantine_errors
-                    .checked_add(errors.len())
-                    .ok_or_else(|| invalid("quarantine error count overflow"))?;
-            }
+            accepted = accepted
+                .checked_add(1)
+                .ok_or_else(|| invalid("accepted inventory count overflow"))?;
+            parsed
+                .identities
+                .entry(OwnedExecutionIdentity {
+                    owner: function.owner,
+                    identity: identity.clone(),
+                })
+                .or_default()
+                .insert(FunctionContext {
+                    entry,
+                    name: function.function.name.clone(),
+                });
         }
     }
-    let raw_count = records.len();
+    if accepted != parsed.accepted {
+        return Err(invalid(
+            "typed Thumb accepted count does not match terminal validation",
+        ));
+    }
+    validate_inventory_count(&parsed, functions.len())?;
+    Ok(parsed)
+}
+
+fn add_inventory_record(
+    parsed: &mut ParsedInventory,
+    record: &Value,
+    owner: FunctionOwner,
+    execution: Option<&ExecutionIdentity>,
+    require_end: bool,
+) -> Result<()> {
+    let object = record
+        .as_object()
+        .ok_or_else(|| invalid("inventory record must be an object"))?;
+    let name = required_string(object, "name")?.to_owned();
+    let entry = parse_canonical_hex(required_string(object, "entry")?)?;
+    if require_end {
+        let _end = parse_canonical_hex(required_string(object, "end")?)?;
+    }
+    let size = parse_positive_size(object.get("size").ok_or_else(|| invalid("missing size"))?)?;
+    if size >= 32 {
+        parsed.substantial = parsed
+            .substantial
+            .checked_add(1)
+            .ok_or_else(|| invalid("thumb substantial count overflow"))?;
+    }
+    match execution {
+        Some(identity) => {
+            if identity.entry != entry {
+                return Err(invalid(
+                    "inventory execution entry does not match its record",
+                ));
+            }
+            parsed.accepted = parsed
+                .accepted
+                .checked_add(1)
+                .ok_or_else(|| invalid("accepted inventory count overflow"))?;
+            parsed
+                .identities
+                .entry(OwnedExecutionIdentity {
+                    owner,
+                    identity: identity.clone(),
+                })
+                .or_default()
+                .insert(FunctionContext { entry, name });
+        }
+        None => {
+            parsed.quarantined = parsed
+                .quarantined
+                .checked_add(1)
+                .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
+            let errors = object
+                .get("decode_range_errors")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("quarantined record missing error list"))?;
+            parsed.quarantine_errors = parsed
+                .quarantine_errors
+                .checked_add(errors.len())
+                .ok_or_else(|| invalid("quarantine error count overflow"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_inventory_count(parsed: &ParsedInventory, raw_count: usize) -> Result<()> {
     if parsed
         .accepted
         .checked_add(parsed.quarantined)
@@ -362,7 +434,7 @@ fn parse_inventory_records(
             "raw inventory count does not equal accepted plus quarantined",
         ));
     }
-    Ok(parsed)
+    Ok(())
 }
 
 fn require_fields(object: &Map<String, Value>, keys: &[&str]) -> Result<()> {
@@ -614,7 +686,7 @@ mod tests {
         load_inputs, serialize, write_atomic, write_atomic_with_before_commit,
     };
     use crate::error::Error;
-    use crate::execution_ranges::{DecodeIsa, DecodeRange};
+    use crate::execution_ranges::{AuthenticatedDecodeRange, DecodeIsa};
     use crate::global_shapes::aggregate::aggregate;
     use crate::global_shapes::decoder::AccessKind;
     use crate::global_shapes::tracker::CandidateObservation;
@@ -785,17 +857,32 @@ mod tests {
         })
     }
 
+    fn authenticated_range(isa: &str, start: &str, end: &str) -> Value {
+        let start_address = u32::from_str_radix(start.trim_start_matches("0x"), 16).unwrap();
+        let end_address = u32::from_str_radix(end.trim_start_matches("0x"), 16).unwrap();
+        let digest = end_address
+            .checked_sub(start_address)
+            .map(|length| blake3::hash(&vec![0; length as usize]).to_hex().to_string())
+            .unwrap_or_else(|| "00".repeat(32));
+        json!({"isa": isa, "start": start, "end": end, "blake3": digest})
+    }
+
     fn arm_range(start: &str, end: &str) -> Value {
-        json!({"isa": "arm", "start": start, "end": end})
+        authenticated_range("arm", start, end)
     }
 
     fn thumb_range(start: &str, end: &str) -> Value {
+        authenticated_range("thumb", start, end)
+    }
+
+    fn legacy_thumb_range(start: &str, end: &str) -> Value {
         json!({"isa": "thumb", "start": start, "end": end})
     }
 
     fn ghidra_accepted(name: &str, entry: &str, end: &str, size: u64, ranges: Vec<Value>) -> Value {
         json!({
             "name": name,
+            "primary_source": "default",
             "entry": entry,
             "end": end,
             "size": size,
@@ -814,6 +901,7 @@ mod tests {
     ) -> Value {
         json!({
             "name": name,
+            "primary_source": "default",
             "entry": entry,
             "end": end,
             "size": size,
@@ -891,10 +979,11 @@ mod tests {
         assert_eq!(loaded.functions[0].identity.entry, 0x4000);
         assert_eq!(
             loaded.functions[0].identity.decode_ranges,
-            vec![DecodeRange {
+            vec![AuthenticatedDecodeRange {
                 start: 0x4000,
                 end: 0x4008,
                 isa: DecodeIsa::Thumb,
+                blake3: *blake3::hash(&[0; 8]).as_bytes(),
             }]
         );
         assert_eq!(
@@ -938,10 +1027,11 @@ mod tests {
         assert_eq!(loaded.functions[0].identity.entry, 0x4000);
         assert_eq!(
             loaded.functions[0].identity.decode_ranges,
-            vec![DecodeRange {
+            vec![AuthenticatedDecodeRange {
                 start: 0x4000,
                 end: 0x4004,
                 isa: DecodeIsa::Arm,
+                blake3: *blake3::hash(&[0; 4]).as_bytes(),
             }]
         );
         assert_eq!(
@@ -983,7 +1073,7 @@ mod tests {
                 "thumb_4000",
                 "0x4000",
                 32,
-                vec![thumb_range("0x4000", "0x4020")],
+                vec![legacy_thumb_range("0x4000", "0x4020")],
             )],
         ));
         let bound = BoundRequest::from_fixture(&fixture, 0, 0, 0, Some(1), Some(1), Some(0), 1);
@@ -1044,7 +1134,7 @@ mod tests {
                 "thumb_4000",
                 "0x4000",
                 16,
-                vec![thumb_range("0x4000", "0x4010")],
+                vec![legacy_thumb_range("0x4000", "0x4010")],
             );
             record["end"] = json!("0x4080");
             fixture.write_thumb(&thumb_file(format, &[record]));
@@ -1142,13 +1232,13 @@ mod tests {
                     "thumb_4020",
                     "0x4020",
                     32,
-                    vec![thumb_range("0x4020", "0x4040")],
+                    vec![legacy_thumb_range("0x4020", "0x4040")],
                 ),
                 thumb_accepted(
                     "thumb_4010",
                     "0x4010",
                     8,
-                    vec![thumb_range("0x4010", "0x4018")],
+                    vec![legacy_thumb_range("0x4010", "0x4018")],
                 ),
             ],
         ));
@@ -1291,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_both_neither_unknown_extra_unsorted_errors_and_accepts_valid_quarantine() {
+    fn rejects_invalid_fresh_tags_and_accepts_legacy_nonexecution_and_valid_quarantine() {
         let fixture = Fixture::new("tags");
         let valid_error = quarantine_error("empty_projection", "0x4008", None);
         let cases: &[Value] = &[
@@ -1380,7 +1470,9 @@ mod tests {
             })],
         ));
         let bound = BoundRequest::from_fixture(&fixture, 0, 0, 0, Some(0), Some(0), Some(1), 0);
-        assert!(load_inputs(&bound.get()).is_err());
+        let loaded = load_ok(&bound.get());
+        assert!(loaded.functions.is_empty());
+        assert_eq!(loaded.source_counts.thumb_quarantined, 1);
 
         write_minimal_with_functions(
             &fixture,
@@ -1514,7 +1606,7 @@ mod tests {
             "thumb_bad",
             "0x4000",
             8,
-            vec![thumb_range("0x4000", "0x4003")],
+            vec![legacy_thumb_range("0x4000", "0x4003")],
         );
         fixture.write_thumb(&thumb_file(
             "pixel-modem-extractor-thumb-functions-v2",

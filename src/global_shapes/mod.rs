@@ -8,7 +8,7 @@ mod tracker;
 mod validate;
 
 use crate::error::{Error, Result};
-use crate::execution_ranges::{DecodeIsa as Isa, ExecutionIdentity};
+use crate::execution_ranges::{DecodeIsa as Isa, ExecutionIdentity, OwnedExecutionIdentity};
 use aggregate::{Aggregation, aggregate};
 use artifact::{
     AnalysisWire, DecoderWire, GlobalShapesFile, InputHashesWire, LoadedInputs, Status, serialize,
@@ -60,6 +60,7 @@ pub(crate) struct FunctionContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FunctionExecution {
+    pub owner: crate::execution_ranges::FunctionOwner,
     pub identity: ExecutionIdentity,
     pub contexts: BTreeSet<FunctionContext>,
 }
@@ -205,7 +206,9 @@ fn analyze_loaded_inputs(
     if !inputs.globals.is_empty() {
         let recovered: BTreeSet<u32> = inputs.globals.iter().map(|global| global.address).collect();
         let mut functions: Vec<&FunctionExecution> = inputs.functions.iter().collect();
-        functions.sort_by(|left, right| left.identity.cmp(&right.identity));
+        functions.sort_by(|left, right| {
+            (left.owner, &left.identity).cmp(&(right.owner, &right.identity))
+        });
         (arm_functions, thumb_functions) = count_isa_identities(functions.iter().copied())?;
 
         let mut entry_index: BTreeMap<u32, Vec<&FunctionExecution>> = BTreeMap::new();
@@ -278,7 +281,7 @@ fn analyze_loaded_inputs(
         // Resolve, then group resolved facts by (callee identity, seed
         // vector) so identical seeds harvested from different call sites
         // replay the callee exactly once; union their CallHop provenance.
-        let mut groups: BTreeMap<(ExecutionIdentity, Vec<(u8, u32)>), SeedGroup<'_>> =
+        let mut groups: BTreeMap<(OwnedExecutionIdentity, Vec<(u8, u32)>), SeedGroup<'_>> =
             BTreeMap::new();
         for fact in &call_facts {
             let Some(callee) = resolve_callee(&entry_index, fact.callee_target, fact.callee_isa)
@@ -293,7 +296,13 @@ fn analyze_loaded_inputs(
                 .map(|(register, address)| (register.0, *address))
                 .collect();
             let group = groups
-                .entry((callee.identity.clone(), seed_key))
+                .entry((
+                    OwnedExecutionIdentity {
+                        owner: callee.owner,
+                        identity: callee.identity.clone(),
+                    },
+                    seed_key,
+                ))
                 .or_insert_with(|| SeedGroup {
                     callee,
                     seed: fact.seed.clone(),
@@ -322,9 +331,12 @@ fn analyze_loaded_inputs(
         // is evidence this same callee would produce on its own and is
         // already covered by its own Pass-1 cold run.
         seed_vectors = groups.len();
-        let mut seeded_callee_identities: BTreeSet<ExecutionIdentity> = BTreeSet::new();
+        let mut seeded_callee_identities: BTreeSet<OwnedExecutionIdentity> = BTreeSet::new();
         for group in groups.values() {
-            seeded_callee_identities.insert(group.callee.identity.clone());
+            seeded_callee_identities.insert(OwnedExecutionIdentity {
+                owner: group.callee.owner,
+                identity: group.callee.identity.clone(),
+            });
             let decoded =
                 decode_function(decoder, group.callee, &inputs.image, inputs.load_address)?;
             let blocks = reachable_blocks(group.callee, &decoded)?;
@@ -880,17 +892,35 @@ mod tests {
         })
     }
 
-    fn arm_range(start: &str, end: &str) -> Value {
-        json!({"isa": "arm", "start": start, "end": end})
+    fn authenticated_range(isa: &str, start: &str, end: &str, image: &[u8]) -> Value {
+        let start_address = u32::from_str_radix(start.trim_start_matches("0x"), 16).unwrap();
+        let end_address = u32::from_str_radix(end.trim_start_matches("0x"), 16).unwrap();
+        let start_offset = (start_address - LOAD_ADDR) as usize;
+        let end_offset = (end_address - LOAD_ADDR) as usize;
+        json!({
+            "isa": isa,
+            "start": start,
+            "end": end,
+            "blake3": blake3::hash(&image[start_offset..end_offset]).to_hex().to_string(),
+        })
     }
 
-    fn thumb_range(start: &str, end: &str) -> Value {
+    fn arm_range(start: &str, end: &str, image: &[u8]) -> Value {
+        authenticated_range("arm", start, end, image)
+    }
+
+    fn ghidra_thumb_range(start: &str, end: &str, image: &[u8]) -> Value {
+        authenticated_range("thumb", start, end, image)
+    }
+
+    fn legacy_thumb_range(start: &str, end: &str) -> Value {
         json!({"isa": "thumb", "start": start, "end": end})
     }
 
     fn ghidra_accepted(name: &str, entry: &str, end: &str, size: u64, ranges: Vec<Value>) -> Value {
         json!({
             "name": name,
+            "primary_source": "default",
             "entry": entry,
             "end": end,
             "size": size,
@@ -909,6 +939,7 @@ mod tests {
     ) -> Value {
         json!({
             "name": name,
+            "primary_source": "default",
             "entry": entry,
             "end": end,
             "size": size,
@@ -955,7 +986,8 @@ mod tests {
 
     fn write_synthetic_sources(fixture: &Fixture, recovered: &[Value]) {
         fixture.write_manifest();
-        fixture.write_image(&synthetic_image_bytes());
+        let image = synthetic_image_bytes();
+        fixture.write_image(&image);
         fixture.write_globals(&globals_file(recovered));
         fixture.write_functions(&json!([
             ghidra_accepted(
@@ -963,7 +995,7 @@ mod tests {
                 "0x4000",
                 "0x4008",
                 8,
-                vec![arm_range("0x4000", "0x4008")],
+                vec![arm_range("0x4000", "0x4008", &image)],
             ),
             ghidra_accepted(
                 "FUN_mixed",
@@ -971,8 +1003,8 @@ mod tests {
                 "0x408c",
                 12,
                 vec![
-                    arm_range("0x4080", "0x4084"),
-                    thumb_range("0x4088", "0x408c"),
+                    arm_range("0x4080", "0x4084", &image),
+                    ghidra_thumb_range("0x4088", "0x408c", &image),
                 ],
             ),
             ghidra_accepted(
@@ -980,14 +1012,14 @@ mod tests {
                 "0x40c0",
                 "0x40c8",
                 8,
-                vec![arm_range("0x40c0", "0x40c8")],
+                vec![arm_range("0x40c0", "0x40c8", &image)],
             ),
             ghidra_accepted(
                 "FUN_overlap_thumb",
                 "0x40c0",
                 "0x40c8",
                 8,
-                vec![thumb_range("0x40c0", "0x40c8")],
+                vec![ghidra_thumb_range("0x40c0", "0x40c8", &image)],
             ),
             ghidra_quarantined(
                 "FUN_quarantined",
@@ -1001,7 +1033,7 @@ mod tests {
             "thumb_4040",
             "0x4040",
             32,
-            vec![thumb_range("0x4040", "0x4048")],
+            vec![legacy_thumb_range("0x4040", "0x4048")],
         )]));
     }
 
@@ -1037,7 +1069,8 @@ mod tests {
 
     fn write_interproc_sources(fixture: &Fixture) {
         fixture.write_manifest();
-        fixture.write_image(&interproc_image_bytes());
+        let image = interproc_image_bytes();
+        fixture.write_image(&image);
         fixture.write_globals(&globals_file(&[recovered_global(
             &hex(SCALAR),
             "g_scalar",
@@ -1051,13 +1084,14 @@ mod tests {
             vec![arm_range(
                 &hex(INTERPROC_CALLER_ENTRY),
                 &hex(INTERPROC_CALLER_ENTRY + 8),
+                &image,
             )],
         )]));
         fixture.write_thumb(&thumb_file(&[thumb_accepted(
             "thumb_callee",
             &hex(INTERPROC_CALLEE_ENTRY),
             32,
-            vec![thumb_range(
+            vec![legacy_thumb_range(
                 &hex(INTERPROC_CALLEE_ENTRY),
                 &hex(INTERPROC_CALLEE_ENTRY + 4),
             )],
@@ -1786,13 +1820,18 @@ mod tests {
                 for isa in [Isa::Arm, Isa::Thumb] {
                     let end = 0x4000 + u32::try_from(length.max(4)).unwrap();
                     let function = FunctionExecution {
+                        owner: crate::execution_ranges::FunctionOwner::Ghidra,
                         identity: crate::execution_ranges::ExecutionIdentity {
                             entry: 0x4000,
-                            decode_ranges: vec![crate::execution_ranges::DecodeRange {
-                                start: 0x4000,
-                                end,
-                                isa,
-                            }],
+                            decode_ranges: vec![
+                                crate::execution_ranges::AuthenticatedDecodeRange {
+                                    start: 0x4000,
+                                    end,
+                                    isa,
+                                    blake3: [0; 32],
+                                },
+                            ],
+                            execution_blake3: [0; 32],
                         },
                         contexts: BTreeSet::from([FunctionContext {
                             entry: 0x4000,
@@ -1943,6 +1982,45 @@ mod tests {
             &fixture.manifest_path(),
             &report_image,
             &file,
+        );
+    }
+
+    #[test]
+    fn artifact_validation_rejects_ghidra_range_hash_mismatch() {
+        let fixture = Fixture::new("validate_execution_hash");
+        let bound = synthetic_bound(&fixture, 3);
+        let (bytes, _) = analyze_to_bytes_without_commit(&bound.get()).unwrap();
+        let mut artifact: Value = serde_json::from_slice(&bytes).unwrap();
+
+        let functions_path = fixture.decompiled().join("functions.json");
+        let mut functions: Value =
+            serde_json::from_slice(&fs::read(&functions_path).unwrap()).unwrap();
+        functions[0]["decode_ranges"][0]["blake3"] = json!("00".repeat(32));
+        fixture.write_functions(&functions);
+        artifact["inputs"]["functions_blake3"] =
+            json!(blake3_bytes(&fs::read(&functions_path).unwrap()));
+
+        let report_image = json!({
+            "image": LABEL,
+            "functions": bound.ghidra_records,
+            "ghidra_execution_accepted": bound.ghidra_accepted,
+            "ghidra_execution_quarantined": bound.ghidra_quarantined,
+            "globals_recovered": bound.recovered,
+            "thumb_functions": bound.thumb_substantial.unwrap(),
+            "thumb_execution_accepted": bound.thumb_accepted.unwrap(),
+            "thumb_execution_quarantined": bound.thumb_quarantined.unwrap(),
+        });
+        let result = std::panic::catch_unwind(|| {
+            validate_artifact_files(
+                &fixture.image_dir(),
+                &fixture.manifest_path(),
+                &report_image,
+                &artifact,
+            );
+        });
+        assert!(
+            result.is_err(),
+            "retained-artifact validation accepted a stale execution hash"
         );
     }
 

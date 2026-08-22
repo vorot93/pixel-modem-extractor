@@ -13,6 +13,8 @@
 //! pattern disambiguation (Phase 3.0.1 territory).
 
 use crate::error::{Error, Result};
+use crate::execution_ranges::{ExecutionIdentity, FunctionOwner, execution_identity};
+use crate::runtime_image::RuntimeImage;
 use crate::source_tree::extract_strings;
 use crate::symbolicate;
 use atomic_write_file::AtomicWriteFile;
@@ -141,8 +143,15 @@ pub enum Arch {
 /// before symbol finalization updates the function inventories.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionEvidenceNameProjection {
-    arm: HashMap<u64, String>,
-    thumb: HashMap<u64, Option<String>>,
+    arm: HashMap<FunctionEvidenceKey, String>,
+    thumb: HashMap<FunctionEvidenceKey, Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FunctionEvidenceKey {
+    owner: FunctionOwner,
+    entry: u64,
+    execution_blake3: Option<[u8; 32]>,
 }
 
 impl FunctionEvidenceNameProjection {
@@ -155,16 +164,21 @@ impl FunctionEvidenceNameProjection {
             let Some(address) = parse_numeric_symbol_address(&symbol.address) else {
                 continue;
             };
+            let key = FunctionEvidenceKey {
+                owner: symbol.owner,
+                entry: address,
+                execution_blake3: symbol.execution_blake3,
+            };
             match symbol.arch {
                 "arm" => {
                     if let Some(name) = &symbol.name {
-                        projection.arm.insert(address, name.clone());
+                        projection.arm.insert(key, name.clone());
                     }
                 }
                 // Thumb records the absence of a name too: an entry present
                 // with `None` is a known function the writer left unnamed.
                 "thumb" => {
-                    projection.thumb.insert(address, symbol.name.clone());
+                    projection.thumb.insert(key, symbol.name.clone());
                 }
                 _ => {}
             }
@@ -174,8 +188,39 @@ impl FunctionEvidenceNameProjection {
 
     pub fn name_for(&self, arch: Arch, entry: u64) -> Option<&str> {
         match arch {
-            Arch::Arm => self.arm.get(&entry).map(String::as_str),
-            Arch::Thumb => self.thumb.get(&entry).and_then(Option::as_deref),
+            Arch::Arm => {
+                let mut matches = self.arm.iter().filter(|(key, _)| key.entry == entry);
+                let (_, name) = matches.next()?;
+                matches.next().is_none().then_some(name.as_str())
+            }
+            Arch::Thumb => {
+                let mut matches = self.thumb.iter().filter(|(key, _)| key.entry == entry);
+                let (_, name) = matches.next()?;
+                if matches.next().is_some() {
+                    None
+                } else {
+                    name.as_deref()
+                }
+            }
+            Arch::Mixed => None,
+        }
+    }
+
+    fn name_for_identity(
+        &self,
+        arch: Arch,
+        owner: FunctionOwner,
+        entry: u64,
+        execution_blake3: Option<[u8; 32]>,
+    ) -> Option<&str> {
+        let key = FunctionEvidenceKey {
+            owner,
+            entry,
+            execution_blake3,
+        };
+        match arch {
+            Arch::Arm => self.arm.get(&key).map(String::as_str),
+            Arch::Thumb => self.thumb.get(&key).and_then(Option::as_deref),
             Arch::Mixed => None,
         }
     }
@@ -403,6 +448,17 @@ pub fn run_with_evidence_projection(
     //    `globals_error` and skips writing globals.json for this image.
     let bin_path = image_dir.join(format!("{image_label}.bin"));
     let image_bytes = std::fs::read(&bin_path)?;
+    let runtime_load_addr = u32::try_from(load_addr)
+        .map_err(|_| Error::Serialize("globals: load_addr does not fit u32".into()))?;
+    let runtime_root = std::fs::canonicalize(image_dir)?;
+    let relative_map = Path::new("scatter/load_map.json");
+    let runtime_map = runtime_root.join(relative_map);
+    let runtime = RuntimeImage::from_artifact(
+        &image_bytes,
+        runtime_load_addr,
+        &runtime_root,
+        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
+    )?;
 
     // 3. Build string_map: {vaddr -> string_content}.
     let mut string_map: HashMap<u64, String> = HashMap::new();
@@ -420,32 +476,41 @@ pub fn run_with_evidence_projection(
         let arm_text = std::fs::read_to_string(&arm_path)?;
         let arm_v: serde_json::Value = serde_json::from_str(&arm_text)
             .map_err(|e| Error::Serialize(format!("parse functions.json: {e}")))?;
-        if let Some(arr) = arm_v.as_array() {
-            for f in arr {
-                if let Some(parsed) =
-                    parse_function(f, Arch::Arm, recovered_function_names, evidence_names)
-                {
-                    all_funcs.push(parsed);
-                }
+        let records = arm_v
+            .as_array()
+            .ok_or_else(|| Error::Serialize("functions.json must be an array".into()))?;
+        let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
+            records,
+            records.len(),
+            &runtime,
+        )?;
+        for (record, tagged) in records.iter().zip(inventory.records) {
+            let execution = execution_identity(tagged.entry, &tagged.projection)?;
+            if let Some(parsed) = parse_function(
+                record,
+                Arch::Arm,
+                FunctionOwner::Ghidra,
+                execution.as_ref(),
+                recovered_function_names,
+                evidence_names,
+            ) {
+                all_funcs.push(parsed);
             }
         }
     }
 
     let thumb_path = decompiled.join("thumb_functions.json");
     if thumb_path.exists() {
-        // The raw image is loaded above, so v3 region bounds and function
-        // envelopes are validated against the image they describe.
-        let mapped = crate::thumb_analysis::MappedImage::new(
-            u32::try_from(load_addr)
-                .map_err(|_| Error::Serialize("globals: load_addr does not fit u32".into()))?,
-            u32::try_from(image_bytes.len())
-                .map_err(|_| Error::Serialize("globals: image length does not fit u32".into()))?,
-        )?;
-        let thumb_artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path, Some(mapped))?;
-        for function in thumb_artifact.function_values() {
+        for function in
+            crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, &runtime)?
+        {
+            let value = serde_json::to_value(&function.function)
+                .map_err(|error| Error::Serialize(error.to_string()))?;
             if let Some(parsed) = parse_function(
-                function,
+                &value,
                 Arch::Thumb,
+                function.owner,
+                function.execution.as_ref(),
                 recovered_function_names,
                 evidence_names,
             ) {
@@ -560,11 +625,7 @@ pub fn run_with_evidence_projection(
         // Thumb: the canonical per-function `body` field from thumb_functions.json
         // (adapted analyzer output — different format from disasm.lst; do NOT
         // re-slice disasm.lst for Thumb).
-        let (disasm_slice, k) = match f.arch {
-            Arch::Arm => (disasm_index.slice_for(f.entry, f.end), opts.k_arm),
-            Arch::Thumb => (f.body.clone().unwrap_or_default(), opts.k_thumb),
-            Arch::Mixed => continue,
-        };
+        let (disasm_slice, k) = function_disassembly(f, &disasm_index, opts);
         let load_events = symbolicate::reconstruct_load_events(&disasm_slice);
         let recovered = disasm_anchored_recovered_for_function(f, &string_map, &load_events, k);
         for (addr, name, sl_ev, gl_ev) in recovered {
@@ -628,11 +689,7 @@ pub fn run_with_evidence_projection(
         if candidate_refs.len() < 2 {
             continue;
         }
-        let (disasm_slice, k) = match f.arch {
-            Arch::Arm => (disasm_index.slice_for(f.entry, f.end), opts.k_arm),
-            Arch::Thumb => (f.body.clone().unwrap_or_default(), opts.k_thumb),
-            Arch::Mixed => continue,
-        };
+        let (disasm_slice, k) = function_disassembly(f, &disasm_index, opts);
         let load_events = symbolicate::reconstruct_load_events(&disasm_slice);
         let provisional = name_prior_provisional_for_function(f, &string_map, &load_events, k);
         provisional_generated += provisional.len();
@@ -756,7 +813,7 @@ pub fn run_with_evidence_projection(
         }
         // Sort contributors by function address ascending (deterministic
         // evidence ordering, mirrors Phase 3.0).
-        contributors.sort_by_key(|c| c.func.entry);
+        contributors.sort_by_key(|c| (c.func.entry, c.func.owner, c.func.execution_blake3));
         let has_arm = contributors.iter().any(|c| c.func.arch == Arch::Arm);
         let has_thumb = contributors.iter().any(|c| c.func.arch == Arch::Thumb);
         let arch = match (has_arm, has_thumb) {
@@ -867,19 +924,43 @@ pub fn run_with_evidence_projection(
 #[derive(Debug, Clone)]
 struct Function {
     entry: u64,
-    /// Inclusive end boundary (for ARM disasm.lst slicing `[entry, end)`).
-    /// Defaults to `entry` when the JSON lacks an `end` field.
-    end: u64,
+    owner: FunctionOwner,
+    execution_blake3: Option<[u8; 32]>,
+    decode_ranges: Vec<(u64, u64)>,
     arch: Arch,
     ghidra_name: String,
     recovered_name: Option<String>,
     data_refs: Vec<u64>,
     /// Thumb only: the per-function disassembly body from
     /// `thumb_functions.json`'s canonical `body` field (adapted analyzer output). `None`
-    /// for ARM — ARM slices `disasm.lst` by `[entry, end)` at processing
-    /// time (Ghidra's full-image disasm, different format from Thumb's
+    /// for ARM, which slices `disasm.lst` over each authenticated range
+    /// (Ghidra's full-image disassembly uses a different format from Thumb's
     /// per-function body).
     body: Option<String>,
+}
+
+fn function_disassembly(
+    function: &Function,
+    index: &crate::disasm_index::DisasmIndex<'_>,
+    opts: &GlobalsOpts,
+) -> (String, usize) {
+    match function.arch {
+        Arch::Arm => {
+            let mut disassembly = String::new();
+            for (start, end) in &function.decode_ranges {
+                disassembly.push_str(&index.slice_for(*start, *end));
+            }
+            (disassembly, opts.k_arm)
+        }
+        Arch::Thumb => (
+            function
+                .execution_blake3
+                .and(function.body.clone())
+                .unwrap_or_default(),
+            opts.k_thumb,
+        ),
+        Arch::Mixed => (String::new(), 0),
+    }
 }
 
 /// Parse one entry from `functions.json` or `thumb_functions.json` into a
@@ -890,6 +971,8 @@ struct Function {
 fn parse_function(
     v: &serde_json::Value,
     arch: Arch,
+    owner: FunctionOwner,
+    execution: Option<&ExecutionIdentity>,
     recovered_function_names: &HashMap<String, String>,
     evidence_names: Option<&FunctionEvidenceNameProjection>,
 ) -> Option<Function> {
@@ -897,18 +980,14 @@ fn parse_function(
         .get("entry")
         .and_then(|e| e.as_str())
         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())?;
-    let end = v
-        .get("end")
-        .and_then(|e| e.as_str())
-        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(entry);
     let source_name = v
         .get("name")
         .and_then(|n| n.as_str())
         .map(String::from)
         .unwrap_or_else(|| format!("FUN_{entry:x}"));
+    let execution_blake3 = execution.map(|execution| execution.execution_blake3);
     let ghidra_name = evidence_names
-        .and_then(|projection| projection.name_for(arch, entry))
+        .and_then(|projection| projection.name_for_identity(arch, owner, entry, execution_blake3))
         .map(str::to_owned)
         .unwrap_or(source_name);
     let data_refs: Vec<u64> = v
@@ -926,7 +1005,17 @@ fn parse_function(
     let recovered_name = recovered_function_names.get(&canonical).cloned();
     Some(Function {
         entry,
-        end,
+        owner,
+        execution_blake3,
+        decode_ranges: execution
+            .map(|execution| {
+                execution
+                    .decode_ranges
+                    .iter()
+                    .map(|range| (u64::from(range.start), u64::from(range.end)))
+                    .collect()
+            })
+            .unwrap_or_default(),
         arch,
         ghidra_name,
         recovered_name,
@@ -992,11 +1081,15 @@ fn disasm_anchored_recovered_for_function(
     k: usize,
 ) -> Vec<(u64, String, Evidence, Evidence)> {
     let mut out = Vec::new();
-    // Mega-slice guard: skip Ghidra-mis-estimated "functions" whose `[entry,
-    // end)` span exceeds `MEGA_FN_THRESHOLD`. See the const's doc comment for
-    // rationale. Must run before any per-load-event work so the pathological
-    // case never enters the matching loop.
-    if func.end.saturating_sub(func.entry) > MEGA_FN_THRESHOLD {
+    // Bound exact authenticated execution coverage, never an address envelope.
+    let execution_bytes = func
+        .decode_ranges
+        .iter()
+        .try_fold(0u64, |total, (start, end)| {
+            total.checked_add(end.saturating_sub(*start))
+        })
+        .unwrap_or(u64::MAX);
+    if execution_bytes > MEGA_FN_THRESHOLD {
         return out;
     }
     if load_events.is_empty() {
@@ -1246,6 +1339,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    static TEST_IMAGE: [u8; 0x100] = [0; 0x100];
+
+    fn test_runtime() -> RuntimeImage<'static> {
+        RuntimeImage::from_plan(&TEST_IMAGE, 0x4000, None).unwrap()
+    }
+
     fn tmp_root(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("pme_globals_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
@@ -1297,6 +1396,8 @@ mod tests {
                 address: address.to_string(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_invalid".to_string(),
                 name: Some("SHOULD_NOT_PROJECT".to_string()),
                 tier: symbolicate::Tier::Recovered,
@@ -1309,6 +1410,53 @@ mod tests {
         assert!(projection.thumb.is_empty());
         assert_eq!(projection.name_for(Arch::Arm, 0), None);
         assert_eq!(projection.name_for(Arch::Thumb, 0), None);
+    }
+
+    #[test]
+    fn function_name_projection_does_not_collapse_same_entry_thumb_runs() {
+        let symbol = |owner, execution_blake3, name: &str| symbolicate::Symbol {
+            address: "0x4000".into(),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner,
+            execution_blake3: Some(execution_blake3),
+            original_name: "thumb_4000".into(),
+            name: Some(name.into()),
+            tier: symbolicate::Tier::Recovered,
+            evidence: Vec::new(),
+            annotations: Vec::new(),
+        };
+        let symbols = vec![
+            symbol(
+                FunctionOwner::Run {
+                    producer: crate::recover_source::Tool::Radare2,
+                    region_index: 0,
+                    run_index: 0,
+                },
+                [1; 32],
+                "first_run",
+            ),
+            symbol(
+                FunctionOwner::Run {
+                    producer: crate::recover_source::Tool::Radare2,
+                    region_index: 1,
+                    run_index: 0,
+                },
+                [2; 32],
+                "second_run",
+            ),
+        ];
+
+        let projection = FunctionEvidenceNameProjection::from_symbols(&symbols);
+
+        assert_eq!(projection.name_for(Arch::Thumb, 0x4000), None);
+        let mut exact_names = projection
+            .thumb
+            .values()
+            .filter_map(Option::as_deref)
+            .collect::<Vec<_>>();
+        exact_names.sort_unstable();
+        assert_eq!(exact_names, ["first_run", "second_run"]);
     }
 
     /// Build a minimal image_dir with decompiled/functions.json +
@@ -1390,15 +1538,51 @@ mod tests {
         buf
     }
 
+    fn image_with_strings_through(load_addr: u64, strings: &[(u64, &str)], end: u64) -> Vec<u8> {
+        let mut image = image_with_strings(load_addr, strings);
+        image.resize((end - load_addr) as usize, 0);
+        image
+    }
+
     fn make_arm_function(entry: u64, data_refs: &[u64]) -> serde_json::Value {
+        make_arm_function_range(entry, entry + 0x10, data_refs)
+    }
+
+    fn make_arm_function_range(entry: u64, end: u64, data_refs: &[u64]) -> serde_json::Value {
         let refs: Vec<String> = data_refs.iter().map(|a| format!("0x{a:x}")).collect();
+        let size = end - entry;
         serde_json::json!({
             "name": format!("FUN_{entry:x}"),
+            "primary_source": "default",
             "entry": format!("0x{entry:x}"),
-            "end": format!("0x{:x}", entry + 0x10),
-            "size": 16,
+            "end": format!("0x{end:x}"),
+            "size": size,
+            "decode_ranges": [{
+                "isa": "arm",
+                "start": format!("0x{entry:x}"),
+                "end": format!("0x{end:x}"),
+                "blake3": blake3::hash(&vec![0; size as usize]).to_hex().to_string(),
+            }],
+            "decode_range_errors": [],
             "data_refs": refs,
         })
+    }
+
+    fn ghidra_execution_blake3(
+        function: &serde_json::Value,
+        image: &[u8],
+        load_addr: u32,
+    ) -> [u8; 32] {
+        let runtime = RuntimeImage::from_plan(image, load_addr, None).unwrap();
+        crate::execution_ranges::validate_ghidra_inventory_records(
+            std::slice::from_ref(function),
+            1,
+            &runtime,
+        )
+        .unwrap()
+        .accepted_executions[0]
+            .identity
+            .execution_blake3
     }
 
     fn make_thumb_function(entry: u64, data_refs: &[u64]) -> serde_json::Value {
@@ -1437,13 +1621,13 @@ mod tests {
         );
         let artifact = crate::thumb_analysis::read_thumb_artifact(
             &img.image_dir().join("decompiled/thumb_functions.json"),
-            None,
+            &test_runtime(),
         )
         .unwrap();
         assert!(
-            artifact
-                .functions()
-                .all(|function| function.producer == crate::thumb_analysis::ThumbProducer::Rizin),
+            artifact.functions().all(|function| {
+                function.owner.analysis_tool() == crate::analysis_tool::AnalysisTool::Rizin
+            }),
             "the downstream fixture must exercise Rizin-owned v3 records"
         );
         assert_eq!(
@@ -1461,7 +1645,7 @@ mod tests {
             run_no_names(&img)
                 .unwrap_err()
                 .to_string()
-                .contains("region 0 is outside mapped image")
+                .contains("region 0 is outside runtime image")
         );
 
         image.resize(0x80, 0);
@@ -1488,6 +1672,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_ghidra_range_hash_mismatch() {
+        let img = Img::new("rejects_ghidra_hash_mismatch");
+        let mut function = make_arm_function(0x2000, &[]);
+        function["decode_ranges"][0]["blake3"] = serde_json::json!("00".repeat(32));
+        img.write_functions_json(&serde_json::to_string(&vec![function]).unwrap());
+        img.write_image_bin(&vec![0u8; 0x2000]);
+
+        let error = run_no_names(&img).unwrap_err();
+
+        assert!(error.to_string().contains("BLAKE3"), "{error}");
+    }
+
     /// Build a `Function` for direct unit tests of
     /// `disasm_anchored_recovered_for_function`. The helper only inspects
     /// `arch` and `data_refs` (the disasm events are passed separately), so
@@ -1495,7 +1692,9 @@ mod tests {
     fn sample_func(arch: Arch, data_refs: Vec<u64>) -> Function {
         Function {
             entry: 0,
-            end: 0,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: None,
+            decode_ranges: Vec::new(),
             arch,
             ghidra_name: "sample".to_string(),
             recovered_name: None,
@@ -1740,12 +1939,16 @@ mod tests {
             img.write_image_bin(&image);
             fs::write(img.image_dir().join("decompiled").join("disasm.lst"), b"").unwrap();
         }
+        let arm_2000_execution = ghidra_execution_blake3(&early_arm[0], &image, 0x1000);
+        let arm_2300_execution = ghidra_execution_blake3(&early_arm[1], &image, 0x1000);
 
         let symbols = vec![
             symbolicate::Symbol {
                 address: "0x2000".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: Some(arm_2000_execution),
                 original_name: "FUN_2000".into(),
                 name: Some("ARM_FINAL_2000".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1756,6 +1959,10 @@ mod tests {
                 address: "0x2100".into(),
                 arch: "thumb",
                 tool: crate::recover_source::Tool::Radare2,
+                owner: FunctionOwner::Legacy {
+                    producer: crate::recover_source::Tool::Radare2,
+                },
+                execution_blake3: None,
                 original_name: "fcn.2100".into(),
                 name: Some("THUMB_FINAL_2100".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -1766,6 +1973,8 @@ mod tests {
                 address: "0x2200".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: None,
                 original_name: "FUN_2200".into(),
                 name: Some("ARM_SHARED_2200".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1776,6 +1985,10 @@ mod tests {
                 address: "0x2200".into(),
                 arch: "thumb",
                 tool: crate::recover_source::Tool::Radare2,
+                owner: FunctionOwner::Legacy {
+                    producer: crate::recover_source::Tool::Radare2,
+                },
+                execution_blake3: None,
                 original_name: "fcn.2200".into(),
                 name: None,
                 tier: symbolicate::Tier::None,
@@ -1786,6 +1999,8 @@ mod tests {
                 address: "0x2300".into(),
                 arch: "arm",
                 tool: crate::recover_source::Tool::Ghidra,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: Some(arm_2300_execution),
                 original_name: "FUN_2300".into(),
                 name: Some("COLLISION_FIRST_2300".into()),
                 tier: symbolicate::Tier::Recovered,
@@ -1796,6 +2011,10 @@ mod tests {
                 address: "0x2300".into(),
                 arch: "thumb",
                 tool: crate::recover_source::Tool::Radare2,
+                owner: FunctionOwner::Legacy {
+                    producer: crate::recover_source::Tool::Radare2,
+                },
+                execution_blake3: None,
                 original_name: "fcn.2300".into(),
                 name: Some("COLLISION_FINAL_2300".into()),
                 tier: symbolicate::Tier::Provisional,
@@ -2299,8 +2518,8 @@ mod tests {
         // "functions" spanning megabytes of disasm (production `02_MAIN` worst
         // case: 37 MB disasm / ~865k load-events / 9.3M insns at one "function").
         // The mega-slice guard at the top of `disasm_anchored_recovered_for_function`
-        // silently skips any function whose `[entry, end)` span exceeds
-        // `MEGA_FN_THRESHOLD`. Real functions (typically < 1 MB) process normally.
+        // silently skips any function whose authenticated execution coverage
+        // exceeds `MEGA_FN_THRESHOLD`. Real functions process normally.
         let string_addr = 0x40e22000;
         let global_addr = 0x40e30000;
         let string_map = HashMap::from([(string_addr, "g_foo is NULL".into())]);
@@ -2311,7 +2530,7 @@ mod tests {
         // Span strictly greater than MEGA_FN_THRESHOLD -> guard fires, empty.
         let mut mega = sample_func(Arch::Arm, vec![string_addr, global_addr]);
         mega.entry = 0x1000;
-        mega.end = mega.entry + MEGA_FN_THRESHOLD + 1;
+        mega.decode_ranges = vec![(mega.entry, mega.entry + MEGA_FN_THRESHOLD + 1)];
         let mega_out = disasm_anchored_recovered_for_function(&mega, &string_map, &events, K_ARM);
         assert!(
             mega_out.is_empty(),
@@ -2322,7 +2541,7 @@ mod tests {
         // guard must not affect ordinary functions.
         let mut normal = sample_func(Arch::Arm, vec![string_addr, global_addr]);
         normal.entry = 0x1000;
-        normal.end = 0x2000;
+        normal.decode_ranges = vec![(normal.entry, 0x2000)];
         let normal_out =
             disasm_anchored_recovered_for_function(&normal, &string_map, &events, K_ARM);
         assert!(
@@ -2510,18 +2729,12 @@ mod tests {
         let string_addr = 0x40e22000u64;
         let g1 = 0x40e30000u64;
         let g2 = 0x40e31000u64;
-        let func_json = serde_json::json!([{
-            "name": format!("FUN_{entry:x}"),
-            "entry": format!("0x{entry:x}"),
-            "end": format!("0x{end:x}"),
-            "size": 0x30,
-            "data_refs": [
-                format!("0x{string_addr:x}"),
-                format!("0x{g1:x}"),
-                format!("0x{g2:x}"),
-            ],
-        }])
-        .to_string();
+        let func_json = serde_json::to_string(&vec![make_arm_function_range(
+            entry,
+            end,
+            &[string_addr, g1, g2],
+        )])
+        .unwrap();
         img.write_functions_json(&func_json);
         img.write_thumb_functions_json(
             r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
@@ -2536,9 +2749,10 @@ mod tests {
             disasm,
         )
         .unwrap();
-        img.write_image_bin(&image_with_strings(
+        img.write_image_bin(&image_with_strings_through(
             0x40e20000,
             &[(string_addr, "lteRrc_state and otherModule_field are NULL")],
+            end,
         ));
 
         // recovered_function_names: entry canonical = lowercase hex, no 0x.
@@ -2595,30 +2809,23 @@ mod tests {
             let recovered_end = 0x40e50030;
             let recovered_string_addr = 0x40e22500u64;
             let recovered_target = 0x40e32000u64;
-            let func_json = serde_json::json!([
-                {
-                    "name": format!("FUN_{provisional_entry:x}"),
-                    "entry": format!("0x{provisional_entry:x}"),
-                    "end": format!("0x{provisional_end:x}"),
-                    "size": 0x30,
-                    "data_refs": [
-                        format!("0x{provisional_string_addr:x}"),
-                        format!("0x{provisional_target:x}"),
-                        format!("0x{provisional_other:x}"),
+            let func_json = serde_json::to_string(&vec![
+                make_arm_function_range(
+                    provisional_entry,
+                    provisional_end,
+                    &[
+                        provisional_string_addr,
+                        provisional_target,
+                        provisional_other,
                     ],
-                },
-                {
-                    "name": format!("FUN_{recovered_entry:x}"),
-                    "entry": format!("0x{recovered_entry:x}"),
-                    "end": format!("0x{recovered_end:x}"),
-                    "size": 0x30,
-                    "data_refs": [
-                        format!("0x{recovered_string_addr:x}"),
-                        format!("0x{recovered_target:x}"),
-                    ],
-                },
+                ),
+                make_arm_function_range(
+                    recovered_entry,
+                    recovered_end,
+                    &[recovered_string_addr, recovered_target],
+                ),
             ])
-            .to_string();
+            .unwrap();
             img.write_functions_json(&func_json);
             img.write_thumb_functions_json(
                 r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
@@ -2631,7 +2838,7 @@ mod tests {
                 disasm,
             )
             .unwrap();
-            img.write_image_bin(&image_with_strings(
+            img.write_image_bin(&image_with_strings_through(
                 0x40e20000,
                 &[
                     (
@@ -2640,6 +2847,7 @@ mod tests {
                     ),
                     (recovered_string_addr, "g_recovered is NULL"),
                 ],
+                recovered_end,
             ));
             let mut names = HashMap::new();
             names.insert(
@@ -2717,30 +2925,11 @@ mod tests {
         let entry_p = 0x40e50000; // needs disasm for the Provisional pass
         let end_p = 0x40e50030;
 
-        let func_json = serde_json::json!([
-            {
-                "name": format!("FUN_{entry_r:x}"),
-                "entry": format!("0x{entry_r:x}"),
-                "end": format!("0x{end_r:x}"),
-                "size": 0x30,
-                "data_refs": [
-                    format!("0x{string_addr_r:x}"),
-                    format!("0x{g_target:x}"),
-                ],
-            },
-            {
-                "name": format!("FUN_{entry_p:x}"),
-                "entry": format!("0x{entry_p:x}"),
-                "end": format!("0x{end_p:x}"),
-                "size": 0x30,
-                "data_refs": [
-                    format!("0x{string_addr_p:x}"),
-                    format!("0x{g_target:x}"),
-                    format!("0x{g_other:x}"),
-                ],
-            },
+        let func_json = serde_json::to_string(&vec![
+            make_arm_function_range(entry_r, end_r, &[string_addr_r, g_target]),
+            make_arm_function_range(entry_p, end_p, &[string_addr_p, g_target, g_other]),
         ])
-        .to_string();
+        .unwrap();
         img.write_functions_json(&func_json);
         img.write_thumb_functions_json(
             r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
@@ -2759,12 +2948,13 @@ mod tests {
         )
         .unwrap();
 
-        img.write_image_bin(&image_with_strings(
+        img.write_image_bin(&image_with_strings_through(
             0x40e20000,
             &[
                 (string_addr_r, "g_foo is NULL"),
                 (string_addr_p, "lteRrc_state and otherModule_field are NULL"),
             ],
+            end_p,
         ));
 
         // recovered_function_names: only the Provisional fn needs a name prior.
@@ -2818,31 +3008,11 @@ mod tests {
         let entry_b = 0x40e50000;
         let end_b = 0x40e50040;
 
-        let func_json = serde_json::json!([
-            {
-                "name": format!("FUN_{entry_a:x}"),
-                "entry": format!("0x{entry_a:x}"),
-                "end": format!("0x{end_a:x}"),
-                "size": 0x40,
-                "data_refs": [
-                    format!("0x{string_addr_a:x}"),
-                    format!("0x{g_shared:x}"),
-                    format!("0x{g_other_a:x}"),
-                ],
-            },
-            {
-                "name": format!("FUN_{entry_b:x}"),
-                "entry": format!("0x{entry_b:x}"),
-                "end": format!("0x{end_b:x}"),
-                "size": 0x40,
-                "data_refs": [
-                    format!("0x{string_addr_b:x}"),
-                    format!("0x{g_shared:x}"),
-                    format!("0x{g_other_b:x}"),
-                ],
-            },
+        let func_json = serde_json::to_string(&vec![
+            make_arm_function_range(entry_a, end_a, &[string_addr_a, g_shared, g_other_a]),
+            make_arm_function_range(entry_b, end_b, &[string_addr_b, g_shared, g_other_b]),
         ])
-        .to_string();
+        .unwrap();
         img.write_functions_json(&func_json);
         img.write_thumb_functions_json(
             r#"{"format":"pixel-modem-extractor-thumb-functions-v2","functions":[]}"#,
@@ -2863,7 +3033,7 @@ mod tests {
         )
         .unwrap();
 
-        img.write_image_bin(&image_with_strings(
+        img.write_image_bin(&image_with_strings_through(
             0x40e20000,
             &[
                 (string_addr_a, "lteRrc_state and otherModule_field are NULL"),
@@ -2872,6 +3042,7 @@ mod tests {
                     "barModule_thing and otherModule_field are NULL",
                 ),
             ],
+            end_b,
         ));
 
         // Each fn gets a matching module prefix so its identifier prefix-matches.

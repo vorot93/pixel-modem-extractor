@@ -431,8 +431,8 @@ fn run_drives_ghidra_end_to_end() {
         lst.contains("010080e0"),
         "disasm.lst missing the instruction-bytes column:\n{lst}"
     );
-    let funcs: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(exp.join("functions.json")).unwrap()).unwrap();
+    let functions_bytes = std::fs::read(exp.join("functions.json")).unwrap();
+    let funcs: serde_json::Value = serde_json::from_slice(&functions_bytes).unwrap();
     assert!(
         funcs.as_array().map(|a| !a.is_empty()).unwrap_or(false),
         "functions.json has no functions: {funcs}"
@@ -455,9 +455,23 @@ fn run_drives_ghidra_end_to_end() {
             .is_some(),
         "functions.json entry missing data_refs array: {first}"
     );
+    assert!(
+        matches!(
+            first
+                .get("primary_source")
+                .and_then(serde_json::Value::as_str),
+            Some("default" | "analysis" | "imported" | "user_defined")
+        ),
+        "functions.json entry missing a canonical primary source: {first}"
+    );
     assert_eq!(
         first["decode_ranges"],
-        serde_json::json!([{"isa":"arm", "start":"0x0", "end":"0x4"}]),
+        serde_json::json!([{
+            "isa":"arm",
+            "start":"0x0",
+            "end":"0x4",
+            "blake3":"586d05e48ce74c78b4e74cefcc5a27a6d5f446dac3324152df360e51db9c2ae9"
+        }]),
         "the normal A32 fixture must export its exact instruction-backed range: {first}"
     );
     assert_eq!(first["decode_range_errors"], serde_json::json!([]));
@@ -1064,8 +1078,18 @@ public class ApplySymbols extends GhidraScript {
     assert_eq!(
         functions[0]["decode_ranges"],
         serde_json::json!([
-            {"isa":"arm", "start":"0x0", "end":"0x4"},
-            {"isa":"thumb", "start":"0x8", "end":"0xa"}
+            {
+                "isa":"arm",
+                "start":"0x0",
+                "end":"0x4",
+                "blake3":"bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2"
+            },
+            {
+                "isa":"thumb",
+                "start":"0x8",
+                "end":"0xa",
+                "blake3":"8a09f486717eda865dd286162039792980cf32f77517e0c4fb472529f72e5e8c"
+            }
         ])
     );
     assert_eq!(functions[0]["decode_range_errors"], serde_json::json!([]));
@@ -1391,7 +1415,12 @@ public class ApplySymbols extends GhidraScript {
         .collect();
     assert_eq!(
         by_name["accepted_before"]["decode_ranges"],
-        serde_json::json!([{"isa":"arm","start":"0x0","end":"0x4"}])
+        serde_json::json!([{
+            "isa":"arm",
+            "start":"0x0",
+            "end":"0x4",
+            "blake3":"bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2"
+        }])
     );
     assert_eq!(
         by_name["overridden"]["decode_ranges"],
@@ -1419,7 +1448,12 @@ public class ApplySymbols extends GhidraScript {
     );
     assert_eq!(
         by_name["accepted_after"]["decode_ranges"],
-        serde_json::json!([{"isa":"arm","start":"0x18","end":"0x1c"}]),
+        serde_json::json!([{
+            "isa":"arm",
+            "start":"0x18",
+            "end":"0x1c",
+            "blake3":"bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2"
+        }]),
         "later functions must still export after record-local quarantines"
     );
 
@@ -1500,7 +1534,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
             )
         })
         .collect();
-    let retained_thumb = br#"{
+    let retained_thumb = std::str::from_utf8(br#"{
   "format": "pixel-modem-extractor-thumb-functions-v3",
   "producers": [
     {"id":"radare2","executable":"/usr/bin/r2","version":"radare2 fixture","command":"aaa;aflj;pdfj @@f"},
@@ -1516,11 +1550,16 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
   }],
   "functions": [{
     "name":"retained_thumb_fixture","entry":"0x0","end":"0x2","size":2,
-    "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2"}],
+    "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2","blake3":"__RANGE_BLAKE3__"}],
     "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":[]
   }]
-}"#
-    .to_vec();
+}"#)
+    .unwrap()
+    .replace(
+        "__RANGE_BLAKE3__",
+        blake3::hash(&arm[..2]).to_hex().as_ref(),
+    )
+    .into_bytes();
     std::fs::write(
         out.join("export/00_BOOT/thumb_functions.json"),
         &retained_thumb,
@@ -2075,58 +2114,6 @@ fn tightened_tame_analysis_dispatchs_tighten_mode() {
         log.contains("TameAnalysis: mode=tighten"),
         "TameAnalysis should have logged mode=tighten; log tail:\n{}",
         log.lines().rev().take(40).collect::<Vec<_>>().join("\n")
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Legacy-mutation e2e: `thumb_enrich` populates `body_c` from a synthetic
-/// `decompiled.c` keyed by normalized entry address. The deliberately-v1 input
-/// promotes to retained v2; fresh producer output is strict v3 and its provenance
-/// preservation is covered separately. This pure-Rust step does not require Ghidra.
-#[test]
-fn thumb_enrich_populates_body_c() {
-    let dir = std::env::temp_dir().join(format!(
-        "pme_decompile_enrich_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let c_path = dir.join("decompiled.c");
-    std::fs::write(
-        &c_path,
-        "// FUN_40e00000 @ 00040e00000\nvoid FUN_40e00000(void)\n{\n  return;\n}\n\n",
-    )
-    .unwrap();
-    let thumb_path = dir.join("thumb_functions.json");
-    std::fs::write(
-        &thumb_path,
-        r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
-            {"entry":"0x40e00000","name":"thumb_40e00000","size":6,
-             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
-    )
-    .unwrap();
-
-    let n = pixel_modem_extractor::decompile::thumb_enrich(&c_path, &thumb_path).unwrap();
-    assert_eq!(n, 1, "thumb_enrich should populate exactly one body_c");
-
-    let v: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
-    assert_eq!(
-        v["format"], "pixel-modem-extractor-thumb-functions-v2",
-        "legacy v1 should promote to v2 after population: {v}"
-    );
-    assert!(
-        v["functions"][0]["body_c"].is_string(),
-        "body_c should be a string after population: {v}"
-    );
-    let body_c = v["functions"][0]["body_c"].as_str().unwrap();
-    assert!(
-        body_c.contains("FUN_40e00000"),
-        "body_c should contain the function body: {body_c:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

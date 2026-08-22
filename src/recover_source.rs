@@ -168,6 +168,10 @@ pub use crate::analysis_tool::AnalysisTool as Tool;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveredFunction {
     pub tool: Tool,
+    #[serde(skip)]
+    pub(crate) owner: crate::execution_ranges::FunctionOwner,
+    #[serde(skip)]
+    pub(crate) execution_blake3: Option<[u8; 32]>,
     pub name: String,
     pub entry: u64,
     pub end: u64,
@@ -210,6 +214,12 @@ struct AttributionResult {
 #[derive(Debug, Serialize)]
 struct IndexFunction {
     tool: Tool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_blake3: Option<String>,
     name: String,
     entry: String,
     end: String,
@@ -222,6 +232,12 @@ struct IndexFunction {
 #[derive(Debug, Serialize)]
 struct IndexAttribution {
     tool: Tool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_blake3: Option<String>,
     name: String,
     entry: String,
     end: String,
@@ -233,6 +249,12 @@ struct IndexAttribution {
 #[derive(Debug, Serialize)]
 struct IndexAmbiguousAttribution {
     tool: Tool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_blake3: Option<String>,
     name: String,
     entry: String,
     end: String,
@@ -337,17 +359,29 @@ fn parse_data_refs(raw: &[String]) -> Result<Vec<u64>> {
 }
 
 impl RecoveredFunctions {
-    pub fn load(dir: &Path) -> Result<Self> {
+    pub(crate) fn load(
+        dir: &Path,
+        runtime: &crate::runtime_image::RuntimeImage<'_>,
+    ) -> Result<Self> {
         let ghidra_reader =
             std::io::BufReader::new(std::fs::File::open(dir.join("functions.json"))?);
         let bodies = parse_decompiled_bodies(&std::fs::read_to_string(dir.join("decompiled.c"))?);
         let mut skipped = 0usize;
         let mut functions = Vec::new();
 
-        let ghidra_file: Vec<GhidraFunctionJson> = serde_json::from_reader(ghidra_reader)
+        let ghidra_file: Vec<serde_json::Value> = serde_json::from_reader(ghidra_reader)
             .map_err(|e| Error::Serialize(format!("functions.json: {e}")))?;
-        for f in ghidra_file {
-            let Some(function) = recovered_ghidra_function(f, &bodies) else {
+        let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
+            &ghidra_file,
+            ghidra_file.len(),
+            runtime,
+        )?;
+        for (value, tagged) in ghidra_file.into_iter().zip(inventory.records) {
+            let f: GhidraFunctionJson = serde_json::from_value(value)
+                .map_err(|e| Error::Serialize(format!("functions.json: {e}")))?;
+            let execution =
+                crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)?;
+            let Some(function) = recovered_ghidra_function(f, &bodies, execution.as_ref()) else {
                 skipped += 1;
                 continue;
             };
@@ -359,15 +393,12 @@ impl RecoveredFunctions {
             // Typed streaming load retains only consumer fields and function
             // bodies while strict v3 metadata resolves each run owner. It never
             // builds the former document-wide `serde_json::Value` tree.
-            // Source recovery is handed only the decompiled directory, with no
-            // manifest load address or raw image, so it cannot supply the
-            // image-aware context; range matching uses validated decode ranges.
-            for owned in crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, None)? {
-                let Some(function) = recovered_thumb_function(
-                    owned.function,
-                    owned.producer.into(),
-                    owned.legacy_range_semantics,
-                ) else {
+            for owned in
+                crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, runtime)?
+            {
+                let Some(function) =
+                    recovered_thumb_function(owned.function, owned.owner, owned.execution.as_ref())
+                else {
                     skipped += 1;
                     continue;
                 };
@@ -382,6 +413,7 @@ impl RecoveredFunctions {
 fn recovered_ghidra_function(
     f: GhidraFunctionJson,
     bodies: &HashMap<u64, String>,
+    execution: Option<&crate::execution_ranges::ExecutionIdentity>,
 ) -> Option<RecoveredFunction> {
     let entry = parse_hex_addr(&f.entry).ok()?;
     let end = match f.end.as_deref() {
@@ -396,10 +428,18 @@ fn recovered_ghidra_function(
 
     Some(RecoveredFunction {
         tool: Tool::Ghidra,
+        owner: crate::execution_ranges::FunctionOwner::Ghidra,
+        execution_blake3: execution.map(|execution| execution.execution_blake3),
         name: f.name,
         entry,
         end,
-        decode_ranges: None,
+        decode_ranges: execution.map(|execution| {
+            execution
+                .decode_ranges
+                .iter()
+                .map(|range| (u64::from(range.start), u64::from(range.end)))
+                .collect()
+        }),
         size: f.size,
         body_kind: "decompiled_c".to_string(),
         body,
@@ -410,26 +450,24 @@ fn recovered_ghidra_function(
 
 fn recovered_thumb_function(
     f: crate::thumb_analysis::ThumbFunctionRecord,
-    tool: Tool,
-    legacy_range_semantics: bool,
+    owner: crate::execution_ranges::FunctionOwner,
+    execution: Option<&crate::execution_ranges::ExecutionIdentity>,
 ) -> Option<RecoveredFunction> {
     let entry = parse_hex_addr(&f.entry).ok()?;
     let end = parse_hex_addr(&f.end).ok()?;
     let data_refs = parse_data_refs(&f.data_refs).ok()?;
-    let decode_ranges = if legacy_range_semantics {
-        None
-    } else {
-        Some(
-            f.decode_ranges
-                .iter()
-                .map(|range| Ok((parse_hex_addr(&range.start)?, parse_hex_addr(&range.end)?)))
-                .collect::<Result<Vec<_>>>()
-                .ok()?,
-        )
-    };
+    let decode_ranges = execution.map(|execution| {
+        execution
+            .decode_ranges
+            .iter()
+            .map(|range| (u64::from(range.start), u64::from(range.end)))
+            .collect()
+    });
 
     Some(RecoveredFunction {
-        tool,
+        tool: owner.analysis_tool(),
+        owner,
+        execution_blake3: execution.map(|execution| execution.execution_blake3),
         name: f.name,
         entry,
         end,
@@ -454,15 +492,12 @@ fn direct_match(source: &SourceEntry, function: &RecoveredFunction) -> Option<St
 }
 
 fn range_match(source: &SourceEntry, function: &RecoveredFunction) -> Option<String> {
+    let ranges = function.decode_ranges.as_ref()?;
     source.occurrences.iter().find_map(|occ| {
-        let matching_range = match &function.decode_ranges {
-            Some(ranges) => ranges
-                .iter()
-                .copied()
-                .find(|(start, end)| occ.vaddr >= *start && occ.vaddr < *end),
-            None => (occ.vaddr >= function.entry && occ.vaddr < function.end)
-                .then_some((function.entry, function.end)),
-        };
+        let matching_range = ranges
+            .iter()
+            .copied()
+            .find(|(start, end)| occ.vaddr >= *start && occ.vaddr < *end);
         matching_range.map(|(start, end)| {
             format!(
                 "function range 0x{:x}-0x{:x} contains source-path string at 0x{:x}",
@@ -578,6 +613,12 @@ fn attribute_with_ambiguity(
             a.function
                 .entry
                 .cmp(&b.function.entry)
+                .then_with(|| a.function.owner.cmp(&b.function.owner))
+                .then_with(|| {
+                    a.function
+                        .execution_blake3
+                        .cmp(&b.function.execution_blake3)
+                })
                 .then_with(|| a.function.name.cmp(&b.function.name))
         });
     }
@@ -586,6 +627,12 @@ fn attribute_with_ambiguity(
         a.function
             .entry
             .cmp(&b.function.entry)
+            .then_with(|| a.function.owner.cmp(&b.function.owner))
+            .then_with(|| {
+                a.function
+                    .execution_blake3
+                    .cmp(&b.function.execution_blake3)
+            })
             .then_with(|| a.function.name.cmp(&b.function.name))
     });
 
@@ -667,18 +714,36 @@ fn build_index(
     attrs: &BTreeMap<String, Vec<Attribution>>,
     ambiguous: &[AmbiguousAttribution],
 ) -> RecoveredIndex {
+    let owner_fields = |owner| match owner {
+        crate::execution_ranges::FunctionOwner::Run {
+            region_index,
+            run_index,
+            ..
+        } => (Some(region_index), Some(run_index)),
+        crate::execution_ranges::FunctionOwner::Ghidra
+        | crate::execution_ranges::FunctionOwner::Legacy { .. } => (None, None),
+    };
+    let digest = |digest: Option<[u8; 32]>| {
+        digest.map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    };
     let functions = recovered
         .functions
         .iter()
-        .map(|f| IndexFunction {
-            tool: f.tool,
-            name: f.name.clone(),
-            entry: hx(f.entry),
-            end: hx(f.end),
-            size: f.size,
-            body_kind: f.body_kind.clone(),
-            source_artifact: f.source_artifact.clone(),
-            data_refs: f.data_refs.iter().map(|r| hx(*r)).collect(),
+        .map(|f| {
+            let (region_index, run_index) = owner_fields(f.owner);
+            IndexFunction {
+                tool: f.tool,
+                region_index,
+                run_index,
+                execution_blake3: digest(f.execution_blake3),
+                name: f.name.clone(),
+                entry: hx(f.entry),
+                end: hx(f.end),
+                size: f.size,
+                body_kind: f.body_kind.clone(),
+                source_artifact: f.source_artifact.clone(),
+                data_refs: f.data_refs.iter().map(|r| hx(*r)).collect(),
+            }
         })
         .collect();
     let mut sources = BTreeMap::new();
@@ -695,14 +760,20 @@ fn build_index(
                     .to_string(),
                 functions: items
                     .into_iter()
-                    .map(|a| IndexAttribution {
-                        tool: a.function.tool,
-                        name: a.function.name,
-                        entry: hx(a.function.entry),
-                        end: hx(a.function.end),
-                        confidence: a.confidence,
-                        reason: a.reason,
-                        source_artifact: a.function.source_artifact,
+                    .map(|a| {
+                        let (region_index, run_index) = owner_fields(a.function.owner);
+                        IndexAttribution {
+                            tool: a.function.tool,
+                            region_index,
+                            run_index,
+                            execution_blake3: digest(a.function.execution_blake3),
+                            name: a.function.name,
+                            entry: hx(a.function.entry),
+                            end: hx(a.function.end),
+                            confidence: a.confidence,
+                            reason: a.reason,
+                            source_artifact: a.function.source_artifact,
+                        }
                     })
                     .collect(),
             },
@@ -710,15 +781,21 @@ fn build_index(
     }
     let ambiguous = ambiguous
         .iter()
-        .map(|a| IndexAmbiguousAttribution {
-            tool: a.function.tool,
-            name: a.function.name.clone(),
-            entry: hx(a.function.entry),
-            end: hx(a.function.end),
-            confidence: a.confidence,
-            reason: a.reason.clone(),
-            source_artifact: a.function.source_artifact.clone(),
-            candidate_source_paths: a.candidate_source_paths.clone(),
+        .map(|a| {
+            let (region_index, run_index) = owner_fields(a.function.owner);
+            IndexAmbiguousAttribution {
+                tool: a.function.tool,
+                region_index,
+                run_index,
+                execution_blake3: digest(a.function.execution_blake3),
+                name: a.function.name.clone(),
+                entry: hx(a.function.entry),
+                end: hx(a.function.end),
+                confidence: a.confidence,
+                reason: a.reason.clone(),
+                source_artifact: a.function.source_artifact.clone(),
+                candidate_source_paths: a.candidate_source_paths.clone(),
+            }
         })
         .collect();
     RecoveredIndex {
@@ -732,14 +809,15 @@ fn build_index(
     }
 }
 
-pub fn run(
+pub(crate) fn run(
     source_tree_dir: &Path,
     decompiled_dir: &Path,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
     out_index: &Path,
     opts: &Opts,
 ) -> Result<PathBuf> {
     let source_tree = SourceTreeIndex::load(source_tree_dir)?;
-    let recovered = RecoveredFunctions::load(decompiled_dir)?;
+    let recovered = RecoveredFunctions::load(decompiled_dir, runtime)?;
     let attribution = attribute_with_ambiguity(&source_tree.entries, &recovered.functions, opts);
     for source in &source_tree.entries {
         let items = attribution
@@ -764,11 +842,66 @@ pub fn run(
 mod tests {
     use super::*;
 
+    static TEST_IMAGE: [u8; 0x10_000] = [0; 0x10_000];
+
+    fn test_runtime() -> crate::runtime_image::RuntimeImage<'static> {
+        crate::runtime_image::RuntimeImage::from_plan(&TEST_IMAGE, 0, None).unwrap()
+    }
+
+    fn ghidra_function(name: &str, entry: u32, end: u32, data_refs: &[u32]) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "primary_source": "default",
+            "entry": hx(u64::from(entry)),
+            "end": hx(u64::from(end)),
+            "size": u64::from(end - entry),
+            "decode_ranges": [{
+                "isa": "arm",
+                "start": hx(u64::from(entry)),
+                "end": hx(u64::from(end)),
+                "blake3": blake3::hash(&TEST_IMAGE[entry as usize..end as usize]).to_hex().to_string(),
+            }],
+            "decode_range_errors": [],
+            "data_refs": data_refs.iter().map(|address| hx(u64::from(*address))).collect::<Vec<_>>(),
+        })
+    }
+
+    fn write_ghidra_functions(dir: &Path, functions: Vec<serde_json::Value>) {
+        std::fs::write(
+            dir.join("functions.json"),
+            serde_json::to_vec(&functions).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pme_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn loads_authenticated_ghidra_execution_identity() {
+        let root = temp_dir("recover_ghidra_execution_identity");
+        write_ghidra_functions(
+            &root,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4004, &[])],
+        );
+        std::fs::write(
+            root.join("decompiled.c"),
+            "// FUN_4000 @ 4000\nint FUN_4000(void) { return 0; }\n",
+        )
+        .unwrap();
+
+        let functions = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
+
+        assert_eq!(functions.functions.len(), 1);
+        assert!(functions.functions[0].execution_blake3.is_some());
+        assert_eq!(
+            functions.functions[0].decode_ranges,
+            Some(vec![(0x4000, 0x4004)])
+        );
     }
 
     #[test]
@@ -803,11 +936,10 @@ mod tests {
         std::fs::write(st.join("tree/foo/empty.cc"), b"// empty stub\n").unwrap();
 
         let decompiled = temp_dir("recover_run_decompiled");
-        std::fs::write(
-            decompiled.join("functions.json"),
-            r#"[{"name":"FUN_4000","entry":"0x4000","end":"0x4010","size":16,"data_refs":["0x5000"]}]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &decompiled,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4010, &[0x5000])],
+        );
         std::fs::write(
             decompiled.join("decompiled.c"),
             "// FUN_4000 @ 4000\nint FUN_4000(void) {\n    return 3;\n}\n\n",
@@ -816,7 +948,7 @@ mod tests {
         std::fs::write(decompiled.join("disasm.lst"), "4000: 00  nop\n").unwrap();
 
         let index = st.join("recovered_index.json");
-        run(&st, &decompiled, &index, &Opts::default()).unwrap();
+        run(&st, &decompiled, &test_runtime(), &index, &Opts::default()).unwrap();
 
         let enriched = std::fs::read_to_string(st.join("tree/foo/bar.cc")).unwrap();
         assert!(enriched.starts_with("// source-tree stub\n"));
@@ -854,16 +986,15 @@ mod tests {
         .unwrap();
 
         let decompiled = temp_dir("recover_run_missing_body_decompiled");
-        std::fs::write(
-            decompiled.join("functions.json"),
-            r#"[{"name":"FUN_4000","entry":"0x4000","end":"0x4010","size":16,"data_refs":["0x5000"]}]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &decompiled,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4010, &[0x5000])],
+        );
         std::fs::write(decompiled.join("decompiled.c"), b"").unwrap();
         std::fs::write(decompiled.join("disasm.lst"), "4000: 00  nop\n").unwrap();
 
         let index = st.join("recovered_index.json");
-        run(&st, &decompiled, &index, &Opts::default()).unwrap();
+        run(&st, &decompiled, &test_runtime(), &index, &Opts::default()).unwrap();
 
         let enriched = std::fs::read_to_string(st.join("tree/foo/bar.cc")).unwrap();
         assert!(enriched.contains("no recovered function body was attributed"));
@@ -969,44 +1100,38 @@ mod tests {
     #[test]
     fn parses_ghidra_functions_and_bodies() {
         let root = temp_dir("recover_ghidra");
-        std::fs::write(
-            root.join("functions.json"),
-            r#"[
-              {"name":"FUN_40010120","entry":"0x40010120","end":"0x40010180","size":96,"data_refs":["0x40010100"]}
-            ]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &root,
+            vec![ghidra_function("FUN_4120", 0x4120, 0x4180, &[0x4100])],
+        );
         std::fs::write(
             root.join("decompiled.c"),
-            "// FUN_40010120 @ 40010120\nint FUN_40010120(void) {\n    return 7;\n}\n\n",
+            "// FUN_4120 @ 4120\nint FUN_4120(void) {\n    return 7;\n}\n\n",
         )
         .unwrap();
-        std::fs::write(root.join("disasm.lst"), "40010120: 00  nop\n").unwrap();
+        std::fs::write(root.join("disasm.lst"), "4120: 00  nop\n").unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert_eq!(funcs.functions.len(), 1);
         assert_eq!(funcs.functions[0].tool, Tool::Ghidra);
-        assert_eq!(funcs.functions[0].entry, 0x4001_0120);
-        assert_eq!(funcs.functions[0].end, 0x4001_0180);
+        assert_eq!(funcs.functions[0].entry, 0x4120);
+        assert_eq!(funcs.functions[0].end, 0x4180);
         assert!(funcs.functions[0].body.contains("return 7;"));
-        assert_eq!(funcs.functions[0].data_refs, vec![0x4001_0100]);
+        assert_eq!(funcs.functions[0].data_refs, vec![0x4100]);
     }
 
     #[test]
     fn skips_ghidra_functions_without_decompiled_body() {
         let root = temp_dir("recover_ghidra_missing_body");
-        std::fs::write(
-            root.join("functions.json"),
-            r#"[
-              {"name":"FUN_4000","entry":"0x4000","end":"0x4010","size":16,"data_refs":["0x5000"]}
-            ]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &root,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4010, &[0x5000])],
+        );
         std::fs::write(root.join("decompiled.c"), b"").unwrap();
         std::fs::write(root.join("disasm.lst"), "4000: 00  nop\n").unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert!(funcs.functions.is_empty());
         assert_eq!(funcs.skipped, 1);
@@ -1015,17 +1140,14 @@ mod tests {
     #[test]
     fn skips_ghidra_functions_with_header_only_body() {
         let root = temp_dir("recover_ghidra_header_only_body");
-        std::fs::write(
-            root.join("functions.json"),
-            r#"[
-              {"name":"FUN_4000","entry":"0x4000","end":"0x4010","size":16,"data_refs":["0x5000"]}
-            ]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &root,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4010, &[0x5000])],
+        );
         std::fs::write(root.join("decompiled.c"), "// FUN_4000 @ 4000\n\n  \n").unwrap();
         std::fs::write(root.join("disasm.lst"), "4000: 00  nop\n").unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert!(funcs.functions.is_empty());
         assert_eq!(funcs.skipped, 1);
@@ -1034,13 +1156,10 @@ mod tests {
     #[test]
     fn skips_ghidra_functions_with_failed_decompilation_sentinel_body() {
         let root = temp_dir("recover_ghidra_failed_decompilation_body");
-        std::fs::write(
-            root.join("functions.json"),
-            r#"[
-              {"name":"FUN_4000","entry":"0x4000","end":"0x4010","size":16,"data_refs":["0x5000"]}
-            ]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &root,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4010, &[0x5000])],
+        );
         std::fs::write(
             root.join("decompiled.c"),
             "// FUN_4000 @ 4000\n// <decompilation failed>\n",
@@ -1048,7 +1167,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("disasm.lst"), "4000: 00  nop\n").unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert!(funcs.functions.is_empty());
         assert_eq!(funcs.skipped, 1);
@@ -1079,7 +1198,7 @@ mod tests {
         )
         .unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert_eq!(funcs.functions.len(), 1);
         assert_eq!(funcs.functions[0].tool, Tool::Radare2);
@@ -1119,7 +1238,7 @@ mod tests {
         )
         .unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert_eq!(funcs.functions.len(), 1);
         assert_eq!(funcs.functions[0].tool, Tool::Radare2);
@@ -1132,7 +1251,7 @@ mod tests {
 
         let sources = vec![source_entry("foo/legacy.cc", 0x4140, 0x100)];
         let map = attribute(&sources, &funcs.functions, &Opts::default());
-        assert_eq!(map["foo/legacy.cc"][0].confidence, Confidence::Proximity);
+        assert!(!map.contains_key("foo/legacy.cc"));
     }
 
     #[test]
@@ -1146,13 +1265,49 @@ mod tests {
         )
         .unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert_eq!(funcs.functions.len(), 2);
         assert_eq!(funcs.functions[0].entry, 0x1000);
         assert_eq!(funcs.functions[1].entry, 0x1000);
         assert_eq!(funcs.functions[0].tool, Tool::Radare2);
         assert_eq!(funcs.functions[1].tool, Tool::Rizin);
+        assert_eq!(
+            funcs.functions[0].owner,
+            crate::execution_ranges::FunctionOwner::Run {
+                producer: Tool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            }
+        );
+        assert_eq!(
+            funcs.functions[1].owner,
+            crate::execution_ranges::FunctionOwner::Run {
+                producer: Tool::Rizin,
+                region_index: 0,
+                run_index: 1,
+            }
+        );
+        assert_ne!(
+            funcs.functions[0].execution_blake3,
+            funcs.functions[1].execution_blake3
+        );
+        let index = build_index(
+            &SourceTreeIndex {
+                root: root.clone(),
+                entries: Vec::new(),
+            },
+            &funcs,
+            &BTreeMap::new(),
+            &[],
+        );
+        let wire = serde_json::to_value(index).unwrap();
+        assert_eq!(wire["functions"][0]["region_index"], 0);
+        assert_eq!(wire["functions"][0]["run_index"], 0);
+        assert_eq!(wire["functions"][1]["region_index"], 0);
+        assert_eq!(wire["functions"][1]["run_index"], 1);
+        assert!(wire["functions"][0]["execution_blake3"].is_string());
+        assert!(wire["functions"][1]["execution_blake3"].is_string());
         assert_eq!(
             funcs.functions[1].decode_ranges,
             Some(vec![(0x1000, 0x1010), (0x1080, 0x1090)])
@@ -1169,7 +1324,7 @@ mod tests {
             crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
         )
         .unwrap();
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
         let rizin = funcs
             .functions
             .into_iter()
@@ -1218,7 +1373,7 @@ mod tests {
         )
         .unwrap();
 
-        let funcs = RecoveredFunctions::load(&root).unwrap();
+        let funcs = RecoveredFunctions::load(&root, &test_runtime()).unwrap();
 
         assert_eq!(funcs.functions.len(), 1);
         assert_eq!(funcs.functions[0].name, "AtiParsePlusCOPS");
@@ -1248,7 +1403,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = RecoveredFunctions::load(&root).unwrap_err();
+        let err = RecoveredFunctions::load(&root, &test_runtime()).unwrap_err();
 
         assert!(
             err.to_string().contains("thumb_functions.json"),
@@ -1267,10 +1422,12 @@ mod tests {
     fn recovered(name: &str, entry: u64, end: u64, refs: &[u64]) -> RecoveredFunction {
         RecoveredFunction {
             tool: Tool::Ghidra,
+            owner: crate::execution_ranges::FunctionOwner::Ghidra,
+            execution_blake3: None,
             name: name.to_string(),
             entry,
             end,
-            decode_ranges: None,
+            decode_ranges: Some(vec![(entry, end)]),
             size: end - entry,
             body_kind: "decompiled_c".to_string(),
             body: format!("int {name}(void) {{\n    return 1;\n}}"),
@@ -1294,15 +1451,15 @@ mod tests {
     }
 
     #[test]
-    fn function_range_containing_source_path_is_proximity() {
+    fn function_without_authenticated_ranges_is_not_proximity() {
         let sources = vec![source_entry("foo/range.cc", 0x4050, 0x100)];
-        let funcs = vec![recovered("FUN_range", 0x4000, 0x4100, &[])];
+        let mut function = recovered("FUN_range", 0x4000, 0x4100, &[]);
+        function.decode_ranges = None;
+        let funcs = vec![function];
 
         let map = attribute(&sources, &funcs, &Opts::default());
 
-        let hits = map.get("foo/range.cc").unwrap();
-        assert_eq!(hits[0].confidence, Confidence::Proximity);
-        assert!(hits[0].reason.contains("contains source-path string"));
+        assert!(!map.contains_key("foo/range.cc"));
     }
 
     #[test]
@@ -1418,11 +1575,15 @@ mod tests {
         .unwrap();
 
         let decompiled = temp_dir("recover_run_direct_conflict_decompiled");
-        std::fs::write(
-            decompiled.join("functions.json"),
-            r#"[{"name":"FUN_4000","entry":"0x4000","end":"0x4010","size":16,"data_refs":["0x5000","0x6000"]}]"#,
-        )
-        .unwrap();
+        write_ghidra_functions(
+            &decompiled,
+            vec![ghidra_function(
+                "FUN_4000",
+                0x4000,
+                0x4010,
+                &[0x5000, 0x6000],
+            )],
+        );
         std::fs::write(
             decompiled.join("decompiled.c"),
             "// FUN_4000 @ 4000\nint FUN_4000(void) {\n    return 3;\n}\n\n",
@@ -1431,7 +1592,7 @@ mod tests {
         std::fs::write(decompiled.join("disasm.lst"), "4000: 00  nop\n").unwrap();
 
         let index = st.join("recovered_index.json");
-        run(&st, &decompiled, &index, &Opts::default()).unwrap();
+        run(&st, &decompiled, &test_runtime(), &index, &Opts::default()).unwrap();
 
         let a = std::fs::read_to_string(st.join("tree/foo/a.cc")).unwrap();
         let b = std::fs::read_to_string(st.join("tree/foo/b.cc")).unwrap();
@@ -1476,6 +1637,8 @@ mod tests {
         let attr = Attribution {
             function: RecoveredFunction {
                 tool: Tool::Ghidra,
+                owner: crate::execution_ranges::FunctionOwner::Ghidra,
+                execution_blake3: None,
                 name: "FUN_40001000".into(),
                 entry: 0x40001000,
                 end: 0x40001100,
@@ -1508,6 +1671,10 @@ mod tests {
         let attr2 = Attribution {
             function: RecoveredFunction {
                 tool: Tool::Radare2,
+                owner: crate::execution_ranges::FunctionOwner::Legacy {
+                    producer: Tool::Radare2,
+                },
+                execution_blake3: None,
                 name: "thumb_40e1200".into(),
                 entry: 0x40e1200,
                 end: 0x40e1300,

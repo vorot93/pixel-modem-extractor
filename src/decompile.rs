@@ -7,7 +7,10 @@
 
 use crate::{
     error::{Error, Result},
-    execution_ranges::{ExecutionIdentity, TaggedExecutionRecord, validate_inventory_records},
+    execution_ranges::{
+        OwnedExecutionIdentity, TaggedExecutionRecord, validate_ghidra_inventory_records,
+    },
+    runtime_image::RuntimeImage,
     scatter,
     toc::Toc,
 };
@@ -27,6 +30,14 @@ const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
 const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
+
+#[cfg(test)]
+static TEST_IMAGE: [u8; 0x10_000] = [0; 0x10_000];
+
+#[cfg(test)]
+fn test_runtime() -> RuntimeImage<'static> {
+    RuntimeImage::from_plan(&TEST_IMAGE, 0, None).unwrap()
+}
 
 /// Ghidra project name passed to `analyzeHeadless` (the directory is
 /// `<root>/ghidra_project`). Shared by pass 1 (`-import`) and pass 2
@@ -433,7 +444,7 @@ pub(crate) struct TerminalInventorySummary {
     pub thumb: Option<ExecutionInventoryCounts>,
     pub thumb_substantial: Option<usize>,
     pub(crate) thumb_metadata: Option<crate::thumb_analysis::ThumbTerminalMetadata>,
-    pub accepted_identities: Vec<ExecutionIdentity>,
+    pub accepted_identities: Vec<OwnedExecutionIdentity>,
     pub ghidra_records: Vec<TaggedExecutionRecord>,
     pub thumb_records: Vec<TaggedExecutionRecord>,
 }
@@ -642,16 +653,14 @@ impl TerminalValidationFailure {
 pub(crate) fn validate_terminal_inventory_pair(
     ghidra_functions_path: &Path,
     thumb_functions_path: &Path,
-    image_start: u32,
-    image_len: u32,
+    runtime: &RuntimeImage<'_>,
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
 ) -> Result<TerminalInventorySummary> {
     validate_terminal_inventory_pair_staged(
         ghidra_functions_path,
         thumb_functions_path,
-        image_start,
-        image_len,
+        runtime,
         expected_thumb_substantial,
         expected_current,
     )
@@ -661,8 +670,7 @@ pub(crate) fn validate_terminal_inventory_pair(
 pub(crate) fn validate_terminal_inventory_pair_staged(
     ghidra_functions_path: &Path,
     thumb_functions_path: &Path,
-    image_start: u32,
-    image_len: u32,
+    runtime: &RuntimeImage<'_>,
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
 ) -> std::result::Result<TerminalInventorySummary, TerminalValidationFailure> {
@@ -673,11 +681,10 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
             "Ghidra functions inventory must be an array".into(),
         ))
     })?;
-    let ghidra =
-        validate_inventory_records(ghidra_records, ghidra_records.len(), image_start, image_len)
-            .map_err(TerminalValidationFailure::ghidra)?;
-    let mut accepted_identities: BTreeSet<ExecutionIdentity> =
-        ghidra.accepted_identities.iter().cloned().collect();
+    let ghidra = validate_ghidra_inventory_records(ghidra_records, ghidra_records.len(), runtime)
+        .map_err(TerminalValidationFailure::ghidra)?;
+    let mut accepted_identities: BTreeSet<OwnedExecutionIdentity> =
+        ghidra.accepted_executions.iter().cloned().collect();
 
     let (thumb, thumb_substantial, thumb_metadata, thumb_records) = match expected_thumb_substantial
     {
@@ -692,14 +699,13 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
         Some(expected_substantial) => {
             let validated = crate::thumb_analysis::validate_thumb_inventory_streaming(
                 thumb_functions_path,
-                image_start,
-                image_len,
+                runtime,
                 expected_substantial,
             )
             .map_err(TerminalValidationFailure::thumb)?;
             let inventory = validated.inventory;
             let metadata = validated.metadata;
-            accepted_identities.extend(inventory.accepted_identities.iter().cloned());
+            accepted_identities.extend(inventory.accepted_executions.iter().cloned());
             (
                 Some(inventory_counts(&inventory)),
                 Some(metadata.summary.substantial),
@@ -743,11 +749,29 @@ pub(crate) fn validate_image_terminal_inventory(
     image: &ImageResult,
     expected_current: Option<&TerminalInventorySummary>,
 ) -> Result<TerminalInventorySummary> {
+    let image_dir = thumb_functions_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::Serialize("Thumb inventory has no image directory".into()))?;
+    let raw = std::fs::read(image_dir.join(format!("{}.bin", image.label)))?;
+    if u32::try_from(raw.len()).ok() != Some(image.image_len) {
+        return Err(Error::Serialize(
+            "terminal raw image length does not match the producer report".into(),
+        ));
+    }
+    let runtime_root = std::fs::canonicalize(image_dir)?;
+    let relative_map = Path::new("scatter/load_map.json");
+    let runtime_map = runtime_root.join(relative_map);
+    let runtime = RuntimeImage::from_artifact(
+        &raw,
+        image.image_start,
+        &runtime_root,
+        runtime_map.try_exists()?.then_some(runtime_map.as_path()),
+    )?;
     let summary = validate_terminal_inventory_pair(
         ghidra_functions_path,
         thumb_functions_path,
-        image.image_start,
-        image.image_len,
+        &runtime,
         image.thumb_functions,
         expected_current,
     )?;
@@ -1770,32 +1794,46 @@ fn run_report_impl(
             let mut terminal_error = None;
             let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
                 let export = root.join("export").join(&label);
-                let validation = validate_terminal_inventory_pair_staged(
-                    &export.join("functions.json"),
-                    &export.join("thumb_functions.json"),
+                let runtime_root = std::fs::canonicalize(&root);
+                let runtime = RuntimeImage::from_artifact(
+                    img,
                     e.load_addr,
-                    e.size,
-                    thumb_functions,
-                    None,
-                )
-                .and_then(|summary| {
-                    let Some(expected) = &thumb_summary else {
-                        return Ok(summary);
-                    };
-                    let expected_tools = thumb_tools.ok_or_else(|| {
-                        TerminalValidationFailure::thumb(Error::Serialize(
-                            "current Thumb analysis lost its injected tool identities".into(),
-                        ))
-                    })?;
-                    validate_thumb_analysis_currentness(
-                        &summary,
-                        expected_tools,
-                        &regions,
-                        expected,
-                    )
-                    .map_err(TerminalValidationFailure::thumb)?;
-                    Ok(summary)
-                });
+                    runtime_root.as_deref().unwrap_or(&root),
+                    runtime_load_maps
+                        .paths
+                        .get(&label)
+                        .map(|path| runtime_root.as_deref().unwrap_or(&root).join(path))
+                        .as_deref(),
+                );
+                let validation = runtime
+                    .map_err(TerminalValidationFailure::ghidra)
+                    .and_then(|runtime| {
+                        validate_terminal_inventory_pair_staged(
+                            &export.join("functions.json"),
+                            &export.join("thumb_functions.json"),
+                            &runtime,
+                            thumb_functions,
+                            None,
+                        )
+                    })
+                    .and_then(|summary| {
+                        let Some(expected) = &thumb_summary else {
+                            return Ok(summary);
+                        };
+                        let expected_tools = thumb_tools.ok_or_else(|| {
+                            TerminalValidationFailure::thumb(Error::Serialize(
+                                "current Thumb analysis lost its injected tool identities".into(),
+                            ))
+                        })?;
+                        validate_thumb_analysis_currentness(
+                            &summary,
+                            expected_tools,
+                            &regions,
+                            expected,
+                        )
+                        .map_err(TerminalValidationFailure::thumb)?;
+                        Ok(summary)
+                    });
                 match validation {
                     Ok(summary) => {
                         outcome = ImageOutcome::Analyzed(summary.ghidra.raw);
@@ -2780,8 +2818,9 @@ pub fn find_radare2() -> Option<PathBuf> {
 }
 
 /// Phase 2: enrich a `thumb_functions.json` with per-function `body_c` sourced
-/// from a `decompiled.c`. A changed v1 artifact is promoted to v2; v2/v3 retain
-/// their format. A semantic no-op leaves the file byte-identical. Idempotent.
+/// from a `decompiled.c`. Only current v3 artifacts are mutable; retained v1/v2
+/// artifacts are read-only replay inputs and fail before a writer is opened. A
+/// semantic no-op leaves the file byte-identical. Idempotent.
 ///
 /// `decompiled.c` is parsed by scanning for ExportDecomp.java's per-function
 /// header line
@@ -2803,15 +2842,20 @@ pub fn find_radare2() -> Option<PathBuf> {
 /// was populated.
 ///
 /// Both inputs stream: the C file is read line-by-line into the address-to-body
-/// map and the artifact is rewritten one function at a time through the shared
-/// atomic v1/v2/v3 mutator. No whole artifact `Value` tree is materialized.
-/// Any malformed input fails closed with the on-disk artifact unchanged.
-pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
+/// map and a current v3 artifact is rewritten one function at a time through
+/// the shared atomic mutator. No whole artifact `Value` tree is materialized.
+/// Legacy or malformed input fails closed with the on-disk artifact unchanged.
+pub(crate) fn thumb_enrich(
+    decompiled_c_path: &Path,
+    thumb_functions_json_path: &Path,
+    runtime: &RuntimeImage<'_>,
+) -> Result<usize> {
     let bodies = collect_decompiled_c_bodies(decompiled_c_path)?;
     let mut populated = 0usize;
     crate::thumb_analysis::stream_rewrite_thumb_functions(
         thumb_functions_json_path,
-        |_, function| {
+        runtime,
+        |_, _, function| {
             // Phase 2.1: match by `entry` (address), not by `name`. The `name`
             // field is analyzer-generated and does not reliably align with
             // Ghidra's `FUN_<addr>`/recovered names — Phase 2's bug.
@@ -2839,7 +2883,8 @@ pub fn thumb_enrich(decompiled_c_path: &Path, thumb_functions_json_path: &Path) 
 fn thumb_enrich_whole(decompiled_c_path: &Path, thumb_functions_json_path: &Path) -> Result<usize> {
     let c_text = std::fs::read_to_string(decompiled_c_path)?;
     let bodies = parse_decompiled_c_function_bodies_by_addr(&c_text);
-    let mut artifact = crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path, None)?;
+    let mut artifact =
+        crate::thumb_analysis::read_thumb_artifact(thumb_functions_json_path, &test_runtime())?;
     let mut populated = 0usize;
     for function in artifact.function_values_mut() {
         let Some(entry) = function.get("entry").and_then(serde_json::Value::as_str) else {
@@ -4324,12 +4369,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             &ghidra,
             serde_json::to_vec(&serde_json::json!([
                 {
-                    "name":"arm_fn", "entry":"0x4000", "end":"0x4004", "size":4,
-                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                    "name":"arm_fn", "primary_source":"default", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004","blake3":"ec2bd03bf86b935fa34d71ad7ebb049f1f10f87d343e521511d8f9e6625620cd"}],
                     "decode_range_errors":[], "data_refs":[]
                 },
                 {
-                    "name":"quarantined", "entry":"0x4008", "end":"0x400c", "size":4,
+                    "name":"quarantined", "primary_source":"analysis", "entry":"0x4008", "end":"0x400c", "size":4,
                     "decode_ranges":[],
                     "decode_range_errors":[{"kind":"missing_isa_context","address":"0x4008","end":"0x400c"}],
                     "data_refs":[]
@@ -4353,7 +4398,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         .unwrap();
 
         let summary =
-            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x10, Some(0), None).unwrap();
+            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None)
+                .unwrap();
 
         assert_eq!(summary.ghidra.raw, 2);
         assert_eq!(summary.ghidra.accepted, 1);
@@ -4364,16 +4410,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             summary
                 .accepted_identities
                 .iter()
-                .any(|identity| { identity.decode_ranges[0].isa == DecodeIsa::Arm })
+                .any(|execution| execution.identity.decode_ranges[0].isa == DecodeIsa::Arm)
         );
         assert!(
             summary
                 .accepted_identities
                 .iter()
-                .any(|identity| { identity.decode_ranges[0].isa == DecodeIsa::Thumb })
+                .any(|execution| execution.identity.decode_ranges[0].isa == DecodeIsa::Thumb)
         );
         assert!(
-            validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x10, None, None).is_err(),
+            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), None, None).is_err(),
             "an unexpected retained Thumb inventory is stale current-run state"
         );
 
@@ -4386,8 +4432,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             validate_terminal_inventory_pair(
                 &ghidra,
                 &thumb,
-                0x4000,
-                0x10,
+                &test_runtime(),
                 Some(0),
                 Some(&summary),
             )
@@ -4399,12 +4444,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             &ghidra,
             serde_json::to_vec(&serde_json::json!([
                 {
-                    "name":"arm_fn", "entry":"0x4000", "end":"0x4004", "size":4,
-                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                    "name":"arm_fn", "primary_source":"default", "entry":"0x4000", "end":"0x4004", "size":4,
+                    "decode_ranges":[{"isa":"arm","start":"0x4000","end":"0x4004","blake3":"ec2bd03bf86b935fa34d71ad7ebb049f1f10f87d343e521511d8f9e6625620cd"}],
                     "decode_range_errors":[], "data_refs":[]
                 },
                 {
-                    "name":"quarantined", "entry":"0x4008", "end":"0x400c", "size":4,
+                    "name":"quarantined", "primary_source":"analysis", "entry":"0x4008", "end":"0x400c", "size":4,
                     "decode_ranges":[],
                     "decode_range_errors":[{"kind":"invalid_isa_context","address":"0x4008","end":"0x400c"}],
                     "data_refs":[]
@@ -4417,8 +4462,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             validate_terminal_inventory_pair(
                 &ghidra,
                 &thumb,
-                0x4000,
-                0x10,
+                &test_runtime(),
                 Some(0),
                 Some(&summary),
             )
@@ -4477,7 +4521,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         {
           "end": "0x4002",
           "isa": "thumb",
-          "start": "0x4000"
+          "start": "0x4000",
+          "blake3": "1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"
         }
       ],
       "end": "0x4002",
@@ -4574,7 +4619,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
       "body_kind": "thumb_disassembly",
       "data_refs": [],
       "decode_range_errors": [],
-      "decode_ranges": [{"end":"0x4002","isa":"thumb","start":"0x4000"}],
+      "decode_ranges": [{"end":"0x4002","isa":"thumb","start":"0x4000","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"}],
       "end": "0x4002",
       "entry": "0x4000",
       "name": "sym.r2",
@@ -4585,7 +4630,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
       "body_kind": "thumb_disassembly",
       "data_refs": [],
       "decode_range_errors": [],
-      "decode_ranges": [{"end":"0x4012","isa":"thumb","start":"0x4010"}],
+      "decode_ranges": [{"end":"0x4012","isa":"thumb","start":"0x4010","blake3":"1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122"}],
       "end": "0x4012",
       "entry": "0x4010",
       "name": "sym.rizin",
@@ -4655,7 +4700,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let thumb = root.path().join("thumb_functions.json");
         std::fs::write(&ghidra, b"[]").unwrap();
         std::fs::write(&thumb, artifact).unwrap();
-        validate_terminal_inventory_pair(&ghidra, &thumb, 0x4000, 0x20, Some(0), None).unwrap()
+        validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None).unwrap()
     }
 
     fn currentness_error(
@@ -6117,6 +6162,14 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         dir
     }
 
+    fn write_consumer_v3_fixture(path: &Path) {
+        std::fs::write(
+            path,
+            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn thumb_enrich_preserves_v3_provenance() {
         let root = temp_dir("thumb_enrich_v3_provenance");
@@ -6131,9 +6184,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::write(&thumb_path, original).unwrap();
         let before: serde_json::Value = serde_json::from_slice(original).unwrap();
 
-        assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
+        assert_eq!(
+            thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap(),
+            1
+        );
         let rewritten_bytes = std::fs::read(&thumb_path).unwrap();
-        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, None).unwrap();
+        crate::thumb_analysis::parse_thumb_artifact(&rewritten_bytes, &test_runtime()).unwrap();
         let after: serde_json::Value = serde_json::from_slice(&rewritten_bytes).unwrap();
         assert_eq!(after["format"], before["format"]);
         assert_eq!(after["producers"], before["producers"]);
@@ -6172,12 +6228,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
         )
         .unwrap();
-        let mut artifact = crate::thumb_analysis::read_thumb_artifact(&thumb_path, None).unwrap();
+        let mut artifact =
+            crate::thumb_analysis::read_thumb_artifact(&thumb_path, &test_runtime()).unwrap();
         artifact.function_values_mut()[0]["body_c"] = serde_json::json!(body);
         artifact.write_atomic(&thumb_path).unwrap();
         let before = std::fs::read(&thumb_path).unwrap();
 
-        assert_eq!(thumb_enrich(&c_path, &thumb_path).unwrap(), 1);
+        assert_eq!(
+            thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap(),
+            1
+        );
         assert_eq!(std::fs::read(&thumb_path).unwrap(), before);
     }
 
@@ -6186,40 +6246,28 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let root = temp_dir("thumb_enrich_match");
         let c_path = root.join("decompiled.c");
         // ExportDecomp.java emits "// <name> @ <addr>\n<C>\n\n" per function.
-        // Ghidra's pre-pass-2 names are `FUN_<addr>`; here the entry-address
-        // (00040e1200, even form) is what thumb_enrich matches by.
+        // Ghidra's pre-pass-2 names are `FUN_<addr>`; the entry address is what
+        // thumb_enrich matches by.
         std::fs::write(
             &c_path,
-            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(int a)\n{\n  return;\n}\n\n",
+            "// FUN_4000 @ 00004000\nvoid FUN_4000(int a)\n{\n  return;\n}\n\n",
         )
         .unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        std::fs::write(
-            &thumb_path,
-            r#"{
-            "format": "pixel-modem-extractor-thumb-functions-v1",
-            "functions": [
-                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
-                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []},
-                {"entry": "0x40efffc", "name": "thumb_40efffc", "size": 4,
-                 "body_kind": "thumb_disassembly", "body": "bx lr", "data_refs": []}
-            ]
-        }"#,
-        )
-        .unwrap();
+        write_consumer_v3_fixture(&thumb_path);
 
-        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let n = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         assert_eq!(n, 1, "exactly one function matched by address");
 
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
-        assert_eq!(v["format"], "pixel-modem-extractor-thumb-functions-v2");
+        assert_eq!(v["format"], "pixel-modem-extractor-thumb-functions-v3");
         assert!(v["functions"][0]["body_c"].is_string());
         assert!(
             v["functions"][0]["body_c"]
                 .as_str()
                 .unwrap()
-                .contains("FUN_40e1200"),
+                .contains("FUN_4000"),
             "body_c is the Ghidra C body (pre-pass-2 form): {}",
             v["functions"][0]["body_c"]
         );
@@ -6240,19 +6288,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let c_path = root.join("decompiled.c");
         std::fs::write(
             &c_path,
-            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(int a)\n\n{\n  return;\n}\n\n",
+            "// FUN_4000 @ 00004000\n\nvoid FUN_4000(int a)\n\n{\n  return;\n}\n\n",
         )
         .unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        std::fs::write(
-            &thumb_path,
-            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
-            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
-             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
-        )
-        .unwrap();
+        write_consumer_v3_fixture(&thumb_path);
 
-        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let n = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         assert_eq!(
             n, 1,
             "real ExportDecomp format (2 blank lines between header and `{{`) must match"
@@ -6272,19 +6314,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let c_path = root.join("decompiled.c");
         std::fs::write(
             &c_path,
-            "// FUN_40e1200 @ 00040e1200\n\nvoid FUN_40e1200(\n    int a,\n    int b)\n\n{\n  return;\n}\n\n",
+            "// FUN_4000 @ 00004000\n\nvoid FUN_4000(\n    int a,\n    int b)\n\n{\n  return;\n}\n\n",
         )
         .unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        std::fs::write(
-            &thumb_path,
-            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
-            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
-             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
-        )
-        .unwrap();
+        write_consumer_v3_fixture(&thumb_path);
 
-        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let n = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         assert_eq!(
             n, 1,
             "real ExportDecomp format with 2-line signature (offset-6 header) must match"
@@ -6303,22 +6339,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // clears the low bit on both sides so they agree.
         std::fs::write(
             &c_path,
-            "// FUN_40e1200 @ 00040e1201\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+            "// FUN_4000 @ 00004001\nvoid FUN_4000(void)\n{\n  return;\n}\n\n",
         )
         .unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        std::fs::write(
-            &thumb_path,
-            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
-            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
-             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
-        )
-        .unwrap();
+        write_consumer_v3_fixture(&thumb_path);
 
-        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let n = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         assert_eq!(
             n, 1,
-            "T-bit normalization: 40e1201 (Ghidra) matches 40e1200 (radare2)"
+            "T-bit normalization: 4001 (Ghidra) matches 4000 (analyzer)"
         );
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
@@ -6335,19 +6365,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         )
         .unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        let original = r#"{
-            "format": "pixel-modem-extractor-thumb-functions-v1",
-            "functions": [
-                {"entry": "0x40e1200", "name": "thumb_40e1200", "size": 8,
-                 "body_kind": "thumb_disassembly", "body": "movs r0, 0", "data_refs": []}
-            ]
-        }"#;
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
         std::fs::write(&thumb_path, original).unwrap();
 
-        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let n = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         assert_eq!(n, 0);
-        // File is byte-identical (format stays v1 because no body_c was populated).
-        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+        assert_eq!(std::fs::read(&thumb_path).unwrap(), original);
     }
 
     #[test]
@@ -6356,21 +6379,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let c_path = root.join("decompiled.c");
         std::fs::write(
             &c_path,
-            "// FUN_40e1200 @ 00040e1200\nvoid FUN_40e1200(void)\n{\n  return;\n}\n\n",
+            "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n  return;\n}\n\n",
         )
         .unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        std::fs::write(
-            &thumb_path,
-            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
-            {"entry":"0x40e1200","name":"thumb_40e1200","size":4,
-             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
-        )
-        .unwrap();
+        write_consumer_v3_fixture(&thumb_path);
 
-        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let _ = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         let after_first = std::fs::read_to_string(&thumb_path).unwrap();
-        let _ = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let _ = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         let after_second = std::fs::read_to_string(&thumb_path).unwrap();
         assert_eq!(
             after_first, after_second,
@@ -6385,12 +6402,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // Not valid UTF-8.
         std::fs::write(&c_path, [0xff, 0xfe, 0xfd, 0xfc]).unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        let original = r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[]}"#;
+        let original = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
         std::fs::write(&thumb_path, original).unwrap();
 
-        let err = thumb_enrich(&c_path, &thumb_path).unwrap_err();
+        let err = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap_err();
         // The on-disk JSON is unchanged.
-        assert_eq!(std::fs::read_to_string(&thumb_path).unwrap(), original);
+        assert_eq!(std::fs::read(&thumb_path).unwrap(), original);
         // Surfaced as a typed error (any variant — just confirm it's not silent).
         let _ = format!("{err}");
     }
@@ -6402,8 +6419,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // in-string `}`. Block and line comments are exercised too.
         let root = temp_dir("thumb_enrich_brace_in_string");
         let c_path = root.join("decompiled.c");
-        let c = "// FUN_40e1300 @ 00040e1300\n\
-                 void FUN_40e1300(void)\n\
+        let c = "// FUN_4000 @ 00004000\n\
+                 void FUN_4000(void)\n\
                  {\n\
                  \x20 const char *s = \"expected } close\";\n\
                  \x20 /* block comment with } brace */\n\
@@ -6413,15 +6430,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                  }\n\n";
         std::fs::write(&c_path, c).unwrap();
         let thumb_path = root.join("thumb_functions.json");
-        std::fs::write(
-            &thumb_path,
-            r#"{"format":"pixel-modem-extractor-thumb-functions-v1","functions":[
-            {"entry":"0x40e1300","name":"thumb_40e1300","size":4,
-             "body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}]}"#,
-        )
-        .unwrap();
+        write_consumer_v3_fixture(&thumb_path);
 
-        let n = thumb_enrich(&c_path, &thumb_path).unwrap();
+        let n = thumb_enrich(&c_path, &thumb_path, &test_runtime()).unwrap();
         assert_eq!(n, 1);
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&thumb_path).unwrap()).unwrap();
@@ -6499,36 +6510,25 @@ void FUN_10(void)\n\
     }
 
     #[test]
-    fn streaming_thumb_enrich_matches_whole_oracle_for_legacy_and_v3() {
+    fn streaming_thumb_enrich_matches_whole_oracle_for_v3() {
         let c = "// FUN_4000 @ 00004000\nvoid FUN_4000(void)\n{\n  return;\n}\n";
-        let inputs: [&[u8]; 2] = [
-            br#"{
-  "format": "pixel-modem-extractor-thumb-functions-v2",
-  "functions": [
-    {"entry":"0x4000","name":"thumb_4000","size":4,"body_kind":"thumb_disassembly","body":"bx lr","data_refs":[]}
-  ]
-}"#,
-            crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture(),
-        ];
-        for (index, input) in inputs.into_iter().enumerate() {
-            let dir = tempfile::tempdir().unwrap();
-            let c_path = dir.path().join("decompiled.c");
-            let streaming = dir.path().join("streaming.json");
-            let oracle = dir.path().join("oracle.json");
-            std::fs::write(&c_path, c).unwrap();
-            std::fs::write(&streaming, input).unwrap();
-            std::fs::write(&oracle, input).unwrap();
+        let input = crate::thumb_analysis::ParsedThumbArtifact::consumer_v3_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let c_path = dir.path().join("decompiled.c");
+        let streaming = dir.path().join("streaming.json");
+        let oracle = dir.path().join("oracle.json");
+        std::fs::write(&c_path, c).unwrap();
+        std::fs::write(&streaming, input).unwrap();
+        std::fs::write(&oracle, input).unwrap();
 
-            let streaming_count = thumb_enrich(&c_path, &streaming).unwrap();
-            let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
+        let streaming_count = thumb_enrich(&c_path, &streaming, &test_runtime()).unwrap();
+        let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
 
-            assert_eq!(streaming_count, oracle_count, "fixture {index} count");
-            assert_eq!(
-                std::fs::read(&streaming).unwrap(),
-                std::fs::read(&oracle).unwrap(),
-                "fixture {index} bytes"
-            );
-        }
+        assert_eq!(streaming_count, oracle_count);
+        assert_eq!(
+            std::fs::read(&streaming).unwrap(),
+            std::fs::read(&oracle).unwrap(),
+        );
     }
 
     /// Production-scale differential replay. The retained tree is read-only;
@@ -6563,7 +6563,7 @@ void FUN_10(void)\n\
         std::fs::copy(&source, &streaming).unwrap();
         std::fs::copy(&source, &oracle).unwrap();
 
-        let streaming_count = thumb_enrich(&c_path, &streaming).unwrap();
+        let streaming_count = thumb_enrich(&c_path, &streaming, &test_runtime()).unwrap();
         let oracle_count = thumb_enrich_whole(&c_path, &oracle).unwrap();
 
         assert_eq!(streaming_count, oracle_count);

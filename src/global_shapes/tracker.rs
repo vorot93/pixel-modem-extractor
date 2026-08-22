@@ -932,7 +932,7 @@ mod tests {
         reachable_blocks,
     };
     use super::*;
-    use crate::execution_ranges::{DecodeRange, ExecutionIdentity};
+    use crate::execution_ranges::{AuthenticatedDecodeRange, ExecutionIdentity, FunctionOwner};
 
     const R0: Register = Register(0);
     const R1: Register = Register(1);
@@ -950,11 +950,13 @@ mod tests {
         }])
     }
 
-    fn function_at(entry: u32, ranges: Vec<DecodeRange>) -> FunctionExecution {
+    fn function_at(entry: u32, ranges: Vec<AuthenticatedDecodeRange>) -> FunctionExecution {
         FunctionExecution {
+            owner: FunctionOwner::Ghidra,
             identity: ExecutionIdentity {
                 entry,
                 decode_ranges: ranges,
+                execution_blake3: [0; 32],
             },
             contexts: BTreeSet::from([FunctionContext {
                 entry,
@@ -963,19 +965,21 @@ mod tests {
         }
     }
 
-    fn arm_range(start: u32, end: u32) -> DecodeRange {
-        DecodeRange {
+    fn arm_range(start: u32, end: u32) -> AuthenticatedDecodeRange {
+        AuthenticatedDecodeRange {
             start,
             end,
             isa: Isa::Arm,
+            blake3: [0; 32],
         }
     }
 
-    fn thumb_range(start: u32, end: u32) -> DecodeRange {
-        DecodeRange {
+    fn thumb_range(start: u32, end: u32) -> AuthenticatedDecodeRange {
+        AuthenticatedDecodeRange {
             start,
             end,
             isa: Isa::Thumb,
+            blake3: [0; 32],
         }
     }
 
@@ -1125,7 +1129,11 @@ mod tests {
     }
 
     fn decoded_from(
-        ranges: Vec<(DecodeRange, Vec<DecodedInstruction>, Option<DecodeFailure>)>,
+        ranges: Vec<(
+            AuthenticatedDecodeRange,
+            Vec<DecodedInstruction>,
+            Option<DecodeFailure>,
+        )>,
     ) -> DecodedFunction {
         DecodedFunction {
             ranges: ranges
@@ -1154,7 +1162,12 @@ mod tests {
             .checked_add(u32::from(last.length))
             .expect("fixture end");
         let isa = first.isa;
-        let range = DecodeRange { start, end, isa };
+        let range = AuthenticatedDecodeRange {
+            start,
+            end,
+            isa,
+            blake3: [0; 32],
+        };
         let function = function_at(start, vec![range]);
         let decoded = decoded_from(vec![(range, insns, None)]);
         let blocks = vec![Block {
@@ -2826,9 +2839,11 @@ mod tests {
     fn barrier_unioned_function_names_do_not_multiply() {
         let range = arm_range(0x1000, 0x100c);
         let function = FunctionExecution {
+            owner: FunctionOwner::Ghidra,
             identity: ExecutionIdentity {
                 entry: 0x1000,
                 decode_ranges: vec![range],
+                execution_blake3: [0; 32],
             },
             contexts: BTreeSet::from([
                 FunctionContext {

@@ -36,7 +36,7 @@ const RIZIN_THUMB_V3: &str = r#"{
   "functions": [{
     "name":"rizin_thumb_4000","entry":"0x4000","end":"0x4002","size":2,
     "body_kind":"thumb_disassembly","body":"0x4000 bx lr\n","data_refs":["0x4020","0x4060"],
-    "decode_ranges":[{"end":"0x4002","isa":"thumb","start":"0x4000"}],"decode_range_errors":[]
+    "decode_ranges":[{"isa":"thumb","start":"0x4000","end":"0x4002","blake3":"__RANGE_BLAKE3__"}],"decode_range_errors":[]
   }]
 }"#;
 
@@ -48,19 +48,14 @@ fn synthetic_rizin_v3_ownership_and_data_refs_reach_downstream_consumers() {
     std::fs::create_dir_all(&decompiled).unwrap();
     std::fs::write(decompiled.join("functions.json"), b"[]").unwrap();
     std::fs::write(decompiled.join("decompiled.c"), b"").unwrap();
-    std::fs::write(decompiled.join("thumb_functions.json"), RIZIN_THUMB_V3).unwrap();
-
-    let functions =
-        pixel_modem_extractor::recover_source::RecoveredFunctions::load(&decompiled).unwrap();
-    assert_eq!(functions.functions.len(), 1);
-    assert_eq!(
-        functions.functions[0].tool,
-        pixel_modem_extractor::recover_source::Tool::Rizin
-    );
-    assert_eq!(functions.functions[0].data_refs, [0x4020, 0x4060]);
 
     let mut image = vec![0u8; 0x80];
     image[0x20..0x28].copy_from_slice(b"g_rizin\0");
+    let thumb = RIZIN_THUMB_V3.replace(
+        "__RANGE_BLAKE3__",
+        blake3::hash(&image[..2]).to_hex().as_ref(),
+    );
+    std::fs::write(decompiled.join("thumb_functions.json"), thumb).unwrap();
     std::fs::write(image_dir.join("01_MAIN.bin"), image).unwrap();
     let manifest = root.path().join("manifest.json");
     std::fs::write(&manifest, br#"{"toc":[{"name":"MAIN","load_addr":16384}]}"#).unwrap();
@@ -79,6 +74,15 @@ fn synthetic_rizin_v3_ownership_and_data_refs_reach_downstream_consumers() {
     assert_eq!(globals["globals"][0]["address"], "0x4060");
     assert_eq!(globals["globals"][0]["name"], "g_rizin");
     assert_eq!(globals["globals"][0]["arch"], "thumb");
+    assert!(
+        globals["globals"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |evidence| evidence["kind"] == "function" && evidence["name"] == "rizin_thumb_4000"
+            )
+    );
 }
 
 fn env_or_skip() -> Option<PathBuf> {

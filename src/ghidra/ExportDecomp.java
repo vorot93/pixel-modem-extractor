@@ -45,25 +45,31 @@ import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.SourceType;
+import org.bouncycastle.crypto.digests.Blake3Digest;
 import java.util.Set;
 import java.util.TreeSet;
 
 public class ExportDecomp extends GhidraScript {
     private static final long U32_END = 0x1_0000_0000L;
     private static final long U32_MAX = U32_END - 1L;
+    private static final int HASH_BUFFER_SIZE = 64 * 1024;
     private static final String COMPLETION = "pixel-modem-extractor-ghidra-export-v1\n";
 
     private static class DecodeRange implements Comparable<DecodeRange> {
         final long start;
         long end;
         final String isa;
+        final String blake3;
 
-        DecodeRange(long start, long end, String isa) {
+        DecodeRange(long start, long end, String isa, String blake3) {
             this.start = start;
             this.end = end;
             this.isa = isa;
+            this.blake3 = blake3;
         }
 
         @Override
@@ -269,7 +275,7 @@ public class ExportDecomp extends GhidraScript {
                 if (start % alignment != 0 || length % alignment != 0) {
                     errors.add(new DecodeError("misaligned_instruction", start, end));
                 }
-                extents.add(new DecodeRange(start, end, isa));
+                extents.add(new DecodeRange(start, end, isa, null));
             }
         }
 
@@ -303,7 +309,7 @@ public class ExportDecomp extends GhidraScript {
                     continue;
                 }
             }
-            ranges.add(new DecodeRange(extent.start, extent.end, extent.isa));
+            ranges.add(new DecodeRange(extent.start, extent.end, extent.isa, null));
         }
 
         if (ranges.isEmpty()) {
@@ -329,7 +335,15 @@ public class ExportDecomp extends GhidraScript {
                 new ArrayList<DecodeError>(errors));
         }
 
-        return new DecodeProjection(ranges, Collections.<DecodeError>emptyList());
+        List<DecodeRange> authenticated = new ArrayList<DecodeRange>();
+        for (DecodeRange range : ranges) {
+            authenticated.add(new DecodeRange(
+                range.start,
+                range.end,
+                range.isa,
+                hashMemory(range.start, range.end)));
+        }
+        return new DecodeProjection(authenticated, Collections.<DecodeError>emptyList());
     }
 
     private String decodeRangesJson(List<DecodeRange> ranges) {
@@ -339,10 +353,11 @@ public class ExportDecomp extends GhidraScript {
             if (!first) out.append(", ");
             first = false;
             out.append(String.format(
-                "{\"isa\":\"%s\",\"start\":\"0x%x\",\"end\":\"0x%x\"}",
+                "{\"isa\":\"%s\",\"start\":\"0x%x\",\"end\":\"0x%x\",\"blake3\":\"%s\"}",
                 range.isa,
                 range.start,
-                range.end));
+                range.end,
+                range.blake3));
         }
         out.append("]");
         return out.toString();
@@ -409,6 +424,48 @@ public class ExportDecomp extends GhidraScript {
         }
     }
 
+    private String hashMemory(long start, long end) throws Exception {
+        Blake3Digest digest = new Blake3Digest();
+        byte[] bytes = new byte[HASH_BUFFER_SIZE];
+        Address address = toAddr(start);
+        long remaining = end - start;
+        long offset = 0;
+        try {
+            while (remaining > 0) {
+                monitor.checkCancelled();
+                int wanted = (int) Math.min(bytes.length, remaining);
+                int read = currentProgram.getMemory().getBytes(
+                    address.addNoWrap(offset), bytes, 0, wanted);
+                if (read != wanted) {
+                    throw new Exception("execution range is not fully initialized");
+                }
+                digest.update(bytes, 0, read);
+                offset += read;
+                remaining -= read;
+            }
+        } catch (MemoryAccessException e) {
+            throw new Exception("execution range could not be read", e);
+        }
+        byte[] output = new byte[digest.getDigestSize()];
+        digest.doFinal(output, 0);
+        StringBuilder text = new StringBuilder(output.length * 2);
+        for (byte value : output) {
+            text.append(String.format("%02x", value & 0xff));
+        }
+        return text.toString();
+    }
+
+    private static String primarySource(Function fn) throws Exception {
+        SourceType source = fn.getSymbol().getSource();
+        switch (source) {
+            case DEFAULT: return "default";
+            case ANALYSIS: return "analysis";
+            case IMPORTED: return "imported";
+            case USER_DEFINED: return "user_defined";
+            default: throw new Exception("unknown function primary source " + source);
+        }
+    }
+
     private void writeFunctionsJson(File f, FunctionManager fm, Listing listing) throws Exception {
         PrintWriter w = new PrintWriter(new FileWriter(f));
         try (w) {
@@ -424,8 +481,9 @@ public class ExportDecomp extends GhidraScript {
                 long end = functionEnd(fn);
                 DecodeProjection projection = decodeProjection(fn, listing);
                 w.print(String.format(
-                    "  {\"name\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s}",
+                    "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s}",
                     name,
+                    primarySource(fn),
                     entry,
                     end,
                     fn.getBody().getNumAddresses(),

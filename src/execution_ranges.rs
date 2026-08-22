@@ -1,6 +1,14 @@
+use crate::analysis_tool::AnalysisTool;
 use crate::error::{Error, Result};
+use crate::runtime_image::RuntimeImage;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+
+pub(crate) const MAX_EXECUTION_FUNCTIONS: usize = 262_144;
+pub(crate) const MAX_EXECUTION_RANGES: usize = 1_048_576;
+pub(crate) const MAX_EXECUTION_RANGES_PER_FUNCTION: usize = 65_536;
+pub(crate) const MAX_EXECUTION_CHARGED_BYTES: u64 = 512 * 1024 * 1024;
+const EXECUTION_DIGEST_DOMAIN: &[u8] = b"pixel-modem-extractor-execution-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum DecodeIsa {
@@ -9,10 +17,53 @@ pub(crate) enum DecodeIsa {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct DecodeRange {
+pub(crate) struct DecodeExtent {
     pub start: u32,
     pub end: u32,
     pub isa: DecodeIsa,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AuthenticatedDecodeRange {
+    pub isa: DecodeIsa,
+    pub start: u32,
+    pub end: u32,
+    pub blake3: [u8; 32],
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ExecutionBudget {
+    functions: usize,
+    ranges: usize,
+    charged_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum FunctionOwner {
+    Ghidra,
+    Legacy {
+        producer: AnalysisTool,
+    },
+    Run {
+        producer: AnalysisTool,
+        region_index: usize,
+        run_index: usize,
+    },
+}
+
+impl FunctionOwner {
+    pub(crate) const fn analysis_tool(self) -> AnalysisTool {
+        match self {
+            Self::Ghidra => AnalysisTool::Ghidra,
+            Self::Legacy { producer } | Self::Run { producer, .. } => producer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct OwnedExecutionIdentity {
+    pub owner: FunctionOwner,
+    pub identity: ExecutionIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,18 +95,20 @@ pub(crate) struct DecodeRangeError {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ExecutionProjection {
-    Accepted(Vec<DecodeRange>),
+    Accepted(Vec<AuthenticatedDecodeRange>),
     Quarantined(Vec<DecodeRangeError>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ExecutionIdentity {
     pub entry: u32,
-    pub decode_ranges: Vec<DecodeRange>,
+    pub decode_ranges: Vec<AuthenticatedDecodeRange>,
+    pub execution_blake3: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TaggedExecutionRecord {
+    pub owner: FunctionOwner,
     pub entry: u32,
     pub projection: ExecutionProjection,
 }
@@ -65,7 +118,7 @@ pub(crate) struct ValidatedInventory {
     pub raw_count: usize,
     pub accepted: usize,
     pub quarantined: usize,
-    pub accepted_identities: Vec<ExecutionIdentity>,
+    pub accepted_executions: Vec<OwnedExecutionIdentity>,
     pub records: Vec<TaggedExecutionRecord>,
 }
 
@@ -89,16 +142,13 @@ pub(crate) fn canonicalize_errors(mut errors: Vec<DecodeRangeError>) -> Vec<Deco
     errors
 }
 
-/// Convert instruction extents into the one permitted tagged state. A single
-/// defect discards all apparent coverage; callers keep collecting errors before
-/// invoking this helper so later records remain independently usable.
+/// Canonicalize producer instruction extents without treating an address
+/// envelope as mapped execution. Runtime authentication happens only after this
+/// geometry is exact.
 pub(crate) fn canonicalize_instruction_extents(
     entry: u32,
-    mut extents: Vec<DecodeRange>,
-    image_start: u32,
-    image_len: u32,
-) -> ExecutionProjection {
-    let image_end = image_start.checked_add(image_len);
+    mut extents: Vec<DecodeExtent>,
+) -> std::result::Result<Vec<DecodeExtent>, Vec<DecodeRangeError>> {
     let mut errors = Vec::new();
     for extent in &extents {
         let length = extent.end.checked_sub(extent.start);
@@ -122,13 +172,6 @@ pub(crate) fn canonicalize_instruction_extents(
         if !aligned {
             errors.push(error(
                 DecodeRangeErrorKind::MisalignedInstruction,
-                extent.start,
-                Some(extent.end),
-            ));
-        }
-        if extent.start < image_start || image_end.is_none_or(|end| extent.end > end) {
-            errors.push(error(
-                DecodeRangeErrorKind::ExtentOutsideImage,
                 extent.start,
                 Some(extent.end),
             ));
@@ -163,7 +206,7 @@ pub(crate) fn canonicalize_instruction_extents(
             maximal_prior = Some(current);
         }
     }
-    let mut ranges: Vec<DecodeRange> = Vec::new();
+    let mut ranges: Vec<DecodeExtent> = Vec::new();
     for extent in extents {
         if let Some(last) = ranges.last_mut()
             && last.isa == extent.isa
@@ -188,9 +231,135 @@ pub(crate) fn canonicalize_instruction_extents(
         errors.push(error(kind, entry, None));
     }
     if !errors.is_empty() {
-        return ExecutionProjection::Quarantined(canonicalize_errors(errors));
+        return Err(canonicalize_errors(errors));
     }
-    ExecutionProjection::Accepted(ranges)
+    Ok(ranges)
+}
+
+impl ExecutionBudget {
+    pub(crate) fn charge_function(&mut self) -> Result<()> {
+        self.charge(0, 0)
+    }
+
+    fn charge(&mut self, ranges: usize, bytes: u64) -> Result<()> {
+        if ranges > MAX_EXECUTION_RANGES_PER_FUNCTION {
+            return Err(invalid(
+                "execution range count exceeds the per-function limit",
+            ));
+        }
+        let functions = self
+            .functions
+            .checked_add(1)
+            .ok_or_else(|| invalid("execution function count overflow"))?;
+        let total_ranges = self
+            .ranges
+            .checked_add(ranges)
+            .ok_or_else(|| invalid("execution range count overflow"))?;
+        let charged_bytes = self
+            .charged_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("execution charged-byte count overflow"))?;
+        if functions > MAX_EXECUTION_FUNCTIONS {
+            return Err(invalid(
+                "execution function count exceeds the supported limit",
+            ));
+        }
+        if total_ranges > MAX_EXECUTION_RANGES {
+            return Err(invalid("execution range count exceeds the supported limit"));
+        }
+        if charged_bytes > MAX_EXECUTION_CHARGED_BYTES {
+            return Err(invalid(
+                "execution charged bytes exceed the supported limit",
+            ));
+        }
+        self.functions = functions;
+        self.ranges = total_ranges;
+        self.charged_bytes = charged_bytes;
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_execution(
+    entry: u32,
+    extents: Vec<DecodeExtent>,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<ExecutionIdentity> {
+    let extents = canonicalize_instruction_extents(entry, extents)
+        .map_err(|_| invalid("execution extents are not canonical"))?;
+    authenticate_extents(entry, &extents, None, runtime, budget)
+}
+
+fn authenticate_extents(
+    entry: u32,
+    extents: &[DecodeExtent],
+    expected: Option<&[[u8; 32]]>,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<ExecutionIdentity> {
+    let range_count = u32::try_from(extents.len())
+        .map_err(|_| invalid("execution range count does not fit u32"))?;
+    let charged_bytes = extents.iter().try_fold(0u64, |total, extent| {
+        let length = extent
+            .end
+            .checked_sub(extent.start)
+            .filter(|length| *length > 0)
+            .ok_or_else(|| invalid("execution range is empty or wraps"))?;
+        total
+            .checked_add(u64::from(length))
+            .ok_or_else(|| invalid("execution charged-byte count overflow"))
+    })?;
+    if expected.is_some_and(|hashes| hashes.len() != extents.len()) {
+        return Err(invalid("execution range hash count mismatch"));
+    }
+
+    // Counters and every limit are settled before allocation, mapping checks,
+    // or hashing. A failed runtime lookup remains charged work.
+    budget.charge(extents.len(), charged_bytes)?;
+    let mut ranges = Vec::new();
+    ranges
+        .try_reserve_exact(extents.len())
+        .map_err(|_| invalid("authenticated execution-range allocation failed"))?;
+    for (index, extent) in extents.iter().enumerate() {
+        let size = extent.end - extent.start;
+        if !runtime.is_byte_backed(extent.start, size)? {
+            return Err(invalid("execution range crosses virtual zero-fill storage"));
+        }
+        let digest = runtime.hash_range(extent.start, size)?;
+        if expected.is_some_and(|hashes| hashes[index] != digest) {
+            return Err(invalid(
+                "execution range BLAKE3 does not match runtime bytes",
+            ));
+        }
+        ranges.push(AuthenticatedDecodeRange {
+            isa: extent.isa,
+            start: extent.start,
+            end: extent.end,
+            blake3: digest,
+        });
+    }
+    Ok(ExecutionIdentity {
+        entry,
+        execution_blake3: execution_digest(entry, range_count, &ranges),
+        decode_ranges: ranges,
+    })
+}
+
+fn execution_digest(entry: u32, range_count: u32, ranges: &[AuthenticatedDecodeRange]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EXECUTION_DIGEST_DOMAIN);
+    hasher.update(&entry.to_le_bytes());
+    hasher.update(&range_count.to_le_bytes());
+    for range in ranges {
+        hasher.update(&[match range.isa {
+            DecodeIsa::Arm => 0,
+            DecodeIsa::Thumb => 1,
+        }]);
+        hasher.update(&range.start.to_le_bytes());
+        hasher.update(&range.end.to_le_bytes());
+        hasher.update(&range.blake3);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 pub(crate) fn execution_identity(
@@ -199,9 +368,12 @@ pub(crate) fn execution_identity(
 ) -> Result<Option<ExecutionIdentity>> {
     match projection {
         ExecutionProjection::Accepted(decode_ranges) if !decode_ranges.is_empty() => {
+            let range_count = u32::try_from(decode_ranges.len())
+                .map_err(|_| invalid("execution range count does not fit u32"))?;
             Ok(Some(ExecutionIdentity {
                 entry,
                 decode_ranges: decode_ranges.clone(),
+                execution_blake3: execution_digest(entry, range_count, decode_ranges),
             }))
         }
         ExecutionProjection::Accepted(_) => {
@@ -233,7 +405,12 @@ pub(crate) fn projection_to_json(projection: &ExecutionProjection) -> Result<Val
     }
 }
 
-pub(crate) fn parse_projection(value: &Value) -> Result<ExecutionProjection> {
+fn parse_projection(
+    value: &Value,
+    entry: u32,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<(ExecutionProjection, Option<ExecutionIdentity>)> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid("projection must be an object"))?;
@@ -245,33 +422,142 @@ pub(crate) fn parse_projection(value: &Value) -> Result<ExecutionProjection> {
         .get("decode_range_errors")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("decode_range_errors must be an array"))?;
-    let ranges = ranges.iter().map(parse_range).collect::<Result<Vec<_>>>()?;
-    let errors = errors.iter().map(parse_error).collect::<Result<Vec<_>>>()?;
     match (ranges.is_empty(), errors.is_empty()) {
-        (false, true) => Ok(ExecutionProjection::Accepted(ranges)),
-        (true, false) => Ok(ExecutionProjection::Quarantined(errors)),
+        (false, true) => {
+            if ranges.len() > MAX_EXECUTION_RANGES_PER_FUNCTION {
+                return Err(invalid(
+                    "execution range count exceeds the per-function limit",
+                ));
+            }
+            let claimed = ranges
+                .iter()
+                .map(parse_claimed_range)
+                .collect::<Result<Vec<_>>>()?;
+            let extents = claimed.iter().map(|range| range.extent).collect::<Vec<_>>();
+            let canonical = canonicalize_instruction_extents(entry, extents.clone())
+                .map_err(|_| invalid("accepted decode_ranges are not canonical"))?;
+            if canonical != extents {
+                return Err(invalid("accepted decode_ranges are not canonical"));
+            }
+            let expected = claimed.iter().map(|range| range.blake3).collect::<Vec<_>>();
+            let identity = authenticate_extents(entry, &extents, Some(&expected), runtime, budget)?;
+            let projection = ExecutionProjection::Accepted(identity.decode_ranges.clone());
+            Ok((projection, Some(identity)))
+        }
+        (true, false) => {
+            budget.charge_function()?;
+            let errors = errors.iter().map(parse_error).collect::<Result<Vec<_>>>()?;
+            if errors != canonicalize_errors(errors.clone()) {
+                return Err(invalid(
+                    "decode_range_errors are not sorted and deduplicated",
+                ));
+            }
+            Ok((ExecutionProjection::Quarantined(errors), None))
+        }
         _ => Err(invalid(
             "decode projection must contain exactly one non-empty tag array",
         )),
     }
 }
 
-/// Validates exact producer representation rather than repairing it. This is
-/// deliberately separate from canonicalization: consumers reject malformed or
-/// old inventories rather than silently rewriting producer evidence.
+/// Validate the exact tagged wire shape without accepting its claimed hashes
+/// as execution. Artifact assembly and mutation use this before a later
+/// runtime-aware reader authenticates the record.
+pub(crate) fn validate_projection_shape(value: &Value, entry: u32) -> Result<bool> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("projection must be an object"))?;
+    let ranges = object
+        .get("decode_ranges")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("decode_ranges must be an array"))?;
+    let errors = object
+        .get("decode_range_errors")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("decode_range_errors must be an array"))?;
+    match (ranges.is_empty(), errors.is_empty()) {
+        (false, true) => {
+            if ranges.len() > MAX_EXECUTION_RANGES_PER_FUNCTION {
+                return Err(invalid(
+                    "execution range count exceeds the per-function limit",
+                ));
+            }
+            let extents = ranges
+                .iter()
+                .map(parse_claimed_range)
+                .map(|range| range.map(|range| range.extent))
+                .collect::<Result<Vec<_>>>()?;
+            let canonical = canonicalize_instruction_extents(entry, extents.clone())
+                .map_err(|_| invalid("accepted decode_ranges are not canonical"))?;
+            if canonical != extents {
+                return Err(invalid("accepted decode_ranges are not canonical"));
+            }
+            Ok(true)
+        }
+        (true, false) => {
+            let errors = errors.iter().map(parse_error).collect::<Result<Vec<_>>>()?;
+            if errors != canonicalize_errors(errors.clone()) {
+                return Err(invalid(
+                    "decode_range_errors are not sorted and deduplicated",
+                ));
+            }
+            Ok(false)
+        }
+        _ => Err(invalid(
+            "decode projection must contain exactly one non-empty tag array",
+        )),
+    }
+}
+
+pub(crate) fn legacy_non_execution_projection(
+    value: &Value,
+    entry: u32,
+) -> Result<ExecutionProjection> {
+    let errors = value
+        .get("decode_range_errors")
+        .and_then(Value::as_array)
+        .map(|errors| errors.iter().map(parse_error).collect::<Result<Vec<_>>>())
+        .transpose()?
+        .unwrap_or_default();
+    if errors.is_empty() {
+        return Ok(ExecutionProjection::Quarantined(vec![error(
+            DecodeRangeErrorKind::EmptyProjection,
+            entry,
+            None,
+        )]));
+    }
+    if errors != canonicalize_errors(errors.clone()) {
+        return Err(invalid(
+            "decode_range_errors are not sorted and deduplicated",
+        ));
+    }
+    Ok(ExecutionProjection::Quarantined(errors))
+}
+
+#[cfg(test)]
 pub(crate) fn validate_inventory_projection(
     entry: u32,
     projection: &ExecutionProjection,
-    image_start: u32,
-    image_len: u32,
-) -> Result<()> {
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<Option<ExecutionIdentity>> {
     match projection {
         ExecutionProjection::Accepted(ranges) => {
-            let canonical =
-                canonicalize_instruction_extents(entry, ranges.clone(), image_start, image_len);
-            if canonical != *projection {
+            let extents = ranges
+                .iter()
+                .map(|range| DecodeExtent {
+                    isa: range.isa,
+                    start: range.start,
+                    end: range.end,
+                })
+                .collect::<Vec<_>>();
+            let canonical = canonicalize_instruction_extents(entry, extents.clone())
+                .map_err(|_| invalid("accepted decode_ranges are not canonical"))?;
+            if canonical != extents {
                 return Err(invalid("accepted decode_ranges are not canonical"));
             }
+            let expected = ranges.iter().map(|range| range.blake3).collect::<Vec<_>>();
+            authenticate_extents(entry, &extents, Some(&expected), runtime, budget).map(Some)
         }
         ExecutionProjection::Quarantined(errors) => {
             if errors.is_empty() {
@@ -282,9 +568,10 @@ pub(crate) fn validate_inventory_projection(
                     "decode_range_errors are not sorted and deduplicated",
                 ));
             }
+            budget.charge_function()?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 pub(crate) fn inventory_count_conserved(
@@ -314,8 +601,9 @@ pub(crate) fn inventory_count_conserved(
 /// whole-record and streaming Thumb validators so verdicts cannot drift.
 pub(crate) fn validate_inventory_record(
     record: &Value,
-    image_start: u32,
-    image_len: u32,
+    owner: FunctionOwner,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
 ) -> Result<(
     TaggedExecutionRecord,
     ExecutionProjection,
@@ -325,11 +613,10 @@ pub(crate) fn validate_inventory_record(
         .as_object()
         .ok_or_else(|| invalid("inventory record must be an object"))?;
     let entry = parse_hex(required_string(object, "entry")?)?;
-    let projection = parse_projection(record)?;
-    validate_inventory_projection(entry, &projection, image_start, image_len)?;
-    let identity = execution_identity(entry, &projection)?;
+    let (projection, identity) = parse_projection(record, entry, runtime, budget)?;
     Ok((
         TaggedExecutionRecord {
+            owner,
             entry,
             projection: projection.clone(),
         },
@@ -341,22 +628,28 @@ pub(crate) fn validate_inventory_record(
 pub(crate) fn validate_inventory_records(
     records: &[Value],
     expected_raw_count: usize,
-    image_start: u32,
-    image_len: u32,
+    owner: FunctionOwner,
+    runtime: &RuntimeImage<'_>,
 ) -> Result<ValidatedInventory> {
+    if records.len() > MAX_EXECUTION_FUNCTIONS {
+        return Err(invalid(
+            "execution function count exceeds the supported limit",
+        ));
+    }
     let mut projections = Vec::with_capacity(records.len());
-    let mut accepted_identities = BTreeSet::new();
+    let mut accepted_executions = BTreeSet::new();
     let mut accepted = 0usize;
     let mut quarantined = 0usize;
     let mut tagged_records = Vec::with_capacity(records.len());
+    let mut budget = ExecutionBudget::default();
     for record in records {
         let (tagged, projection, identity) =
-            validate_inventory_record(record, image_start, image_len)?;
+            validate_inventory_record(record, owner, runtime, &mut budget)?;
         if let Some(identity) = identity {
             accepted = accepted
                 .checked_add(1)
                 .ok_or_else(|| invalid("accepted inventory count overflow"))?;
-            accepted_identities.insert(identity);
+            accepted_executions.insert(OwnedExecutionIdentity { owner, identity });
         } else {
             quarantined = quarantined
                 .checked_add(1)
@@ -376,9 +669,70 @@ pub(crate) fn validate_inventory_records(
         raw_count: expected_raw_count,
         accepted,
         quarantined,
-        accepted_identities: accepted_identities.into_iter().collect(),
+        accepted_executions: accepted_executions.into_iter().collect(),
         records: tagged_records,
     })
+}
+
+pub(crate) fn validate_ghidra_inventory_records(
+    records: &[Value],
+    expected_raw_count: usize,
+    runtime: &RuntimeImage<'_>,
+) -> Result<ValidatedInventory> {
+    const REQUIRED_KEYS: [&str; 8] = [
+        "name",
+        "primary_source",
+        "entry",
+        "end",
+        "size",
+        "decode_ranges",
+        "decode_range_errors",
+        "data_refs",
+    ];
+    const ENRICHMENT_KEYS: [&str; 2] = ["original_name", "annotations"];
+    for record in records {
+        let object = record
+            .as_object()
+            .ok_or_else(|| invalid("Ghidra function record must be an object"))?;
+        if REQUIRED_KEYS.iter().any(|key| !object.contains_key(*key))
+            || object.keys().any(|key| {
+                !REQUIRED_KEYS.contains(&key.as_str()) && !ENRICHMENT_KEYS.contains(&key.as_str())
+            })
+        {
+            return Err(invalid(
+                "Ghidra function record has unknown or missing fields",
+            ));
+        }
+        required_string(object, "name")?;
+        match required_string(object, "primary_source")? {
+            "default" | "analysis" | "imported" | "user_defined" => {}
+            _ => return Err(invalid("unknown Ghidra primary source")),
+        }
+        if object.contains_key("original_name") {
+            required_string(object, "original_name")?;
+        }
+        if object.get("annotations").is_some_and(|annotations| {
+            annotations
+                .as_array()
+                .is_none_or(|annotations| annotations.iter().any(|value| !value.is_string()))
+        }) {
+            return Err(invalid("Ghidra annotations must be an array of strings"));
+        }
+    }
+    validate_inventory_records(records, expected_raw_count, FunctionOwner::Ghidra, runtime)
+}
+
+pub(crate) fn validate_legacy_execution(
+    entry: u32,
+    ranges: Vec<DecodeExtent>,
+    runtime: &RuntimeImage<'_>,
+    budget: &mut ExecutionBudget,
+) -> Result<Option<ExecutionIdentity>> {
+    if ranges.is_empty() {
+        budget.charge_function()?;
+        return Ok(None);
+    }
+    validate_execution(entry, ranges, runtime, budget).map(Some)
 }
 
 #[cfg(test)]
@@ -393,26 +747,63 @@ where
         .collect()
 }
 
-fn range_to_json(range: &DecodeRange) -> Value {
-    json!({"isa": isa_name(range.isa), "start": hex(range.start), "end": hex(range.end)})
+fn range_to_json(range: &AuthenticatedDecodeRange) -> Value {
+    json!({
+        "isa": isa_name(range.isa),
+        "start": hex(range.start),
+        "end": hex(range.end),
+        "blake3": digest_hex(range.blake3),
+    })
 }
 
 fn error_to_json(error: &DecodeRangeError) -> Value {
     json!({"kind": error_kind_name(error.kind), "address": hex(error.address), "end": error.end.map(hex)})
 }
 
-fn parse_range(value: &Value) -> Result<DecodeRange> {
-    let object = strict_object(value, &["isa", "start", "end"])?;
+#[derive(Clone, Copy)]
+struct ClaimedDecodeRange {
+    extent: DecodeExtent,
+    blake3: [u8; 32],
+}
+
+fn parse_claimed_range(value: &Value) -> Result<ClaimedDecodeRange> {
+    let object = strict_object(value, &["isa", "start", "end", "blake3"])?;
     let isa = match required_string(object, "isa")? {
         "arm" => DecodeIsa::Arm,
         "thumb" => DecodeIsa::Thumb,
         _ => return Err(invalid("unknown decode ISA")),
     };
-    Ok(DecodeRange {
-        isa,
-        start: parse_hex(required_string(object, "start")?)?,
-        end: parse_hex(required_string(object, "end")?)?,
+    Ok(ClaimedDecodeRange {
+        extent: DecodeExtent {
+            isa,
+            start: parse_hex(required_string(object, "start")?)?,
+            end: parse_hex(required_string(object, "end")?)?,
+        },
+        blake3: parse_blake3(required_string(object, "blake3")?)?,
     })
+}
+
+fn parse_blake3(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "BLAKE3 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .map_err(|_| invalid("BLAKE3 contains invalid hexadecimal"))?;
+    }
+    Ok(digest)
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn parse_error(value: &Value) -> Result<DecodeRangeError> {
@@ -530,20 +921,227 @@ pub(crate) fn invalid(message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_image::RuntimeImage;
+    use crate::scatter::{
+        Descriptor, HandlerMap, LoadPlan, Operation, PlannedEntry, PlannedOutput,
+    };
     use serde_json::json;
+
+    fn digest_hex(digest: [u8; 32]) -> String {
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn extent(isa: DecodeIsa, start: u32, end: u32) -> DecodeExtent {
+        DecodeExtent { isa, start, end }
+    }
+
+    fn zero_fill_plan(base: u32, raw_size: u32) -> LoadPlan {
+        LoadPlan {
+            image_base: base,
+            image_size: raw_size,
+            loader_address: base,
+            literal_pair_address: base,
+            table_start: base,
+            table_end: base + raw_size,
+            handlers: HandlerMap {
+                null: base,
+                copy: base + 1,
+                decompress1: base + 2,
+                zero: base + 3,
+            },
+            entries: vec![PlannedEntry {
+                index: 0,
+                descriptor: Descriptor {
+                    source: 0,
+                    destination: base + raw_size,
+                    size: 4,
+                    handler: base + 3,
+                },
+                operation: Operation::Zero,
+                compressed_size: None,
+                output: PlannedOutput::ZeroFill,
+            }],
+            logical_output_size: 4,
+        }
+    }
+
+    #[test]
+    fn authenticated_execution_digest_matches_the_pinned_framing() {
+        let bytes = [1u8, 2, 3, 4];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x1000, None).unwrap();
+        let mut budget = ExecutionBudget::default();
+        let identity = validate_execution(
+            0x1000,
+            vec![extent(DecodeIsa::Thumb, 0x1000, 0x1004)],
+            &runtime,
+            &mut budget,
+        )
+        .unwrap();
+
+        assert_eq!(
+            digest_hex(identity.decode_ranges[0].blake3),
+            "63781d171425a36312fa058d8712d5d05135a991ec20351ce9d65cdb19a05432"
+        );
+        assert_eq!(
+            digest_hex(identity.execution_blake3),
+            "435e60b18c4a67713f0d787a4d39253650bc551764f617728591356995d500c6"
+        );
+    }
+
+    #[test]
+    fn execution_identity_changes_with_bytes_boundaries_and_isa() {
+        let original = [1u8, 2, 3, 4, 5, 6];
+        let changed = [1u8, 2, 3, 9, 5, 6];
+        let original_runtime = RuntimeImage::from_plan(&original, 0x1000, None).unwrap();
+        let changed_runtime = RuntimeImage::from_plan(&changed, 0x1000, None).unwrap();
+        let validate = |runtime: &RuntimeImage<'_>, isa, end| {
+            validate_execution(
+                0x1000,
+                vec![extent(isa, 0x1000, end)],
+                runtime,
+                &mut ExecutionBudget::default(),
+            )
+            .unwrap()
+        };
+
+        let baseline = validate(&original_runtime, DecodeIsa::Thumb, 0x1004);
+        let changed_bytes = validate(&changed_runtime, DecodeIsa::Thumb, 0x1004);
+        let changed_boundary = validate(&original_runtime, DecodeIsa::Thumb, 0x1006);
+        let changed_isa = validate(&original_runtime, DecodeIsa::Arm, 0x1004);
+
+        assert_ne!(
+            baseline.decode_ranges[0].blake3,
+            changed_bytes.decode_ranges[0].blake3
+        );
+        assert_ne!(baseline.execution_blake3, changed_bytes.execution_blake3);
+        assert_ne!(baseline.execution_blake3, changed_boundary.execution_blake3);
+        assert_eq!(
+            baseline.decode_ranges[0].blake3,
+            changed_isa.decode_ranges[0].blake3
+        );
+        assert_ne!(baseline.execution_blake3, changed_isa.execution_blake3);
+    }
+
+    #[test]
+    fn execution_authentication_rejects_gaps_and_virtual_zero_fill() {
+        let raw = [0u8; 16];
+        let gap_runtime = RuntimeImage::from_plan(&raw, 0x1000, None).unwrap();
+        assert!(
+            validate_execution(
+                0x1000,
+                vec![extent(DecodeIsa::Thumb, 0x1000, 0x1012)],
+                &gap_runtime,
+                &mut ExecutionBudget::default(),
+            )
+            .is_err()
+        );
+
+        let plan = zero_fill_plan(0x1000, raw.len() as u32);
+        let zero_runtime = RuntimeImage::from_plan(&raw, 0x1000, Some(&plan)).unwrap();
+        assert!(
+            validate_execution(
+                0x1010,
+                vec![extent(DecodeIsa::Thumb, 0x1010, 0x1014)],
+                &zero_runtime,
+                &mut ExecutionBudget::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn execution_budget_enforces_inventory_aggregate_and_byte_limits() {
+        let bytes = [0u8; 8];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x1000, None).unwrap();
+        let one = || vec![extent(DecodeIsa::Arm, 0x1000, 0x1004)];
+
+        let mut functions = ExecutionBudget {
+            functions: MAX_EXECUTION_FUNCTIONS - 1,
+            ..ExecutionBudget::default()
+        };
+        validate_execution(0x1000, one(), &runtime, &mut functions).unwrap();
+        assert_eq!(functions.functions, MAX_EXECUTION_FUNCTIONS);
+        assert!(validate_execution(0x1000, one(), &runtime, &mut functions).is_err());
+
+        let mut ranges = ExecutionBudget {
+            ranges: MAX_EXECUTION_RANGES - 1,
+            ..ExecutionBudget::default()
+        };
+        validate_execution(0x1000, one(), &runtime, &mut ranges).unwrap();
+        assert_eq!(ranges.ranges, MAX_EXECUTION_RANGES);
+        assert!(validate_execution(0x1000, one(), &runtime, &mut ranges).is_err());
+
+        let mut bytes = ExecutionBudget {
+            charged_bytes: MAX_EXECUTION_CHARGED_BYTES - 4,
+            ..ExecutionBudget::default()
+        };
+        validate_execution(0x1000, one(), &runtime, &mut bytes).unwrap();
+        assert_eq!(bytes.charged_bytes, MAX_EXECUTION_CHARGED_BYTES);
+        assert!(validate_execution(0x1000, one(), &runtime, &mut bytes).is_err());
+    }
+
+    #[test]
+    fn execution_budget_enforces_per_function_range_limit_before_runtime_work() {
+        let count = MAX_EXECUTION_RANGES_PER_FUNCTION + 1;
+        let extents = (0..count)
+            .map(|index| {
+                let start = 0x1000 + u32::try_from(index * 4).unwrap();
+                extent(DecodeIsa::Thumb, start, start + 2)
+            })
+            .collect();
+        let runtime = RuntimeImage::from_plan(&[0u8; 2], 0x1000, None).unwrap();
+        let mut budget = ExecutionBudget::default();
+
+        assert!(validate_execution(0x1000, extents, &runtime, &mut budget).is_err());
+        assert_eq!(budget.ranges, 0);
+        assert_eq!(budget.charged_bytes, 0);
+    }
+
+    #[test]
+    fn execution_budget_rejects_counter_overflow() {
+        let runtime = RuntimeImage::from_plan(&[0u8; 4], 0x1000, None).unwrap();
+        let mut function_overflow = ExecutionBudget {
+            functions: usize::MAX,
+            ..ExecutionBudget::default()
+        };
+        assert!(
+            validate_execution(
+                0x1000,
+                vec![extent(DecodeIsa::Arm, 0x1000, 0x1004)],
+                &runtime,
+                &mut function_overflow,
+            )
+            .is_err()
+        );
+
+        let mut byte_overflow = ExecutionBudget {
+            charged_bytes: u64::MAX,
+            ..ExecutionBudget::default()
+        };
+        assert!(
+            validate_execution(
+                0x1000,
+                vec![extent(DecodeIsa::Arm, 0x1000, 0x1004)],
+                &runtime,
+                &mut byte_overflow,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn tagged_projection_serializes_canonical_wire_shape() {
-        let projection = ExecutionProjection::Accepted(vec![DecodeRange {
+        let projection = ExecutionProjection::Accepted(vec![AuthenticatedDecodeRange {
             isa: DecodeIsa::Thumb,
             start: 0x4001_0000,
             end: 0x4001_0004,
+            blake3: [0; 32],
         }]);
 
         assert_eq!(
             projection_to_json(&projection).unwrap(),
             json!({
-                "decode_ranges": [{"isa":"thumb","start":"0x40010000","end":"0x40010004"}],
+                "decode_ranges": [{"isa":"thumb","start":"0x40010000","end":"0x40010004","blake3":"00".repeat(32)}],
                 "decode_range_errors": [],
             })
         );
@@ -551,15 +1149,17 @@ mod tests {
 
     #[test]
     fn projection_parser_rejects_noncanonical_or_nonexclusive_tags() {
+        let bytes = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
         for bad in [
             json!({"decode_ranges": [], "decode_range_errors": []}),
-            json!({"decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}], "decode_range_errors": [{"kind":"empty_projection","address":"0x4000","end":null}]}),
-            json!({"decode_ranges": [{"isa":"ARM","start":"0x4000","end":"0x4004"}], "decode_range_errors": []}),
-            json!({"decode_ranges": [{"isa":"arm","start":"0X4000","end":"0x4004"}], "decode_range_errors": []}),
-            json!({"decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004","extra":true}], "decode_range_errors": []}),
+            json!({"decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004","blake3":"00".repeat(32)}], "decode_range_errors": [{"kind":"empty_projection","address":"0x4000","end":null}]}),
+            json!({"decode_ranges": [{"isa":"ARM","start":"0x4000","end":"0x4004","blake3":"00".repeat(32)}], "decode_range_errors": []}),
+            json!({"decode_ranges": [{"isa":"arm","start":"0X4000","end":"0x4004","blake3":"00".repeat(32)}], "decode_range_errors": []}),
+            json!({"decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004","blake3":"00".repeat(32),"extra":true}], "decode_range_errors": []}),
         ] {
             assert!(
-                parse_projection(&bad).is_err(),
+                parse_projection(&bad, 0x4000, &runtime, &mut ExecutionBudget::default(),).is_err(),
                 "accepted invalid projection: {bad}"
             );
         }
@@ -567,80 +1167,42 @@ mod tests {
 
     #[test]
     fn canonicalization_merges_only_adjacent_same_isa_and_requires_entry_start() {
-        let projection = canonicalize_instruction_extents(
+        let ranges = canonicalize_instruction_extents(
             0x4000,
             vec![
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4006,
-                    end: 0x4008,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4000,
-                    end: 0x4002,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4002,
-                    end: 0x4004,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4004,
-                    end: 0x4006,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Arm,
-                    start: 0x4008,
-                    end: 0x400c,
-                },
+                extent(DecodeIsa::Thumb, 0x4006, 0x4008),
+                extent(DecodeIsa::Thumb, 0x4000, 0x4002),
+                extent(DecodeIsa::Thumb, 0x4002, 0x4004),
+                extent(DecodeIsa::Thumb, 0x4004, 0x4006),
+                extent(DecodeIsa::Arm, 0x4008, 0x400c),
             ],
-            0x4000,
-            0x10,
-        );
+        )
+        .unwrap();
         assert_eq!(
-            projection,
-            ExecutionProjection::Accepted(vec![
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4000,
-                    end: 0x4008
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Arm,
-                    start: 0x4008,
-                    end: 0x400c
-                },
-            ])
+            ranges,
+            vec![
+                extent(DecodeIsa::Thumb, 0x4000, 0x4008),
+                extent(DecodeIsa::Arm, 0x4008, 0x400c),
+            ]
         );
     }
 
     #[test]
     fn canonicalization_quarantines_when_merging_makes_entry_interior() {
-        let projection = canonicalize_instruction_extents(
+        let errors = canonicalize_instruction_extents(
             0x4004,
             vec![
-                DecodeRange {
-                    isa: DecodeIsa::Arm,
-                    start: 0x4000,
-                    end: 0x4004,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Arm,
-                    start: 0x4004,
-                    end: 0x4008,
-                },
+                extent(DecodeIsa::Arm, 0x4000, 0x4004),
+                extent(DecodeIsa::Arm, 0x4004, 0x4008),
             ],
-            0x4000,
-            0x10,
-        );
-        let expected = ExecutionProjection::Quarantined(vec![DecodeRangeError {
+        )
+        .unwrap_err();
+        let expected = vec![DecodeRangeError {
             kind: DecodeRangeErrorKind::EntryNotRangeStart,
             address: 0x4004,
             end: None,
-        }]);
-        assert_eq!(projection, expected);
+        }];
+        assert_eq!(errors, expected);
 
         let record = json!({
             "entry":"0x4004",
@@ -651,38 +1213,28 @@ mod tests {
                 "end":null
             }]
         });
-        let inventory = validate_inventory_records(&[record], 1, 0x4000, 0x10).unwrap();
+        let bytes = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
+        let inventory =
+            validate_inventory_records(&[record], 1, FunctionOwner::Ghidra, &runtime).unwrap();
         assert_eq!(inventory.accepted, 0);
         assert_eq!(inventory.quarantined, 1);
     }
 
     #[test]
     fn canonicalization_quarantines_whole_record_with_sorted_deduplicated_errors() {
-        let projection = canonicalize_instruction_extents(
+        let errors = canonicalize_instruction_extents(
             0x4001,
             vec![
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4001,
-                    end: 0x4003,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4002,
-                    end: 0x4004,
-                },
-                DecodeRange {
-                    isa: DecodeIsa::Thumb,
-                    start: 0x4001,
-                    end: 0x4003,
-                },
+                extent(DecodeIsa::Thumb, 0x4001, 0x4003),
+                extent(DecodeIsa::Thumb, 0x4002, 0x4004),
+                extent(DecodeIsa::Thumb, 0x4001, 0x4003),
             ],
-            0x4000,
-            0x10,
-        );
+        )
+        .unwrap_err();
         assert_eq!(
-            projection,
-            ExecutionProjection::Quarantined(vec![
+            errors,
+            vec![
                 DecodeRangeError {
                     kind: DecodeRangeErrorKind::DuplicateExtent,
                     address: 0x4001,
@@ -703,28 +1255,28 @@ mod tests {
                     address: 0x4002,
                     end: Some(0x4004)
                 },
-            ])
+            ]
         );
     }
 
     #[test]
     fn accepted_identity_dedup_uses_the_complete_tagged_range_list() {
-        let arm = ExecutionIdentity {
-            entry: 0x4000,
-            decode_ranges: vec![DecodeRange {
-                isa: DecodeIsa::Arm,
-                start: 0x4000,
-                end: 0x4004,
-            }],
-        };
-        let thumb = ExecutionIdentity {
-            entry: 0x4000,
-            decode_ranges: vec![DecodeRange {
-                isa: DecodeIsa::Thumb,
-                start: 0x4000,
-                end: 0x4004,
-            }],
-        };
+        let bytes = [0u8; 4];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
+        let arm = validate_execution(
+            0x4000,
+            vec![extent(DecodeIsa::Arm, 0x4000, 0x4004)],
+            &runtime,
+            &mut ExecutionBudget::default(),
+        )
+        .unwrap();
+        let thumb = validate_execution(
+            0x4000,
+            vec![extent(DecodeIsa::Thumb, 0x4000, 0x4004)],
+            &runtime,
+            &mut ExecutionBudget::default(),
+        )
+        .unwrap();
         assert_ne!(arm, thumb, "cross-ISA overlaps remain distinct identities");
         assert_eq!(
             execution_identity(
@@ -750,28 +1302,43 @@ mod tests {
 
     #[test]
     fn empty_tag_payloads_are_rejected_at_every_model_boundary() {
+        let bytes = [0u8; 4];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
         let empty_accepted = ExecutionProjection::Accepted(vec![]);
         let empty_quarantined = ExecutionProjection::Quarantined(vec![]);
         for projection in [&empty_accepted, &empty_quarantined] {
             assert!(projection_to_json(projection).is_err());
             assert!(execution_identity(0x4000, projection).is_err());
-            assert!(validate_inventory_projection(0x4000, projection, 0x4000, 4).is_err());
+            assert!(
+                validate_inventory_projection(
+                    0x4000,
+                    projection,
+                    &runtime,
+                    &mut ExecutionBudget::default(),
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn inventory_conservation_detects_an_omitted_raw_record() {
-        let projections = vec![ExecutionProjection::Accepted(vec![DecodeRange {
-            isa: DecodeIsa::Thumb,
-            start: 0x4000,
-            end: 0x4002,
-        }])];
+        let projections = vec![ExecutionProjection::Accepted(vec![
+            AuthenticatedDecodeRange {
+                isa: DecodeIsa::Thumb,
+                start: 0x4000,
+                end: 0x4002,
+                blake3: [0; 32],
+            },
+        ])];
         assert!(inventory_count_conserved(1, &projections));
         assert!(!inventory_count_conserved(2, &projections));
     }
 
     #[test]
     fn projection_parser_rejects_missing_and_malformed_error_fields() {
+        let bytes = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
         for bad in [
             json!({"decode_range_errors": []}),
             json!({"decode_ranges": []}),
@@ -780,13 +1347,22 @@ mod tests {
             json!({"decode_ranges": [], "decode_range_errors": [{"kind":"empty_projection", "address":"0x04000", "end":false}]}),
         ] {
             assert!(
-                parse_projection(&bad).is_err(),
+                parse_projection(&bad, 0x4000, &runtime, &mut ExecutionBudget::default(),).is_err(),
                 "accepted malformed projection: {bad}"
             );
         }
         assert_eq!(
-            parse_projection(&json!({"decode_ranges": [], "decode_range_errors": [{"kind":"raw_byte_mismatch", "address":"0x4000", "end":"0x4004"}]})).unwrap(),
-            ExecutionProjection::Quarantined(vec![DecodeRangeError { kind: DecodeRangeErrorKind::RawByteMismatch, address: 0x4000, end: Some(0x4004) }])
+            parse_projection(
+                &json!({"decode_ranges": [], "decode_range_errors": [{"kind":"raw_byte_mismatch", "address":"0x4000", "end":"0x4004"}]}),
+                0x4000,
+                &runtime,
+                &mut ExecutionBudget::default(),
+            )
+            .unwrap(),
+            (
+                ExecutionProjection::Quarantined(vec![DecodeRangeError { kind: DecodeRangeErrorKind::RawByteMismatch, address: 0x4000, end: Some(0x4004) }]),
+                None,
+            )
         );
     }
 
@@ -805,22 +1381,22 @@ mod tests {
                 (0x4002, "z".into())
             ]
         );
-        let left = ExecutionIdentity {
-            entry: 0x4000,
-            decode_ranges: vec![DecodeRange {
-                isa: DecodeIsa::Thumb,
-                start: 0x4000,
-                end: 0x4006,
-            }],
-        };
-        let right = ExecutionIdentity {
-            entry: 0x4002,
-            decode_ranges: vec![DecodeRange {
-                isa: DecodeIsa::Thumb,
-                start: 0x4002,
-                end: 0x4008,
-            }],
-        };
+        let bytes = [0u8; 8];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
+        let left = validate_execution(
+            0x4000,
+            vec![extent(DecodeIsa::Thumb, 0x4000, 0x4006)],
+            &runtime,
+            &mut ExecutionBudget::default(),
+        )
+        .unwrap();
+        let right = validate_execution(
+            0x4002,
+            vec![extent(DecodeIsa::Thumb, 0x4002, 0x4008)],
+            &runtime,
+            &mut ExecutionBudget::default(),
+        )
+        .unwrap();
         assert_ne!(
             left, right,
             "same-ISA overlaps remain distinct complete identities"
@@ -829,25 +1405,36 @@ mod tests {
 
     #[test]
     fn terminal_inventory_deduplicates_only_complete_accepted_identities() {
+        let bytes = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
+        let range = |isa: &str, start: u32, end: u32| {
+            let digest = runtime.hash_range(start, end - start).unwrap();
+            json!({
+                "isa": isa,
+                "start": hex(start),
+                "end": hex(end),
+                "blake3": digest_hex(digest),
+            })
+        };
         let records = vec![
             json!({
                 "entry": "0x4000",
-                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                "decode_ranges": [range("arm", 0x4000, 0x4004)],
                 "decode_range_errors": [],
             }),
             json!({
                 "entry": "0x4000",
-                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                "decode_ranges": [range("arm", 0x4000, 0x4004)],
                 "decode_range_errors": [],
             }),
             json!({
                 "entry": "0x4000",
-                "decode_ranges": [{"isa":"thumb","start":"0x4000","end":"0x4004"}],
+                "decode_ranges": [range("thumb", 0x4000, 0x4004)],
                 "decode_range_errors": [],
             }),
             json!({
                 "entry": "0x4002",
-                "decode_ranges": [{"isa":"thumb","start":"0x4002","end":"0x4006"}],
+                "decode_ranges": [range("thumb", 0x4002, 0x4006)],
                 "decode_range_errors": [],
             }),
             json!({
@@ -857,36 +1444,42 @@ mod tests {
             }),
         ];
 
-        let inventory = validate_inventory_records(&records, 5, 0x4000, 0x10).unwrap();
+        let inventory =
+            validate_inventory_records(&records, 5, FunctionOwner::Ghidra, &runtime).unwrap();
 
         assert_eq!(inventory.raw_count, 5);
         assert_eq!(inventory.accepted, 4);
         assert_eq!(inventory.quarantined, 1);
-        assert_eq!(inventory.accepted_identities.len(), 3);
-        assert!(inventory.accepted_identities.iter().any(|identity| {
-            identity.entry == 0x4000 && identity.decode_ranges[0].isa == DecodeIsa::Arm
+        assert_eq!(inventory.accepted_executions.len(), 3);
+        assert!(inventory.accepted_executions.iter().any(|execution| {
+            execution.identity.entry == 0x4000
+                && execution.identity.decode_ranges[0].isa == DecodeIsa::Arm
         }));
-        assert!(inventory.accepted_identities.iter().any(|identity| {
-            identity.entry == 0x4000 && identity.decode_ranges[0].isa == DecodeIsa::Thumb
+        assert!(inventory.accepted_executions.iter().any(|execution| {
+            execution.identity.entry == 0x4000
+                && execution.identity.decode_ranges[0].isa == DecodeIsa::Thumb
         }));
         assert!(
             inventory
-                .accepted_identities
+                .accepted_executions
                 .iter()
-                .any(|identity| identity.entry == 0x4002)
+                .any(|execution| execution.identity.entry == 0x4002)
         );
     }
 
     #[test]
     fn terminal_inventory_rejects_orphans_malformed_tags_and_count_mismatch() {
+        let bytes = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&bytes, 0x4000, None).unwrap();
+        let digest = digest_hex(runtime.hash_range(0x4000, 4).unwrap());
         let valid = json!({
             "entry": "0x4000",
-            "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+            "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004","blake3":digest}],
             "decode_range_errors": [],
         });
         let invalid_cases = [
             vec![json!({
-                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004"}],
+                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4004","blake3":"00".repeat(32)}],
                 "decode_range_errors": [],
             })],
             vec![json!({
@@ -896,7 +1489,7 @@ mod tests {
             })],
             vec![json!({
                 "entry": "0x4000",
-                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4002"}],
+                "decode_ranges": [{"isa":"arm","start":"0x4000","end":"0x4002","blake3":"00".repeat(32)}],
                 "decode_range_errors": [],
             })],
             vec![json!({
@@ -910,10 +1503,10 @@ mod tests {
         ];
         for records in invalid_cases {
             assert!(
-                validate_inventory_records(&records, 1, 0x4000, 0x10).is_err(),
+                validate_inventory_records(&records, 1, FunctionOwner::Ghidra, &runtime,).is_err(),
                 "accepted invalid terminal inventory: {records:?}"
             );
         }
-        assert!(validate_inventory_records(&[valid], 2, 0x4000, 0x10).is_err());
+        assert!(validate_inventory_records(&[valid], 2, FunctionOwner::Ghidra, &runtime,).is_err());
     }
 }

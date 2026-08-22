@@ -56,8 +56,10 @@ Fresh Thumb output is strict `pixel-modem-extractor-thumb-functions-v3`. Its ord
 `producers`, `regions`, and `attempts` identify the canonical executable, version, exact command,
 attempt outcome, and retained capture. Each successful attempt owns one contiguous slice of the
 flat `functions` array through `function_runs`; consumers derive radare2 or Rizin ownership from
-those validated runs. Retained v1/v2 files remain readable as legacy radare2 evidence, but new
-analysis never writes them.
+those validated region/run coordinates. Every accepted range carries a lowercase BLAKE3 over its
+exact runtime bytes, and the concrete run plus framed aggregate execution digest remains attached
+through downstream attribution and mutation. Retained v1/v2 files remain readable as legacy
+radare2 evidence, but are read-only; new analysis and enrichment never write them.
 
 **Resources and captures:** every radare2 or Rizin attempt has a 4 GiB stdout cap and, on
 Unix, a 16 GiB child `RLIMIT_AS`. Rizin additionally has a fixed 30-minute deadline per
@@ -72,7 +74,9 @@ recorded identity.
 
 **Memory:** the dense-Thumb producer and every downstream mutation are streaming. Each backend
 capture is parsed value-by-value, functions are normalized and spilled one at a time, and strict v3
-is assembled atomically. One consumer is deliberately whole-file: `global_shapes` retains the
+is assembled atomically. One analyzer inventory is limited to 262,144 functions, 1,048,576 accepted
+ranges, 65,536 ranges per function, and 512 MiB of charged executable bytes. One consumer is
+deliberately whole-file: `global_shapes` retains the
 complete validated function set because its decoder analyzes those records together. The retained Mustang replay measured ~3.65 GiB of radare2 stdout, 151,411 functions,
 582,543,970 output bytes, ~248 seconds, and ~2.8 GB peak RSS for replay plus comparison; capture
 production itself measured ~0.3 GB. `thumb_enrich` streams `decompiled.c` and rewrites one function
@@ -246,7 +250,8 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   `pixel-modem-extractor-thumb-functions-v3`: producer identities, requested regions, ordered
   attempts, capture provenance, contiguous producer-owned function runs, then normalized
   functions. `end` is the backend's exclusive `maxaddr`/`maxbound`, `size` is positive `realsz`,
-  and `decode_ranges` are authoritative executable coverage. v1/v2 remain legacy readable inputs.
+  and each authoritative executable `decode_range` has ordered `isa`, `start`, `end`, and `blake3`
+  fields. v1/v2 remain legacy readable, read-only inputs.
 - **global_shapes.json** — `pixel-modem-extractor-global-shapes-v4`; record-only
   storage-shape evidence for Recovered globals, written by the default-on
   `global_shapes` stage (on the normal route, before pass 2; on
