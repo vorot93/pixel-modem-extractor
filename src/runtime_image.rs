@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::scatter::{
     self, ArtifactSegment, LoadPlan, MAX_ENTRIES, MAX_LOGICAL_OUTPUT, Operation, PlannedOutput,
+    PlannedStorage,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -242,6 +243,20 @@ impl<'a> RuntimeImage<'a> {
                             "{context} byte destination overlaps the raw image"
                         )));
                     }
+                    let backing = match entry.storage() {
+                        PlannedStorage::Bytes(bytes) => Backing::PlanBytes {
+                            bytes,
+                            scatter_entry: entry.index,
+                        },
+                        PlannedStorage::ZeroFill => Backing::Zero {
+                            scatter_entry: entry.index,
+                        },
+                        _ => {
+                            return Err(bad(format!(
+                                "{context} byte output has an invalid storage classification"
+                            )));
+                        }
+                    };
                     segments.push(Segment {
                         start: entry.descriptor.destination,
                         end: checked_end(
@@ -249,10 +264,7 @@ impl<'a> RuntimeImage<'a> {
                             entry.descriptor.size,
                             &context,
                         )?,
-                        backing: Backing::PlanBytes {
-                            bytes,
-                            scatter_entry: entry.index,
-                        },
+                        backing,
                     });
                 }
                 PlannedOutput::ZeroFill => {

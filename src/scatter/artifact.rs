@@ -1,11 +1,21 @@
-use super::{LoadPlan, Operation, PlannedEntry, PlannedOutput};
+use super::{LoadPlan, Operation, PlannedEntry, PlannedOutput, PlannedStorage};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
 
 pub const LOAD_MAP_FORMAT: &str = "pixel-modem-extractor-scatter-load-v1";
 
@@ -41,6 +51,175 @@ pub(crate) struct ArtifactSegment {
 enum ArtifactBacking {
     File(Mutex<File>),
     Zero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[cfg(unix)]
+struct ValidatedRegularFile {
+    path: PathBuf,
+    identity: FileIdentity,
+    context: String,
+}
+
+#[cfg(unix)]
+impl ValidatedRegularFile {
+    fn new(path: PathBuf, context: impl Into<String>) -> Result<Self> {
+        let context = context.into();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
+        require_regular_file(&metadata, &context)?;
+        let identity = file_identity(&metadata, &context)?;
+        Ok(Self {
+            path,
+            identity,
+            context,
+        })
+    }
+
+    fn open(self) -> Result<File> {
+        let file = open_no_follow(&self.path, &self.context)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| bad(format!("{} metadata is unavailable: {error}", self.context)))?;
+        require_regular_file(&metadata, &self.context)?;
+        if file_identity(&metadata, &self.context)? != self.identity {
+            return Err(bad(format!(
+                "{} identity changed during open",
+                self.context
+            )));
+        }
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+struct ValidatedRegularFile {
+    file: File,
+    identity: FileIdentity,
+    context: String,
+}
+
+#[cfg(windows)]
+impl ValidatedRegularFile {
+    fn new(path: PathBuf, context: impl Into<String>) -> Result<Self> {
+        let context = context.into();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
+        require_regular_file(&metadata, &context)?;
+        let file = open_no_follow(&path, &context)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
+        require_regular_file(&metadata, &context)?;
+        let identity = windows_file_identity(&file, &context)?;
+        Ok(Self {
+            file,
+            identity,
+            context,
+        })
+    }
+
+    fn open(self) -> Result<File> {
+        if windows_file_identity(&self.file, &self.context)? != self.identity {
+            return Err(bad(format!("{} identity changed after open", self.context)));
+        }
+        Ok(self.file)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ValidatedRegularFile;
+
+#[cfg(not(any(unix, windows)))]
+impl ValidatedRegularFile {
+    fn new(_path: PathBuf, context: impl Into<String>) -> Result<Self> {
+        Err(bad(format!(
+            "{} identity validation is unsupported on this platform",
+            context.into()
+        )))
+    }
+
+    fn open(self) -> Result<File> {
+        unreachable!("unsupported platforms reject validated files during construction")
+    }
+}
+
+fn require_regular_file(metadata: &Metadata, context: &str) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(bad(format!("{context} is a symlink")));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(bad(format!("{context} is not a regular file")));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &Metadata, _context: &str) -> Result<FileIdentity> {
+    Ok(FileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File, context: &str) -> Result<FileIdentity> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live handle and `information` is writable for the call.
+    let result = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::addr_of_mut!(information))
+    };
+    if result == 0 {
+        return Err(bad(format!(
+            "{context} identity is unavailable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(FileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path, context: &str) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            bad(format!(
+                "{context} cannot be opened without following links: {error}"
+            ))
+        })
+}
+
+#[cfg(windows)]
+fn open_no_follow(path: &Path, context: &str) -> Result<File> {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            bad(format!(
+                "{context} cannot be opened without following links: {error}"
+            ))
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_no_follow(path: &Path, context: &str) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| bad(format!("{context} cannot be opened: {error}")))
 }
 
 impl ArtifactSegment {
@@ -617,9 +796,7 @@ fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, PathBuf)> {
     }
     let supplied_metadata = fs::symlink_metadata(manifest_path)
         .map_err(|error| bad(format!("scatter load map metadata is unavailable: {error}")))?;
-    if supplied_metadata.file_type().is_symlink() {
-        return Err(bad("scatter load map is a symlink"));
-    }
+    require_regular_file(&supplied_metadata, "scatter load map")?;
     let canonical_manifest = fs::canonicalize(manifest_path)
         .map_err(|error| bad(format!("scatter load map cannot be canonicalized: {error}")))?;
     if canonical_manifest
@@ -636,16 +813,7 @@ fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, PathBuf)> {
         .parent()
         .ok_or_else(|| bad("scatter load map has no parent directory"))?
         .to_path_buf();
-    let file = File::open(&canonical_manifest)
-        .map_err(|error| bad(format!("scatter load map cannot be opened: {error}")))?;
-    if !file
-        .metadata()
-        .map_err(|error| bad(format!("scatter load-map metadata is unavailable: {error}")))?
-        .file_type()
-        .is_file()
-    {
-        return Err(bad("scatter load map is not a regular file"));
-    }
+    let file = ValidatedRegularFile::new(canonical_manifest, "scatter load map")?.open()?;
     Ok((file, parent))
 }
 
@@ -712,9 +880,7 @@ fn open_authenticated_payload(
             "{context} payload metadata is unavailable: {error}"
         ))
     })?;
-    if supplied_metadata.file_type().is_symlink() {
-        return Err(bad(format!("{context} payload is a symlink")));
-    }
+    require_regular_file(&supplied_metadata, &format!("{context} payload"))?;
     let canonical = fs::canonicalize(&supplied).map_err(|error| {
         bad(format!(
             "{context} payload cannot be canonicalized: {error}"
@@ -728,16 +894,12 @@ fn open_authenticated_payload(
             "{context} payload path escapes the load-map directory"
         )));
     }
-    let mut file = File::open(&canonical)
-        .map_err(|error| bad(format!("{context} payload cannot be opened: {error}")))?;
+    let mut file = ValidatedRegularFile::new(canonical, format!("{context} payload"))?.open()?;
     let metadata = file.metadata().map_err(|error| {
         bad(format!(
             "{context} payload metadata is unavailable: {error}"
         ))
     })?;
-    if !metadata.file_type().is_file() {
-        return Err(bad(format!("{context} payload is not a regular file")));
-    }
     if metadata.len() != u64::from(size) {
         return Err(bad(format!(
             "{context} payload does not have its declared size"
@@ -1002,19 +1164,26 @@ fn stage_entry(
         | (Operation::Decompress1, PlannedOutput::Bytes(bytes)) => {
             validate_output_size(entry, bytes)?;
             let hash = hash_bytes(bytes).to_hex().to_string();
-            if entry.operation == Operation::Decompress1 && bytes.iter().all(|&byte| byte == 0) {
-                (Some(hash), Materialization::ZeroFill)
-            } else {
-                let operation = operation_name(entry.operation);
-                let file_name = format!("{:02}-{operation}.bin", entry.index);
-                fs::write(blocks_dir.join(&file_name), bytes)?;
-                (
-                    Some(hash),
-                    Materialization::File {
-                        path: format!("blocks/{file_name}"),
-                        size: entry.descriptor.size,
-                    },
-                )
+            match entry.storage() {
+                PlannedStorage::ZeroFill => (Some(hash), Materialization::ZeroFill),
+                PlannedStorage::Bytes(bytes) => {
+                    let operation = operation_name(entry.operation);
+                    let file_name = format!("{:02}-{operation}.bin", entry.index);
+                    fs::write(blocks_dir.join(&file_name), bytes)?;
+                    (
+                        Some(hash),
+                        Materialization::File {
+                            path: format!("blocks/{file_name}"),
+                            size: entry.descriptor.size,
+                        },
+                    )
+                }
+                _ => {
+                    return Err(entry_error(
+                        entry,
+                        "byte output has an invalid storage classification",
+                    ));
+                }
             }
         }
         (Operation::Zero, PlannedOutput::ZeroFill) => (
@@ -1178,15 +1347,21 @@ fn bad(reason: impl Into<String>) -> Error {
 mod tests {
     use super::{LOAD_MAP_FORMAT, clear_materialized, materialize, read_materialized};
     use crate::error::Error;
-    use crate::runtime_image::RuntimeImage;
+    use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
     use crate::scatter::{
         Descriptor, HandlerMap, LoadPlan, Operation, PlannedEntry, PlannedOutput,
     };
     use serde_json::json;
+    #[cfg(unix)]
+    use std::ffi::CString;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, symlink};
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir};
 
     const BASE: u32 = 0x1000_0000;
@@ -1343,6 +1518,29 @@ mod tests {
             Err(other) => panic!("expected bad scatter reader failure, got {other:?}"),
             Ok(_) => panic!("strict reader accepted invalid input"),
         }
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(unix)]
+    fn delayed_fifo_writer(path: PathBuf, delay: Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path);
+        })
     }
 
     #[test]
@@ -1791,6 +1989,104 @@ mod tests {
             segment.read_exact(0, &mut bytes).unwrap();
             assert_eq!(bytes, [0x11, 0x22, 0x33, 0x44]);
         }
+    }
+
+    #[test]
+    fn plan_and_artifact_use_identical_zero_and_byte_backed_provenance() {
+        let mut fixture = fixture();
+        fixture.image[0x710..0x714].fill(0);
+        fixture.plan.entries[3].output = PlannedOutput::Bytes(vec![0; 4]);
+        fixture.plan.entries[4].output = PlannedOutput::Bytes(vec![0; 3]);
+        let root = tempdir().unwrap();
+        let materialized =
+            materialize(&fixture.plan, &fixture.image, "02_MAIN", root.path()).unwrap();
+        let manifest = root.path().join(materialized.relative_path);
+        let planned = RuntimeImage::from_plan(&fixture.image, BASE, Some(&fixture.plan)).unwrap();
+        let retained =
+            RuntimeImage::from_artifact(&fixture.image, BASE, root.path(), Some(&manifest))
+                .unwrap();
+
+        let copy_storage = vec![StorageSpan {
+            kind: StorageKind::ScatterBytes,
+            address: 0x2000_0100,
+            size: 4,
+            scatter_entry: Some(3),
+        }];
+        assert_eq!(planned.storage_spans(0x2000_0100, 4).unwrap(), copy_storage);
+        assert_eq!(
+            retained.storage_spans(0x2000_0100, 4).unwrap(),
+            copy_storage
+        );
+        assert!(planned.is_byte_backed(0x2000_0100, 4).unwrap());
+        assert!(retained.is_byte_backed(0x2000_0100, 4).unwrap());
+
+        let zero_storage = vec![StorageSpan {
+            kind: StorageKind::ScatterZero,
+            address: 0x2000_0200,
+            size: 3,
+            scatter_entry: Some(4),
+        }];
+        assert_eq!(planned.storage_spans(0x2000_0200, 3).unwrap(), zero_storage);
+        assert_eq!(
+            retained.storage_spans(0x2000_0200, 3).unwrap(),
+            zero_storage
+        );
+        assert!(!planned.is_byte_backed(0x2000_0200, 3).unwrap());
+        assert!(!retained.is_byte_backed(0x2000_0200, 3).unwrap());
+        assert_eq!(planned.read_exact(0x2000_0200, 3).unwrap().as_ref(), [0; 3]);
+        assert_eq!(
+            retained.read_exact(0x2000_0200, 3).unwrap().as_ref(),
+            [0; 3]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_reader_rejects_non_regular_files_before_opening() {
+        const WRITER_DELAY: Duration = Duration::from_millis(400);
+        const MAX_PREOPEN_REJECTION: Duration = Duration::from_millis(200);
+
+        let (fixture, root, manifest) = strict_case();
+        fs::remove_file(&manifest).unwrap();
+        make_fifo(&manifest);
+        let writer = delayed_fifo_writer(manifest.clone(), WRITER_DELAY);
+        let started = Instant::now();
+        let result = read_materialized(root.path(), &manifest, &fixture.image, BASE);
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+        assert_bad_reader(result, "regular file");
+        assert!(
+            elapsed < MAX_PREOPEN_REJECTION,
+            "manifest FIFO was opened before rejection: {elapsed:?}"
+        );
+
+        let (fixture, root, manifest) = strict_case();
+        let payload = manifest.parent().unwrap().join("blocks/03-copy.bin");
+        fs::remove_file(&payload).unwrap();
+        make_fifo(&payload);
+        let writer = delayed_fifo_writer(payload, WRITER_DELAY);
+        let started = Instant::now();
+        let result = read_materialized(root.path(), &manifest, &fixture.image, BASE);
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+        assert_bad_reader(result, "regular file");
+        assert!(
+            elapsed < MAX_PREOPEN_REJECTION,
+            "payload FIFO was opened before rejection: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_open_rejects_path_replacement_after_validation() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("payload.bin");
+        fs::write(&path, b"same bytes").unwrap();
+        let validated = super::ValidatedRegularFile::new(path.clone(), "test payload").unwrap();
+        fs::rename(&path, root.path().join("authenticated.bin")).unwrap();
+        fs::write(&path, b"same bytes").unwrap();
+
+        assert_bad_reader(validated.open(), "identity changed during open");
     }
 
     #[test]

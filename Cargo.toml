@@ -39,8 +39,8 @@ typed-path = "0.12.3"
 libc = "0.2.188"
 
 [target."cfg(windows)".dependencies]
-# Cancel blocking version-probe pipe reads before joining their threads.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_IO"] }
+# Cancel blocking version-probe reads and identify retained artifact handles.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

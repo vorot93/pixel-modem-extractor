@@ -57,6 +57,31 @@ pub struct PlannedEntry {
     pub output: PlannedOutput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlannedStorage<'a> {
+    None,
+    SelfCopy,
+    Bytes(&'a [u8]),
+    ZeroFill,
+}
+
+impl PlannedEntry {
+    pub(crate) fn storage(&self) -> PlannedStorage<'_> {
+        match &self.output {
+            PlannedOutput::None => PlannedStorage::None,
+            PlannedOutput::SelfCopy => PlannedStorage::SelfCopy,
+            PlannedOutput::Bytes(bytes)
+                if self.operation == Operation::Decompress1
+                    && bytes.iter().all(|&byte| byte == 0) =>
+            {
+                PlannedStorage::ZeroFill
+            }
+            PlannedOutput::Bytes(bytes) => PlannedStorage::Bytes(bytes),
+            PlannedOutput::ZeroFill => PlannedStorage::ZeroFill,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadPlan {
     pub image_base: u32,
