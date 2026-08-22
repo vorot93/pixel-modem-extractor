@@ -2,10 +2,20 @@ use super::{LoadPlan, Operation, PlannedEntry, PlannedOutput, PlannedStorage};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt as _;
 #[cfg(windows)]
@@ -14,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
 pub const LOAD_MAP_FORMAT: &str = "pixel-modem-extractor-scatter-load-v1";
@@ -22,6 +34,43 @@ pub const LOAD_MAP_FORMAT: &str = "pixel-modem-extractor-scatter-load-v1";
 const SCHEMA_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 static ZERO_CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
+
+#[cfg(all(test, unix))]
+type ContainedOpenHook = Option<(String, Box<dyn FnOnce()>)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static BEFORE_CONTAINED_OPEN: std::cell::RefCell<ContainedOpenHook> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn set_before_contained_open(context: &str, hook: impl FnOnce() + 'static) {
+    BEFORE_CONTAINED_OPEN.with(|slot| {
+        assert!(
+            slot.borrow_mut()
+                .replace((context.to_owned(), Box::new(hook)))
+                .is_none()
+        );
+    });
+}
+
+#[cfg(all(test, unix))]
+fn run_before_contained_open(context: &str) {
+    BEFORE_CONTAINED_OPEN.with(|slot| {
+        let should_run = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| target == context);
+        if should_run {
+            let (_, hook) = slot.borrow_mut().take().unwrap();
+            hook();
+        }
+    });
+}
+
+#[cfg(not(all(test, unix)))]
+fn run_before_contained_open(_context: &str) {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedLoadMap {
@@ -53,6 +102,7 @@ enum ArtifactBacking {
     Zero,
 }
 
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     volume: u64,
@@ -60,92 +110,233 @@ struct FileIdentity {
 }
 
 #[cfg(unix)]
-struct ValidatedRegularFile {
-    path: PathBuf,
-    identity: FileIdentity,
-    context: String,
+#[derive(Debug)]
+struct TrustedDirectory {
+    // Descendant traversal is always relative to this retained capability.
+    file: File,
 }
 
 #[cfg(unix)]
-impl ValidatedRegularFile {
-    fn new(path: PathBuf, context: impl Into<String>) -> Result<Self> {
-        let context = context.into();
-        let metadata = fs::symlink_metadata(&path)
+impl TrustedDirectory {
+    fn new(path: &Path, context: &str) -> Result<Self> {
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| bad(format!("{context} cannot be canonicalized: {error}")))?;
+        open_unix_absolute_directory(&canonical, context)
+    }
+
+    fn open_regular_file_with_parent(
+        &self,
+        relative: &Path,
+        context: &str,
+    ) -> Result<(File, Self)> {
+        validate_relative_path(relative, context)?;
+        run_before_contained_open(context);
+        let file_name = relative
+            .file_name()
+            .ok_or_else(|| bad(format!("{context} path has no file name")))?;
+        let parent =
+            self.open_directory(relative.parent().unwrap_or_else(|| Path::new("")), context)?;
+        let file = open_unix_regular_component(&parent.file, file_name, context)?;
+        let metadata = file
+            .metadata()
             .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
-        require_regular_file(&metadata, &context)?;
-        let identity = file_identity(&metadata, &context)?;
-        Ok(Self {
-            path,
+        require_regular_file(&metadata, context)?;
+        Ok((file, parent))
+    }
+
+    fn open_regular_file(&self, relative: &Path, context: &str) -> Result<File> {
+        self.open_regular_file_with_parent(relative, context)
+            .map(|(file, _)| file)
+    }
+
+    fn open_directory(&self, relative: &Path, context: &str) -> Result<Self> {
+        let mut current = self.file.try_clone().map_err(|error| {
+            bad(format!(
+                "{context} directory handle cannot be retained: {error}"
+            ))
+        })?;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(bad(format!(
+                    "{context} path is not canonical relative form"
+                )));
+            };
+            current = open_unix_directory_component(&current, name, context)?;
+        }
+        Ok(Self { file: current })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsDirectoryHandle {
+    file: File,
+    resolved_path: PathBuf,
+    identity: FileIdentity,
+}
+
+#[cfg(windows)]
+impl WindowsDirectoryHandle {
+    fn open(path: &Path, context: &str) -> Result<Self> {
+        let file = open_windows_directory(path, context)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
+        if !metadata.is_dir() {
+            return Err(bad(format!("{context} is not a directory")));
+        }
+        let information = windows_file_information(&file, context)?;
+        require_windows_directory(&information, context)?;
+        let resolved_path = windows_resolved_path(&file, context)?;
+        let identity = windows_file_identity(&information, context)?;
+        let directory = Self {
+            file,
+            resolved_path,
             identity,
-            context,
+        };
+        directory.verify_current(context)?;
+        Ok(directory)
+    }
+
+    fn try_clone(&self, context: &str) -> Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone().map_err(|error| {
+                bad(format!(
+                    "{context} directory handle cannot be retained: {error}"
+                ))
+            })?,
+            resolved_path: self.resolved_path.clone(),
+            identity: self.identity,
         })
     }
 
-    fn open(self) -> Result<File> {
-        let file = open_no_follow(&self.path, &self.context)?;
-        let metadata = file
+    fn verify_current(&self, context: &str) -> Result<()> {
+        let information = windows_file_information(&self.file, context)?;
+        require_windows_directory(&information, context)?;
+        if windows_file_identity(&information, context)? != self.identity
+            || windows_resolved_path(&self.file, context)? != self.resolved_path
+        {
+            return Err(bad(format!("{context} directory identity changed")));
+        }
+
+        let reopened = open_windows_directory(&self.resolved_path, context)?;
+        let metadata = reopened
             .metadata()
-            .map_err(|error| bad(format!("{} metadata is unavailable: {error}", self.context)))?;
-        require_regular_file(&metadata, &self.context)?;
-        if file_identity(&metadata, &self.context)? != self.identity {
+            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
+        if !metadata.is_dir() {
+            return Err(bad(format!("{context} is not a directory")));
+        }
+        let information = windows_file_information(&reopened, context)?;
+        require_windows_directory(&information, context)?;
+        if windows_file_identity(&information, context)? != self.identity
+            || windows_resolved_path(&reopened, context)? != self.resolved_path
+        {
             return Err(bad(format!(
-                "{} identity changed during open",
-                self.context
+                "{context} directory name no longer identifies its handle"
             )));
         }
-        Ok(file)
+        Ok(())
     }
 }
 
 #[cfg(windows)]
-struct ValidatedRegularFile {
-    file: File,
-    identity: FileIdentity,
-    context: String,
+#[derive(Debug)]
+struct TrustedDirectory {
+    // Windows has no openat equivalent in std, so retain and re-prove the full chain.
+    chain: Vec<WindowsDirectoryHandle>,
 }
 
 #[cfg(windows)]
-impl ValidatedRegularFile {
-    fn new(path: PathBuf, context: impl Into<String>) -> Result<Self> {
-        let context = context.into();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
-        require_regular_file(&metadata, &context)?;
-        let file = open_no_follow(&path, &context)?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
-        require_regular_file(&metadata, &context)?;
-        let identity = windows_file_identity(&file, &context)?;
-        Ok(Self {
-            file,
-            identity,
-            context,
-        })
+impl TrustedDirectory {
+    fn new(path: &Path, context: &str) -> Result<Self> {
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| bad(format!("{context} cannot be canonicalized: {error}")))?;
+        let directory = Self {
+            chain: vec![WindowsDirectoryHandle::open(&canonical, context)?],
+        };
+        directory.verify_chain(context)?;
+        Ok(directory)
     }
 
-    fn open(self) -> Result<File> {
-        if windows_file_identity(&self.file, &self.context)? != self.identity {
-            return Err(bad(format!("{} identity changed after open", self.context)));
+    fn open_regular_file_with_parent(
+        &self,
+        relative: &Path,
+        context: &str,
+    ) -> Result<(File, Self)> {
+        validate_relative_path(relative, context)?;
+        run_before_contained_open(context);
+        let file_name = relative
+            .file_name()
+            .ok_or_else(|| bad(format!("{context} path has no file name")))?;
+        let parent =
+            self.open_directory(relative.parent().unwrap_or_else(|| Path::new("")), context)?;
+        parent.verify_chain(context)?;
+        let parent_path = &parent.current().resolved_path;
+        let candidate = parent_path.join(file_name);
+        let file = open_windows_regular_file(&candidate, context)?;
+        let information = windows_file_information(&file, context)?;
+        require_windows_regular_file(&file, &information, context)?;
+        let identity = windows_file_identity(&information, context)?;
+        let resolved_path = windows_resolved_path(&file, context)?;
+        require_windows_direct_child(parent_path, &resolved_path, context)?;
+        parent.verify_chain(context)?;
+        verify_windows_regular_file(&file, identity, &resolved_path, context)?;
+        parent.verify_chain(context)?;
+        Ok((file, parent))
+    }
+
+    fn open_regular_file(&self, relative: &Path, context: &str) -> Result<File> {
+        self.open_regular_file_with_parent(relative, context)
+            .map(|(file, _)| file)
+    }
+
+    fn open_directory(&self, relative: &Path, context: &str) -> Result<Self> {
+        let mut directory = self.try_clone(context)?;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(bad(format!(
+                    "{context} path is not canonical relative form"
+                )));
+            };
+            directory.verify_chain(context)?;
+            let parent_path = directory.current().resolved_path.clone();
+            let child = WindowsDirectoryHandle::open(&parent_path.join(name), context)?;
+            require_windows_direct_child(&parent_path, &child.resolved_path, context)?;
+            directory.verify_chain(context)?;
+            directory.chain.push(child);
         }
-        Ok(self.file)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ValidatedRegularFile;
-
-#[cfg(not(any(unix, windows)))]
-impl ValidatedRegularFile {
-    fn new(_path: PathBuf, context: impl Into<String>) -> Result<Self> {
-        Err(bad(format!(
-            "{} identity validation is unsupported on this platform",
-            context.into()
-        )))
+        directory.verify_chain(context)?;
+        Ok(directory)
     }
 
-    fn open(self) -> Result<File> {
-        unreachable!("unsupported platforms reject validated files during construction")
+    fn try_clone(&self, context: &str) -> Result<Self> {
+        let mut chain = Vec::new();
+        chain
+            .try_reserve_exact(self.chain.len())
+            .map_err(|_| bad(format!("{context} directory proof allocation failed")))?;
+        for directory in &self.chain {
+            chain.push(directory.try_clone(context)?);
+        }
+        Ok(Self { chain })
+    }
+
+    fn current(&self) -> &WindowsDirectoryHandle {
+        self.chain
+            .last()
+            .expect("a trusted Windows directory always retains its root")
+    }
+
+    fn verify_chain(&self, context: &str) -> Result<()> {
+        for directory in &self.chain {
+            directory.verify_current(context)?;
+        }
+        for adjacent in self.chain.windows(2) {
+            let [parent, child] = adjacent else {
+                continue;
+            };
+            require_windows_direct_child(&parent.resolved_path, &child.resolved_path, context)?;
+        }
+        Ok(())
     }
 }
 
@@ -159,16 +350,22 @@ fn require_regular_file(metadata: &Metadata, context: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn file_identity(metadata: &Metadata, _context: &str) -> Result<FileIdentity> {
-    Ok(FileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
+fn validate_relative_path(path: &Path, context: &str) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(bad(format!(
+            "{context} path is not canonical relative form"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn windows_file_identity(file: &File, context: &str) -> Result<FileIdentity> {
+fn windows_file_information(file: &File, context: &str) -> Result<BY_HANDLE_FILE_INFORMATION> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: `file` owns a live handle and `information` is writable for the call.
     let result = unsafe {
@@ -180,46 +377,281 @@ fn windows_file_identity(file: &File, context: &str) -> Result<FileIdentity> {
             std::io::Error::last_os_error()
         )));
     }
+    Ok(information)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(
+    information: &BY_HANDLE_FILE_INFORMATION,
+    context: &str,
+) -> Result<FileIdentity> {
+    let file = (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    if file == 0 {
+        return Err(bad(format!("{context} identity is unavailable")));
+    }
     Ok(FileIdentity {
         volume: u64::from(information.dwVolumeSerialNumber),
-        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        file,
     })
 }
 
 #[cfg(unix)]
-fn open_no_follow(path: &Path, context: &str) -> Result<File> {
+fn open_unix_absolute_directory(path: &Path, context: &str) -> Result<TrustedDirectory> {
+    if !path.is_absolute() {
+        return Err(bad(format!("{context} path is not absolute")));
+    }
+    let mut current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(Path::new("/"))
+        .map_err(|error| {
+            bad(format!(
+                "{context} filesystem root cannot be opened securely: {error}"
+            ))
+        })?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                current = open_unix_directory_component(&current, name, context)?;
+            }
+            _ => {
+                return Err(bad(format!(
+                    "{context} path is not canonical absolute form"
+                )));
+            }
+        }
+    }
+    Ok(TrustedDirectory { file: current })
+}
+
+#[cfg(unix)]
+fn open_unix_directory_component(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    context: &str,
+) -> Result<File> {
+    open_unix_component(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        context,
+        true,
+    )
+}
+
+#[cfg(unix)]
+fn open_unix_regular_component(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    context: &str,
+) -> Result<File> {
+    open_unix_component(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        context,
+        false,
+    )
+}
+
+#[cfg(unix)]
+fn open_unix_component(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+    context: &str,
+    directory: bool,
+) -> Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| bad(format!("{context} path component contains NUL")))?;
+    // SAFETY: `parent` is a live directory handle and `name` is a NUL-terminated component.
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        if !directory && error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(bad(format!("{context} is a symlink")));
+        }
+        let target = if directory {
+            "directory component"
+        } else {
+            "file"
+        };
+        return Err(bad(format!(
+            "{context} {target} cannot be opened without following links: {error}"
+        )));
+    }
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path, context: &str) -> Result<File> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|error| {
             bad(format!(
-                "{context} cannot be opened without following links: {error}"
+                "{context} directory component cannot be opened without following reparse points: {error}"
             ))
         })
 }
 
 #[cfg(windows)]
-fn open_no_follow(path: &Path, context: &str) -> Result<File> {
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
+fn open_windows_regular_file(path: &Path, context: &str) -> Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| {
             bad(format!(
-                "{context} cannot be opened without following links: {error}"
+                "{context} cannot be opened without following reparse points: {error}"
             ))
         })
 }
 
+#[cfg(windows)]
+fn windows_resolved_path(file: &File, context: &str) -> Result<PathBuf> {
+    let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    // SAFETY: a null buffer with zero length requests the required UTF-16 buffer size.
+    let required =
+        unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), std::ptr::null_mut(), 0, flags) };
+    if required == 0 {
+        return Err(bad(format!(
+            "{context} resolved path is unavailable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(required as usize)
+        .map_err(|_| bad(format!("{context} resolved-path allocation failed")))?;
+    buffer.resize(required as usize, 0u16);
+    loop {
+        let capacity = u32::try_from(buffer.len())
+            .map_err(|_| bad(format!("{context} resolved path is too long")))?;
+        // SAFETY: `buffer` is writable for `capacity` UTF-16 code units and the handle is live.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), capacity, flags)
+        };
+        if length == 0 {
+            return Err(bad(format!(
+                "{context} resolved path is unavailable: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if length < capacity {
+            buffer.truncate(length as usize);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        let required = usize::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| bad(format!("{context} resolved path is too long")))?;
+        buffer
+            .try_reserve(required.saturating_sub(buffer.len()))
+            .map_err(|_| bad(format!("{context} resolved-path allocation failed")))?;
+        buffer.resize(required, 0);
+    }
+}
+
+#[cfg(windows)]
+fn require_windows_directory(
+    information: &BY_HANDLE_FILE_INFORMATION,
+    context: &str,
+) -> Result<()> {
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(bad(format!(
+            "{context} directory component is a reparse point"
+        )));
+    }
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(bad(format!("{context} is not a directory")));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn require_windows_regular_file(
+    file: &File,
+    information: &BY_HANDLE_FILE_INFORMATION,
+    context: &str,
+) -> Result<()> {
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(bad(format!("{context} is a reparse point")));
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
+    require_regular_file(&metadata, context)
+}
+
+#[cfg(windows)]
+fn require_windows_direct_child(parent: &Path, child: &Path, context: &str) -> Result<()> {
+    if child == parent || child.parent() != Some(parent) {
+        return Err(bad(format!(
+            "{context} resolved path escapes its trusted directory"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_windows_regular_file(
+    file: &File,
+    identity: FileIdentity,
+    resolved_path: &Path,
+    context: &str,
+) -> Result<()> {
+    let information = windows_file_information(file, context)?;
+    require_windows_regular_file(file, &information, context)?;
+    if windows_file_identity(&information, context)? != identity
+        || windows_resolved_path(file, context)? != resolved_path
+    {
+        return Err(bad(format!("{context} identity changed after open")));
+    }
+
+    let reopened = open_windows_regular_file(resolved_path, context)?;
+    let information = windows_file_information(&reopened, context)?;
+    require_windows_regular_file(&reopened, &information, context)?;
+    if windows_file_identity(&information, context)? != identity
+        || windows_resolved_path(&reopened, context)? != resolved_path
+    {
+        return Err(bad(format!(
+            "{context} resolved path no longer identifies its retained handle"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(any(unix, windows)))]
-fn open_no_follow(path: &Path, context: &str) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|error| bad(format!("{context} cannot be opened: {error}")))
+#[derive(Debug)]
+struct TrustedDirectory;
+
+#[cfg(not(any(unix, windows)))]
+impl TrustedDirectory {
+    fn new(_path: &Path, context: &str) -> Result<Self> {
+        Err(bad(format!(
+            "{context} trusted-directory validation is unsupported on this platform"
+        )))
+    }
+
+    fn open_regular_file_with_parent(
+        &self,
+        _relative: &Path,
+        context: &str,
+    ) -> Result<(File, Self)> {
+        Err(bad(format!(
+            "{context} trusted-directory validation is unsupported on this platform"
+        )))
+    }
+
+    fn open_regular_file(&self, _relative: &Path, context: &str) -> Result<File> {
+        Err(bad(format!(
+            "{context} trusted-directory validation is unsupported on this platform"
+        )))
+    }
 }
 
 impl ArtifactSegment {
@@ -782,39 +1214,19 @@ pub(crate) fn read_materialized(
     })
 }
 
-fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, PathBuf)> {
+fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, TrustedDirectory)> {
     if !root.is_absolute() || !manifest_path.is_absolute() {
         return Err(bad("scatter root and load-map path must be absolute"));
     }
-    let canonical_root = fs::canonicalize(root)
-        .map_err(|error| bad(format!("scatter root cannot be canonicalized: {error}")))?;
-    if !fs::metadata(&canonical_root)
-        .map_err(|error| bad(format!("scatter root metadata is unavailable: {error}")))?
-        .is_dir()
-    {
-        return Err(bad("scatter root is not a directory"));
-    }
-    let supplied_metadata = fs::symlink_metadata(manifest_path)
-        .map_err(|error| bad(format!("scatter load map metadata is unavailable: {error}")))?;
-    require_regular_file(&supplied_metadata, "scatter load map")?;
-    let canonical_manifest = fs::canonicalize(manifest_path)
-        .map_err(|error| bad(format!("scatter load map cannot be canonicalized: {error}")))?;
-    if canonical_manifest
-        .file_name()
-        .and_then(|name| name.to_str())
-        != Some("load_map.json")
-    {
+    let relative = manifest_path
+        .strip_prefix(root)
+        .map_err(|_| bad("scatter load map escapes the scatter root"))?;
+    validate_relative_path(relative, "scatter load map")?;
+    if relative.file_name().and_then(|name| name.to_str()) != Some("load_map.json") {
         return Err(bad("scatter load-map filename is not load_map.json"));
     }
-    if !strictly_contained(&canonical_root, &canonical_manifest) {
-        return Err(bad("scatter load map escapes the scatter root"));
-    }
-    let parent = canonical_manifest
-        .parent()
-        .ok_or_else(|| bad("scatter load map has no parent directory"))?
-        .to_path_buf();
-    let file = ValidatedRegularFile::new(canonical_manifest, "scatter load map")?.open()?;
-    Ok((file, parent))
+    let trusted_root = TrustedDirectory::new(root, "scatter root")?;
+    trusted_root.open_regular_file_with_parent(relative, "scatter load map")
 }
 
 fn read_manifest(mut file: File) -> Result<(LoadMapWire, [u8; 32])> {
@@ -856,45 +1268,16 @@ fn read_manifest(mut file: File) -> Result<(LoadMapWire, [u8; 32])> {
 }
 
 fn open_authenticated_payload(
-    manifest_parent: &Path,
+    manifest_parent: &TrustedDirectory,
     relative_path: &str,
     size: u32,
     expected_hash: [u8; 32],
     copy_source: Option<&[u8]>,
     context: &str,
 ) -> Result<File> {
+    let payload_context = format!("{context} payload");
     let relative = Path::new(relative_path);
-    if relative_path.is_empty()
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err(bad(format!(
-            "{context} payload path is not canonical relative form"
-        )));
-    }
-    let supplied = manifest_parent.join(relative);
-    let supplied_metadata = fs::symlink_metadata(&supplied).map_err(|error| {
-        bad(format!(
-            "{context} payload metadata is unavailable: {error}"
-        ))
-    })?;
-    require_regular_file(&supplied_metadata, &format!("{context} payload"))?;
-    let canonical = fs::canonicalize(&supplied).map_err(|error| {
-        bad(format!(
-            "{context} payload cannot be canonicalized: {error}"
-        ))
-    })?;
-    if canonical != supplied {
-        return Err(bad(format!("{context} payload path traverses a symlink")));
-    }
-    if !strictly_contained(manifest_parent, &canonical) {
-        return Err(bad(format!(
-            "{context} payload path escapes the load-map directory"
-        )));
-    }
-    let mut file = ValidatedRegularFile::new(canonical, format!("{context} payload"))?.open()?;
+    let mut file = manifest_parent.open_regular_file(relative, &payload_context)?;
     let metadata = file.metadata().map_err(|error| {
         bad(format!(
             "{context} payload metadata is unavailable: {error}"
@@ -1050,10 +1433,6 @@ fn require_within_raw(
         return Err(bad(format!("{context} range escapes the raw image")));
     }
     Ok(())
-}
-
-fn strictly_contained(root: &Path, child: &Path) -> bool {
-    child != root && child.starts_with(root)
 }
 
 fn ranges_overlap(first_start: u32, first_end: u32, second_start: u32, second_end: u32) -> bool {
@@ -2078,15 +2457,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn retained_open_rejects_path_replacement_after_validation() {
+    fn trusted_directory_rejects_final_symlink_replacement() {
         let root = tempdir().unwrap();
         let path = root.path().join("payload.bin");
         fs::write(&path, b"same bytes").unwrap();
-        let validated = super::ValidatedRegularFile::new(path.clone(), "test payload").unwrap();
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
         fs::rename(&path, root.path().join("authenticated.bin")).unwrap();
-        fs::write(&path, b"same bytes").unwrap();
+        symlink(root.path().join("authenticated.bin"), &path).unwrap();
 
-        assert_bad_reader(validated.open(), "identity changed during open");
+        assert_bad_reader(
+            trusted.open_regular_file(Path::new("payload.bin"), "test payload"),
+            "is a symlink",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_reader_rejects_intermediate_directory_replacement() {
+        let (_fixture, root, manifest) = strict_case();
+        let outside = tempdir().unwrap();
+        let trusted_scatter = root.path().join("scatter");
+        let outside_scatter = outside.path().join("outside-scatter");
+        let replacement = trusted_scatter.clone();
+        let target = outside_scatter.clone();
+        super::set_before_contained_open("scatter load map", move || {
+            fs::rename(&replacement, &target).unwrap();
+            symlink(&target, &replacement).unwrap();
+        });
+
+        let result = super::open_manifest(root.path(), &manifest).map(|_| ());
+
+        assert_bad_reader(result, "directory component");
+        assert!(outside_scatter.join("02_MAIN/load_map.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_reader_rejects_payload_intermediate_directory_replacement() {
+        let (fixture, root, manifest) = strict_case();
+        let outside = tempdir().unwrap();
+        let trusted_blocks = manifest.parent().unwrap().join("blocks");
+        let outside_blocks = outside.path().join("outside-blocks");
+        let replacement = trusted_blocks.clone();
+        let target = outside_blocks.clone();
+        super::set_before_contained_open("scatter entry 4 payload", move || {
+            fs::rename(&replacement, &target).unwrap();
+            symlink(&target, &replacement).unwrap();
+        });
+
+        let result = read_materialized(root.path(), &manifest, &fixture.image, BASE);
+
+        assert_bad_reader(result, "directory component");
+        assert!(outside_blocks.join("03-copy.bin").is_file());
     }
 
     #[test]
