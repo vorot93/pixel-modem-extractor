@@ -40,7 +40,10 @@ pub(super) fn decode_thumb_at(image: &RuntimeImage<'_>, pc: u32) -> Option<Decod
     decode_with(image, &decoder, &mut state, pc)
 }
 
-fn decode_with(
+/// Decode one Thumb instruction at `pc`, advancing the caller's IT-range
+/// state: a scan over consecutive positions sees predicated flow exactly
+/// as the architectural range would.
+pub(super) fn decode_with(
     image: &RuntimeImage<'_>,
     decoder: &PureRustDecoder,
     state: &mut ItRangeState,
@@ -437,6 +440,30 @@ impl LocalCfg {
             }
         }
         false
+    }
+
+    /// The sub-CFG induced on `nodes`: every retained node keeps its
+    /// original instruction and successors, with edges to excluded
+    /// targets becoming external edges. The entry is the lowest retained
+    /// program counter, so the induced theorem is rooted exactly like a
+    /// fresh decode of that region.
+    pub(crate) fn induced_subgraph(&self, nodes: &BTreeSet<u32>) -> LocalCfg {
+        let filtered: BTreeMap<u32, CfgNode> = self
+            .nodes
+            .iter()
+            .filter(|(pc, _)| nodes.contains(pc))
+            .map(|(pc, node)| {
+                (
+                    *pc,
+                    CfgNode {
+                        instruction: node.instruction.clone(),
+                        successors: node.successors.clone(),
+                    },
+                )
+            })
+            .collect();
+        let entry = filtered.keys().next().copied().unwrap_or(self.entry);
+        LocalCfg::new(entry, filtered)
     }
 
     /// Solve the definition-aware dataflow over the graph. Facts merge
@@ -1017,5 +1044,40 @@ mod tests {
             ],
         );
         assert!(decode_entry_rooted_cfg(&raw_image(&bytes), BASE).is_none());
+    }
+
+    #[test]
+    fn induced_subgraph_keeps_internal_edges_and_externalizes_exits() {
+        let bytes = assemble(
+            0x20,
+            &[
+                (0x00, enc(&T32::Push_T1(vec![gpr(4), gpr(14)]))),
+                (0x02, enc(&T32::Adr_T1(low(1), 0x10))),
+                // A conditional split whose arms rejoin at the return.
+                (0x04, enc(&T32::B_T1(Arm32Condition::Equal, 4))),
+                (0x06, enc(&T32::Nop_T1)),
+                (0x08, enc(&T32::B_T2(0))),
+                (0x0c, enc(&T32::Bx_T1(gpr(14)))),
+            ],
+        );
+        let cfg = decode_entry_rooted_cfg(&raw_image(&bytes), BASE).expect("fixture decodes");
+        let region = BTreeSet::from([BASE + 0x04, BASE + 0x06, BASE + 0x08]);
+        let induced = cfg.induced_subgraph(&region);
+        assert_eq!(induced.entry(), BASE + 0x04);
+        assert!(induced.contains_node(BASE + 0x08));
+        assert!(!induced.contains_node(BASE + 0x0c));
+        // Both conditional successors stay edges of the region.
+        assert!(induced.has_edge(BASE + 0x04, BASE + 0x0c));
+        assert!(induced.has_edge(BASE + 0x04, BASE + 0x06));
+        assert!(induced.has_edge(BASE + 0x08, BASE + 0x0c));
+        // The excluded join becomes an external edge of the region.
+        assert_eq!(
+            induced.external_edges(),
+            &BTreeSet::from([(BASE + 0x04, BASE + 0x0c), (BASE + 0x08, BASE + 0x0c)])
+        );
+        // Dominance is proven inside the induced region alone: the
+        // region entry dominates, the CFG root does not.
+        assert!(induced.dominates(BASE + 0x04, BASE + 0x08));
+        assert!(!induced.dominates(BASE, BASE + 0x08));
     }
 }

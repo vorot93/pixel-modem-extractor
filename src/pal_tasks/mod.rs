@@ -2,8 +2,9 @@
 // structured domain error. The bounded anchor sweep and unique-prologue
 // root selection live in `discover`; the entry-rooted CFG, its
 // definition-aware dataflow, and the graph queries used by the induction
-// proofs live in `cfg`. Later stages build loop proofs and table
-// validation on the candidates assembled here.
+// proofs live in `cfg`. The counting-loop, dual-exit, suffix, and
+// slot-base proofs assemble the initializer candidates defined here;
+// later stages table-validate them and materialize the artifact.
 
 use crate::arm32::Register;
 use crate::error::Error;
@@ -25,6 +26,19 @@ pub(super) fn discover_anchor_cfg(
     discover::discover_anchor_cfg(image, label)
 }
 
+/// Discover every plausible initializer candidate: the counting-loop,
+/// dual-exit, suffix, and slot-base proofs over the anchor CFG
+/// candidates. Topology misses are skipped; competing CFG roots stay
+/// separate candidates; named resource limits and runtime failures are
+/// typed errors.
+pub(super) fn discover_initializer_candidates(
+    image: &RuntimeImage<'_>,
+    label: &str,
+) -> std::result::Result<Vec<InitializerCandidate>, PalTaskError> {
+    let mut budget = CandidateBudget::default();
+    discover::discover_initializer_candidates_bounded(image, label, &mut budget)
+}
+
 /// Exact nine-byte runtime materialization searched over byte-backed
 /// storage.
 pub(crate) const ANCHOR_PATTERN: &[u8; 9] = b"PALTskTm\0";
@@ -43,6 +57,52 @@ pub(crate) const PROLOGUE_WINDOW_BYTES: u32 = 256;
 pub(crate) const CFG_WINDOW_BYTES: u32 = 512;
 /// Instruction budget the entry-rooted local CFG may decode.
 pub(crate) const CFG_MAX_INSTRUCTIONS: usize = 256;
+/// Unique semantic candidate tuples that may reach table validation.
+pub(crate) const MAX_CANDIDATE_TUPLES: usize = 64;
+/// One non-refundable budget shared by every slot byte hashed, bounded
+/// name byte read, and entry instruction byte decoded across all
+/// candidate tuples: charged bytes never return, even when the
+/// candidate they were charged for is later rejected.
+pub(crate) const MAX_CANDIDATE_VALIDATION_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum decoded instructions in one side-effect-free slot-base leaf.
+pub(crate) const MAX_SLOT_LEAF_INSTRUCTIONS: usize = 16;
+/// The `pal-task-descriptor-v1` projection subtracts this fixed offset
+/// from the discovered name field under checked arithmetic.
+pub(crate) const DESCRIPTOR_PROJECTION_OFFSET: u32 = 0x24;
+
+/// The shared non-refundable candidate-validation budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CandidateBudget {
+    charged: u64,
+}
+
+impl CandidateBudget {
+    /// Charge `bytes` against the budget before performing the work;
+    /// exceeding the limit is a typed resource error and never a
+    /// silent miss. Charged bytes are never refunded.
+    pub(crate) fn charge(
+        &mut self,
+        bytes: u64,
+        what: &'static str,
+    ) -> std::result::Result<(), PalTaskError> {
+        let Some(total) = self.charged.checked_add(bytes) else {
+            return Err(PalTaskError::ResourceLimit {
+                what,
+                actual: u64::MAX,
+                limit: MAX_CANDIDATE_VALIDATION_BYTES,
+            });
+        };
+        if total > MAX_CANDIDATE_VALIDATION_BYTES {
+            return Err(PalTaskError::ResourceLimit {
+                what,
+                actual: total,
+                limit: MAX_CANDIDATE_VALIDATION_BYTES,
+            });
+        }
+        self.charged = total;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -188,4 +248,105 @@ pub(crate) struct AnchorCfgCandidate {
     pub reference: AnchorReference,
     pub initializer: u32,
     pub cfg: cfg::LocalCfg,
+}
+
+/// One complete anchor proof path: the anchor occurrence, the
+/// materialization whose reaching chain carried it into a call
+/// argument, and the dominating direct call itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnchorProofPath {
+    pub anchor: u32,
+    pub reference: AnchorReference,
+    pub call: u32,
+}
+
+/// One anchor occurrence with its byte storage provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnchorProvenance {
+    pub address: u32,
+    pub storage: Vec<StorageSpan>,
+}
+
+/// The capacity guard: a decoded `count >> shift_amount` compared
+/// unsigned with `compare_value`, branching to the join exactly when
+/// `count >= capacity`; the branch is proven by
+/// `(compare_value + 1) << shift_amount == capacity` under checked
+/// arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacityGuard {
+    pub start: u32,
+    pub compare: u32,
+    pub branch: u32,
+    pub fallthrough: u32,
+    pub shift_amount: u8,
+    pub compare_value: u32,
+}
+
+/// The complete initializer proof: canonical proof paths, the loop and
+/// induction roots, both exits with the shared count global, the
+/// capacity guard, the suffix loop, the join, and the derived table
+/// geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InitializerEvidence {
+    pub cfg_entry: u32,
+    pub proof_paths: Vec<AnchorProofPath>,
+    pub anchors: Vec<AnchorProvenance>,
+    pub code_storage: Vec<StorageSpan>,
+    pub loop_start: u32,
+    pub count_zero_definition: u32,
+    pub slot_definition: u32,
+    pub normal_exit: u32,
+    pub capacity_exit: u32,
+    pub capacity_guard: CapacityGuard,
+    pub suffix_loop: u32,
+    pub join: u32,
+    pub count_global: u32,
+    pub slot_base: u32,
+    pub name_offset: u32,
+    pub index_offset: u32,
+    pub stride: u32,
+    pub capacity: u32,
+}
+
+impl InitializerEvidence {
+    /// Whether two proofs carry the same semantic tuple: identical CFG
+    /// entry, loop start, count/slot roots, geometry, count global,
+    /// exits, guard, suffix loop, and join. Proof paths and storage
+    /// provenance aggregate instead of distinguishing candidates.
+    fn same_semantics(&self, other: &Self) -> bool {
+        self.cfg_entry == other.cfg_entry
+            && self.loop_start == other.loop_start
+            && self.count_zero_definition == other.count_zero_definition
+            && self.slot_definition == other.slot_definition
+            && self.slot_base == other.slot_base
+            && self.name_offset == other.name_offset
+            && self.index_offset == other.index_offset
+            && self.stride == other.stride
+            && self.capacity == other.capacity
+            && self.count_global == other.count_global
+            && self.normal_exit == other.normal_exit
+            && self.capacity_exit == other.capacity_exit
+            && self.capacity_guard == other.capacity_guard
+            && self.suffix_loop == other.suffix_loop
+            && self.join == other.join
+    }
+}
+
+/// The table geometry the initializer proof derives for slot parsing:
+/// slot base, field offsets, stride, and capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskTableGeometry {
+    pub slot_base: u32,
+    pub name_offset: u32,
+    pub index_offset: u32,
+    pub stride: u32,
+    pub capacity: u32,
+}
+
+/// One plausible initializer candidate: the complete proof plus the
+/// geometry its table validation consumes.
+#[derive(Debug, Clone)]
+pub(crate) struct InitializerCandidate {
+    pub evidence: InitializerEvidence,
+    pub geometry: TaskTableGeometry,
 }
