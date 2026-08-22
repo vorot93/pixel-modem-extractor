@@ -29,6 +29,7 @@ const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
 const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
+const APPLY_PAL_TASKS_JAVA: &str = include_str!("ghidra/ApplyPalTasks.java");
 const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
@@ -153,12 +154,20 @@ pub fn build_load_spec(
 /// `mode` is "tighten" (Phase 2+ default — attempt Thumb) or "datamark" (Phase-1
 /// fallback — mark regions as data). When "tighten", the `thumb_regions` arg is
 /// ignored (no data-marks passed to the script).
+///
+/// `pal_task_map` is the relative PAL task-manifest path for this image. When
+/// present the pre-script order is `ApplyScatterLoad`, `ApplyPalTasks`,
+/// `TameAnalysis`; a PAL map without a scatter map passes `-` as
+/// `ApplyPalTasks`'s scatter argument. Production callers stay on `None`
+/// (identity `none`) until generation state is coherent.
+#[allow(clippy::too_many_arguments)]
 fn headless_args(
     root: &str,
     label: &str,
     processor: &str,
     base_addr: u32,
     runtime_load_map: Option<&str>,
+    pal_task_map: Option<&str>,
     thumb_regions: &[(u32, u32)],
     mode: &str,
 ) -> Vec<String> {
@@ -183,6 +192,19 @@ fn headless_args(
             root.to_string(),
             label.to_string(),
             format!("{root}/{relative_path}"),
+        ]);
+    }
+    if let Some(relative_path) = pal_task_map {
+        let scatter_argument = runtime_load_map
+            .map(|scatter_relative| format!("{root}/{scatter_relative}"))
+            .unwrap_or_else(|| "-".to_string());
+        args.extend([
+            "-preScript".to_string(),
+            "ApplyPalTasks.java".to_string(),
+            root.to_string(),
+            label.to_string(),
+            format!("{root}/{relative_path}"),
+            scatter_argument,
         ]);
     }
     // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as its
@@ -1199,6 +1221,7 @@ fn write_run_script(
             processor,
             e.load_addr,
             runtime_load_maps.get(&label).map(String::as_str),
+            None,
             &[],
             mode,
         );
@@ -1379,11 +1402,13 @@ fn run_report_impl(
 
     let runtime_load_maps = materialize_runtime_load_maps(&toc, &data, out)?;
 
-    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,PalTasksSupport,TameAnalysis,
-    //    ExportDecomp,ApplySymbols,ApplyGlobals,ApplyGlobalTypes}.java
+    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,ApplyPalTasks,
+    //    PalTasksSupport,TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,
+    //    ApplyGlobalTypes}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplySymbols,
     //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
+    //    ApplyPalTasks transactionally seeds PAL task functions before analysis;
     //    PalTasksSupport is the package-private strict PAL support class every
     //    PAL-aware script shares - no script may grow a second parser.)
     let scripts = out.join("scripts");
@@ -1392,6 +1417,7 @@ fn run_report_impl(
         scripts.join("ApplyScatterLoad.java"),
         APPLY_SCATTER_LOAD_JAVA,
     )?;
+    std::fs::write(scripts.join("ApplyPalTasks.java"), APPLY_PAL_TASKS_JAVA)?;
     std::fs::write(scripts.join("PalTasksSupport.java"), PAL_TASKS_SUPPORT_JAVA)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
@@ -1557,6 +1583,7 @@ fn run_report_impl(
                 &opts.processor,
                 e.load_addr,
                 runtime_load_maps.paths.get(&label).map(String::as_str),
+                None,
                 &regions,
                 mode,
             );
@@ -1687,6 +1714,7 @@ fn run_report_impl(
                             &opts.processor,
                             e.load_addr,
                             runtime_load_maps.paths.get(&label).map(String::as_str),
+                            None,
                             &regions,
                             "datamark",
                         );
@@ -3444,6 +3472,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             0x4001_0000,
             None,
+            None,
             &[(0x4109_0000, 0x288_0000)],
             "datamark",
         );
@@ -3471,7 +3500,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(args.iter().any(|a| a == "-overwrite"));
         // base 0 -> zero-padded "00000000"; no data regions -> -postScript directly
         // follows the mode arg
-        let z = headless_args("/o", "00_BOOT", "ARM:LE:32:v7", 0, None, &[], "datamark");
+        let z = headless_args(
+            "/o",
+            "00_BOOT",
+            "ARM:LE:32:v7",
+            0,
+            None,
+            None,
+            &[],
+            "datamark",
+        );
         let zpre = z.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(z[zpre + 1], "TameAnalysis.java");
         assert_eq!(z[zpre + 2], "datamark");
@@ -3487,6 +3525,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
+            None,
             None,
             &[(0x40e12000, 0x100000)],
             "tighten",
@@ -3510,6 +3549,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             0x40e00000,
             None,
+            None,
             &[(0x40e12000, 0x100000)],
             "datamark",
         );
@@ -3526,6 +3566,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             SCATTER_BASE,
             Some("scatter/02_MAIN/load_map.json"),
+            None,
             &[],
             "tighten",
         );
@@ -3549,8 +3590,129 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert!(apply < tame);
 
-        let raw_only = headless_args("/out", "00_BOOT", "ARM:LE:32:v7", 0, None, &[], "tighten");
+        let raw_only = headless_args(
+            "/out",
+            "00_BOOT",
+            "ARM:LE:32:v7",
+            0,
+            None,
+            None,
+            &[],
+            "tighten",
+        );
         assert!(!raw_only.iter().any(|arg| arg == "ApplyScatterLoad.java"));
+    }
+
+    #[test]
+    fn pal_pre_script_order_and_nullability() {
+        let pal_map = "pal_tasks/02_MAIN/tasks.json";
+        // Present PAL map plus a scatter map: the pre-script order is
+        // ApplyScatterLoad, ApplyPalTasks, TameAnalysis, and ApplyPalTasks
+        // consumes the four canonical arguments verbatim.
+        let both = headless_args(
+            "/out",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            SCATTER_BASE,
+            Some("scatter/02_MAIN/load_map.json"),
+            Some(pal_map),
+            &[],
+            "tighten",
+        );
+        let scatter_at = both
+            .iter()
+            .position(|arg| arg == "ApplyScatterLoad.java")
+            .unwrap();
+        let pal_at = both
+            .iter()
+            .position(|arg| arg == "ApplyPalTasks.java")
+            .expect("a present PAL map must schedule ApplyPalTasks");
+        let tame_at = both
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert!(scatter_at < pal_at && pal_at < tame_at);
+        assert_eq!(
+            &both[pal_at - 1..=pal_at + 4],
+            [
+                "-preScript",
+                "ApplyPalTasks.java",
+                "/out",
+                "02_MAIN",
+                "/out/pal_tasks/02_MAIN/tasks.json",
+                "/out/scatter/02_MAIN/load_map.json",
+            ]
+        );
+
+        // Present PAL map without a scatter map: no scatter pre-script, and
+        // ApplyPalTasks receives the literal `-` scatter dependency.
+        let pal_only = headless_args(
+            "/out",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            SCATTER_BASE,
+            None,
+            Some(pal_map),
+            &[],
+            "tighten",
+        );
+        let pal_only_at = pal_only
+            .iter()
+            .position(|arg| arg == "ApplyPalTasks.java")
+            .unwrap();
+        let tame_only_at = pal_only
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert!(pal_only_at < tame_only_at);
+        assert!(!pal_only.iter().any(|arg| arg == "ApplyScatterLoad.java"));
+        assert_eq!(pal_only[pal_only_at + 4], "-");
+
+        // Current-none paths omit ApplyPalTasks entirely.
+        let none = headless_args(
+            "/out",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            SCATTER_BASE,
+            Some("scatter/02_MAIN/load_map.json"),
+            None,
+            &[],
+            "tighten",
+        );
+        assert!(!none.iter().any(|arg| arg == "ApplyPalTasks.java"));
+    }
+
+    #[test]
+    fn pal_pre_script_remains_under_no_thumb_decompile() {
+        // --no-thumb-decompile suppresses dense-Thumb discovery, not
+        // firmware-authoritative task entries: datamark mode still schedules
+        // ApplyPalTasks ahead of TameAnalysis, with `-` when scatter is absent.
+        let args = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            0x40e00000,
+            None,
+            Some("pal_tasks/02_MAIN/tasks.json"),
+            &[(0x40e12000, 0x100000)],
+            "datamark",
+        );
+        let pal_at = args
+            .iter()
+            .position(|arg| arg == "ApplyPalTasks.java")
+            .expect("datamark mode must keep ApplyPalTasks");
+        let tame_at = args
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert!(pal_at < tame_at);
+        assert_eq!(
+            &args[pal_at - 1..=pal_at],
+            ["-preScript", "ApplyPalTasks.java"]
+        );
+        assert_eq!(args[pal_at + 4], "-");
+        assert_eq!(args[tame_at + 1], "datamark");
+        assert!(args[tame_at + 2..].iter().any(|a| a == "40e12000:100000"));
     }
 
     #[test]
@@ -5862,6 +6024,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             vec![
                 out.join("scripts/ApplyGlobalTypes.java").to_string_lossy(),
                 out.join("scripts/ApplyGlobals.java").to_string_lossy(),
+                out.join("scripts/ApplyPalTasks.java").to_string_lossy(),
                 out.join("scripts/ApplyScatterLoad.java").to_string_lossy(),
                 out.join("scripts/ApplySymbols.java").to_string_lossy(),
                 out.join("scripts/ExportDecomp.java").to_string_lossy(),

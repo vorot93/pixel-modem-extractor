@@ -2976,3 +2976,844 @@ fn pal_support_strict_parsers_registry_and_digests() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -------------------------------------------------------------------------
+// Task 9: transactional ApplyPalTasks
+// -------------------------------------------------------------------------
+
+/// Seeds the meaningful-name targets: a pre-existing function at the zeta
+/// entry with a USER_DEFINED name and a user repeatable comment that the
+/// owned section must not disturb, plus a pre-existing function at the
+/// beta entry whose ANALYSIS primary coincidentally carries the desired
+/// PAL text - both must remain `preserved`, never `pal_owned`.
+const PAL_SEED_MEANINGFUL_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+
+public class PalSeedMeaningful extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Address zetaEntry = toAddr(0x4001_0438L);
+        disassemble(zetaEntry);
+        Function zeta = createFunction(zetaEntry, null);
+        if (zeta == null) {
+            throw new AssertionError("meaningful-name seed could not create the zeta function");
+        }
+        zeta.setName("zetaKeptName", SourceType.USER_DEFINED);
+        zeta.setRepeatableComment("user zeta note");
+
+        Address betaEntry = toAddr(0x4001_0410L);
+        disassemble(betaEntry);
+        Function beta = createFunction(betaEntry, null);
+        if (beta == null) {
+            throw new AssertionError("meaningful-name seed could not create the beta function");
+        }
+        beta.setName("pal_TaskEntry_beta", SourceType.ANALYSIS);
+
+        println("PalSeedMeaningful: seeded zetaKeptName and coincident ANALYSIS pal_TaskEntry_beta");
+    }
+}
+"#;
+
+/// Seeds a wrong-ISA entry: the alpha entry instruction is disassembled
+/// in Thumb context although the manifest declares ARM.
+const PAL_SEED_WRONG_ISA_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import java.math.BigInteger;
+
+public class PalSeedWrongIsa extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        if (tMode == null) {
+            throw new AssertionError("language lacks the TMode context register");
+        }
+        Address entry = toAddr(0x4001_0400L);
+        currentProgram.getProgramContext()
+                .setValue(tMode, entry, entry.add(3), BigInteger.ONE);
+        disassemble(entry);
+        if (currentProgram.getListing().getInstructionAt(entry) == null) {
+            throw new AssertionError("wrong-ISA seed disassembled nothing");
+        }
+        println("PalSeedWrongIsa: seeded Thumb context at the ARM entry " + entry);
+    }
+}
+"#;
+
+/// Seeds a containing function: a function beginning at 0x40010428 flows
+/// into the shared entry 0x40010430 without beginning there.
+const PAL_SEED_CONTAINING_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+
+public class PalSeedContaining extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Address start = toAddr(0x4001_0428L);
+        disassemble(start);
+        Function function = createFunction(start, null);
+        if (function == null) {
+            throw new AssertionError("containing-function seed could not create the function");
+        }
+        if (!function.getBody().contains(toAddr(0x4001_0430L))) {
+            throw new AssertionError("containing-function seed does not cover the shared entry");
+        }
+        println("PalSeedContaining: seeded function at " + start);
+    }
+}
+"#;
+
+/// Seeds an unrelated reserved-namespace label so the canonical labels
+/// collide with pre-existing state.
+const PAL_SEED_LABEL_COLLISION_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.SymbolTable;
+
+public class PalSeedLabelCollision extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        SymbolTable symbols = currentProgram.getSymbolTable();
+        Namespace namespace = symbols.createNameSpace(currentProgram.getGlobalNamespace(),
+                PalTasksSupport.RESERVED_NAMESPACE, SourceType.ANALYSIS);
+        symbols.createLabel(toAddr(0x4001_0460L), "pal_TaskEntry_alpha", namespace,
+                SourceType.ANALYSIS);
+        println("PalSeedLabelCollision: seeded reserved-namespace collision label");
+    }
+}
+"#;
+
+/// Corrupts one registry entry's manifest binding so a reapplication of
+/// the same manifest must fail as stale.
+const PAL_SEED_STALE_REGISTRY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class PalSeedStaleRegistry extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        if (registry == null) {
+            throw new AssertionError("stale-registry seed requires an applied registry");
+        }
+        Address entry = toAddr(0x4001_0400L);
+        String value = registry.getString(entry);
+        if (value == null) {
+            throw new AssertionError("stale-registry seed lost the alpha entry");
+        }
+        char digit = value.charAt(3);
+        char flipped = digit == '0' ? '1' : '0';
+        registry.add(entry, value.substring(0, 3) + flipped + value.substring(4));
+        println("PalSeedStaleRegistry: tampered the alpha manifest binding");
+    }
+}
+"#;
+
+/// Postflight inspector for a successful application (and reapplication):
+/// validates the complete applied state, pins the disposition counts, and
+/// prints registry/label fingerprints that must be identical across runs.
+const PAL_INSPECT_APPLIED_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class InspectApplied extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 4) {
+            throw new AssertionError("expected four InspectApplied arguments");
+        }
+        File kitRoot = new File(args[0]);
+        String label = args[1];
+        File palFile = new File(args[2]);
+        File scatterFile = new File(args[3]);
+        PalTasksSupport.PalManifest manifest =
+                PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile);
+        String identity = PalTasksSupport.expectedPalIdentity(manifest);
+        PalTasksSupport.AppliedState state =
+                PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        if (state.applications != 6 || state.createdFunctions != 4
+                || state.preexistingFunctions != 2 || state.palOwnedPrimaries != 4
+                || state.preservedPrimaries != 2 || state.pass2OwnedPrimaries != 0
+                || state.reservedLabels != 7) {
+            throw new AssertionError("applied-state counts are wrong: " + state.applications
+                    + " applications, " + state.createdFunctions + " created, "
+                    + state.preexistingFunctions + " preexisting, " + state.palOwnedPrimaries
+                    + " pal_owned, " + state.preservedPrimaries + " preserved, "
+                    + state.reservedLabels + " labels");
+        }
+        FunctionManager functions = currentProgram.getFunctionManager();
+        Function zeta = functions.getFunctionAt(toAddr(0x4001_0438L));
+        if (zeta == null || !"zetaKeptName".equals(zeta.getName())
+                || zeta.getSymbol().getSource() != SourceType.USER_DEFINED) {
+            throw new AssertionError("the meaningful primary was not preserved");
+        }
+        List<PalTasksSupport.PalTask> zetaTasks = new ArrayList<>();
+        zetaTasks.add(manifest.tasks.get(6));
+        String zetaSection =
+                PalTasksSupport.ownedCommentSection(manifest.manifestBlake3, zetaTasks);
+        if (!("user zeta note\n" + zetaSection).equals(zeta.getRepeatableComment())) {
+            throw new AssertionError("the owned comment disturbed the user text");
+        }
+        Function beta = functions.getFunctionAt(toAddr(0x4001_0410L));
+        if (beta == null || !"pal_TaskEntry_beta".equals(beta.getName())
+                || beta.getSymbol().getSource() != SourceType.ANALYSIS) {
+            throw new AssertionError(
+                    "the coincident ANALYSIS primary was not preserved verbatim");
+        }
+        Function shared = functions.getFunctionAt(toAddr(0x4001_0430L));
+        if (shared == null || !"pal_TaskEntry_shared_40010430".equals(shared.getName())) {
+            throw new AssertionError("the shared-entry primary is wrong");
+        }
+        if (functions.getFunctionAt(toAddr(0x4001_1000L)) == null) {
+            throw new AssertionError("the scatter-backed task function is missing");
+        }
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        if (registry == null) {
+            throw new AssertionError("the ownership registry is missing");
+        }
+        List<String> values = new ArrayList<>();
+        AddressIterator entries = registry.getPropertyIterator();
+        while (entries.hasNext()) {
+            Address address = entries.next();
+            values.add(registry.getString(address));
+        }
+        Collections.sort(values);
+        println("InspectApplied: registry " + String.join("|", values));
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+        List<Long> labelIds = new ArrayList<>();
+        SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(namespace);
+        while (symbols.hasNext()) {
+            labelIds.add(symbols.next().getID());
+        }
+        Collections.sort(labelIds);
+        StringBuilder ids = new StringBuilder();
+        for (Long id : labelIds) {
+            if (ids.length() > 0) {
+                ids.append(',');
+            }
+            ids.append(id);
+        }
+        println("InspectApplied: labels " + ids);
+        println("InspectApplied: ok");
+    }
+}
+"#;
+
+/// Saved-project inspector after an expected ApplyPalTasks failure. All
+/// modes assert no task function exists at any application entry.
+/// `pristine` additionally requires no surviving instructions at the
+/// entries; `seeded` allows pre-seeded code; `collision` allows the
+/// seeded collision label but no other PAL surface; `stale` requires the
+/// previously applied state to be completely undisturbed.
+const PAL_INSPECT_ABSENT_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.listing.CommentType;
+import ghidra.program.model.listing.Listing;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class InspectAbsent extends GhidraScript {
+    private static final long[] ENTRIES = {0x4001_0400L, 0x4001_0410L, 0x4001_0420L,
+        0x4001_0430L, 0x4001_0438L, 0x4001_1000L};
+
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length < 1 || args.length > 2) {
+            throw new AssertionError("expected one or two InspectAbsent arguments");
+        }
+        String mode = args[0];
+        if (!"stale".equals(mode)) {
+            // The stale mode certifies an intact applied state; every other
+            // mode must show no task function at any application entry.
+            for (long entry : ENTRIES) {
+                if (currentProgram.getFunctionManager().getFunctionAt(toAddr(entry)) != null) {
+                    throw new AssertionError("a task function survived at 0x"
+                            + Long.toHexString(entry));
+                }
+            }
+        }
+        if ("pristine".equals(mode)) {
+            PalTasksSupport.validateAbsent(currentProgram);
+            for (long entry : ENTRIES) {
+                if (currentProgram.getListing().getInstructionAt(toAddr(entry)) != null) {
+                    throw new AssertionError("a task instruction survived at 0x"
+                            + Long.toHexString(entry));
+                }
+            }
+        }
+        else if ("seeded".equals(mode)) {
+            PalTasksSupport.validateAbsent(currentProgram);
+        }
+        else if ("collision".equals(mode)) {
+            StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                    .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+            if (registry != null && registry.getSize() > 0) {
+                throw new AssertionError("a registry entry survived the failed application");
+            }
+            if (currentProgram.getOptions(Program.PROGRAM_INFO)
+                    .getString(PalTasksSupport.PAL_PROPERTY, null) != null) {
+                throw new AssertionError("the PAL property survived the failed application");
+            }
+            if (ownedCommentCount() != 0) {
+                throw new AssertionError("an owned comment survived the failed application");
+            }
+            Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                    PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+            int labels = 0;
+            if (namespace != null) {
+                SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(namespace);
+                while (symbols.hasNext()) {
+                    symbols.next();
+                    labels++;
+                }
+            }
+            if (labels != 1) {
+                throw new AssertionError("expected only the seeded collision label, found "
+                        + labels);
+            }
+        }
+        else if ("stale".equals(mode)) {
+            if (args.length != 2) {
+                throw new AssertionError("stale inspection requires the identity argument");
+            }
+            StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                    .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+            if (registry == null || registry.getSize() != 6) {
+                throw new AssertionError("the applied registry was disturbed");
+            }
+            if (!args[1].equals(currentProgram.getOptions(Program.PROGRAM_INFO)
+                    .getString(PalTasksSupport.PAL_PROPERTY, null))) {
+                throw new AssertionError("the applied PAL property was disturbed");
+            }
+            if (ownedCommentCount() != 6) {
+                throw new AssertionError("the applied owned comments were disturbed");
+            }
+            Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                    PalTasksSupport.RESERVED_NAMESPACE, currentProgram.getGlobalNamespace());
+            int labels = 0;
+            SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(namespace);
+            while (symbols.hasNext()) {
+                symbols.next();
+                labels++;
+            }
+            if (labels != 7) {
+                throw new AssertionError("the applied labels were disturbed");
+            }
+        }
+        else {
+            throw new AssertionError("unknown inspection mode " + mode);
+        }
+        println("InspectAbsent: " + mode + " ok");
+    }
+
+    private int ownedCommentCount() {
+        Listing listing = currentProgram.getListing();
+        AddressIterator iterator = listing.getCommentAddressIterator(CommentType.REPEATABLE,
+                currentProgram.getMemory(), true);
+        int count = 0;
+        while (iterator.hasNext()) {
+            Address address = iterator.next();
+            String comment = listing.getCodeUnitContaining(address)
+                    .getComment(CommentType.REPEATABLE);
+            if (comment != null
+                    && comment.contains(PalTasksSupport.COMMENT_OPEN_MARKER)) {
+                count++;
+            }
+        }
+        return count;
+    }
+}
+"#;
+
+struct PalApplyKit {
+    dir: PathBuf,
+    out: PathBuf,
+    identity: String,
+    manifest_path: PathBuf,
+    scatter_path: PathBuf,
+    kit_root: PathBuf,
+}
+
+/// Generates the extended seven-task PAL kit (image, scatter map,
+/// manifest, staged scripts, helper seeds/inspectors) for one case.
+fn generate_pal_apply_kit(home: &std::path::Path, case: &str) -> PalApplyKit {
+    let dir = std::env::temp_dir().join(format!("pme_pal_apply_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, pal_fixture::craft_pal_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        },
+        &out,
+    )
+    .unwrap();
+
+    let scatter_path = out.join("scatter/02_MAIN/load_map.json");
+    assert!(
+        scatter_path.exists(),
+        "kit must materialize the scatter load map"
+    );
+    let scatter_hash = pal_fixture::blake3_hex(&std::fs::read(&scatter_path).unwrap());
+    let manifest = pal_fixture::extended_manifest(&pal_fixture::craft_main_image(), &scatter_hash);
+    let manifest_dir = out.join("pal_tasks/02_MAIN");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    let manifest_path = manifest_dir.join("tasks.json");
+    std::fs::write(&manifest_path, &manifest).unwrap();
+    let identity = pal_fixture::extended_identity(&manifest);
+
+    for (name, source) in [
+        ("PalSeedMeaningful.java", PAL_SEED_MEANINGFUL_JAVA),
+        ("PalSeedWrongIsa.java", PAL_SEED_WRONG_ISA_JAVA),
+        ("PalSeedContaining.java", PAL_SEED_CONTAINING_JAVA),
+        ("PalSeedLabelCollision.java", PAL_SEED_LABEL_COLLISION_JAVA),
+        ("PalSeedStaleRegistry.java", PAL_SEED_STALE_REGISTRY_JAVA),
+        ("InspectApplied.java", PAL_INSPECT_APPLIED_JAVA),
+        ("InspectAbsent.java", PAL_INSPECT_ABSENT_JAVA),
+    ] {
+        std::fs::write(out.join("scripts").join(name), source).unwrap();
+    }
+    std::fs::create_dir_all(out.join("ghidra_project")).unwrap();
+    for directory in ["ghidra_config", "ghidra_cache", "ghidra_tmp"] {
+        std::fs::create_dir_all(out.join(directory)).unwrap();
+    }
+
+    PalApplyKit {
+        kit_root: std::fs::canonicalize(&out).unwrap(),
+        manifest_path: std::fs::canonicalize(&manifest_path).unwrap(),
+        scatter_path: std::fs::canonicalize(&scatter_path).unwrap(),
+        dir,
+        out,
+        identity,
+    }
+}
+
+fn pal_headless(home: &std::path::Path, kit: &PalApplyKit, args: &[String]) -> String {
+    let config = kit.out.join("ghidra_config");
+    let cache = kit.out.join("ghidra_cache");
+    let temp = kit.out.join("ghidra_tmp");
+    let java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        config.display(),
+        cache.display(),
+        temp.display(),
+        temp.display()
+    );
+    let output = std::process::Command::new(
+        analyze_headless_in_home(home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(kit.out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .args(args)
+    .env("XDG_CONFIG_HOME", &config)
+    .env("XDG_CACHE_HOME", &cache)
+    .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+    .output()
+    .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The initial `-import` run: applies the scatter load map and optionally
+/// runs one seeding post-script.
+fn pal_import(home: &std::path::Path, kit: &PalApplyKit, seed: Option<&str>) -> String {
+    let mut args: Vec<String> = [
+        "-import".to_string(),
+        kit.out
+            .join("images/02_MAIN")
+            .to_string_lossy()
+            .into_owned(),
+        "-processor".to_string(),
+        "ARM:LE:32:v7".to_string(),
+        "-loader".to_string(),
+        "BinaryLoader".to_string(),
+        "-loader-baseAddr".to_string(),
+        "40010000".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-preScript".to_string(),
+        "ApplyScatterLoad.java".to_string(),
+        kit.kit_root.to_string_lossy().into_owned(),
+        "02_MAIN".to_string(),
+        kit.scatter_path.to_string_lossy().into_owned(),
+    ]
+    .into();
+    if let Some(script) = seed {
+        args.extend(["-postScript".to_string(), script.to_string()]);
+    }
+    pal_headless(home, kit, &args)
+}
+
+/// The `-process` run driving ApplyPalTasks with its four canonical
+/// arguments, plus an optional post-script that receives the same four.
+fn pal_apply(home: &std::path::Path, kit: &PalApplyKit, post: Option<&str>) -> String {
+    let mut args: Vec<String> = [
+        "-process".to_string(),
+        "02_MAIN".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-preScript".to_string(),
+        "ApplyPalTasks.java".to_string(),
+        kit.kit_root.to_string_lossy().into_owned(),
+        "02_MAIN".to_string(),
+        kit.manifest_path.to_string_lossy().into_owned(),
+        kit.scatter_path.to_string_lossy().into_owned(),
+    ]
+    .into();
+    if let Some(script) = post {
+        args.extend([
+            "-postScript".to_string(),
+            script.to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".to_string(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            kit.scatter_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    pal_headless(home, kit, &args)
+}
+
+/// InspectAbsent as its own `-process` run with an optional extra argument.
+fn pal_inspect_absent(
+    home: &std::path::Path,
+    kit: &PalApplyKit,
+    mode: &str,
+    extra: &str,
+) -> String {
+    let mut args: Vec<String> = [
+        "-process".to_string(),
+        "02_MAIN".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "InspectAbsent.java".to_string(),
+        mode.to_string(),
+    ]
+    .into();
+    if !extra.is_empty() {
+        args.push(extra.to_string());
+    }
+    pal_headless(home, kit, &args)
+}
+
+/// Patches the staged ApplyPalTasks source once per anchor pair.
+fn patch_apply_script(out: &std::path::Path, replacements: &[(&str, &str)]) {
+    let path = out.join("scripts/ApplyPalTasks.java");
+    let mut script = std::fs::read_to_string(&path).unwrap();
+    for (from, to) in replacements {
+        assert_eq!(
+            script.matches(from).count(),
+            1,
+            "patch anchor {from:?} must be unique"
+        );
+        script = script.replacen(from, to, 1);
+    }
+    std::fs::write(&path, script).unwrap();
+}
+
+fn pal_expected_summary(
+    kit: &PalApplyKit,
+    created: usize,
+    existing: usize,
+    applied: usize,
+    preserved: usize,
+) -> String {
+    format!(
+        "ApplyPalTasks: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{}\",\"tasks\":7,\"entries\":6,\"functions_created\":{},\"functions_existing\":{},\"names_applied\":{},\"names_preserved\":{},\"shared_entries\":1}}",
+        kit.identity, created, existing, applied, preserved
+    )
+}
+
+#[test]
+fn apply_pal_tasks_seeds_state_and_reapplies_idempotently() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let kit = generate_pal_apply_kit(&home, "ok");
+    let import = pal_import(&home, &kit, Some("PalSeedMeaningful.java"));
+    assert!(
+        import.contains("PalSeedMeaningful: seeded zetaKeptName and coincident"),
+        "meaningful-name seed did not run:\n{import}"
+    );
+
+    let first = pal_apply(&home, &kit, Some("InspectApplied.java"));
+    assert!(
+        first.contains(&pal_expected_summary(&kit, 4, 2, 4, 2)),
+        "first application summary mismatch:\n{first}"
+    );
+    assert!(
+        first.contains("InspectApplied: ok"),
+        "inspection failed:\n{first}"
+    );
+
+    let second = pal_apply(&home, &kit, Some("InspectApplied.java"));
+    assert!(
+        second.contains(&pal_expected_summary(&kit, 0, 6, 4, 2)),
+        "reapplication summary mismatch:\n{second}"
+    );
+    assert!(
+        second.contains("InspectApplied: ok"),
+        "reapply inspection failed:\n{second}"
+    );
+    let first_fingerprint: Vec<&str> = first
+        .lines()
+        .filter(|line| {
+            line.starts_with("InspectApplied: registry ")
+                || line.starts_with("InspectApplied: labels ")
+        })
+        .collect();
+    let second_fingerprint: Vec<&str> = second
+        .lines()
+        .filter(|line| {
+            line.starts_with("InspectApplied: registry ")
+                || line.starts_with("InspectApplied: labels ")
+        })
+        .collect();
+    assert_eq!(
+        first_fingerprint, second_fingerprint,
+        "reapplication created new registry or label state"
+    );
+
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+fn assert_apply_fails_without_partial_state(
+    home: &std::path::Path,
+    case: &str,
+    seed: Option<&str>,
+    patches: &[(&str, &str)],
+    expected_failure: &str,
+    absent_mode: &str,
+) {
+    let kit = generate_pal_apply_kit(home, case);
+    let import = pal_import(home, &kit, seed);
+    assert!(
+        !import.contains("REPORT SCRIPT ERROR"),
+        "seed run failed for {case}:\n{import}"
+    );
+    if let Some(script) = seed {
+        let marker = script.trim_end_matches(".java");
+        assert!(
+            import.contains(marker),
+            "seed {script} did not run for {case}:\n{import}"
+        );
+    }
+    if !patches.is_empty() {
+        patch_apply_script(&kit.out, patches);
+    }
+    let failed = pal_apply(home, &kit, None);
+    assert!(
+        failed.contains(expected_failure),
+        "apply run for {case} missed {expected_failure:?}:\n{failed}"
+    );
+    let inspected = pal_inspect_absent(home, &kit, absent_mode, "");
+    assert!(
+        inspected.contains(&format!("InspectAbsent: {absent_mode} ok")),
+        "saved project retained partial PAL state after {case}:\napplied:\n{failed}\ninspected:\n{inspected}"
+    );
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn apply_pal_tasks_rolls_back_injected_failure_after_several_functions() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "rollback",
+        None,
+        &[(
+            "chargeNewlyDefinedAddresses(disassembled);",
+            concat!(
+                "if (appliedCount == 2) {\n",
+                "                    throw new IllegalStateException(\n",
+                "                            \"injected failure after several functions\");\n",
+                "                }\n",
+                "                chargeNewlyDefinedAddresses(disassembled);"
+            ),
+        )],
+        "injected failure after several functions",
+        "pristine",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_entry_timeout_and_rolls_back() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "timeout",
+        None,
+        &[
+            ("PER_ENTRY_BUDGET_MS = 30_000L", "PER_ENTRY_BUDGET_MS = 1L"),
+            (
+                "TimeoutTaskMonitor entryMonitor = newEntryMonitor(remainingPhaseMs);",
+                concat!(
+                    "TimeoutTaskMonitor entryMonitor = newEntryMonitor(remainingPhaseMs);\n",
+                    "                Thread.sleep(50);"
+                ),
+            ),
+        ],
+        "the per-entry PAL budget was exhausted",
+        "pristine",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_code_byte_exhaustion_and_rolls_back() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "bytes",
+        None,
+        &[(
+            "MAX_NEWLY_DEFINED_BYTES = 64L * 1024L * 1024L",
+            "MAX_NEWLY_DEFINED_BYTES = 24L",
+        )],
+        "the newly-defined address budget was exhausted",
+        "pristine",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_wrong_isa_context() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "wrong_isa",
+        Some("PalSeedWrongIsa.java"),
+        &[],
+        "the entry ISA context does not match the declared",
+        "seeded",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_containing_function() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "containing",
+        Some("PalSeedContaining.java"),
+        &[],
+        "a function contains the task entry but does not begin there",
+        "seeded",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_label_collision() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "collision",
+        Some("PalSeedLabelCollision.java"),
+        &[],
+        "the reserved namespace is not empty",
+        "collision",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_stale_registry() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let kit = generate_pal_apply_kit(&home, "stale");
+    let import = pal_import(&home, &kit, None);
+    assert!(
+        !import.contains("REPORT SCRIPT ERROR"),
+        "import failed:\n{import}"
+    );
+    let applied = pal_apply(&home, &kit, None);
+    assert!(
+        applied.contains(&pal_expected_summary(&kit, 6, 0, 6, 0)),
+        "initial application failed:\n{applied}"
+    );
+    let seeded = pal_headless(
+        &home,
+        &kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "PalSeedStaleRegistry.java".to_string(),
+        ],
+    );
+    assert!(
+        seeded.contains("PalSeedStaleRegistry: tampered the alpha manifest binding"),
+        "stale seed did not run:\n{seeded}"
+    );
+    let failed = pal_apply(&home, &kit, None);
+    assert!(
+        failed.contains("binds a different manifest than the identity"),
+        "stale registry was not rejected:\n{failed}"
+    );
+    let inspected = pal_inspect_absent(&home, &kit, "stale", &kit.identity);
+    assert!(
+        inspected.contains("InspectAbsent: stale ok"),
+        "failed reapplication disturbed the applied state:\n{inspected}"
+    );
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}

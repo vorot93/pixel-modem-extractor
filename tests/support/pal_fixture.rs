@@ -3,11 +3,14 @@
 //! names, bytes, or derived payloads. The MAIN image carries a valid
 //! scatter loader/table (so kit generation materializes a real
 //! `scatter/02_MAIN/load_map.json` whose digest pins the PAL manifest's
-//! scatter dependency), two disassemblable ARM task entries, two anchor
-//! occurrences, and the task slot/name storage the canonical manifest
-//! references. The canonical manifest bytes follow the exact
+//! scatter dependency), disassemblable ARM and Thumb task entries (one
+//! ARM entry is scatter-backed through copy entry 3), a shared-entry
+//! pair, two anchor occurrences, and the task slot/name storage the
+//! canonical manifests reference. The manifest bytes follow the exact
 //! `pal_tasks::artifact` wire layout (two-space indent, exact key order,
-//! lowercase `0x` addresses, canonical decimals).
+//! lowercase `0x` addresses, canonical decimals). Two manifest variants
+//! share the image: `canonical_manifest` (Task 8's two-task probe) and
+//! `extended_manifest` (Task 9's seven-task/seven-application battery).
 
 pub(super) const BASE: u32 = 0x4001_0000;
 pub(super) const IMAGE_LEN: usize = 0x1000;
@@ -20,13 +23,34 @@ const SLOT_B_OFF: usize = SLOT_BASE_OFF + STRIDE;
 const TERMINAL_OFF: usize = SLOT_BASE_OFF + 2 * STRIDE;
 const ENTRY_A_OFF: usize = 0x400;
 const ENTRY_B_OFF: usize = 0x410;
+const ENTRY_C_OFF: usize = 0x420;
+const ENTRY_D_OFF: usize = 0x430;
+const ENTRY_E_OFF: usize = 0x438;
 const ANCHOR_A_OFF: usize = 0x440;
 const ANCHOR_B_OFF: usize = 0x450;
 const CFG_ENTRY_OFF: usize = 0x460;
 const NAME_ALPHA_OFF: usize = 0x500;
 const NAME_BETA_OFF: usize = 0x508;
+const NAME_GAMMA_OFF: usize = 0x510;
+const NAME_DELTA_ONE_OFF: usize = 0x518;
+const NAME_DELTA_TWO_OFF: usize = 0x524;
+const NAME_EPSILON_OFF: usize = 0x530;
+const NAME_ZETA_OFF: usize = 0x538;
 const NAME_OFFSET: u32 = 40;
 const ANCHOR_PATTERN: &[u8; 9] = b"PALTskTm\0";
+
+/// Extended-manifest geometry: seven tasks cover slots `SLOT_BASE_OFF`
+/// through `EXTENDED_TERMINAL_OFF`, so the scatter table moves to 0x300
+/// (it would otherwise overlap the slot region).
+const EXTENDED_TASKS: usize = 7;
+const EXTENDED_CAPACITY: u64 = 8;
+const EXTENDED_TERMINAL_OFF: usize = SLOT_BASE_OFF + EXTENDED_TASKS * STRIDE;
+const TABLE_OFFSET: usize = 0x300;
+/// Scatter copy entry 3 materializes the scatter-backed task entry at
+/// `BASE + SCATTER_TASK_OFF` from the eight ARM bytes at 0x710.
+const SCATTER_TASK_OFF: usize = IMAGE_LEN;
+const SCATTER_COPY_SIZE: usize = 8;
+const SCATTER_COPY_SOURCE_OFF: usize = 0x710;
 
 pub(super) fn entry_a() -> u32 {
     BASE + ENTRY_A_OFF as u32
@@ -34,6 +58,10 @@ pub(super) fn entry_a() -> u32 {
 
 pub(super) fn entry_b() -> u32 {
     BASE + ENTRY_B_OFF as u32
+}
+
+pub(super) fn entry_d() -> u32 {
+    BASE + ENTRY_D_OFF as u32
 }
 
 fn put_u32(image: &mut [u8], offset: usize, value: u32) {
@@ -47,7 +75,6 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     const LOADER_OFFSET: usize = 0x40;
     const LOADER_IMMEDIATE: u32 = 0x38;
     const LITERAL_OFFSET: usize = LOADER_OFFSET + 8 + LOADER_IMMEDIATE as usize;
-    const TABLE_OFFSET: usize = 0x200;
     const TABLE_LEN: u32 = 6 * 16;
     const NULL_HANDLER: u32 = BASE + 0x600;
     const COPY_HANDLER: u32 = BASE + 0x601;
@@ -55,7 +82,7 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     const ZERO_HANDLER: u32 = BASE + 0x609;
     const SENTINEL_SOURCE: u32 = BASE + 0x680;
     const SELF_COPY_SOURCE: u32 = BASE + 0x700;
-    const COPY_SOURCE: u32 = BASE + 0x710;
+    const COPY_SOURCE: u32 = BASE + SCATTER_COPY_SOURCE_OFF as u32;
     const DECOMPRESS1_SOURCE: u32 = BASE + 0x720;
     const ZERO_SOURCE: u32 = BASE + 0x730;
 
@@ -87,7 +114,13 @@ pub(super) fn craft_main_image() -> Vec<u8> {
         (0, SENTINEL_SOURCE, 0, 0, NULL_HANDLER),
         (1, 0, SENTINEL_SOURCE, 0, NULL_HANDLER),
         (2, SELF_COPY_SOURCE, SELF_COPY_SOURCE, 4, COPY_HANDLER),
-        (3, COPY_SOURCE, BASE + IMAGE_LEN as u32, 4, COPY_HANDLER),
+        (
+            3,
+            COPY_SOURCE,
+            BASE + SCATTER_TASK_OFF as u32,
+            SCATTER_COPY_SIZE as u32,
+            COPY_HANDLER,
+        ),
         (
             4,
             DECOMPRESS1_SOURCE,
@@ -109,17 +142,32 @@ pub(super) fn craft_main_image() -> Vec<u8> {
         }
     }
 
-    // PAL task content: two ARM functions (add r0,r0,r1 / add r1,r1,r2 /
-    // bx lr and add r0,r0,r1 / bx lr), two anchor occurrences, names.
+    // PAL task content. ARM entries A (add/add/bx lr), B (add/bx lr);
+    // Thumb entry C (`bx lr`, 0x4770); shared ARM entry D and the
+    // meaningful-name ARM entry E (add/bx lr each); the scatter-backed
+    // entry's add/bx lr pair lives at COPY_SOURCE (0x710) and is
+    // materialized at BASE+0x1000 by scatter copy entry 3.
     image[ENTRY_A_OFF..ENTRY_A_OFF + 12].copy_from_slice(&[
         0x01, 0x00, 0x80, 0xe0, 0x02, 0x10, 0x81, 0xe0, 0x1e, 0xff, 0x2f, 0xe1,
     ]);
     image[ENTRY_B_OFF..ENTRY_B_OFF + 8]
         .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
+    image[ENTRY_C_OFF..ENTRY_C_OFF + 2].copy_from_slice(&[0x70, 0x47]);
+    image[ENTRY_D_OFF..ENTRY_D_OFF + 8]
+        .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
+    image[ENTRY_E_OFF..ENTRY_E_OFF + 8]
+        .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
+    image[SCATTER_COPY_SOURCE_OFF..SCATTER_COPY_SOURCE_OFF + SCATTER_COPY_SIZE]
+        .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
     image[ANCHOR_A_OFF..ANCHOR_A_OFF + 9].copy_from_slice(ANCHOR_PATTERN);
     image[ANCHOR_B_OFF..ANCHOR_B_OFF + 9].copy_from_slice(ANCHOR_PATTERN);
     image[NAME_ALPHA_OFF..NAME_ALPHA_OFF + 6].copy_from_slice(b"alpha\0");
     image[NAME_BETA_OFF..NAME_BETA_OFF + 5].copy_from_slice(b"beta\0");
+    image[NAME_GAMMA_OFF..NAME_GAMMA_OFF + 6].copy_from_slice(b"gamma\0");
+    image[NAME_DELTA_ONE_OFF..NAME_DELTA_ONE_OFF + 10].copy_from_slice(b"delta_one\0");
+    image[NAME_DELTA_TWO_OFF..NAME_DELTA_TWO_OFF + 10].copy_from_slice(b"delta_two\0");
+    image[NAME_EPSILON_OFF..NAME_EPSILON_OFF + 8].copy_from_slice(b"epsilon\0");
+    image[NAME_ZETA_OFF..NAME_ZETA_OFF + 5].copy_from_slice(b"zeta\0");
     image
 }
 
@@ -147,6 +195,226 @@ pub(super) fn blake3_hex(bytes: &[u8]) -> String {
 /// The PAL identity grammar: `v1:<manifest-blake3>:<task-records>:<distinct-entries>`.
 pub(super) fn identity(manifest: &str) -> String {
     format!("v1:{}:2:0", blake3_hex(manifest.as_bytes()))
+}
+
+/// The identity of the extended seven-task manifest: one scatter entry
+/// backs task storage, so `distinct-entries` is 1.
+pub(super) fn extended_identity(manifest: &str) -> String {
+    format!(
+        "v1:{}:{}:{}",
+        blake3_hex(manifest.as_bytes()),
+        EXTENDED_TASKS,
+        1
+    )
+}
+
+/// The seven-task manifest exercising raw ARM, raw Thumb, shared-entry,
+/// meaningful-name, and scatter-backed applications against the same
+/// image as the two-task canonical manifest.
+pub(super) fn extended_manifest(image: &[u8], scatter_blake3_hex: &str) -> String {
+    let mut json = Json::new();
+    write_manifest_skeleton(
+        &mut json,
+        image,
+        scatter_blake3_hex,
+        &[3],
+        EXTENDED_TASKS as u64,
+        EXTENDED_TERMINAL_OFF,
+    );
+
+    json.key(false, "tasks");
+    json.open_array();
+    let tasks = [
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF,
+            name_off: NAME_ALPHA_OFF,
+            name_len: 6,
+            name: "alpha",
+            priority: 100,
+            stack: 512,
+            entry_off: ENTRY_A_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_A_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: None,
+        },
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF + STRIDE,
+            name_off: NAME_BETA_OFF,
+            name_len: 5,
+            name: "beta",
+            priority: 255,
+            stack: 33000,
+            entry_off: ENTRY_B_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_B_OFF,
+            callback: "0x6789abcd",
+            unknown: "0x00001234",
+            entry_scatter: None,
+        },
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF + 2 * STRIDE,
+            name_off: NAME_GAMMA_OFF,
+            name_len: 6,
+            name: "gamma",
+            priority: 7,
+            stack: 1024,
+            entry_off: ENTRY_C_OFF,
+            isa: "thumb",
+            instruction_size: 2,
+            instruction_off: ENTRY_C_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: None,
+        },
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF + 3 * STRIDE,
+            name_off: NAME_DELTA_ONE_OFF,
+            name_len: 10,
+            name: "delta_one",
+            priority: 3,
+            stack: 2048,
+            entry_off: ENTRY_D_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_D_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: None,
+        },
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF + 4 * STRIDE,
+            name_off: NAME_DELTA_TWO_OFF,
+            name_len: 10,
+            name: "delta_two",
+            priority: 4,
+            stack: 4096,
+            entry_off: ENTRY_D_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_D_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: None,
+        },
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF + 5 * STRIDE,
+            name_off: NAME_EPSILON_OFF,
+            name_len: 8,
+            name: "epsilon",
+            priority: 9,
+            stack: 8192,
+            entry_off: SCATTER_TASK_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: SCATTER_COPY_SOURCE_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: Some(3),
+        },
+        TaskSpec {
+            slot_off: SLOT_BASE_OFF + 6 * STRIDE,
+            name_off: NAME_ZETA_OFF,
+            name_len: 5,
+            name: "zeta",
+            priority: 5,
+            stack: 2048,
+            entry_off: ENTRY_E_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_E_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: None,
+        },
+    ];
+    for (index, task) in tasks.iter().enumerate() {
+        write_task(&mut json, image, index == 0, index as u64, task);
+    }
+    json.close_array();
+
+    json.key(false, "applications");
+    json.open_array();
+    let shared_primary = format!("pal_TaskEntry_shared_{:08x}", entry_d());
+    let applications = [
+        ApplicationSpec {
+            entry_off: ENTRY_A_OFF,
+            isa: "arm",
+            desired_primary: "pal_TaskEntry_alpha".to_string(),
+            task_indices: &[0],
+            labels: &[LabelSpec {
+                label: "pal_TaskEntry_alpha",
+                indices: &[0],
+            }],
+        },
+        ApplicationSpec {
+            entry_off: ENTRY_B_OFF,
+            isa: "arm",
+            desired_primary: "pal_TaskEntry_beta".to_string(),
+            task_indices: &[1],
+            labels: &[LabelSpec {
+                label: "pal_TaskEntry_beta",
+                indices: &[1],
+            }],
+        },
+        ApplicationSpec {
+            entry_off: ENTRY_C_OFF,
+            isa: "thumb",
+            desired_primary: "pal_TaskEntry_gamma".to_string(),
+            task_indices: &[2],
+            labels: &[LabelSpec {
+                label: "pal_TaskEntry_gamma",
+                indices: &[2],
+            }],
+        },
+        ApplicationSpec {
+            entry_off: ENTRY_D_OFF,
+            isa: "arm",
+            desired_primary: shared_primary,
+            task_indices: &[3, 4],
+            labels: &[
+                LabelSpec {
+                    label: "pal_TaskEntry_delta_one",
+                    indices: &[3],
+                },
+                LabelSpec {
+                    label: "pal_TaskEntry_delta_two",
+                    indices: &[4],
+                },
+            ],
+        },
+        ApplicationSpec {
+            entry_off: ENTRY_E_OFF,
+            isa: "arm",
+            desired_primary: "pal_TaskEntry_zeta".to_string(),
+            task_indices: &[6],
+            labels: &[LabelSpec {
+                label: "pal_TaskEntry_zeta",
+                indices: &[6],
+            }],
+        },
+        ApplicationSpec {
+            entry_off: SCATTER_TASK_OFF,
+            isa: "arm",
+            desired_primary: "pal_TaskEntry_epsilon".to_string(),
+            task_indices: &[5],
+            labels: &[LabelSpec {
+                label: "pal_TaskEntry_epsilon",
+                indices: &[5],
+            }],
+        },
+    ];
+    for (index, application) in applications.iter().enumerate() {
+        write_application(&mut json, index == 0, application);
+    }
+    json.close_array();
+
+    json.close_object();
+    json.out.push('\n');
+    json.out
 }
 
 // A minimal pretty-JSON writer pinned to the canonical two-space layout
@@ -270,12 +538,50 @@ fn address(value: u32) -> String {
     format!("{value:#010x}")
 }
 
-/// The canonical PAL task manifest for the fixture image, pinned against
-/// the generated scatter load map's digest. Layout mirrors the Rust
-/// serializer byte for byte.
-pub(super) fn canonical_manifest(image: &[u8], scatter_blake3_hex: &str) -> String {
+/// One serialized task record. `instruction_off` is the image-relative
+/// offset whose bytes hash to `instruction_blake3` (identical to the
+/// runtime-view bytes at `entry`).
+struct TaskSpec<'a> {
+    slot_off: usize,
+    name_off: usize,
+    name_len: usize,
+    name: &'a str,
+    priority: u64,
+    stack: u64,
+    entry_off: usize,
+    isa: &'a str,
+    instruction_size: u64,
+    instruction_off: usize,
+    callback: &'a str,
+    unknown: &'a str,
+    /// Extra scatter entry when the entry storage is scatter-backed.
+    entry_scatter: Option<u64>,
+}
+
+struct LabelSpec<'a> {
+    label: &'a str,
+    indices: &'a [u64],
+}
+
+struct ApplicationSpec<'a> {
+    entry_off: usize,
+    isa: &'a str,
+    desired_primary: String,
+    task_indices: &'a [u64],
+    labels: &'a [LabelSpec<'a>],
+}
+
+/// The shared manifest skeleton: everything from `format` through the
+/// `table` block. `terminal_off` is the image-relative terminal slot.
+fn write_manifest_skeleton(
+    json: &mut Json,
+    image: &[u8],
+    scatter_blake3_hex: &str,
+    scatter_entries_used: &[u64],
+    task_count: u64,
+    terminal_off: usize,
+) {
     let image_hash = blake3_hex(image);
-    let mut json = Json::new();
     json.open_object();
     json.string_field(true, "format", "pixel-modem-extractor-pal-tasks-v1");
     json.number_field(false, "schema_version", 1);
@@ -294,6 +600,10 @@ pub(super) fn canonical_manifest(image: &[u8], scatter_blake3_hex: &str) -> Stri
     json.string_field(true, "scatter_load_map_blake3", scatter_blake3_hex);
     json.key(false, "scatter_entries_used");
     json.open_array();
+    for (index, entry) in scatter_entries_used.iter().enumerate() {
+        json.element(index == 0);
+        json.out.push_str(&entry.to_string());
+    }
     json.close_array();
     json.close_object();
 
@@ -406,22 +716,22 @@ pub(super) fn canonical_manifest(image: &[u8], scatter_blake3_hex: &str) -> Stri
     json.number_field(false, "name_offset", NAME_OFFSET as u64);
     json.number_field(false, "index_offset", 12);
     json.number_field(false, "stride", STRIDE as u64);
-    json.number_field(false, "capacity", 8);
+    json.number_field(false, "capacity", EXTENDED_CAPACITY);
     json.close_object();
 
     json.key(false, "table");
     json.open_object();
-    json.number_field(true, "count", 2);
-    json.string_field(false, "terminal_slot", &address(BASE + TERMINAL_OFF as u32));
+    json.number_field(true, "count", task_count);
+    json.string_field(false, "terminal_slot", &address(BASE + terminal_off as u32));
     json.string_field(
         false,
         "terminal_blake3",
-        &hash_region(image, TERMINAL_OFF, STRIDE),
+        &hash_region(image, terminal_off, STRIDE),
     );
     json.spans_field(
         false,
         "terminal_storage",
-        &[(BASE + TERMINAL_OFF as u32, STRIDE as u64)],
+        &[(BASE + terminal_off as u32, STRIDE as u64)],
     );
     json.number_field(
         false,
@@ -434,93 +744,166 @@ pub(super) fn canonical_manifest(image: &[u8], scatter_blake3_hex: &str) -> Stri
     json.number_field(false, "callback_offset", NAME_OFFSET as u64 + 16);
     json.number_field(false, "unknown_pointer_offset", NAME_OFFSET as u64 + 20);
     json.close_object();
+}
+
+fn write_task(json: &mut Json, image: &[u8], first: bool, index: u64, task: &TaskSpec) {
+    json.element(first);
+    json.open_object();
+    json.number_field(true, "index", index);
+    json.string_field(false, "slot", &address(BASE + task.slot_off as u32));
+    json.string_field(
+        false,
+        "slot_blake3",
+        &hash_region(image, task.slot_off, STRIDE),
+    );
+    json.string_field(false, "name_pointer", &address(BASE + task.name_off as u32));
+    json.string_field(false, "name", task.name);
+    json.string_field(false, "task_label", &format!("pal_TaskEntry_{}", task.name));
+    json.number_field(false, "priority", task.priority);
+    json.number_field(false, "stack_size", task.stack);
+    let entry = BASE + task.entry_off as u32;
+    let entry_pointer = if task.isa == "thumb" {
+        entry | 1
+    } else {
+        entry
+    };
+    json.string_field(false, "entry_pointer", &address(entry_pointer));
+    json.string_field(false, "entry", &address(entry));
+    json.string_field(false, "isa", task.isa);
+    json.number_field(false, "instruction_size", task.instruction_size);
+    json.string_field(
+        false,
+        "instruction_blake3",
+        &hash_region(image, task.instruction_off, task.instruction_size as usize),
+    );
+    json.string_field(false, "callback", task.callback);
+    json.string_field(false, "unknown_pointer", task.unknown);
+    json.spans_field(
+        false,
+        "slot_storage",
+        &[(BASE + task.slot_off as u32, STRIDE as u64)],
+    );
+    json.spans_field(
+        false,
+        "name_storage",
+        &[(BASE + task.name_off as u32, task.name_len as u64)],
+    );
+    match task.entry_scatter {
+        None => json.spans_field(false, "entry_storage", &[(entry, task.instruction_size)]),
+        Some(scatter_entry) => {
+            json.key(false, "entry_storage");
+            json.open_array();
+            json.element(true);
+            json.open_object();
+            json.string_field(true, "kind", "scatter_bytes");
+            json.string_field(false, "address", &address(entry));
+            json.number_field(false, "size", task.instruction_size);
+            json.number_field(false, "scatter_entry", scatter_entry);
+            json.close_object();
+            json.close_array();
+        }
+    }
+    json.close_object();
+}
+
+fn write_application(json: &mut Json, first: bool, application: &ApplicationSpec) {
+    json.element(first);
+    json.open_object();
+    json.string_field(true, "entry", &address(BASE + application.entry_off as u32));
+    json.string_field(false, "isa", application.isa);
+    json.string_field(false, "desired_primary", &application.desired_primary);
+    json.key(false, "task_indices");
+    json.open_array();
+    for (position, index) in application.task_indices.iter().enumerate() {
+        json.element(position == 0);
+        json.out.push_str(&index.to_string());
+    }
+    json.close_array();
+    json.key(false, "labels");
+    json.open_array();
+    for (position, label) in application.labels.iter().enumerate() {
+        json.element(position == 0);
+        json.open_object();
+        json.string_field(true, "label", label.label);
+        json.key(false, "task_indices");
+        json.open_array();
+        for (slot, index) in label.indices.iter().enumerate() {
+            json.element(slot == 0);
+            json.out.push_str(&index.to_string());
+        }
+        json.close_array();
+        json.close_object();
+    }
+    json.close_array();
+    json.close_object();
+}
+
+/// The canonical two-task PAL task manifest for the fixture image,
+/// pinned against the generated scatter load map's digest. Layout
+/// mirrors the Rust serializer byte for byte.
+pub(super) fn canonical_manifest(image: &[u8], scatter_blake3_hex: &str) -> String {
+    let mut json = Json::new();
+    write_manifest_skeleton(&mut json, image, scatter_blake3_hex, &[], 2, TERMINAL_OFF);
 
     json.key(false, "tasks");
     json.open_array();
     let tasks = [
-        (
-            0,
-            SLOT_A_OFF,
-            NAME_ALPHA_OFF,
-            6,
-            "alpha",
-            100,
-            512,
-            ENTRY_A_OFF,
-            "0x00000000",
-            "0x00000000",
-        ),
-        (
-            1,
-            SLOT_B_OFF,
-            NAME_BETA_OFF,
-            5,
-            "beta",
-            255,
-            33000,
-            ENTRY_B_OFF,
-            "0x6789abcd",
-            "0x00001234",
-        ),
+        TaskSpec {
+            slot_off: SLOT_A_OFF,
+            name_off: NAME_ALPHA_OFF,
+            name_len: 6,
+            name: "alpha",
+            priority: 100,
+            stack: 512,
+            entry_off: ENTRY_A_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_A_OFF,
+            callback: "0x00000000",
+            unknown: "0x00000000",
+            entry_scatter: None,
+        },
+        TaskSpec {
+            slot_off: SLOT_B_OFF,
+            name_off: NAME_BETA_OFF,
+            name_len: 5,
+            name: "beta",
+            priority: 255,
+            stack: 33000,
+            entry_off: ENTRY_B_OFF,
+            isa: "arm",
+            instruction_size: 4,
+            instruction_off: ENTRY_B_OFF,
+            callback: "0x6789abcd",
+            unknown: "0x00001234",
+            entry_scatter: None,
+        },
     ];
-    for (index, slot, name_at, name_len, name, priority, stack, entry, callback, unknown) in tasks {
-        json.element(index == 0);
-        json.open_object();
-        json.number_field(true, "index", index as u64);
-        json.string_field(false, "slot", &address(BASE + slot as u32));
-        json.string_field(false, "slot_blake3", &hash_region(image, slot, STRIDE));
-        json.string_field(false, "name_pointer", &address(BASE + name_at as u32));
-        json.string_field(false, "name", name);
-        json.string_field(false, "task_label", &format!("pal_TaskEntry_{name}"));
-        json.number_field(false, "priority", priority);
-        json.number_field(false, "stack_size", stack);
-        json.string_field(false, "entry_pointer", &address(BASE + entry as u32));
-        json.string_field(false, "entry", &address(BASE + entry as u32));
-        json.string_field(false, "isa", "arm");
-        json.number_field(false, "instruction_size", 4);
-        json.string_field(false, "instruction_blake3", &hash_region(image, entry, 4));
-        json.string_field(false, "callback", callback);
-        json.string_field(false, "unknown_pointer", unknown);
-        json.spans_field(
-            false,
-            "slot_storage",
-            &[(BASE + slot as u32, STRIDE as u64)],
-        );
-        json.spans_field(false, "name_storage", &[(BASE + name_at as u32, name_len)]);
-        json.spans_field(false, "entry_storage", &[(BASE + entry as u32, 4)]);
-        json.close_object();
+    for (index, task) in tasks.iter().enumerate() {
+        write_task(&mut json, image, index == 0, index as u64, task);
     }
     json.close_array();
 
     json.key(false, "applications");
     json.open_array();
-    for (index, (name, entry)) in [("alpha", ENTRY_A_OFF), ("beta", ENTRY_B_OFF)]
+    for (index, (name, entry_off)) in [("alpha", ENTRY_A_OFF), ("beta", ENTRY_B_OFF)]
         .into_iter()
         .enumerate()
     {
-        json.element(index == 0);
-        json.open_object();
-        json.string_field(true, "entry", &address(BASE + entry as u32));
-        json.string_field(false, "isa", "arm");
-        json.string_field(false, "desired_primary", &format!("pal_TaskEntry_{name}"));
-        json.key(false, "task_indices");
-        json.open_array();
-        json.element(true);
-        json.out.push_str(&index.to_string());
-        json.close_array();
-        json.key(false, "labels");
-        json.open_array();
-        json.element(true);
-        json.open_object();
-        json.string_field(true, "label", &format!("pal_TaskEntry_{name}"));
-        json.key(false, "task_indices");
-        json.open_array();
-        json.element(true);
-        json.out.push_str(&index.to_string());
-        json.close_array();
-        json.close_object();
-        json.close_array();
-        json.close_object();
+        write_application(
+            &mut json,
+            index == 0,
+            &ApplicationSpec {
+                entry_off,
+                isa: "arm",
+                desired_primary: format!("pal_TaskEntry_{name}"),
+                task_indices: &[index as u64],
+                labels: &[LabelSpec {
+                    label: &format!("pal_TaskEntry_{name}"),
+                    indices: &[index as u64],
+                }],
+            },
+        );
     }
     json.close_array();
 
