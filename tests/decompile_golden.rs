@@ -4388,6 +4388,16 @@ fn datamark_rejects_strict_argument_contract_before_mutation() {
             vec!["datamark", "none", "ffffffff:2"],
             "wraps the 32-bit address space",
         ),
+        // 16-hex-digit fields parse to negative longs; they must hit the
+        // wrap rejection, never a silent no-op or an obscure address error.
+        (
+            vec!["datamark", "none", "40010000:ffffffffffffffff"],
+            "wraps the 32-bit address space",
+        ),
+        (
+            vec!["datamark", "none", "ffffffffffffffff:1"],
+            "wraps the 32-bit address space",
+        ),
         (
             vec!["datamark", "none", "40010020:4", "40010010:4"],
             "not sorted",

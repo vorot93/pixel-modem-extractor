@@ -242,7 +242,11 @@ public class TameAnalysis extends HeadlessScript {
         if (length == 0) {
             fail("the region length is zero: " + arg);
         }
-        if (start > PalTasksSupport.UINT32_MAX || length > PalTasksSupport.UINT32_MAX
+        // Negative catches the 16-hex-digit overflow case: a field like
+        // "ffffffffffffffff" parses to a negative long via parseUnsignedLong,
+        // which the u32 comparisons alone would let through as signed.
+        if (start < 0 || length < 0 || start > PalTasksSupport.UINT32_MAX
+                || length > PalTasksSupport.UINT32_MAX
                 || Math.addExact(start, length) > PalTasksSupport.UINT32_END) {
             fail("the region wraps the 32-bit address space: " + arg);
         }
