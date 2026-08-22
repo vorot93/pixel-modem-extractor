@@ -1,9 +1,5 @@
 use super::{LoadPlan, Operation, PlannedEntry, PlannedOutput, PlannedStorage};
 use crate::error::{Error, Result};
-#[cfg(windows)]
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
-#[cfg(windows)]
-use cap_std::fs::{Dir as CapDirectory, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 #[cfg(unix)]
@@ -19,20 +15,33 @@ use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
-use std::os::windows::ffi::OsStringExt as _;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt as _;
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    VOLUME_NAME_DOS,
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+#[cfg(windows)]
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    GENERIC_READ, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, SYNCHRONIZE, VOLUME_NAME_DOS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 pub const LOAD_MAP_FORMAT: &str = "pixel-modem-extractor-scatter-load-v1";
 
@@ -182,7 +191,7 @@ impl TrustedDirectory {
 #[cfg(windows)]
 #[derive(Debug)]
 struct WindowsDirectoryHandle {
-    directory: CapDirectory,
+    file: File,
     proof: WindowsObjectProof,
 }
 
@@ -199,15 +208,12 @@ impl WindowsDirectoryHandle {
         require_windows_directory(&information, context)?;
         let proof = windows_object_proof(&file, &information, context)?;
         validate_windows_root_binding(expected_path, &proof, context)?;
-        Ok(Self {
-            directory: CapDirectory::from_std_file(file),
-            proof,
-        })
+        Ok(Self { file, proof })
     }
 
     fn try_clone(&self, context: &str) -> Result<Self> {
         Ok(Self {
-            directory: self.directory.try_clone().map_err(|error| {
+            file: self.file.try_clone().map_err(|error| {
                 bad(format!(
                     "{context} directory handle cannot be retained: {error}"
                 ))
@@ -217,20 +223,11 @@ impl WindowsDirectoryHandle {
     }
 
     fn open_directory(&self, name: &std::ffi::OsStr, context: &str) -> Result<Self> {
-        let mut options = CapOpenOptions::new();
-        options
-            .read(true)
-            .follow(FollowSymlinks::No)
-            .maybe_dir(true);
-        let file = self
-            .directory
-            .open_with(Path::new(name), &options)
-            .map_err(|error| {
+        let file = open_windows_component(&self.file, name, true).map_err(|error| {
                 bad(format!(
                     "{context} directory component cannot be opened relative to its retained parent: {error}"
                 ))
-            })?
-            .into_std();
+            })?;
         let metadata = file
             .metadata()
             .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
@@ -248,24 +245,15 @@ impl WindowsDirectoryHandle {
             &proof,
             context,
         )?;
-        Ok(Self {
-            directory: CapDirectory::from_std_file(file),
-            proof,
-        })
+        Ok(Self { file, proof })
     }
 
     fn open_regular_file(&self, name: &std::ffi::OsStr, context: &str) -> Result<File> {
-        let mut options = CapOpenOptions::new();
-        options.read(true).follow(FollowSymlinks::No);
-        let file = self
-            .directory
-            .open_with(Path::new(name), &options)
-            .map_err(|error| {
-                bad(format!(
-                    "{context} cannot be opened relative to its retained parent: {error}"
-                ))
-            })?
-            .into_std();
+        let file = open_windows_component(&self.file, name, false).map_err(|error| {
+            bad(format!(
+                "{context} cannot be opened relative to its retained parent: {error}"
+            ))
+        })?;
         let information = windows_file_information(&file, context)?;
         require_windows_regular_file(&file, &information, context)?;
         let proof = windows_object_proof(&file, &information, context)?;
@@ -279,6 +267,97 @@ impl WindowsDirectoryHandle {
         )?;
         Ok(file)
     }
+}
+
+#[cfg(windows)]
+fn open_windows_component(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<File> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(component)) if component == name)
+        || components.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not one normal component",
+        ));
+    }
+
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component contains NUL",
+        ));
+    }
+    let byte_length = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path component is too long",
+            )
+        })?;
+    let name = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: wide.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())
+            .expect("OBJECT_ATTRIBUTES size fits u32"),
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: std::ptr::addr_of!(name),
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut handle = INVALID_HANDLE_VALUE;
+    let create_options = FILE_OPEN_REPARSE_POINT
+        | FILE_SYNCHRONOUS_IO_NONALERT
+        | if directory {
+            FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+
+    // One counted component plus `RootDirectory` binds lookup to the retained parent.
+    // Reparse objects are exposed for rejection, and no delete sharing pins the opened name.
+    // SAFETY: every pointer refers to storage that outlives the call, `parent` is a live
+    // directory handle, and the returned owned handle is converted into `File` exactly once.
+    let status = unsafe {
+        NtCreateFile(
+            std::ptr::addr_of_mut!(handle),
+            GENERIC_READ | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            std::ptr::addr_of!(attributes),
+            std::ptr::addr_of_mut!(status_block),
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            create_options,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: translating an NTSTATUS has no pointer or lifetime requirements.
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(error as i32));
+    }
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::other(
+            "NtCreateFile succeeded without returning a valid handle",
+        ));
+    }
+
+    // SAFETY: successful `NtCreateFile` returned a new owned handle, checked above.
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 #[cfg(windows)]
