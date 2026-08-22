@@ -213,6 +213,16 @@ pub struct Symbol {
     pub name_conflicts: Vec<NameConflict>,
 }
 
+impl Symbol {
+    /// The record's actual decode ISA from its first validated decode range.
+    /// Every Ghidra `functions.json` record carries the family label
+    /// `arch: "arm"` regardless of Thumb decode ranges, so PAL application
+    /// ISA matching must use this, not `arch`.
+    pub fn decode_isa(&self) -> &str {
+        self.decode_ranges.first().map_or(self.arch, |r| r.isa)
+    }
+}
+
 /// One validated decode range as serialized in `symbols.json` and the strict
 /// pass-2 map: exact ISA, u32 bounds, and lowercase BLAKE3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1327,9 +1337,9 @@ pub(crate) fn write_pass2_symbol_map(
                     .is_some_and(|name| name != execution.original_primary)
                     && symbol.tier == Tier::Recovered =>
             {
-                if app.isa != symbol.arch {
+                if app.isa != symbol.decode_isa() {
                     return Err(Error::Serialize(
-                        "PAL application ISA does not match the symbol arch".into(),
+                        "PAL application ISA does not match the record's decode ISA".into(),
                     ));
                 }
                 Some(PalTransition {
@@ -2009,9 +2019,19 @@ pub(crate) fn build_map(
         hits.sort_by_key(|(t, _)| *t);
 
         let func_name = recovered_names[i].clone();
+        // PAL applications match on the record's actual decode ISA — Ghidra
+        // records carry the family label "arm" even for Thumb projections.
+        let record_isa = f
+            .execution
+            .as_ref()
+            .and_then(|e| e.decode_ranges.first())
+            .map_or(f.arch, |range| match range.isa {
+                crate::execution_ranges::DecodeIsa::Arm => "arm",
+                crate::execution_ranges::DecodeIsa::Thumb => "thumb",
+            });
         let pal_app = pal
             .and_then(|ctx| ctx.applications.get(&u32::try_from(f.entry).ok()?))
-            .filter(|app| app.isa == f.arch)
+            .filter(|app| app.isa == record_isa)
             .map(|app| PalApplicationRef {
                 isa: app.isa,
                 desired_primary: app.desired_primary.clone(),
@@ -4050,6 +4070,13 @@ mod tests {
         }
     }
 
+    fn pal_app_isa(isa: &'static str, desired: &str, tasks: &[(&str, u32)]) -> PalApplicationRef {
+        PalApplicationRef {
+            isa,
+            ..pal_app(desired, tasks)
+        }
+    }
+
     fn raw_with_pal(pal: Option<PalApplicationRef>) -> RawEvidence {
         RawEvidence { pal, ..raw() }
     }
@@ -4863,6 +4890,164 @@ mod tests {
                     .iter()
                     .any(|e| matches!(&e, TaggedEvidence::PalTask { .. }))),
             "pal evidence must attach per exact entry"
+        );
+    }
+
+    /// One Ghidra `functions.json` record whose validated decode projection is
+    /// Thumb (`bx lr`, 2 bytes). Every Ghidra record carries the family label
+    /// `arch: "arm"` regardless — PAL applications must therefore match on the
+    /// record's actual decode ISA, not the label.
+    fn thumb_ghidra_record_tree(tag: &str, record_name: &str, data_refs: &[u32]) -> PathBuf {
+        let root = tmp(&format!("pme_sym_pal_thumb_{tag}_{}", std::process::id()));
+        let dec = root.join("decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let mut image = vec![0u8; 0x300];
+        image[0x100..0x102].copy_from_slice(&[0x70, 0x47]); // thumb: bx lr
+        std::fs::write(root.join("02_MAIN.bin"), &image).unwrap();
+        let record = serde_json::json!({
+            "name": record_name,
+            "primary_source": "analysis",
+            "entry": "0x100",
+            "end": "0x102",
+            "size": 2,
+            "decode_ranges": [{
+                "isa": "thumb",
+                "start": "0x100",
+                "end": "0x102",
+                "blake3": crate::manifest::blake3_bytes(&image[0x100..0x102]),
+            }],
+            "decode_range_errors": [],
+            "data_refs": data_refs.iter().map(|r| format!("0x{r:x}")).collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            dec.join("functions.json"),
+            serde_json::to_vec(&vec![record]).unwrap(),
+        )
+        .unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
+        root
+    }
+
+    #[test]
+    fn build_map_attaches_pal_evidence_by_decode_isa_not_arch_label() {
+        // Layer 1: a Thumb-ISA application attaches its evidence to a Ghidra
+        // record whose validated projection is Thumb (the family label is
+        // "arm"), and a token guess at that record never displaces the task
+        // primary. With the label comparison, the evidence silently failed to
+        // attach and the provisional token name won.
+        let root = thumb_ghidra_record_tree("attach", "pal_TaskEntry_gamma", &[0x20]);
+        let tokens = HashMap::from([(0x20u32, "■format♦gamma tok■domain♦D".to_string())]);
+        let manifest = root.join("manifest.json");
+        let pal = pal_ctx(
+            "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:0",
+            vec![(
+                0x100,
+                pal_app_isa("thumb", "pal_TaskEntry_gamma", &[("gamma", 2)]),
+            )],
+        );
+        let symbols = build_map(&root, "02_MAIN", &tokens, &manifest, Some(&pal)).unwrap();
+
+        let gamma = symbols
+            .iter()
+            .find(|s| s.owner == FunctionOwner::Ghidra && s.address == "0x00000100")
+            .unwrap();
+        assert!(
+            gamma
+                .evidence
+                .iter()
+                .any(|e| matches!(&e, TaggedEvidence::PalTask { task } if task.name == "gamma")),
+            "the thumb-ISA application did not attach: {:?}",
+            gamma.evidence
+        );
+        assert_eq!(gamma.name.as_deref(), Some("pal_TaskEntry_gamma"));
+        assert_eq!(gamma.tier, Tier::Recovered);
+        assert!(
+            gamma
+                .annotations
+                .iter()
+                .any(|annotation| annotation.starts_with("pal task: gamma")),
+            "PAL annotation missing: {:?}",
+            gamma.annotations
+        );
+
+        // An ARM-ISA application at the same thumb record attaches nothing
+        // (and, without other evidence, no name is applied at all).
+        let root = thumb_ghidra_record_tree("mismatch", "FUN_00000100", &[]);
+        let pal = pal_ctx(
+            "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:0",
+            vec![(0x100, pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]))],
+        );
+        let symbols = build_map(&root, "02_MAIN", &HashMap::new(), &manifest, Some(&pal)).unwrap();
+        let record = symbols
+            .iter()
+            .find(|s| s.owner == FunctionOwner::Ghidra && s.address == "0x00000100")
+            .unwrap();
+        assert!(
+            !record
+                .evidence
+                .iter()
+                .any(|e| matches!(&e, TaggedEvidence::PalTask { .. })),
+            "an ISA-mismatched application attached: {:?}",
+            record.evidence
+        );
+        assert!(record.name.is_none());
+    }
+
+    #[test]
+    fn map_pal_transition_matches_thumb_decode_isa() {
+        // Layer 2: the map writer's transition ISA check must compare the
+        // application ISA against the record's decode ISA, so the authorized
+        // registration rename of an applied Thumb task primary carries the
+        // exact pal_transition instead of an arch-label mismatch error.
+        let root = thumb_ghidra_record_tree("transition", "pal_TaskEntry_gamma", &[]);
+        let image = std::fs::read(root.join("02_MAIN.bin")).unwrap();
+        let load_addr = 0u32;
+        let (identity, _) = identity_for(&root, 0x100, &image, load_addr);
+        let decode_ranges = identity
+            .decode_ranges
+            .iter()
+            .map(DecodeRangeWire::from_authenticated)
+            .collect::<Vec<_>>();
+        let symbols = vec![Symbol {
+            address: "0x00000100".into(),
+            arch: "arm", // the Ghidra family label, deliberately not the decode ISA
+            tool: crate::recover_source::Tool::Ghidra,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: Some(identity.execution_blake3),
+            decode_ranges,
+            original_name: "pal_TaskEntry_gamma".into(),
+            name: Some("gamma_task_fn".into()), // registration-rank rename
+            tier: Tier::Recovered,
+            evidence: Vec::new(),
+            annotations: vec!["pal task: gamma slot=0x40010180 priority=7 stack=1024".into()],
+            name_conflicts: Vec::new(),
+        }];
+        let pal = pal_ctx(
+            "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:0",
+            vec![(
+                0x100,
+                pal_app_isa("thumb", "pal_TaskEntry_gamma", &[("gamma", 2)]),
+            )],
+        );
+        let map_path = root.join("map.json");
+        write_pass2_symbol_map(
+            &map_path,
+            &root,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            Some(&pal),
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["symbols"][0]["pal_transition"],
+            serde_json::json!({"from": "pal_owned", "to": "pass2_owned"}),
+            "the thumb task rename lost its authorized transition: {parsed}"
         );
     }
 

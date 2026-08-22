@@ -2488,9 +2488,9 @@ fn headless_process_args(
 }
 
 /// Extract the `N` from the summary line
-/// `ApplySymbols: image=<image> applied N names, M plate comments, skipped K`.
-/// `None` when the line is missing or the count is not an integer — the caller
-/// treats `None` as "no information from pass 2".
+/// `ApplySymbols: image=<image> applied N names, M plate comments over E
+/// executions`. `None` when the line is missing or the count is not an
+/// integer — the caller treats `None` as "no information from pass 2".
 fn parse_pass2_summary(stdout: &str) -> Option<usize> {
     for line in stdout.lines() {
         let Some(rest) = line.strip_prefix("ApplySymbols:") else {
@@ -4708,8 +4708,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn parse_pass2_summary_reads_applied_count() {
-        let stdout =
-            "...\nApplySymbols: image=02_MAIN applied 42 names, 7 plate comments, skipped 3\n";
+        let stdout = "...\nApplySymbols: image=02_MAIN applied 42 names, 7 plate comments over 6 executions\n";
         assert_eq!(parse_pass2_summary(stdout), Some(42));
         // Missing / malformed summary -> None (caller treats as "no info").
         assert_eq!(parse_pass2_summary("nothing useful\n"), None);
