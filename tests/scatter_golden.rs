@@ -494,7 +494,9 @@ fn parse_descriptors(image: &[u8], pins: &CorpusPins) -> Vec<ExpectedDescriptor>
     );
 
     table
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, entry)| {
             let handler = read_u32(entry, 12);

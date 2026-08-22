@@ -1512,7 +1512,7 @@ fn parse_blake3(value: &str, context: &str) -> Result<[u8; 32]> {
         return Err(bad(format!("{context} is not canonical lowercase BLAKE3")));
     }
     let mut output = [0; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         output[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
     Ok(output)

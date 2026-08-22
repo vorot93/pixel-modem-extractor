@@ -51,7 +51,7 @@ pub fn parse(bytes: &[u8]) -> Result<Database> {
 
     // Pass 1: tokens + removal dates (strings follow the whole entry table).
     let mut meta: Vec<(u32, Option<Date>)> = Vec::with_capacity(count);
-    for chunk in bytes[HEADER_LEN..table_end].chunks_exact(ENTRY_LEN) {
+    for chunk in bytes[HEADER_LEN..table_end].as_chunks::<ENTRY_LEN>().0 {
         let token = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let date_removed = if chunk[4..8] == [0xFF, 0xFF, 0xFF, 0xFF] {
             None
