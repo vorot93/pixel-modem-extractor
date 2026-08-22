@@ -365,6 +365,18 @@ impl<'a> RuntimeImage<'a> {
         Self::from_artifact(raw, base, &root, map.try_exists()?.then_some(map.as_path()))
     }
 
+    /// The raw image bounds: the base address and byte size of the one
+    /// raw backing segment every constructor installs. Scatter
+    /// destinations never move or resize the raw image.
+    pub(crate) fn image_bounds(&self) -> (u32, u32) {
+        let segment = self
+            .segments
+            .iter()
+            .find(|segment| matches!(segment.backing, Backing::Raw(_)))
+            .expect("every runtime image carries the raw segment");
+        (segment.start, segment.end.saturating_sub(segment.start))
+    }
+
     pub(crate) fn read_u8(&self, address: u32) -> Result<u8> {
         Ok(self.read_exact(address, 1)?[0])
     }

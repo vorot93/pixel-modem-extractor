@@ -4,7 +4,8 @@
 // definition-aware dataflow, and the graph queries used by the induction
 // proofs live in `cfg`. The counting-loop, dual-exit, suffix, and
 // slot-base proofs assemble the initializer candidates defined here;
-// later stages table-validate them and materialize the artifact.
+// `table` validates their slots and allocates deterministic
+// applications, and `discover` returns the final plan boundary.
 
 use crate::arm32::Register;
 use crate::error::Error;
@@ -14,6 +15,7 @@ use std::fmt;
 
 mod cfg;
 mod discover;
+mod table;
 
 /// Discover every anchor-reference candidate: one entry per semantic
 /// reference that survives unique-prologue root selection and bounded
@@ -37,6 +39,20 @@ pub(super) fn discover_initializer_candidates(
 ) -> std::result::Result<Vec<InitializerCandidate>, PalTaskError> {
     let mut budget = CandidateBudget::default();
     discover::discover_initializer_candidates_bounded(image, label, &mut budget)
+}
+
+/// The complete discovery boundary: prove initializer candidates,
+/// table-validate each against one shared non-refundable budget, and
+/// return the single complete plan. `Ok(None)` means no candidate
+/// crossed the first-slot plausibility threshold; several complete
+/// survivors are the typed ambiguity; a plausible candidate that then
+/// fails is the contextual malformed error even when a sibling is
+/// valid.
+pub(super) fn discover(
+    image: &RuntimeImage<'_>,
+    label: &str,
+) -> std::result::Result<Option<TaskPlan>, PalTaskError> {
+    discover::discover(image, label)
 }
 
 /// Exact nine-byte runtime materialization searched over byte-backed
@@ -69,6 +85,21 @@ pub(crate) const MAX_SLOT_LEAF_INSTRUCTIONS: usize = 16;
 /// The `pal-task-descriptor-v1` projection subtracts this fixed offset
 /// from the discovered name field under checked arithmetic.
 pub(crate) const DESCRIPTOR_PROJECTION_OFFSET: u32 = 0x24;
+/// Maximum decoded table capacity; parsing never reads more slots.
+pub(crate) const MAX_TABLE_CAPACITY: u32 = 4096;
+/// Maximum decoded slot stride in bytes.
+pub(crate) const MAX_TABLE_STRIDE: u32 = 64 * 1024;
+/// Maximum task-name length in bytes (the NUL terminator is extra).
+pub(crate) const MAX_TASK_NAME_BYTES: usize = 128;
+/// Bytes charged per bounded name read: the printable maximum plus the
+/// NUL probe.
+pub(crate) const TASK_NAME_READ_BYTES: u64 = MAX_TASK_NAME_BYTES as u64 + 1;
+/// Bytes charged per entry instruction decode: the four-byte ISA
+/// maximum.
+pub(crate) const MAX_ENTRY_INSTRUCTION_BYTES: u64 = 4;
+/// Ghidra `SymbolUtilities.MAX_SYMBOL_NAME_LENGTH`: every final leaf is
+/// bounded to this many ASCII characters.
+pub(crate) const MAX_SYMBOL_LEAF_BYTES: usize = 2000;
 
 /// The shared non-refundable candidate-validation budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -104,7 +135,7 @@ impl CandidateBudget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TaskIsa {
     Arm,
@@ -112,7 +143,6 @@ pub(crate) enum TaskIsa {
 }
 
 impl TaskIsa {
-    #[allow(dead_code)] // entry validation consumes this in the table stage
     pub(crate) const fn decode_isa(self) -> crate::execution_ranges::DecodeIsa {
         match self {
             TaskIsa::Arm => crate::execution_ranges::DecodeIsa::Arm,
@@ -131,7 +161,6 @@ impl fmt::Display for TaskIsa {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // later stages construct every variant; Task 4 raises resource and runtime errors
 pub(crate) enum PalTaskError {
     Malformed {
         initializer: u32,
@@ -349,4 +378,90 @@ pub(crate) struct TaskTableGeometry {
 pub(crate) struct InitializerCandidate {
     pub evidence: InitializerEvidence,
     pub geometry: TaskTableGeometry,
+}
+
+/// One complete validated PAL task table plan. Carries the image
+/// identity, the initializer proof, the parsed table, every task
+/// record, the deterministic applications, and the terminal evidence;
+/// no analyzer inventory appears here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskPlan {
+    pub image_base: u32,
+    pub image_size: u32,
+    pub initializer: InitializerEvidence,
+    pub table: TaskTable,
+    pub tasks: Vec<TaskRecord>,
+    pub applications: Vec<TaskApplication>,
+    pub terminal: TerminalRecord,
+}
+
+/// The validated descriptor-v1 table: geometry plus the derived field
+/// offsets and the observed slot count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskTable {
+    pub slot_base: u32,
+    pub name_offset: u32,
+    pub index_offset: u32,
+    pub stride: u32,
+    pub capacity: u32,
+    pub count: u32,
+    pub descriptor_projection_offset: u32,
+    pub priority_offset: u32,
+    pub stack_size_offset: u32,
+    pub entry_offset: u32,
+    pub callback_offset: u32,
+    pub unknown_pointer_offset: u32,
+}
+
+/// One parsed nonterminal slot: the exact firmware name separate from
+/// the allocated label, the stored pointer separate from the
+/// normalized entry, and the evidence hashes with storage provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskRecord {
+    pub index: u32,
+    pub slot: u32,
+    pub slot_blake3: [u8; 32],
+    pub name_pointer: u32,
+    pub name: String,
+    pub task_label: String,
+    pub priority: u8,
+    pub stack_size: u32,
+    pub entry_pointer: u32,
+    pub entry: u32,
+    pub isa: TaskIsa,
+    pub instruction_size: u8,
+    pub instruction_blake3: [u8; 32],
+    pub callback: u32,
+    pub unknown_pointer: u32,
+    pub slot_storage: Vec<StorageSpan>,
+    pub name_storage: Vec<StorageSpan>,
+    pub entry_storage: Vec<StorageSpan>,
+}
+
+/// One application group per normalized `(entry, isa)`: the desired
+/// global primary, the complete member task indices, and the complete
+/// namespaced-label decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskApplication {
+    pub entry: u32,
+    pub isa: TaskIsa,
+    pub desired_primary: String,
+    pub task_indices: Vec<u32>,
+    pub labels: Vec<TaskLabelApplication>,
+}
+
+/// One allocated task label and the member task indices it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskLabelApplication {
+    pub label: String,
+    pub task_indices: Vec<u32>,
+}
+
+/// The terminal slot evidence: address, complete-slot hash, and
+/// storage provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalRecord {
+    pub slot: u32,
+    pub slot_blake3: [u8; 32],
+    pub storage: Vec<StorageSpan>,
 }

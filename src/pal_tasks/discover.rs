@@ -15,13 +15,14 @@ use crate::pal_tasks::cfg::{
     DataflowStates, LocalCfg, ValueFact, decode_entry_rooted_cfg, decode_thumb_at, decode_with,
     visible_pc, wrapping_offset,
 };
+use crate::pal_tasks::table;
 use crate::pal_tasks::{
     ANCHOR_PATTERN, AnchorCfgCandidate, AnchorProofPath, AnchorProvenance, AnchorReference,
     AnchorReferenceKind, CandidateBudget, CapacityGuard, DESCRIPTOR_PROJECTION_OFFSET,
     InitializerCandidate, InitializerEvidence, MAX_ANCHOR_OCCURRENCES,
     MAX_ANCHOR_REFERENCE_DISTANCE, MAX_ANCHOR_REFERENCES, MAX_CANDIDATE_TUPLES,
     MAX_MOVW_MOVT_SPAN_INSTRUCTIONS, MAX_SLOT_LEAF_INSTRUCTIONS, PROLOGUE_WINDOW_BYTES,
-    PalTaskError, TaskTableGeometry,
+    PalTaskError, TaskPlan, TaskTableGeometry,
 };
 use crate::runtime_image::{MAX_EXACT_READ, RuntimeImage, StorageSpan};
 use scaleservers_arm32_assembly::Arm32Condition;
@@ -69,6 +70,45 @@ pub(super) fn discover_anchor_cfg(
         });
     }
     Ok(candidates)
+}
+
+/// The final discovery boundary: prove every initializer candidate,
+/// table-validate each against one shared non-refundable budget, and
+/// return the single complete plan. No plausible survivor is
+/// `Ok(None)`; a plausible candidate that then fails is the contextual
+/// error even when a sibling validates; several complete survivors
+/// report every initializer/slot-base pair.
+pub(super) fn discover(
+    image: &RuntimeImage<'_>,
+    label: &str,
+) -> std::result::Result<Option<TaskPlan>, PalTaskError> {
+    let mut budget = CandidateBudget::default();
+    let candidates = discover_initializer_candidates_bounded(image, label, &mut budget)?;
+    let (image_base, image_size) = image.image_bounds();
+    let mut plans = Vec::new();
+    for candidate in &candidates {
+        if let Some(validated) = table::validate_candidate(image, label, candidate, &mut budget)? {
+            plans.push(TaskPlan {
+                image_base,
+                image_size,
+                initializer: candidate.evidence.clone(),
+                table: validated.table,
+                tasks: validated.tasks,
+                applications: validated.applications,
+                terminal: validated.terminal,
+            });
+        }
+    }
+    match plans.len() {
+        0 => Ok(None),
+        1 => Ok(plans.pop()),
+        _ => Err(PalTaskError::Ambiguous {
+            candidates: plans
+                .iter()
+                .map(|plan| (plan.initializer.cfg_entry, plan.table.slot_base))
+                .collect(),
+        }),
+    }
 }
 
 /// One exact `PALTskTm\0` occurrence with its nine-byte storage
@@ -240,9 +280,13 @@ fn code_storage_spans(
     let mut spans = Vec::new();
     let mut run: Option<(u32, u32)> = None;
     for (pc, instruction) in cfg.instructions() {
-        let end = pc
-            .checked_add(u32::from(instruction.length))
-            .expect("decoded instruction extent stays inside the CFG window");
+        let Some(end) = pc.checked_add(u32::from(instruction.length)) else {
+            return Err(PalTaskError::Runtime {
+                address: pc,
+                size: u32::from(instruction.length),
+                reason: format!("{label}: decoded instruction extent wraps the address space"),
+            });
+        };
         match run {
             Some((start, run_end)) if pc == run_end => run = Some((start, end)),
             Some((start, run_end)) => {
@@ -665,7 +709,11 @@ fn find_anchor_call(
         let carries_anchor = states.before(pc).is_some_and(|state| {
             state.registers[..4].iter().any(|fact| {
                 fact.is_some_and(|fact| {
-                    fact.value == reference.anchor && fact.root == reference.definitions[0]
+                    fact.value == reference.anchor
+                        && reference
+                            .definitions
+                            .first()
+                            .is_some_and(|root| *root == fact.root)
                 })
             })
         });
@@ -1498,35 +1546,29 @@ fn is_recognized_prologue(instruction: &DecodedInstruction) -> bool {
         })
 }
 
+/// Shared fixture machinery for the PAL test modules: raw/scatter image
+/// construction and the two-pass label-resolving Thumb assembler. Both
+/// the discovery tests here and the table-validation tests in `table`
+/// build their fixtures from these helpers.
 #[cfg(test)]
-mod tests {
-    use super::{find_anchor_occurrences, find_anchor_references, merge_initializer_candidate};
-    use crate::arm32::Register;
-    use crate::pal_tasks::discover_anchor_cfg;
-    use crate::pal_tasks::discover_initializer_candidates;
-    use crate::pal_tasks::{
-        ANCHOR_PATTERN, AnchorProofPath, AnchorProvenance, AnchorReference, AnchorReferenceKind,
-        CandidateBudget, CapacityGuard, InitializerCandidate, InitializerEvidence,
-        MAX_ANCHOR_REFERENCE_DISTANCE, MAX_CANDIDATE_TUPLES, MAX_CANDIDATE_VALIDATION_BYTES,
-        MAX_SLOT_LEAF_INSTRUCTIONS, PalTaskError, TaskTableGeometry,
-    };
-    use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
+pub(crate) mod test_support {
+    use crate::runtime_image::RuntimeImage;
     use crate::scatter::{
         Descriptor, HandlerMap, LoadPlan, Operation, PlannedEntry, PlannedOutput,
     };
     use scaleservers_arm32_assembly::{
-        Arm32Condition, Arm32GeneralPurposeRegister as Gpr, Arm32LowGeneralPurposeRegister as Low,
+        Arm32GeneralPurposeRegister as Gpr, Arm32LowGeneralPurposeRegister as Low,
         ArmT32Instruction as T32,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
-    const BASE: u32 = 0x1000;
+    pub(crate) const BASE: u32 = 0x1000;
 
-    fn raw_image(bytes: &[u8]) -> RuntimeImage<'_> {
+    pub(crate) fn raw_image(bytes: &[u8]) -> RuntimeImage<'_> {
         RuntimeImage::from_plan(bytes, BASE, None).expect("raw fixture image")
     }
 
-    fn bytes_entry(index: usize, destination: u32, bytes: Vec<u8>) -> PlannedEntry {
+    pub(crate) fn bytes_entry(index: usize, destination: u32, bytes: Vec<u8>) -> PlannedEntry {
         PlannedEntry {
             index,
             descriptor: Descriptor {
@@ -1541,7 +1583,7 @@ mod tests {
         }
     }
 
-    fn zero_entry(index: usize, destination: u32, size: u32) -> PlannedEntry {
+    pub(crate) fn zero_entry(index: usize, destination: u32, size: u32) -> PlannedEntry {
         PlannedEntry {
             index,
             descriptor: Descriptor {
@@ -1556,7 +1598,7 @@ mod tests {
         }
     }
 
-    fn scatter_plan(image_size: u32, entries: Vec<PlannedEntry>) -> LoadPlan {
+    pub(crate) fn scatter_plan(image_size: u32, entries: Vec<PlannedEntry>) -> LoadPlan {
         let logical = entries
             .iter()
             .map(|entry| u64::from(entry.descriptor.size))
@@ -1579,25 +1621,212 @@ mod tests {
         }
     }
 
-    fn enc(instruction: &T32) -> Vec<u8> {
+    pub(crate) fn enc(instruction: &T32) -> Vec<u8> {
         instruction.encode().expect("fixture encodes")
     }
 
-    fn put(bytes: &mut [u8], offset: usize, part: &[u8]) {
+    pub(crate) fn put(bytes: &mut [u8], offset: usize, part: &[u8]) {
         bytes[offset..offset + part.len()].copy_from_slice(part);
     }
 
-    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    pub(crate) fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn gpr(number: u8) -> Gpr {
+    pub(crate) fn gpr(number: u8) -> Gpr {
         Gpr::from_operand_bits(number)
     }
 
-    fn low(number: u8) -> Low {
+    pub(crate) fn low(number: u8) -> Low {
         Low::from_operand_bits(number)
     }
+
+    pub(crate) type FixtureLabels = BTreeMap<&'static str, u32>;
+    pub(crate) type FixtureBuild = Box<dyn Fn(u32, &FixtureLabels) -> T32>;
+
+    pub(crate) enum FixtureItem {
+        Insn(&'static str, FixtureBuild),
+        Word(&'static str, u32),
+        Data(&'static str, usize),
+        Anchor(&'static str),
+        Align(u32),
+    }
+
+    pub(crate) fn insn(
+        label: &'static str,
+        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
+    ) -> FixtureItem {
+        FixtureItem::Insn(label, Box::new(build))
+    }
+
+    /// Assemble a complete fixture image: pass one measures every item
+    /// with neutral branch offsets, pass two re-encodes with the
+    /// resolved label addresses.
+    pub(crate) fn assemble(base: u32, items: &[FixtureItem]) -> (Vec<u8>, FixtureLabels) {
+        let unresolved = FixtureLabels::new();
+        let mut starts = Vec::with_capacity(items.len());
+        let mut pc = base;
+        for item in items {
+            if let FixtureItem::Align(to) = item {
+                pc = pc.div_ceil(*to) * *to;
+            }
+            starts.push(pc);
+            let size = match item {
+                FixtureItem::Insn(_, build) => u32::try_from(
+                    build(pc, &unresolved)
+                        .encode()
+                        .expect("fixture instruction encodes")
+                        .len(),
+                )
+                .expect("fixture instruction size fits u32"),
+                FixtureItem::Word(_, _) | FixtureItem::Data(_, 4) => 4,
+                FixtureItem::Data(_, size) => *size as u32,
+                FixtureItem::Anchor(_) => super::ANCHOR_PATTERN.len() as u32,
+                FixtureItem::Align(_) => 0,
+            };
+            pc += size;
+        }
+        let labels: FixtureLabels = items
+            .iter()
+            .zip(&starts)
+            .filter_map(|(item, start)| match item {
+                FixtureItem::Insn(label, _)
+                | FixtureItem::Word(label, _)
+                | FixtureItem::Data(label, _)
+                | FixtureItem::Anchor(label) => (!label.is_empty()).then_some((*label, *start)),
+                FixtureItem::Align(_) => None,
+            })
+            .collect();
+        let mut bytes = vec![0u8; (pc - base) as usize];
+        for (item, start) in items.iter().zip(&starts) {
+            match item {
+                FixtureItem::Insn(_, build) => {
+                    let part = build(*start, &labels)
+                        .encode()
+                        .expect("fixture instruction encodes");
+                    put(&mut bytes, (*start - base) as usize, &part);
+                }
+                FixtureItem::Word(_, value) => {
+                    put_u32(&mut bytes, (*start - base) as usize, *value)
+                }
+                FixtureItem::Data(_, _) => {}
+                FixtureItem::Anchor(_) => {
+                    put(&mut bytes, (*start - base) as usize, super::ANCHOR_PATTERN)
+                }
+                FixtureItem::Align(_) => {}
+            }
+        }
+        (bytes, labels)
+    }
+
+    pub(crate) fn branch_offset(target: u32, pc: u32) -> i32 {
+        i32::try_from(i64::from(target) - i64::from(pc) - 4)
+            .expect("fixture branch offset fits i32")
+    }
+
+    pub(crate) fn branch_i16(target: u32, pc: u32) -> i16 {
+        i16::try_from(branch_offset(target, pc)).expect("fixture branch offset fits i16")
+    }
+
+    pub(crate) fn cbz_offset(target: u32, pc: u32) -> u8 {
+        u8::try_from(branch_offset(target, pc)).expect("fixture cbz offset fits u8")
+    }
+
+    pub(crate) fn aligned_offset(target: u32, pc: u32) -> u16 {
+        let aligned = (pc.wrapping_add(4)) & !3;
+        u16::try_from(target - aligned).expect("fixture aligned offset fits u16")
+    }
+
+    // Pass one encodes with unresolved labels, so every lookup falls
+    // back to a neutral target that keeps the encoding length fixed.
+    pub(crate) fn branch_to(l: &FixtureLabels, name: &str, pc: u32) -> i16 {
+        branch_i16(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    pub(crate) fn branch32_to(l: &FixtureLabels, name: &str, pc: u32) -> i32 {
+        branch_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    pub(crate) fn cbz_to(l: &FixtureLabels, name: &str, pc: u32) -> u8 {
+        cbz_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    pub(crate) fn adr_to(l: &FixtureLabels, name: &str, pc: u32) -> u16 {
+        aligned_offset(l.get(name).copied().unwrap_or((pc + 8) & !3), pc)
+    }
+
+    pub(crate) fn word_at(l: &FixtureLabels, name: &str) -> u32 {
+        l.get(name).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn replace_insn(
+        mut items: Vec<FixtureItem>,
+        label: &'static str,
+        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
+    ) -> Vec<FixtureItem> {
+        let position = items
+            .iter()
+            .position(|item| matches!(item, FixtureItem::Insn(existing, _) if *existing == label))
+            .expect("fixture label exists");
+        items[position] = insn(label, build);
+        items
+    }
+
+    pub(crate) fn insert_after(
+        mut items: Vec<FixtureItem>,
+        label: &'static str,
+        new: FixtureItem,
+    ) -> Vec<FixtureItem> {
+        let position = items
+            .iter()
+            .position(|item| matches!(item, FixtureItem::Insn(existing, _) if *existing == label))
+            .expect("fixture label exists");
+        items.insert(position + 1, new);
+        items
+    }
+
+    pub(crate) fn insert_before(
+        mut items: Vec<FixtureItem>,
+        label: &'static str,
+        new: FixtureItem,
+    ) -> Vec<FixtureItem> {
+        let position = items
+            .iter()
+            .position(|item| matches!(item, FixtureItem::Insn(existing, _) if *existing == label))
+            .expect("fixture label exists");
+        items.insert(position, new);
+        items
+    }
+
+    pub(crate) fn remove_labeled(
+        mut items: Vec<FixtureItem>,
+        label: &'static str,
+    ) -> Vec<FixtureItem> {
+        items.retain(|item| !matches!(item, FixtureItem::Insn(existing, _) if *existing == label));
+        items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{
+        BASE, FixtureItem, adr_to, assemble, branch_to, branch32_to, bytes_entry, cbz_to, enc, gpr,
+        insert_after, insert_before, insn, low, put, put_u32, raw_image, remove_labeled,
+        replace_insn, scatter_plan, word_at, zero_entry,
+    };
+    use super::{find_anchor_occurrences, find_anchor_references, merge_initializer_candidate};
+    use crate::arm32::Register;
+    use crate::pal_tasks::discover_anchor_cfg;
+    use crate::pal_tasks::discover_initializer_candidates;
+    use crate::pal_tasks::{
+        ANCHOR_PATTERN, AnchorProofPath, AnchorProvenance, AnchorReference, AnchorReferenceKind,
+        CandidateBudget, CapacityGuard, InitializerCandidate, InitializerEvidence,
+        MAX_ANCHOR_REFERENCE_DISTANCE, MAX_CANDIDATE_TUPLES, MAX_CANDIDATE_VALIDATION_BYTES,
+        MAX_SLOT_LEAF_INSTRUCTIONS, PalTaskError, TaskTableGeometry,
+    };
+    use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
+    use scaleservers_arm32_assembly::{Arm32Condition, ArmT32Instruction as T32};
+    use std::collections::BTreeSet;
 
     fn addresses(occurrences: &[super::AnchorOccurrence]) -> Vec<u32> {
         occurrences.iter().map(|anchor| anchor.address).collect()
@@ -1933,166 +2162,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    type FixtureLabels = BTreeMap<&'static str, u32>;
-    type FixtureBuild = Box<dyn Fn(u32, &FixtureLabels) -> T32>;
-
-    enum FixtureItem {
-        Insn(&'static str, FixtureBuild),
-        Word(&'static str, u32),
-        Data(&'static str, usize),
-        Anchor(&'static str),
-        Align(u32),
-    }
-
-    fn insn(
-        label: &'static str,
-        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
-    ) -> FixtureItem {
-        FixtureItem::Insn(label, Box::new(build))
-    }
-
-    /// Assemble a complete fixture image: pass one measures every item
-    /// with neutral branch offsets, pass two re-encodes with the
-    /// resolved label addresses.
-    fn assemble(base: u32, items: &[FixtureItem]) -> (Vec<u8>, FixtureLabels) {
-        let unresolved = FixtureLabels::new();
-        let mut starts = Vec::with_capacity(items.len());
-        let mut pc = base;
-        for item in items {
-            if let FixtureItem::Align(to) = item {
-                pc = pc.div_ceil(*to) * *to;
-            }
-            starts.push(pc);
-            let size = match item {
-                FixtureItem::Insn(_, build) => u32::try_from(
-                    build(pc, &unresolved)
-                        .encode()
-                        .expect("fixture instruction encodes")
-                        .len(),
-                )
-                .expect("fixture instruction size fits u32"),
-                FixtureItem::Word(_, _) | FixtureItem::Data(_, 4) => 4,
-                FixtureItem::Data(_, size) => *size as u32,
-                FixtureItem::Anchor(_) => ANCHOR_PATTERN.len() as u32,
-                FixtureItem::Align(_) => 0,
-            };
-            pc += size;
-        }
-        let labels: FixtureLabels = items
-            .iter()
-            .zip(&starts)
-            .filter_map(|(item, start)| match item {
-                FixtureItem::Insn(label, _)
-                | FixtureItem::Word(label, _)
-                | FixtureItem::Data(label, _)
-                | FixtureItem::Anchor(label) => (!label.is_empty()).then_some((*label, *start)),
-                FixtureItem::Align(_) => None,
-            })
-            .collect();
-        let mut bytes = vec![0u8; (pc - base) as usize];
-        for (item, start) in items.iter().zip(&starts) {
-            match item {
-                FixtureItem::Insn(_, build) => {
-                    let part = build(*start, &labels)
-                        .encode()
-                        .expect("fixture instruction encodes");
-                    put(&mut bytes, (*start - base) as usize, &part);
-                }
-                FixtureItem::Word(_, value) => {
-                    put_u32(&mut bytes, (*start - base) as usize, *value)
-                }
-                FixtureItem::Data(_, _) => {}
-                FixtureItem::Anchor(_) => put(&mut bytes, (*start - base) as usize, ANCHOR_PATTERN),
-                FixtureItem::Align(_) => {}
-            }
-        }
-        (bytes, labels)
-    }
-
-    fn branch_offset(target: u32, pc: u32) -> i32 {
-        i32::try_from(i64::from(target) - i64::from(pc) - 4)
-            .expect("fixture branch offset fits i32")
-    }
-
-    fn branch_i16(target: u32, pc: u32) -> i16 {
-        i16::try_from(branch_offset(target, pc)).expect("fixture branch offset fits i16")
-    }
-
-    fn cbz_offset(target: u32, pc: u32) -> u8 {
-        u8::try_from(branch_offset(target, pc)).expect("fixture cbz offset fits u8")
-    }
-
-    fn aligned_offset(target: u32, pc: u32) -> u16 {
-        let aligned = (pc.wrapping_add(4)) & !3;
-        u16::try_from(target - aligned).expect("fixture aligned offset fits u16")
-    }
-
-    // Pass one encodes with unresolved labels, so every lookup falls
-    // back to a neutral target that keeps the encoding length fixed.
-    fn branch_to(l: &FixtureLabels, name: &str, pc: u32) -> i16 {
-        branch_i16(l.get(name).copied().unwrap_or(pc + 4), pc)
-    }
-
-    fn branch32_to(l: &FixtureLabels, name: &str, pc: u32) -> i32 {
-        branch_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
-    }
-
-    fn cbz_to(l: &FixtureLabels, name: &str, pc: u32) -> u8 {
-        cbz_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
-    }
-
-    fn adr_to(l: &FixtureLabels, name: &str, pc: u32) -> u16 {
-        aligned_offset(l.get(name).copied().unwrap_or((pc + 8) & !3), pc)
-    }
-
-    fn word_at(l: &FixtureLabels, name: &str) -> u32 {
-        l.get(name).copied().unwrap_or(0)
-    }
-
-    fn replace_insn(
-        mut items: Vec<FixtureItem>,
-        label: &'static str,
-        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
-    ) -> Vec<FixtureItem> {
-        let position = items
-            .iter()
-            .position(|item| matches!(item, FixtureItem::Insn(existing, _) if *existing == label))
-            .expect("fixture label exists");
-        items[position] = insn(label, build);
-        items
-    }
-
-    fn insert_after(
-        mut items: Vec<FixtureItem>,
-        label: &'static str,
-        new: FixtureItem,
-    ) -> Vec<FixtureItem> {
-        let position = items
-            .iter()
-            .position(|item| matches!(item, FixtureItem::Insn(existing, _) if *existing == label))
-            .expect("fixture label exists");
-        items.insert(position + 1, new);
-        items
-    }
-
-    fn insert_before(
-        mut items: Vec<FixtureItem>,
-        label: &'static str,
-        new: FixtureItem,
-    ) -> Vec<FixtureItem> {
-        let position = items
-            .iter()
-            .position(|item| matches!(item, FixtureItem::Insn(existing, _) if *existing == label))
-            .expect("fixture label exists");
-        items.insert(position, new);
-        items
-    }
-
-    fn remove_labeled(mut items: Vec<FixtureItem>, label: &'static str) -> Vec<FixtureItem> {
-        items.retain(|item| !matches!(item, FixtureItem::Insn(existing, _) if *existing == label));
-        items
     }
 
     fn assert_no_initializer(items: Vec<FixtureItem>) {
