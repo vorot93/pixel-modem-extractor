@@ -181,6 +181,23 @@ pub struct ImageReport {
     /// wrong-image/non-conserving summary, or a missing pass-2 image result).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_types_error: Option<String>,
+    /// The seven current-run PAL application counters, carried only by
+    /// images whose pass-1 import applied a configured PAL task map
+    /// (`ImageResult.pal_applied`); every image without one omits all seven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_tasks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_entries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_functions_created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_functions_existing: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_names_applied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_names_preserved: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_shared_entries: Option<usize>,
 }
 
 impl ImageReport {
@@ -252,6 +269,13 @@ impl ImageReport {
             global_types_ineligible: None,
             global_types_skipped: None,
             global_types_error: None,
+            pal_tasks: r.pal_applied.as_ref().map(|pal| pal.tasks),
+            pal_entries: r.pal_applied.as_ref().map(|pal| pal.entries),
+            pal_functions_created: r.pal_applied.as_ref().map(|pal| pal.functions_created),
+            pal_functions_existing: r.pal_applied.as_ref().map(|pal| pal.functions_existing),
+            pal_names_applied: r.pal_applied.as_ref().map(|pal| pal.names_applied),
+            pal_names_preserved: r.pal_applied.as_ref().map(|pal| pal.names_preserved),
+            pal_shared_entries: r.pal_applied.as_ref().map(|pal| pal.shared_entries),
         }
     }
 }
@@ -461,13 +485,23 @@ fn main_image_dir_name(images_dir: &Path) -> Option<String> {
 ///   `<ghidra>/images/<label>`   (slice file) -> `<images>/<label>/<label>.bin`
 ///   current `<ghidra>/export/<label>/`          -> `<images>/<label>/decompiled/`
 ///   present `<ghidra>/scatter/<label>/`         -> `<images>/<label>/scatter/`
+///   present `<ghidra>/pal_tasks/<label>/tasks.json`
+///                                             -> `<images>/<label>/pal_tasks/tasks.json`
 ///   current raw-only scatter state              -> remove terminal `scatter/`
+///   explicit PAL absence                        -> remove terminal `pal_tasks/`
+///
+/// The PAL state follows the same explicit-ownership rule as scatter:
+/// `Unmanaged` (unrecognized image, or a non-current run) leaves both the
+/// terminal state and any leftover source untouched — currentness never
+/// comes from artifact existence.
 fn marshal_image(
     ghidra_dir: &Path,
     images_dir: &Path,
     label: &str,
     export_current: bool,
     scatter_state: decompile::RuntimeScatterState,
+    pal_state: &decompile::RuntimeTaskState,
+    image_start: u32,
 ) -> Result<()> {
     let dest = images_dir.join(label);
     std::fs::create_dir_all(&dest)?;
@@ -507,7 +541,182 @@ fn marshal_image(
             std::fs::rename(&scatter, scatter_dest)?;
         }
     }
+    let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+    marshal_pal_tasks_with(
+        ghidra_dir,
+        images_dir,
+        label,
+        pal_state,
+        image_start,
+        scatter_state,
+        &mut rename,
+    )
+}
+
+/// The terminal `pal_tasks/tasks.json` file name, shared by the marshal
+/// commit and the terminal validation paths.
+const PAL_MANIFEST_FILE: &str = "tasks.json";
+
+/// Marshal one image's PAL task manifest under explicit-state ownership:
+///
+/// - `Unmanaged` — no terminal mutation, no source consumption.
+/// - `Absent` — remove the owned terminal `pal_tasks/` directory (a
+///   successful no-candidate result means no current manifest may remain).
+/// - `Present(map)` — type-validate and authenticate the source manifest
+///   against the terminal raw/scatter bytes *first* (fail-closed on any
+///   mismatch, before a single terminal byte changes), then atomically
+///   replace the terminal manifest bytes (`rename` is the commit) and
+///   remove the emptied source label directory only after that commit.
+///   A failed validation or rename leaves the old complete terminal bytes
+///   in place and the source unconsumed; neither side becomes current.
+fn marshal_pal_tasks_with<R>(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    label: &str,
+    pal_state: &decompile::RuntimeTaskState,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    rename: &mut R,
+) -> Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let image_dir = images_dir.join(label);
+    let pal_dir = image_dir.join("pal_tasks");
+    let map = match pal_state {
+        decompile::RuntimeTaskState::Unmanaged => return Ok(()),
+        decompile::RuntimeTaskState::Absent => return remove_any(&pal_dir),
+        decompile::RuntimeTaskState::Present(map) => map,
+    };
+    let source = ghidra_dir.join(&map.relative_path);
+    if !source.is_file() {
+        return Err(Error::DecomposeIncomplete(format!(
+            "missing current PAL task manifest for {label}: {}",
+            source.display()
+        )));
+    }
+    validate_terminal_pal_manifest(
+        &image_dir,
+        label,
+        image_start,
+        scatter_state,
+        &source,
+        &map.identity,
+    )?;
+    // The terminal directory must be a real directory before the commit;
+    // anything else (absent, a stray file, a symlink) is replaced.
+    match std::fs::symlink_metadata(&pal_dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => remove_any(&pal_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::create_dir_all(&pal_dir)?;
+    rename(&source, &pal_dir.join(PAL_MANIFEST_FILE)).map_err(|error| {
+        Error::DecomposeIncomplete(format!(
+            "pal task manifest commit for {label} failed: {error}"
+        ))
+    })?;
+    // The commit already moved the manifest; the emptied source label
+    // directory is post-commit cleanup, so a failure here can only warn.
+    if let Some(parent) = source.parent()
+        && let Err(error) = std::fs::remove_dir(parent)
+    {
+        tracing::warn!(
+            "pal task manifest for {label} committed but the source directory {} \
+             could not be removed: {error}",
+            parent.display()
+        );
+    }
     Ok(())
+}
+
+/// Type-validate and authenticate a PAL task manifest (`manifest`) against
+/// the terminal raw/scatter bytes of `image_dir`: rebuild the runtime view
+/// over `<image_dir>/{<label>.bin,scatter/}`, derive the expected artifact
+/// context (image BLAKE3, scatter load-map dependency from the explicit
+/// scatter state — never from artifact existence), run the strict
+/// fail-closed reader, and pin the reader's identity against
+/// `expected_identity`. Any mismatch is a typed error; nothing is mutated.
+fn validate_terminal_pal_manifest(
+    image_dir: &Path,
+    label: &str,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    manifest: &Path,
+    expected_identity: &str,
+) -> Result<crate::pal_tasks::ValidatedTaskArtifact> {
+    let raw = std::fs::read(image_dir.join(format!("{label}.bin")))?;
+    let runtime = crate::runtime_image::RuntimeImage::for_image_dir(&raw, image_start, image_dir)?;
+    let scatter_load_map_blake3 = match scatter_state {
+        decompile::RuntimeScatterState::Present => {
+            let bytes = std::fs::read(image_dir.join("scatter").join("load_map.json"))?;
+            Some(*blake3::hash(&bytes).as_bytes())
+        }
+        decompile::RuntimeScatterState::Absent | decompile::RuntimeScatterState::Unmanaged => None,
+    };
+    let context = crate::pal_tasks::TaskArtifactContext {
+        label,
+        image_blake3: *blake3::hash(&raw).as_bytes(),
+        scatter_load_map_blake3,
+    };
+    let artifact = crate::pal_tasks::read(manifest, &runtime, context)
+        .map_err(|error| Error::BadPalTasks(error.to_string()))?;
+    if artifact.identity != expected_identity {
+        return Err(Error::DecomposeIncomplete(format!(
+            "current PAL task manifest for {label} has identity {}, expected {expected_identity}",
+            artifact.identity
+        )));
+    }
+    Ok(artifact)
+}
+
+/// The deterministic per-run PAL marshalling totals, accumulated from the
+/// explicit `Present` states the pass-1 marshal committed.
+#[derive(Debug, Default)]
+struct PalMarshalTally {
+    images: usize,
+    tasks: usize,
+    entries: usize,
+}
+
+impl PalMarshalTally {
+    fn record(&mut self, map: &crate::pal_tasks::MaterializedTaskMap) -> Result<()> {
+        let add = |total: usize, count: usize| {
+            total.checked_add(count).ok_or_else(|| {
+                Error::DecomposeIncomplete("PAL task marshalling totals overflow".to_string())
+            })
+        };
+        self.images = add(self.images, 1)?;
+        self.tasks = add(self.tasks, map.task_records)?;
+        self.entries = add(self.entries, map.distinct_entries)?;
+        Ok(())
+    }
+}
+
+/// The `pal_tasks` stage. A completed marshal loop reports `ok` with the
+/// deterministic totals (the only nondeterministic field is the stage
+/// duration); a loop with no committed map — a successful no-candidate
+/// absence, or no recognized MAIN at all — reports the successful skip
+/// `no PAL task initializer`. `None` means the pass-1 decompile command
+/// itself failed (e.g. malformed PAL generation): the failure already owns
+/// the `decompile` stage, so this stage defers to it instead of claiming a
+/// successful absence.
+fn pal_tasks_stage(tally: Option<&PalMarshalTally>, duration_ms: u128) -> StageReport {
+    let Some(tally) = tally else {
+        return StageReport::skipped("pal_tasks", "pass 1 failed");
+    };
+    if tally.images == 0 {
+        return StageReport::skipped("pal_tasks", "no PAL task initializer");
+    }
+    StageReport::ok(
+        "pal_tasks",
+        &format!(
+            "images/*/pal_tasks/tasks.json (images={}, tasks={}, entries={})",
+            tally.images, tally.tasks, tally.entries
+        ),
+        duration_ms,
+    )
 }
 
 /// After pass 2, ExportDecomp.java has overwritten {ghidra}/export/{label}/
@@ -1293,10 +1502,154 @@ fn take_globals_function_inputs(
     inputs
 }
 
+/// One image's terminal PAL state, resolved once after the pass-1 marshal:
+/// the validated terminal manifest (`images/<label>/pal_tasks/tasks.json`),
+/// its identity, the canonical manifest path pass-2 arguments consume, the
+/// terminal scatter manifest path (present-state images only), and the
+/// symbolicate pass-2 context derived from the same validated artifact.
+struct TerminalPalMap {
+    identity: String,
+    manifest_path: PathBuf,
+    scatter_manifest: Option<PathBuf>,
+    context: symbolicate::PalPass2Context,
+}
+
+/// Re-read every explicit `Present` image's terminal PAL manifest against
+/// the terminal raw/scatter bytes (validating the committed tree, never
+/// trusting directory existence) and derive the pass-2 symbolicate context.
+/// A label whose terminal manifest fails validation is returned as an
+/// error — the symbol map and pass 2 must not bind a manifest the strict
+/// reader rejects.
+fn load_terminal_pal_maps(
+    images_dir: &Path,
+    report: &decompile::DecompileReport,
+) -> (HashMap<String, TerminalPalMap>, Vec<(String, String)>) {
+    let mut maps = HashMap::new();
+    let mut errors = Vec::new();
+    for image in &report.images {
+        let state = explicit_runtime_state(report, image);
+        let map = match state.tasks {
+            decompile::RuntimeTaskState::Present(ref map) => map.clone(),
+            _ => continue,
+        };
+        let label = &image.label;
+        let image_dir = images_dir.join(label);
+        let manifest_path = image_dir.join("pal_tasks").join(PAL_MANIFEST_FILE);
+        let scatter_manifest = match state.scatter {
+            decompile::RuntimeScatterState::Present => {
+                Some(image_dir.join("scatter").join("load_map.json"))
+            }
+            _ => None,
+        };
+        match validate_terminal_pal_manifest(
+            &image_dir,
+            label,
+            image.image_start,
+            state.scatter,
+            &manifest_path,
+            &map.identity,
+        ) {
+            Ok(artifact) => {
+                maps.insert(
+                    label.clone(),
+                    TerminalPalMap {
+                        identity: artifact.identity.clone(),
+                        manifest_path,
+                        scatter_manifest,
+                        context: pal_pass2_context(&artifact),
+                    },
+                );
+            }
+            Err(error) => errors.push((label.clone(), format!("terminal PAL manifest: {error}"))),
+        }
+    }
+    (maps, errors)
+}
+
+/// The coherent runtime analysis state of one image, with the same
+/// non-current downgrade the pass-1 marshal applies: a failed or
+/// terminal-invalid run owns no current scatter or PAL state, so its
+/// explicit state is `Unmanaged` regardless of what an older run left on
+/// disk.
+fn explicit_runtime_state(
+    report: &decompile::DecompileReport,
+    image: &decompile::ImageResult,
+) -> decompile::RuntimeAnalysisState {
+    if matches!(
+        image.outcome,
+        ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid
+    ) {
+        return decompile::RuntimeAnalysisState {
+            scatter: decompile::RuntimeScatterState::Unmanaged,
+            tasks: decompile::RuntimeTaskState::Unmanaged,
+        };
+    }
+    report.runtime_analysis_state(&image.label)
+}
+
+/// Derive the symbolicate pass-2 PAL context from a validated artifact:
+/// the identity and dependency hashes the map's `pal` block binds, plus
+/// every application group keyed by normalized entry with its full task
+/// refs. `applied` is recomputed per record inside `build_map`, so the
+/// context-level value carries no information.
+fn pal_pass2_context(
+    artifact: &crate::pal_tasks::ValidatedTaskArtifact,
+) -> symbolicate::PalPass2Context {
+    let manifest_blake3 = crate::manifest::blake3_fixed(artifact.manifest_blake3);
+    let scatter_load_map_blake3 = artifact
+        .scatter_load_map_blake3
+        .map(crate::manifest::blake3_fixed);
+    let tasks_by_index = |index: u32| {
+        artifact
+            .plan
+            .tasks
+            .iter()
+            .find(|task| task.index == index)
+            .expect("validated applications reference parsed task indices")
+    };
+    let mut applications = std::collections::BTreeMap::new();
+    for application in &artifact.plan.applications {
+        let tasks = application
+            .task_indices
+            .iter()
+            .map(|index| {
+                let task = tasks_by_index(*index);
+                symbolicate::PalTaskRef {
+                    manifest_blake3: manifest_blake3.clone(),
+                    task_index: task.index,
+                    name: task.name.clone(),
+                    slot: task.slot,
+                    priority: task.priority,
+                    stack_size: task.stack_size,
+                }
+            })
+            .collect();
+        applications.insert(
+            application.entry,
+            symbolicate::PalApplicationRef {
+                isa: match application.isa {
+                    crate::pal_tasks::TaskIsa::Arm => "arm",
+                    crate::pal_tasks::TaskIsa::Thumb => "thumb",
+                },
+                desired_primary: application.desired_primary.clone(),
+                applied: true,
+                tasks,
+            },
+        );
+    }
+    symbolicate::PalPass2Context {
+        identity: artifact.identity.clone(),
+        manifest_blake3,
+        scatter_load_map_blake3,
+        applications,
+    }
+}
+
 fn prepare_pass2_inputs(
     function_maps: &HashMap<String, PreparedFunctionMap>,
     global_maps: &HashMap<String, PreparedGlobalMap>,
     global_types_maps: &HashMap<String, decompile::PreparedPass2Map>,
+    pal: &HashMap<String, TerminalPalMap>,
 ) -> HashMap<String, decompile::Pass2Input> {
     let mut inputs = HashMap::new();
     for (label, prepared) in function_maps {
@@ -1319,6 +1672,18 @@ fn prepare_pass2_inputs(
             .entry(label.clone())
             .or_insert_with(decompile::Pass2Input::default);
         input.global_types_map = Some(map.clone());
+    }
+    // Pass-2 PAL wiring: every scheduled image whose run carried a present
+    // PAL map agrees on that identity and receives the canonical terminal
+    // task/scatter manifest paths; images without PAL state keep the
+    // `none`/`-` arguments (absence validation).
+    for (label, terminal) in pal {
+        let Some(input) = inputs.get_mut(label) else {
+            continue;
+        };
+        input.pal_identity = terminal.identity.clone();
+        input.pal_manifest = Some(terminal.manifest_path.clone());
+        input.scatter_manifest = terminal.scatter_manifest.clone();
     }
     inputs
 }
@@ -2168,6 +2533,7 @@ fn build_and_write_symbol_maps(
     images_dir: &Path,
     token_db: &Path,
     manifest: &Path,
+    pal: &HashMap<String, TerminalPalMap>,
 ) -> SymbolMapsResult {
     let mut errors: Vec<(String, String)> = Vec::new();
     let tokens = if token_db.exists() {
@@ -2213,11 +2579,18 @@ fn build_and_write_symbol_maps(
             continue;
         }
         let map_path = maps_dir.join(format!("{label}.json"));
-        // No production caller supplies a present PAL identity yet: the PAL
-        // task-inventory generation wires that state. Identity is `none`
-        // until then, and the map binds null PAL hashes.
-        let bundle =
-            symbolicate::prepare_pass2_symbol_map(&map_path, &dir, &label, &tokens, manifest, None);
+        // The PAL context comes from the explicit terminal state validated
+        // against the terminal raw/scatter bytes — never from the existence
+        // of a stale `pal_tasks/` directory. Images without a present map
+        // bind identity `none` and null PAL hashes.
+        let bundle = symbolicate::prepare_pass2_symbol_map(
+            &map_path,
+            &dir,
+            &label,
+            &tokens,
+            manifest,
+            pal.get(&label).map(|terminal| &terminal.context),
+        );
         match bundle {
             Ok(bundle) => {
                 let (prepared, validation_error) =
@@ -2321,39 +2694,49 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         Ok(rep) => {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
+            let mut pal_tally = PalMarshalTally::default();
             for ir in &rep.images {
                 // A rejected export is as unusable as a failed Ghidra run, so
-                // its runtime scatter map stays unmanaged either way.
-                let scatter_state = if matches!(
-                    ir.outcome,
-                    ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid
-                ) {
-                    decompile::RuntimeScatterState::Unmanaged
-                } else {
-                    rep.runtime_scatter_state(&ir.label)
-                };
+                // its runtime scatter and PAL task state stay unmanaged
+                // either way — currentness is explicit state, never artifact
+                // existence.
+                let runtime_state = explicit_runtime_state(&rep, ir);
                 if let Err(e) = marshal_image(
                     &ghidra_dir,
                     &images_dir,
                     &ir.label,
                     rep.export_is_current(&ir.label),
-                    scatter_state,
+                    runtime_state.scatter,
+                    &runtime_state.tasks,
+                    ir.image_start,
                 ) {
+                    marshal_err = Some(e.to_string());
+                    break;
+                }
+                if let decompile::RuntimeTaskState::Present(map) = &runtime_state.tasks
+                    && let Err(e) = pal_tally.record(map)
+                {
                     marshal_err = Some(e.to_string());
                     break;
                 }
                 image_reports.push(ImageReport::from_result(ir));
             }
             match marshal_err {
-                None => stages.push(StageReport::decompile(
-                    image_reports,
-                    t.elapsed().as_millis(),
-                )),
-                Some(err) => stages.push(StageReport::failed(
-                    "decompile",
-                    format!("marshal: {err}"),
-                    t.elapsed().as_millis(),
-                )),
+                None => {
+                    stages.push(StageReport::decompile(
+                        image_reports,
+                        t.elapsed().as_millis(),
+                    ));
+                    stages.push(pal_tasks_stage(Some(&pal_tally), t.elapsed().as_millis()));
+                }
+                Some(err) => {
+                    stages.push(StageReport::failed(
+                        "decompile",
+                        format!("marshal: {err}"),
+                        t.elapsed().as_millis(),
+                    ));
+                    stages.push(StageReport::skipped("pal_tasks", "pass 1 marshal failed"));
+                }
             }
             Some(rep)
         }
@@ -2363,6 +2746,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 e.to_string(),
                 t.elapsed().as_millis(),
             ));
+            // The failed decompile command owns the failure (e.g. malformed
+            // PAL generation); the PAL stage defers to it.
+            stages.push(pal_tasks_stage(None, 0));
             None
         }
     };
@@ -2488,11 +2874,33 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 
     // 6. Build the per-image symbol map from pass-1 outputs + attribution +
     //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
+    //    First resolve the terminal PAL maps (normal route only — the
+    //    symbol map's `pal` block and the pass-2 arguments both bind the
+    //    identity validated against the terminal raw/scatter bytes); a
+    //    terminal manifest the strict reader rejects fails the symbol-map
+    //    stage rather than binding an unauthenticated identity.
+    let mut terminal_pal_maps: HashMap<String, TerminalPalMap> = HashMap::new();
     let t = Instant::now();
     let (mut function_maps, symbol_map_errors) = if opts.no_symbol_pass {
         (HashMap::new(), Vec::new())
     } else {
-        build_and_write_symbol_maps(out, &images_dir, &token_db, &out.join("manifest.json"))
+        let (pal_maps, pal_errors) = match pass1_report.as_ref() {
+            Some(report) => load_terminal_pal_maps(&images_dir, report),
+            None => (HashMap::new(), Vec::new()),
+        };
+        terminal_pal_maps = pal_maps;
+        let (maps, errors) = build_and_write_symbol_maps(
+            out,
+            &images_dir,
+            &token_db,
+            &out.join("manifest.json"),
+            &terminal_pal_maps,
+        );
+        let mut errors = errors;
+        for (label, error) in pal_errors {
+            errors.push((label, error));
+        }
+        (maps, errors)
     };
     if opts.no_symbol_pass {
         stages.push(StageReport::skipped("symbol_map", "--no-symbol-pass"));
@@ -2641,8 +3049,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             } else {
                 derive_global_types_maps(&images_dir, &ghidra_dir)
             };
-            let inputs =
-                prepare_pass2_inputs(&function_maps, &prepared_global_maps, &global_types_maps);
+            let inputs = prepare_pass2_inputs(
+                &function_maps,
+                &prepared_global_maps,
+                &global_types_maps,
+                &terminal_pal_maps,
+            );
             let scheduled_count = inputs.len();
             drop(std::mem::take(&mut function_maps));
 
@@ -3428,7 +3840,12 @@ mod tests {
             ),
         ]);
 
-        let inputs = prepare_pass2_inputs(&function_maps, &global_maps, &HashMap::new());
+        let inputs = prepare_pass2_inputs(
+            &function_maps,
+            &global_maps,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(inputs.len(), 3);
         assert_eq!(
@@ -3464,7 +3881,8 @@ mod tests {
             "02_MAIN".to_string(),
             decompile::PreparedPass2Map::new(&tp, std::num::NonZeroUsize::new(1).unwrap()).unwrap(),
         );
-        let inputs = prepare_pass2_inputs(&HashMap::new(), &HashMap::new(), &types);
+        let inputs =
+            prepare_pass2_inputs(&HashMap::new(), &HashMap::new(), &types, &HashMap::new());
         assert!(inputs["02_MAIN"].global_types_map.is_some());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3555,6 +3973,7 @@ mod tests {
                 ("03_APM".to_string(), valid_other_global),
             ]),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(inputs["02_MAIN"].function_map.is_none());
         assert_eq!(inputs["02_MAIN"].global_map.as_ref().unwrap().count(), 1);
@@ -3640,6 +4059,7 @@ mod tests {
             ]),
             &outcome.maps,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(
             inputs["02_MAIN"]
@@ -3701,7 +4121,12 @@ mod tests {
         assert_eq!(error.matches("04_VSS: zeta failure").count(), 1);
         assert!(!Report::is_ok(&[stage]));
 
-        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new(), &HashMap::new());
+        let inputs = prepare_pass2_inputs(
+            &function_maps,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(
             inputs["02_MAIN"]
                 .function_map
@@ -4600,7 +5025,12 @@ mod tests {
             )
         );
 
-        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
+        let inputs = prepare_pass2_inputs(
+            &function_maps,
+            &outcome.maps,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(
             inputs["02_MAIN"]
                 .function_map
@@ -4660,7 +5090,12 @@ mod tests {
             &globals::GlobalsOpts::default(),
             |_, _, _, _, _, _| Err(Error::Serialize("malformed functions.json".into())),
         );
-        let inputs = prepare_pass2_inputs(&function_maps, &outcome.maps, &HashMap::new());
+        let inputs = prepare_pass2_inputs(
+            &function_maps,
+            &outcome.maps,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let apply_stage = globals_apply_stage(false, &outcome.maps, Some(&images), 12);
 
         assert_eq!(outcome.stage.status, "failed");
@@ -5069,6 +5504,13 @@ mod tests {
                         global_types_ineligible: None,
                         global_types_skipped: None,
                         global_types_error: None,
+                        pal_tasks: None,
+                        pal_entries: None,
+                        pal_functions_created: None,
+                        pal_functions_existing: None,
+                        pal_names_applied: None,
+                        pal_names_preserved: None,
+                        pal_shared_entries: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -5116,6 +5558,13 @@ mod tests {
                         global_types_ineligible: None,
                         global_types_skipped: None,
                         global_types_error: None,
+                        pal_tasks: None,
+                        pal_entries: None,
+                        pal_functions_created: None,
+                        pal_functions_existing: None,
+                        pal_names_applied: None,
+                        pal_names_preserved: None,
+                        pal_shared_entries: None,
                     },
                 ],
                 10,
@@ -5714,6 +6163,13 @@ mod tests {
             global_types_ineligible: None,
             global_types_skipped: None,
             global_types_error: None,
+            pal_tasks: None,
+            pal_entries: None,
+            pal_functions_created: None,
+            pal_functions_existing: None,
+            pal_names_applied: None,
+            pal_names_preserved: None,
+            pal_shared_entries: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -6015,6 +6471,8 @@ mod tests {
             "02_MAIN",
             true,
             decompile::RuntimeScatterState::Present,
+            &decompile::RuntimeTaskState::Unmanaged,
+            PAL_BASE,
         )
         .unwrap();
 
@@ -6085,6 +6543,8 @@ mod tests {
             "02_MAIN",
             false,
             decompile::RuntimeScatterState::Present,
+            &decompile::RuntimeTaskState::Unmanaged,
+            PAL_BASE,
         )
         .unwrap();
         let scatter = images.join("02_MAIN/scatter");
@@ -6100,6 +6560,8 @@ mod tests {
             "02_MAIN",
             false,
             decompile::RuntimeScatterState::Absent,
+            &decompile::RuntimeTaskState::Unmanaged,
+            PAL_BASE,
         )
         .unwrap();
 
@@ -6140,6 +6602,8 @@ mod tests {
             "02_MAIN",
             false,
             decompile::RuntimeScatterState::Unmanaged,
+            &decompile::RuntimeTaskState::Unmanaged,
+            PAL_BASE,
         )
         .unwrap();
 
@@ -6175,11 +6639,548 @@ mod tests {
             "02_MAIN",
             false,
             decompile::RuntimeScatterState::Present,
+            &decompile::RuntimeTaskState::Unmanaged,
+            PAL_BASE,
         )
         .expect_err("a scatter metadata error must not be treated as absence");
 
         assert!(matches!(error, Error::Io(_)));
         assert_eq!(std::fs::read(retained).unwrap(), b"retained");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -------------------------------------------------------------------
+    // PAL task marshalling, stage, and pass-2 wiring (Task 13)
+    // -------------------------------------------------------------------
+
+    use crate::pal_tasks::test_support::BASE as PAL_BASE;
+    use crate::pal_tasks::{self, TaskArtifactContext};
+
+    fn pal_temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("pme_pal_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn materialized_map_fixture(
+        label: &str,
+        task_records: usize,
+        distinct_entries: usize,
+    ) -> pal_tasks::MaterializedTaskMap {
+        pal_tasks::MaterializedTaskMap {
+            relative_path: format!("pal_tasks/{label}/tasks.json"),
+            blake3: "a".repeat(64),
+            identity: format!("v1:{}:{task_records}:{distinct_entries}", "b".repeat(64)),
+            task_records,
+            distinct_entries,
+        }
+    }
+
+    /// Discover and materialize a real PAL task manifest for the raw-only
+    /// discoverable fixture, rooted at `ghidra`, returning the explicit
+    /// `Present` state plus the manifest bytes.
+    fn materialize_raw_pal_fixture(
+        ghidra: &Path,
+        label: &str,
+    ) -> (decompile::RuntimeTaskState, Vec<u8>) {
+        let image_bytes = crate::pal_tasks::test_support::craft_discoverable_pal_main_image();
+        let runtime = crate::runtime_image::RuntimeImage::from_plan(&image_bytes, PAL_BASE, None)
+            .expect("raw fixture runtime");
+        materialize_pal_plan(&image_bytes, &runtime, None, ghidra, label)
+    }
+
+    fn materialize_pal_plan(
+        image_bytes: &[u8],
+        runtime: &crate::runtime_image::RuntimeImage<'_>,
+        scatter_blake3: Option<[u8; 32]>,
+        ghidra: &Path,
+        label: &str,
+    ) -> (decompile::RuntimeTaskState, Vec<u8>) {
+        let plan = pal_tasks::discover(runtime, label)
+            .expect("fixture discovery succeeds")
+            .expect("fixture has a discoverable PAL table");
+        let context = TaskArtifactContext {
+            label,
+            image_blake3: *blake3::hash(image_bytes).as_bytes(),
+            scatter_load_map_blake3: scatter_blake3,
+        };
+        let map = pal_tasks::materialize(&plan, context, ghidra).expect("fixture materializes");
+        let bytes = std::fs::read(ghidra.join("pal_tasks").join(label).join("tasks.json")).unwrap();
+        (decompile::RuntimeTaskState::Present(map), bytes)
+    }
+
+    /// Marshal scaffolding: the slice in the kit position, a stale complete
+    /// terminal manifest, and (optionally) a pass-1 export.
+    fn pal_marshal_tree(ghidra: &Path, images: &Path, label: &str, image_bytes: &[u8]) {
+        std::fs::create_dir_all(ghidra.join("images")).unwrap();
+        std::fs::write(ghidra.join("images").join(label), image_bytes).unwrap();
+        let old = images.join(label).join("pal_tasks");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("tasks.json"), b"old complete terminal bytes").unwrap();
+    }
+
+    #[test]
+    fn pal_marshal_honors_explicit_state() {
+        let root = pal_temp_root("marshal_states");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let (present, manifest_bytes) = materialize_raw_pal_fixture(&ghidra, label);
+        let map = match present.clone() {
+            decompile::RuntimeTaskState::Present(map) => map,
+            _ => panic!("fixture state is Present"),
+        };
+        let source_manifest = ghidra.join("pal_tasks").join(label).join("tasks.json");
+        assert_eq!(std::fs::read(&source_manifest).unwrap(), manifest_bytes);
+        pal_marshal_tree(&ghidra, &images, label, &craft_bytes());
+
+        // Present: type-validate + authenticate against the terminal raw
+        // bytes, then atomically replace the terminal manifest and consume
+        // the source.
+        marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            decompile::RuntimeScatterState::Absent,
+            &decompile::RuntimeTaskState::Present(map.clone()),
+            PAL_BASE,
+        )
+        .unwrap();
+        let terminal_manifest = images.join(label).join("pal_tasks").join("tasks.json");
+        assert_eq!(std::fs::read(&terminal_manifest).unwrap(), manifest_bytes);
+        assert!(
+            !source_manifest.exists(),
+            "the source manifest is consumed by the commit"
+        );
+        assert!(
+            !ghidra.join("pal_tasks").join(label).exists(),
+            "the owned source label directory is removed after commit"
+        );
+        assert_eq!(
+            std::fs::read(images.join(label).join(format!("{label}.bin"))).unwrap(),
+            craft_bytes(),
+            "the slice marshal is unchanged"
+        );
+
+        // Unmanaged: the terminal state and any leftover source are left
+        // untouched — currentness never comes from artifact existence.
+        std::fs::create_dir_all(source_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&source_manifest, b"leftover source bytes").unwrap();
+        marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            decompile::RuntimeScatterState::Absent,
+            &decompile::RuntimeTaskState::Unmanaged,
+            PAL_BASE,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&terminal_manifest).unwrap(), manifest_bytes);
+        assert_eq!(
+            std::fs::read(&source_manifest).unwrap(),
+            b"leftover source bytes"
+        );
+
+        // Absent: a successful no-candidate result removes the owned
+        // terminal directory.
+        marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            decompile::RuntimeScatterState::Absent,
+            &decompile::RuntimeTaskState::Absent,
+            PAL_BASE,
+        )
+        .unwrap();
+        assert!(!images.join(label).join("pal_tasks").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn craft_bytes() -> Vec<u8> {
+        crate::pal_tasks::test_support::craft_discoverable_pal_main_image()
+    }
+
+    #[test]
+    fn pal_marshal_failure_preserves_old_complete_bytes() {
+        let root = pal_temp_root("marshal_failure");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+
+        // Authentication failure: a corrupt source manifest must fail
+        // closed before any terminal mutation.
+        let (present, _manifest_bytes) = materialize_raw_pal_fixture(&ghidra, label);
+        let source_manifest = ghidra.join("pal_tasks").join(label).join("tasks.json");
+        pal_marshal_tree(&ghidra, &images, label, &craft_bytes());
+        std::fs::write(&source_manifest, b"{not a manifest").unwrap();
+        let terminal_manifest = images.join(label).join("pal_tasks").join("tasks.json");
+        let error = marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            decompile::RuntimeScatterState::Absent,
+            &present,
+            PAL_BASE,
+        )
+        .expect_err("a corrupt source manifest must fail closed");
+        assert!(error.to_string().to_lowercase().contains("pal"));
+        assert_eq!(
+            std::fs::read(&terminal_manifest).unwrap(),
+            b"old complete terminal bytes"
+        );
+        assert_eq!(
+            std::fs::read(&source_manifest).unwrap(),
+            b"{not a manifest",
+            "the failed validation must not consume the source"
+        );
+
+        // Rename (commit) failure: the old complete terminal bytes remain
+        // and the source is not consumed.
+        let (present, manifest_bytes) = materialize_raw_pal_fixture(&ghidra, label);
+        std::fs::write(&source_manifest, &manifest_bytes).unwrap();
+        let mut failing_rename =
+            |_: &Path, _: &Path| Err(std::io::Error::other("injected pal commit failure"));
+        let error = marshal_pal_tasks_with(
+            &ghidra,
+            &images,
+            label,
+            &present,
+            PAL_BASE,
+            decompile::RuntimeScatterState::Absent,
+            &mut failing_rename,
+        )
+        .expect_err("an injected rename failure must surface");
+        assert!(error.to_string().contains("injected pal commit failure"));
+        assert_eq!(
+            std::fs::read(&terminal_manifest).unwrap(),
+            b"old complete terminal bytes",
+            "rename failure must leave the old complete terminal bytes"
+        );
+        assert_eq!(
+            std::fs::read(&source_manifest).unwrap(),
+            manifest_bytes,
+            "rename failure must not consume the source"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pal_marshal_authenticates_scatter_backed_manifest() {
+        let root = pal_temp_root("marshal_scatter");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let image_bytes = crate::pal_tasks::test_support::craft_scatter_pal_main_image();
+
+        let scatter_plan = crate::scatter::discover(&image_bytes, PAL_BASE)
+            .unwrap()
+            .expect("fixture has a discoverable scatter map");
+        let scatter_map =
+            crate::scatter::materialize(&scatter_plan, &image_bytes, label, &ghidra).unwrap();
+        let runtime = crate::runtime_image::RuntimeImage::from_artifact(
+            &image_bytes,
+            PAL_BASE,
+            &ghidra,
+            Some(&ghidra.join(&scatter_map.relative_path)),
+        )
+        .unwrap();
+        let scatter_blake3 = crate::execution_ranges::parse_blake3(&scatter_map.blake3).unwrap();
+        let (present, manifest_bytes) =
+            materialize_pal_plan(&image_bytes, &runtime, Some(scatter_blake3), &ghidra, label);
+
+        pal_marshal_tree(&ghidra, &images, label, &image_bytes);
+        marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            decompile::RuntimeScatterState::Present,
+            &present,
+            PAL_BASE,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(images.join(label).join("pal_tasks").join("tasks.json")).unwrap(),
+            manifest_bytes
+        );
+        assert!(
+            images
+                .join(label)
+                .join("scatter")
+                .join("load_map.json")
+                .exists(),
+            "the scatter marshal is unchanged"
+        );
+
+        // The scatter dependency is authenticated, not assumed: the same
+        // validated map marshalled with an absent scatter dependency fails
+        // closed and leaves the terminal bytes complete.
+        let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+        let error = marshal_pal_tasks_with(
+            &ghidra,
+            &images,
+            label,
+            &present,
+            PAL_BASE,
+            decompile::RuntimeScatterState::Absent,
+            &mut rename,
+        )
+        .expect_err("a mismatched scatter dependency must fail closed");
+        assert!(error.to_string().to_lowercase().contains("scatter"));
+        assert_eq!(
+            std::fs::read(images.join(label).join("pal_tasks").join("tasks.json")).unwrap(),
+            manifest_bytes
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pal_stage_reports_ok_with_deterministic_counts_for_present_map() {
+        let mut tally = PalMarshalTally::default();
+        tally
+            .record(&materialized_map_fixture("02_MAIN", 2, 1))
+            .unwrap();
+        let stage = pal_tasks_stage(Some(&tally), 9);
+        assert_eq!(stage.stage, "pal_tasks");
+        assert_eq!(stage.status, "ok");
+        assert_eq!(
+            stage.output.as_deref(),
+            Some("images/*/pal_tasks/tasks.json (images=1, tasks=2, entries=1)")
+        );
+        assert_eq!(stage.duration_ms, 9);
+
+        tally
+            .record(&materialized_map_fixture("01_PSP", 3, 2))
+            .unwrap();
+        let stage = pal_tasks_stage(Some(&tally), 9);
+        assert_eq!(
+            stage.output.as_deref(),
+            Some("images/*/pal_tasks/tasks.json (images=2, tasks=5, entries=3)")
+        );
+
+        // Checked arithmetic: totals that overflow are the typed error,
+        // never a silent wrap.
+        let mut overflow = PalMarshalTally::default();
+        overflow
+            .record(&materialized_map_fixture("02_MAIN", usize::MAX, 0))
+            .unwrap();
+        assert!(
+            overflow
+                .record(&materialized_map_fixture("01_PSP", 1, 0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pal_stage_reports_skipped_no_initializer_on_successful_absence() {
+        let tally = PalMarshalTally::default();
+        let stage = pal_tasks_stage(Some(&tally), 9);
+        assert_eq!(stage.stage, "pal_tasks");
+        assert_eq!(stage.status, "skipped");
+        assert_eq!(stage.reason.as_deref(), Some("no PAL task initializer"));
+        assert!(stage.output.is_none());
+    }
+
+    #[test]
+    fn pal_stage_follows_command_failure() {
+        // A failed decompile command (e.g. malformed PAL generation) owns
+        // the failure in the `decompile` stage; the PAL stage defers to it
+        // instead of claiming a successful absence.
+        let stage = pal_tasks_stage(None, 9);
+        assert_eq!(stage.stage, "pal_tasks");
+        assert_eq!(stage.status, "skipped");
+        assert_eq!(stage.reason.as_deref(), Some("pass 1 failed"));
+        assert_ne!(stage.reason.as_deref(), Some("no PAL task initializer"));
+    }
+
+    #[test]
+    fn pal_image_report_carries_every_counter_only_for_configured_maps() {
+        let mut image = analyzed_image("02_MAIN");
+        image.pal_applied = Some(decompile::AppliedPalTasks {
+            tasks: 2,
+            entries: 3,
+            functions_created: 2,
+            functions_existing: 1,
+            names_applied: 2,
+            names_preserved: 1,
+            shared_entries: 1,
+        });
+        let report = ImageReport::from_result(&image);
+        assert_eq!(report.pal_tasks, Some(2));
+        assert_eq!(report.pal_entries, Some(3));
+        assert_eq!(report.pal_functions_created, Some(2));
+        assert_eq!(report.pal_functions_existing, Some(1));
+        assert_eq!(report.pal_names_applied, Some(2));
+        assert_eq!(report.pal_names_preserved, Some(1));
+        assert_eq!(report.pal_shared_entries, Some(1));
+
+        let json = serde_json::to_value(&report).unwrap();
+        for key in [
+            "pal_tasks",
+            "pal_entries",
+            "pal_functions_created",
+            "pal_functions_existing",
+            "pal_names_applied",
+            "pal_names_preserved",
+            "pal_shared_entries",
+        ] {
+            assert!(json.get(key).and_then(serde_json::Value::as_u64).is_some());
+        }
+
+        // No configured map: every optional counter is omitted.
+        let plain = ImageReport::from_result(&analyzed_image("01_PSP"));
+        let json = serde_json::to_value(&plain).unwrap();
+        for key in [
+            "pal_tasks",
+            "pal_entries",
+            "pal_functions_created",
+            "pal_functions_existing",
+            "pal_names_applied",
+            "pal_names_preserved",
+            "pal_shared_entries",
+        ] {
+            assert!(json.get(key).is_none(), "{key} must be omitted: {json}");
+        }
+    }
+
+    #[test]
+    fn pal_pass2_context_binds_validated_artifact() {
+        let root = pal_temp_root("pass2_context");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let (present, manifest_bytes) = materialize_raw_pal_fixture(&ghidra, label);
+        pal_marshal_tree(&ghidra, &images, label, &craft_bytes());
+        marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            decompile::RuntimeScatterState::Absent,
+            &present,
+            PAL_BASE,
+        )
+        .unwrap();
+
+        let image_dir = images.join(label);
+        let artifact = validate_terminal_pal_manifest(
+            &image_dir,
+            label,
+            PAL_BASE,
+            decompile::RuntimeScatterState::Absent,
+            &image_dir.join("pal_tasks").join("tasks.json"),
+            "mismatched-identity",
+        )
+        .err()
+        .expect("an identity mismatch must fail closed");
+        assert!(artifact.to_string().contains("identity"));
+
+        let artifact = validate_terminal_pal_manifest(
+            &image_dir,
+            label,
+            PAL_BASE,
+            decompile::RuntimeScatterState::Absent,
+            &image_dir.join("pal_tasks").join("tasks.json"),
+            &identity_of(&present),
+        )
+        .unwrap();
+        assert_eq!(artifact.image_label, label);
+
+        let context = pal_pass2_context(&artifact);
+        assert_eq!(context.identity, identity_of(&present));
+        assert_eq!(
+            context.manifest_blake3,
+            crate::manifest::blake3_bytes(&manifest_bytes)
+        );
+        assert_eq!(context.scatter_load_map_blake3, None);
+        assert_eq!(
+            context.applications.len(),
+            2,
+            "the two fixture tasks allocate two application groups"
+        );
+        let names: std::collections::BTreeSet<String> = context
+            .applications
+            .values()
+            .flat_map(|app| app.tasks.iter().map(|task| task.name.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            ["first_task", "second_task"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn identity_of(state: &decompile::RuntimeTaskState) -> String {
+        match state {
+            decompile::RuntimeTaskState::Present(map) => map.identity.clone(),
+            _ => panic!("fixture state is Present"),
+        }
+    }
+
+    #[test]
+    fn pal_prepare_pass2_inputs_wires_identity_and_manifests() {
+        let root = pal_temp_root("pass2_inputs");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let manifest_path = images.join(label).join("pal_tasks").join("tasks.json");
+        let scatter_path = images.join(label).join("scatter").join("load_map.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(scatter_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, b"manifest").unwrap();
+        std::fs::write(&scatter_path, b"scatter").unwrap();
+
+        let identity = format!("v1:{}:2:0", "c".repeat(64));
+        let pal = HashMap::from([(
+            label.to_string(),
+            TerminalPalMap {
+                identity: identity.clone(),
+                manifest_path: manifest_path.clone(),
+                scatter_manifest: Some(scatter_path.clone()),
+                context: symbolicate::PalPass2Context {
+                    identity: identity.clone(),
+                    manifest_blake3: "d".repeat(64),
+                    scatter_load_map_blake3: None,
+                    applications: Default::default(),
+                },
+            },
+        )]);
+        let mut function_maps = HashMap::new();
+        let prepared = PreparedFunctionMap {
+            pass2_map: Some(prepared_symbol_test_map("pal_wire", label, 1)),
+            function_names: HashMap::new(),
+            evidence_name_projection: Default::default(),
+        };
+        function_maps.insert(label.to_string(), prepared);
+        // A second image with maps but no PAL state keeps today's
+        // none/-/- arguments.
+        function_maps.insert(
+            "01_PSP".to_string(),
+            PreparedFunctionMap {
+                pass2_map: Some(prepared_symbol_test_map("pal_wire_psp", "01_PSP", 1)),
+                function_names: HashMap::new(),
+                evidence_name_projection: Default::default(),
+            },
+        );
+
+        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new(), &HashMap::new(), &pal);
+        let wired = &inputs[label];
+        assert_eq!(wired.pal_identity, identity);
+        assert_eq!(wired.pal_manifest.as_deref(), Some(manifest_path.as_path()));
+        assert_eq!(
+            wired.scatter_manifest.as_deref(),
+            Some(scatter_path.as_path())
+        );
+        let unwired = &inputs["01_PSP"];
+        assert_eq!(unwired.pal_identity, "");
+        assert!(unwired.pal_manifest.is_none());
+        assert!(unwired.scatter_manifest.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6211,6 +7212,16 @@ mod tests {
         let global_shapes_json = b"{\"sentinel\":true}";
         std::fs::write(dest.join("global_shapes.json"), global_shapes_json).unwrap();
         std::fs::write(dest.join("future-sidecar.bin"), future_sidecar).unwrap();
+        // The marshalled PAL task manifest is a sibling of `decompiled/` and
+        // outside Ghidra's three-file refresh ownership: it must survive the
+        // pass-2 refresh byte-for-byte.
+        let pal_manifest = b"{\"format\":\"pixel-modem-extractor-pal-tasks-v1\"}";
+        std::fs::create_dir_all(images.join(label).join("pal_tasks")).unwrap();
+        std::fs::write(
+            images.join(label).join("pal_tasks").join("tasks.json"),
+            pal_manifest,
+        )
+        .unwrap();
         std::fs::write(
             images.join(label).join(format!("{label}.bin")),
             vec![0u8; 0x40],
@@ -6257,6 +7268,12 @@ mod tests {
             std::fs::read(dest.join("future-sidecar.bin")).unwrap(),
             future_sidecar,
             "unrelated sidecars must be byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(images.join(label).join("pal_tasks").join("tasks.json")).unwrap(),
+            pal_manifest,
+            "the PAL task manifest is outside the pass-2 refresh transaction \
+             and must be byte-identical"
         );
         assert!(
             !export.exists(),
@@ -6689,6 +7706,14 @@ mod tests {
             b"payload",
         )
         .unwrap();
+        // The marshalled PAL task manifest is a terminal leaf: prune keeps
+        // the directory and never prunes anything below it.
+        std::fs::create_dir_all(out.join("images/02_MAIN/pal_tasks")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/pal_tasks/tasks.json"),
+            b"{\"format\":\"pixel-modem-extractor-pal-tasks-v1\"}",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
@@ -6731,6 +7756,11 @@ mod tests {
         assert_eq!(
             std::fs::read(out.join("images/02_MAIN/scatter/blocks/04-decompress1.bin")).unwrap(),
             b"payload"
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/pal_tasks/tasks.json")).unwrap(),
+            b"{\"format\":\"pixel-modem-extractor-pal-tasks-v1\"}",
+            "the PAL task manifest is a retained leaf"
         );
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());

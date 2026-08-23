@@ -107,6 +107,59 @@ fn decompose_produces_unified_tree() {
         .expect("report.json must contain symbol_map stage");
     assert_eq!(symbol_map_stage["status"], "ok");
 
+    // PAL task inventory: exactly one `pal_tasks` stage, directly after the
+    // `decompile` stage whose marshal produced the terminal manifests.
+    let stage_names: Vec<String> = report["stages"]
+        .as_array()
+        .map(|stages| {
+            stages
+                .iter()
+                .map(|s| s["stage"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        stage_names
+            .iter()
+            .filter(|name| name.as_str() == "pal_tasks")
+            .count(),
+        1,
+        "expected exactly one pal_tasks stage: {stage_names:?}"
+    );
+    let pal_index = stage_names
+        .iter()
+        .position(|name| name == "pal_tasks")
+        .unwrap();
+    let decompile_index = stage_names
+        .iter()
+        .position(|name| name == "decompile")
+        .expect("decompile stage");
+    assert!(
+        pal_index > decompile_index,
+        "pal_tasks must follow the decompile stage: {stage_names:?}"
+    );
+    let pal_stage = &report["stages"].as_array().unwrap()[pal_index];
+    assert!(
+        pal_stage["status"] == "ok" || pal_stage["status"] == "skipped",
+        "pal_tasks stage status must be ok or skipped: {pal_stage}"
+    );
+    if pal_stage["status"] == "ok" {
+        let output = pal_stage["output"].as_str().expect("ok pal_tasks output");
+        assert!(
+            output.starts_with("images/*/pal_tasks/tasks.json ("),
+            "deterministic pal_tasks output: {output}"
+        );
+        let marshalled = output_count_field(output, "images=");
+        assert!(
+            marshalled >= 1,
+            "ok pal_tasks must count >=1 image: {output}"
+        );
+        assert!(
+            output_count_field(output, "tasks=") >= 1,
+            "tasks count: {output}"
+        );
+    }
+
     // Phase 1: pass 2 ran on at least one image (02_MAIN on real firmware has
     // token-derived names). pass2_applied is recorded into the decompile stage's
     // per-image report.
@@ -216,15 +269,6 @@ fn decompose_produces_unified_tree() {
     // Phase 2: thumb_enrich (pass 1) and thumb_enrich_post_pass2 stages are
     // both present in the report. Defaults run both; skip rules covered in
     // Task 10/12.
-    let stage_names: Vec<String> = report["stages"]
-        .as_array()
-        .map(|stages| {
-            stages
-                .iter()
-                .map(|s| s["stage"].as_str().unwrap_or("").to_string())
-                .collect()
-        })
-        .unwrap_or_default();
     assert!(
         stage_names.iter().any(|s| s == "thumb_enrich"),
         "expected thumb_enrich stage in report: {stage_names:?}"
@@ -609,6 +653,30 @@ const NINE_GLOBAL_SHAPES_FIELDS: [&str; 9] = [
     "global_shapes_state_barriers",
 ];
 
+const SEVEN_PAL_COUNTER_FIELDS: [&str; 7] = [
+    "pal_tasks",
+    "pal_entries",
+    "pal_functions_created",
+    "pal_functions_existing",
+    "pal_names_applied",
+    "pal_names_preserved",
+    "pal_shared_entries",
+];
+
+/// `key<value>` from a `(..., key=value, ...)` stage-output summary.
+fn output_count_field(output: &str, key: &str) -> u64 {
+    let start = output
+        .find(key)
+        .unwrap_or_else(|| panic!("stage output missing {key}: {output}"));
+    let rest = &output[start + key.len()..];
+    let end = rest
+        .find([',', ')'])
+        .unwrap_or_else(|| panic!("unterminated {key} in {output}"));
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|_| panic!("invalid {key} in {output}"))
+}
+
 fn current_global_shapes_inputs_succeeded(image: &serde_json::Value) -> bool {
     if image
         .get("functions")
@@ -861,6 +929,119 @@ fn global_types_applied_on_retained_tree() {
          (candidates={candidates}, skipped={skipped}): {main}"
     );
     eprintln!("02_MAIN global_types: applied={applied} candidates={candidates} skipped={skipped}");
+}
+
+/// PAL task inventory (Task 13): a retained decompose tree carries exactly
+/// one `pal_tasks` stage directly after `decompile`, and the decompile
+/// stage's per-image rows carry the seven optional PAL counters as an
+/// all-or-none group — present only for images whose pass-1 import applied
+/// a configured PAL map. When the stage reports `ok`, the terminal
+/// `images/<label>/pal_tasks/tasks.json` manifests must exist for exactly
+/// the counter-carrying images. Reads `$PME_GOLDEN_DIR/report.json` only
+/// (never launches decompose); skips cleanly when the env is unset or the
+/// retained tree predates the PAL stage.
+#[test]
+fn report_json_includes_pal_fields() {
+    let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = dir.join("report.json");
+    if !report_path.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report.json readable"))
+            .expect("report.json valid JSON");
+    let stages = v["stages"]
+        .as_array()
+        .expect("report.json stages must be an array");
+    let names: Vec<&str> = stages.iter().filter_map(|s| s["stage"].as_str()).collect();
+    let images = stages
+        .iter()
+        .find(|stage| stage["stage"] == "decompile")
+        .and_then(|stage| stage["images"].as_array())
+        .expect("decompile stage images");
+    let counter_images: Vec<&serde_json::Value> = images
+        .iter()
+        .filter(|image| image.get("pal_tasks").is_some())
+        .collect();
+    let has_stage = names.contains(&"pal_tasks");
+    if !has_stage && counter_images.is_empty() {
+        eprintln!(
+            "skip: retained tree predates the pal_tasks stage ({})",
+            dir.display()
+        );
+        return;
+    }
+
+    assert_eq!(
+        names.iter().filter(|name| **name == "pal_tasks").count(),
+        1,
+        "exactly one pal_tasks stage: {names:?}"
+    );
+    let pal_index = names.iter().position(|name| *name == "pal_tasks").unwrap();
+    let decompile_index = names
+        .iter()
+        .position(|name| *name == "decompile")
+        .expect("decompile stage");
+    assert!(
+        pal_index > decompile_index,
+        "pal_tasks must follow decompile: {names:?}"
+    );
+    let pal_stage = &stages[pal_index];
+    assert!(
+        pal_stage["status"] == "ok" || pal_stage["status"] == "skipped",
+        "pal_tasks status: {pal_stage}"
+    );
+
+    // All-or-none per image, with the terminal manifest present exactly for
+    // the counter-carrying images when the stage marshalled a map.
+    for image in images {
+        let label = image["image"].as_str().expect("image label");
+        let carries = image.get("pal_tasks").is_some();
+        for key in SEVEN_PAL_COUNTER_FIELDS {
+            assert_eq!(
+                image.get(key).is_some(),
+                carries,
+                "{label} must carry every PAL counter or none: {image}"
+            );
+            if carries {
+                assert!(
+                    image.get(key).and_then(serde_json::Value::as_u64).is_some(),
+                    "{key} must be an unsigned counter: {image}"
+                );
+            }
+        }
+        if carries && pal_stage["status"] == "ok" {
+            assert!(
+                dir.join("images")
+                    .join(label)
+                    .join("pal_tasks")
+                    .join("tasks.json")
+                    .exists(),
+                "{label} carries PAL counters but has no terminal manifest"
+            );
+        }
+    }
+    if pal_stage["status"] == "skipped" {
+        assert!(
+            counter_images.is_empty(),
+            "a skipped pal_tasks stage cannot coexist with per-image PAL counters"
+        );
+        assert!(
+            pal_stage["reason"].as_str().is_some(),
+            "a skipped pal_tasks stage must carry its reason"
+        );
+    } else {
+        let output = pal_stage["output"].as_str().expect("ok pal_tasks output");
+        assert_eq!(
+            output_count_field(output, "images=") as usize,
+            counter_images.len(),
+            "stage output must agree with the per-image counters: {output}"
+        );
+    }
 }
 
 /// pme-paq-v1 equality of every pinned deterministic surface against a

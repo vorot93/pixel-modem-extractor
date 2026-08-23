@@ -593,10 +593,6 @@ pub struct DecompileReport {
     pub spec_path: PathBuf,
     current_exports: BTreeSet<String>,
     runtime_scatter: HashMap<String, RuntimeScatterState>,
-    // Read today by the generation tests and the decompile orchestrator
-    // wiring that consumes PAL state (the same interim state the whole
-    // `pal_tasks` module carries in lib.rs).
-    #[cfg_attr(not(test), allow(dead_code))]
     runtime_tasks: HashMap<String, RuntimeTaskState>,
 }
 
@@ -612,7 +608,6 @@ impl DecompileReport {
             .unwrap_or(RuntimeScatterState::Unmanaged)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn runtime_task_state(&self, label: &str) -> RuntimeTaskState {
         self.runtime_tasks
             .get(label)
@@ -622,7 +617,6 @@ impl DecompileReport {
 
     /// One image's coherent runtime analysis state: the scatter and PAL
     /// task states the generation loop measured for this run.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn runtime_analysis_state(&self, label: &str) -> RuntimeAnalysisState {
         RuntimeAnalysisState {
             scatter: self.runtime_scatter_state(label),
@@ -645,13 +639,11 @@ pub(crate) enum RuntimeScatterState {
 /// failed discovery/publication can never fabricate (`Present`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeTaskState {
-    #[cfg_attr(not(test), allow(dead_code))]
     Unmanaged,
     Absent,
     Present(crate::pal_tasks::MaterializedTaskMap),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeAnalysisState {
     pub scatter: RuntimeScatterState,
@@ -4068,328 +4060,15 @@ mod tests {
 
     // -------------------------------------------------------------------
     // Runtime PAL discovery fixtures (Task 12): discoverable MAIN images
-    // built from the shared PAL fixture machinery. The initializer shape,
-    // slot-table layout, and image builder mirror the pal_tasks table
-    // fixtures — the only producers of a complete, discoverable plan.
+    // built from the shared PAL fixture machinery in
+    // `pal_tasks::discover::test_support` — the only producer of a
+    // complete, discoverable plan.
     // -------------------------------------------------------------------
 
     use crate::pal_tasks::test_support::{
-        BASE as PAL_BASE, FixtureItem, adr_to, assemble, branch_to, branch32_to, cbz_to, enc, gpr,
-        insn, low, word_at,
+        BASE as PAL_BASE, craft_ambiguous_pal_main_image, craft_discoverable_pal_main_image,
+        craft_scatter_pal_main_image,
     };
-    use scaleservers_arm32_assembly::{Arm32Condition, ArmT32Instruction as T32};
-
-    const PAL_STRIDE: u32 = 0x1f8;
-    const PAL_NAME_OFFSET: u32 = 0x4c;
-    const PAL_SLOT_TABLE_OFF: u32 = 0x4000;
-    const PAL_EXTENDED_CAPACITY: u32 = 8;
-
-    /// Growable MAIN image under construction: bytes above `PAL_BASE`
-    /// grown on demand, written at absolute addresses.
-    struct PalImageBuilder {
-        bytes: Vec<u8>,
-    }
-
-    impl PalImageBuilder {
-        fn new() -> Self {
-            PalImageBuilder { bytes: Vec::new() }
-        }
-
-        fn ensure(&mut self, end: u32) {
-            let end = usize::try_from(end - PAL_BASE).expect("fixture extent fits the host");
-            if self.bytes.len() < end {
-                self.bytes.resize(end, 0);
-            }
-        }
-
-        fn write(&mut self, address: u32, data: &[u8]) {
-            self.ensure(
-                address
-                    .checked_add(u32::try_from(data.len()).unwrap())
-                    .unwrap(),
-            );
-            let offset = usize::try_from(address - PAL_BASE).unwrap();
-            self.bytes[offset..offset + data.len()].copy_from_slice(data);
-        }
-
-        fn write_u32(&mut self, address: u32, value: u32) {
-            self.write(address, &value.to_le_bytes());
-        }
-    }
-
-    /// The canonical discoverable initializer shape with a parameterized
-    /// slot base and capacity: slot r4, count r5, name r0, guard shift 3.
-    fn pal_initializer_items(slot_base: u32, capacity: u32) -> Vec<FixtureItem> {
-        let guard_value = capacity / 8 - 1;
-        vec![
-            insn("init", |_, _| T32::Push_T1(vec![gpr(4), gpr(14)])),
-            insn("ref", |pc, l| T32::Adr_T1(low(1), adr_to(l, "anchor", pc))),
-            insn("zero", |_, _| T32::Mov_Immediate_T1(low(5), 0)),
-            insn("slotlo", move |_, _| {
-                T32::Mov_Immediate_T3(gpr(4), u16::try_from(slot_base & 0xffff).unwrap())
-            }),
-            insn("slothi", move |_, _| {
-                T32::Movt_T1(gpr(4), u16::try_from(slot_base >> 16).unwrap())
-            }),
-            insn("call", |pc, l| T32::Bl_T1(branch32_to(l, "leaf", pc))),
-            insn("load", |_, _| T32::Ldr_Immediate_T1(low(0), low(4), 0x4c)),
-            insn("lcbz", |pc, l| T32::Cbz_T1(low(0), cbz_to(l, "term", pc))),
-            insn("lstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
-            insn("ladd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
-            insn("lstride", |_, _| {
-                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
-            }),
-            insn("lcmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
-            insn("lbne", |pc, l| {
-                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "load", pc))
-            }),
-            insn("cap", |_, l| {
-                T32::Mov_Immediate_T3(
-                    gpr(0),
-                    u16::try_from(word_at(l, "globals") & 0xffff).unwrap(),
-                )
-            }),
-            insn("", |_, l| {
-                T32::Movt_T1(gpr(0), u16::try_from(word_at(l, "globals") >> 16).unwrap())
-            }),
-            insn("cval", move |_, _| {
-                T32::Mov_Immediate_T3(gpr(1), u16::try_from(capacity).unwrap())
-            }),
-            insn("cstr", |_, _| T32::Str_Immediate_T1(low(1), low(0), 0)),
-            insn("cjmp", |pc, l| T32::B_T2(branch_to(l, "join", pc))),
-            insn("term", |pc, l| {
-                T32::Adr_T1(low(0), adr_to(l, "globals", pc))
-            }),
-            insn("tstr", |_, _| T32::Str_Immediate_T1(low(5), low(0), 0)),
-            insn("glsr", |_, _| T32::Lsr_Immediate_T1(low(0), low(5), 3)),
-            insn("gcmp", move |_, _| {
-                T32::Cmp_Immediate_T1(low(0), u8::try_from(guard_value).unwrap())
-            }),
-            insn("gbhi", |pc, l| {
-                T32::B_T1(Arm32Condition::UnsignedHigher, branch_to(l, "join", pc))
-            }),
-            insn("sstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
-            insn("sadd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
-            insn("sslot", |_, _| {
-                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
-            }),
-            insn("smov", |_, _| T32::Mov_Register_T1(gpr(6), gpr(0))),
-            insn("snop", |_, _| T32::Nop_T1),
-            insn("scmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
-            insn("sbne", |pc, l| {
-                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "sstr", pc))
-            }),
-            insn("join", |_, _| T32::Bx_T1(gpr(14))),
-            FixtureItem::Align(4),
-            FixtureItem::Anchor("anchor"),
-            FixtureItem::Align(2),
-            insn("leaf", |_, _| T32::Mov_Immediate_T3(gpr(0), 0x1234)),
-            insn("leaf2", |_, _| T32::Movt_T1(gpr(0), 0)),
-            insn("leafret", |_, _| T32::Bx_T1(gpr(14))),
-            FixtureItem::Align(4),
-            FixtureItem::Data("globals", 8),
-        ]
-    }
-
-    /// One nonterminal slot's desired content; `None` pointers let the
-    /// builder assign default addresses (a written name string and a
-    /// distinct Thumb `push` entry).
-    struct PalSlotSpec {
-        name: &'static str,
-        entry_pointer: Option<u32>,
-        priority: u32,
-        stack_size: u32,
-        opaque: u8,
-    }
-
-    fn pal_slot(name: &'static str) -> PalSlotSpec {
-        PalSlotSpec {
-            name,
-            entry_pointer: None,
-            priority: 0x64,
-            stack_size: 0x200,
-            opaque: 0x5a,
-        }
-    }
-
-    /// Write the descriptor-v1 slots and terminal plus their name strings
-    /// and default Thumb `push {r4, lr}` entries.
-    fn write_pal_table(image: &mut PalImageBuilder, slot_base: u32, slots: &[PalSlotSpec]) {
-        let slot_count = u32::try_from(slots.len()).expect("fixture slot count fits u32") + 1;
-        let table_end = slot_base + slot_count * PAL_STRIDE;
-        image.ensure(table_end);
-        let mut cursor = table_end + 0x40;
-        let mut name_addresses = Vec::with_capacity(slots.len());
-        for spec in slots {
-            image.write(cursor, spec.name.as_bytes());
-            image.write(cursor + u32::try_from(spec.name.len()).unwrap(), &[0]);
-            name_addresses.push(cursor);
-            cursor += u32::try_from(spec.name.len()).unwrap() + 1;
-        }
-        cursor = cursor.div_ceil(4) * 4;
-        let entries_base = cursor;
-        // Each entry is a self-contained Thumb function (`push {r4, lr}`;
-        // `bx lr`) at 8-byte spacing, so Ghidra's flow disassembly from one
-        // entry never crosses into the next.
-        let push = enc(&T32::Push_T1(vec![gpr(4), gpr(14)]));
-        let bx_lr = enc(&T32::Bx_T1(gpr(14)));
-        let mut entry_addresses = Vec::with_capacity(slots.len());
-        for index in 0..slots.len() {
-            let address = entries_base + u32::try_from(index).unwrap() * 8;
-            image.write(address, &push);
-            image.write(address + u32::try_from(push.len()).unwrap(), &bx_lr);
-            entry_addresses.push(address);
-        }
-        image.ensure(entries_base + u32::try_from(slots.len()).unwrap() * 8 + 8);
-        for (index, spec) in slots.iter().enumerate() {
-            let index = u32::try_from(index).unwrap();
-            let slot_address = slot_base + index * PAL_STRIDE;
-            for offset in 0..PAL_STRIDE {
-                let byte = spec.opaque.wrapping_add((offset as u8) ^ (index as u8));
-                image.write(slot_address + offset, &[byte]);
-            }
-            image.write_u32(
-                slot_address + PAL_NAME_OFFSET,
-                name_addresses[usize::try_from(index).unwrap()],
-            );
-            image.write_u32(slot_address + PAL_NAME_OFFSET + 4, spec.priority);
-            image.write_u32(slot_address + PAL_NAME_OFFSET + 8, spec.stack_size);
-            image.write_u32(
-                slot_address + PAL_NAME_OFFSET + 12,
-                spec.entry_pointer
-                    .unwrap_or(entry_addresses[usize::try_from(index).unwrap()] | 1),
-            );
-            image.write_u32(slot_address + PAL_NAME_OFFSET + 16, 0);
-            image.write_u32(slot_address + PAL_NAME_OFFSET + 20, 0);
-        }
-        let terminal = slot_base + slot_count.saturating_sub(1) * PAL_STRIDE;
-        for offset in 0..PAL_STRIDE {
-            let byte = 0x33u8.wrapping_add(offset as u8);
-            image.write(terminal + offset, &[byte]);
-        }
-        for field in [
-            PAL_NAME_OFFSET,
-            PAL_NAME_OFFSET + 4,
-            PAL_NAME_OFFSET + 8,
-            PAL_NAME_OFFSET + 12,
-            PAL_NAME_OFFSET + 16,
-            PAL_NAME_OFFSET + 20,
-        ] {
-            image.write_u32(terminal + field, 0);
-        }
-    }
-
-    /// A MAIN image whose PAL initializer and two-slot table are
-    /// discoverable end to end (no scatter loader: PAL over a raw-only
-    /// runtime view).
-    fn craft_discoverable_pal_main_image() -> Vec<u8> {
-        let mut image = PalImageBuilder::new();
-        let (code_bytes, _) = assemble(
-            PAL_BASE,
-            &pal_initializer_items(PAL_BASE + PAL_SLOT_TABLE_OFF, PAL_EXTENDED_CAPACITY),
-        );
-        image.write(PAL_BASE, &code_bytes);
-        write_pal_table(
-            &mut image,
-            PAL_BASE + PAL_SLOT_TABLE_OFF,
-            &[pal_slot("first_task"), pal_slot("second_task")],
-        );
-        image.bytes
-    }
-
-    /// A MAIN image carrying BOTH a discoverable scatter loader/table and
-    /// the discoverable PAL initializer/table: the scatter loader block is
-    /// the scatter-kit fixture shape re-based to `PAL_BASE`, with copy
-    /// destinations just past the image end so no scatter destination
-    /// overlaps the raw span.
-    fn craft_scatter_pal_main_image() -> Vec<u8> {
-        const IMAGE_LEN: usize = 0x4700;
-        const LOADER_OFFSET: usize = 0x40;
-        const LITERAL_OFFSET: usize = 0x80;
-        const TABLE_OFFSET: usize = 0x200;
-        const TABLE_LEN: u32 = 6 * 16;
-        let null_handler = PAL_BASE + 0x600;
-        let copy_handler = PAL_BASE + 0x601;
-        let decompress1_handler = PAL_BASE + 0x604;
-        let zero_handler = PAL_BASE + 0x609;
-        let sentinel_source = PAL_BASE + 0x680;
-        let self_copy_source = PAL_BASE + 0x700;
-        let copy_source = PAL_BASE + 0x710;
-        let decompress1_source = PAL_BASE + 0x720;
-        let zero_source = PAL_BASE + 0x730;
-        let copy_destination = PAL_BASE + 0x5000;
-        let decompress1_destination = PAL_BASE + 0x5010;
-        let zero_destination = PAL_BASE + 0x5020;
-
-        let mut image = PalImageBuilder::new();
-        image.ensure(PAL_BASE + IMAGE_LEN as u32);
-        // add r0, pc, #0x38; ldmia r0, {r10,r11}; add r10/r11, r0.
-        image.write_u32(PAL_BASE + LOADER_OFFSET as u32, 0xe28f_0038);
-        image.write_u32(PAL_BASE + LOADER_OFFSET as u32 + 4, 0xe890_0c00);
-        image.write_u32(PAL_BASE + LOADER_OFFSET as u32 + 8, 0xe08a_a000);
-        image.write_u32(PAL_BASE + LOADER_OFFSET as u32 + 12, 0xe08b_b000);
-        let literal_address = PAL_BASE + LITERAL_OFFSET as u32;
-        let table_address = PAL_BASE + TABLE_OFFSET as u32;
-        image.write_u32(literal_address, table_address.wrapping_sub(literal_address));
-        image.write_u32(
-            literal_address + 4,
-            (table_address + TABLE_LEN).wrapping_sub(literal_address),
-        );
-        image.write(PAL_BASE + 0x700, &[0xff, 0xff, 0xff, 0xff]);
-        image.write(PAL_BASE + 0x710, &[0x11, 0x22, 0x33, 0x44]);
-        image.write(PAL_BASE + 0x720, &[0x22, 0xaa]);
-        for (index, source, destination, size, handler) in [
-            (0u32, sentinel_source, 0u32, 0u32, null_handler),
-            (1, 0, sentinel_source, 0, null_handler),
-            (2, self_copy_source, self_copy_source, 4, copy_handler),
-            (3, copy_source, copy_destination, 4, copy_handler),
-            (
-                4,
-                decompress1_source,
-                decompress1_destination,
-                3,
-                decompress1_handler,
-            ),
-            (5, zero_source, zero_destination, 5, zero_handler),
-        ] {
-            let offset = TABLE_OFFSET + index as usize * 16;
-            image.write_u32(PAL_BASE + offset as u32, source);
-            image.write_u32(PAL_BASE + offset as u32 + 4, destination);
-            image.write_u32(PAL_BASE + offset as u32 + 8, size);
-            image.write_u32(PAL_BASE + offset as u32 + 12, handler);
-        }
-
-        let (code_bytes, _) = assemble(
-            PAL_BASE + 0x800,
-            &pal_initializer_items(PAL_BASE + PAL_SLOT_TABLE_OFF, PAL_EXTENDED_CAPACITY),
-        );
-        image.write(PAL_BASE + 0x800, &code_bytes);
-        write_pal_table(
-            &mut image,
-            PAL_BASE + PAL_SLOT_TABLE_OFF,
-            &[pal_slot("first_task"), pal_slot("second_task")],
-        );
-        image.bytes
-    }
-
-    /// A MAIN image with two complete initializer/table pairs: discovery
-    /// is the typed ambiguity error, never a silently chosen plan.
-    fn craft_ambiguous_pal_main_image() -> Vec<u8> {
-        let mut image = PalImageBuilder::new();
-        let (first, _) = assemble(
-            PAL_BASE,
-            &pal_initializer_items(PAL_BASE + PAL_SLOT_TABLE_OFF, PAL_EXTENDED_CAPACITY),
-        );
-        let (second, _) = assemble(
-            PAL_BASE + 0x200,
-            &pal_initializer_items(PAL_BASE + 0x8000, PAL_EXTENDED_CAPACITY),
-        );
-        image.write(PAL_BASE, &first);
-        image.write(PAL_BASE + 0x200, &second);
-        write_pal_table(&mut image, PAL_BASE + PAL_SLOT_TABLE_OFF, &[pal_slot("aa")]);
-        write_pal_table(&mut image, PAL_BASE + 0x8000, &[pal_slot("bb")]);
-        image.bytes
-    }
 
     fn test_identity(
         producer: crate::thumb_analysis::ThumbProducer,

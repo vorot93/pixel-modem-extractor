@@ -22,7 +22,8 @@ mod table;
 
 // The generation and Ghidra consumers import this surface.
 pub(crate) use artifact::{
-    MaterializedTaskMap, TaskArtifactContext, clear_materialized, materialize,
+    MaterializedTaskMap, TaskArtifactContext, ValidatedTaskArtifact, clear_materialized,
+    materialize, read,
 };
 
 /// The shared PAL fixture machinery (raw/scatter image construction and
