@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+#[path = "support/pal_fixture.rs"]
+mod pal_fixture;
+
 const SCATTER_BASE: u32 = 0x4001_0000;
 const SCATTER_IMAGE_LEN: usize = 0x1000;
 const SCATTER_COPY_DESTINATION: u32 = SCATTER_BASE + SCATTER_IMAGE_LEN as u32;
@@ -144,355 +147,6 @@ fn craft_scatter_main_modem_bin() -> Vec<u8> {
     craft_single_image_modem_bin("MAIN", SCATTER_BASE, 3, &image)
 }
 
-// ---------------------------------------------------------------------------
-// Runtime PAL discovery fixture (Task 12): a self-synthesized MAIN image
-// whose PAL initializer CFG and descriptor-v1 slot table are discoverable
-// by the production `pal_tasks::discover` boundary. Mirrors the shape the
-// crate-internal pal_tasks fixtures use (the two-pass label-resolving
-// Thumb assembler is re-implemented here because integration tests cannot
-// reach cfg(test) support modules).
-// ---------------------------------------------------------------------------
-
-mod pal_runtime_fixture {
-    use scaleservers_arm32_assembly::{
-        Arm32Condition, Arm32GeneralPurposeRegister as Gpr, Arm32LowGeneralPurposeRegister as Low,
-        ArmT32Instruction as T32,
-    };
-    use std::collections::BTreeMap;
-
-    pub(super) const BASE: u32 = 0x1000;
-    const STRIDE: u32 = 0x1f8;
-    const NAME_OFFSET: u32 = 0x4c;
-    const SLOT_TABLE_OFF: u32 = 0x4000;
-    const CAPACITY: u32 = 8;
-    const ANCHOR_PATTERN: &[u8; 9] = b"PALTskTm\0";
-
-    pub(super) type FixtureLabels = BTreeMap<&'static str, u32>;
-    pub(super) type FixtureBuild = Box<dyn Fn(u32, &FixtureLabels) -> T32>;
-
-    pub(super) enum FixtureItem {
-        Insn(&'static str, FixtureBuild),
-        Data(&'static str, usize),
-        Anchor(&'static str),
-        Align(u32),
-    }
-
-    pub(super) fn insn(
-        label: &'static str,
-        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
-    ) -> FixtureItem {
-        FixtureItem::Insn(label, Box::new(build))
-    }
-
-    fn put(bytes: &mut [u8], offset: usize, part: &[u8]) {
-        bytes[offset..offset + part.len()].copy_from_slice(part);
-    }
-
-    fn enc(instruction: &T32) -> Vec<u8> {
-        instruction.encode().expect("fixture encodes")
-    }
-
-    fn branch_offset(target: u32, pc: u32) -> i32 {
-        i32::try_from(i64::from(target) - i64::from(pc) - 4).expect("branch offset fits i32")
-    }
-
-    fn branch_i16(target: u32, pc: u32) -> i16 {
-        i16::try_from(branch_offset(target, pc)).expect("branch offset fits i16")
-    }
-
-    fn cbz_offset(target: u32, pc: u32) -> u8 {
-        u8::try_from(branch_offset(target, pc)).expect("cbz offset fits u8")
-    }
-
-    fn aligned_offset(target: u32, pc: u32) -> u16 {
-        let aligned = (pc.wrapping_add(4)) & !3;
-        u16::try_from(target - aligned).expect("aligned offset fits u16")
-    }
-
-    fn branch_to(l: &FixtureLabels, name: &str, pc: u32) -> i16 {
-        branch_i16(l.get(name).copied().unwrap_or(pc + 4), pc)
-    }
-
-    fn branch32_to(l: &FixtureLabels, name: &str, pc: u32) -> i32 {
-        branch_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
-    }
-
-    fn cbz_to(l: &FixtureLabels, name: &str, pc: u32) -> u8 {
-        cbz_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
-    }
-
-    fn adr_to(l: &FixtureLabels, name: &str, pc: u32) -> u16 {
-        aligned_offset(l.get(name).copied().unwrap_or((pc + 8) & !3), pc)
-    }
-
-    fn word_at(l: &FixtureLabels, name: &str) -> u32 {
-        l.get(name).copied().unwrap_or(0)
-    }
-
-    /// Two-pass assembler: measure with neutral offsets, then encode with
-    /// resolved label addresses.
-    pub(super) fn assemble(base: u32, items: &[FixtureItem]) -> (Vec<u8>, FixtureLabels) {
-        let unresolved = FixtureLabels::new();
-        let mut starts = Vec::with_capacity(items.len());
-        let mut pc = base;
-        for item in items {
-            if let FixtureItem::Align(to) = item {
-                pc = pc.div_ceil(*to) * *to;
-            }
-            starts.push(pc);
-            let size = match item {
-                FixtureItem::Insn(_, build) => u32::try_from(
-                    build(pc, &unresolved)
-                        .encode()
-                        .expect("fixture instruction encodes")
-                        .len(),
-                )
-                .expect("fixture instruction size fits u32"),
-                FixtureItem::Data(_, 4) => 4,
-                FixtureItem::Data(_, size) => *size as u32,
-                FixtureItem::Anchor(_) => ANCHOR_PATTERN.len() as u32,
-                FixtureItem::Align(_) => 0,
-            };
-            pc += size;
-        }
-        let labels: FixtureLabels = items
-            .iter()
-            .zip(&starts)
-            .filter_map(|(item, start)| match item {
-                FixtureItem::Insn(label, _)
-                | FixtureItem::Data(label, _)
-                | FixtureItem::Anchor(label) => (!label.is_empty()).then_some((*label, *start)),
-                FixtureItem::Align(_) => None,
-            })
-            .collect();
-        let mut bytes = vec![0u8; (pc - base) as usize];
-        for (item, start) in items.iter().zip(&starts) {
-            match item {
-                FixtureItem::Insn(_, build) => {
-                    let part = build(*start, &labels)
-                        .encode()
-                        .expect("fixture instruction encodes");
-                    put(&mut bytes, (*start - base) as usize, &part);
-                }
-                FixtureItem::Data(_, _) => {}
-                FixtureItem::Anchor(_) => put(&mut bytes, (*start - base) as usize, ANCHOR_PATTERN),
-                FixtureItem::Align(_) => {}
-            }
-        }
-        (bytes, labels)
-    }
-
-    fn gpr(number: u8) -> Gpr {
-        Gpr::from_operand_bits(number)
-    }
-
-    fn low(number: u8) -> Low {
-        Low::from_operand_bits(number)
-    }
-
-    /// The canonical discoverable initializer shape: slot r4, count r5,
-    /// name r0, guard shift 3.
-    fn initializer_items(slot_base: u32, capacity: u32) -> Vec<FixtureItem> {
-        let guard_value = capacity / 8 - 1;
-        vec![
-            insn("init", |_, _| T32::Push_T1(vec![gpr(4), gpr(14)])),
-            insn("ref", |pc, l| T32::Adr_T1(low(1), adr_to(l, "anchor", pc))),
-            insn("zero", |_, _| T32::Mov_Immediate_T1(low(5), 0)),
-            insn("slotlo", move |_, _| {
-                T32::Mov_Immediate_T3(gpr(4), u16::try_from(slot_base & 0xffff).unwrap())
-            }),
-            insn("slothi", move |_, _| {
-                T32::Movt_T1(gpr(4), u16::try_from(slot_base >> 16).unwrap())
-            }),
-            insn("call", |pc, l| T32::Bl_T1(branch32_to(l, "leaf", pc))),
-            insn("load", |_, _| T32::Ldr_Immediate_T1(low(0), low(4), 0x4c)),
-            insn("lcbz", |pc, l| T32::Cbz_T1(low(0), cbz_to(l, "term", pc))),
-            insn("lstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
-            insn("ladd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
-            insn("lstride", |_, _| {
-                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
-            }),
-            insn("lcmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
-            insn("lbne", |pc, l| {
-                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "load", pc))
-            }),
-            insn("cap", |_, l| {
-                T32::Mov_Immediate_T3(
-                    gpr(0),
-                    u16::try_from(word_at(l, "globals") & 0xffff).unwrap(),
-                )
-            }),
-            insn("", |_, l| {
-                T32::Movt_T1(gpr(0), u16::try_from(word_at(l, "globals") >> 16).unwrap())
-            }),
-            insn("cval", move |_, _| {
-                T32::Mov_Immediate_T3(gpr(1), u16::try_from(capacity).unwrap())
-            }),
-            insn("cstr", |_, _| T32::Str_Immediate_T1(low(1), low(0), 0)),
-            insn("cjmp", |pc, l| T32::B_T2(branch_to(l, "join", pc))),
-            insn("term", |pc, l| {
-                T32::Adr_T1(low(0), adr_to(l, "globals", pc))
-            }),
-            insn("tstr", |_, _| T32::Str_Immediate_T1(low(5), low(0), 0)),
-            insn("glsr", |_, _| T32::Lsr_Immediate_T1(low(0), low(5), 3)),
-            insn("gcmp", move |_, _| {
-                T32::Cmp_Immediate_T1(low(0), u8::try_from(guard_value).unwrap())
-            }),
-            insn("gbhi", |pc, l| {
-                T32::B_T1(Arm32Condition::UnsignedHigher, branch_to(l, "join", pc))
-            }),
-            insn("sstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
-            insn("sadd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
-            insn("sslot", |_, _| {
-                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
-            }),
-            insn("smov", |_, _| T32::Mov_Register_T1(gpr(6), gpr(0))),
-            insn("snop", |_, _| T32::Nop_T1),
-            insn("scmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
-            insn("sbne", |pc, l| {
-                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "sstr", pc))
-            }),
-            insn("join", |_, _| T32::Bx_T1(gpr(14))),
-            FixtureItem::Align(4),
-            FixtureItem::Anchor("anchor"),
-            FixtureItem::Align(2),
-            insn("leaf", |_, _| T32::Mov_Immediate_T3(gpr(0), 0x1234)),
-            insn("leaf2", |_, _| T32::Movt_T1(gpr(0), 0)),
-            insn("leafret", |_, _| T32::Bx_T1(gpr(14))),
-            FixtureItem::Align(4),
-            FixtureItem::Data("globals", 8),
-        ]
-    }
-
-    /// Growable MAIN image under construction.
-    struct ImageBuilder {
-        bytes: Vec<u8>,
-    }
-
-    impl ImageBuilder {
-        fn new() -> Self {
-            ImageBuilder { bytes: Vec::new() }
-        }
-
-        fn ensure(&mut self, end: u32) {
-            let end = usize::try_from(end - BASE).expect("fixture extent fits the host");
-            if self.bytes.len() < end {
-                self.bytes.resize(end, 0);
-            }
-        }
-
-        fn write(&mut self, address: u32, data: &[u8]) {
-            self.ensure(
-                address
-                    .checked_add(u32::try_from(data.len()).unwrap())
-                    .unwrap(),
-            );
-            let offset = usize::try_from(address - BASE).unwrap();
-            self.bytes[offset..offset + data.len()].copy_from_slice(data);
-        }
-
-        fn write_u32(&mut self, address: u32, value: u32) {
-            self.write(address, &value.to_le_bytes());
-        }
-    }
-
-    fn write_table(image: &mut ImageBuilder, slot_base: u32, slots: &[&str]) {
-        let slot_count = u32::try_from(slots.len()).expect("slot count fits u32") + 1;
-        let table_end = slot_base + slot_count * STRIDE;
-        image.ensure(table_end);
-        let mut cursor = table_end + 0x40;
-        let mut name_addresses = Vec::with_capacity(slots.len());
-        for name in slots {
-            image.write(cursor, name.as_bytes());
-            image.write(cursor + u32::try_from(name.len()).unwrap(), &[0]);
-            name_addresses.push(cursor);
-            cursor += u32::try_from(name.len()).unwrap() + 1;
-        }
-        cursor = cursor.div_ceil(4) * 4;
-        let entries_base = cursor;
-        // Each entry is a self-contained Thumb function (`push {r4, lr}`;
-        // `bx lr`) at 8-byte spacing, so Ghidra's flow disassembly from one
-        // entry never crosses into the next.
-        let push = enc(&T32::Push_T1(vec![gpr(4), gpr(14)]));
-        let bx_lr = enc(&T32::Bx_T1(gpr(14)));
-        let mut entry_addresses = Vec::with_capacity(slots.len());
-        for index in 0..slots.len() {
-            let address = entries_base + u32::try_from(index).unwrap() * 8;
-            image.write(address, &push);
-            image.write(address + u32::try_from(push.len()).unwrap(), &bx_lr);
-            entry_addresses.push(address);
-        }
-        image.ensure(entries_base + u32::try_from(slots.len()).unwrap() * 8 + 8);
-        for (index, _) in slots.iter().enumerate() {
-            let index = u32::try_from(index).unwrap();
-            let slot_address = slot_base + index * STRIDE;
-            for offset in 0..STRIDE {
-                let byte = 0x5au8.wrapping_add((offset as u8) ^ (index as u8));
-                image.write(slot_address + offset, &[byte]);
-            }
-            image.write_u32(
-                slot_address + NAME_OFFSET,
-                name_addresses[usize::try_from(index).unwrap()],
-            );
-            image.write_u32(slot_address + NAME_OFFSET + 4, 0x64);
-            image.write_u32(slot_address + NAME_OFFSET + 8, 0x200);
-            image.write_u32(
-                slot_address + NAME_OFFSET + 12,
-                entry_addresses[usize::try_from(index).unwrap()] | 1,
-            );
-            image.write_u32(slot_address + NAME_OFFSET + 16, 0);
-            image.write_u32(slot_address + NAME_OFFSET + 20, 0);
-        }
-        let terminal = slot_base + slot_count.saturating_sub(1) * STRIDE;
-        for offset in 0..STRIDE {
-            let byte = 0x33u8.wrapping_add(offset as u8);
-            image.write(terminal + offset, &[byte]);
-        }
-        for field in [
-            NAME_OFFSET,
-            NAME_OFFSET + 4,
-            NAME_OFFSET + 8,
-            NAME_OFFSET + 12,
-            NAME_OFFSET + 16,
-            NAME_OFFSET + 20,
-        ] {
-            image.write_u32(terminal + field, 0);
-        }
-    }
-
-    /// The MAIN slice: a discoverable PAL initializer and a two-slot
-    /// descriptor-v1 table (no scatter loader).
-    pub(super) fn craft_main_image() -> Vec<u8> {
-        let mut image = ImageBuilder::new();
-        let (code_bytes, _) = assemble(BASE, &initializer_items(BASE + SLOT_TABLE_OFF, CAPACITY));
-        image.write(BASE, &code_bytes);
-        write_table(
-            &mut image,
-            BASE + SLOT_TABLE_OFF,
-            &["first_task", "second_task"],
-        );
-        image.bytes
-    }
-
-    /// The modem.bin wrapping the discoverable MAIN slice (TOC label
-    /// `02_MAIN`, base 0x1000).
-    pub(super) fn craft_pal_main_modem_bin() -> Vec<u8> {
-        let image = craft_main_image();
-        let entry_off = 0x20usize;
-        let payload_off = entry_off + 0x20;
-        let mut buf = vec![0u8; payload_off + image.len()];
-        buf[0..4].copy_from_slice(b"TOC\0");
-        buf[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
-        buf[entry_off..entry_off + 4].copy_from_slice(b"MAIN");
-        buf[entry_off + 12..entry_off + 16].copy_from_slice(&(payload_off as u32).to_le_bytes());
-        buf[entry_off + 16..entry_off + 20].copy_from_slice(&BASE.to_le_bytes());
-        buf[entry_off + 20..entry_off + 24].copy_from_slice(&(image.len() as u32).to_le_bytes());
-        buf[entry_off + 28..entry_off + 32].copy_from_slice(&3u32.to_le_bytes());
-        buf[payload_off..].copy_from_slice(&image);
-        buf
-    }
-}
-
 const INSPECT_SCATTER_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.mem.Memory;
@@ -576,6 +230,16 @@ fn inspect_saved_project(
     label: &str,
     script: &str,
 ) -> std::process::Output {
+    inspect_saved_project_with_args(home, out, label, script, &[])
+}
+
+fn inspect_saved_project_with_args(
+    home: &std::path::Path,
+    out: &std::path::Path,
+    label: &str,
+    script: &str,
+    script_args: &[String],
+) -> std::process::Output {
     let config = out.join("ghidra_config");
     let cache = out.join("ghidra_cache");
     let temp = out.join("ghidra_tmp");
@@ -598,6 +262,7 @@ fn inspect_saved_project(
     .arg(out.join("scripts"))
     .arg("-postScript")
     .arg(script)
+    .args(script_args)
     .env("XDG_CONFIG_HOME", config)
     .env("XDG_CACHE_HOME", cache)
     .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
@@ -965,7 +630,11 @@ fn generated_only_pal_seeding_is_default_on() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let modem_path = dir.join("modem.bin");
-        std::fs::write(&modem_path, pal_runtime_fixture::craft_pal_main_modem_bin()).unwrap();
+        std::fs::write(
+            &modem_path,
+            pal_fixture::discoverable::craft_pal_main_modem_bin(),
+        )
+        .unwrap();
         let out = dir.join("out");
         pixel_modem_extractor::decompile::run_report(
             &modem_path,
@@ -1025,7 +694,11 @@ fn immediate_run_applies_pal_tasks_by_default() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let modem_path = dir.join("modem.bin");
-    std::fs::write(&modem_path, pal_runtime_fixture::craft_pal_main_modem_bin()).unwrap();
+    std::fs::write(
+        &modem_path,
+        pal_fixture::discoverable::craft_pal_main_modem_bin(),
+    )
+    .unwrap();
     let out = dir.join("out");
     let report = pixel_modem_extractor::decompile::run_report(
         &modem_path,
@@ -1090,7 +763,11 @@ fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let modem_path = dir.join("modem.bin");
-    std::fs::write(&modem_path, pal_runtime_fixture::craft_pal_main_modem_bin()).unwrap();
+    std::fs::write(
+        &modem_path,
+        pal_fixture::discoverable::craft_pal_main_modem_bin(),
+    )
+    .unwrap();
     let out = dir.join("out");
     let report = pixel_modem_extractor::decompile::run_report(
         &modem_path,
@@ -1133,7 +810,152 @@ fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
         }),
         "datamark mode must apply and parse the same PAL seeding"
     );
+    let marker = std::fs::read_to_string(out.join("export/02_MAIN.complete")).unwrap_or_default();
+    assert!(
+        marker.starts_with("pixel-modem-extractor-ghidra-export-v3\npal_tasks=v1:"),
+        "the datamark marker must bind the applied PAL identity: {marker:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 14: the full tighten and datamark routes over one discoverable
+/// image carrying a controlled undefined gap — every task function and
+/// its authoritative code survives both modes while the gap is
+/// partitioned as data only in datamark mode.
+#[test]
+fn tighten_and_datamark_runs_preserve_tasks_and_partition_controlled_gap() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let manifest_entries = |out: &std::path::Path| {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out.join("pal_tasks/02_MAIN/tasks.json"))
+                .expect("generated PAL manifest exists"),
+        )
+        .expect("generated PAL manifest parses");
+        let mut entries: Vec<(u64, String)> = manifest["tasks"]
+            .as_array()
+            .expect("tasks array")
+            .iter()
+            .map(|task| {
+                (
+                    u64::from_str_radix(
+                        task["entry"]
+                            .as_str()
+                            .expect("entry address")
+                            .trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap(),
+                    task["task_label"].as_str().expect("task label").to_string(),
+                )
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(entries.len(), 2, "the two-task fixture is expected");
+        entries
+    };
+    let inspect_gap = |out: &std::path::Path, case: &str, expect_data: bool| {
+        for directory in ["ghidra_config", "ghidra_cache", "ghidra_tmp"] {
+            std::fs::create_dir_all(out.join(directory)).unwrap();
+        }
+        std::fs::write(out.join("scripts/PalInspectGap.java"), PAL_INSPECT_GAP_JAVA).unwrap();
+        let output = inspect_saved_project_with_args(
+            &home,
+            out,
+            "02_MAIN",
+            "PalInspectGap.java",
+            &[
+                out.to_string_lossy().into_owned(),
+                format!("{:#x}", pal_fixture::discoverable::GAP_ADDR),
+                expect_data.to_string(),
+            ],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("PalInspectGap: ok"),
+            "gap inspection failed for {case}:\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    for (case, no_thumb_decompile) in [("tighten", false), ("datamark", true)] {
+        let dir = std::env::temp_dir().join(format!("pme_pal_gap_{case}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem_path = dir.join("modem.bin");
+        std::fs::write(
+            &modem_path,
+            pal_fixture::discoverable::craft_pal_main_modem_bin(),
+        )
+        .unwrap();
+        let out = dir.join("out");
+        let report = pixel_modem_extractor::decompile::run_report(
+            &modem_path,
+            &pixel_modem_extractor::decompile::Opts {
+                run: true,
+                image: None,
+                ghidra_home: Some(home.clone()),
+                processor: "ARM:LE:32:v7".to_string(),
+                no_thumb_decompile,
+                rizin_fallback: false,
+                tighten_wall_clock_budget_override: None,
+                no_skip_opaque: true,
+            },
+            &out,
+        )
+        .unwrap();
+        let image = report
+            .images
+            .first()
+            .expect("discoverable MAIN was selected");
+        assert!(
+            matches!(
+                image.outcome,
+                pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
+            ),
+            "{case} run failed: {:?} (terminal_error={:?})",
+            image.outcome,
+            image.terminal_error
+        );
+        assert_eq!(
+            image.pal_applied,
+            Some(pixel_modem_extractor::decompile::AppliedPalTasks {
+                tasks: 2,
+                entries: 2,
+                functions_created: 2,
+                functions_existing: 0,
+                names_applied: 2,
+                names_preserved: 0,
+                shared_entries: 0,
+            }),
+            "{case} mode must seed every task"
+        );
+        let entries = manifest_entries(&out);
+        let functions: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out.join("export/02_MAIN/functions.json"))
+                .expect("exported functions.json"),
+        )
+        .unwrap();
+        let exported: Vec<&str> = functions
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["name"].as_str().unwrap())
+            .collect();
+        for (_, label) in &entries {
+            assert!(
+                exported.contains(&label.as_str()),
+                "{case} export lost the task primary {label}: {exported:?}"
+            );
+        }
+        // The gap is partitioned as data only in datamark mode; tighten
+        // must still keep every task function.
+        inspect_gap(&out, case, no_thumb_decompile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
@@ -1507,6 +1329,169 @@ printf 'pixel-modem-extractor-ghidra-export-v1\n\n' > "$export_dir.complete"
         );
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 14: the generated shell runs the complete PAL-seeded pass from a
+/// kit root whose path contains spaces and parentheses — the quoted
+/// `$HERE` rooting, the PAL-aware argv, and the exact v3 marker
+/// comparison must all survive them. The remaining shell-active
+/// characters (quotes, `&`, `;`, backtick, `!`, `$`) are mangled by
+/// upstream `analyzeHeadless`'s own launcher before our quoting can
+/// matter, so they are an upstream path constraint (documented in
+/// README), not a quoting defect here.
+#[test]
+fn generated_shell_completes_pal_run_from_root_with_spaces_and_metacharacters() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pme_pal_shell_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("pal kit (roots) meta char");
+    std::fs::create_dir_all(&out).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        pal_fixture::discoverable::craft_pal_main_modem_bin(),
+    )
+    .unwrap();
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.clone()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let manifest_path = out.join("pal_tasks/02_MAIN/tasks.json");
+    assert!(
+        manifest_path.is_file(),
+        "generation must publish the manifest"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let labels: Vec<&str> = manifest["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["task_label"].as_str().unwrap())
+        .collect();
+    let identity = format!(
+        "v1:{}:2:0",
+        blake3::hash(&std::fs::read(&manifest_path).unwrap()).to_hex()
+    );
+
+    let run = std::process::Command::new(out.join("run_ghidra.sh"))
+        .env("GHIDRA_INSTALL_DIR", &home)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "generated shell failed from a metacharacter root:\n{}",
+        process_diagnostics(&run)
+    );
+    let marker = std::fs::read(out.join("export/02_MAIN.complete")).unwrap();
+    assert_eq!(
+        marker,
+        pixel_modem_extractor::decompile::export_completion_marker(&identity, "none"),
+        "the shell must compare the exact PAL-aware v3 marker"
+    );
+    let functions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("export/02_MAIN/functions.json")).unwrap())
+            .unwrap();
+    let exported: Vec<&str> = functions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["name"].as_str().unwrap())
+        .collect();
+    for label in labels {
+        assert!(
+            exported.contains(&label),
+            "shell-root run lost task primary {label}: {exported:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 12's deferred guard: the generated shell fails closed with a clear
+/// message when TMPDIR contains whitespace — the `-D` Java tokens are
+/// word-split unquoted by analyzeHeadless itself, so a spaced state home
+/// would otherwise fail obscurely inside Ghidra. The stub launcher proves
+/// the guard fires before any Ghidra work; no real Ghidra is needed.
+#[cfg(unix)]
+#[test]
+fn generated_shell_fails_closed_on_spaced_tmpdir() {
+    let dir = std::env::temp_dir().join(format!("pme_pal_tmpdir_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        pal_fixture::discoverable::craft_pal_main_modem_bin(),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: None,
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let stub_home = dir.join("ghidra-home");
+    std::fs::create_dir_all(stub_home.join("support")).unwrap();
+    std::fs::write(
+        stub_home.join("support/analyzeHeadless"),
+        "#!/bin/sh\necho 'stub analyzeHeadless must not run' >&2\nexit 99\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            stub_home.join("support/analyzeHeadless"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let spaced_tmp = dir.join("tmp with spaces");
+    std::fs::create_dir_all(&spaced_tmp).unwrap();
+    let run = std::process::Command::new(out.join("run_ghidra.sh"))
+        .env("GHIDRA_INSTALL_DIR", &stub_home)
+        .env("TMPDIR", &spaced_tmp)
+        .output()
+        .unwrap();
+    assert!(
+        !run.status.success(),
+        "a spaced TMPDIR must fail the generated shell"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("whitespace") && stderr.contains("TMPDIR"),
+        "the failure must name the whitespace TMPDIR clearly:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("stub analyzeHeadless must not run"),
+        "the guard must fire before any Ghidra work:\n{stderr}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2761,9 +2746,6 @@ fn run_report_skips_opaque_image_without_spawning_ghidra() {
 // Shared PAL support (Task 8): non-proprietary fixture + real-Ghidra probe
 // ---------------------------------------------------------------------------
 
-#[path = "support/pal_fixture.rs"]
-mod pal_fixture;
-
 /// Drives `PalTasksSupport` inside real Ghidra against the canonical
 /// fixture kit and malformed variants: digest vectors, strict parsing,
 /// path containment, raw/scatter byte tampering, storage/task/application
@@ -3609,6 +3591,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolIterator;
@@ -3667,8 +3650,15 @@ public class InspectApplied extends GhidraScript {
         if (shared == null || !"pal_TaskEntry_shared_40010430".equals(shared.getName())) {
             throw new AssertionError("the shared-entry primary is wrong");
         }
-        if (functions.getFunctionAt(toAddr(0x4001_1000L)) == null) {
+        Function scatter = functions.getFunctionAt(toAddr(0x4001_1000L));
+        if (scatter == null) {
             throw new AssertionError("the scatter-backed task function is missing");
+        }
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        if (tMode == null || currentProgram.getProgramContext()
+                .getRegisterValue(tMode, scatter.getEntryPoint())
+                .getUnsignedValue().intValue() != 1) {
+            throw new AssertionError("the scatter-backed task function is not in Thumb context");
         }
         StringPropertyMap registry = currentProgram.getUsrPropertyManager()
                 .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
@@ -3831,6 +3821,134 @@ public class InspectAbsent extends GhidraScript {
             }
         }
         return count;
+    }
+}
+"#;
+
+/// Saved-project inspector for the controlled-gap battery: validates the
+/// complete applied PAL state, then proves no mode turns the gap into a
+/// fabricated instruction while datamark partitions exactly it as data.
+const PAL_INSPECT_GAP_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Listing;
+import java.io.File;
+
+public class PalInspectGap extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 3) {
+            throw new AssertionError("expected kit root, gap address, and expect-data flag");
+        }
+        File kitRoot = new File(args[0]);
+        long gap = Long.parseLong(args[1].replaceFirst("^0x", ""), 16);
+        boolean expectData = Boolean.parseBoolean(args[2]);
+
+        PalTasksSupport.PalManifest manifest = PalTasksSupport.readPal(
+                kitRoot, "02_MAIN", new File(kitRoot, "pal_tasks/02_MAIN/tasks.json"), null);
+        PalTasksSupport.validateApplied(currentProgram, manifest,
+                PalTasksSupport.expectedPalIdentity(manifest));
+
+        Listing listing = currentProgram.getListing();
+        for (long offset = 0; offset < 0x80; offset += 0x20) {
+            Address address = toAddr(gap + offset);
+            if (listing.getInstructionAt(address) != null) {
+                throw new AssertionError("the controlled gap was disassembled at " + address);
+            }
+            if (expectData && listing.getDataAt(address) == null) {
+                throw new AssertionError("datamark did not partition the gap at " + address);
+            }
+        }
+        println("PalInspectGap: ok");
+    }
+}
+"#;
+
+/// Saved-project inspector for the colliding/shared leaf policy: the
+/// complete applied state plus every deterministic `_pme_` role label,
+/// `_pme_` global primary, and `shared_` global primary derived from the
+/// manifest the production allocator produced.
+const PAL_INSPECT_COLLIDING_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolTable;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+
+public class PalInspectColliding extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 2) {
+            throw new AssertionError("expected kit root and PAL manifest path");
+        }
+        File kitRoot = new File(args[0]);
+        File palFile = new File(args[1]);
+        PalTasksSupport.PalManifest manifest =
+                PalTasksSupport.readPal(kitRoot, "02_MAIN", palFile, null);
+        String identity = PalTasksSupport.expectedPalIdentity(manifest);
+        PalTasksSupport.AppliedState state =
+                PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+        if (state.applications != 3 || state.createdFunctions != 3
+                || state.preexistingFunctions != 0 || state.palOwnedPrimaries != 3
+                || state.preservedPrimaries != 0 || state.pass2OwnedPrimaries != 0
+                || state.reservedLabels != 4) {
+            throw new AssertionError("colliding applied-state counts are wrong: " + state.applications
+                    + " applications, " + state.createdFunctions + " created, "
+                    + state.reservedLabels + " labels");
+        }
+
+        FunctionManager functions = currentProgram.getFunctionManager();
+        SymbolTable symbols = currentProgram.getSymbolTable();
+        Namespace namespace = symbols.getNamespace(PalTasksSupport.RESERVED_NAMESPACE,
+                currentProgram.getGlobalNamespace());
+        if (namespace == null) {
+            throw new AssertionError("the reserved namespace is missing");
+        }
+        int pmeLabels = 0;
+        int sharedPrimaries = 0;
+        for (PalTasksSupport.PalApplication application : manifest.applications) {
+            Function function = functions.getFunctionAt(toAddr(application.entry));
+            if (function == null) {
+                throw new AssertionError("missing function at 0x"
+                        + Long.toHexString(application.entry));
+            }
+            if (!function.getName().equals(application.desiredPrimary)) {
+                throw new AssertionError("primary at 0x" + Long.toHexString(application.entry)
+                        + " is " + function.getName() + ", expected " + application.desiredPrimary);
+            }
+            if (application.desiredPrimary.contains("_pme_")) {
+                pmeLabels++;
+            }
+            if (application.desiredPrimary.startsWith("pal_TaskEntry_shared_")) {
+                sharedPrimaries++;
+            }
+        }
+        for (PalTasksSupport.PalTask task : manifest.tasks) {
+            List<String> at = new ArrayList<>();
+            for (Symbol symbol : symbols.getSymbols(toAddr(task.entry))) {
+                if (symbol.getParentNamespace() == namespace) {
+                    at.add(symbol.getName());
+                }
+            }
+            if (!at.contains(task.taskLabel)) {
+                throw new AssertionError("role label " + task.taskLabel
+                        + " missing at 0x" + Long.toHexString(task.entry) + ": " + at);
+            }
+            if (task.taskLabel.contains("_pme_")) {
+                pmeLabels++;
+            }
+        }
+        if (pmeLabels != 4 || sharedPrimaries != 1) {
+            throw new AssertionError("leaf-policy counts wrong: " + pmeLabels
+                    + " _pme_ leaves, " + sharedPrimaries + " shared primaries");
+        }
+        println("PalInspectColliding: ok");
     }
 }
 "#;
@@ -4333,6 +4451,228 @@ fn apply_pal_tasks_rejects_stale_registry() {
         "failed reapplication disturbed the applied state:\n{inspected}"
     );
     let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+/// Task 14 (Task 8's deferred leaf-policy probe): a discoverable image
+/// whose `co.llide` and `co llide` tasks sanitize to the same preferred
+/// leaf from different entries (the `_pme_` suffix branch) while
+/// `dup_one`/`dup_two` share one entry (the `shared_` primary branch).
+/// The production allocator's decisions are pinned from the generated
+/// manifest, then applied and validated inside real Ghidra.
+#[test]
+fn colliding_and_shared_names_allocate_deterministic_leaves() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pme_pal_collide_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        pal_fixture::discoverable::craft_colliding_names_modem_bin(),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.clone()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+
+    let manifest_path = out.join("pal_tasks/02_MAIN/tasks.json");
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .unwrap_or_else(|error| panic!("colliding fixture produced no manifest: {error}"));
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let tasks = manifest["tasks"].as_array().unwrap();
+    let names: Vec<&str> = tasks.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["co.llide", "co llide", "dup_one", "dup_two"]);
+    let entry_hex = |task: &serde_json::Value| {
+        task["entry"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x")
+            .to_string()
+    };
+    let entries: Vec<String> = tasks.iter().map(entry_hex).collect();
+    assert_eq!(entries[2], entries[3], "dup tasks must share one entry");
+
+    // The colliding sanitized leaves are suffix-allocated by identity
+    // key: entry then lowest colliding index, nonce 0.
+    assert_eq!(
+        tasks[0]["task_label"].as_str().unwrap(),
+        format!(
+            "pal_TaskEntry_co_llide_pme_{}_00000000_00000000",
+            entries[0]
+        ),
+        "the first colliding leaf must take the deterministic suffix"
+    );
+    assert_eq!(
+        tasks[1]["task_label"].as_str().unwrap(),
+        format!(
+            "pal_TaskEntry_co_llide_pme_{}_00000001_00000000",
+            entries[1]
+        ),
+        "the second colliding leaf must take the next identity key"
+    );
+    assert_eq!(
+        tasks[2]["task_label"].as_str().unwrap(),
+        "pal_TaskEntry_dup_one",
+        "unique names keep their exact leaves"
+    );
+    assert_eq!(
+        tasks[3]["task_label"].as_str().unwrap(),
+        "pal_TaskEntry_dup_two",
+        "shared entries still keep every role label"
+    );
+
+    let applications = manifest["applications"].as_array().unwrap();
+    assert_eq!(applications.len(), 3, "three normalized entry groups");
+    let mut by_entry: std::collections::BTreeMap<&str, &serde_json::Value> = applications
+        .iter()
+        .map(|app| (app["entry"].as_str().unwrap(), app))
+        .collect();
+    for (index, entry) in entries[0..2].iter().enumerate() {
+        let key = format!("0x{entry}");
+        let app = by_entry.remove(key.as_str()).unwrap_or_else(|| {
+            panic!("no application for colliding entry {key}: {applications:?}")
+        });
+        assert_eq!(
+            app["desired_primary"].as_str().unwrap(),
+            format!("pal_TaskEntry_co_llide_pme_{entry}_{:08x}_00000000", index),
+            "colliding global primaries take the same deterministic suffixes"
+        );
+    }
+    let shared_key = format!("0x{}", entries[2]);
+    let shared = by_entry.remove(shared_key.as_str()).unwrap();
+    assert_eq!(
+        shared["desired_primary"].as_str().unwrap(),
+        format!("pal_TaskEntry_shared_{}", entries[2]),
+        "the shared entry must take the shared primary"
+    );
+    assert_eq!(
+        manifest["table"]["count"].as_u64().unwrap(),
+        4,
+        "four tasks entered the table"
+    );
+    let identity = format!("v1:{}:4:0", blake3::hash(&manifest_bytes).to_hex());
+    let modem = pal_fixture::discoverable::craft_colliding_names_modem_bin();
+    let main_slice = &modem[0x40..];
+    assert_eq!(
+        manifest["image"]["blake3"].as_str().unwrap(),
+        blake3::hash(main_slice).to_hex().to_string(),
+        "the manifest must authenticate the exact MAIN slice"
+    );
+    assert!(
+        manifest["runtime_view"]["scatter_load_map_blake3"].is_null(),
+        "the colliding fixture has no scatter dependency"
+    );
+
+    // Real Ghidra: import raw, apply the discovered manifest, validate
+    // every deterministic leaf inside the saved project.
+    std::fs::write(
+        out.join("scripts/PalInspectColliding.java"),
+        PAL_INSPECT_COLLIDING_JAVA,
+    )
+    .unwrap();
+    for directory in [
+        "ghidra_project",
+        "ghidra_config",
+        "ghidra_cache",
+        "ghidra_tmp",
+    ] {
+        std::fs::create_dir_all(out.join(directory)).unwrap();
+    }
+    let kit_root = std::fs::canonicalize(&out).unwrap();
+    let manifest_canon = std::fs::canonicalize(&manifest_path).unwrap();
+    let mut import_args: Vec<String> = [
+        "-import".to_string(),
+        out.join("images/02_MAIN").to_string_lossy().into_owned(),
+        "-processor".to_string(),
+        "ARM:LE:32:v7".to_string(),
+        "-loader".to_string(),
+        "BinaryLoader".to_string(),
+        "-loader-baseAddr".to_string(),
+        format!("{:#x}", pal_fixture::discoverable::BASE),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        out.join("scripts").to_string_lossy().into_owned(),
+    ]
+    .into();
+    let headless = |args: &[String]| -> String {
+        let config = out.join("ghidra_config");
+        let cache = out.join("ghidra_cache");
+        let temp = out.join("ghidra_tmp");
+        let java_options = format!(
+            "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+            config.display(),
+            cache.display(),
+            temp.display(),
+            temp.display()
+        );
+        let output = std::process::Command::new(
+            analyze_headless_in_home(&home).expect("located Ghidra home still has analyzeHeadless"),
+        )
+        .arg(out.join("ghidra_project"))
+        .arg("pixel-modem")
+        .args(args)
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_CACHE_HOME", cache)
+        .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+        .output()
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        format!("{stdout}\n--- stderr ---\n{stderr}")
+    };
+    let imported = headless(&import_args);
+    assert!(
+        !imported.contains("REPORT SCRIPT ERROR") && !imported.contains("ERROR "),
+        "raw import failed:\n{imported}"
+    );
+    import_args = [
+        "-process".to_string(),
+        "02_MAIN".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        out.join("scripts").to_string_lossy().into_owned(),
+        "-preScript".to_string(),
+        "ApplyPalTasks.java".to_string(),
+        kit_root.to_string_lossy().into_owned(),
+        "02_MAIN".to_string(),
+        manifest_canon.to_string_lossy().into_owned(),
+        "-".to_string(),
+        "-postScript".to_string(),
+        "PalInspectColliding.java".to_string(),
+        kit_root.to_string_lossy().into_owned(),
+        manifest_canon.to_string_lossy().into_owned(),
+    ]
+    .into();
+    let applied = headless(&import_args);
+    assert!(
+        applied.contains(&format!("\"identity\":\"{identity}\"")),
+        "the applied summary must bind the generated identity:\n{applied}"
+    );
+    assert!(
+        applied.contains("PalInspectColliding: ok"),
+        "colliding application failed:\n{applied}"
+    );
+    assert!(
+        !applied.contains("REPORT SCRIPT ERROR"),
+        "colliding inspection failed:\n{applied}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // -------------------------------------------------------------------------

@@ -3,14 +3,19 @@
 //! names, bytes, or derived payloads. The MAIN image carries a valid
 //! scatter loader/table (so kit generation materializes a real
 //! `scatter/02_MAIN/load_map.json` whose digest pins the PAL manifest's
-//! scatter dependency), disassemblable ARM and Thumb task entries (one
-//! ARM entry is scatter-backed through copy entry 3), a shared-entry
-//! pair, two anchor occurrences, and the task slot/name storage the
-//! canonical manifests reference. The manifest bytes follow the exact
-//! `pal_tasks::artifact` wire layout (two-space indent, exact key order,
-//! lowercase `0x` addresses, canonical decimals). Two manifest variants
-//! share the image: `canonical_manifest` (Task 8's two-task probe) and
-//! `extended_manifest` (Task 9's seven-task/seven-application battery).
+//! scatter dependency), disassemblable ARM and Thumb task entries (the
+//! scatter-backed entry is Thumb, materialized through copy entry 3), a
+//! shared-entry pair, two anchor occurrences, the task slot/name storage
+//! the canonical manifests reference, and a controlled undefined gap the
+//! datamark battery partitions as data. The manifest bytes follow the
+//! exact `pal_tasks::artifact` wire layout (two-space indent, exact key
+//! order, lowercase `0x` addresses, canonical decimals). Two manifest
+//! variants share the image: `canonical_manifest` (Task 8's two-task
+//! probe) and `extended_manifest` (Task 9's seven-task battery). The
+//! `discoverable` submodule builds MAIN images whose initializer CFG and
+//! descriptor-v1 slot table the production `pal_tasks::discover`
+//! boundary proves semantically, including the colliding/shared-name
+//! allocator fixture.
 
 pub(super) const BASE: u32 = 0x4001_0000;
 pub(super) const IMAGE_LEN: usize = 0x1000;
@@ -46,11 +51,18 @@ const EXTENDED_TASKS: usize = 7;
 const EXTENDED_CAPACITY: u64 = 8;
 const EXTENDED_TERMINAL_OFF: usize = SLOT_BASE_OFF + EXTENDED_TASKS * STRIDE;
 const TABLE_OFFSET: usize = 0x300;
-/// Scatter copy entry 3 materializes the scatter-backed task entry at
-/// `BASE + SCATTER_TASK_OFF` from the eight ARM bytes at 0x710.
+/// Scatter copy entry 3 materializes the scatter-backed Thumb task entry
+/// (a two-byte `bx lr`) at `BASE + SCATTER_TASK_OFF` from the bytes at
+/// 0x710.
 const SCATTER_TASK_OFF: usize = IMAGE_LEN;
-const SCATTER_COPY_SIZE: usize = 8;
+const SCATTER_COPY_SIZE: usize = 2;
 const SCATTER_COPY_SOURCE_OFF: usize = 0x710;
+/// A controlled undefined gap outside every task's code storage: 0x80
+/// bytes of a pattern that stays undefined in both ISAs, so the datamark
+/// battery can prove it is partitioned as data while task code survives.
+const GAP_OFF: usize = 0x580;
+const GAP_LEN: usize = 0x80;
+const GAP_FILL: u8 = 0xde;
 
 /// Task 11: the registration-table fixture — an `alpha_task_fn\0` name at
 /// 0x780 and a three-record {name, fn} table at 0x790 (the scanner's minimum
@@ -153,7 +165,7 @@ pub(super) fn extended_application_summaries() -> Vec<PalAppSummary> {
         ),
         (
             BASE + SCATTER_TASK_OFF as u32,
-            "arm",
+            "thumb",
             "pal_TaskEntry_epsilon",
             vec![(
                 5,
@@ -247,7 +259,7 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     // PAL task content. ARM entries A (add/add/bx lr), B (add/bx lr);
     // Thumb entry C (`bx lr`, 0x4770); shared ARM entry D and the
     // meaningful-name ARM entry E (add/bx lr each); the scatter-backed
-    // entry's add/bx lr pair lives at COPY_SOURCE (0x710) and is
+    // Thumb entry's `bx lr` lives at COPY_SOURCE (0x710) and is
     // materialized at BASE+0x1000 by scatter copy entry 3.
     image[ENTRY_A_OFF..ENTRY_A_OFF + 12].copy_from_slice(&[
         0x01, 0x00, 0x80, 0xe0, 0x02, 0x10, 0x81, 0xe0, 0x1e, 0xff, 0x2f, 0xe1,
@@ -260,7 +272,10 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     image[ENTRY_E_OFF..ENTRY_E_OFF + 8]
         .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
     image[SCATTER_COPY_SOURCE_OFF..SCATTER_COPY_SOURCE_OFF + SCATTER_COPY_SIZE]
-        .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
+        .copy_from_slice(&[0x70, 0x47]);
+    // The controlled undefined gap: no task, anchor, slot, or table byte
+    // ever lands here.
+    image[GAP_OFF..GAP_OFF + GAP_LEN].fill(GAP_FILL);
     image[ANCHOR_A_OFF..ANCHOR_A_OFF + 9].copy_from_slice(ANCHOR_PATTERN);
     image[ANCHOR_B_OFF..ANCHOR_B_OFF + 9].copy_from_slice(ANCHOR_PATTERN);
     image[NAME_ALPHA_OFF..NAME_ALPHA_OFF + 6].copy_from_slice(b"alpha\0");
@@ -419,8 +434,8 @@ pub(super) fn extended_manifest(image: &[u8], scatter_blake3_hex: &str) -> Strin
             priority: 9,
             stack: 8192,
             entry_off: SCATTER_TASK_OFF,
-            isa: "arm",
-            instruction_size: 4,
+            isa: "thumb",
+            instruction_size: 2,
             instruction_off: SCATTER_COPY_SOURCE_OFF,
             callback: "0x00000000",
             unknown: "0x00000000",
@@ -509,7 +524,7 @@ pub(super) fn extended_manifest(image: &[u8], scatter_blake3_hex: &str) -> Strin
         },
         ApplicationSpec {
             entry_off: SCATTER_TASK_OFF,
-            isa: "arm",
+            isa: "thumb",
             desired_primary: "pal_TaskEntry_epsilon".to_string(),
             task_indices: &[5],
             labels: &[LabelSpec {
@@ -1176,4 +1191,391 @@ pub(super) fn canonical_symbol_map(
     json.close_object();
     json.out.push('\n');
     json.out
+}
+
+/// MAIN images whose initializer CFG and descriptor-v1 slot table the
+/// production `pal_tasks::discover` boundary proves semantically. The
+/// two-pass label-resolving Thumb assembler is reproduced here because
+/// integration tests cannot reach the crate-internal `cfg(test)`
+/// support modules. Every image also carries a controlled undefined
+/// gap that no task owns, so the datamark battery can prove gap/data
+/// partitioning around authoritative task code.
+pub(crate) mod discoverable {
+    use scaleservers_arm32_assembly::{
+        Arm32Condition, Arm32GeneralPurposeRegister as Gpr, Arm32LowGeneralPurposeRegister as Low,
+        ArmT32Instruction as T32,
+    };
+    use std::collections::BTreeMap;
+
+    pub(crate) const BASE: u32 = 0x1000;
+    const STRIDE: u32 = 0x1f8;
+    const NAME_OFFSET: u32 = 0x4c;
+    const SLOT_TABLE_OFF: u32 = 0x4000;
+    const CAPACITY: u32 = 8;
+    const ANCHOR_PATTERN: &[u8; 9] = b"PALTskTm\0";
+    /// The controlled undefined gap: 0x80 bytes, clear of the initializer
+    /// code (near `BASE`) and the slot table (at `BASE + 0x4000`).
+    pub(crate) const GAP_ADDR: u32 = BASE + 0x1000;
+    pub(crate) const GAP_LEN: u32 = 0x80;
+    const GAP_FILL: u8 = 0xde;
+
+    pub(crate) type FixtureLabels = BTreeMap<&'static str, u32>;
+    pub(crate) type FixtureBuild = Box<dyn Fn(u32, &FixtureLabels) -> T32>;
+
+    pub(crate) enum FixtureItem {
+        Insn(&'static str, FixtureBuild),
+        Data(&'static str, usize),
+        Anchor(&'static str),
+        Align(u32),
+    }
+
+    pub(crate) fn insn(
+        label: &'static str,
+        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
+    ) -> FixtureItem {
+        FixtureItem::Insn(label, Box::new(build))
+    }
+
+    fn put(bytes: &mut [u8], offset: usize, part: &[u8]) {
+        bytes[offset..offset + part.len()].copy_from_slice(part);
+    }
+
+    fn enc(instruction: &T32) -> Vec<u8> {
+        instruction.encode().expect("fixture encodes")
+    }
+
+    fn branch_offset(target: u32, pc: u32) -> i32 {
+        i32::try_from(i64::from(target) - i64::from(pc) - 4).expect("branch offset fits i32")
+    }
+
+    fn branch_i16(target: u32, pc: u32) -> i16 {
+        i16::try_from(branch_offset(target, pc)).expect("branch offset fits i16")
+    }
+
+    fn cbz_offset(target: u32, pc: u32) -> u8 {
+        u8::try_from(branch_offset(target, pc)).expect("cbz offset fits u8")
+    }
+
+    fn aligned_offset(target: u32, pc: u32) -> u16 {
+        let aligned = (pc.wrapping_add(4)) & !3;
+        u16::try_from(target - aligned).expect("aligned offset fits u16")
+    }
+
+    fn branch_to(l: &FixtureLabels, name: &str, pc: u32) -> i16 {
+        branch_i16(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    fn branch32_to(l: &FixtureLabels, name: &str, pc: u32) -> i32 {
+        branch_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    fn cbz_to(l: &FixtureLabels, name: &str, pc: u32) -> u8 {
+        cbz_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    fn adr_to(l: &FixtureLabels, name: &str, pc: u32) -> u16 {
+        aligned_offset(l.get(name).copied().unwrap_or((pc + 8) & !3), pc)
+    }
+
+    fn word_at(l: &FixtureLabels, name: &str) -> u32 {
+        l.get(name).copied().unwrap_or(0)
+    }
+
+    /// Two-pass assembler: measure with neutral offsets, then encode with
+    /// resolved label addresses.
+    pub(crate) fn assemble(base: u32, items: &[FixtureItem]) -> (Vec<u8>, FixtureLabels) {
+        let unresolved = FixtureLabels::new();
+        let mut starts = Vec::with_capacity(items.len());
+        let mut pc = base;
+        for item in items {
+            if let FixtureItem::Align(to) = item {
+                pc = pc.div_ceil(*to) * *to;
+            }
+            starts.push(pc);
+            let size = match item {
+                FixtureItem::Insn(_, build) => u32::try_from(
+                    build(pc, &unresolved)
+                        .encode()
+                        .expect("fixture instruction encodes")
+                        .len(),
+                )
+                .expect("fixture instruction size fits u32"),
+                FixtureItem::Data(_, 4) => 4,
+                FixtureItem::Data(_, size) => *size as u32,
+                FixtureItem::Anchor(_) => ANCHOR_PATTERN.len() as u32,
+                FixtureItem::Align(_) => 0,
+            };
+            pc += size;
+        }
+        let labels: FixtureLabels = items
+            .iter()
+            .zip(&starts)
+            .filter_map(|(item, start)| match item {
+                FixtureItem::Insn(label, _)
+                | FixtureItem::Data(label, _)
+                | FixtureItem::Anchor(label) => (!label.is_empty()).then_some((*label, *start)),
+                FixtureItem::Align(_) => None,
+            })
+            .collect();
+        let mut bytes = vec![0u8; (pc - base) as usize];
+        for (item, start) in items.iter().zip(&starts) {
+            match item {
+                FixtureItem::Insn(_, build) => {
+                    let part = build(*start, &labels)
+                        .encode()
+                        .expect("fixture instruction encodes");
+                    put(&mut bytes, (*start - base) as usize, &part);
+                }
+                FixtureItem::Data(_, _) => {}
+                FixtureItem::Anchor(_) => put(&mut bytes, (*start - base) as usize, ANCHOR_PATTERN),
+                FixtureItem::Align(_) => {}
+            }
+        }
+        (bytes, labels)
+    }
+
+    fn gpr(number: u8) -> Gpr {
+        Gpr::from_operand_bits(number)
+    }
+
+    fn low(number: u8) -> Low {
+        Low::from_operand_bits(number)
+    }
+
+    /// The canonical discoverable initializer shape: slot r4, count r5,
+    /// name r0, guard shift 3.
+    fn initializer_items(slot_base: u32, capacity: u32) -> Vec<FixtureItem> {
+        let guard_value = capacity / 8 - 1;
+        vec![
+            insn("init", |_, _| T32::Push_T1(vec![gpr(4), gpr(14)])),
+            insn("ref", |pc, l| T32::Adr_T1(low(1), adr_to(l, "anchor", pc))),
+            insn("zero", |_, _| T32::Mov_Immediate_T1(low(5), 0)),
+            insn("slotlo", move |_, _| {
+                T32::Mov_Immediate_T3(gpr(4), u16::try_from(slot_base & 0xffff).unwrap())
+            }),
+            insn("slothi", move |_, _| {
+                T32::Movt_T1(gpr(4), u16::try_from(slot_base >> 16).unwrap())
+            }),
+            insn("call", |pc, l| T32::Bl_T1(branch32_to(l, "leaf", pc))),
+            insn("load", |_, _| T32::Ldr_Immediate_T1(low(0), low(4), 0x4c)),
+            insn("lcbz", |pc, l| T32::Cbz_T1(low(0), cbz_to(l, "term", pc))),
+            insn("lstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
+            insn("ladd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
+            insn("lstride", |_, _| {
+                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
+            }),
+            insn("lcmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
+            insn("lbne", |pc, l| {
+                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "load", pc))
+            }),
+            insn("cap", |_, l| {
+                T32::Mov_Immediate_T3(
+                    gpr(0),
+                    u16::try_from(word_at(l, "globals") & 0xffff).unwrap(),
+                )
+            }),
+            insn("", |_, l| {
+                T32::Movt_T1(gpr(0), u16::try_from(word_at(l, "globals") >> 16).unwrap())
+            }),
+            insn("cval", move |_, _| {
+                T32::Mov_Immediate_T3(gpr(1), u16::try_from(capacity).unwrap())
+            }),
+            insn("cstr", |_, _| T32::Str_Immediate_T1(low(1), low(0), 0)),
+            insn("cjmp", |pc, l| T32::B_T2(branch_to(l, "join", pc))),
+            insn("term", |pc, l| {
+                T32::Adr_T1(low(0), adr_to(l, "globals", pc))
+            }),
+            insn("tstr", |_, _| T32::Str_Immediate_T1(low(5), low(0), 0)),
+            insn("glsr", |_, _| T32::Lsr_Immediate_T1(low(0), low(5), 3)),
+            insn("gcmp", move |_, _| {
+                T32::Cmp_Immediate_T1(low(0), u8::try_from(guard_value).unwrap())
+            }),
+            insn("gbhi", |pc, l| {
+                T32::B_T1(Arm32Condition::UnsignedHigher, branch_to(l, "join", pc))
+            }),
+            insn("sstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
+            insn("sadd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
+            insn("sslot", |_, _| {
+                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
+            }),
+            insn("smov", |_, _| T32::Mov_Register_T1(gpr(6), gpr(0))),
+            insn("snop", |_, _| T32::Nop_T1),
+            insn("scmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
+            insn("sbne", |pc, l| {
+                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "sstr", pc))
+            }),
+            insn("join", |_, _| T32::Bx_T1(gpr(14))),
+            FixtureItem::Align(4),
+            FixtureItem::Anchor("anchor"),
+            FixtureItem::Align(2),
+            insn("leaf", |_, _| T32::Mov_Immediate_T3(gpr(0), 0x1234)),
+            insn("leaf2", |_, _| T32::Movt_T1(gpr(0), 0)),
+            insn("leafret", |_, _| T32::Bx_T1(gpr(14))),
+            FixtureItem::Align(4),
+            FixtureItem::Data("globals", 8),
+        ]
+    }
+
+    /// Growable MAIN image under construction.
+    struct ImageBuilder {
+        bytes: Vec<u8>,
+    }
+
+    impl ImageBuilder {
+        fn new() -> Self {
+            ImageBuilder { bytes: Vec::new() }
+        }
+
+        fn ensure(&mut self, end: u32) {
+            let end = usize::try_from(end - BASE).expect("fixture extent fits the host");
+            if self.bytes.len() < end {
+                self.bytes.resize(end, 0);
+            }
+        }
+
+        fn write(&mut self, address: u32, data: &[u8]) {
+            self.ensure(
+                address
+                    .checked_add(u32::try_from(data.len()).unwrap())
+                    .unwrap(),
+            );
+            let offset = usize::try_from(address - BASE).unwrap();
+            self.bytes[offset..offset + data.len()].copy_from_slice(data);
+        }
+
+        fn write_u32(&mut self, address: u32, value: u32) {
+            self.write(address, &value.to_le_bytes());
+        }
+    }
+
+    /// Writes the descriptor-v1 slot table for `slots` and returns the
+    /// entry function address of each slot, in slot order. Every entry is
+    /// a self-contained Thumb function (`push {r4, lr}`; `bx lr`) at
+    /// 8-byte spacing, so Ghidra's flow disassembly from one entry never
+    /// crosses into the next.
+    fn write_table(image: &mut ImageBuilder, slot_base: u32, slots: &[&str]) -> Vec<u32> {
+        let slot_count = u32::try_from(slots.len()).expect("slot count fits u32") + 1;
+        let table_end = slot_base + slot_count * STRIDE;
+        image.ensure(table_end);
+        let mut cursor = table_end + 0x40;
+        let mut name_addresses = Vec::with_capacity(slots.len());
+        for name in slots {
+            image.write(cursor, name.as_bytes());
+            image.write(cursor + u32::try_from(name.len()).unwrap(), &[0]);
+            name_addresses.push(cursor);
+            cursor += u32::try_from(name.len()).unwrap() + 1;
+        }
+        cursor = cursor.div_ceil(4) * 4;
+        let entries_base = cursor;
+        let push = enc(&T32::Push_T1(vec![gpr(4), gpr(14)]));
+        let bx_lr = enc(&T32::Bx_T1(gpr(14)));
+        let mut entry_addresses = Vec::with_capacity(slots.len());
+        for index in 0..slots.len() {
+            let address = entries_base + u32::try_from(index).unwrap() * 8;
+            image.write(address, &push);
+            image.write(address + u32::try_from(push.len()).unwrap(), &bx_lr);
+            entry_addresses.push(address);
+        }
+        image.ensure(entries_base + u32::try_from(slots.len()).unwrap() * 8 + 8);
+        for (index, _) in slots.iter().enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let slot_address = slot_base + index * STRIDE;
+            for offset in 0..STRIDE {
+                let byte = 0x5au8.wrapping_add((offset as u8) ^ (index as u8));
+                image.write(slot_address + offset, &[byte]);
+            }
+            image.write_u32(
+                slot_address + NAME_OFFSET,
+                name_addresses[usize::try_from(index).unwrap()],
+            );
+            image.write_u32(slot_address + NAME_OFFSET + 4, 0x64);
+            image.write_u32(slot_address + NAME_OFFSET + 8, 0x200);
+            image.write_u32(
+                slot_address + NAME_OFFSET + 12,
+                entry_addresses[usize::try_from(index).unwrap()] | 1,
+            );
+            image.write_u32(slot_address + NAME_OFFSET + 16, 0);
+            image.write_u32(slot_address + NAME_OFFSET + 20, 0);
+        }
+        let terminal = slot_base + slot_count.saturating_sub(1) * STRIDE;
+        for offset in 0..STRIDE {
+            let byte = 0x33u8.wrapping_add(offset as u8);
+            image.write(terminal + offset, &[byte]);
+        }
+        for field in [
+            NAME_OFFSET,
+            NAME_OFFSET + 4,
+            NAME_OFFSET + 8,
+            NAME_OFFSET + 12,
+            NAME_OFFSET + 16,
+            NAME_OFFSET + 20,
+        ] {
+            image.write_u32(terminal + field, 0);
+        }
+        entry_addresses
+    }
+
+    /// The controlled undefined gap shared by every discoverable image.
+    fn write_gap(image: &mut ImageBuilder) {
+        image.write(GAP_ADDR, &vec![GAP_FILL; GAP_LEN as usize]);
+    }
+
+    /// The MAIN slice: a discoverable PAL initializer, a two-slot
+    /// descriptor-v1 table (no scatter loader), and the controlled
+    /// undefined gap.
+    pub(crate) fn craft_main_image() -> Vec<u8> {
+        let mut image = ImageBuilder::new();
+        let (code_bytes, _) = assemble(BASE, &initializer_items(BASE + SLOT_TABLE_OFF, CAPACITY));
+        image.write(BASE, &code_bytes);
+        write_table(
+            &mut image,
+            BASE + SLOT_TABLE_OFF,
+            &["first_task", "second_task"],
+        );
+        write_gap(&mut image);
+        image.bytes
+    }
+
+    /// The modem.bin wrapping the discoverable MAIN slice (TOC label
+    /// `02_MAIN`, base 0x1000).
+    pub(crate) fn craft_pal_main_modem_bin() -> Vec<u8> {
+        wrap_main_image(&craft_main_image())
+    }
+
+    /// The colliding/shared-name fixture: `co.llide` and `co llide`
+    /// sanitize to the same leaf from different entries (the `_pme_`
+    /// suffix branch), while `dup_one` and `dup_two` share one entry
+    /// (the `shared_` primary branch).
+    pub(crate) fn craft_colliding_names_modem_bin() -> Vec<u8> {
+        let mut image = ImageBuilder::new();
+        let (code_bytes, _) = assemble(BASE, &initializer_items(BASE + SLOT_TABLE_OFF, CAPACITY));
+        image.write(BASE, &code_bytes);
+        let slot_base = BASE + SLOT_TABLE_OFF;
+        let entries = write_table(
+            &mut image,
+            slot_base,
+            &["co.llide", "co llide", "dup_one", "dup_two"],
+        );
+        // The fourth slot's entry pointer redirects to the third slot's
+        // entry, making one Thumb entry serve two tasks.
+        image.write_u32(slot_base + 3 * STRIDE + NAME_OFFSET + 12, entries[2] | 1);
+        write_gap(&mut image);
+        wrap_main_image(&image.bytes)
+    }
+
+    /// The TOC wrapper around one MAIN slice (label `02_MAIN`).
+    fn wrap_main_image(image: &[u8]) -> Vec<u8> {
+        let entry_off = 0x20usize;
+        let payload_off = entry_off + 0x20;
+        let mut buf = vec![0u8; payload_off + image.len()];
+        buf[0..4].copy_from_slice(b"TOC\0");
+        buf[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+        buf[entry_off..entry_off + 4].copy_from_slice(b"MAIN");
+        buf[entry_off + 12..entry_off + 16].copy_from_slice(&(payload_off as u32).to_le_bytes());
+        buf[entry_off + 16..entry_off + 20].copy_from_slice(&BASE.to_le_bytes());
+        buf[entry_off + 20..entry_off + 24].copy_from_slice(&(image.len() as u32).to_le_bytes());
+        buf[entry_off + 28..entry_off + 32].copy_from_slice(&3u32.to_le_bytes());
+        buf[payload_off..].copy_from_slice(image);
+        buf
+    }
 }

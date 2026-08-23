@@ -85,6 +85,12 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test scatter_golden -- --nocapture`.
   These inputs and every generated payload remain outside git; tests commit only structural
   metadata, addresses, counts, and hashes, never proprietary firmware or derived bytes.
+- **Private-corpus PAL task goldens** (`tests/pal_tasks_golden.rs`) consume the *same* two
+  retained MAIN files (`PME_S5400_MAIN` / `PME_S5300_MAIN`) through the complete production
+  generation path (scatter + PAL manifest) and pin the corrected 133/162 baseline — see
+  **Runtime PAL task inventory** below for the commands, the digest-population procedure, and
+  the gating test (`no_corpus_environment_skips_independently`) that proves each leg skips
+  only on unset/missing input.
 - **Phase 3.0 production goldens** (`tests/globals_golden.rs` and
   `report_json_includes_globals_field` in `tests/decompose_golden.rs`) need
   `PME_RADIO_IMG`, Ghidra, and radare2. Run production-scale cases with
@@ -251,6 +257,11 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `scatter/mod.rs` | Semantic A32 scatter discovery, exact bounded-table classification, and checked runtime planning |
 | `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
 | `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
+| `pal_tasks/mod.rs` | PAL shared types, named resource limits, the structured domain error, and the `discover` plan boundary |
+| `pal_tasks/cfg.rs` | Entry-rooted local CFG decode and its definition-aware dataflow/graph queries |
+| `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
+| `pal_tasks/table.rs` | Slot parsing, descriptor-v1 field relationships, and the deterministic application/label allocator |
+| `pal_tasks/artifact.rs` | Canonical authenticated v1 task manifest: serialize, strict typed reader, materialize, and clear |
 | `source_tree.rs` | Reconstruct the source-tree layout from `__FILE__` strings |
 | `analysis_tool.rs` | Shared `AnalysisTool::{Ghidra, Radare2, Rizin}` downstream identity |
 | `recover_source.rs` | Attribute producer-owned Ghidra/Thumb functions to source paths |
@@ -281,7 +292,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ExportDecomp`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -597,6 +608,114 @@ hardcoded. Two reference images exercise both models end-to-end:
   scatter-table research as a secondary reference. The production implementation is an
   idiomatic, independently tested Rust reconstruction; never import upstream code, firmware
   excerpts, or generated corpus payloads.
+
+### Runtime PAL task inventory
+
+- **Discovery proves the initializer semantically; nothing else nominates a candidate.**
+  `pal_tasks::discover` finds every materialization of the nine-byte anchor `PALTskTm\0`
+  (`ADR`-family, PC-relative literal load, or register-consistent `MOVW`/`MOVT`), keeps the ones
+  that survive unique-prologue root selection and bounded CFG closure, then proves a counting
+  loop: a reaching zero definition of the count register, a decoded `count >> shift` unsigned
+  capacity guard whose `(compare_value + 1) << shift == capacity` under checked arithmetic, both
+  loop exits sharing one count global, an exact suffix loop, and a common join. The slot base
+  comes from a backward-sliced direct constant or side-effect-free leaf accessor; geometry
+  (slot base, name/index offsets, stride, capacity) is *derived from code*, never scanned raw.
+  Raw shape scanning is unusably permissive (it finds exact-stride harmonics); a fixed threshold
+  or analyzer-inventory gate would both reject valid firmware and bless invalid lookalikes —
+  neither is anywhere in the code. `Ok(None)` is clean absence; a candidate that crosses the
+  first-slot plausibility threshold and then fails is the contextual malformed error; several
+  complete survivors are the typed ambiguity error. A malformed sibling never lets a valid one
+  pass silently.
+- **The corrected corpus baseline is 133/162 from true slot 0.** Earlier research described
+  Cheetah as 161 records from `0x441c8398` — that is slot 1's descriptor projection, not the
+  table start (`FUN_42118f76(0)` returns `slot_base + 0x118`, and a forward-only margin search
+  from it skipped slot 0). Mustang/S5400: slot base `0x43d61f60`, stride `0x1f8`, 133 tasks,
+  terminal `0x43d72538`. Cheetah/S5300: slot base `0x441c8198`, stride `0x1d8`, 162 tasks,
+  terminal `0x441dac48`. Every entry on both corpora is a uniquely addressed, uniquely named
+  odd (Thumb) pointer; 57 Cheetah entries sit at `2 mod 4` (Thumb needs halfword, not word,
+  alignment). The regression `cheetah_slot_zero_regression_parses_162_slots`
+  (`pal_tasks/table.rs`) reproduces the interior-accessor shape and pins table start at true
+  slot 0; production contains no forward margin search.
+- **Descriptor-v1 field relationships.** Within each slot: `+0x0c` runtime task index (static
+  zero), `+0x4c` name pointer (the initializer's tested termination field), `+0x50` priority
+  byte (upper 24 bits zero), `+0x54` nonzero stack size divisible by four (not necessarily a
+  power of two), `+0x58` entry pointer with the ISA tag in bit 0, `+0x5c` optional
+  callback-like pointer, `+0x60` optional unknown pointer. The descriptor projection at slot
+  `+0x28` (name/priority/stack/entry at `+0x24/+0x28/+0x2c/+0x30`) is an artifact view, not the
+  table boundary. The large zero regions inside each slot are *not* padding — consumers use
+  fields deep in the runtime object; uninterpreted bytes stay opaque static runtime state and
+  contribute to the slot hash only.
+- **One runtime view, shared execution identities.** PAL discovery validates against the same
+  `RuntimeImage` every other execution consumer uses: byte-backed storage spans resolve raw
+  bytes *or* scatter-materialized bytes, a task's name/entry/slot may live in either, and every
+  accepted entry instruction decodes through the project-owned
+  `scaleservers-arm32-assembly` adapter with strict ISA tagging — no cross-ISA fallback. ARM
+  and Thumb pointers normalizing to one address reject the candidate; shared entries with one
+  ISA stay valid. The manifest binds the scatter load-map BLAKE3 it was validated against plus
+  the sorted unique scatter entries used, and readers re-authenticate both.
+- **Resource limits are named constants** (`pal_tasks/mod.rs`): 4096 anchor occurrences, 16384
+  anchor references, 4096 bytes anchor-reference distance, 32 instructions per `MOVW`/`MOVT`
+  span, 256-byte prologue window, 512-byte/256-instruction entry-rooted CFG, 64 candidate
+  tuples, 512 MiB *non-refundable* shared validation budget (charged bytes never return, even
+  for rejected candidates), 16 instructions per slot-base leaf, 4096 table capacity, 64 KiB
+  stride, 128-byte names, and 2000-byte symbol leaves (Ghidra's own bound). Exceeding any limit
+  is a typed resource error, never a silent miss.
+- **Ghidra seeding is transactional and ordered.** Script order is `ApplyScatterLoad` →
+  `ApplyPalTasks` → `TameAnalysis` → analysis → export; a PAL map without a scatter map passes
+  `-` as the scatter argument. `ApplyPalTasks.java` strictly revalidates the manifest (image
+  identity, scatter dependency, hashes, label policy recomputation) before any mutation, seeds
+  one function per entry inside one transaction, records ownership in the
+  `PixelModemExtractor.PalTasks.v1.Ownership` property map plus the reserved
+  `PixelModemExtractor_PalTasks_v1` namespace, and on any failure rolls back every created
+  function/label/comment in reverse and explicitly aborts the Ghidra transaction (throwing
+  alone is insufficient — Ghidra can commit a failed script transaction). Re-application is
+  idempotent. In datamark mode (`--no-thumb-decompile`) authoritative task code is carved out
+  as code before undefined regions are marked data — task functions survive both modes.
+- **Ownership survives pass 2.** Pass-2 name application matches PAL applications by decode
+  ISA; stronger recovered evidence replaces only project-owned task primaries (recording the
+  transition) while PAL evidence and role labels persist, a meaningful pre-existing name is
+  preserved and counted, and any stale registry entry, unregistered owned comment, merged or
+  retagged task function, or identity mismatch is a hard failure — never a silent overwrite.
+  The export completion marker binds the exact PAL identity
+  (`pal_tasks=v1:<manifest-blake3>:<tasks>:<distinct-entries>`); the postflight re-reads the
+  program state and rejects drift.
+- **Terminal state is ownership-explicit.** `decompose` marshals the validated manifest to
+  `images/<MAIN>/pal_tasks/tasks.json` after authenticating it against the terminal
+  raw/scatter bytes (validation precedes any terminal byte change; `rename` is the commit).
+  A successful no-candidate run removes the terminal directory; failed or unmanaged runs
+  leave prior terminal state untouched. Currentness never comes from artifact existence.
+  `--prune` retains the terminal manifest.
+- **Corpus and real-Ghidra commands.** The generated-fixture battery and every apply/rollback/
+  pass-2/postflight leg run inside the serial real-Ghidra suite:
+
+      cargo test --test decompile_golden -- --nocapture --test-threads=1
+
+  The private-corpus PAL goldens (`tests/pal_tasks_golden.rs`) wrap the retained MAIN slices
+  from `PME_S5400_MAIN` / `PME_S5300_MAIN` through the complete production generation path and
+  pin semantic addresses, geometry, counts, distributions, uniqueness, ISA totals, inventory
+  diagnostics, and two aggregate digests:
+
+      cargo test --test pal_tasks_golden -- --nocapture --test-threads=1
+      env -u PME_S5400_MAIN -u PME_S5300_MAIN \
+        cargo test --test pal_tasks_golden no_corpus_environment_skips_independently \
+        -- --exact --nocapture --test-threads=1
+
+  The `manifest_blake3` / `metadata_blake3` pins commit no names or firmware bytes, so they
+  are population points: run once with the corpus, copy the digests the unpopulated pins print,
+  and every later run enforces them. Never infer a corpus pass from a clean env-gated skip.
+  The pre-implementation research proof stays reproducible outside Git with
+  `rust-script --test ~/.superpowers/pixel-modem-extractor/2026-08-20-pal-task-semantic-validation.rs`
+  (and its two corpus invocations; see the design trail). The release acceptance matrix —
+  both semantic-proof legs plus fresh release-mode decompose in tighten and datamark modes
+  for both retained images, with isolated-build provenance and per-leg report/manifest
+  consistency gates — is `scripts/pal-acceptance.sh`; a missing input leaves that named
+  gate UNRUN, never passed (`--partial` runs the subset and prints every unrun gate).
+- **Rejected approaches, keep rejecting them.** Upstream's forward padding/margin search
+  (it manufactured the Cheetah slot-0 omission), inventory-gated task acceptance (retained
+  Ghidra matched 0/3 and radare2 11/19 of the true entries — inventories are producer-tagged
+  evidence, never validity), fixed per-model addresses or strides, raw shape scanning, byte
+  signatures for the loader, and any artifact-only or opt-in seeding fallback (a MAIN either
+  proves its initializer or the command fails; it never ships half-seeded).
 
 - **CLI dispatch is thin.** `cli.rs` only parses args and resolves the `--out` default,
   then delegates to a module-level `run(...)`. Put new logic in the module, not in

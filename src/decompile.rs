@@ -1392,6 +1392,15 @@ fn write_run_script(
     // word-split unquoted by analyzeHeadless itself, and reusing a kit-local
     // directory would leak Java/cache state across runs of the same kit.
     s.push_str("STATE_HOME=\"$(mktemp -d \"${TMPDIR:-/tmp}/pixel-modem-ghidra.XXXXXXXX\")\"\n");
+    // A spaced TMPDIR would reintroduce exactly the word-split breakage the
+    // `-D` tokens' space-free requirement exists to prevent; fail closed
+    // with a clear message instead of failing obscurely inside Ghidra.
+    s.push_str("case \"$STATE_HOME\" in\n");
+    s.push_str("  *[\\ \\\t]*)\n");
+    s.push_str("    echo \"the temp directory path contains whitespace; set TMPDIR to a space-free directory\" >&2\n");
+    s.push_str("    exit 1\n");
+    s.push_str("    ;;\n");
+    s.push_str("esac\n");
     s.push_str("cleanup() { rm -rf \"$STATE_HOME\"; }\n");
     s.push_str("trap cleanup EXIT\n");
     s.push_str("trap 'exit 130' INT\n");
@@ -7588,6 +7597,11 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 "STATE_HOME=\"$(mktemp -d \"${TMPDIR:-/tmp}/pixel-modem-ghidra.XXXXXXXX\")\""
             ),
             "run_ghidra.sh must derive its state home from a unique space-free mktemp -d:\n{sh}"
+        );
+        assert!(
+            sh.contains("case \"$STATE_HOME\" in")
+                && sh.contains("the temp directory path contains whitespace; set TMPDIR to a space-free directory"),
+            "run_ghidra.sh must fail closed on a space-containing TMPDIR instead of word-splitting the -D tokens:\n{sh}"
         );
         assert!(
             sh.contains("trap cleanup EXIT")
