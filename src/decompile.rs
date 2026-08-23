@@ -408,23 +408,36 @@ fn headless_command(
 
 /// Run one headless command to completion with stdout captured (stderr
 /// still inherited, so Ghidra's diagnostics stay visible live). Returns
-/// the exit status plus the captured stdout text.
+/// the exit status plus the captured stdout text. The child runs in its
+/// own process group; if capture fails (read error or retention-ceiling
+/// breach) the whole tree is killed and reaped before the error returns.
 fn headless_stdout_status(
     mut command: std::process::Command,
 ) -> std::io::Result<(std::process::ExitStatus, String)> {
     use std::io::BufRead as _;
 
     command.stdout(std::process::Stdio::piped());
+    spawn_in_own_process_group(&mut command);
     let mut child = command.spawn()?;
+    let child_pid = child.id();
     let mut stdout = String::new();
     if let Some(piped) = child.stdout.take() {
         for line in std::io::BufReader::new(piped).lines() {
             match line {
                 Ok(line) => {
-                    push_captured_line(&mut stdout, &line)?;
+                    if let Err(error) = push_captured_line(&mut stdout, &line) {
+                        // Fail closed on runaway stdout: tear down the whole
+                        // tree so no JVM survives holding the project lock.
+                        let _ = child.kill();
+                        kill_process_group(child_pid);
+                        let _ = child.wait();
+                        return Err(error);
+                    }
                     println!("{line}");
                 }
                 Err(error) => {
+                    let _ = child.kill();
+                    kill_process_group(child_pid);
                     let _ = child.wait();
                     return Err(error);
                 }
