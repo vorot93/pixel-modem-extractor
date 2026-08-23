@@ -1374,7 +1374,19 @@ fn parse_manifest(bytes: &[u8]) -> Result<WireManifest> {
     let mut definition_first = true;
     while cursor.peek() != Some(b']') {
         cursor.element(definition_first)?;
-        slot_definition_definitions.push(cursor.address("slot definition")?);
+        let address = cursor.address("slot definition")?;
+        // The wire contract is a strictly increasing chain of unique
+        // definition addresses; duplicates or out-of-order entries are
+        // malformed.
+        if slot_definition_definitions
+            .last()
+            .is_some_and(|last| *last >= address)
+        {
+            return Err(invalid(
+                "slot definition addresses are not strictly increasing",
+            ));
+        }
+        slot_definition_definitions.push(address);
         definition_first = false;
         cursor.skip_whitespace();
     }
@@ -3594,6 +3606,24 @@ mod tests {
                     "\"labels\": []",
                 ),
                 "label",
+            ),
+            (
+                "duplicate slot definition address",
+                replace_once(
+                    &canonical,
+                    "\"definitions\": [\n        \"0x0000100c\"\n      ]\n    },\n    \"normal_exit\"",
+                    "\"definitions\": [\n        \"0x0000100c\",\n        \"0x0000100c\"\n      ]\n    },\n    \"normal_exit\"",
+                ),
+                "strictly increasing",
+            ),
+            (
+                "out-of-order slot definition addresses",
+                replace_once(
+                    &canonical,
+                    "\"definitions\": [\n        \"0x0000100c\"\n      ]\n    },\n    \"normal_exit\"",
+                    "\"definitions\": [\n        \"0x0000100d\",\n        \"0x0000100c\"\n      ]\n    },\n    \"normal_exit\"",
+                ),
+                "strictly increasing",
             ),
         ];
         for (name, bytes, reason) in mutations {

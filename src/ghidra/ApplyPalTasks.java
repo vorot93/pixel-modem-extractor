@@ -298,6 +298,19 @@ public class ApplyPalTasks extends HeadlessScript {
                 fail("a function contains the task entry but does not begin there: " + entry);
             }
             Function existing = functions.getFunctionAt(entry);
+            // A pre-existing function comment with a stray closing marker
+            // (no open marker) is rejected here, before any mutation
+            // begins, instead of mid-application inside the comment
+            // merge.
+            if (existing != null) {
+                String currentComment = existing.getRepeatableComment();
+                if (currentComment != null
+                        && !currentComment.isEmpty()
+                        && PalTasksSupport.findOwnedSection(currentComment) == null
+                        && currentComment.contains(PalTasksSupport.COMMENT_CLOSE_MARKER)) {
+                    fail("a stray owned-comment closing marker exists at " + entry);
+                }
+            }
             boolean willApplyPrimary = existing == null
                     || existing.getSymbol().getSource() == SourceType.DEFAULT;
             if (willApplyPrimary) {

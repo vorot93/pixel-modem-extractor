@@ -2695,6 +2695,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
             let mut pal_tally = PalMarshalTally::default();
+            // The PAL stage measures its own marshal loop; it must not
+            // duplicate the decompile stage's pass-1 duration.
+            let pal_started = Instant::now();
             for ir in &rep.images {
                 // A rejected export is as unusable as a failed Ghidra run, so
                 // its runtime scatter and PAL task state stay unmanaged
@@ -2727,7 +2730,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         image_reports,
                         t.elapsed().as_millis(),
                     ));
-                    stages.push(pal_tasks_stage(Some(&pal_tally), t.elapsed().as_millis()));
+                    stages.push(pal_tasks_stage(
+                        Some(&pal_tally),
+                        pal_started.elapsed().as_millis(),
+                    ));
                 }
                 Some(err) => {
                     stages.push(StageReport::failed(

@@ -32,7 +32,7 @@
 //     "region_bytes":<n>,"gaps":<n>,"gap_bytes":<n>,"arrays":<n>,
 //     "units_before":<n>,"units_after":<n>,"code_units_digest":<hex>,
 //     "functions_before":<n>,"function_digest":<hex>,
-//     "gap_digests":[<hex>,...]}
+//     "gap_digests":[<hex>,... first 64 only],"gap_digests_listed":<n>}
 //@category PixelModem
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.framework.options.Options;
@@ -61,6 +61,9 @@ public class TameAnalysis extends HeadlessScript {
     private static final int MAX_STREAM_RECORDS = 1_000_000;
     private static final long MAX_METADATA_BYTES = 64L * 1024L * 1024L;
     private static final int MAX_ARRAY_BYTES = 16 * 1024 * 1024;
+    /** Cap on the digests inlined into the one summary log line; the
+     * count and aggregate always cover every gap. */
+    static final int MAX_SUMMARY_GAP_DIGESTS = 64;
 
     private static final String[] DISABLE = {
         "ARM Aggressive Instruction Finder",
@@ -536,7 +539,9 @@ public class TameAnalysis extends HeadlessScript {
                 fail("the code-unit count is not the preflight count plus the created arrays");
             }
             for (Gap gap : gaps) {
+                checkDeadline();
                 for (Chunk chunk : gap.chunks) {
+                    checkDeadline();
                     Data array = listing.getDefinedDataAt(toAddr(chunk.start));
                     if (array == null || array.getLength() != (int) chunk.length
                             || !array.getDataType().isEquivalent(
@@ -550,6 +555,7 @@ public class TameAnalysis extends HeadlessScript {
                     fail("the gap bytes changed during data-marking at " + toAddr(gap.start));
                 }
             }
+            checkDeadline();
             if (!PalTasksSupport.functionBodiesDigestHex(currentProgram)
                     .equals(preflight.functionDigest)) {
                 fail("the function bodies changed during data-marking");
@@ -568,13 +574,21 @@ public class TameAnalysis extends HeadlessScript {
                 regionBytes = Math.addExact(regionBytes, region.length);
             }
             long gapBytes = 0;
+            // The digest listing is capped: worst-case gap counts would
+            // otherwise inline every digest into one huge log line. The
+            // count and aggregate always cover every gap; only the
+            // inlined digest list stops at the cap.
             StringBuilder gapDigests = new StringBuilder();
+            long listed = 0;
             for (Gap gap : gaps) {
                 gapBytes = Math.addExact(gapBytes, gap.length);
-                if (gapDigests.length() > 0) {
-                    gapDigests.append(',');
+                if (listed < MAX_SUMMARY_GAP_DIGESTS) {
+                    if (gapDigests.length() > 0) {
+                        gapDigests.append(',');
+                    }
+                    gapDigests.append('"').append(gap.digest).append('"');
+                    listed++;
                 }
-                gapDigests.append('"').append(gap.digest).append('"');
             }
             println("TameAnalysis: {\"mode\":\"datamark\",\"identity\":\"" + preflight.identity
                     + "\",\"regions\":" + preflight.regions.size() + ",\"region_bytes\":"
@@ -585,7 +599,8 @@ public class TameAnalysis extends HeadlessScript {
                     + ",\"code_units_digest\":\"" + preflight.codeUnitsDigest
                     + "\",\"functions_before\":" + preflight.functionsBefore
                     + ",\"function_digest\":\"" + preflight.functionDigest
-                    + "\",\"gap_digests\":[" + gapDigests + "]}");
+                    + "\",\"gap_digests\":[" + gapDigests + "],\"gap_digests_listed\":"
+                    + listed + "}");
         }
 
         void rollback(Throwable original) {

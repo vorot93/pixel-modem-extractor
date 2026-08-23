@@ -203,29 +203,22 @@ impl ControlFlow {
     /// Returns `None` for non-call flows.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn call_boundary(&self, links_lr: bool) -> Option<CallBoundary> {
+        fn aapcs_boundary() -> CallBoundary {
+            CallBoundary {
+                volatile: BTreeSet::from([
+                    Register(0),
+                    Register(1),
+                    Register(2),
+                    Register(3),
+                    Register(12),
+                    LR,
+                ]),
+                flags_unknown: true,
+            }
+        }
         match self {
-            ControlFlow::DirectCall { .. } | ControlFlow::ExceptionCall => Some(CallBoundary {
-                volatile: BTreeSet::from([
-                    Register(0),
-                    Register(1),
-                    Register(2),
-                    Register(3),
-                    Register(12),
-                    LR,
-                ]),
-                flags_unknown: true,
-            }),
-            ControlFlow::Barrier if links_lr => Some(CallBoundary {
-                volatile: BTreeSet::from([
-                    Register(0),
-                    Register(1),
-                    Register(2),
-                    Register(3),
-                    Register(12),
-                    LR,
-                ]),
-                flags_unknown: true,
-            }),
+            ControlFlow::DirectCall { .. } | ControlFlow::ExceptionCall => Some(aapcs_boundary()),
+            ControlFlow::Barrier if links_lr => Some(aapcs_boundary()),
             _ => None,
         }
     }
@@ -4328,14 +4321,9 @@ mod tests {
         assert!(matches!(insn.flow, ControlFlow::ExceptionCall));
     }
 
-    fn decode_fixture(isa: Isa, pc: u32, bytes: &[u8]) -> DecodedInstruction {
-        let decoder = PureRustDecoder;
-        let mut state = decoder.begin_range(isa);
-        decoder
-            .decode_one(&mut state, isa, pc, bytes)
-            .expect("fixture must decode")
-    }
-
+    // Mirror of the production `insn()` flag-defaulting above, kept
+    // deliberately independent so a bug introduced in `insn()` cannot
+    // self-hide by making both sides agree; update both consciously.
     fn expected(
         isa: Isa,
         length: u8,
@@ -5799,7 +5787,7 @@ mod tests {
         assert_eq!(identity.version, "1.0.0");
 
         for fixture in fixtures() {
-            let got = decode_fixture(fixture.isa, 0x1000, fixture.bytes);
+            let got = decode(fixture.isa, 0x1000, fixture.bytes);
             assert_eq!(got, fixture.expected, "{}", fixture.name);
             assert!(got.length > 0 && usize::from(got.length) <= fixture.bytes.len());
         }

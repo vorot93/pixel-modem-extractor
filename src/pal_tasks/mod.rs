@@ -494,3 +494,16 @@ pub(crate) struct TerminalRecord {
     pub slot_blake3: [u8; 32],
     pub storage: Vec<StorageSpan>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TaskIsa;
+
+    #[test]
+    fn task_isa_round_trips_lowercase_wire_names() {
+        for (isa, wire) in [(TaskIsa::Arm, "\"arm\""), (TaskIsa::Thumb, "\"thumb\"")] {
+            assert_eq!(serde_json::to_string(&isa).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<TaskIsa>(wire).unwrap(), isa);
+        }
+    }
+}

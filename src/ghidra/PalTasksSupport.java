@@ -1723,7 +1723,7 @@ final class PalTasksSupport {
     // Strict JSON cursor helpers
     // -------------------------------------------------------------------------
 
-    private static void name(JsonReader reader, boolean first, String expected)
+    private static void name(JsonReader reader, String expected)
             throws IOException {
         if (reader.peek() != JsonToken.NAME) {
             fail("expected key '" + expected + "' but the object ended early");
@@ -1965,80 +1965,80 @@ final class PalTasksSupport {
             fail("task manifest root is not an object");
         }
         reader.beginObject();
-        name(reader, true, "format");
+        name(reader, "format");
         if (!PAL_FORMAT.equals(stringValue(reader, "format"))) {
             fail("unexpected PAL task-manifest format");
         }
-        name(reader, false, "schema_version");
+        name(reader, "schema_version");
         if (unsignedValue(reader, UINT32_MAX, "schema_version") != 1) {
             fail("unsupported PAL task-manifest schema_version");
         }
-        name(reader, false, "tool_version");
+        name(reader, "tool_version");
         if (stringValue(reader, "tool_version").isEmpty()) {
             fail("task manifest tool_version is empty");
         }
 
-        name(reader, false, "image");
+        name(reader, "image");
         reader.beginObject();
-        name(reader, true, "label");
+        name(reader, "label");
         String label = stringValue(reader, "image label");
         if (!isSafeLabel(label) || !label.equals(expectedLabel)) {
             fail("image label does not match the expected label");
         }
         wire.imageLabel = label;
-        name(reader, false, "base_addr");
+        name(reader, "base_addr");
         wire.imageBase = addressValue(reader, "image base_addr");
-        name(reader, false, "size");
+        name(reader, "size");
         wire.imageSize = unsignedValue(reader, UINT32_MAX, "image size");
         if (wire.imageSize == 0) {
             fail("image size is zero");
         }
         checkedEnd(wire.imageBase, wire.imageSize, "image");
-        name(reader, false, "blake3");
+        name(reader, "blake3");
         wire.imageBlake3 = hashValue(reader, "image blake3");
         endObject(reader, "blake3");
 
-        name(reader, false, "runtime_view");
+        name(reader, "runtime_view");
         reader.beginObject();
-        name(reader, true, "scatter_load_map_blake3");
+        name(reader, "scatter_load_map_blake3");
         wire.scatterLoadMapBlake3 =
                 nullValue(reader, "scatter_load_map_blake3") ? null
                         : hashValue(reader, "scatter_load_map_blake3");
-        name(reader, false, "scatter_entries_used");
+        name(reader, "scatter_entries_used");
         wire.scatterEntriesUsed = readSortedUnsignedArray(reader, "scatter_entries_used element",
                 "scatter_entries_used");
         endObject(reader, "scatter_entries_used");
 
-        name(reader, false, "decoder");
+        name(reader, "decoder");
         reader.beginObject();
-        name(reader, true, "semantic_adapter");
+        name(reader, "semantic_adapter");
         if (!SEMANTIC_ADAPTER.equals(stringValue(reader, "semantic_adapter"))) {
             fail("decoder semantic_adapter does not match the compiled semantic adapter");
         }
-        name(reader, false, "backend_crate");
+        name(reader, "backend_crate");
         if (!BACKEND_CRATE.equals(stringValue(reader, "backend_crate"))) {
             fail("decoder backend_crate does not match the compiled decoder crate");
         }
-        name(reader, false, "backend_version");
+        name(reader, "backend_version");
         if (stringValue(reader, "backend_version").isEmpty()) {
             fail("decoder backend_version is empty");
         }
         endObject(reader, "backend_version");
 
-        name(reader, false, "initializer");
+        name(reader, "initializer");
         readInitializer(reader, wire);
 
-        name(reader, false, "table");
+        name(reader, "table");
         readTable(reader, wire);
 
-        name(reader, false, "tasks");
+        name(reader, "tasks");
         beginArray(reader, "tasks");
         while (arrayHasNext(reader)) {
             wire.tasks.add(readTask(reader));
         }
         endArray(reader, "tasks");
 
-        name(reader, false, "applications");
+        name(reader, "applications");
         beginArray(reader, "applications");
         while (arrayHasNext(reader)) {
             wire.applications.add(readApplication(reader));
@@ -2052,16 +2052,16 @@ final class PalTasksSupport {
 
     private static void readInitializer(JsonReader reader, ManifestWire wire) throws IOException {
         reader.beginObject();
-        name(reader, true, "cfg_entry");
+        name(reader, "cfg_entry");
         addressValue(reader, "initializer cfg_entry");
-        name(reader, false, "anchors");
+        name(reader, "anchors");
         List<Long> anchors = new ArrayList<>();
         beginArray(reader, "anchors");
         while (arrayHasNext(reader)) {
             reader.beginObject();
-            name(reader, true, "address");
+            name(reader, "address");
             long anchorAddress = addressValue(reader, "anchor address");
-            name(reader, false, "storage");
+            name(reader, "storage");
             List<PalSpan> storage = readSpans(reader, "anchor storage");
             endObject(reader, "storage");
             if (storage.isEmpty()) {
@@ -2080,18 +2080,18 @@ final class PalTasksSupport {
             fail("the anchors array is empty");
         }
 
-        name(reader, false, "anchor_references");
+        name(reader, "anchor_references");
         beginArray(reader, "anchor_references");
         long[] previousReference = null;
         while (arrayHasNext(reader)) {
             reader.beginObject();
-            name(reader, true, "anchor");
+            name(reader, "anchor");
             long anchor = addressValue(reader, "anchor reference anchor");
-            name(reader, false, "address");
+            name(reader, "address");
             long referenceAddress = addressValue(reader, "anchor reference address");
-            name(reader, false, "kind");
+            name(reader, "kind");
             int kindRank = anchorKindRank(stringValue(reader, "anchor reference kind"));
-            name(reader, false, "definitions");
+            name(reader, "definitions");
             beginArray(reader, "definitions");
             boolean sawDefinition = false;
             while (arrayHasNext(reader)) {
@@ -2102,7 +2102,7 @@ final class PalTasksSupport {
             if (!sawDefinition) {
                 fail("an anchor reference has an empty definition chain");
             }
-            name(reader, false, "call");
+            name(reader, "call");
             long call = addressValue(reader, "anchor reference call");
             endObject(reader, "call");
             long[] key = {anchor, referenceAddress, kindRank, call};
@@ -2116,7 +2116,7 @@ final class PalTasksSupport {
         }
         endArray(reader, "anchor_references");
 
-        name(reader, false, "code_storage");
+        name(reader, "code_storage");
         List<PalSpan> codeStorage = readSpans(reader, "code_storage");
         if (codeStorage.isEmpty()) {
             fail("the code_storage array is empty");
@@ -2124,15 +2124,15 @@ final class PalTasksSupport {
         if (codeStorage.stream().anyMatch(PalSpan::isZeroFill)) {
             fail("code_storage contains virtual zero fill");
         }
-        name(reader, false, "loop_start");
+        name(reader, "loop_start");
         addressValue(reader, "initializer loop_start");
-        name(reader, false, "count_zero_definition");
+        name(reader, "count_zero_definition");
         addressValue(reader, "initializer count_zero_definition");
-        name(reader, false, "slot_definition");
+        name(reader, "slot_definition");
         reader.beginObject();
-        name(reader, true, "root");
+        name(reader, "root");
         long root = addressValue(reader, "slot definition root");
-        name(reader, false, "definitions");
+        name(reader, "definitions");
         beginArray(reader, "slot definitions");
         boolean sawRoot = false;
         while (arrayHasNext(reader)) {
@@ -2149,41 +2149,41 @@ final class PalTasksSupport {
         if (!sawRoot) {
             fail("slot definition chain does not begin at its root");
         }
-        name(reader, false, "normal_exit");
+        name(reader, "normal_exit");
         long normalExit = addressValue(reader, "initializer normal_exit");
-        name(reader, false, "capacity_exit");
+        name(reader, "capacity_exit");
         long capacityExit = addressValue(reader, "initializer capacity_exit");
         if (normalExit == capacityExit) {
             fail("dual exits share one address");
         }
-        name(reader, false, "capacity_guard");
+        name(reader, "capacity_guard");
         reader.beginObject();
-        name(reader, true, "start");
+        name(reader, "start");
         addressValue(reader, "capacity guard start");
-        name(reader, false, "branch");
+        name(reader, "branch");
         addressValue(reader, "capacity guard branch");
-        name(reader, false, "fallthrough");
+        name(reader, "fallthrough");
         addressValue(reader, "capacity guard fallthrough");
-        name(reader, false, "relation");
+        name(reader, "relation");
         if (!CAPACITY_GUARD_RELATION.equals(stringValue(reader, "capacity guard relation"))) {
             fail("unknown capacity guard relation");
         }
         endObject(reader, "relation");
-        name(reader, false, "suffix_loop");
+        name(reader, "suffix_loop");
         addressValue(reader, "initializer suffix_loop");
-        name(reader, false, "join");
+        name(reader, "join");
         addressValue(reader, "initializer join");
-        name(reader, false, "count_global");
+        name(reader, "count_global");
         addressValue(reader, "initializer count_global");
-        name(reader, false, "slot_base");
+        name(reader, "slot_base");
         wire.slotBase = addressValue(reader, "initializer slot_base");
-        name(reader, false, "name_offset");
+        name(reader, "name_offset");
         wire.nameOffset = unsignedValue(reader, UINT32_MAX, "initializer name_offset");
-        name(reader, false, "index_offset");
+        name(reader, "index_offset");
         long indexOffset = unsignedValue(reader, UINT32_MAX, "initializer index_offset");
-        name(reader, false, "stride");
+        name(reader, "stride");
         wire.stride = unsignedValue(reader, UINT32_MAX, "initializer stride");
-        name(reader, false, "capacity");
+        name(reader, "capacity");
         wire.capacity = unsignedValue(reader, UINT32_MAX, "initializer capacity");
         endObject(reader, "capacity");
         if (wire.capacity == 0 || wire.capacity > MAX_TABLE_CAPACITY) {
@@ -2200,28 +2200,28 @@ final class PalTasksSupport {
 
     private static void readTable(JsonReader reader, ManifestWire wire) throws IOException {
         reader.beginObject();
-        name(reader, true, "count");
+        name(reader, "count");
         wire.tableCount = unsignedValue(reader, UINT32_MAX, "table count");
-        name(reader, false, "terminal_slot");
+        name(reader, "terminal_slot");
         wire.terminalSlot = addressValue(reader, "table terminal_slot");
-        name(reader, false, "terminal_blake3");
+        name(reader, "terminal_blake3");
         hashValue(reader, "table terminal_blake3");
-        name(reader, false, "terminal_storage");
+        name(reader, "terminal_storage");
         wire.terminalStorage = readSpans(reader, "terminal_storage");
         if (wire.terminalStorage.isEmpty()) {
             fail("terminal storage is empty");
         }
-        name(reader, false, "descriptor_projection_offset");
+        name(reader, "descriptor_projection_offset");
         long projection = unsignedValue(reader, UINT32_MAX, "table descriptor_projection_offset");
-        name(reader, false, "priority_offset");
+        name(reader, "priority_offset");
         long priorityOffset = unsignedValue(reader, UINT32_MAX, "table priority_offset");
-        name(reader, false, "stack_size_offset");
+        name(reader, "stack_size_offset");
         long stackSizeOffset = unsignedValue(reader, UINT32_MAX, "table stack_size_offset");
-        name(reader, false, "entry_offset");
+        name(reader, "entry_offset");
         long entryOffset = unsignedValue(reader, UINT32_MAX, "table entry_offset");
-        name(reader, false, "callback_offset");
+        name(reader, "callback_offset");
         long callbackOffset = unsignedValue(reader, UINT32_MAX, "table callback_offset");
-        name(reader, false, "unknown_pointer_offset");
+        name(reader, "unknown_pointer_offset");
         long unknownPointerOffset =
                 unsignedValue(reader, UINT32_MAX, "table unknown_pointer_offset");
         endObject(reader, "unknown_pointer_offset");
@@ -2277,15 +2277,15 @@ final class PalTasksSupport {
         beginArray(reader, what);
         while (arrayHasNext(reader)) {
             reader.beginObject();
-            name(reader, true, "kind");
+            name(reader, "kind");
             String kind = stringValue(reader, "storage kind");
             if (!"raw".equals(kind) && !"scatter_bytes".equals(kind)
                     && !"scatter_zero".equals(kind)) {
                 fail("unknown storage kind " + kind);
             }
-            name(reader, false, "address");
+            name(reader, "address");
             long address = addressValue(reader, "storage address");
-            name(reader, false, "size");
+            name(reader, "size");
             long size = unsignedValue(reader, UINT32_MAX, "storage size");
             Long scatterEntry = null;
             if (optionalName(reader, "scatter_entry")) {
@@ -2321,41 +2321,41 @@ final class PalTasksSupport {
 
     private static PalTask readTask(JsonReader reader) throws IOException {
         reader.beginObject();
-        name(reader, true, "index");
+        name(reader, "index");
         long index = unsignedValue(reader, UINT32_MAX, "task index");
-        name(reader, false, "slot");
+        name(reader, "slot");
         long slot = addressValue(reader, "task slot");
-        name(reader, false, "slot_blake3");
+        name(reader, "slot_blake3");
         String slotBlake3 = hashValue(reader, "task slot_blake3");
-        name(reader, false, "name_pointer");
+        name(reader, "name_pointer");
         long namePointer = addressValue(reader, "task name_pointer");
-        name(reader, false, "name");
+        name(reader, "name");
         String name = stringValue(reader, "task name");
-        name(reader, false, "task_label");
+        name(reader, "task_label");
         String taskLabel = stringValue(reader, "task task_label");
-        name(reader, false, "priority");
+        name(reader, "priority");
         long priority = unsignedValue(reader, 0xff, "task priority");
-        name(reader, false, "stack_size");
+        name(reader, "stack_size");
         long stackSize = unsignedValue(reader, UINT32_MAX, "task stack_size");
-        name(reader, false, "entry_pointer");
+        name(reader, "entry_pointer");
         long entryPointer = addressValue(reader, "task entry_pointer");
-        name(reader, false, "entry");
+        name(reader, "entry");
         long entry = addressValue(reader, "task entry");
-        name(reader, false, "isa");
+        name(reader, "isa");
         String isa = requireIsa(stringValue(reader, "task isa"));
-        name(reader, false, "instruction_size");
+        name(reader, "instruction_size");
         long instructionSize = unsignedValue(reader, 0xff, "task instruction_size");
-        name(reader, false, "instruction_blake3");
+        name(reader, "instruction_blake3");
         String instructionBlake3 = hashValue(reader, "task instruction_blake3");
-        name(reader, false, "callback");
+        name(reader, "callback");
         long callback = addressValue(reader, "task callback");
-        name(reader, false, "unknown_pointer");
+        name(reader, "unknown_pointer");
         long unknownPointer = addressValue(reader, "task unknown_pointer");
-        name(reader, false, "slot_storage");
+        name(reader, "slot_storage");
         List<PalSpan> slotStorage = readSpans(reader, "task slot_storage");
-        name(reader, false, "name_storage");
+        name(reader, "name_storage");
         List<PalSpan> nameStorage = readSpans(reader, "task name_storage");
-        name(reader, false, "entry_storage");
+        name(reader, "entry_storage");
         List<PalSpan> entryStorage = readSpans(reader, "task entry_storage");
         endObject(reader, "entry_storage");
 
@@ -2390,23 +2390,23 @@ final class PalTasksSupport {
 
     private static PalApplication readApplication(JsonReader reader) throws IOException {
         reader.beginObject();
-        name(reader, true, "entry");
+        name(reader, "entry");
         long entry = addressValue(reader, "application entry");
-        name(reader, false, "isa");
+        name(reader, "isa");
         String isa = requireIsa(stringValue(reader, "application isa"));
-        name(reader, false, "desired_primary");
+        name(reader, "desired_primary");
         String desiredPrimary = stringValue(reader, "application desired_primary");
-        name(reader, false, "task_indices");
+        name(reader, "task_indices");
         List<Long> taskIndices = readSortedUnsignedArray(reader, "application task index",
                 "application task_indices");
-        name(reader, false, "labels");
+        name(reader, "labels");
         List<PalLabel> labels = new ArrayList<>();
         beginArray(reader, "labels");
         while (arrayHasNext(reader)) {
             reader.beginObject();
-            name(reader, true, "label");
+            name(reader, "label");
             String label = stringValue(reader, "application label");
-            name(reader, false, "task_indices");
+            name(reader, "task_indices");
             List<Long> labelIndices =
                     readSortedUnsignedArray(reader, "label task index", "label task_indices");
             endObject(reader, "task_indices");
@@ -2518,7 +2518,9 @@ final class PalTasksSupport {
             if (previousEntry == application.entry && previousIsa.equals(application.isa)) {
                 fail("applications do not carry unique (entry, isa) groups");
             }
-            if (previousEntry > application.entry) {
+            if (previousEntry > application.entry
+                    || (previousEntry == application.entry
+                            && previousIsa.compareTo(application.isa) > 0)) {
                 fail("applications are not sorted by (entry, isa)");
             }
             previousEntry = application.entry;
@@ -2658,41 +2660,41 @@ final class PalTasksSupport {
             fail("symbol map root is not an object");
         }
         reader.beginObject();
-        name(reader, true, "format");
+        name(reader, "format");
         if (!SYMBOL_MAP_FORMAT.equals(stringValue(reader, "format"))) {
             fail("unexpected symbol-map format");
         }
-        name(reader, false, "image");
+        name(reader, "image");
         reader.beginObject();
-        name(reader, true, "label");
+        name(reader, "label");
         String label = stringValue(reader, "symbol map image label");
         if (!isSafeLabel(label)) {
             fail("symbol map image label is not a safe path component");
         }
         wire.imageLabel = label;
-        name(reader, false, "base_addr");
+        name(reader, "base_addr");
         wire.imageBase = addressValue(reader, "symbol map image base_addr");
-        name(reader, false, "size");
+        name(reader, "size");
         wire.imageSize = unsignedValue(reader, UINT32_MAX, "symbol map image size");
         if (wire.imageSize == 0) {
             fail("symbol map image size is zero");
         }
         checkedEnd(wire.imageBase, wire.imageSize, "symbol map image");
-        name(reader, false, "blake3");
+        name(reader, "blake3");
         wire.imageBlake3 = hashValue(reader, "symbol map image blake3");
         endObject(reader, "blake3");
 
-        name(reader, false, "pal");
+        name(reader, "pal");
         reader.beginObject();
-        name(reader, true, "identity");
+        name(reader, "identity");
         String identity = stringValue(reader, "symbol map pal identity");
         if (NONE_IDENTITY.equals(identity)) {
             wire.palIdentity = NONE_IDENTITY;
-            name(reader, false, "manifest_blake3");
+            name(reader, "manifest_blake3");
             if (!nullValue(reader, "manifest_blake3")) {
                 fail("a none identity carries a manifest BLAKE3");
             }
-            name(reader, false, "scatter_load_map_blake3");
+            name(reader, "scatter_load_map_blake3");
             if (!nullValue(reader, "scatter_load_map_blake3")) {
                 fail("a none identity carries a scatter BLAKE3");
             }
@@ -2700,20 +2702,20 @@ final class PalTasksSupport {
         else {
             String[] parts = parsePalIdentity(identity);
             wire.palIdentity = identity;
-            name(reader, false, "manifest_blake3");
+            name(reader, "manifest_blake3");
             wire.manifestBlake3 = hashValue(reader, "manifest_blake3");
             if (!wire.manifestBlake3.equals(parts[1])) {
                 fail("pal identity does not bind its manifest BLAKE3");
             }
-            name(reader, false, "scatter_load_map_blake3");
+            name(reader, "scatter_load_map_blake3");
             wire.scatterLoadMapBlake3 = hashValue(reader, "scatter_load_map_blake3");
         }
         endObject(reader, "scatter_load_map_blake3");
 
-        name(reader, false, "functions_blake3");
+        name(reader, "functions_blake3");
         wire.functionsBlake3 = hashValue(reader, "functions_blake3");
 
-        name(reader, false, "executions");
+        name(reader, "executions");
         beginArray(reader, "executions");
         long totalRanges = 0;
         long chargedBytes = 0;
@@ -2725,15 +2727,15 @@ final class PalTasksSupport {
                 fail("symbol map exceeds the execution limit");
             }
             reader.beginObject();
-            name(reader, true, "producer");
+            name(reader, "producer");
             if (!"ghidra".equals(stringValue(reader, "producer"))) {
                 fail("symbol map producer is not ghidra");
             }
-            name(reader, false, "entry");
+            name(reader, "entry");
             long entry = addressValue(reader, "execution entry");
-            name(reader, false, "execution_blake3");
+            name(reader, "execution_blake3");
             String executionBlake3 = hashValue(reader, "execution_blake3");
-            name(reader, false, "decode_ranges");
+            name(reader, "decode_ranges");
             List<ExecutionRangeWire> ranges = new ArrayList<>();
             beginArray(reader, "decode_ranges");
             long previousEnd = -1;
@@ -2745,13 +2747,13 @@ final class PalTasksSupport {
                     fail("symbol map exceeds the aggregate range limit");
                 }
                 reader.beginObject();
-                name(reader, true, "isa");
+                name(reader, "isa");
                 String isa = requireIsa(stringValue(reader, "decode range isa"));
-                name(reader, false, "start");
+                name(reader, "start");
                 long start = addressValue(reader, "decode range start");
-                name(reader, false, "end");
+                name(reader, "end");
                 long end = addressValue(reader, "decode range end");
-                name(reader, false, "blake3");
+                name(reader, "blake3");
                 String blake3 = hashValue(reader, "decode range blake3");
                 endObject(reader, "blake3");
                 if (end <= start) {
@@ -2789,30 +2791,30 @@ final class PalTasksSupport {
         }
         endArray(reader, "executions");
 
-        name(reader, false, "symbols");
+        name(reader, "symbols");
         beginArray(reader, "symbols");
         long annotationAggregate = 0;
         while (arrayHasNext(reader)) {
             reader.beginObject();
-            name(reader, true, "execution");
+            name(reader, "execution");
             long execution = unsignedValue(reader, UINT32_MAX, "decision execution");
             if (execution != wire.decisions.size()) {
                 fail("symbol decisions are not the exact execution order");
             }
-            name(reader, false, "original_primary");
+            name(reader, "original_primary");
             String originalPrimary = mapString(reader, "original_primary");
-            name(reader, false, "original_source");
+            name(reader, "original_source");
             String originalSource = requireSourceName(stringValue(reader, "original_source"));
-            name(reader, false, "final_primary");
+            name(reader, "final_primary");
             String finalPrimary = mapString(reader, "final_primary");
-            name(reader, false, "final_source");
+            name(reader, "final_source");
             String finalSource = requireSourceName(stringValue(reader, "final_source"));
-            name(reader, false, "action");
+            name(reader, "action");
             String action = stringValue(reader, "action");
             if (!"preserve".equals(action) && !"rename".equals(action)) {
                 fail("decision action is not preserve or rename");
             }
-            name(reader, false, "annotations");
+            name(reader, "annotations");
             List<String> annotations = new ArrayList<>();
             beginArray(reader, "annotations");
             while (arrayHasNext(reader)) {
@@ -2833,14 +2835,14 @@ final class PalTasksSupport {
             }
             endArray(reader, "annotations");
             boolean palTransition = false;
-            name(reader, false, "pal_transition");
+            name(reader, "pal_transition");
             if (!nullValue(reader, "pal_transition")) {
                 reader.beginObject();
-                name(reader, true, "from");
+                name(reader, "from");
                 if (!"pal_owned".equals(stringValue(reader, "pal_transition from"))) {
                     fail("pal_transition from is not pal_owned");
                 }
-                name(reader, false, "to");
+                name(reader, "to");
                 if (!"pass2_owned".equals(stringValue(reader, "pal_transition to"))) {
                     fail("pal_transition to is not pass2_owned");
                 }

@@ -211,6 +211,9 @@ fn prove_initializer(
     if !slot_base_form_supported(cfg, counting.slot_register, &slot_fact) {
         return Ok(None);
     }
+    let Some(slot_definition) = slot_definition(cfg, &slot_fact) else {
+        return Ok(None);
+    };
     let Some(exits) = find_exit_evidence(cfg, &counting, &states) else {
         return Ok(None);
     };
@@ -236,7 +239,7 @@ fn prove_initializer(
         code_storage: code_storage_spans(image, label, cfg)?,
         loop_start: counting.loop_start,
         count_zero_definition: counting.count_zero_definition,
-        slot_definition: slot_definition(cfg, &slot_fact),
+        slot_definition,
         normal_exit: counting.terminal,
         capacity_exit: counting.capacity_exit,
         capacity_guard: exits.guard,
@@ -762,47 +765,35 @@ fn slot_base_form_supported(
 /// onward — a same-register MOVT high-half replacement or a copy of the
 /// register currently holding it — through the fact's concrete
 /// definition. For the leaf-call form the chain is the call and its
-/// move.
-fn slot_definition(cfg: &LocalCfg, slot_fact: &ValueFact) -> SlotDefinition {
+/// move. An out-of-set instruction shape between the root and the
+/// definition (a missing or non-linear/conditional instruction, a
+/// clobber of the carrier, or an address wrap) breaks the chain: the
+/// module's contract rejects the candidate (`None`) rather than emit a
+/// silently truncated chain.
+fn slot_definition(cfg: &LocalCfg, slot_fact: &ValueFact) -> Option<SlotDefinition> {
     let mut definitions = vec![slot_fact.root];
     if slot_fact.definition == slot_fact.root {
-        return SlotDefinition {
+        return Some(SlotDefinition {
             root: slot_fact.root,
             definitions,
-        };
+        });
     }
     // The register that currently carries the root value: the root's
     // destination, or R0 for a leaf-call root.
-    let Some(root) = cfg.instruction(slot_fact.root) else {
-        return SlotDefinition {
-            root: slot_fact.root,
-            definitions,
-        };
-    };
+    let root = cfg.instruction(slot_fact.root)?;
     let mut carrier = match &root.effect {
         ValueEffect::RegisterWrite { dst, .. } => *dst,
         _ if matches!(root.flow, ControlFlow::DirectCall { .. }) => Register(0),
-        _ => {
-            return SlotDefinition {
-                root: slot_fact.root,
-                definitions,
-            };
-        }
+        _ => return None,
     };
     let mut pc = slot_fact.root;
     while pc < slot_fact.definition {
-        let Some(instruction) = cfg.instruction(pc) else {
-            break;
-        };
-        let Some(next) = pc.checked_add(u32::from(instruction.length)) else {
-            break;
-        };
+        let instruction = cfg.instruction(pc)?;
+        let next = pc.checked_add(u32::from(instruction.length))?;
         pc = next;
-        let Some(instruction) = cfg.instruction(pc) else {
-            break;
-        };
+        let instruction = cfg.instruction(pc)?;
         if !matches!(instruction.flow, ControlFlow::Linear) || instruction.conditional {
-            break;
+            return None;
         }
         match &instruction.effect {
             ValueEffect::RegisterWrite { dst, value } => match value {
@@ -815,17 +806,17 @@ fn slot_definition(cfg: &LocalCfg, slot_fact: &ValueFact) -> SlotDefinition {
                     carrier = *dst;
                     definitions.push(pc);
                 }
-                _ if instruction.writes.contains(&carrier) => break,
+                _ if instruction.writes.contains(&carrier) => return None,
                 _ => {}
             },
-            _ if instruction.writes.contains(&carrier) => break,
+            _ if instruction.writes.contains(&carrier) => return None,
             _ => {}
         }
     }
-    SlotDefinition {
+    Some(SlotDefinition {
         root: slot_fact.root,
         definitions,
-    }
+    })
 }
 
 /// Prove the dual exits: exactly one unequal backedge, a linear capacity
@@ -2346,6 +2337,60 @@ mod tests {
     }
 
     #[test]
+    fn it_predicated_movw_movt_pair_yields_no_candidate() {
+        // REGRESSION PIN (revisit before any arm32 flow-model
+        // relaxation that admits IT blocks): the stateless MOVW/MOVT
+        // lookahead resolves each instruction independently, so it
+        // accepts a pair predicated by an enclosing IT block (pinned
+        // below: the sweep collects the reference). That acceptance is
+        // unobservable today only because the entry-rooted CFG rejects
+        // every IT block outright, so the predicated pair can never
+        // become a candidate end to end.
+        let mut bytes = vec![0u8; 0x20];
+        put(&mut bytes, 0x00, &enc(&T32::Push_T1(vec![gpr(4), gpr(14)])));
+        put(
+            &mut bytes,
+            0x02,
+            &enc(&T32::It_T1(Arm32Condition::Equal, 0b0100)),
+        );
+        put(
+            &mut bytes,
+            0x04,
+            &enc(&T32::Mov_Immediate_T3(gpr(3), 0x1010)),
+        );
+        put(&mut bytes, 0x08, &enc(&T32::Movt_T1(gpr(3), 0)));
+        put(&mut bytes, 0x0c, &enc(&T32::Bx_T1(gpr(14))));
+        put(&mut bytes, 0x10, ANCHOR_PATTERN);
+
+        // The stateless sweep is IT-blind: the predicated pair is
+        // collected as an anchor reference.
+        let anchors = find_anchor_occurrences(&raw_image(&bytes), "fixture").unwrap();
+        let references = find_anchor_references(&raw_image(&bytes), "fixture", &anchors).unwrap();
+        assert_eq!(
+            references,
+            [AnchorReference {
+                anchor: BASE + 0x10,
+                kind: AnchorReferenceKind::MovwMovt,
+                pc: BASE + 0x04,
+                definitions: vec![BASE + 0x04, BASE + 0x08],
+                register: Register(3),
+            }]
+        );
+
+        // End to end the CFG rejects the IT block, so no candidate.
+        assert!(
+            discover_anchor_cfg(&raw_image(&bytes), "fixture")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            discover_initializer_candidates(&raw_image(&bytes), "fixture")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn anchor_reference_beyond_four_kib_is_not_collected() {
         // Anchor at BASE+0x10; a literal load at +0x1000 (exactly the
         // distance limit, collected) and materializations far beyond it
@@ -2782,6 +2827,22 @@ mod tests {
             },
             geometry,
         }
+    }
+
+    #[test]
+    fn branch_inside_the_slot_chain_rejects_the_candidate() {
+        // A non-linear instruction between the slot root and its concrete
+        // definition breaks the complete-chain walk: the candidate is
+        // rejected (empty result) rather than published with a silently
+        // truncated slot-definition chain.
+        let items = insert_after(
+            canonical_items(),
+            "slotlo",
+            insn("", |pc, l| T32::B_T2(branch_to(l, "slothi", pc))),
+        );
+        let (bytes, _) = assemble(BASE, &items);
+        let candidates = discover_initializer_candidates(&raw_image(&bytes), "fixture").unwrap();
+        assert!(candidates.is_empty());
     }
 
     #[test]

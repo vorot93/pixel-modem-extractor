@@ -764,18 +764,26 @@ pub(super) fn allocate_applications(
     }
 
     let leaves = allocate_leaves(&identities)?;
-    let label_of = |name: &str, entry: u32, isa: TaskIsa| -> Option<String> {
-        let indices = label_members.get(&(name.to_string(), entry, isa))?;
-        let lowest = *indices.first()?;
-        leaves
-            .get(&LeafIdentityKey {
+    // Pre-collect every member's allocated role label so the per-record
+    // lookups below borrow their keys instead of allocating an owned
+    // `(String, u32, TaskIsa)` per lookup; bounded by MAX_TABLE_CAPACITY
+    // task names.
+    let allocated_labels: BTreeMap<(&str, u32, TaskIsa), &str> = label_members
+        .iter()
+        .filter_map(|((name, entry, isa), indices)| {
+            let lowest = *indices.first()?;
+            let label = leaves.get(&LeafIdentityKey {
                 namespace: LabelNamespace::Reserved,
-                entry,
-                isa,
+                entry: *entry,
+                isa: *isa,
                 lowest_index: lowest,
                 kind: LeafKind::Role,
-            })
-            .cloned()
+            })?;
+            Some(((name.as_str(), *entry, *isa), label.as_str()))
+        })
+        .collect();
+    let label_of = |name: &str, entry: u32, isa: TaskIsa| -> Option<&str> {
+        allocated_labels.get(&(name, entry, isa)).copied()
     };
     for task in tasks.iter_mut() {
         let Some(label) = label_of(&task.name, task.entry, task.isa) else {
@@ -783,7 +791,7 @@ pub(super) fn allocate_applications(
                 "task record lost its allocated label".to_string(),
             ));
         };
-        task.task_label = label;
+        task.task_label = label.to_string();
     }
 
     let mut applications = Vec::new();
@@ -814,7 +822,7 @@ pub(super) fn allocate_applications(
                 return Err(PalTaskError::Artifact("label allocation gap".to_string()));
             };
             labels.push(TaskLabelApplication {
-                label,
+                label: label.to_string(),
                 task_indices: member_indices.clone(),
             });
         }

@@ -36,6 +36,8 @@ pub enum Error {
     GhidraNotFound(String),
     #[error("ghidra failed on {image}: exit code {code}")]
     GhidraFailed { image: String, code: i32 },
+    #[error("ghidra state home unusable: {0}")]
+    GhidraStateHome(String),
     #[error("required tool not found: {0}")]
     ToolNotFound(String),
     #[error("decompose incomplete: {0}")]

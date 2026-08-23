@@ -135,8 +135,8 @@ fn decompose_produces_unified_tree() {
         .position(|name| name == "decompile")
         .expect("decompile stage");
     assert!(
-        pal_index > decompile_index,
-        "pal_tasks must follow the decompile stage: {stage_names:?}"
+        pal_index == decompile_index + 1,
+        "pal_tasks must immediately follow the decompile stage: {stage_names:?}"
     );
     let pal_stage = &report["stages"].as_array().unwrap()[pal_index];
     assert!(
@@ -987,8 +987,8 @@ fn report_json_includes_pal_fields() {
         .position(|name| *name == "decompile")
         .expect("decompile stage");
     assert!(
-        pal_index > decompile_index,
-        "pal_tasks must follow decompile: {names:?}"
+        pal_index == decompile_index + 1,
+        "pal_tasks must immediately follow decompile: {names:?}"
     );
     let pal_stage = &stages[pal_index];
     assert!(

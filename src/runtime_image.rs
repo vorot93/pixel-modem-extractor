@@ -867,6 +867,79 @@ mod tests {
     }
 
     #[test]
+    fn byte_backed_ranges_merge_adjacent_and_break_on_zero_and_gaps() {
+        let raw = raw();
+        // Two adjacent copy destinations merge with each other but sit
+        // behind a gap after the raw segment; the zero-fill destination
+        // is excluded entirely.
+        let first_bytes = BASE + 0x100;
+        let second_bytes = first_bytes + 4;
+        let zero_fill = BASE + 0x200;
+        let plan = LoadPlan {
+            image_base: BASE,
+            image_size: 16,
+            loader_address: BASE,
+            literal_pair_address: BASE + 4,
+            table_start: BASE,
+            table_end: BASE + 16,
+            handlers: HandlerMap {
+                null: BASE,
+                copy: BASE + 1,
+                decompress1: BASE + 4,
+                zero: BASE + 9,
+            },
+            entries: vec![
+                entry(
+                    0,
+                    BASE,
+                    first_bytes,
+                    4,
+                    BASE + 1,
+                    Operation::Copy,
+                    None,
+                    PlannedOutput::Bytes(vec![1, 2, 3, 4]),
+                ),
+                entry(
+                    1,
+                    BASE,
+                    second_bytes,
+                    4,
+                    BASE + 1,
+                    Operation::Copy,
+                    None,
+                    PlannedOutput::Bytes(vec![5, 6, 7, 8]),
+                ),
+                entry(
+                    2,
+                    BASE,
+                    zero_fill,
+                    4,
+                    BASE + 9,
+                    Operation::Zero,
+                    None,
+                    PlannedOutput::ZeroFill,
+                ),
+            ],
+            logical_output_size: 12,
+        };
+        let image = RuntimeImage::from_plan(&raw, BASE, Some(&plan)).unwrap();
+
+        assert_eq!(
+            image.byte_backed_ranges(),
+            [
+                super::ByteBackedRange {
+                    start: BASE,
+                    end: BASE + 16,
+                },
+                super::ByteBackedRange {
+                    start: first_bytes,
+                    end: second_bytes + 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn gaps_overlap_defense_wrap_and_zero_fill_execution_fail_closed() {
         let raw = raw();
         let plan = plan();

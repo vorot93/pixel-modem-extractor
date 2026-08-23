@@ -490,6 +490,10 @@ hardcoded. Two reference images exercise both models end-to-end:
 
 ## Domain map & code conventions
 
+- **Em-dashes in prose.** The plan-level ASCII constraint applies to code, wire
+  fixtures, and generated output — not to documentation prose. Em-dashes in `.md`
+  files follow each file's established style (this file uses them); new Rust/Java
+  code and test lines remain ASCII-only.
 - **The TOC images** (parsed in `toc.rs`) are model-dependent. mustang/S5400 has six —
   `00_BOOT`, `01_PSP`, `02_MAIN`, `03_APM`, `04_VSS`, `05_DBGCORE`; cheetah/S5300 has four —
   `00_BOOT`, `01_MAIN`, `02_VSS`, `03_APM` (no PSP/DBGCORE). **MAIN** is the primary code image —

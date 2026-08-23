@@ -958,6 +958,26 @@ mod tests {
     }
 
     #[test]
+    fn unaligned_entry_target_rejects_the_cfg() {
+        // Unaligned-target rejection: the entry is the first decode
+        // target, and a hand-assembled prologue reached at an odd entry
+        // is rejected before any byte decodes. Every Thumb branch form
+        // the decoder maps scales its displacement in halfwords, so
+        // encoded successors are always even; the successor parity
+        // check inside the walk is the defensive backstop for that
+        // invariant.
+        let bytes = assemble(
+            0x10,
+            &[
+                (0x00, enc(&T32::Push_T1(vec![gpr(4), gpr(14)]))),
+                (0x02, enc(&T32::Bx_T1(gpr(14)))),
+            ],
+        );
+        assert!(decode_entry_rooted_cfg(&raw_image(&bytes), BASE).is_some());
+        assert!(decode_entry_rooted_cfg(&raw_image(&bytes), BASE + 1).is_none());
+    }
+
+    #[test]
     fn svc_falls_through_but_invalidates_only_volatile_facts() {
         let bytes = assemble(
             0x10,

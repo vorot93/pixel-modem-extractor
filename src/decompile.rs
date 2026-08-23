@@ -237,8 +237,8 @@ fn headless_args(
         ]);
     }
     // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as its
-    // arg[0], then the expected PAL identity (`none` for every current
-    // caller). In `datamark` mode it also disables the Aggressive Instruction
+    // arg[0], then the expected PAL identity (`none` only when this run has
+    // no present PAL plan; a discovered plan carries its manifest identity). In `datamark` mode it also disables the Aggressive Instruction
     // Finder and marks the dense high-entropy regions passed below (each as
     // "addrHex:lenHex") as data. In `tighten` mode no regions are passed.
     args.extend([
@@ -315,7 +315,7 @@ impl GhidraStateHome {
             .bytes()
             .any(|byte| byte == b' ' || byte == b'\t')
         {
-            return Err(Error::DecomposeIncomplete(format!(
+            return Err(Error::GhidraStateHome(format!(
                 "the system temp directory {} is not space-free; Ghidra's word-split Java options cannot address it",
                 base.display()
             )));
@@ -328,7 +328,7 @@ impl GhidraStateHome {
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(Error::DecomposeIncomplete(
+        Err(Error::GhidraStateHome(
             "no unique Ghidra state directory remains under the system temp directory".into(),
         ))
     }
@@ -421,8 +421,7 @@ fn headless_stdout_status(
         for line in std::io::BufReader::new(piped).lines() {
             match line {
                 Ok(line) => {
-                    stdout.push_str(&line);
-                    stdout.push('\n');
+                    push_captured_line(&mut stdout, &line)?;
                     println!("{line}");
                 }
                 Err(error) => {
@@ -434,6 +433,39 @@ fn headless_stdout_status(
     }
     let status = child.wait()?;
     Ok((status, stdout))
+}
+
+/// Ceiling on one image's retained headless stdout. The strict summary
+/// and marker parsing only needs the bounded `ApplyPalTasks`/export
+/// lines; a run whose stdout grows past this is a runaway logger, and
+/// retention fails closed with a clear error instead of growing without
+/// bound or silently truncating.
+const MAX_CAPTURED_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Append one captured stdout line under checked arithmetic, failing
+/// closed when the retained buffer would exceed the ceiling.
+fn push_captured_line(buffer: &mut String, line: &str) -> std::io::Result<()> {
+    let ceiling = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "captured headless stdout exceeds the {MAX_CAPTURED_STDOUT_BYTES} byte ceiling"
+            ),
+        )
+    };
+    let addition = line.len().checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "captured headless stdout line length overflows",
+        )
+    })?;
+    let total = buffer.len().checked_add(addition).ok_or_else(ceiling)?;
+    if total > MAX_CAPTURED_STDOUT_BYTES {
+        return Err(ceiling());
+    }
+    buffer.push_str(line);
+    buffer.push('\n');
+    Ok(())
 }
 
 /// True if this image should be analyzed under `--run`: no `--image` filter, or
@@ -1975,6 +2007,10 @@ fn run_report_impl(
                 let baseline = tighten_baseline_for_dense_thumb_bytes(dense_thumb_bytes);
                 let mut killed: Option<KillReason> = None;
                 let mut repair_lines = 0usize;
+                // Retention ceiling failure for the captured stdout: set
+                // inside the drain loop, acted on (kill + fail closed)
+                // once the loop exits.
+                let mut stdout_overflow: Option<std::io::Error> = None;
                 // Surface B must also fire on a *silent* spin (GC storm, deadlock,
                 // blocked-on-IO) where Ghidra stops emitting stdout — `BufRead::lines`
                 // blocks on the read and the wall-clock budget would otherwise never
@@ -1997,8 +2033,10 @@ fn run_report_impl(
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_millis(500)) {
                         Ok(Ok(line)) => {
-                            captured_stdout.push_str(&line);
-                            captured_stdout.push('\n');
+                            if let Err(error) = push_captured_line(&mut captured_stdout, &line) {
+                                stdout_overflow = Some(error);
+                                break;
+                            }
                             // Match case-insensitively on the symbols Ghidra emits
                             // while looping on overlapping-function repair. The
                             // exact log shape is an implementation detail, so the
@@ -2031,6 +2069,14 @@ fn run_report_impl(
                     }
                 }
                 // (Drain thread exits when the child's stdout closes below.)
+                if let Some(error) = stdout_overflow {
+                    // Fail closed on runaway stdout: tear down the whole
+                    // tree so no JVM survives holding the project lock.
+                    let _ = child.kill();
+                    kill_process_group(child_pid);
+                    let _ = child.wait();
+                    return Err(Error::Io(error));
+                }
                 match killed {
                     Some(reason) => {
                         tracing::warn!(
@@ -4746,6 +4792,11 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // --no-thumb-decompile suppresses dense-Thumb discovery, not
         // firmware-authoritative task entries: datamark mode still schedules
         // ApplyPalTasks ahead of TameAnalysis, with `-` when scatter is absent.
+        // The mode routes through the option plumbing (mode_from_opts), not a
+        // literal, so an Opts-to-mode regression fails here.
+        let mut opts = generation_opts(Some("02_MAIN"));
+        opts.no_thumb_decompile = true;
+        let mode = mode_from_opts(&opts);
         let plan = PalScriptPlan {
             manifest: "pal_tasks/02_MAIN/tasks.json",
             identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
@@ -4758,7 +4809,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             None,
             Some(plan),
             &[(0x40e12000, 0x100000)],
-            "datamark",
+            mode,
         );
         let pal_at = args
             .iter()
@@ -4780,6 +4831,18 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
         );
         assert!(args[tame_at + 3..].iter().any(|a| a == "40e12000:100000"));
+    }
+
+    #[test]
+    fn captured_stdout_retention_fails_closed_at_the_ceiling() {
+        let mut buffer = String::new();
+        let line = "x".repeat(64);
+        while buffer.len() + line.len() < MAX_CAPTURED_STDOUT_BYTES {
+            push_captured_line(&mut buffer, &line).unwrap();
+        }
+        let error = push_captured_line(&mut buffer, &line)
+            .expect_err("retention past the ceiling must fail closed");
+        assert!(error.to_string().contains("ceiling"));
     }
 
     #[test]

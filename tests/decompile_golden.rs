@@ -2170,11 +2170,13 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         &map_path,
         bundle.map.execution_count,
     );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&map_path).unwrap()).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&map_path).unwrap(),
-        std::fs::read_to_string(&map_path).unwrap(),
+        written["executions"].as_array().map(Vec::len),
+        Some(bundle.map.execution_count),
+        "the written map must carry the measured execution count"
     );
-    let _ = symbol_map.map_blake3();
 
     let global_map_path = maps_dir.join("00_BOOT-globals.json");
     let global_map = serde_json::json!({
@@ -3482,6 +3484,30 @@ public class PalSeedMeaningful extends GhidraScript {
 }
 "#;
 
+/// Seeds a stray owned-comment closing marker: a pre-existing function at
+/// the alpha entry carries a repeatable comment with the close marker but
+/// no open marker, which preflight must reject before any mutation.
+const PAL_SEED_STRAY_CLOSE_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+
+public class PalSeedStrayClose extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Address entry = toAddr(0x4001_0400L);
+        disassemble(entry);
+        Function function = createFunction(entry, null);
+        if (function == null) {
+            throw new AssertionError("stray-close seed could not create the function");
+        }
+        function.setRepeatableComment("user note\n"
+                + PalTasksSupport.COMMENT_CLOSE_MARKER);
+        println("PalSeedStrayClose: seeded stray closing marker at " + entry);
+    }
+}
+"#;
+
 /// Seeds a wrong-ISA entry: the alpha entry instruction is disassembled
 /// in Thumb context although the manifest declares ARM.
 const PAL_SEED_WRONG_ISA_JAVA: &str = r#"//@category PixelModemTest
@@ -3722,9 +3748,12 @@ public class InspectAbsent extends GhidraScript {
             throw new AssertionError("expected one or two InspectAbsent arguments");
         }
         String mode = args[0];
-        if (!"stale".equals(mode)) {
+        if (!"stale".equals(mode) && !"seeded_fn".equals(mode)) {
             // The stale mode certifies an intact applied state; every other
-            // mode must show no task function at any application entry.
+            // mode must show no task function at any application entry. The
+            // seeded_fn mode allows a pre-existing function at an entry
+            // (the stray-close-marker probe seeds one) but still requires
+            // the complete PAL absence.
             for (long entry : ENTRIES) {
                 if (currentProgram.getFunctionManager().getFunctionAt(toAddr(entry)) != null) {
                     throw new AssertionError("a task function survived at 0x"
@@ -3733,6 +3762,27 @@ public class InspectAbsent extends GhidraScript {
             }
         }
         if ("pristine".equals(mode)) {
+            // Probe: an empty-but-present ownership registry and reserved
+            // namespace are equivalent to absent for the expected `none`
+            // identity.
+            int probeTx = currentProgram.startTransaction("probe-empty-present");
+            try {
+                currentProgram.getUsrPropertyManager()
+                        .createStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+            }
+            catch (Exception duplicate) {
+                // An already-present map is the empty-but-present probe.
+            }
+            try {
+                currentProgram.getSymbolTable().createNameSpace(
+                        currentProgram.getGlobalNamespace(),
+                        PalTasksSupport.RESERVED_NAMESPACE,
+                        ghidra.program.model.symbol.SourceType.ANALYSIS);
+            }
+            catch (Exception duplicate) {
+                // An already-present namespace is the probe.
+            }
+            currentProgram.endTransaction(probeTx, true);
             PalTasksSupport.validateAbsent(currentProgram);
             for (long entry : ENTRIES) {
                 if (currentProgram.getListing().getInstructionAt(toAddr(entry)) != null) {
@@ -3742,6 +3792,9 @@ public class InspectAbsent extends GhidraScript {
             }
         }
         else if ("seeded".equals(mode)) {
+            PalTasksSupport.validateAbsent(currentProgram);
+        }
+        else if ("seeded_fn".equals(mode)) {
             PalTasksSupport.validateAbsent(currentProgram);
         }
         else if ("collision".equals(mode)) {
@@ -4022,6 +4075,7 @@ fn generate_pal_apply_kit_manifests(
     for (name, source) in [
         ("PalSeedMeaningful.java", PAL_SEED_MEANINGFUL_JAVA),
         ("PalSeedWrongIsa.java", PAL_SEED_WRONG_ISA_JAVA),
+        ("PalSeedStrayClose.java", PAL_SEED_STRAY_CLOSE_JAVA),
         ("PalSeedContaining.java", PAL_SEED_CONTAINING_JAVA),
         ("PalSeedLabelCollision.java", PAL_SEED_LABEL_COLLISION_JAVA),
         ("PalSeedStaleRegistry.java", PAL_SEED_STALE_REGISTRY_JAVA),
@@ -4371,6 +4425,22 @@ fn apply_pal_tasks_rejects_wrong_isa_context() {
         &[],
         "the entry ISA context does not match the declared",
         "seeded",
+    );
+}
+
+#[test]
+fn apply_pal_tasks_rejects_stray_close_marker_before_mutation() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    assert_apply_fails_without_partial_state(
+        &home,
+        "stray_close",
+        Some("PalSeedStrayClose.java"),
+        &[],
+        "a stray owned-comment closing marker exists",
+        "seeded_fn",
     );
 }
 
@@ -4884,6 +4954,90 @@ public class InspectDatamark extends GhidraScript {
 }
 "#;
 
+/// Postflight for the scaled-down multi-chunk datamark run (the staged
+/// TameAnalysis patched to MAX_ARRAY_BYTES = 8): the 44-byte gap must be
+/// partitioned into exact 8/8/8/8/8/4 arrays with nothing defined at any
+/// chunk-internal offset.
+const INSPECT_DATAMARK_CHUNKS_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.framework.options.Options;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.ByteDataType;
+import ghidra.program.model.listing.Data;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Listing;
+import ghidra.program.model.listing.Program;
+
+public class InspectDatamarkChunks extends GhidraScript {
+    private void requireArray(long address, int length) {
+        Data array = currentProgram.getListing().getDefinedDataAt(toAddr(address));
+        if (array == null || array.getLength() != length || !array.getDataType()
+                .isEquivalent(new ArrayDataType(ByteDataType.dataType, length, 1))) {
+            throw new AssertionError("expected an exact byte[" + length + "] array at 0x"
+                    + Long.toHexString(address));
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        Listing listing = currentProgram.getListing();
+        if (listing.getInstructionAt(toAddr(0x40010000L)) == null
+                || listing.getInstructionAt(toAddr(0x40010004L)) == null) {
+            throw new AssertionError("a seeded instruction was cleared");
+        }
+        Data dword = listing.getDefinedDataAt(toAddr(0x40010010L));
+        if (dword == null || dword.getLength() != 4
+                || !"/dword".equals(dword.getDataType().getPathName())) {
+            throw new AssertionError("the seeded dword was disturbed");
+        }
+        Function function = currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(0x40010000L));
+        if (function == null || !function.getBody().getMinAddress().equals(toAddr(0x40010000L))
+                || function.getBody().getMaxAddress().compareTo(toAddr(0x40010007L)) != 0) {
+            throw new AssertionError("the seeded function was disturbed");
+        }
+        requireArray(0x40010008L, 8);
+        requireArray(0x40010014L, 8);
+        requireArray(0x4001001cL, 8);
+        requireArray(0x40010024L, 8);
+        requireArray(0x4001002cL, 8);
+        requireArray(0x40010034L, 8);
+        requireArray(0x4001003cL, 4);
+        // Nothing is defined at any chunk-internal offset: the arrays
+        // exactly partition both gaps.
+        long[][] chunks = {{0x40010008L, 8}, {0x40010014L, 8}, {0x4001001cL, 8},
+            {0x40010024L, 8}, {0x4001002cL, 8}, {0x40010034L, 8}, {0x4001003cL, 4}};
+        for (long[] chunk : chunks) {
+            for (long offset = 1; offset < chunk[1]; offset++) {
+                long address = chunk[0] + offset;
+                if (currentProgram.getListing().getDefinedDataAt(toAddr(address)) != null) {
+                    throw new AssertionError("a chunk-internal offset is defined at 0x"
+                            + Long.toHexString(address));
+                }
+            }
+        }
+        if (listing.getNumCodeUnits() != 10) {
+            throw new AssertionError("the unit count is not additive: "
+                    + listing.getNumCodeUnits());
+        }
+        PalTasksSupport.validateAbsent(currentProgram);
+        Options opts = currentProgram.getOptions(Program.ANALYSIS_PROPERTIES);
+        if (opts.getBoolean("ARM Aggressive Instruction Finder", true)
+                || opts.getBoolean("Aggressive Instruction Finder", true)) {
+            throw new AssertionError("datamark did not disable the aggressive finders");
+        }
+        AddressSet gaps = new AddressSet(toAddr(0x40010008L), toAddr(0x4001000fL));
+        gaps.add(toAddr(0x40010014L), toAddr(0x4001003fL));
+        println("InspectDatamarkChunks: units_digest "
+                + PalTasksSupport.codeUnitsDigestHex(currentProgram, gaps));
+        println("InspectDatamarkChunks: function_digest "
+                + PalTasksSupport.functionBodiesDigestHex(currentProgram));
+        println("InspectDatamarkChunks: ok");
+    }
+}
+"#;
+
 /// Postflight for a failed datamark run: no data-mark array survives (both
 /// gap starts are undefined), the seeded code/function/dword are intact, the
 /// unit count is back to three, the PAL state is absent, and the aggressive
@@ -5193,6 +5347,82 @@ fn datamark_preserves_code_functions_and_partitions_gaps() {
             .unwrap(),
         function_id,
         "the seeded function identity changed during data-marking"
+    );
+
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn datamark_partitions_large_gaps_into_chunks_and_caps_digest_listing() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let kit = generate_tame_kit(&home, "chunks");
+    let seeded = tame_import(&home, &kit, true);
+    assert!(
+        seeded.contains("TameSeed: ok"),
+        "seed run failed:\n{seeded}"
+    );
+
+    // Scale the chunk boundary down through the staged-source seam (the
+    // production constant stays untouched) so one gap exceeds one chunk
+    // and must be partitioned into several exact arrays; also cap the
+    // inlined digest listing at one entry to prove the summary cap.
+    patch_tame_script(
+        &kit.out,
+        &[
+            (
+                "MAX_ARRAY_BYTES = 16 * 1024 * 1024;",
+                "MAX_ARRAY_BYTES = 8;",
+            ),
+            (
+                "MAX_SUMMARY_GAP_DIGESTS = 64;",
+                "MAX_SUMMARY_GAP_DIGESTS = 1;",
+            ),
+        ],
+    );
+    std::fs::write(
+        kit.out.join("scripts/InspectDatamarkChunks.java"),
+        INSPECT_DATAMARK_CHUNKS_JAVA,
+    )
+    .unwrap();
+
+    let run = tame_datamark(
+        &home,
+        &kit,
+        &["datamark", "none", "40010000:40"],
+        Some("InspectDatamarkChunks.java"),
+    );
+    assert!(
+        !run.contains("REPORT SCRIPT ERROR"),
+        "datamark multi-chunk run failed:\n{run}"
+    );
+    let summary = tame_summary(&run);
+    // The seeded fixture has two gaps (8 bytes and 44 bytes): the first
+    // is exactly one 8-byte chunk, the second partitions into
+    // 8+8+8+8+8+4 across six arrays.
+    assert_eq!(summary["gaps"], 2);
+    assert_eq!(summary["gap_bytes"], 52);
+    assert_eq!(summary["arrays"], 7);
+    assert_eq!(summary["units_after"], 3 + 7);
+    // The digest listing is capped at one inlined digest, while the gap
+    // count and aggregate still cover every gap.
+    assert_eq!(summary["gap_digests"].as_array().unwrap().len(), 1);
+    assert_eq!(summary["gap_digests_listed"], 1);
+    assert!(
+        run.contains("InspectDatamarkChunks: ok"),
+        "postflight failed:\n{run}"
+    );
+    assert_eq!(
+        tame_script_value(&run, "InspectDatamarkChunks: units_digest "),
+        tame_script_value(&seeded, "TameSeed: units_digest "),
+        "the preserved code units changed during multi-chunk data-marking"
+    );
+    assert_eq!(
+        tame_script_value(&run, "InspectDatamarkChunks: function_digest "),
+        tame_script_value(&seeded, "TameSeed: function_digest "),
+        "the function bodies changed during multi-chunk data-marking"
     );
 
     let _ = std::fs::remove_dir_all(&kit.dir);
@@ -5857,6 +6087,44 @@ public class SeedRenameAlpha extends GhidraScript {
 }
 "#;
 
+/// Changes only the alpha primary's source (same name, USER_DEFINED) so the
+/// retained map's original-source binding rejects it (the changed-source
+/// rejection).
+const PAL_SEED_CHANGE_ALPHA_SOURCE_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class SeedChangeAlphaSource extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Function alpha = currentProgram.getFunctionManager().getFunctionAt(toAddr(0x4001_0400L));
+        if (alpha == null) {
+            throw new AssertionError("source-change seed lost the alpha function");
+        }
+        String name = alpha.getName();
+        alpha.setName(name, SourceType.USER_DEFINED);
+        // Keep the registry self-consistent with the source drift so the
+        // rejection under test is ApplySymbols' retained-original binding,
+        // not the shared registry validator.
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
+        PalTasksSupport.RegistryEntry previous = PalTasksSupport.parseRegistry(
+                registry.getString(alpha.getEntryPoint()));
+        registry.add(alpha.getEntryPoint(), PalTasksSupport.registryValue(
+                new PalTasksSupport.RegistryEntry(
+                        previous.manifestBlake3, previous.isa, previous.functionId,
+                        previous.functionDisposition, previous.commentBlake3,
+                        previous.primaryDisposition, previous.primarySymbolId,
+                        "user_defined",
+                        PalTasksSupport.primaryDigestHex(name),
+                        previous.labelCount, previous.labelsBlake3)));
+        System.out.println("SeedChangeAlphaSource: ok");
+    }
+}
+"#;
+
 /// Clears the first instruction of the alpha body so its authenticated decode
 /// projection no longer matches the retained map (the changed-body rejection).
 const PAL_SEED_CLEAR_ALPHA_BODY_JAVA: &str = r#"//@category PixelModemTest
@@ -6006,6 +6274,16 @@ public class SeedCorrupt extends GhidraScript {
                 fn.setName("probe_drifted_name", SourceType.USER_DEFINED);
                 break;
             }
+            case "corrupt_task_bytes": {
+                // Corrupt the alpha task entry's instruction extent: the
+                // applied registry and function stay intact, so the
+                // export-side re-validation alone must catch the drifted
+                // task bytes (the apply-side instruction-blake3 check is
+                // not on this path).
+                currentProgram.getListing()
+                        .clearCodeUnits(toAddr(ALPHA), toAddr(ALPHA + 3), false);
+                break;
+            }
             case "orphan_label": {
                 Namespace namespace = symbols.getNamespace(
                         PalTasksSupport.RESERVED_NAMESPACE,
@@ -6051,6 +6329,10 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
         ),
         ("SeedRenameAlpha.java", PAL_SEED_RENAME_ALPHA_JAVA),
         ("SeedClearAlphaBody.java", PAL_SEED_CLEAR_ALPHA_BODY_JAVA),
+        (
+            "SeedChangeAlphaSource.java",
+            PAL_SEED_CHANGE_ALPHA_SOURCE_JAVA,
+        ),
     ] {
         std::fs::write(
             {
@@ -6175,6 +6457,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
         "SeedClearPass2Property.java",
         "SeedRenameAlpha.java",
         "SeedClearAlphaBody.java",
+        "SeedChangeAlphaSource.java",
     ] {
         std::fs::copy(
             script_staging.join(name),
@@ -6219,6 +6502,26 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.map_hash.clone(),
             ],
             "image BLAKE3 does not match the symbol map",
+        ),
+        // Stale PAL identity argument: a well-formed v1 identity that is
+        // not the manifest's own (a direct argument rejection, never a
+        // silent override).
+        (
+            vec![
+                "-postScript".into(),
+                "ApplySymbols.java".into(),
+                state.kit.kit_root.to_string_lossy().into_owned(),
+                "02_MAIN".into(),
+                state.image_hash.clone(),
+                format!("v1:{}:9:9", "b".repeat(64)),
+                state.kit.manifest_path.to_string_lossy().into_owned(),
+                state.kit.scatter_path.to_string_lossy().into_owned(),
+                functions_arg.clone(),
+                state.functions_hash.clone(),
+                map_arg.clone(),
+                state.map_hash.clone(),
+            ],
+            "the expected PAL identity does not match the manifest",
         ),
         // Stale functions BLAKE3.
         (
@@ -6417,6 +6720,46 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
             || failed.contains("primary symbol binding does not match the registry")
             || failed.contains("no longer carries the desired task name"),
         "a changed primary was not rejected:\n{failed}"
+    );
+    let _ = std::fs::remove_dir_all(&state.kit.dir);
+
+    // A changed primary SOURCE (the same name re-applied as USER_DEFINED)
+    // fails the retained map's original-source binding.
+    let state = build_pal_pass2_kit(
+        &home,
+        "pass2_source",
+        &image,
+        |scatter_hash| pal_fixture::extended_manifest(&image, scatter_hash),
+        None,
+        true,
+    );
+    std::fs::copy(
+        script_staging.join("SeedChangeAlphaSource.java"),
+        state.kit.out.join("scripts/SeedChangeAlphaSource.java"),
+    )
+    .unwrap();
+    let seeded = pal_headless(
+        &home,
+        &state.kit,
+        &[
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            state.kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedChangeAlphaSource.java".to_string(),
+        ],
+    );
+    assert!(
+        seeded.contains("SeedChangeAlphaSource: ok"),
+        "source-change seed did not run:\n{seeded}"
+    );
+    let failed = pal_apply_symbols(&home, &state, None, false);
+    assert!(
+        failed.contains("the current primary changed")
+            || failed.contains("primary symbol binding does not match the registry"),
+        "a changed primary source was not rejected:\n{failed}"
     );
     let _ = std::fs::remove_dir_all(&state.kit.dir);
 
@@ -6688,7 +7031,8 @@ fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
 
 /// The export postflight re-validates the complete PAL state: a removed task
 /// function, a deleted reserved label, a tampered registry, an edited owned
-/// comment, a renamed task primary, an orphan reserved label, a drifted
+/// comment, a renamed task primary, an orphan reserved label, a corrupted
+/// task entry byte extent, a drifted
 /// non-task body under the pass-2 comparison, and the task-body/deadline
 /// limits each fail before any output is published.
 #[test]
@@ -6733,6 +7077,11 @@ fn export_pal_postflight_rejects_program_drift() {
             "rename_primary",
             "rename_primary",
             "primary symbol binding does not match the registry",
+        ),
+        (
+            "corrupt_task_bytes",
+            "corrupt_task_bytes",
+            "no instruction exists at the task entry",
         ),
         (
             "orphan_label",
