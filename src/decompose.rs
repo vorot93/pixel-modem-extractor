@@ -2961,6 +2961,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         }
     }
 
@@ -5361,6 +5362,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -5414,6 +5416,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         });
 
         assert_eq!(image.status, "analyzed");
@@ -5517,6 +5520,7 @@ mod tests {
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                pal_applied: None,
             },
             decompile::ImageResult {
                 label: "01_BOOT".into(),
@@ -5551,6 +5555,7 @@ mod tests {
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                pal_applied: None,
             },
         ];
         let images_dir = root.join("images");
@@ -5624,6 +5629,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
 
@@ -5745,6 +5751,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         }];
 
         refresh_decompile_stage_images(&mut stages, &post_enrich_images);
@@ -5817,6 +5824,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
         assert_eq!(outcome.counts.len(), 0);
@@ -6617,6 +6625,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         };
 
         assert!(refresh_decompiled(&ghidra, &images, &image).is_err());
@@ -6863,6 +6872,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -6907,6 +6917,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -6950,6 +6961,7 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            pal_applied: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -6985,6 +6997,7 @@ mod tests {
             thumb_tighten_error: None,
             thumb_enrich_error: None,
             globals_recovered: Some(137),
+            pal_applied: None,
             globals_error: Some("malformed functions.json".into()),
             globals_applied: None,
             globals_apply_skipped: None,

@@ -742,7 +742,12 @@ public class ApplyPalTasks extends HeadlessScript {
                     sharedEntries++;
                 }
             }
-            println("ApplyPalTasks: {\"image\":\"" + preflight.manifest.imageLabel
+            // Bypass GhidraScript.println (which routes through Msg.info and
+            // gets wrapped as "INFO  ApplyPalTasks.java> ... (GhidraScript)")
+            // for the machine line: emit on stdout verbatim so the Rust
+            // driver's parse_apply_pal_tasks_summary can
+            // strip_prefix("ApplyPalTasks: "); println keeps the human log.
+            String summary = "ApplyPalTasks: {\"image\":\"" + preflight.manifest.imageLabel
                     + "\",\"status\":\"ok\",\"identity\":\"" + preflight.identity
                     + "\",\"tasks\":" + preflight.manifest.taskRecords
                     + ",\"entries\":" + state.applications
@@ -750,7 +755,9 @@ public class ApplyPalTasks extends HeadlessScript {
                     + ",\"functions_existing\":" + existingFunctions
                     + ",\"names_applied\":" + state.palOwnedPrimaries
                     + ",\"names_preserved\":" + state.preservedPrimaries
-                    + ",\"shared_entries\":" + sharedEntries + "}");
+                    + ",\"shared_entries\":" + sharedEntries + "}";
+            System.out.println(summary);
+            println(summary);
         }
     }
 }

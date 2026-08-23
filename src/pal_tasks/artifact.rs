@@ -34,6 +34,7 @@ const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// The result of one successful present publication: the current-run
 /// state itself, never inferred from path existence.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedTaskMap {
     pub relative_path: String,
     pub blake3: String,
@@ -2511,7 +2512,11 @@ fn open_manifest_file(path: &Path) -> Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        FORMAT, TaskArtifactContext, ValidatedTaskArtifact, clear_materialized, materialize, read,
+    };
     use crate::arm32::Register;
+    use crate::pal_tasks::MaterializedTaskMap;
     use crate::pal_tasks::discover::test_support::{
         BASE, bytes_entry, enc, gpr, raw_image, scatter_plan, zero_entry,
     };
@@ -2519,10 +2524,6 @@ mod tests {
         ANCHOR_PATTERN, AnchorProofPath, AnchorProvenance, AnchorReference, AnchorReferenceKind,
         CapacityGuard, InitializerEvidence, PalTaskError, SlotDefinition, TaskApplication, TaskIsa,
         TaskLabelApplication, TaskPlan, TaskRecord, TaskTable, TerminalRecord,
-    };
-    use crate::pal_tasks::{
-        FORMAT, MaterializedTaskMap, TaskArtifactContext, ValidatedTaskArtifact,
-        clear_materialized, materialize, read,
     };
     use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
     use scaleservers_arm32_assembly::{Arm32Condition, ArmT32Instruction as T32};

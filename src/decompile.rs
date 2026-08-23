@@ -4,12 +4,17 @@
 //! exporter); the opt-in `--run` drives `analyzeHeadless` headless to export
 //! decompiled C, a disassembly listing, a function inventory, and a saved project,
 //! with radare2 primary and optional failure-only Rizin covering dense Thumb regions.
+//! One MAIN generation loop discovers the scatter load map and the PAL task table
+//! together, so every kit and run carries explicit runtime analysis state: the
+//! scatter map, the authenticated PAL task manifest, and their identities.
 
 use crate::{
     error::{Error, Result},
     execution_ranges::{
-        OwnedExecutionIdentity, TaggedExecutionRecord, validate_ghidra_inventory_records,
+        OwnedExecutionIdentity, TaggedExecutionRecord, parse_blake3,
+        validate_ghidra_inventory_records,
     },
+    pal_tasks::{self, TaskArtifactContext},
     runtime_image::RuntimeImage,
     scatter,
     toc::Toc,
@@ -101,6 +106,8 @@ pub struct ImageSpec {
     pub blake3: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_load_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pal_task_map: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -143,6 +150,7 @@ pub fn build_load_spec(
                 entry_point: format!("0x{:08x}", e.load_addr),
                 blake3: crate::manifest::blake3_bytes(&data[start..end]),
                 runtime_load_map: None,
+                pal_task_map: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -173,16 +181,14 @@ pub struct PalScriptPlan<'a> {
 /// `mode` is "tighten" (Phase 2+ default — attempt Thumb) or "datamark" (Phase-1
 /// fallback — mark regions as data). When "tighten", the `thumb_regions` arg is
 /// ignored (no data-marks passed to the script). Immediately after the mode the
-/// pre-script consumes the expected PAL identity — every current source passes
-/// `none` (the PAL task-inventory generation is the only future supplier of a
-/// present identity).
+/// pre-script consumes the expected PAL identity — `none` when this run's
+/// generation loop measured no present map, else the manifest identity.
 ///
-/// `pal` schedules the PAL task-manifest application for this image. When
-/// present the pre-script order is `ApplyScatterLoad`, `ApplyPalTasks`,
-/// `TameAnalysis`, and `TameAnalysis`/`ExportDecomp` receive the plan's
-/// identity; a PAL map without a scatter map passes `-` as `ApplyPalTasks`'s
-/// scatter argument. Production callers stay on `None` (identity `none`) until
-/// generation state is coherent.
+/// `pal` schedules the PAL task-manifest application for this image, built
+/// from this run's present generation state. When present the pre-script
+/// order is `ApplyScatterLoad`, `ApplyPalTasks`, `TameAnalysis`, and
+/// `TameAnalysis`/`ExportDecomp` receive the plan's identity; a PAL map
+/// without a scatter map passes `-` as `ApplyPalTasks`'s scatter argument.
 #[allow(clippy::too_many_arguments)]
 fn headless_args(
     root: &str,
@@ -248,12 +254,12 @@ fn headless_args(
         }
     }
     // ExportDecomp (post): the strict eight-argument contract — output
-    // directory, canonical kit root, image label, PAL identity (`none` for
-    // every current caller), task manifest (`-` under the same nullability
-    // rule as ApplyPalTasks), scatter manifest when ApplyScatterLoad was
-    // scheduled (`-` otherwise), pass-1 symbol map (`-` for pass 1 and
-    // generated single-pass kits), and the expected map BLAKE3 (literal
-    // `none` with `-`).
+    // directory, canonical kit root, image label, PAL identity (`none`
+    // when no map is present), task manifest (`-` under the same
+    // nullability rule as ApplyPalTasks), scatter manifest when
+    // ApplyScatterLoad was scheduled (`-` otherwise), pass-1 symbol map
+    // (`-` for pass 1 and generated single-pass kits), and the expected
+    // map BLAKE3 (literal `none` with `-`).
     let scatter_argument = runtime_load_map
         .map(|scatter_relative| format!("{root}/{scatter_relative}"))
         .unwrap_or_else(|| "-".to_string());
@@ -289,25 +295,82 @@ fn mode_from_opts(opts: &Opts) -> &'static str {
     }
 }
 
-fn ghidra_config_home(root: &Path) -> PathBuf {
-    root.join("ghidra_config")
+/// One unique, space-free Java/XDG state directory for a headless run —
+/// the in-process equivalent of the generated script's `mktemp -d` state
+/// home and cleanup trap. Ghidra user settings, cache, and temp files
+/// never leak between runs, and the `-D…` tokens (word-split unquoted by
+/// `analyzeHeadless`) can never inherit a space from the kit root. The
+/// directory is removed on drop.
+#[derive(Debug)]
+struct GhidraStateHome {
+    path: PathBuf,
 }
 
-fn ghidra_cache_home(root: &Path) -> PathBuf {
-    root.join("ghidra_cache")
+impl GhidraStateHome {
+    fn new() -> Result<Self> {
+        let base = std::env::temp_dir();
+        let prefix = format!("pixel-modem-ghidra-{}", std::process::id());
+        if base
+            .to_string_lossy()
+            .bytes()
+            .any(|byte| byte == b' ' || byte == b'\t')
+        {
+            return Err(Error::DecomposeIncomplete(format!(
+                "the system temp directory {} is not space-free; Ghidra's word-split Java options cannot address it",
+                base.display()
+            )));
+        }
+        for attempt in 0..u32::MAX {
+            let candidate = base.join(format!("{prefix}-{attempt:08x}"));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(Error::DecomposeIncomplete(
+            "no unique Ghidra state directory remains under the system temp directory".into(),
+        ))
+    }
+
+    fn config_home(&self) -> PathBuf {
+        self.path.join("ghidra_config")
+    }
+
+    fn cache_home(&self) -> PathBuf {
+        self.path.join("ghidra_cache")
+    }
+
+    fn temp_home(&self) -> PathBuf {
+        self.path.join("ghidra_tmp")
+    }
+
+    fn create_subdirs(&self) -> Result<()> {
+        std::fs::create_dir_all(self.config_home())?;
+        std::fs::create_dir_all(self.cache_home())?;
+        std::fs::create_dir_all(self.temp_home())?;
+        Ok(())
+    }
 }
 
-fn ghidra_temp_home(root: &Path) -> PathBuf {
-    root.join("ghidra_tmp")
+impl Drop for GhidraStateHome {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            tracing::warn!(
+                "failed to clean up the Ghidra state directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
-fn ghidra_java_options(root: &Path, existing: Option<&OsStr>) -> OsString {
+fn ghidra_java_options(state: &GhidraStateHome, existing: Option<&OsStr>) -> OsString {
     let local = format!(
         "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
-        ghidra_config_home(root).display(),
-        ghidra_cache_home(root).display(),
-        ghidra_temp_home(root).display(),
-        ghidra_temp_home(root).display()
+        state.config_home().display(),
+        state.cache_home().display(),
+        state.temp_home().display(),
+        state.temp_home().display()
     );
     let mut options = OsString::new();
     if let Some(existing) = existing.filter(|s| !s.is_empty()) {
@@ -321,17 +384,17 @@ fn ghidra_java_options(root: &Path, existing: Option<&OsStr>) -> OsString {
 fn headless_command(
     headless: &Path,
     args: &[String],
-    root: &Path,
+    state: &GhidraStateHome,
     java_home: Option<&Path>,
 ) -> std::process::Command {
     let mut command = std::process::Command::new(headless);
     command.args(args);
-    command.env("XDG_CONFIG_HOME", ghidra_config_home(root));
-    command.env("XDG_CACHE_HOME", ghidra_cache_home(root));
+    command.env("XDG_CONFIG_HOME", state.config_home());
+    command.env("XDG_CACHE_HOME", state.cache_home());
     command.env(
         "GHIDRA_HEADLESS_JAVA_OPTIONS",
         ghidra_java_options(
-            root,
+            state,
             std::env::var_os("GHIDRA_HEADLESS_JAVA_OPTIONS").as_deref(),
         ),
     );
@@ -341,6 +404,36 @@ fn headless_command(
         command.env("JAVA_HOME", jh);
     }
     command
+}
+
+/// Run one headless command to completion with stdout captured (stderr
+/// still inherited, so Ghidra's diagnostics stay visible live). Returns
+/// the exit status plus the captured stdout text.
+fn headless_stdout_status(
+    mut command: std::process::Command,
+) -> std::io::Result<(std::process::ExitStatus, String)> {
+    use std::io::BufRead as _;
+
+    command.stdout(std::process::Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout = String::new();
+    if let Some(piped) = child.stdout.take() {
+        for line in std::io::BufReader::new(piped).lines() {
+            match line {
+                Ok(line) => {
+                    stdout.push_str(&line);
+                    stdout.push('\n');
+                    println!("{line}");
+                }
+                Err(error) => {
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
+    }
+    let status = child.wait()?;
+    Ok((status, stdout))
 }
 
 /// True if this image should be analyzed under `--run`: no `--image` filter, or
@@ -471,8 +564,26 @@ pub struct ImageResult {
     pub globals_provisional: Option<usize>,
     /// Phase 3.0.1: subset dropped because a Recovered (addr, name') exists at
     /// the same address (tier-conflict suppression — the gate-relevant metric).
-    /// None when Phase 3.0.1 didn't run; Some(0) is a valid value.
+    /// None when Phase 3.0.1 didn't run for this image; Some(0) is a valid value.
     pub globals_provisional_suppressed: Option<usize>,
+    /// The current-run `ApplyPalTasks` summary for a present PAL map:
+    /// task count, application entries, created/existing functions, names
+    /// applied/preserved, and shared entries. `None` when no PAL map was
+    /// applied for this image; a missing, duplicate, or malformed summary
+    /// (or a wrong completion marker) rejects the image instead.
+    pub pal_applied: Option<AppliedPalTasks>,
+}
+
+/// The parsed `ApplyPalTasks: {json}` current-run summary line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedPalTasks {
+    pub tasks: usize,
+    pub entries: usize,
+    pub functions_created: usize,
+    pub functions_existing: usize,
+    pub names_applied: usize,
+    pub names_preserved: usize,
+    pub shared_entries: usize,
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -482,6 +593,11 @@ pub struct DecompileReport {
     pub spec_path: PathBuf,
     current_exports: BTreeSet<String>,
     runtime_scatter: HashMap<String, RuntimeScatterState>,
+    // Read today by the generation tests and the decompile orchestrator
+    // wiring that consumes PAL state (the same interim state the whole
+    // `pal_tasks` module carries in lib.rs).
+    #[cfg_attr(not(test), allow(dead_code))]
+    runtime_tasks: HashMap<String, RuntimeTaskState>,
 }
 
 impl DecompileReport {
@@ -495,6 +611,24 @@ impl DecompileReport {
             .copied()
             .unwrap_or(RuntimeScatterState::Unmanaged)
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn runtime_task_state(&self, label: &str) -> RuntimeTaskState {
+        self.runtime_tasks
+            .get(label)
+            .cloned()
+            .unwrap_or(RuntimeTaskState::Unmanaged)
+    }
+
+    /// One image's coherent runtime analysis state: the scatter and PAL
+    /// task states the generation loop measured for this run.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn runtime_analysis_state(&self, label: &str) -> RuntimeAnalysisState {
+        RuntimeAnalysisState {
+            scatter: self.runtime_scatter_state(label),
+            tasks: self.runtime_task_state(label),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,6 +636,26 @@ pub(crate) enum RuntimeScatterState {
     Unmanaged,
     Absent,
     Present,
+}
+
+/// The runtime PAL task state of one image, measured by this run's
+/// generation loop: never managed for an unrecognized image (`Unmanaged`),
+/// explicitly absent for a recognized MAIN whose discovery completed with
+/// no candidate, and present with the authenticated manifest identity a
+/// failed discovery/publication can never fabricate (`Present`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeTaskState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unmanaged,
+    Absent,
+    Present(crate::pal_tasks::MaterializedTaskMap),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeAnalysisState {
+    pub scatter: RuntimeScatterState,
+    pub tasks: RuntimeTaskState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1214,12 +1368,16 @@ fn shell_arg(arg: &str) -> String {
 }
 
 /// Write a turnkey `run_ghidra.sh` (one `analyzeHeadless` invocation per image),
-/// built from `headless_args` against a relocatable `$HERE` root.
+/// built from `headless_args` against a relocatable `$HERE` root. Ghidra's
+/// Java/XDG state lives in one unique, space-free `mktemp -d` directory removed
+/// by the cleanup trap, so no cross-run state ever leaks and a `$HERE`
+/// containing spaces cannot corrupt the word-split `-D` tokens.
 fn write_run_script(
     out: &Path,
     toc: &Toc,
     processor: &str,
     runtime_load_maps: &HashMap<String, String>,
+    runtime_task_states: &HashMap<String, RuntimeTaskState>,
 ) -> Result<()> {
     let mut s = String::new();
     s.push_str("#!/usr/bin/env sh\n");
@@ -1238,21 +1396,23 @@ fn write_run_script(
     s.push_str("  exit 1\n");
     s.push_str("fi\n");
     s.push_str("HERE=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd -P)\"\n");
-    s.push_str("export XDG_CONFIG_HOME=\"$HERE/ghidra_config\"\n");
-    s.push_str("export XDG_CACHE_HOME=\"$HERE/ghidra_cache\"\n");
-    // NOTE: `$HERE` is interpolated into these `-D…` tokens and the resulting
-    // env var is later word-split unquoted by `analyzeHeadless` itself, so a
-    // `$HERE` containing spaces breaks the launch. We don't escape here because
-    // no shell-quoting survives the unquoted re-split downstream; if you need a
-    // `$HERE` with spaces, invoke the binary directly (the in-process `Command`
-    // path is unaffected).
-    s.push_str("GHIDRA_LOCAL_JAVA_OPTIONS=\"-Dapplication.settingsdir=$HERE/ghidra_config -Dapplication.cachedir=$HERE/ghidra_cache -Dapplication.tempdir=$HERE/ghidra_tmp -Djava.io.tmpdir=$HERE/ghidra_tmp\"\n");
+    // A unique, space-free state directory: the `-D…` tokens below are
+    // word-split unquoted by analyzeHeadless itself, and reusing a kit-local
+    // directory would leak Java/cache state across runs of the same kit.
+    s.push_str("STATE_HOME=\"$(mktemp -d \"${TMPDIR:-/tmp}/pixel-modem-ghidra.XXXXXXXX\")\"\n");
+    s.push_str("cleanup() { rm -rf \"$STATE_HOME\"; }\n");
+    s.push_str("trap cleanup EXIT\n");
+    s.push_str("trap 'exit 130' INT\n");
+    s.push_str("trap 'exit 143' TERM\n");
+    s.push_str("export XDG_CONFIG_HOME=\"$STATE_HOME/ghidra_config\"\n");
+    s.push_str("export XDG_CACHE_HOME=\"$STATE_HOME/ghidra_cache\"\n");
+    s.push_str("GHIDRA_LOCAL_JAVA_OPTIONS=\"-Dapplication.settingsdir=$STATE_HOME/ghidra_config -Dapplication.cachedir=$STATE_HOME/ghidra_cache -Dapplication.tempdir=$STATE_HOME/ghidra_tmp -Djava.io.tmpdir=$STATE_HOME/ghidra_tmp\"\n");
     s.push_str("if [ \"${GHIDRA_HEADLESS_JAVA_OPTIONS+x}\" ]; then\n");
     s.push_str("  export GHIDRA_HEADLESS_JAVA_OPTIONS=\"$GHIDRA_HEADLESS_JAVA_OPTIONS $GHIDRA_LOCAL_JAVA_OPTIONS\"\n");
     s.push_str("else\n");
     s.push_str("  export GHIDRA_HEADLESS_JAVA_OPTIONS=\"$GHIDRA_LOCAL_JAVA_OPTIONS\"\n");
     s.push_str("fi\n");
-    s.push_str("mkdir -p \"$HERE/ghidra_project\" \"$HERE/export\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$HERE/ghidra_tmp\"\n");
+    s.push_str("mkdir -p \"$HERE/ghidra_project\" \"$HERE/export\" \"$STATE_HOME/ghidra_config\" \"$STATE_HOME/ghidra_cache\" \"$STATE_HOME/ghidra_tmp\"\n");
     for e in toc.embedded() {
         // `run_ghidra.sh` runs in tighten mode (production default), which does
         // not data-mark regions — `headless_args` ignores the slice. Pass an
@@ -1260,6 +1420,13 @@ fn write_run_script(
         // `run_report` under `--run` only when `mode=datamark` actually needs them.
         let mode = "tighten";
         let label = e.label();
+        let pal_plan = match runtime_task_states.get(&label) {
+            Some(RuntimeTaskState::Present(map)) => Some(PalScriptPlan {
+                manifest: &map.relative_path,
+                identity: &map.identity,
+            }),
+            _ => None,
+        };
         let export_dir = format!("$HERE/export/{label}");
         let completion = format!("$HERE/export/{label}.complete");
         let mut cleanup = format!("rm -f {}", shell_arg(&completion));
@@ -1275,7 +1442,7 @@ fn write_run_script(
             processor,
             e.load_addr,
             runtime_load_maps.get(&label).map(String::as_str),
-            None,
+            pal_plan,
             &[],
             mode,
         );
@@ -1297,9 +1464,11 @@ fn write_run_script(
             ));
         }
         // The exact three-line v3 marker, constructed from the same current
-        // generation state (a PAL-none single-pass kit) the script compares
-        // against — no map-v1/marker-v1 compatibility branch remains.
-        let marker = export_completion_marker("none", "none");
+        // generation state (this image's PAL identity, or `none` when the
+        // generation loop measured no present map) the script compares
+        // against.
+        let pal_identity = pal_plan.map(|plan| plan.identity).unwrap_or("none");
+        let marker = export_completion_marker(pal_identity, "none");
         let marker_lines: Vec<String> = String::from_utf8(marker)
             .expect("the completion marker is ASCII")
             .lines()
@@ -1331,40 +1500,122 @@ fn write_run_script(
     Ok(())
 }
 
-struct RuntimeLoadMaps {
-    paths: HashMap<String, String>,
-    states: HashMap<String, RuntimeScatterState>,
+/// The generation loop's per-image runtime analysis products: scatter
+/// paths/states plus the explicit PAL task states. Every entry is
+/// measured by this run — currentness is never inferred from artifact
+/// existence on disk.
+struct RuntimeAnalysis {
+    scatter_paths: HashMap<String, String>,
+    scatter_states: HashMap<String, RuntimeScatterState>,
+    tasks: HashMap<String, RuntimeTaskState>,
 }
 
-fn materialize_runtime_load_maps(toc: &Toc, data: &[u8], out: &Path) -> Result<RuntimeLoadMaps> {
-    let mut paths = HashMap::new();
-    let mut states = HashMap::new();
+fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<RuntimeAnalysis> {
+    generate_runtime_analysis_with(
+        toc,
+        data,
+        out,
+        |image, base| scatter::discover(image, base).map_err(|error| error.to_string()),
+        pal_tasks::discover,
+    )
+}
+
+/// One MAIN loop: discover scatter once, publish or clear the owned
+/// scatter artifact, build the `RuntimeImage` over that single result,
+/// then run PAL discovery and publish or clear the owned task manifest.
+/// Publication is atomic replacement; the owned artifact is cleared only
+/// after a successful no-candidate result. A failed discovery or
+/// publication never pre-clears — older complete physical bytes may
+/// remain on disk, but the propagated error returns no consumable
+/// current state. Discovery seams are injected so tests can pin the
+/// one-scatter-discovery contract.
+#[allow(clippy::type_complexity)]
+fn generate_runtime_analysis_with(
+    toc: &Toc,
+    data: &[u8],
+    out: &Path,
+    mut discover_scatter: impl FnMut(
+        &[u8],
+        u32,
+    ) -> std::result::Result<Option<scatter::LoadPlan>, String>,
+    mut discover_tasks: impl FnMut(
+        &RuntimeImage<'_>,
+        &str,
+    ) -> std::result::Result<
+        Option<pal_tasks::TaskPlan>,
+        pal_tasks::PalTaskError,
+    >,
+) -> Result<RuntimeAnalysis> {
+    let mut scatter_paths = HashMap::new();
+    let mut scatter_states = HashMap::new();
+    let mut tasks = HashMap::new();
     for entry in toc
         .embedded()
         .into_iter()
         .filter(|entry| entry.name == "MAIN")
     {
         let label = entry.label();
-        scatter::clear_materialized(out, &label)?;
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
         let image = &data[start..end];
-        let plan = scatter::discover(image, entry.load_addr)
-            .map_err(|error| Error::BadScatter(error.to_string()))?;
-        let Some(plan) = plan else {
-            tracing::info!("scatter: {label} has no load-map candidate; keeping raw mapping");
-            states.insert(label, RuntimeScatterState::Absent);
-            continue;
+        let scatter_plan = discover_scatter(image, entry.load_addr).map_err(Error::BadScatter)?;
+        let scatter_map = match scatter_plan {
+            Some(plan) => {
+                let materialized = scatter::materialize(&plan, image, &label, out)?;
+                tracing::info!(
+                    "scatter: {label} runtime load map -> {}",
+                    materialized.relative_path
+                );
+                scatter_states.insert(label.clone(), RuntimeScatterState::Present);
+                scatter_paths.insert(label.clone(), materialized.relative_path.clone());
+                Some(materialized)
+            }
+            None => {
+                scatter::clear_materialized(out, &label)?;
+                tracing::info!("scatter: {label} has no load-map candidate; keeping raw mapping");
+                scatter_states.insert(label.clone(), RuntimeScatterState::Absent);
+                None
+            }
         };
-        let materialized = scatter::materialize(&plan, image, &label, out)?;
-        tracing::info!(
-            "scatter: {label} runtime load map -> {}",
-            materialized.relative_path
-        );
-        states.insert(label.clone(), RuntimeScatterState::Present);
-        paths.insert(label, materialized.relative_path);
+        let runtime = RuntimeImage::from_artifact(
+            image,
+            entry.load_addr,
+            out,
+            scatter_map
+                .as_ref()
+                .map(|map| out.join(&map.relative_path))
+                .as_deref(),
+        )?;
+        let context = TaskArtifactContext {
+            label: &label,
+            image_blake3: *blake3::hash(image).as_bytes(),
+            scatter_load_map_blake3: scatter_map
+                .as_ref()
+                .map(|map| parse_blake3(&map.blake3))
+                .transpose()?,
+        };
+        match discover_tasks(&runtime, &label)? {
+            Some(plan) => {
+                let materialized = pal_tasks::materialize(&plan, context, out)?;
+                tracing::info!(
+                    "pal: {label} task map -> {} ({})",
+                    materialized.relative_path,
+                    materialized.identity
+                );
+                tasks.insert(label, RuntimeTaskState::Present(materialized));
+            }
+            None => {
+                pal_tasks::clear_materialized(out, &label)?;
+                tracing::info!("pal: {label} has no task-table candidate; keeping raw analysis");
+                tasks.insert(label, RuntimeTaskState::Absent);
+            }
+        }
     }
-    Ok(RuntimeLoadMaps { paths, states })
+    Ok(RuntimeAnalysis {
+        scatter_paths,
+        scatter_states,
+        tasks,
+    })
 }
 
 /// Build the Ghidra import kit (always) and, with `--run`, drive `analyzeHeadless` per
@@ -1463,7 +1714,7 @@ fn run_report_impl(
     // 1. per-image slices -> out/images/NN_NAME (validates ranges; CRC advisory only)
     toc.split_to_dir(&data, &out.join("images"), false)?;
 
-    let runtime_load_maps = materialize_runtime_load_maps(&toc, &data, out)?;
+    let runtime_analysis = generate_runtime_analysis(&toc, &data, out)?;
 
     // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,ApplyPalTasks,
     //    PalTasksSupport,TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,
@@ -1498,7 +1749,11 @@ fn run_report_impl(
         .unwrap_or("modem.bin");
     let mut spec = build_load_spec(&toc, &data, source_name, &opts.processor)?;
     for image in &mut spec.images {
-        image.runtime_load_map = runtime_load_maps.paths.get(&image.name).cloned();
+        image.runtime_load_map = runtime_analysis.scatter_paths.get(&image.name).cloned();
+        image.pal_task_map = match runtime_analysis.tasks.get(&image.name) {
+            Some(RuntimeTaskState::Present(map)) => Some(map.relative_path.clone()),
+            _ => None,
+        };
     }
     let spec_path = out.join("ghidra_load.json");
     std::fs::write(
@@ -1507,7 +1762,13 @@ fn run_report_impl(
     )?;
 
     // 4. turnkey shell script -> out/run_ghidra.sh
-    write_run_script(out, &toc, &opts.processor, &runtime_load_maps.paths)?;
+    write_run_script(
+        out,
+        &toc,
+        &opts.processor,
+        &runtime_analysis.scatter_paths,
+        &runtime_analysis.tasks,
+    )?;
 
     // 5. optional: drive Ghidra headless and the configured dense-Thumb analyzers per image
     let mut image_results: Vec<ImageResult> = Vec::new();
@@ -1520,9 +1781,10 @@ fn run_report_impl(
         // the spawned invocation is cwd-independent (the generated run_ghidra.sh uses $HERE).
         let root = std::fs::canonicalize(out)?;
         std::fs::create_dir_all(root.join("ghidra_project"))?;
-        std::fs::create_dir_all(ghidra_config_home(&root))?;
-        std::fs::create_dir_all(ghidra_cache_home(&root))?;
-        std::fs::create_dir_all(ghidra_temp_home(&root))?;
+        // One RAII Java/XDG state home for the whole run: unique,
+        // space-free, and removed when the run ends.
+        let state_home = GhidraStateHome::new()?;
+        state_home.create_subdirs()?;
         let root_str = root.to_string_lossy().into_owned();
         let want = opts.image.as_deref();
         // Analyze every selected image, recording each outcome rather than aborting on the
@@ -1549,6 +1811,9 @@ fn run_report_impl(
             // definitively zero so downstream stages don't enqueue
             // work against an empty decompiled.c.
             thumb_decompiled: Option<usize>,
+            /// The current-run `ApplyPalTasks` summary when a present PAL
+            /// map was applied by this run's import.
+            pal_applied: Option<AppliedPalTasks>,
         }
         let mut results: Vec<RunResult> = Vec::new();
         for e in toc.embedded() {
@@ -1589,6 +1854,7 @@ fn run_report_impl(
                         terminal_error: None,
                         tighten_error: None,
                         thumb_decompiled: None,
+                        pal_applied: None,
                     });
                     continue;
                 }
@@ -1623,6 +1889,7 @@ fn run_report_impl(
                     terminal_error: None,
                     tighten_error: None,
                     thumb_decompiled: None,
+                    pal_applied: None,
                 });
                 continue;
             }
@@ -1640,13 +1907,26 @@ fn run_report_impl(
                     regions.len()
                 );
             }
+            let pal_plan = match runtime_analysis.tasks.get(&label) {
+                Some(RuntimeTaskState::Present(map)) => Some(PalScriptPlan {
+                    manifest: &map.relative_path,
+                    identity: &map.identity,
+                }),
+                _ => None,
+            };
+            let pal_identity = pal_plan
+                .map(|plan| plan.identity.to_string())
+                .unwrap_or_else(|| "none".to_string());
             let args = headless_args(
                 &root_str,
                 &label,
                 &opts.processor,
                 e.load_addr,
-                runtime_load_maps.paths.get(&label).map(String::as_str),
-                None,
+                runtime_analysis
+                    .scatter_paths
+                    .get(&label)
+                    .map(String::as_str),
+                pal_plan,
                 &regions,
                 mode,
             );
@@ -1654,16 +1934,18 @@ fn run_report_impl(
             // count `ClearFlowAndRepairCmd` log lines and kill the runaway
             // overlap-repair loop before it sinks the whole run. On kill we
             // fall back to `datamark` (Phase-1 behavior). In datamark mode
-            // there is no watch — the spawn blocks until completion as before.
+            // there is no watch — stdout is still captured so the strict
+            // `ApplyPalTasks` summary of this run can be parsed.
             let mut tighten_error: Option<String> = None;
             // When the tighten-watch kills the run, we re-spawn as datamark
             // and there is no `thumb_enrich` to run later; mark the count
             // definitively zero so downstream stages don't enqueue
             // work against an empty decompiled.c.
             let mut thumb_decompiled_override: Option<usize> = None;
+            let mut captured_stdout = String::new();
             let status: Option<std::process::ExitStatus> = if mode == "tighten" {
                 let mut cmd =
-                    headless_command(&install.headless, &args, &root, java_home.as_deref());
+                    headless_command(&install.headless, &args, &state_home, java_home.as_deref());
                 cmd.stdout(std::process::Stdio::piped());
                 // Spawn `analyzeHeadless` in its own process group so the
                 // Surface B watch can kill the whole tree (bash launcher +
@@ -1714,6 +1996,8 @@ fn run_report_impl(
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_millis(500)) {
                         Ok(Ok(line)) => {
+                            captured_stdout.push_str(&line);
+                            captured_stdout.push('\n');
                             // Match case-insensitively on the symbols Ghidra emits
                             // while looping on overlapping-function repair. The
                             // exact log shape is an implementation detail, so the
@@ -1776,21 +2060,21 @@ fn run_report_impl(
                             &label,
                             &opts.processor,
                             e.load_addr,
-                            runtime_load_maps.paths.get(&label).map(String::as_str),
-                            None,
+                            runtime_analysis
+                                .scatter_paths
+                                .get(&label)
+                                .map(String::as_str),
+                            pal_plan,
                             &regions,
                             "datamark",
                         );
-                        let retry_status = match export_attempt.invalidate() {
-                            Ok(()) => Some(
-                                headless_command(
-                                    &install.headless,
-                                    &datamark_args,
-                                    &root,
-                                    java_home.as_deref(),
-                                )
-                                .status()?,
-                            ),
+                        let retry_run = match export_attempt.invalidate() {
+                            Ok(()) => Some(headless_stdout_status(headless_command(
+                                &install.headless,
+                                &datamark_args,
+                                &state_home,
+                                java_home.as_deref(),
+                            ))?),
                             Err(error) => {
                                 tracing::warn!(
                                     "ghidra: {label} failed to invalidate tighten output before datamark retry: {error}"
@@ -1798,7 +2082,7 @@ fn run_report_impl(
                                 None
                             }
                         };
-                        if let Some(retry_status) = &retry_status {
+                        if let Some((retry_status, _)) = &retry_run {
                             if retry_status.success() {
                                 tracing::info!(
                                     "ghidra: {label} datamark retry succeeded after tighten kill"
@@ -1810,25 +2094,58 @@ fn run_report_impl(
                                 );
                             }
                         }
-                        retry_status
+                        match retry_run {
+                            Some((status, stdout)) => {
+                                captured_stdout = stdout;
+                                Some(status)
+                            }
+                            None => None,
+                        }
                     }
                     None => Some(child.wait()?),
                 }
             } else {
-                Some(
-                    headless_command(&install.headless, &args, &root, java_home.as_deref())
-                        .status()?,
-                )
+                let (status, stdout) = headless_stdout_status(headless_command(
+                    &install.headless,
+                    &args,
+                    &state_home,
+                    java_home.as_deref(),
+                ))?;
+                captured_stdout = stdout;
+                Some(status)
             };
+            let mut pal_applied: Option<AppliedPalTasks> = None;
+            let mut terminal_error = None;
             let mut outcome = match status.as_ref() {
                 Some(status) if status.success() => {
-                    match export_attempt.validate_current("none", "none") {
-                        Ok(()) => {
+                    // The export must be exactly this run's: the v3 marker
+                    // binds the PAL identity this run scheduled, and a
+                    // present PAL map must produce exactly one well-formed
+                    // `ApplyPalTasks` summary carrying the same identity.
+                    // Anything else is terminal-invalid, never a Ghidra
+                    // process failure.
+                    let validated = export_attempt
+                        .validate_current(&pal_identity, "none")
+                        .and_then(|()| match &pal_plan {
+                            Some(plan) => parse_apply_pal_tasks_summary(
+                                &captured_stdout,
+                                &label,
+                                plan.identity,
+                            )
+                            .map(Some),
+                            None => Ok(None),
+                        });
+                    match validated {
+                        Ok(summary) => {
+                            pal_applied = summary;
                             ImageOutcome::Analyzed(count_functions(&export_attempt.directory))
                         }
-                        Err(error) => {
-                            tracing::warn!("ghidra: {label} current export is incomplete: {error}");
-                            ImageOutcome::Failed(-1)
+                        Err(reason) => {
+                            tracing::warn!(
+                                "ghidra: {label} current export is not this run's: {reason}"
+                            );
+                            terminal_error = Some(reason);
+                            ImageOutcome::TerminalInvalid
                         }
                     }
                 }
@@ -1883,7 +2200,6 @@ fn run_report_impl(
                 (None, Some(err))
             };
             let thumb_functions = thumb_summary.as_ref().map(|summary| summary.substantial);
-            let mut terminal_error = None;
             let terminal_inventory = if matches!(outcome, ImageOutcome::Analyzed(_)) {
                 let export = root.join("export").join(&label);
                 // `root` is already canonical; re-canonicalizing here (with a
@@ -1893,8 +2209,8 @@ fn run_report_impl(
                     img,
                     e.load_addr,
                     &root,
-                    runtime_load_maps
-                        .paths
+                    runtime_analysis
+                        .scatter_paths
                         .get(&label)
                         .map(|path| root.join(path))
                         .as_deref(),
@@ -1974,6 +2290,7 @@ fn run_report_impl(
                 terminal_error,
                 tighten_error,
                 thumb_decompiled: thumb_decompiled_override,
+                pal_applied,
             });
         }
         if results.is_empty() {
@@ -2079,6 +2396,7 @@ fn run_report_impl(
                     global_types_apply_error: None,
                     globals_provisional: None,
                     globals_provisional_suppressed: None,
+                    pal_applied: r.pal_applied,
                 }
             })
             .collect();
@@ -2098,7 +2416,8 @@ fn run_report_impl(
         images: image_results,
         spec_path,
         current_exports,
-        runtime_scatter: runtime_load_maps.states,
+        runtime_scatter: runtime_analysis.scatter_states,
+        runtime_tasks: runtime_analysis.tasks,
     })
 }
 
@@ -2355,9 +2674,9 @@ pub struct Pass2Input {
     pub function_map: Option<PreparedSymbolPass2Map>,
     pub global_map: Option<PreparedPass2Map>,
     pub global_types_map: Option<PreparedPass2Map>,
-    /// The PAL identity the scripts must agree on (`none` for every current
-    /// production run) plus the canonical task/scatter manifest paths when a
-    /// PAL state is present.
+    /// The PAL identity the pass-2 scripts must agree on (`none` when the
+    /// orchestrator drives no PAL state) plus the canonical task/scatter
+    /// manifest paths when a PAL state is present.
     pub pal_identity: String,
     pub pal_manifest: Option<PathBuf>,
     pub scatter_manifest: Option<PathBuf>,
@@ -2506,6 +2825,76 @@ fn parse_pass2_summary(stdout: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Parse the strict `ApplyPalTasks: {json}` current-run summary of one
+/// successful PAL application: exactly one line, a JSON object whose
+/// image, `ok` status, and identity match this run's scheduled map, and
+/// the seven current-run counters. A missing, duplicate, or malformed
+/// summary is the typed reason string — the caller rejects the image as
+/// terminal-invalid.
+fn parse_apply_pal_tasks_summary(
+    stdout: &str,
+    expected_image: &str,
+    expected_identity: &str,
+) -> std::result::Result<AppliedPalTasks, String> {
+    let mut payloads = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyPalTasks: "));
+    let payload = payloads
+        .next()
+        .ok_or_else(|| "missing ApplyPalTasks summary".to_string())?;
+    if payloads.next().is_some() {
+        return Err("duplicate ApplyPalTasks summaries".to_string());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| format!("malformed ApplyPalTasks summary: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "ApplyPalTasks summary is not an object".to_string())?;
+    let image = object
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyPalTasks summary image is not a string".to_string())?;
+    if image != expected_image {
+        return Err(format!(
+            "ApplyPalTasks summary image {image:?} does not match {expected_image:?}"
+        ));
+    }
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyPalTasks summary status is not a string".to_string())?;
+    if status != "ok" {
+        return Err(format!(
+            "ApplyPalTasks summary status {status:?} is not \"ok\""
+        ));
+    }
+    let identity = object
+        .get("identity")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyPalTasks summary identity is not a string".to_string())?;
+    if identity != expected_identity {
+        return Err("ApplyPalTasks summary identity does not match this run's PAL map".to_string());
+    }
+    let count = |field: &str| -> std::result::Result<usize, String> {
+        let count = object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("ApplyPalTasks summary {field} is not an unsigned integer"))?;
+        usize::try_from(count)
+            .map_err(|_| format!("ApplyPalTasks summary {field} does not fit usize"))
+    };
+    Ok(AppliedPalTasks {
+        tasks: count("tasks")?,
+        entries: count("entries")?,
+        functions_created: count("functions_created")?,
+        functions_existing: count("functions_existing")?,
+        names_applied: count("names_applied")?,
+        names_preserved: count("names_preserved")?,
+        shared_entries: count("shared_entries")?,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2784,6 +3173,9 @@ pub fn run_two_pass(
     let java_home = resolve_java_home(std::env::var_os("JAVA_HOME"), install.ghidra_run.as_deref());
     let root = std::fs::canonicalize(out)?;
     let root_str = root.to_string_lossy().into_owned();
+    // One RAII Java/XDG state home for the whole pass-2 run.
+    let state_home = GhidraStateHome::new()?;
+    state_home.create_subdirs()?;
 
     for (label, input) in inputs {
         if (input.function_map.is_some() || input.global_map.is_some())
@@ -2842,19 +3234,20 @@ pub fn run_two_pass(
         // Spawn failure (e.g. executable bit lost, Ghidra uninstalled mid-run)
         // lands in `pass2_error` per image instead of propagating — pass 1
         // already produced a valid `decompiled.c` for every image.
-        let output = match headless_command(&install.headless, &args, &root, java_home.as_deref())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                let reason = format!("spawn: {e}");
-                ir.pass2_error = Some(reason.clone());
-                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
-                continue;
-            }
-        };
+        let output =
+            match headless_command(&install.headless, &args, &state_home, java_home.as_deref())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    let reason = format!("spawn: {e}");
+                    ir.pass2_error = Some(reason.clone());
+                    outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                    continue;
+                }
+            };
         if output.status.success() {
             let symbol_map_hash = input
                 .function_map
@@ -3673,6 +4066,331 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------
+    // Runtime PAL discovery fixtures (Task 12): discoverable MAIN images
+    // built from the shared PAL fixture machinery. The initializer shape,
+    // slot-table layout, and image builder mirror the pal_tasks table
+    // fixtures — the only producers of a complete, discoverable plan.
+    // -------------------------------------------------------------------
+
+    use crate::pal_tasks::test_support::{
+        BASE as PAL_BASE, FixtureItem, adr_to, assemble, branch_to, branch32_to, cbz_to, enc, gpr,
+        insn, low, word_at,
+    };
+    use scaleservers_arm32_assembly::{Arm32Condition, ArmT32Instruction as T32};
+
+    const PAL_STRIDE: u32 = 0x1f8;
+    const PAL_NAME_OFFSET: u32 = 0x4c;
+    const PAL_SLOT_TABLE_OFF: u32 = 0x4000;
+    const PAL_EXTENDED_CAPACITY: u32 = 8;
+
+    /// Growable MAIN image under construction: bytes above `PAL_BASE`
+    /// grown on demand, written at absolute addresses.
+    struct PalImageBuilder {
+        bytes: Vec<u8>,
+    }
+
+    impl PalImageBuilder {
+        fn new() -> Self {
+            PalImageBuilder { bytes: Vec::new() }
+        }
+
+        fn ensure(&mut self, end: u32) {
+            let end = usize::try_from(end - PAL_BASE).expect("fixture extent fits the host");
+            if self.bytes.len() < end {
+                self.bytes.resize(end, 0);
+            }
+        }
+
+        fn write(&mut self, address: u32, data: &[u8]) {
+            self.ensure(
+                address
+                    .checked_add(u32::try_from(data.len()).unwrap())
+                    .unwrap(),
+            );
+            let offset = usize::try_from(address - PAL_BASE).unwrap();
+            self.bytes[offset..offset + data.len()].copy_from_slice(data);
+        }
+
+        fn write_u32(&mut self, address: u32, value: u32) {
+            self.write(address, &value.to_le_bytes());
+        }
+    }
+
+    /// The canonical discoverable initializer shape with a parameterized
+    /// slot base and capacity: slot r4, count r5, name r0, guard shift 3.
+    fn pal_initializer_items(slot_base: u32, capacity: u32) -> Vec<FixtureItem> {
+        let guard_value = capacity / 8 - 1;
+        vec![
+            insn("init", |_, _| T32::Push_T1(vec![gpr(4), gpr(14)])),
+            insn("ref", |pc, l| T32::Adr_T1(low(1), adr_to(l, "anchor", pc))),
+            insn("zero", |_, _| T32::Mov_Immediate_T1(low(5), 0)),
+            insn("slotlo", move |_, _| {
+                T32::Mov_Immediate_T3(gpr(4), u16::try_from(slot_base & 0xffff).unwrap())
+            }),
+            insn("slothi", move |_, _| {
+                T32::Movt_T1(gpr(4), u16::try_from(slot_base >> 16).unwrap())
+            }),
+            insn("call", |pc, l| T32::Bl_T1(branch32_to(l, "leaf", pc))),
+            insn("load", |_, _| T32::Ldr_Immediate_T1(low(0), low(4), 0x4c)),
+            insn("lcbz", |pc, l| T32::Cbz_T1(low(0), cbz_to(l, "term", pc))),
+            insn("lstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
+            insn("ladd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
+            insn("lstride", |_, _| {
+                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
+            }),
+            insn("lcmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
+            insn("lbne", |pc, l| {
+                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "load", pc))
+            }),
+            insn("cap", |_, l| {
+                T32::Mov_Immediate_T3(
+                    gpr(0),
+                    u16::try_from(word_at(l, "globals") & 0xffff).unwrap(),
+                )
+            }),
+            insn("", |_, l| {
+                T32::Movt_T1(gpr(0), u16::try_from(word_at(l, "globals") >> 16).unwrap())
+            }),
+            insn("cval", move |_, _| {
+                T32::Mov_Immediate_T3(gpr(1), u16::try_from(capacity).unwrap())
+            }),
+            insn("cstr", |_, _| T32::Str_Immediate_T1(low(1), low(0), 0)),
+            insn("cjmp", |pc, l| T32::B_T2(branch_to(l, "join", pc))),
+            insn("term", |pc, l| {
+                T32::Adr_T1(low(0), adr_to(l, "globals", pc))
+            }),
+            insn("tstr", |_, _| T32::Str_Immediate_T1(low(5), low(0), 0)),
+            insn("glsr", |_, _| T32::Lsr_Immediate_T1(low(0), low(5), 3)),
+            insn("gcmp", move |_, _| {
+                T32::Cmp_Immediate_T1(low(0), u8::try_from(guard_value).unwrap())
+            }),
+            insn("gbhi", |pc, l| {
+                T32::B_T1(Arm32Condition::UnsignedHigher, branch_to(l, "join", pc))
+            }),
+            insn("sstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
+            insn("sadd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
+            insn("sslot", |_, _| {
+                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
+            }),
+            insn("smov", |_, _| T32::Mov_Register_T1(gpr(6), gpr(0))),
+            insn("snop", |_, _| T32::Nop_T1),
+            insn("scmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
+            insn("sbne", |pc, l| {
+                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "sstr", pc))
+            }),
+            insn("join", |_, _| T32::Bx_T1(gpr(14))),
+            FixtureItem::Align(4),
+            FixtureItem::Anchor("anchor"),
+            FixtureItem::Align(2),
+            insn("leaf", |_, _| T32::Mov_Immediate_T3(gpr(0), 0x1234)),
+            insn("leaf2", |_, _| T32::Movt_T1(gpr(0), 0)),
+            insn("leafret", |_, _| T32::Bx_T1(gpr(14))),
+            FixtureItem::Align(4),
+            FixtureItem::Data("globals", 8),
+        ]
+    }
+
+    /// One nonterminal slot's desired content; `None` pointers let the
+    /// builder assign default addresses (a written name string and a
+    /// distinct Thumb `push` entry).
+    struct PalSlotSpec {
+        name: &'static str,
+        entry_pointer: Option<u32>,
+        priority: u32,
+        stack_size: u32,
+        opaque: u8,
+    }
+
+    fn pal_slot(name: &'static str) -> PalSlotSpec {
+        PalSlotSpec {
+            name,
+            entry_pointer: None,
+            priority: 0x64,
+            stack_size: 0x200,
+            opaque: 0x5a,
+        }
+    }
+
+    /// Write the descriptor-v1 slots and terminal plus their name strings
+    /// and default Thumb `push {r4, lr}` entries.
+    fn write_pal_table(image: &mut PalImageBuilder, slot_base: u32, slots: &[PalSlotSpec]) {
+        let slot_count = u32::try_from(slots.len()).expect("fixture slot count fits u32") + 1;
+        let table_end = slot_base + slot_count * PAL_STRIDE;
+        image.ensure(table_end);
+        let mut cursor = table_end + 0x40;
+        let mut name_addresses = Vec::with_capacity(slots.len());
+        for spec in slots {
+            image.write(cursor, spec.name.as_bytes());
+            image.write(cursor + u32::try_from(spec.name.len()).unwrap(), &[0]);
+            name_addresses.push(cursor);
+            cursor += u32::try_from(spec.name.len()).unwrap() + 1;
+        }
+        cursor = cursor.div_ceil(4) * 4;
+        let entries_base = cursor;
+        // Each entry is a self-contained Thumb function (`push {r4, lr}`;
+        // `bx lr`) at 8-byte spacing, so Ghidra's flow disassembly from one
+        // entry never crosses into the next.
+        let push = enc(&T32::Push_T1(vec![gpr(4), gpr(14)]));
+        let bx_lr = enc(&T32::Bx_T1(gpr(14)));
+        let mut entry_addresses = Vec::with_capacity(slots.len());
+        for index in 0..slots.len() {
+            let address = entries_base + u32::try_from(index).unwrap() * 8;
+            image.write(address, &push);
+            image.write(address + u32::try_from(push.len()).unwrap(), &bx_lr);
+            entry_addresses.push(address);
+        }
+        image.ensure(entries_base + u32::try_from(slots.len()).unwrap() * 8 + 8);
+        for (index, spec) in slots.iter().enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let slot_address = slot_base + index * PAL_STRIDE;
+            for offset in 0..PAL_STRIDE {
+                let byte = spec.opaque.wrapping_add((offset as u8) ^ (index as u8));
+                image.write(slot_address + offset, &[byte]);
+            }
+            image.write_u32(
+                slot_address + PAL_NAME_OFFSET,
+                name_addresses[usize::try_from(index).unwrap()],
+            );
+            image.write_u32(slot_address + PAL_NAME_OFFSET + 4, spec.priority);
+            image.write_u32(slot_address + PAL_NAME_OFFSET + 8, spec.stack_size);
+            image.write_u32(
+                slot_address + PAL_NAME_OFFSET + 12,
+                spec.entry_pointer
+                    .unwrap_or(entry_addresses[usize::try_from(index).unwrap()] | 1),
+            );
+            image.write_u32(slot_address + PAL_NAME_OFFSET + 16, 0);
+            image.write_u32(slot_address + PAL_NAME_OFFSET + 20, 0);
+        }
+        let terminal = slot_base + slot_count.saturating_sub(1) * PAL_STRIDE;
+        for offset in 0..PAL_STRIDE {
+            let byte = 0x33u8.wrapping_add(offset as u8);
+            image.write(terminal + offset, &[byte]);
+        }
+        for field in [
+            PAL_NAME_OFFSET,
+            PAL_NAME_OFFSET + 4,
+            PAL_NAME_OFFSET + 8,
+            PAL_NAME_OFFSET + 12,
+            PAL_NAME_OFFSET + 16,
+            PAL_NAME_OFFSET + 20,
+        ] {
+            image.write_u32(terminal + field, 0);
+        }
+    }
+
+    /// A MAIN image whose PAL initializer and two-slot table are
+    /// discoverable end to end (no scatter loader: PAL over a raw-only
+    /// runtime view).
+    fn craft_discoverable_pal_main_image() -> Vec<u8> {
+        let mut image = PalImageBuilder::new();
+        let (code_bytes, _) = assemble(
+            PAL_BASE,
+            &pal_initializer_items(PAL_BASE + PAL_SLOT_TABLE_OFF, PAL_EXTENDED_CAPACITY),
+        );
+        image.write(PAL_BASE, &code_bytes);
+        write_pal_table(
+            &mut image,
+            PAL_BASE + PAL_SLOT_TABLE_OFF,
+            &[pal_slot("first_task"), pal_slot("second_task")],
+        );
+        image.bytes
+    }
+
+    /// A MAIN image carrying BOTH a discoverable scatter loader/table and
+    /// the discoverable PAL initializer/table: the scatter loader block is
+    /// the scatter-kit fixture shape re-based to `PAL_BASE`, with copy
+    /// destinations just past the image end so no scatter destination
+    /// overlaps the raw span.
+    fn craft_scatter_pal_main_image() -> Vec<u8> {
+        const IMAGE_LEN: usize = 0x4700;
+        const LOADER_OFFSET: usize = 0x40;
+        const LITERAL_OFFSET: usize = 0x80;
+        const TABLE_OFFSET: usize = 0x200;
+        const TABLE_LEN: u32 = 6 * 16;
+        let null_handler = PAL_BASE + 0x600;
+        let copy_handler = PAL_BASE + 0x601;
+        let decompress1_handler = PAL_BASE + 0x604;
+        let zero_handler = PAL_BASE + 0x609;
+        let sentinel_source = PAL_BASE + 0x680;
+        let self_copy_source = PAL_BASE + 0x700;
+        let copy_source = PAL_BASE + 0x710;
+        let decompress1_source = PAL_BASE + 0x720;
+        let zero_source = PAL_BASE + 0x730;
+        let copy_destination = PAL_BASE + 0x5000;
+        let decompress1_destination = PAL_BASE + 0x5010;
+        let zero_destination = PAL_BASE + 0x5020;
+
+        let mut image = PalImageBuilder::new();
+        image.ensure(PAL_BASE + IMAGE_LEN as u32);
+        // add r0, pc, #0x38; ldmia r0, {r10,r11}; add r10/r11, r0.
+        image.write_u32(PAL_BASE + LOADER_OFFSET as u32, 0xe28f_0038);
+        image.write_u32(PAL_BASE + LOADER_OFFSET as u32 + 4, 0xe890_0c00);
+        image.write_u32(PAL_BASE + LOADER_OFFSET as u32 + 8, 0xe08a_a000);
+        image.write_u32(PAL_BASE + LOADER_OFFSET as u32 + 12, 0xe08b_b000);
+        let literal_address = PAL_BASE + LITERAL_OFFSET as u32;
+        let table_address = PAL_BASE + TABLE_OFFSET as u32;
+        image.write_u32(literal_address, table_address.wrapping_sub(literal_address));
+        image.write_u32(
+            literal_address + 4,
+            (table_address + TABLE_LEN).wrapping_sub(literal_address),
+        );
+        image.write(PAL_BASE + 0x700, &[0xff, 0xff, 0xff, 0xff]);
+        image.write(PAL_BASE + 0x710, &[0x11, 0x22, 0x33, 0x44]);
+        image.write(PAL_BASE + 0x720, &[0x22, 0xaa]);
+        for (index, source, destination, size, handler) in [
+            (0u32, sentinel_source, 0u32, 0u32, null_handler),
+            (1, 0, sentinel_source, 0, null_handler),
+            (2, self_copy_source, self_copy_source, 4, copy_handler),
+            (3, copy_source, copy_destination, 4, copy_handler),
+            (
+                4,
+                decompress1_source,
+                decompress1_destination,
+                3,
+                decompress1_handler,
+            ),
+            (5, zero_source, zero_destination, 5, zero_handler),
+        ] {
+            let offset = TABLE_OFFSET + index as usize * 16;
+            image.write_u32(PAL_BASE + offset as u32, source);
+            image.write_u32(PAL_BASE + offset as u32 + 4, destination);
+            image.write_u32(PAL_BASE + offset as u32 + 8, size);
+            image.write_u32(PAL_BASE + offset as u32 + 12, handler);
+        }
+
+        let (code_bytes, _) = assemble(
+            PAL_BASE + 0x800,
+            &pal_initializer_items(PAL_BASE + PAL_SLOT_TABLE_OFF, PAL_EXTENDED_CAPACITY),
+        );
+        image.write(PAL_BASE + 0x800, &code_bytes);
+        write_pal_table(
+            &mut image,
+            PAL_BASE + PAL_SLOT_TABLE_OFF,
+            &[pal_slot("first_task"), pal_slot("second_task")],
+        );
+        image.bytes
+    }
+
+    /// A MAIN image with two complete initializer/table pairs: discovery
+    /// is the typed ambiguity error, never a silently chosen plan.
+    fn craft_ambiguous_pal_main_image() -> Vec<u8> {
+        let mut image = PalImageBuilder::new();
+        let (first, _) = assemble(
+            PAL_BASE,
+            &pal_initializer_items(PAL_BASE + PAL_SLOT_TABLE_OFF, PAL_EXTENDED_CAPACITY),
+        );
+        let (second, _) = assemble(
+            PAL_BASE + 0x200,
+            &pal_initializer_items(PAL_BASE + 0x8000, PAL_EXTENDED_CAPACITY),
+        );
+        image.write(PAL_BASE, &first);
+        image.write(PAL_BASE + 0x200, &second);
+        write_pal_table(&mut image, PAL_BASE + PAL_SLOT_TABLE_OFF, &[pal_slot("aa")]);
+        write_pal_table(&mut image, PAL_BASE + 0x8000, &[pal_slot("bb")]);
+        image.bytes
+    }
+
     fn test_identity(
         producer: crate::thumb_analysis::ThumbProducer,
         executable: &str,
@@ -3707,22 +4425,23 @@ set -eu
 export_dir=
 pal_identity=none
 map_hash=none
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "ExportDecomp.java" ]; then
-    shift
-    export_dir=$1
-    shift
-    shift
-    shift
-    pal_identity=$1
-    shift
-    shift
-    shift
-    shift
-    map_hash=$1
-    break
+state=0
+for arg in "$@"; do
+  if [ "$arg" = "ExportDecomp.java" ]; then
+    state=1
+    continue
   fi
-  shift
+  case "$state" in
+    1) export_dir=$arg; state=2 ;;
+    2) state=3 ;;
+    3) state=4 ;;
+    4) pal_identity=$arg; state=5 ;;
+    5) state=6 ;;
+    6) state=7 ;;
+    7) state=8 ;;
+    8) map_hash=$arg; state=0 ;;
+    *) : ;;
+  esac
 done
 test -n "$export_dir"
 mkdir -p "$export_dir"
@@ -3732,6 +4451,240 @@ printf '%s
 : > "$export_dir/decompiled.c"
 export_root=$(dirname "$export_dir")
 label=$(basename "$export_dir")
+printf '%s
+' 'pixel-modem-extractor-ghidra-export-v3' "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
+"#,
+        );
+    }
+
+    /// One full `--run` over a discoverable MAIN with a fake recording
+    /// headless: the in-process spawn argv equals `headless_args` over the
+    /// canonical kit root exactly, the generated script embeds the same
+    /// argv over `$HERE`, the two differ only in root expansion, and the
+    /// run consumes the strict `ApplyPalTasks` summary and identity-bound
+    /// v3 marker. Exercised under tighten (default), datamark
+    /// (`--no-thumb-decompile`), and a scatter+PAL MAIN.
+    #[cfg(unix)]
+    #[test]
+    fn pal_runtime_argv_is_identical_generated_and_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_recording_headless(&ghidra_home);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/tools/r2",
+                "radare2 argv fixture",
+            ),
+            rizin: None,
+        };
+
+        let run_once = |image_bytes: &[u8], scatter: bool, datamark: bool, case: &str| {
+            let buf = craft_modem_bin(&[("MAIN", PAL_BASE, 3, image_bytes)]);
+            let modem = dir.path().join(format!("modem-{case}.bin"));
+            std::fs::write(&modem, buf).unwrap();
+            let out = dir.path().join(format!("out-{case}"));
+            let mut opts = generation_opts(None);
+            opts.run = true;
+            opts.ghidra_home = Some(ghidra_home.clone());
+            opts.no_thumb_decompile = datamark;
+            let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools)
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+            let image = &report.images[0];
+            assert_eq!(image.label, "02_MAIN");
+            assert!(
+                matches!(image.outcome, ImageOutcome::Analyzed(_)),
+                "{case}: outcome was not Analyzed: {:?} (terminal_error={:?})",
+                image.outcome,
+                image.terminal_error
+            );
+            assert_eq!(
+                image.pal_applied,
+                Some(AppliedPalTasks {
+                    tasks: 2,
+                    entries: 2,
+                    functions_created: 2,
+                    functions_existing: 0,
+                    names_applied: 2,
+                    names_preserved: 0,
+                    shared_entries: 0,
+                }),
+                "{case}: the strict ApplyPalTasks summary must be parsed"
+            );
+
+            let root = std::fs::canonicalize(&out).unwrap();
+            let root_str = root.to_string_lossy().into_owned();
+            let mode = if datamark { "datamark" } else { "tighten" };
+            let RuntimeTaskState::Present(map) = report.runtime_analysis_state("02_MAIN").tasks
+            else {
+                panic!("{case}: the run must carry a present PAL map");
+            };
+            let scatter_arg = if scatter {
+                Some("scatter/02_MAIN/load_map.json")
+            } else {
+                None
+            };
+
+            // In-process: the recorded argv is exactly `headless_args` over
+            // the canonical kit root.
+            let expected = headless_args(
+                &root_str,
+                "02_MAIN",
+                "ARM:LE:32:v7",
+                PAL_BASE,
+                scatter_arg,
+                Some(PalScriptPlan {
+                    manifest: &map.relative_path,
+                    identity: &map.identity,
+                }),
+                &[],
+                mode,
+            );
+            let recorded: Vec<String> =
+                std::fs::read_to_string(root.join("export/02_MAIN/argv.txt"))
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+            assert_eq!(recorded, expected, "{case}: in-process argv");
+
+            // Generated script: for the production (tighten) route the
+            // script embeds the same argv over `$HERE` with the exact
+            // shell quoting; the datamark in-process spawn is compared
+            // against `headless_args` in its own mode (the generated
+            // script is always the tighten route).
+            let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+            let generated = headless_args(
+                "$HERE",
+                "02_MAIN",
+                "ARM:LE:32:v7",
+                PAL_BASE,
+                scatter_arg,
+                Some(PalScriptPlan {
+                    manifest: &map.relative_path,
+                    identity: &map.identity,
+                }),
+                &[],
+                mode,
+            );
+            if !datamark {
+                let mut quoted: Vec<String> = Vec::with_capacity(generated.len());
+                let mut processor_value = false;
+                for arg in &generated {
+                    if processor_value {
+                        quoted.push(shell_quote(arg));
+                    } else {
+                        quoted.push(shell_arg(arg));
+                    }
+                    processor_value = arg == "-processor";
+                }
+                let invocation = format!("if \"$HEADLESS\" {}", quoted.join(" "));
+                assert!(
+                    script.contains(&invocation),
+                    "{case}: run_ghidra.sh must embed the exact generated argv:\n{script}\nexpected {invocation}"
+                );
+            }
+            for (recorded_arg, generated_arg) in recorded.iter().zip(generated.iter()) {
+                let expanded = if generated_arg == "$HERE" {
+                    root_str.clone()
+                } else {
+                    generated_arg.replace("$HERE", &root_str)
+                };
+                assert_eq!(
+                    recorded_arg, &expanded,
+                    "{case}: argv must differ only in root expansion ({generated_arg})"
+                );
+            }
+            // The scatter argument of ApplyPalTasks mirrors scatter presence.
+            let pal_at = recorded
+                .iter()
+                .position(|arg| arg == "ApplyPalTasks.java")
+                .unwrap();
+            assert_eq!(
+                recorded[pal_at + 4],
+                if scatter {
+                    format!("{root_str}/scatter/02_MAIN/load_map.json")
+                } else {
+                    "-".to_string()
+                },
+                "{case}: ApplyPalTasks scatter argument"
+            );
+            // The mode dispatches as configured, after ApplyPalTasks.
+            let tame_at = recorded
+                .iter()
+                .position(|arg| arg == "TameAnalysis.java")
+                .unwrap();
+            assert!(
+                pal_at < tame_at,
+                "{case}: ApplyPalTasks precedes TameAnalysis"
+            );
+            assert_eq!(recorded[tame_at + 1], mode);
+            assert_eq!(recorded[tame_at + 2], map.identity);
+        };
+
+        run_once(
+            &craft_discoverable_pal_main_image(),
+            false,
+            false,
+            "pal_tighten",
+        );
+        run_once(
+            &craft_discoverable_pal_main_image(),
+            false,
+            true,
+            "pal_datamark",
+        );
+        run_once(&craft_scatter_pal_main_image(), true, false, "pal_scatter");
+    }
+
+    /// A fake `analyzeHeadless` that additionally records its full argv
+    /// (one argument per line, under the image's export directory) and
+    /// prints the strict `ApplyPalTasks` success summary with the
+    /// identity ExportDecomp was given — so the in-process route's exact
+    /// spawn argv, marker identity, and summary parsing are observable.
+    #[cfg(unix)]
+    fn write_recording_headless(home: &Path) {
+        let headless = home.join("support/analyzeHeadless");
+        write_executable(
+            &headless,
+            r#"#!/bin/sh
+set -eu
+export_dir=
+pal_identity=none
+map_hash=none
+applied=0
+state=0
+for arg in "$@"; do
+  [ "$arg" = "ApplyPalTasks.java" ] && applied=1
+  if [ "$arg" = "ExportDecomp.java" ]; then
+    state=1
+    continue
+  fi
+  case "$state" in
+    1) export_dir=$arg; state=2 ;;
+    2) state=3 ;;
+    3) state=4 ;;
+    4) pal_identity=$arg; state=5 ;;
+    5) state=6 ;;
+    6) state=7 ;;
+    7) state=8 ;;
+    8) map_hash=$arg; state=0 ;;
+    *) : ;;
+  esac
+done
+test -n "$export_dir"
+mkdir -p "$export_dir"
+printf '%s\n' "$@" > "$export_dir/argv.txt"
+printf '%s
+' '[]' > "$export_dir/functions.json"
+: > "$export_dir/disasm.lst"
+: > "$export_dir/decompiled.c"
+export_root=$(dirname "$export_dir")
+label=$(basename "$export_dir")
+if [ "$applied" = 1 ]; then
+  printf 'ApplyPalTasks: {"image":"%s","status":"ok","identity":"%s","tasks":2,"entries":2,"functions_created":2,"functions_existing":0,"names_applied":2,"names_preserved":0,"shared_entries":0}\n' "$label" "$pal_identity"
+fi
 printf '%s
 ' 'pixel-modem-extractor-ghidra-export-v3' "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
 "#,
@@ -4715,6 +5668,70 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(parse_pass2_summary(""), None);
     }
 
+    #[test]
+    fn parse_apply_pal_tasks_summary_is_strict() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0";
+        let ok = format!(
+            "ApplyPalTasks: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{identity}\",\"tasks\":2,\"entries\":2,\"functions_created\":2,\"functions_existing\":0,\"names_applied\":2,\"names_preserved\":0,\"shared_entries\":0}}"
+        );
+        assert_eq!(
+            parse_apply_pal_tasks_summary(&ok, "02_MAIN", identity).unwrap(),
+            AppliedPalTasks {
+                tasks: 2,
+                entries: 2,
+                functions_created: 2,
+                functions_existing: 0,
+                names_applied: 2,
+                names_preserved: 0,
+                shared_entries: 0,
+            }
+        );
+
+        // Missing, duplicate, malformed, wrong-image, wrong-identity, and
+        // non-ok summaries are each the typed rejection.
+        assert_eq!(
+            parse_apply_pal_tasks_summary("no summary here\n", "02_MAIN", identity).unwrap_err(),
+            "missing ApplyPalTasks summary"
+        );
+        assert!(
+            parse_apply_pal_tasks_summary(&format!("{ok}\n{ok}\n"), "02_MAIN", identity)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(
+            parse_apply_pal_tasks_summary("ApplyPalTasks: {not json}", "02_MAIN", identity)
+                .unwrap_err()
+                .contains("malformed")
+        );
+        assert!(
+            parse_apply_pal_tasks_summary(&ok, "00_BOOT", identity)
+                .unwrap_err()
+                .contains("does not match")
+        );
+        assert!(
+            parse_apply_pal_tasks_summary(&ok, "02_MAIN", "none")
+                .unwrap_err()
+                .contains("identity")
+        );
+        let error_status = format!(
+            "ApplyPalTasks: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"identity\":\"{identity}\",\"tasks\":0,\"entries\":0,\"functions_created\":0,\"functions_existing\":0,\"names_applied\":0,\"names_preserved\":0,\"shared_entries\":0}}"
+        );
+        assert!(
+            parse_apply_pal_tasks_summary(&error_status, "02_MAIN", identity)
+                .unwrap_err()
+                .contains("is not")
+        );
+        // A counter that is not an unsigned integer rejects the summary.
+        let bad_count = format!(
+            "ApplyPalTasks: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{identity}\",\"tasks\":\"two\",\"entries\":2,\"functions_created\":2,\"functions_existing\":0,\"names_applied\":2,\"names_preserved\":0,\"shared_entries\":0}}"
+        );
+        assert!(
+            parse_apply_pal_tasks_summary(&bad_count, "02_MAIN", identity)
+                .unwrap_err()
+                .contains("tasks")
+        );
+    }
+
     fn ok_globals_summary(
         candidates: usize,
         applied: usize,
@@ -4884,22 +5901,28 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
-    fn headless_command_uses_output_local_ghidra_config() {
-        let root = PathBuf::from("/tmp/pme-out");
+    fn headless_command_pins_unique_space_free_state_dirs() {
+        let state = GhidraStateHome::new().unwrap();
         let args = vec!["/tmp/pme-out/ghidra_project".to_string()];
         let cmd = headless_command(
             Path::new("/opt/ghidra/support/analyzeHeadless"),
             &args,
-            &root,
+            &state,
             None,
         );
 
+        let spelling = state.path.to_string_lossy();
+        assert!(
+            !spelling.bytes().any(|byte| byte == b' ' || byte == b'\t'),
+            "state home must be space-free: {spelling}"
+        );
+        assert!(state.path.is_dir());
         assert_eq!(
             cmd.get_envs()
                 .find(|(key, _)| *key == std::ffi::OsStr::new("XDG_CONFIG_HOME")),
             Some((
                 std::ffi::OsStr::new("XDG_CONFIG_HOME"),
-                Some(ghidra_config_home(&root).as_os_str())
+                Some(state.config_home().as_os_str())
             ))
         );
         assert_eq!(
@@ -4907,9 +5930,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .find(|(key, _)| *key == std::ffi::OsStr::new("XDG_CACHE_HOME")),
             Some((
                 std::ffi::OsStr::new("XDG_CACHE_HOME"),
-                Some(ghidra_cache_home(&root).as_os_str())
+                Some(state.cache_home().as_os_str())
             ))
         );
+
+        // Each state home is unique, and drop removes the directory.
+        let path = state.path.clone();
+        let second = GhidraStateHome::new().unwrap();
+        assert_ne!(path, second.path);
+        drop(state);
+        assert!(!path.exists(), "drop must remove the state home");
     }
 
     #[test]
@@ -4977,13 +6007,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn headless_command_injects_java_home_when_given() {
-        let root = PathBuf::from("/tmp/pme-out");
+        let state = GhidraStateHome::new().unwrap();
         let args = vec!["/tmp/pme-out/ghidra_project".to_string()];
         let jh = PathBuf::from("/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home");
         let cmd = headless_command(
             Path::new("/opt/ghidra/support/analyzeHeadless"),
             &args,
-            &root,
+            &state,
             Some(&jh),
         );
         assert_eq!(
@@ -4996,7 +6026,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let cmd = headless_command(
             Path::new("/opt/ghidra/support/analyzeHeadless"),
             &args,
-            &root,
+            &state,
             None,
         );
         assert!(
@@ -5017,25 +6047,27 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
-    fn ghidra_java_options_preserve_existing_and_add_output_local_dirs() {
-        let root = PathBuf::from("/tmp/pme-out");
-        let options = ghidra_java_options(&root, Some(std::ffi::OsStr::new("-Dexisting.option=1")));
+    fn ghidra_java_options_preserve_existing_and_pin_state_home_dirs() {
+        let state = GhidraStateHome::new().unwrap();
+        let options =
+            ghidra_java_options(&state, Some(std::ffi::OsStr::new("-Dexisting.option=1")));
         let options = options.to_string_lossy();
 
         assert!(
             options.contains("-Dexisting.option=1"),
             "options: {options}"
         );
-        assert!(
-            options.contains("-Dapplication.settingsdir=/tmp/pme-out/ghidra_config"),
-            "options: {options}"
+        let config = format!(
+            "-Dapplication.settingsdir={}",
+            state.config_home().display()
         );
+        let cache = format!("-Dapplication.cachedir={}", state.cache_home().display());
+        let temp = format!("-Dapplication.tempdir={}", state.temp_home().display());
+        assert!(options.contains(&config), "options: {options}");
+        assert!(options.contains(&cache), "options: {options}");
+        assert!(options.contains(&temp), "options: {options}");
         assert!(
-            options.contains("-Dapplication.cachedir=/tmp/pme-out/ghidra_cache"),
-            "options: {options}"
-        );
-        assert!(
-            options.contains("-Dapplication.tempdir=/tmp/pme-out/ghidra_tmp"),
+            options.contains(&format!("-Djava.io.tmpdir={}", state.temp_home().display())),
             "options: {options}"
         );
     }
@@ -5892,6 +6924,282 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn pal_generation_state_is_explicit() {
+        // Unmanaged: no recognized MAIN ever enters PAL discovery, and an
+        // unknown label never resolves to a managed state.
+        let buf = craft_modem_bin(&[("BOOT", 0, 1, &[0u8; 4])]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let report = run_report(&modem, &generation_opts(None), &out).unwrap();
+        assert_eq!(
+            report.runtime_analysis_state("00_BOOT"),
+            RuntimeAnalysisState {
+                scatter: RuntimeScatterState::Unmanaged,
+                tasks: RuntimeTaskState::Unmanaged,
+            }
+        );
+        assert_eq!(
+            report.runtime_analysis_state("missing"),
+            RuntimeAnalysisState {
+                scatter: RuntimeScatterState::Unmanaged,
+                tasks: RuntimeTaskState::Unmanaged,
+            }
+        );
+        assert!(!out.join("pal_tasks").exists());
+
+        // Absent: a recognized MAIN with no PAL candidate clears the owned
+        // manifest only after the successful no-candidate result.
+        let buf = craft_modem_bin(&[("MAIN", SCATTER_BASE, 3, &[0u8; 64])]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let stale_manifest = out.join("pal_tasks/02_MAIN/tasks.json");
+        std::fs::create_dir_all(stale_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&stale_manifest, b"stale").unwrap();
+        let report = run_report(&modem, &generation_opts(None), &out).unwrap();
+        assert_eq!(
+            report.runtime_analysis_state("02_MAIN").tasks,
+            RuntimeTaskState::Absent
+        );
+        assert!(!out.join("pal_tasks/02_MAIN").exists());
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        assert!(spec["images"][0].get("pal_task_map").is_none());
+
+        // Present: a discoverable MAIN publishes the manifest atomically
+        // and reports the exact map identity; `pal_task_map` appears only
+        // on the recognized MAIN and the generated script carries the
+        // exact ApplyPalTasks argv under no-scatter (`-`).
+        let main = craft_discoverable_pal_main_image();
+        let buf = craft_modem_bin(&[("BOOT", 0, 1, &[0u8; 4]), ("MAIN", PAL_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let report = run_report(&modem, &generation_opts(None), &out).unwrap();
+        let RuntimeTaskState::Present(map) = report.runtime_analysis_state("02_MAIN").tasks else {
+            panic!("discoverable MAIN must report a present PAL map");
+        };
+        assert_eq!(map.relative_path, "pal_tasks/02_MAIN/tasks.json");
+        assert_eq!(map.task_records, 2);
+        assert_eq!(map.distinct_entries, 0);
+        let manifest_path = out.join(&map.relative_path);
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        assert_eq!(
+            map.identity,
+            format!(
+                "v1:{}:{}:{}",
+                crate::manifest::blake3_bytes(&manifest_bytes),
+                map.task_records,
+                map.distinct_entries
+            )
+        );
+        assert_eq!(map.blake3, crate::manifest::blake3_bytes(&manifest_bytes));
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        let boot = &spec["images"][0];
+        let main_entry = &spec["images"][1];
+        assert_eq!(boot["name"], "00_BOOT");
+        assert!(boot.get("pal_task_map").is_none());
+        assert_eq!(main_entry["pal_task_map"], "pal_tasks/02_MAIN/tasks.json");
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        let expected = headless_args(
+            "$HERE",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            PAL_BASE,
+            None,
+            Some(PalScriptPlan {
+                manifest: &map.relative_path,
+                identity: &map.identity,
+            }),
+            &[],
+            "tighten",
+        );
+        let quoted: Vec<String> = expected
+            .iter()
+            .map(|arg| {
+                if arg == "$HERE" {
+                    "\"${HERE}\"".to_string()
+                } else {
+                    shell_arg(arg)
+                }
+            })
+            .collect();
+        let invocation = format!("if \"$HEADLESS\" {}", quoted.join(" "));
+        assert!(
+            script.contains(&invocation),
+            "run_ghidra.sh must carry the exact PAL argv:\n{script}\nexpected {invocation}"
+        );
+        assert!(
+            script.contains(&format!(
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v3' 'pal_tasks={}' 'symbol_map=none'",
+                map.identity
+            )),
+            "run_ghidra.sh must compare the exact present-PAL v3 marker:\n{script}"
+        );
+
+        // Malformed: an ambiguous MAIN is the typed BadPalTasks error and
+        // returns no consumable state — no spec is published, and the
+        // older manifest bytes are never pre-cleared.
+        let main = craft_ambiguous_pal_main_image();
+        let buf = craft_modem_bin(&[("MAIN", PAL_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let stale_manifest = out.join("pal_tasks/02_MAIN/tasks.json");
+        std::fs::create_dir_all(stale_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&stale_manifest, b"older complete bytes").unwrap();
+        let error = run_report(&modem, &generation_opts(None), &out).unwrap_err();
+        assert!(matches!(error, Error::BadPalTasks(reason) if reason.contains("ambiguous")));
+        assert!(!out.join("ghidra_load.json").exists());
+        assert_eq!(
+            std::fs::read(&stale_manifest).unwrap(),
+            b"older complete bytes",
+            "a failed discovery must never pre-clear older physical bytes"
+        );
+    }
+
+    #[test]
+    fn pal_load_spec_is_filter_independent() {
+        // The --image filter selects Ghidra runs, never generation: PAL
+        // discovery and publication run for MAIN even when the filter
+        // selects another image.
+        let main = craft_discoverable_pal_main_image();
+        let buf = craft_modem_bin(&[("BOOT", 0, 1, &[0u8; 4]), ("MAIN", PAL_BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+
+        let report = run_report(&modem, &generation_opts(Some("BOOT")), &out).unwrap();
+
+        let RuntimeTaskState::Present(map) = report.runtime_analysis_state("02_MAIN").tasks else {
+            panic!("PAL generation must stay filter-independent");
+        };
+        assert!(out.join(&map.relative_path).is_file());
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        assert_eq!(
+            spec["images"][1]["pal_task_map"],
+            "pal_tasks/02_MAIN/tasks.json"
+        );
+        assert!(report.images.is_empty());
+    }
+
+    #[test]
+    fn pal_generation_reuses_scatter_discovery() {
+        // One MAIN generation loop: the single scatter discovery result
+        // feeds both the scatter artifact and the RuntimeImage PAL
+        // discovery consumes — scatter is never discovered twice, PAL
+        // discovery runs exactly once, over a raw-only MAIN with no PAL
+        // evidence and over a scatter+PAL MAIN alike.
+        let scatter_main = scatter_main_image();
+        let buf = craft_modem_bin(&[("MAIN", SCATTER_BASE, 3, &scatter_main)]);
+        let data = buf.clone();
+        let toc = Toc::parse(&data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scatter_calls = std::cell::Cell::new(0);
+        let pal_calls = std::cell::Cell::new(0);
+        let maps = generate_runtime_analysis_with(
+            &toc,
+            &data,
+            dir.path(),
+            |image, base| {
+                scatter_calls.set(scatter_calls.get() + 1);
+                scatter::discover(image, base).map_err(|error| error.to_string())
+            },
+            |runtime, label| {
+                pal_calls.set(pal_calls.get() + 1);
+                crate::pal_tasks::discover(runtime, label)
+            },
+        )
+        .unwrap();
+        assert_eq!(scatter_calls.get(), 1);
+        assert_eq!(pal_calls.get(), 1);
+        assert_eq!(
+            maps.scatter_states.get("02_MAIN"),
+            Some(&RuntimeScatterState::Present)
+        );
+        assert_eq!(maps.tasks.get("02_MAIN"), Some(&RuntimeTaskState::Absent));
+
+        let main = craft_discoverable_pal_main_image();
+        let buf = craft_modem_bin(&[("MAIN", PAL_BASE, 3, &main)]);
+        let toc = Toc::parse(&buf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scatter_calls = std::cell::Cell::new(0);
+        let pal_calls = std::cell::Cell::new(0);
+        let maps = generate_runtime_analysis_with(
+            &toc,
+            &buf,
+            dir.path(),
+            |image, base| {
+                scatter_calls.set(scatter_calls.get() + 1);
+                scatter::discover(image, base).map_err(|error| error.to_string())
+            },
+            |runtime, label| {
+                pal_calls.set(pal_calls.get() + 1);
+                crate::pal_tasks::discover(runtime, label)
+            },
+        )
+        .unwrap();
+        assert_eq!(scatter_calls.get(), 1);
+        assert_eq!(pal_calls.get(), 1);
+        assert_eq!(
+            maps.scatter_states.get("02_MAIN"),
+            Some(&RuntimeScatterState::Absent)
+        );
+        assert!(matches!(
+            maps.tasks.get("02_MAIN"),
+            Some(RuntimeTaskState::Present(_))
+        ));
+
+        // A MAIN with both a scatter loader and a discoverable PAL table:
+        // still exactly one scatter discovery (the RuntimeImage over the
+        // published artifact is not a second discovery) and one PAL
+        // discovery, with both states present.
+        let main = craft_scatter_pal_main_image();
+        let buf = craft_modem_bin(&[("MAIN", PAL_BASE, 3, &main)]);
+        let toc = Toc::parse(&buf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scatter_calls = std::cell::Cell::new(0);
+        let pal_calls = std::cell::Cell::new(0);
+        let maps = generate_runtime_analysis_with(
+            &toc,
+            &buf,
+            dir.path(),
+            |image, base| {
+                scatter_calls.set(scatter_calls.get() + 1);
+                scatter::discover(image, base).map_err(|error| error.to_string())
+            },
+            |runtime, label| {
+                pal_calls.set(pal_calls.get() + 1);
+                crate::pal_tasks::discover(runtime, label)
+            },
+        )
+        .unwrap();
+        assert_eq!(scatter_calls.get(), 1);
+        assert_eq!(pal_calls.get(), 1);
+        assert_eq!(
+            maps.scatter_states.get("02_MAIN"),
+            Some(&RuntimeScatterState::Present)
+        );
+        assert!(
+            maps.scatter_paths
+                .get("02_MAIN")
+                .is_some_and(|path| path == "scatter/02_MAIN/load_map.json")
+        );
+        assert!(matches!(
+            maps.tasks.get("02_MAIN"),
+            Some(RuntimeTaskState::Present(_))
+        ));
+    }
+
+    #[test]
     fn run_script_expands_here_for_import_and_scatter_paths() {
         let main = scatter_main_image();
         let buf = craft_modem_bin(&[("MAIN", SCATTER_BASE, 3, &main)]);
@@ -5980,10 +7288,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                pal_applied: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_tasks: HashMap::new(),
         };
 
         let err = report_failure(&report).expect("thumb error should fail standalone run");
@@ -6440,10 +7750,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                pal_applied: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_tasks: HashMap::new(),
         };
         assert!(report_failure(&report).is_none());
     }
@@ -6487,10 +7799,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                pal_applied: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_tasks: HashMap::new(),
         };
 
         let err = report_failure(&report).expect("thumb error should fail standalone run");
@@ -6535,6 +7849,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             global_types_apply_error: None,
             globals_provisional: Some(42),
             globals_provisional_suppressed: Some(7),
+            pal_applied: None,
         };
         assert_eq!(r.globals_provisional, Some(42));
         assert_eq!(r.globals_provisional_suppressed, Some(7));
@@ -6590,16 +7905,31 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "run_ghidra.sh must create the project dir:\n{sh}"
         );
         assert!(
-            sh.contains("export XDG_CONFIG_HOME=\"$HERE/ghidra_config\""),
-            "run_ghidra.sh must keep Ghidra config under the output dir:\n{sh}"
+            sh.contains(
+                "STATE_HOME=\"$(mktemp -d \"${TMPDIR:-/tmp}/pixel-modem-ghidra.XXXXXXXX\")\""
+            ),
+            "run_ghidra.sh must derive its state home from a unique space-free mktemp -d:\n{sh}"
         );
         assert!(
-            sh.contains("export XDG_CACHE_HOME=\"$HERE/ghidra_cache\""),
-            "run_ghidra.sh must keep Ghidra cache under the output dir:\n{sh}"
+            sh.contains("trap cleanup EXIT")
+                && sh.contains("cleanup() { rm -rf \"$STATE_HOME\"; }"),
+            "run_ghidra.sh must remove its state home through the cleanup trap:\n{sh}"
         );
         assert!(
-            sh.contains("-Dapplication.tempdir=$HERE/ghidra_tmp"),
-            "run_ghidra.sh must keep Ghidra temp files under the output dir:\n{sh}"
+            sh.contains("export XDG_CONFIG_HOME=\"$STATE_HOME/ghidra_config\""),
+            "run_ghidra.sh must keep Ghidra config under the state home:\n{sh}"
+        );
+        assert!(
+            sh.contains("export XDG_CACHE_HOME=\"$STATE_HOME/ghidra_cache\""),
+            "run_ghidra.sh must keep Ghidra cache under the state home:\n{sh}"
+        );
+        assert!(
+            sh.contains("-Dapplication.tempdir=$STATE_HOME/ghidra_tmp"),
+            "run_ghidra.sh must keep Ghidra temp files under the state home:\n{sh}"
+        );
+        assert!(
+            !sh.contains("$HERE/ghidra_config") && !sh.contains("$HERE/ghidra_tmp"),
+            "run_ghidra.sh must not leak Java/XDG state into the kit root:\n{sh}"
         );
         assert!(
             sh.contains("GHIDRA_HEADLESS_JAVA_OPTIONS=\"$GHIDRA_HEADLESS_JAVA_OPTIONS $GHIDRA_LOCAL_JAVA_OPTIONS\""),
@@ -7051,7 +8381,14 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::create_dir_all(&base).unwrap();
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb, 0xcc, 0xdd])]);
         let toc = Toc::parse(&buf).unwrap();
-        write_run_script(&base, &toc, "ARM:LE:32:v7", &HashMap::new()).unwrap();
+        write_run_script(
+            &base,
+            &toc,
+            "ARM:LE:32:v7",
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
         assert!(
             sh.contains("$GHIDRA_INSTALL_DIR/support/analyzeHeadless"),
@@ -7086,7 +8423,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb])]);
         let toc = Toc::parse(&buf).unwrap();
         let evil = "a';rm -rf $HOME;echo'";
-        write_run_script(&base, &toc, evil, &HashMap::new()).unwrap();
+        write_run_script(&base, &toc, evil, &HashMap::new(), &HashMap::new()).unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
         // The processor appears only inside the single-quoted, escaped form — never
         // raw. The dangerous chars (`;`, `$`, ` `, `'`) are inert inside the quotes.

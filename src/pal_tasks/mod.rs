@@ -20,13 +20,17 @@ mod cfg;
 mod discover;
 mod table;
 
-// The Task 8+ Ghidra and generation consumers import this surface; until
-// they land only the artifact tests exercise it.
-#[cfg_attr(not(test), allow(unused_imports))]
+// The generation and Ghidra consumers import this surface.
 pub(crate) use artifact::{
-    FORMAT, MaterializedTaskMap, TaskArtifactContext, ValidatedTaskArtifact, clear_materialized,
-    materialize, read,
+    MaterializedTaskMap, TaskArtifactContext, clear_materialized, materialize,
 };
+
+/// The shared PAL fixture machinery (raw/scatter image construction and
+/// the two-pass label-resolving Thumb assembler), reachable crate-wide
+/// under test so the decompile generation tests can build discoverable
+/// MAIN images.
+#[cfg(test)]
+pub(crate) use discover::test_support;
 
 /// Discover every anchor-reference candidate: one entry per semantic
 /// reference that survives unique-prologue root selection and bounded
@@ -59,7 +63,7 @@ pub(super) fn discover_initializer_candidates(
 /// survivors are the typed ambiguity; a plausible candidate that then
 /// fails is the contextual malformed error even when a sibling is
 /// valid.
-pub(super) fn discover(
+pub(crate) fn discover(
     image: &RuntimeImage<'_>,
     label: &str,
 ) -> std::result::Result<Option<TaskPlan>, PalTaskError> {

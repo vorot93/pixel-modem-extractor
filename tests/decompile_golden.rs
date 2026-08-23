@@ -144,6 +144,355 @@ fn craft_scatter_main_modem_bin() -> Vec<u8> {
     craft_single_image_modem_bin("MAIN", SCATTER_BASE, 3, &image)
 }
 
+// ---------------------------------------------------------------------------
+// Runtime PAL discovery fixture (Task 12): a self-synthesized MAIN image
+// whose PAL initializer CFG and descriptor-v1 slot table are discoverable
+// by the production `pal_tasks::discover` boundary. Mirrors the shape the
+// crate-internal pal_tasks fixtures use (the two-pass label-resolving
+// Thumb assembler is re-implemented here because integration tests cannot
+// reach cfg(test) support modules).
+// ---------------------------------------------------------------------------
+
+mod pal_runtime_fixture {
+    use scaleservers_arm32_assembly::{
+        Arm32Condition, Arm32GeneralPurposeRegister as Gpr, Arm32LowGeneralPurposeRegister as Low,
+        ArmT32Instruction as T32,
+    };
+    use std::collections::BTreeMap;
+
+    pub(super) const BASE: u32 = 0x1000;
+    const STRIDE: u32 = 0x1f8;
+    const NAME_OFFSET: u32 = 0x4c;
+    const SLOT_TABLE_OFF: u32 = 0x4000;
+    const CAPACITY: u32 = 8;
+    const ANCHOR_PATTERN: &[u8; 9] = b"PALTskTm\0";
+
+    pub(super) type FixtureLabels = BTreeMap<&'static str, u32>;
+    pub(super) type FixtureBuild = Box<dyn Fn(u32, &FixtureLabels) -> T32>;
+
+    pub(super) enum FixtureItem {
+        Insn(&'static str, FixtureBuild),
+        Data(&'static str, usize),
+        Anchor(&'static str),
+        Align(u32),
+    }
+
+    pub(super) fn insn(
+        label: &'static str,
+        build: impl Fn(u32, &FixtureLabels) -> T32 + 'static,
+    ) -> FixtureItem {
+        FixtureItem::Insn(label, Box::new(build))
+    }
+
+    fn put(bytes: &mut [u8], offset: usize, part: &[u8]) {
+        bytes[offset..offset + part.len()].copy_from_slice(part);
+    }
+
+    fn enc(instruction: &T32) -> Vec<u8> {
+        instruction.encode().expect("fixture encodes")
+    }
+
+    fn branch_offset(target: u32, pc: u32) -> i32 {
+        i32::try_from(i64::from(target) - i64::from(pc) - 4).expect("branch offset fits i32")
+    }
+
+    fn branch_i16(target: u32, pc: u32) -> i16 {
+        i16::try_from(branch_offset(target, pc)).expect("branch offset fits i16")
+    }
+
+    fn cbz_offset(target: u32, pc: u32) -> u8 {
+        u8::try_from(branch_offset(target, pc)).expect("cbz offset fits u8")
+    }
+
+    fn aligned_offset(target: u32, pc: u32) -> u16 {
+        let aligned = (pc.wrapping_add(4)) & !3;
+        u16::try_from(target - aligned).expect("aligned offset fits u16")
+    }
+
+    fn branch_to(l: &FixtureLabels, name: &str, pc: u32) -> i16 {
+        branch_i16(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    fn branch32_to(l: &FixtureLabels, name: &str, pc: u32) -> i32 {
+        branch_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    fn cbz_to(l: &FixtureLabels, name: &str, pc: u32) -> u8 {
+        cbz_offset(l.get(name).copied().unwrap_or(pc + 4), pc)
+    }
+
+    fn adr_to(l: &FixtureLabels, name: &str, pc: u32) -> u16 {
+        aligned_offset(l.get(name).copied().unwrap_or((pc + 8) & !3), pc)
+    }
+
+    fn word_at(l: &FixtureLabels, name: &str) -> u32 {
+        l.get(name).copied().unwrap_or(0)
+    }
+
+    /// Two-pass assembler: measure with neutral offsets, then encode with
+    /// resolved label addresses.
+    pub(super) fn assemble(base: u32, items: &[FixtureItem]) -> (Vec<u8>, FixtureLabels) {
+        let unresolved = FixtureLabels::new();
+        let mut starts = Vec::with_capacity(items.len());
+        let mut pc = base;
+        for item in items {
+            if let FixtureItem::Align(to) = item {
+                pc = pc.div_ceil(*to) * *to;
+            }
+            starts.push(pc);
+            let size = match item {
+                FixtureItem::Insn(_, build) => u32::try_from(
+                    build(pc, &unresolved)
+                        .encode()
+                        .expect("fixture instruction encodes")
+                        .len(),
+                )
+                .expect("fixture instruction size fits u32"),
+                FixtureItem::Data(_, 4) => 4,
+                FixtureItem::Data(_, size) => *size as u32,
+                FixtureItem::Anchor(_) => ANCHOR_PATTERN.len() as u32,
+                FixtureItem::Align(_) => 0,
+            };
+            pc += size;
+        }
+        let labels: FixtureLabels = items
+            .iter()
+            .zip(&starts)
+            .filter_map(|(item, start)| match item {
+                FixtureItem::Insn(label, _)
+                | FixtureItem::Data(label, _)
+                | FixtureItem::Anchor(label) => (!label.is_empty()).then_some((*label, *start)),
+                FixtureItem::Align(_) => None,
+            })
+            .collect();
+        let mut bytes = vec![0u8; (pc - base) as usize];
+        for (item, start) in items.iter().zip(&starts) {
+            match item {
+                FixtureItem::Insn(_, build) => {
+                    let part = build(*start, &labels)
+                        .encode()
+                        .expect("fixture instruction encodes");
+                    put(&mut bytes, (*start - base) as usize, &part);
+                }
+                FixtureItem::Data(_, _) => {}
+                FixtureItem::Anchor(_) => put(&mut bytes, (*start - base) as usize, ANCHOR_PATTERN),
+                FixtureItem::Align(_) => {}
+            }
+        }
+        (bytes, labels)
+    }
+
+    fn gpr(number: u8) -> Gpr {
+        Gpr::from_operand_bits(number)
+    }
+
+    fn low(number: u8) -> Low {
+        Low::from_operand_bits(number)
+    }
+
+    /// The canonical discoverable initializer shape: slot r4, count r5,
+    /// name r0, guard shift 3.
+    fn initializer_items(slot_base: u32, capacity: u32) -> Vec<FixtureItem> {
+        let guard_value = capacity / 8 - 1;
+        vec![
+            insn("init", |_, _| T32::Push_T1(vec![gpr(4), gpr(14)])),
+            insn("ref", |pc, l| T32::Adr_T1(low(1), adr_to(l, "anchor", pc))),
+            insn("zero", |_, _| T32::Mov_Immediate_T1(low(5), 0)),
+            insn("slotlo", move |_, _| {
+                T32::Mov_Immediate_T3(gpr(4), u16::try_from(slot_base & 0xffff).unwrap())
+            }),
+            insn("slothi", move |_, _| {
+                T32::Movt_T1(gpr(4), u16::try_from(slot_base >> 16).unwrap())
+            }),
+            insn("call", |pc, l| T32::Bl_T1(branch32_to(l, "leaf", pc))),
+            insn("load", |_, _| T32::Ldr_Immediate_T1(low(0), low(4), 0x4c)),
+            insn("lcbz", |pc, l| T32::Cbz_T1(low(0), cbz_to(l, "term", pc))),
+            insn("lstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
+            insn("ladd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
+            insn("lstride", |_, _| {
+                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
+            }),
+            insn("lcmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
+            insn("lbne", |pc, l| {
+                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "load", pc))
+            }),
+            insn("cap", |_, l| {
+                T32::Mov_Immediate_T3(
+                    gpr(0),
+                    u16::try_from(word_at(l, "globals") & 0xffff).unwrap(),
+                )
+            }),
+            insn("", |_, l| {
+                T32::Movt_T1(gpr(0), u16::try_from(word_at(l, "globals") >> 16).unwrap())
+            }),
+            insn("cval", move |_, _| {
+                T32::Mov_Immediate_T3(gpr(1), u16::try_from(capacity).unwrap())
+            }),
+            insn("cstr", |_, _| T32::Str_Immediate_T1(low(1), low(0), 0)),
+            insn("cjmp", |pc, l| T32::B_T2(branch_to(l, "join", pc))),
+            insn("term", |pc, l| {
+                T32::Adr_T1(low(0), adr_to(l, "globals", pc))
+            }),
+            insn("tstr", |_, _| T32::Str_Immediate_T1(low(5), low(0), 0)),
+            insn("glsr", |_, _| T32::Lsr_Immediate_T1(low(0), low(5), 3)),
+            insn("gcmp", move |_, _| {
+                T32::Cmp_Immediate_T1(low(0), u8::try_from(guard_value).unwrap())
+            }),
+            insn("gbhi", |pc, l| {
+                T32::B_T1(Arm32Condition::UnsignedHigher, branch_to(l, "join", pc))
+            }),
+            insn("sstr", |_, _| T32::Str_Immediate_T1(low(5), low(4), 0x0c)),
+            insn("sadd", |_, _| T32::Add_Immediate_T2(low(5), 1)),
+            insn("sslot", |_, _| {
+                T32::Add_Immediate_T3(gpr(4), gpr(4), 0x1f8, false)
+            }),
+            insn("smov", |_, _| T32::Mov_Register_T1(gpr(6), gpr(0))),
+            insn("snop", |_, _| T32::Nop_T1),
+            insn("scmp", move |_, _| T32::Cmp_Immediate_T2(gpr(5), capacity)),
+            insn("sbne", |pc, l| {
+                T32::B_T1(Arm32Condition::NotEqual, branch_to(l, "sstr", pc))
+            }),
+            insn("join", |_, _| T32::Bx_T1(gpr(14))),
+            FixtureItem::Align(4),
+            FixtureItem::Anchor("anchor"),
+            FixtureItem::Align(2),
+            insn("leaf", |_, _| T32::Mov_Immediate_T3(gpr(0), 0x1234)),
+            insn("leaf2", |_, _| T32::Movt_T1(gpr(0), 0)),
+            insn("leafret", |_, _| T32::Bx_T1(gpr(14))),
+            FixtureItem::Align(4),
+            FixtureItem::Data("globals", 8),
+        ]
+    }
+
+    /// Growable MAIN image under construction.
+    struct ImageBuilder {
+        bytes: Vec<u8>,
+    }
+
+    impl ImageBuilder {
+        fn new() -> Self {
+            ImageBuilder { bytes: Vec::new() }
+        }
+
+        fn ensure(&mut self, end: u32) {
+            let end = usize::try_from(end - BASE).expect("fixture extent fits the host");
+            if self.bytes.len() < end {
+                self.bytes.resize(end, 0);
+            }
+        }
+
+        fn write(&mut self, address: u32, data: &[u8]) {
+            self.ensure(
+                address
+                    .checked_add(u32::try_from(data.len()).unwrap())
+                    .unwrap(),
+            );
+            let offset = usize::try_from(address - BASE).unwrap();
+            self.bytes[offset..offset + data.len()].copy_from_slice(data);
+        }
+
+        fn write_u32(&mut self, address: u32, value: u32) {
+            self.write(address, &value.to_le_bytes());
+        }
+    }
+
+    fn write_table(image: &mut ImageBuilder, slot_base: u32, slots: &[&str]) {
+        let slot_count = u32::try_from(slots.len()).expect("slot count fits u32") + 1;
+        let table_end = slot_base + slot_count * STRIDE;
+        image.ensure(table_end);
+        let mut cursor = table_end + 0x40;
+        let mut name_addresses = Vec::with_capacity(slots.len());
+        for name in slots {
+            image.write(cursor, name.as_bytes());
+            image.write(cursor + u32::try_from(name.len()).unwrap(), &[0]);
+            name_addresses.push(cursor);
+            cursor += u32::try_from(name.len()).unwrap() + 1;
+        }
+        cursor = cursor.div_ceil(4) * 4;
+        let entries_base = cursor;
+        // Each entry is a self-contained Thumb function (`push {r4, lr}`;
+        // `bx lr`) at 8-byte spacing, so Ghidra's flow disassembly from one
+        // entry never crosses into the next.
+        let push = enc(&T32::Push_T1(vec![gpr(4), gpr(14)]));
+        let bx_lr = enc(&T32::Bx_T1(gpr(14)));
+        let mut entry_addresses = Vec::with_capacity(slots.len());
+        for index in 0..slots.len() {
+            let address = entries_base + u32::try_from(index).unwrap() * 8;
+            image.write(address, &push);
+            image.write(address + u32::try_from(push.len()).unwrap(), &bx_lr);
+            entry_addresses.push(address);
+        }
+        image.ensure(entries_base + u32::try_from(slots.len()).unwrap() * 8 + 8);
+        for (index, _) in slots.iter().enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let slot_address = slot_base + index * STRIDE;
+            for offset in 0..STRIDE {
+                let byte = 0x5au8.wrapping_add((offset as u8) ^ (index as u8));
+                image.write(slot_address + offset, &[byte]);
+            }
+            image.write_u32(
+                slot_address + NAME_OFFSET,
+                name_addresses[usize::try_from(index).unwrap()],
+            );
+            image.write_u32(slot_address + NAME_OFFSET + 4, 0x64);
+            image.write_u32(slot_address + NAME_OFFSET + 8, 0x200);
+            image.write_u32(
+                slot_address + NAME_OFFSET + 12,
+                entry_addresses[usize::try_from(index).unwrap()] | 1,
+            );
+            image.write_u32(slot_address + NAME_OFFSET + 16, 0);
+            image.write_u32(slot_address + NAME_OFFSET + 20, 0);
+        }
+        let terminal = slot_base + slot_count.saturating_sub(1) * STRIDE;
+        for offset in 0..STRIDE {
+            let byte = 0x33u8.wrapping_add(offset as u8);
+            image.write(terminal + offset, &[byte]);
+        }
+        for field in [
+            NAME_OFFSET,
+            NAME_OFFSET + 4,
+            NAME_OFFSET + 8,
+            NAME_OFFSET + 12,
+            NAME_OFFSET + 16,
+            NAME_OFFSET + 20,
+        ] {
+            image.write_u32(terminal + field, 0);
+        }
+    }
+
+    /// The MAIN slice: a discoverable PAL initializer and a two-slot
+    /// descriptor-v1 table (no scatter loader).
+    pub(super) fn craft_main_image() -> Vec<u8> {
+        let mut image = ImageBuilder::new();
+        let (code_bytes, _) = assemble(BASE, &initializer_items(BASE + SLOT_TABLE_OFF, CAPACITY));
+        image.write(BASE, &code_bytes);
+        write_table(
+            &mut image,
+            BASE + SLOT_TABLE_OFF,
+            &["first_task", "second_task"],
+        );
+        image.bytes
+    }
+
+    /// The modem.bin wrapping the discoverable MAIN slice (TOC label
+    /// `02_MAIN`, base 0x1000).
+    pub(super) fn craft_pal_main_modem_bin() -> Vec<u8> {
+        let image = craft_main_image();
+        let entry_off = 0x20usize;
+        let payload_off = entry_off + 0x20;
+        let mut buf = vec![0u8; payload_off + image.len()];
+        buf[0..4].copy_from_slice(b"TOC\0");
+        buf[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+        buf[entry_off..entry_off + 4].copy_from_slice(b"MAIN");
+        buf[entry_off + 12..entry_off + 16].copy_from_slice(&(payload_off as u32).to_le_bytes());
+        buf[entry_off + 16..entry_off + 20].copy_from_slice(&BASE.to_le_bytes());
+        buf[entry_off + 20..entry_off + 24].copy_from_slice(&(image.len() as u32).to_le_bytes());
+        buf[entry_off + 28..entry_off + 32].copy_from_slice(&3u32.to_le_bytes());
+        buf[payload_off..].copy_from_slice(&image);
+        buf
+    }
+}
+
 const INSPECT_SCATTER_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.mem.Memory;
@@ -600,6 +949,190 @@ fn scatter_load_map_is_applied_before_analysis() {
         process_diagnostics(&inspection)
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 12: the generation-only route materializes the PAL task manifest
+/// and wires it into `ghidra_load.json` and `run_ghidra.sh` with no flag —
+/// `--no-thumb-decompile` changes nothing about PAL seeding.
+#[test]
+fn generated_only_pal_seeding_is_default_on() {
+    for no_thumb_decompile in [false, true] {
+        let dir = std::env::temp_dir().join(format!(
+            "pme_pal_gen_{}_{no_thumb_decompile}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem_path = dir.join("modem.bin");
+        std::fs::write(&modem_path, pal_runtime_fixture::craft_pal_main_modem_bin()).unwrap();
+        let out = dir.join("out");
+        pixel_modem_extractor::decompile::run_report(
+            &modem_path,
+            &pixel_modem_extractor::decompile::Opts {
+                run: false,
+                image: None,
+                ghidra_home: None,
+                processor: "ARM:LE:32:v7".to_string(),
+                no_thumb_decompile,
+                rizin_fallback: false,
+                tighten_wall_clock_budget_override: None,
+                no_skip_opaque: true,
+            },
+            &out,
+        )
+        .unwrap();
+
+        let manifest_path = out.join("pal_tasks/02_MAIN/tasks.json");
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap_or_else(|_| {
+            panic!("PAL manifest missing under no_thumb_decompile={no_thumb_decompile}")
+        });
+        let identity = format!("v1:{}:2:0", blake3::hash(&manifest_bytes));
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
+        assert_eq!(
+            spec["images"][0]["pal_task_map"], "pal_tasks/02_MAIN/tasks.json",
+            "no_thumb_decompile={no_thumb_decompile}"
+        );
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(
+            script.contains("ApplyPalTasks.java"),
+            "no_thumb_decompile={no_thumb_decompile}: script must schedule PAL seeding:\n{script}"
+        );
+        assert!(
+            script.contains("\"${HERE}/pal_tasks/02_MAIN/tasks.json\""),
+            "no_thumb_decompile={no_thumb_decompile}: script must pass the manifest:\n{script}"
+        );
+        assert!(
+            script.contains(&format!("'pal_tasks={identity}'")),
+            "no_thumb_decompile={no_thumb_decompile}: script marker must bind the identity:\n{script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Task 12: the immediate `--run` route discovers, materializes, applies,
+/// and certifies PAL task seeding under real Ghidra with no flag — the
+/// tighten default. The strict `ApplyPalTasks` summary is parsed into the
+/// report and the identity-bound v3 marker is validated.
+#[test]
+fn immediate_run_applies_pal_tasks_by_default() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pme_pal_run_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, pal_runtime_fixture::craft_pal_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let image = report
+        .images
+        .first()
+        .expect("discoverable MAIN was selected");
+    assert_eq!(image.label, "02_MAIN");
+    assert!(
+        matches!(
+            image.outcome,
+            pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
+        ),
+        "PAL-seeded tighten run failed: {:?} (terminal_error={:?})",
+        image.outcome,
+        image.terminal_error
+    );
+    assert_eq!(
+        image.pal_applied,
+        Some(pixel_modem_extractor::decompile::AppliedPalTasks {
+            tasks: 2,
+            entries: 2,
+            functions_created: 2,
+            functions_existing: 0,
+            names_applied: 2,
+            names_preserved: 0,
+            shared_entries: 0,
+        }),
+        "the strict ApplyPalTasks summary must be parsed from this run"
+    );
+    assert!(out.join("pal_tasks/02_MAIN/tasks.json").is_file());
+    let marker = std::fs::read_to_string(out.join("export/02_MAIN.complete")).unwrap_or_default();
+    assert!(
+        marker.starts_with("pixel-modem-extractor-ghidra-export-v3\npal_tasks=v1:"),
+        "the current marker must bind the applied PAL identity: {marker:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 12: the same immediate route under `--no-thumb-decompile`
+/// (datamark mode) — PAL seeding stays default-on in both modes.
+#[test]
+fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pme_pal_dmk_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, pal_runtime_fixture::craft_pal_main_modem_bin()).unwrap();
+    let out = dir.join("out");
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: true,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let image = report
+        .images
+        .first()
+        .expect("discoverable MAIN was selected");
+    assert!(
+        matches!(
+            image.outcome,
+            pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
+        ),
+        "PAL-seeded datamark run failed: {:?} (terminal_error={:?})",
+        image.outcome,
+        image.terminal_error
+    );
+    assert_eq!(
+        image.pal_applied,
+        Some(pixel_modem_extractor::decompile::AppliedPalTasks {
+            tasks: 2,
+            entries: 2,
+            functions_created: 2,
+            functions_existing: 0,
+            names_applied: 2,
+            names_preserved: 0,
+            shared_entries: 0,
+        }),
+        "datamark mode must apply and parse the same PAL seeding"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2115,158 +2648,6 @@ fn pass2_applies_global_types_and_skips_span_collision() {
     assert!(
         c.contains("undefined4 Reset(void)") && c.contains("return DAT_00000020;"),
         "decompiled.c missing the undefined4 global at its 0x20 reference site:\n{c}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Hand-assembled minimal Thumb-2 function: `push {r7, lr}; movs r0, #0; pop {r7, pc}`.
-/// Used by the Phase-2 mode-dispatch e2e tests below. Under the `ARM:LE:32:v7`
-/// language Ghidra does not auto-switch into Thumb mode for these bytes alone
-/// (no `BX` with the LSB set, no `__thumb` symbol), so the assertion the tests
-/// make is on TameAnalysis's `mode=` log line rather than on Ghidra's
-/// interpretation of the payload — see the per-test notes.
-fn thumb_function_bytes() -> Vec<u8> {
-    // push {r7, lr}   -> 0xb580 (LE: 80 b5)
-    // movs r0, #0     -> 0x2000 (LE: 00 20)
-    // pop {r7, pc}    -> 0xbd80 (LE: 80 bd)
-    vec![0x80, 0xb5, 0x00, 0x20, 0x80, 0xbd]
-}
-
-/// Locate Ghidra's per-run `application.log`, written under
-/// `<out>/ghidra_config/user-ghidra/ghidra_<VERSION>_DEV/application.log`. The
-/// version-segment path component varies with the Ghidra release, so we walk the
-/// directory to find it. Returns the parsed log text.
-fn read_ghidra_application_log(out: &std::path::Path) -> String {
-    let user_ghidra = out.join("ghidra_config").join("user-ghidra");
-    let mut found: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&user_ghidra) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("application.log");
-            if candidate.exists() {
-                found.push(candidate);
-            }
-        }
-    }
-    assert_eq!(
-        found.len(),
-        1,
-        "expected exactly one application.log under {}, found {found:?}",
-        user_ghidra.display()
-    );
-    std::fs::read_to_string(&found[0]).unwrap()
-}
-
-/// Phase-2 e2e: under `--thumb-decompile` (default) `run_report` dispatches
-/// `TameAnalysis mode=tighten`, the tightened mode emitted by `headless_args`.
-/// With the 6-byte Thumb fixture, Ghidra does not auto-discover a Thumb
-/// function under `ARM:LE:32:v7` (no mode-switch instruction), so the assertion
-/// verifies (a) the run completed and produced a non-empty `decompiled.c`, and
-/// (b) TameAnalysis's startup line in `application.log` records `mode=tighten`.
-/// Together with `no_thumb_decompile_flag_falls_back_to_datamark` this locks in
-/// the per-mode dispatch on the same fixture.
-#[test]
-fn tightened_tame_analysis_dispatchs_tighten_mode() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
-
-    let payload = thumb_function_bytes();
-    let modem = craft_modem_bin(&payload);
-
-    let dir = std::env::temp_dir().join(format!("pme_decompile_t2_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let modem_path = dir.join("modem.bin");
-    std::fs::write(&modem_path, &modem).unwrap();
-    let out = dir.join("out");
-
-    let opts = pixel_modem_extractor::decompile::Opts {
-        run: true,
-        image: None,
-        ghidra_home: Some(home),
-        processor: "ARM:LE:32:v7".to_string(),
-        no_thumb_decompile: false,
-        rizin_fallback: false,
-        tighten_wall_clock_budget_override: None,
-        no_skip_opaque: false,
-    };
-    let report =
-        pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).expect("run_report");
-
-    assert!(
-        report.images.iter().any(|r| r.label == "00_BOOT"
-            && matches!(
-                r.outcome,
-                pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
-            )),
-        "tighten run should have analyzed 00_BOOT: {report:?}"
-    );
-
-    let exp = out.join("export").join("00_BOOT");
-    let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
-    assert!(
-        !c.trim().is_empty(),
-        "tighten run should produce a non-empty decompiled.c"
-    );
-
-    let log = read_ghidra_application_log(&out);
-    assert!(
-        log.contains("TameAnalysis: mode=tighten"),
-        "TameAnalysis should have logged mode=tighten; log tail:\n{}",
-        log.lines().rev().take(40).collect::<Vec<_>>().join("\n")
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Phase-2 e2e: the `--no-thumb-decompile` escape hatch flips `TameAnalysis` to
-/// `mode=datamark`. The 6-byte fixture is far below the 1 MiB `thumb_regions`
-/// threshold, so datamark mode marks no regions (Ghidra's analysis matches the
-/// tighten run byte-for-byte); the assertion is therefore on the `mode=datamark`
-/// dispatch line in `application.log` — proving the Opts flag wires through to
-/// `headless_args` and into the spawned script under real Ghidra.
-#[test]
-fn no_thumb_decompile_flag_falls_back_to_datamark() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
-
-    let payload = thumb_function_bytes();
-    let modem = craft_modem_bin(&payload);
-
-    let dir = std::env::temp_dir().join(format!("pme_decompile_d2_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let modem_path = dir.join("modem.bin");
-    std::fs::write(&modem_path, &modem).unwrap();
-    let out = dir.join("out");
-
-    let opts = pixel_modem_extractor::decompile::Opts {
-        run: true,
-        image: None,
-        ghidra_home: Some(home),
-        processor: "ARM:LE:32:v7".to_string(),
-        no_thumb_decompile: true,
-        rizin_fallback: false,
-        tighten_wall_clock_budget_override: None,
-        no_skip_opaque: false,
-    };
-    let _report =
-        pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).expect("run_report");
-
-    let log = read_ghidra_application_log(&out);
-    assert!(
-        log.contains("TameAnalysis: mode=datamark"),
-        "TameAnalysis should have logged mode=datamark under --no-thumb-decompile; log tail:\n{}",
-        log.lines().rev().take(40).collect::<Vec<_>>().join("\n")
-    );
-    assert!(
-        !log.contains("TameAnalysis: mode=tighten"),
-        "datamark run should NOT have logged mode=tighten; log tail:\n{}",
-        log.lines().rev().take(40).collect::<Vec<_>>().join("\n")
     );
 
     let _ = std::fs::remove_dir_all(&dir);
