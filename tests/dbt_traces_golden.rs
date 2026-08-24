@@ -31,7 +31,7 @@ const S5400: CorpusPins = CorpusPins {
     parameter_count: 276,
     sentinel: 246_929,
     unknown: 0,
-    manifest_metadata_blake3: "",
+    manifest_metadata_blake3: "657bd31988784689033f652367007723facb215ccef8a14873fafaf445130c3d",
     refs_count: None,
 };
 
@@ -47,7 +47,7 @@ const S5300: CorpusPins = CorpusPins {
     parameter_count: 265,
     sentinel: 237_735,
     unknown: 0,
-    manifest_metadata_blake3: "",
+    manifest_metadata_blake3: "bed4d437c49d21ea322d5c2edba305669a9cd08265027734f021d9e31b3c0267",
     refs_count: None,
 };
 
@@ -161,6 +161,7 @@ fn scatter_resolution_of_raw_unmapped_messages() {
 
 #[test]
 fn refs_pins() {
+    // Live refs measurement lives in crate dbt_traces::tests::corpus_refs_pins.
     for pins in [&S5400, &S5300] {
         match decompiled_inventory(pins.label) {
             None => eprintln!(
@@ -168,7 +169,7 @@ fn refs_pins() {
                 pins.label, pins.refs_count
             ),
             Some(dir) => eprintln!(
-                "refs inventories present for {} at {}; pin {:?}",
+                "skip: live refs pin lives in crate test; inventories for {} at {}; pin {:?}",
                 pins.label,
                 dir.display(),
                 pins.refs_count
@@ -285,18 +286,6 @@ fn assert_corpus(pins: &CorpusPins) {
             "{} manifest metadata BLAKE3",
             pins.env_var
         );
-    }
-
-    if let Some(decompiled) = decompiled_inventory(pins.label) {
-        let count = dbt_traces::run_refs(&out, &modem_path, &decompiled)
-            .unwrap_or_else(|error| panic!("{} refs failed: {error}", pins.env_var));
-        match pins.refs_count {
-            None => eprintln!(
-                "PIN UNPOPULATED: {env} refs_count = {count}",
-                env = pins.env_var
-            ),
-            Some(expected) => assert_eq!(count, expected, "{} refs_count", pins.env_var),
-        }
     }
 }
 

@@ -1052,34 +1052,8 @@ fn run_debug_traces_refs_stage(
         return (0, Vec::new());
     }
     let result = (|| -> Result<(usize, Vec<String>)> {
-        let catalog = crate::dbt_traces::reader::read(&catalog_dir, runtime, ctx)?;
-        let mut record_addresses = Vec::with_capacity(catalog.counts.records);
-        for record in crate::dbt_traces::reader::iter_records(&catalog_dir) {
-            record_addresses.push(record?.address);
-        }
-        let mut functions =
-            crate::dbt_traces::refs::load_functions(&decompiled_dir, runtime)?.unwrap_or_default();
-        if let Some(thumb) = crate::dbt_traces::refs::load_thumb(&decompiled_dir, runtime)? {
-            functions.extend(thumb);
-        }
-        let thumb_path = decompiled_dir.join("thumb_functions.json");
-        let inputs = crate::dbt_traces::refs::RefsInputs {
-            functions_blake3: manifest::blake3_file(&decompiled_dir.join("functions.json"))?,
-            thumb_functions_blake3: if thumb_path.exists() {
-                Some(manifest::blake3_file(&thumb_path)?)
-            } else {
-                None
-            },
-        };
-        let out_path = catalog_dir.join("references.json");
-        let outcome = crate::dbt_traces::refs::attribute(
-            runtime,
-            &record_addresses,
-            &functions,
-            &catalog,
-            inputs,
-            &out_path,
-        )?;
+        let outcome =
+            crate::dbt_traces::attribute_published(runtime, ctx, &catalog_dir, &decompiled_dir)?;
         let producers = outcome
             .producers
             .iter()
