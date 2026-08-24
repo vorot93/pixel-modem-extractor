@@ -3,6 +3,7 @@ pub mod archive;
 pub(crate) mod arm32;
 pub mod classify;
 pub mod cli;
+pub mod dbt_traces;
 pub mod decode_rf;
 pub mod decompile;
 pub mod decompose;

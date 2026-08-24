@@ -295,7 +295,7 @@ fn identity(manifest_blake3: [u8; 32], task_records: usize, distinct_entries: us
     )
 }
 
-fn storage_kind_name(kind: StorageKind) -> &'static str {
+pub(crate) fn storage_kind_name(kind: StorageKind) -> &'static str {
     match kind {
         StorageKind::Raw => "raw",
         StorageKind::ScatterBytes => "scatter_bytes",

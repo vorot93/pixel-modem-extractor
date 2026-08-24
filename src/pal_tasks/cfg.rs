@@ -18,17 +18,13 @@ const THUMB: DecodeIsa = DecodeIsa::Thumb;
 
 /// The visible PC value a PC-relative Thumb expression resolves against.
 pub(super) fn visible_pc(pc: u32, align_to_four: bool) -> u32 {
-    if align_to_four {
-        pc.wrapping_add(4) & !3
-    } else {
-        pc.wrapping_add(8)
-    }
+    crate::arm32::visible_pc(pc, align_to_four)
 }
 
 /// Wrapping add of an i64 offset onto a u32 address: exact modular
 /// arithmetic through the low 32 bits for any offset magnitude.
 pub(super) fn wrapping_offset(address: u32, offset: i64) -> u32 {
-    address.wrapping_add((offset & 0xFFFF_FFFF) as u32)
+    crate::arm32::wrapping_offset(address, offset)
 }
 
 /// Decode the single Thumb instruction at `pc`, statelessly. Fetch or

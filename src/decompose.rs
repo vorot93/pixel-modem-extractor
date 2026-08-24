@@ -198,6 +198,34 @@ pub struct ImageReport {
     pub pal_names_preserved: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pal_shared_entries: Option<usize>,
+    /// The six `debug_traces` catalog/reference counters plus the refs
+    /// producers, carried only by the MAIN image whose `debug_traces` stage
+    /// ran (an ok row, including a successful clean absence with zero
+    /// counts); every other image omits all seven. Like the
+    /// `global_shapes_*` group these are patched post-hoc onto the
+    /// `decompile` stage's rows — `ImageReport::from_result` always nulls
+    /// them — so they MUST be re-applied after every later
+    /// `refresh_decompile_stage_images` /
+    /// `install_decompile_stage_image_snapshot` call site; see
+    /// `DbtCounters` and `reapply_dbt_outcomes`. `None` = the dbt stages
+    /// did not run; `Some(0)` = ran, zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_records: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_files: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_messages: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_quarantined: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_unresolved_messages: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_references: Option<usize>,
+    /// Distinct producers of the attributed references (wire names, e.g.
+    /// `["ghidra"]`); empty when the refs leg produced nothing. Same
+    /// all-or-none group as the six counters above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbt_refs_producers: Option<Vec<String>>,
 }
 
 impl ImageReport {
@@ -276,6 +304,13 @@ impl ImageReport {
             pal_names_applied: r.pal_applied.as_ref().map(|pal| pal.names_applied),
             pal_names_preserved: r.pal_applied.as_ref().map(|pal| pal.names_preserved),
             pal_shared_entries: r.pal_applied.as_ref().map(|pal| pal.shared_entries),
+            dbt_records: None,
+            dbt_files: None,
+            dbt_messages: None,
+            dbt_quarantined: None,
+            dbt_unresolved_messages: None,
+            dbt_references: None,
+            dbt_refs_producers: None,
         }
     }
 }
@@ -717,6 +752,338 @@ fn pal_tasks_stage(tally: Option<&PalMarshalTally>, duration_ms: u128) -> StageR
         ),
         duration_ms,
     )
+}
+
+/// The per-image `dbt_*` report counters the `debug_traces` /
+/// `debug_traces_refs` stages produce for the MAIN image, retained across
+/// the symbol route's later rebuilds of the decompile stage's `ImageReport`s
+/// (from `decompile::ImageResult` via `ImageReport::from_result`, which
+/// always nulls the seven `dbt_*` fields — `ImageResult` has no such fields
+/// to preserve them from; the same hazard `global_shapes_*` and
+/// `global_types_*` survive via their own reappliers). Without re-applying
+/// this retained outcome after each rebuild — `RunGlobals(RecordOnly)`'s
+/// refresh on `--no-symbol-pass`, and `DispatchPass2`'s
+/// `install_decompile_stage_image_snapshot` / `refresh_decompile_stage_images`
+/// on the normal route — the patch is silently discarded and `dbt_*` never
+/// reaches `report.json`. See `reapply_dbt_outcomes`.
+#[derive(Debug, Clone)]
+struct DbtCounters {
+    label: String,
+    records: usize,
+    files: usize,
+    messages: usize,
+    quarantined: usize,
+    unresolved_messages: usize,
+    references: usize,
+    refs_producers: Vec<String>,
+}
+
+/// Apply one retained outcome to `image`, mirroring exactly what the first
+/// patch after `run_debug_traces_stages` did.
+fn apply_dbt_counters(image: &mut ImageReport, counters: &DbtCounters) {
+    image.dbt_records = Some(counters.records);
+    image.dbt_files = Some(counters.files);
+    image.dbt_messages = Some(counters.messages);
+    image.dbt_quarantined = Some(counters.quarantined);
+    image.dbt_unresolved_messages = Some(counters.unresolved_messages);
+    image.dbt_references = Some(counters.references);
+    image.dbt_refs_producers = Some(counters.refs_producers.clone());
+}
+
+/// Re-apply the retained `dbt_*` counters onto the MAIN image's row by
+/// label. Called after the stages first run and after every later rebuild
+/// of the decompile stage's `ImageReport`s (see `DbtCounters`'s doc comment
+/// for why those rebuilds otherwise discard this data). `None` (no MAIN
+/// image, no MAIN binary, or a failed catalog stage) leaves every row
+/// untouched — the rows are always a fresh rebuild at the call sites, so
+/// their `dbt_*` fields are already `None` there.
+fn reapply_dbt_outcomes(report_images: &mut [ImageReport], outcomes: &Option<DbtCounters>) {
+    if let Some(counters) = outcomes {
+        for image in report_images {
+            if image.image == counters.label {
+                apply_dbt_counters(image, counters);
+            }
+        }
+    }
+}
+
+/// The `debug_traces` catalog outcome, carrying the runtime view and the
+/// identity the refs stage must re-validate through (same runtime, same
+/// expected context). `raw` — the bytes the runtime borrows — must outlive
+/// this value in the caller.
+enum DebugTracesCatalog<'a> {
+    Published {
+        runtime: crate::runtime_image::RuntimeImage<'a>,
+        ctx: crate::dbt_traces::artifact::DbtContext<'a>,
+        counts: crate::dbt_traces::artifact::CatalogCounts,
+    },
+    /// Zero candidates: `publish` is the single owner of absence semantics
+    /// and already cleared the owned directory; the stage is ok with zero
+    /// counts.
+    CleanAbsence,
+}
+
+/// The `debug_traces` stage's output summary: the catalog location plus the
+/// counts it published (all zeros for a clean absence).
+fn debug_traces_stage_output(
+    main_name: &str,
+    counts: &crate::dbt_traces::artifact::CatalogCounts,
+) -> String {
+    format!(
+        "images/{main_name}/debug_traces (records={}, files={}, messages={}, quarantined={}, unresolved_messages={})",
+        counts.records,
+        counts.files,
+        counts.messages,
+        counts.quarantined,
+        counts.unresolved_messages
+    )
+}
+
+/// Run the `debug_traces` / `debug_traces_refs` stages for the MAIN split
+/// dir, recording both stage rows in order — between `thumb_enrich` and
+/// `source_tree` — or both as skipped (`"no MAIN image"` / `"no MAIN image
+/// binary"`) when the MAIN inputs are absent. Returns the retained
+/// per-image counters; `None` means the catalog stage did not produce a
+/// current catalog (failed, or no MAIN inputs at all).
+fn run_debug_traces_stages(
+    stages: &mut Vec<StageReport>,
+    out: &Path,
+    images_dir: &Path,
+) -> Option<DbtCounters> {
+    let Some(main_name) = main_image_dir_name(images_dir) else {
+        stages.push(StageReport::skipped("debug_traces", "no MAIN image"));
+        stages.push(StageReport::skipped("debug_traces_refs", "no MAIN image"));
+        return None;
+    };
+    let main_img_dir = images_dir.join(&main_name);
+    let main_bin = main_img_dir.join(format!("{main_name}.bin"));
+    if !main_bin.exists() {
+        stages.push(StageReport::skipped("debug_traces", "no MAIN image binary"));
+        stages.push(StageReport::skipped(
+            "debug_traces_refs",
+            "no MAIN image binary",
+        ));
+        return None;
+    }
+    run_debug_traces_stage(stages, out, &main_name, &main_img_dir, &main_bin)
+}
+
+/// Discover and publish the DBT debug-trace catalog for the MAIN image,
+/// then run the `debug_traces_refs` attribution stage over the published
+/// catalog. Both rows are recorded in `stages`. Failure of the catalog leg
+/// clears the owned output (authenticated absence) and skips refs; a
+/// successful clean absence is an ok row with zero counts. Returns the
+/// retained per-image counters, or `None` when the catalog leg failed.
+fn run_debug_traces_stage(
+    stages: &mut Vec<StageReport>,
+    out: &Path,
+    main_name: &str,
+    main_img_dir: &Path,
+    main_bin: &Path,
+) -> Option<DbtCounters> {
+    let started = Instant::now();
+    // The raw MAIN bytes must outlive the runtime view both stages share.
+    let raw = std::fs::read(main_bin);
+    let catalog = match raw {
+        Ok(ref raw) => run_debug_traces_catalog(raw, out, main_name, main_img_dir),
+        Err(error) => Err(error.into()),
+    };
+    match catalog {
+        Err(error) => {
+            let _ = crate::dbt_traces::artifact::clear(main_img_dir);
+            stages.push(StageReport::failed(
+                "debug_traces",
+                error.to_string(),
+                started.elapsed().as_millis(),
+            ));
+            stages.push(StageReport::skipped(
+                "debug_traces_refs",
+                "no debug traces catalog",
+            ));
+            None
+        }
+        Ok(DebugTracesCatalog::CleanAbsence) => {
+            stages.push(StageReport::ok(
+                "debug_traces",
+                &debug_traces_stage_output(
+                    main_name,
+                    &crate::dbt_traces::artifact::CatalogCounts {
+                        records: 0,
+                        files: 0,
+                        messages: 0,
+                        quarantined: 0,
+                        unresolved_messages: 0,
+                        occurrences: 0,
+                    },
+                ),
+                started.elapsed().as_millis(),
+            ));
+            stages.push(StageReport::skipped(
+                "debug_traces_refs",
+                "no debug traces catalog",
+            ));
+            Some(DbtCounters {
+                label: main_name.to_string(),
+                records: 0,
+                files: 0,
+                messages: 0,
+                quarantined: 0,
+                unresolved_messages: 0,
+                references: 0,
+                refs_producers: Vec::new(),
+            })
+        }
+        Ok(DebugTracesCatalog::Published {
+            runtime,
+            ctx,
+            counts,
+        }) => {
+            stages.push(StageReport::ok(
+                "debug_traces",
+                &debug_traces_stage_output(main_name, &counts),
+                started.elapsed().as_millis(),
+            ));
+            let (references, refs_producers) =
+                run_debug_traces_refs_stage(stages, main_name, main_img_dir, &runtime, &ctx);
+            Some(DbtCounters {
+                label: main_name.to_string(),
+                records: counts.records,
+                files: counts.files,
+                messages: counts.messages,
+                quarantined: counts.quarantined,
+                unresolved_messages: counts.unresolved_messages,
+                references,
+                refs_producers,
+            })
+        }
+    }
+}
+
+/// Build the MAIN runtime view, bind its identity (image hash plus the
+/// explicit scatter state pass 1 marshalled to disk — never derived from
+/// `debug_traces` artifact existence), then discover and publish the
+/// catalog by rename-swap. The spill directory is removed on every exit
+/// path after discovery starts.
+fn run_debug_traces_catalog<'raw>(
+    raw: &'raw [u8],
+    out: &Path,
+    main_name: &'raw str,
+    main_img_dir: &Path,
+) -> Result<DebugTracesCatalog<'raw>> {
+    let load_address = u32::try_from(
+        manifest::load_addr_for_image(&out.join("manifest.json"), main_name)?
+            .ok_or_else(|| Error::Serialize(format!("load_addr missing for {main_name}")))?,
+    )
+    .map_err(|_| Error::Serialize(format!("load_addr for {main_name} does not fit u32")))?;
+    let runtime =
+        crate::runtime_image::RuntimeImage::for_image_dir(raw, load_address, main_img_dir)?;
+    let scatter_path = main_img_dir.join("scatter").join("load_map.json");
+    let scatter_load_map_blake3 = if scatter_path.exists() {
+        Some(crate::execution_ranges::parse_blake3(
+            &manifest::blake3_file(&scatter_path)?,
+        )?)
+    } else {
+        None
+    };
+    let image_blake3 = runtime.hash_range(load_address, raw.len() as u32)?;
+    let ctx = crate::dbt_traces::artifact::DbtContext {
+        label: main_name,
+        image_blake3,
+        scatter_load_map_blake3,
+    };
+    let spill = main_img_dir.join(format!("dbt_spill+{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&spill);
+    let published = (|| -> Result<Option<crate::dbt_traces::artifact::MaterializedCatalog>> {
+        let discovery = crate::dbt_traces::discover::discover(&runtime, &spill)?;
+        Ok(crate::dbt_traces::artifact::publish(
+            &discovery,
+            &runtime,
+            &ctx,
+            main_img_dir,
+            true,
+        )?)
+    })();
+    let _ = std::fs::remove_dir_all(&spill);
+    match published? {
+        None => Ok(DebugTracesCatalog::CleanAbsence),
+        Some(map) => Ok(DebugTracesCatalog::Published {
+            runtime,
+            ctx,
+            counts: map.counts,
+        }),
+    }
+}
+
+/// Run the `debug_traces_refs` stage: re-validate the published catalog
+/// through the strict reader (same runtime, same expected identity), then
+/// attribute every record address over the authenticated function
+/// inventories pass 1 wrote under `main_img_dir/decompiled/`. Skips with a
+/// reason when the catalog or the function inventories are absent; a
+/// failure removes `references.json` (authenticated absence — `attribute`
+/// owns the removal on its own error paths, this covers the rest) and
+/// records a failed row. Returns `(reference count, producer names)` —
+/// `(0, [])` whenever the stage did not attribute.
+fn run_debug_traces_refs_stage(
+    stages: &mut Vec<StageReport>,
+    main_name: &str,
+    main_img_dir: &Path,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+    ctx: &crate::dbt_traces::artifact::DbtContext<'_>,
+) -> (usize, Vec<String>) {
+    let started = Instant::now();
+    let catalog_dir = main_img_dir.join("debug_traces");
+    if !catalog_dir.join("manifest.json").exists() {
+        stages.push(StageReport::skipped(
+            "debug_traces_refs",
+            "no debug traces catalog",
+        ));
+        return (0, Vec::new());
+    }
+    let decompiled_dir = main_img_dir.join("decompiled");
+    // The refs inputs bind both inventory files' content hashes; the Ghidra
+    // inventory is the non-optional leg (`RefsInputs::functions_blake3`).
+    // Ghidra-only is the valid degenerate (thumb binds null); without the
+    // Ghidra inventory there is nothing to hash or attribute through.
+    if !decompiled_dir.join("functions.json").exists() {
+        stages.push(StageReport::skipped(
+            "debug_traces_refs",
+            "no function inventories",
+        ));
+        return (0, Vec::new());
+    }
+    let result = (|| -> Result<(usize, Vec<String>)> {
+        let outcome =
+            crate::dbt_traces::attribute_published(runtime, ctx, &catalog_dir, &decompiled_dir)?;
+        let producers = outcome
+            .producers
+            .iter()
+            .map(|producer| crate::dbt_traces::refs::producer_name(*producer).to_string())
+            .collect();
+        Ok((outcome.count, producers))
+    })();
+    match result {
+        Ok((count, producers)) => {
+            stages.push(StageReport::ok(
+                "debug_traces_refs",
+                &format!(
+                    "images/{main_name}/debug_traces/references.json \
+                     (references={count}, producers=[{}])",
+                    producers.join(",")
+                ),
+                started.elapsed().as_millis(),
+            ));
+            (count, producers)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(catalog_dir.join("references.json"));
+            stages.push(StageReport::failed(
+                "debug_traces_refs",
+                error.to_string(),
+                started.elapsed().as_millis(),
+            ));
+            (0, Vec::new())
+        }
+    }
 }
 
 /// After pass 2, ExportDecomp.java has overwritten {ghidra}/export/{label}/
@@ -2797,6 +3164,16 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         }
     }
 
+    // 3c. DBT debug-trace catalog + reference attribution — MAIN only,
+    //     between thumb_enrich and the source tree: exact DBT record
+    //     evidence (file + line) outranks adjacency-derived attribution
+    //     for the same functions, so it is recorded before source
+    //     attribution consumes the inventories.
+    let dbt_outcomes = run_debug_traces_stages(&mut stages, out, &images_dir);
+    // Patch the counters onto the decompile stage's MAIN row; every later
+    // rebuild of those rows must re-apply them (see `DbtCounters`).
+    reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
+
     // 4. Source tree — MAIN image only. The MAIN split-dir name is
     //    model-dependent ("02_MAIN" on mustang/S5400, "01_MAIN" on cheetah/S5300);
     //    the TOC name "MAIN" is the stable key, so locate the `*_MAIN` split dir.
@@ -2848,12 +3225,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         load_address,
                         &main_img_dir,
                     )?;
+                    // Fail closed on a tampered dbt artifact: an invalid
+                    // references.json fails the stage rather than being
+                    // silently ignored; an absent one attributes nothing.
+                    let dbt = crate::dbt_traces::exact::load_exact_index(&main_img_dir)?;
                     recover_source::run(
                         &source_tree_dir,
                         &decompiled_dir,
                         &runtime,
                         &source_tree_dir.join("recovered_index.json"),
                         &recover_source::Opts::default(),
+                        dbt.as_ref(),
                     )
                 },
             );
@@ -3012,6 +3394,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 application_uninvoked,
             );
             if application_uninvoked {
+                // `record_globals_stage` just refreshed the decompile stage's
+                // rows (application is conclusively uninvoked on this
+                // route), which rebuilt them via `ImageReport::from_result`
+                // and nulled the `dbt_*` counters patched before this route
+                // ran — re-apply the retained outcome (see `DbtCounters`).
+                reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
                 stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
                 stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
                 // No pass 2 on this route, so `derive_global_types_maps` never
@@ -3176,6 +3564,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 decompile_stage_images_mut(&mut stages),
                 &global_shapes_outcomes,
             );
+            // Same hazard, same fix: the `dbt_*` counters were patched
+            // before this route ran (step 3c), and every DispatchPass2
+            // rebuild above nulls them along with the shape fields.
+            reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
         }
         SymbolRouteStep::RefreshGlobalShapes => {
             // Re-run the stage after the route's LAST rewrite of the
@@ -5517,6 +5909,13 @@ mod tests {
                         pal_names_applied: None,
                         pal_names_preserved: None,
                         pal_shared_entries: None,
+                        dbt_records: None,
+                        dbt_files: None,
+                        dbt_messages: None,
+                        dbt_quarantined: None,
+                        dbt_unresolved_messages: None,
+                        dbt_references: None,
+                        dbt_refs_producers: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -5571,6 +5970,13 @@ mod tests {
                         pal_names_applied: None,
                         pal_names_preserved: None,
                         pal_shared_entries: None,
+                        dbt_records: None,
+                        dbt_files: None,
+                        dbt_messages: None,
+                        dbt_quarantined: None,
+                        dbt_unresolved_messages: None,
+                        dbt_references: None,
+                        dbt_refs_producers: None,
                     },
                 ],
                 10,
@@ -6176,6 +6582,13 @@ mod tests {
             pal_names_applied: None,
             pal_names_preserved: None,
             pal_shared_entries: None,
+            dbt_records: None,
+            dbt_files: None,
+            dbt_messages: None,
+            dbt_quarantined: None,
+            dbt_unresolved_messages: None,
+            dbt_references: None,
+            dbt_refs_producers: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -9382,6 +9795,107 @@ mod tests {
         reapply_global_shapes_outcomes(&mut images, &outcomes);
         assert_nine_shape_counts(&images[0], None);
         assert!(images[0].global_shapes_error.is_none());
+    }
+
+    #[test]
+    fn dbt_counters_survive_refresh_decompile_stage_images() {
+        // The dbt twin of `global_shapes_outcomes_survive_refresh_...`:
+        // the `dbt_*` counters are patched between `thumb_enrich` and the
+        // source tree, before both the `RunGlobals(RecordOnly)` refresh and
+        // `DispatchPass2`'s rebuilds, which null them via
+        // `ImageReport::from_result` — unless `reapply_dbt_outcomes` runs
+        // afterward.
+        let counters = DbtCounters {
+            label: "02_MAIN".to_string(),
+            records: 7,
+            files: 2,
+            messages: 5,
+            quarantined: 1,
+            unresolved_messages: 3,
+            references: 4,
+            refs_producers: vec!["ghidra".to_string()],
+        };
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                ImageReport::from_result(&analyzed_image("02_MAIN")),
+                ImageReport::from_result(&analyzed_image("03_APM")),
+            ],
+            1,
+        )];
+        reapply_dbt_outcomes(
+            decompile_stage_images_mut(&mut stages),
+            &Some(counters.clone()),
+        );
+
+        // The initial patch landed on the MAIN row only.
+        assert_eq!(stages[0].images[0].dbt_records, Some(7));
+        assert_eq!(stages[0].images[0].dbt_references, Some(4));
+        assert_eq!(
+            stages[0].images[0].dbt_refs_producers,
+            Some(vec!["ghidra".to_string()])
+        );
+        assert!(stages[0].images[1].dbt_records.is_none());
+
+        // Simulate the later rebuild: the refresh alone nulls everything.
+        let rebuilt = vec![analyzed_image("02_MAIN"), analyzed_image("03_APM")];
+        refresh_decompile_stage_images(&mut stages, &rebuilt);
+        assert!(stages[0].images[0].dbt_records.is_none());
+        assert!(stages[0].images[0].dbt_refs_producers.is_none());
+
+        // The fix: re-applying the retained outcome restores it, still
+        // only on the MAIN row.
+        reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &Some(counters));
+        assert_eq!(stages[0].images[0].dbt_records, Some(7));
+        assert_eq!(stages[0].images[0].dbt_files, Some(2));
+        assert_eq!(stages[0].images[0].dbt_messages, Some(5));
+        assert_eq!(stages[0].images[0].dbt_quarantined, Some(1));
+        assert_eq!(stages[0].images[0].dbt_unresolved_messages, Some(3));
+        assert_eq!(stages[0].images[0].dbt_references, Some(4));
+        assert_eq!(
+            stages[0].images[0].dbt_refs_producers,
+            Some(vec!["ghidra".to_string()])
+        );
+        assert!(stages[0].images[1].dbt_records.is_none());
+    }
+
+    #[test]
+    fn reapply_dbt_outcomes_none_leaves_rows_untouched() {
+        let mut images = vec![ImageReport::from_result(&analyzed_image("02_MAIN"))];
+        reapply_dbt_outcomes(&mut images, &None);
+        assert!(images[0].dbt_records.is_none());
+        assert!(images[0].dbt_refs_producers.is_none());
+    }
+
+    #[test]
+    fn debug_traces_stages_skip_with_reasons_when_main_inputs_are_absent() {
+        let root = std::env::temp_dir().join(format!("pme_dbt_stage_skips_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+
+        // No MAIN split dir at all.
+        let mut stages = Vec::new();
+        let outcomes = run_debug_traces_stages(&mut stages, &root, &images_dir);
+        assert!(outcomes.is_none());
+        let names: Vec<&'static str> = stages.iter().map(|stage| stage.stage).collect();
+        assert_eq!(names, ["debug_traces", "debug_traces_refs"]);
+        for stage in &stages {
+            assert_eq!(stage.status, "skipped");
+            assert_eq!(stage.reason.as_deref(), Some("no MAIN image"));
+        }
+
+        // A MAIN split dir without its binary.
+        std::fs::create_dir_all(images_dir.join("02_MAIN")).unwrap();
+        let mut stages = Vec::new();
+        let outcomes = run_debug_traces_stages(&mut stages, &root, &images_dir);
+        assert!(outcomes.is_none());
+        let names: Vec<&'static str> = stages.iter().map(|stage| stage.stage).collect();
+        assert_eq!(names, ["debug_traces", "debug_traces_refs"]);
+        for stage in &stages {
+            assert_eq!(stage.status, "skipped");
+            assert_eq!(stage.reason.as_deref(), Some("no MAIN image binary"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
