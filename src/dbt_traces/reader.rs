@@ -1,11 +1,11 @@
 use crate::dbt_traces::artifact::{
-    CatalogCounts, DbtContext, ManifestWire, THRESHOLD, TableHashes, serialize_manifest,
+    CatalogCounts, DbtContext, ManifestWire, THRESHOLD, TableHashes, catalog_identity,
+    serialize_manifest,
 };
 use crate::dbt_traces::discover::{FourthCounts, fourth_word_variant};
 use crate::dbt_traces::{
     DbtTraceError, FORMAT, HEADER, MAX_LINE, MAX_QUARANTINED, RECORD_BYTES, SCHEMA_VERSION,
 };
-use crate::manifest::blake3_fixed;
 use crate::runtime_image::RuntimeImage;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -178,12 +178,11 @@ pub(crate) fn read(
     body_wire.identity = None;
     let body = serialize_manifest(&body_wire)?;
     let manifest_blake3 = *blake3::hash(&body).as_bytes();
-    let recomputed = format!(
-        "v1:{}:{}:{}:{}",
-        blake3_fixed(manifest_blake3),
+    let recomputed = catalog_identity(
+        manifest_blake3,
         wire.counts.records,
         wire.counts.files,
-        wire.counts.messages
+        wire.counts.messages,
     );
     if recomputed != identity {
         return Err(artifact(
@@ -571,6 +570,9 @@ impl<'de> Visitor<'de> for RecordsTableVisitor<'_> {
                     count = Some(map.next_value()?);
                 }
                 "records" => {
+                    if saw_records {
+                        return Err(de::Error::duplicate_field("records"));
+                    }
                     saw_records = true;
                     map.next_value_seed(RecordsSeq { scan: self.scan })?;
                 }
@@ -787,6 +789,9 @@ impl<'de> Visitor<'de> for StringTableVisitor<'_> {
                     count = Some(map.next_value()?);
                 }
                 key if key == self.table_key => {
+                    if saw_table {
+                        return Err(de::Error::duplicate_field(self.table_key));
+                    }
                     saw_table = true;
                     map.next_value_seed(StringEntries {
                         value_key: self.value_key,
@@ -1304,24 +1309,38 @@ mod tests {
         text
     }
 
-    fn rebind_records_hash(dir: &Path, text: &str, records: usize, files: usize, messages: usize) {
-        std::fs::write(dir.join("records.json"), text).unwrap();
-        let hash = crate::manifest::blake3_file(&dir.join("records.json")).unwrap();
+    fn rebind_table_hash(dir: &Path, file: &str, field: &str, text: &str, counts: &CatalogCounts) {
+        std::fs::write(dir.join(file), text).unwrap();
+        let hash = crate::manifest::blake3_file(&dir.join(file)).unwrap();
         let mut manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
-        let hash_at =
-            manifest.find("\"records_blake3\": \"").unwrap() + "\"records_blake3\": \"".len();
+        let needle = format!("\"{field}\": \"");
+        let hash_at = manifest.find(&needle).unwrap() + needle.len();
         let hash_end = hash_at + manifest[hash_at..].find('"').unwrap();
         manifest.replace_range(hash_at..hash_end, &hash);
         let identity_at = manifest.find(",\n  \"identity\": \"").unwrap();
         let body = format!("{}\n}}\n", &manifest[..identity_at]);
-        let digest = blake3_fixed(*blake3::hash(body.as_bytes()).as_bytes());
-        let identity = format!("v1:{digest}:{records}:{files}:{messages}");
+        let digest = *blake3::hash(body.as_bytes()).as_bytes();
+        let identity = crate::dbt_traces::artifact::catalog_identity(
+            digest,
+            counts.records,
+            counts.files,
+            counts.messages,
+        );
         manifest = format!(
             "{},\n  \"identity\": \"{}\"\n}}\n",
             &manifest[..identity_at],
             identity
         );
         std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+    }
+
+    fn duplicate_top_level_array(text: &str, key: &str) -> String {
+        let duplicated = text.replace("\n  ]\n}\n", &format!("\n  ],\n  \"{key}\": [\n  ]\n}}\n"));
+        assert_ne!(
+            text, duplicated,
+            "no top-level array tail found to duplicate"
+        );
+        duplicated
     }
 
     #[test]
@@ -1337,13 +1356,7 @@ mod tests {
                 value["records"].as_array_mut().unwrap().reverse();
                 value
             });
-            rebind_records_hash(
-                &dir,
-                &reversed,
-                counts.records,
-                counts.files,
-                counts.messages,
-            );
+            rebind_table_hash(&dir, "records.json", "records_blake3", &reversed, counts);
             let error = read(&dir, runtime, ctx).unwrap_err();
             let DbtTraceError::Artifact(message) = &error else {
                 panic!("expected Artifact error, got {error:?}");
@@ -1357,18 +1370,52 @@ mod tests {
                 value["count"] = serde_json::Value::from(4);
                 value
             });
-            rebind_records_hash(
-                &dir,
-                &inflated,
-                counts.records,
-                counts.files,
-                counts.messages,
-            );
+            rebind_table_hash(&dir, "records.json", "records_blake3", &inflated, counts);
             let error = read(&dir, runtime, ctx).unwrap_err();
             let DbtTraceError::Artifact(message) = &error else {
                 panic!("expected Artifact error, got {error:?}");
             };
             assert!(message.contains("count"), "message was {message}");
+        });
+    }
+
+    #[test]
+    fn read_rejects_duplicate_table_content_keys() {
+        with_catalog("rd-dup", 1, None, |parent, runtime, ctx, materialized| {
+            let dir = parent.join("debug_traces");
+            let records = std::fs::read_to_string(dir.join("records.json")).unwrap();
+            rebind_table_hash(
+                &dir,
+                "records.json",
+                "records_blake3",
+                &duplicate_top_level_array(&records, "records"),
+                &materialized.counts,
+            );
+            let error = read(&dir, runtime, ctx).unwrap_err();
+            let DbtTraceError::Artifact(message) = &error else {
+                panic!("expected Artifact error, got {error:?}");
+            };
+            assert!(
+                message.contains("duplicate field `records`"),
+                "message was {message}"
+            );
+
+            let messages = std::fs::read_to_string(dir.join("messages.json")).unwrap();
+            rebind_table_hash(
+                &dir,
+                "messages.json",
+                "messages_blake3",
+                &duplicate_top_level_array(&messages, "messages"),
+                &materialized.counts,
+            );
+            let error = read(&dir, runtime, ctx).unwrap_err();
+            let DbtTraceError::Artifact(message) = &error else {
+                panic!("expected Artifact error, got {error:?}");
+            };
+            assert!(
+                message.contains("duplicate field `messages`"),
+                "message was {message}"
+            );
         });
     }
 

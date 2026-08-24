@@ -186,7 +186,6 @@ fn read_bounded_string(runtime: &RuntimeImage<'_>, pointer: u32, max: usize) -> 
     None
 }
 
-#[allow(dead_code)]
 pub(crate) fn discover(
     runtime: &RuntimeImage<'_>,
     spill_dir: &Path,

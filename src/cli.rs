@@ -64,6 +64,14 @@ pub enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Decode the DBT debug-trace catalog of a modem.bin MAIN image.
+    DecodeTraces {
+        /// Path to the modem.bin (TOC) containing the MAIN image.
+        input: PathBuf,
+        /// Output directory (default: ./decoded_traces).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Summarize hardware_config.json (structural stats + RF_CFG coverage)
     HardwareConfig {
         input: PathBuf,
@@ -241,6 +249,11 @@ pub fn run() -> anyhow::Result<()> {
             let out = out.unwrap_or_else(|| PathBuf::from("./decoded_tokens"));
             crate::tokens::run(&input, &out)?; // run() prints the console report
         }
+        Commands::DecodeTraces { input, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from("./decoded_traces"));
+            let opts = crate::dbt_traces::Opts::default();
+            crate::dbt_traces::run(&input, &opts, &out)?; // run() prints the console report
+        }
         Commands::HardwareConfig { input, rf_dir, out } => {
             let out = out.unwrap_or_else(|| PathBuf::from("./hwcfg_summary"));
             // Standalone: record the user's path spelling verbatim as coverage provenance.
@@ -377,6 +390,20 @@ mod tests {
         match cli.command {
             Commands::DecodeTokens { input, out } => {
                 assert_eq!(input, PathBuf::from("/tmp/pw_token_db"));
+                assert_eq!(out, Some(PathBuf::from("/tmp/o")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_decode_traces() {
+        let cli =
+            Cli::try_parse_from(["pme", "decode-traces", "/tmp/modem.bin", "--out", "/tmp/o"])
+                .unwrap();
+        match cli.command {
+            Commands::DecodeTraces { input, out } => {
+                assert_eq!(input, PathBuf::from("/tmp/modem.bin"));
                 assert_eq!(out, Some(PathBuf::from("/tmp/o")));
             }
             _ => panic!("wrong subcommand"),

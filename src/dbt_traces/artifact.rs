@@ -71,7 +71,6 @@ pub(crate) struct ManifestWire {
     pub(crate) identity: Option<String>,
 }
 
-#[allow(dead_code)]
 pub(crate) fn publish(
     discovery: &Discovery,
     runtime: &RuntimeImage<'_>,
@@ -105,6 +104,23 @@ pub(crate) fn clear(parent: &Path) -> std::io::Result<()> {
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
+}
+
+/// The catalog identity shared by the writer and the reader: one format,
+/// defined once, so a read-back recomputation can never drift.
+pub(crate) fn catalog_identity(
+    manifest_blake3: [u8; 32],
+    records: usize,
+    files: usize,
+    messages: usize,
+) -> String {
+    format!(
+        "v1:{}:{}:{}:{}",
+        blake3_fixed(manifest_blake3),
+        records,
+        files,
+        messages
+    )
 }
 
 fn swap_into_place(parent: &Path, staging: &Path, pid: u32) -> Result<(), DbtTraceError> {
@@ -163,12 +179,11 @@ fn write_catalog(
     let mut wire = manifest_wire(discovery, runtime, ctx, counts, tables);
     let body = serialize_manifest(&wire)?;
     let manifest_blake3 = *blake3::hash(&body).as_bytes();
-    let identity = format!(
-        "v1:{}:{}:{}:{}",
-        blake3_fixed(manifest_blake3),
+    let identity = catalog_identity(
+        manifest_blake3,
         wire.counts.records,
         wire.counts.files,
-        wire.counts.messages
+        wire.counts.messages,
     );
     wire.identity = Some(identity.clone());
     let manifest = serialize_manifest(&wire)?;
