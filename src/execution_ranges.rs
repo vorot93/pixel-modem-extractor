@@ -60,6 +60,18 @@ impl FunctionOwner {
     }
 }
 
+/// Identity of one recovered-function evidence claim: the concrete owner,
+/// the entry address, and the authenticated execution digest when the
+/// inventory carried one. Shared by source attribution (recovered index
+/// writer and reader) and the DBT exact index; `execution_blake3` is `None`
+/// whenever the binding artifact does not carry an execution digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct FunctionEvidenceKey {
+    pub(crate) owner: FunctionOwner,
+    pub(crate) entry: u64,
+    pub(crate) execution_blake3: Option<[u8; 32]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OwnedExecutionIdentity {
     pub owner: FunctionOwner,

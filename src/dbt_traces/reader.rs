@@ -33,9 +33,8 @@ pub(crate) struct ValidatedCatalog {
 
 pub(crate) struct RecordWire {
     pub(crate) address: u32,
-    /// Carried on the wire and validated; reference attribution binds
-    /// addresses only.
-    #[allow(dead_code)]
+    /// Carried on the wire and validated; the dbt exact index joins record
+    /// addresses to their source file through it.
     pub(crate) file_id: u32,
     #[allow(dead_code)]
     pub(crate) line: u32,
@@ -55,7 +54,7 @@ fn hex_nibble(field: &str, byte: u8) -> Result<u8, DbtTraceError> {
     }
 }
 
-fn hex_word(field: &str, value: &str) -> Result<u32, DbtTraceError> {
+pub(crate) fn hex_word(field: &str, value: &str) -> Result<u32, DbtTraceError> {
     let digits = value
         .strip_prefix("0x")
         .ok_or_else(|| artifact(format!("field {field} lacks the 0x prefix")))?;
@@ -71,7 +70,7 @@ fn hex_word(field: &str, value: &str) -> Result<u32, DbtTraceError> {
     Ok(word)
 }
 
-fn hex_digest(field: &str, value: &str) -> Result<[u8; 32], DbtTraceError> {
+pub(crate) fn hex_digest(field: &str, value: &str) -> Result<[u8; 32], DbtTraceError> {
     if value.len() != 64 {
         return Err(artifact(format!(
             "field {field} is not a 64-digit hex digest"
@@ -194,25 +193,7 @@ pub(crate) fn read(
         ));
     }
 
-    for (name, file, bound) in [
-        ("files_blake3", "files.json", &wire.tables.files),
-        ("messages_blake3", "messages.json", &wire.tables.messages),
-        ("records_blake3", "records.json", &wire.tables.records),
-        (
-            "quarantine_blake3",
-            "quarantine.json",
-            &wire.tables.quarantine,
-        ),
-    ] {
-        let actual = crate::manifest::blake3_file(&dir.join(file))
-            .map_err(|error| artifact(format!("table {file} cannot be hashed: {error}")))?;
-        if &actual != bound {
-            return Err(artifact(format!(
-                "table {name} does not match the manifest hash"
-            )));
-        }
-    }
-
+    validate_table_hashes(dir, &wire.tables)?;
     validate_string_table(&dir.join("files.json"), "files", "path", wire.counts.files)?;
     validate_string_table(
         &dir.join("messages.json"),
@@ -230,6 +211,138 @@ pub(crate) fn read(
         image_blake3: wire.image_blake3,
         scatter_entries_used: wire.scatter_entries_used,
     })
+}
+
+/// The manifest's binding of every table file: each table's blake3 must
+/// match the hash the manifest carries, so any tampered table is rejected.
+fn validate_table_hashes(dir: &Path, tables: &TableHashes) -> Result<(), DbtTraceError> {
+    for (name, file, bound) in [
+        ("files_blake3", "files.json", &tables.files),
+        ("messages_blake3", "messages.json", &tables.messages),
+        ("records_blake3", "records.json", &tables.records),
+        ("quarantine_blake3", "quarantine.json", &tables.quarantine),
+    ] {
+        let actual = crate::manifest::blake3_file(&dir.join(file))
+            .map_err(|error| artifact(format!("table {file} cannot be hashed: {error}")))?;
+        if &actual != bound {
+            return Err(artifact(format!(
+                "table {name} does not match the manifest hash"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The manifest-side half of `read` without a runtime view: canonical
+/// bytes, envelope fields, the identity recomputation, and the four table
+/// hash bindings. Runtime-less consumers that join catalog tables (the dbt
+/// exact index) bind to the catalog through this instead.
+pub(crate) struct ManifestBinding {
+    pub(crate) image_blake3: [u8; 32],
+    pub(crate) manifest_blake3: [u8; 32],
+    pub(crate) identity: String,
+}
+
+pub(crate) fn manifest_binding(dir: &Path) -> Result<ManifestBinding, DbtTraceError> {
+    let bytes = read_manifest_bounded(&dir.join("manifest.json"))?;
+    let wire = parse_manifest(&bytes)?;
+
+    let canonical = serialize_manifest(&wire)?;
+    if canonical != bytes {
+        return Err(artifact("manifest bytes are not canonical"));
+    }
+    if wire.format != FORMAT {
+        return Err(artifact(format!(
+            "manifest format {:?} does not match {:?}",
+            wire.format, FORMAT
+        )));
+    }
+    if wire.schema_version != SCHEMA_VERSION {
+        return Err(artifact(format!(
+            "manifest schema_version {} does not match {SCHEMA_VERSION}",
+            wire.schema_version
+        )));
+    }
+    if wire.tool_version != env!("CARGO_PKG_VERSION") {
+        return Err(artifact(format!(
+            "manifest tool_version {:?} does not match the compiled crate version {:?}",
+            wire.tool_version,
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    validate_table_hashes(dir, &wire.tables)?;
+
+    let identity = wire.identity.clone().unwrap_or_default();
+    let mut body_wire = wire.clone();
+    body_wire.identity = None;
+    let manifest_blake3 = *blake3::hash(&serialize_manifest(&body_wire)?).as_bytes();
+    let recomputed = catalog_identity(
+        manifest_blake3,
+        wire.counts.records,
+        wire.counts.files,
+        wire.counts.messages,
+    );
+    if recomputed != identity {
+        return Err(artifact(
+            "manifest identity does not match the identity-less manifest body",
+        ));
+    }
+
+    Ok(ManifestBinding {
+        image_blake3: wire.image_blake3,
+        manifest_blake3,
+        identity,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesTableJson {
+    format: String,
+    schema_version: u64,
+    tool_version: String,
+    count: u64,
+    files: Vec<FilesEntryJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesEntryJson {
+    id: u64,
+    path: String,
+}
+
+/// Source paths from `files.json`, indexed by file id (the entry index).
+pub(crate) fn file_paths(dir: &Path) -> Result<Vec<String>, DbtTraceError> {
+    let bytes = std::fs::read(dir.join("files.json"))
+        .map_err(|error| artifact(format!("files table read failed: {error}")))?;
+    let table: FilesTableJson = serde_json::from_slice(&bytes)
+        .map_err(|error| artifact(format!("files table rejected: {error}")))?;
+    if table.format != FORMAT {
+        return Err(artifact("files-table format mismatch"));
+    }
+    if table.schema_version != u64::from(SCHEMA_VERSION) {
+        return Err(artifact("files-table schema_version mismatch"));
+    }
+    if table.tool_version != env!("CARGO_PKG_VERSION") {
+        return Err(artifact("files-table tool_version mismatch"));
+    }
+    if table.count != table.files.len() as u64 {
+        return Err(artifact(format!(
+            "files-table envelope count {} does not match its {} entries",
+            table.count,
+            table.files.len()
+        )));
+    }
+    for (index, entry) in table.files.iter().enumerate() {
+        if entry.id != index as u64 {
+            return Err(artifact(format!(
+                "files-table entry id {} is out of sequence, expected {index}",
+                entry.id
+            )));
+        }
+    }
+    Ok(table.files.into_iter().map(|entry| entry.path).collect())
 }
 
 fn read_manifest_bounded(path: &Path) -> Result<Vec<u8>, DbtTraceError> {

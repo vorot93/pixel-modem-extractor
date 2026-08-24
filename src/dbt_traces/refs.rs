@@ -476,6 +476,16 @@ pub(crate) fn producer_name(producer: AnalysisTool) -> &'static str {
     }
 }
 
+/// Inverse of `producer_name` for wire parsing; `None` on an unknown name.
+pub(crate) fn producer_from_name(name: &str) -> Option<AnalysisTool> {
+    match name {
+        "ghidra" => Some(AnalysisTool::Ghidra),
+        "radare2" => Some(AnalysisTool::Radare2),
+        "rizin" => Some(AnalysisTool::Rizin),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

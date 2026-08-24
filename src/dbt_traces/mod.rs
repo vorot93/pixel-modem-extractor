@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod artifact;
 pub(crate) mod discover;
+pub(crate) mod exact;
 pub(crate) mod reader;
 pub(crate) mod refs;
 pub(crate) mod wire;

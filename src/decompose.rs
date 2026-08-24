@@ -3251,12 +3251,17 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         load_address,
                         &main_img_dir,
                     )?;
+                    // Fail closed on a tampered dbt artifact: an invalid
+                    // references.json fails the stage rather than being
+                    // silently ignored; an absent one attributes nothing.
+                    let dbt = crate::dbt_traces::exact::load_exact_index(&main_img_dir)?;
                     recover_source::run(
                         &source_tree_dir,
                         &decompiled_dir,
                         &runtime,
                         &source_tree_dir.join("recovered_index.json"),
                         &recover_source::Opts::default(),
+                        dbt.as_ref(),
                     )
                 },
             );

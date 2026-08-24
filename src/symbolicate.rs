@@ -16,8 +16,8 @@
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::disasm_index::DisasmIndex;
 use crate::error::{Error, Result};
-use crate::execution_ranges::{ExecutionIdentity, FunctionOwner};
-use crate::recover_source::Tool;
+use crate::execution_ranges::{ExecutionIdentity, FunctionEvidenceKey, FunctionOwner};
+use crate::recover_source::{Confidence, Tool};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -291,13 +291,6 @@ pub struct FuncRec<'a> {
     pub tool: Tool,
     pub(crate) owner: FunctionOwner,
     pub(crate) execution: Option<ExecutionIdentity>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct FunctionEvidenceKey {
-    owner: FunctionOwner,
-    entry: u64,
-    execution_blake3: Option<[u8; 32]>,
 }
 
 /// 32-bit constants materialized by `movw`/`movt` (and lone `movw`) in a block
@@ -921,13 +914,32 @@ struct RiFn {
     #[serde(default)]
     execution_blake3: Option<String>,
     entry: String,
+    confidence: Confidence,
+}
+
+/// One identity's winning source-path claim: the path plus the confidence
+/// tier that won it (see `load_attribution`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttributionPath {
+    path: String,
+    confidence: Confidence,
+}
+
+fn tool_wire_name(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Ghidra => "ghidra",
+        Tool::Radare2 => "radare2",
+        Tool::Rizin => "rizin",
+    }
 }
 
 /// `(owner, entry-vaddr, execution digest) -> attributed source path` from
-/// `recovered_index.json`. Distinct executions may claim the same entry; one
-/// exact identity naming two paths is a hard failure. Returned as a `BTreeMap`
+/// `recovered_index.json`. Distinct executions may claim the same entry. One
+/// identity claiming several paths resolves by confidence rank: rows below
+/// the strongest tier are dropped, and only a same-tier path conflict is a
+/// hard failure (dbt_exact > direct > proximity). Returned as a `BTreeMap`
 /// (not `HashMap`) so repeated loads and conflict path order are deterministic.
-fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, String>> {
+fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, AttributionPath>> {
     let path = source_tree.join("recovered_index.json");
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -937,7 +949,8 @@ fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, 
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
     // Walk sources in path order so first-seen conflict path is stable.
     let sources: BTreeMap<String, RiSource> = idx.sources.into_iter().collect();
-    let mut m = BTreeMap::new();
+    let mut claims: BTreeMap<FunctionEvidenceKey, Vec<(String, Confidence, Tool)>> =
+        BTreeMap::new();
     for (src, s) in sources {
         for f in s.functions {
             let entry = parse_hex(&f.entry)?;
@@ -971,24 +984,46 @@ fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, 
                 entry,
                 execution_blake3,
             };
-            match m.get(&key) {
-                Some(prev) if prev == &src => {} // same identity + same path: idempotent
-                Some(prev) => {
-                    let tool = match f.tool {
-                        Tool::Ghidra => "ghidra",
-                        Tool::Radare2 => "radare2",
-                        Tool::Rizin => "rizin",
-                    };
-                    return Err(Error::DecomposeIncomplete(format!(
-                        "source attribution conflict for {tool} entry 0x{entry:x}: \
-                         {prev:?} vs {src:?}"
-                    )));
-                }
-                None => {
-                    m.insert(key, src.clone());
-                }
-            }
+            claims
+                .entry(key)
+                .or_default()
+                .push((src.clone(), f.confidence, f.tool));
         }
+    }
+    let mut m = BTreeMap::new();
+    for (key, rows) in claims {
+        let top = rows
+            .iter()
+            .map(|(_, confidence, _)| *confidence)
+            .max()
+            .expect("at least one claim per identity");
+        let top_paths: BTreeSet<&str> = rows
+            .iter()
+            .filter(|(_, confidence, _)| *confidence == top)
+            .map(|(path, _, _)| path.as_str())
+            .collect();
+        if top_paths.len() > 1 {
+            let ordered: Vec<&str> = top_paths.into_iter().collect();
+            return Err(Error::DecomposeIncomplete(format!(
+                "source attribution conflict for {} entry 0x{:x}: {:?} vs {:?}",
+                tool_wire_name(rows[0].2),
+                key.entry,
+                ordered.first(),
+                ordered.last()
+            )));
+        }
+        let path = top_paths
+            .into_iter()
+            .next()
+            .expect("one top-tier path")
+            .to_string();
+        m.insert(
+            key,
+            AttributionPath {
+                path,
+                confidence: top,
+            },
+        );
     }
     Ok(m)
 }
@@ -2044,7 +2079,7 @@ pub(crate) fn build_map(
                 entry: f.entry,
                 execution_blake3: f.execution.as_ref().map(|e| e.execution_blake3),
             })
-            .cloned();
+            .map(|claim| claim.path.clone());
         let fstrings = file
             .as_ref()
             .and_then(|p| file_strings.get(p))
@@ -2718,7 +2753,7 @@ mod tests {
             r#"{"files":{"A/x.c":{"occurrences":[{"vaddr":"0x100"}],"attributed_strings":["reest"]}}}"#).unwrap();
         std::fs::write(
             dir.join("recovered_index.json"),
-            r#"{"sources":{"A/x.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]}}}"#,
+            r#"{"sources":{"A/x.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"direct"}]}}}"#,
         )
         .unwrap();
         let (occ, strs) = load_file_occurrences(&dir).unwrap();
@@ -2731,8 +2766,8 @@ mod tests {
                 entry: 0x10,
                 execution_blake3: None,
             })
-            .map(String::as_str),
-            Some("A/x.c")
+            .map(|claim| (claim.path.as_str(), claim.confidence)),
+            Some(("A/x.c", Confidence::Direct))
         );
     }
 
@@ -2743,8 +2778,8 @@ mod tests {
         std::fs::write(
             dir.join("recovered_index.json"),
             r#"{"sources":{
-            "ghidra/a.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]},
-            "r2/b.c":{"functions":[{"tool":"radare2","entry":"0x10"}]}
+            "ghidra/a.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"direct"}]},
+            "r2/b.c":{"functions":[{"tool":"radare2","entry":"0x10","confidence":"direct"}]}
         }}"#,
         )
         .unwrap();
@@ -2755,7 +2790,7 @@ mod tests {
                 entry: 0x10,
                 execution_blake3: None,
             })
-            .map(String::as_str),
+            .map(|claim| claim.path.as_str()),
             Some("ghidra/a.c")
         );
         assert_eq!(
@@ -2766,7 +2801,7 @@ mod tests {
                 entry: 0x10,
                 execution_blake3: None,
             })
-            .map(String::as_str),
+            .map(|claim| claim.path.as_str()),
             Some("r2/b.c")
         );
     }
@@ -2796,14 +2831,16 @@ mod tests {
                         "region_index": 0,
                         "run_index": 0,
                         "execution_blake3": digest(funcs[0].execution.as_ref().unwrap().execution_blake3),
-                        "entry": "0x1000"
+                        "entry": "0x1000",
+                        "confidence": "direct"
                     }]},
                     "rizin/b.c": {"functions": [{
                         "tool": "rizin",
                         "region_index": 0,
                         "run_index": 1,
                         "execution_blake3": digest(funcs[1].execution.as_ref().unwrap().execution_blake3),
-                        "entry": "0x1000"
+                        "entry": "0x1000",
+                        "confidence": "direct"
                     }]}
                 }
             })
@@ -2839,7 +2876,7 @@ mod tests {
                     entry: funcs[0].entry,
                     execution_blake3: funcs[0].execution.as_ref().map(|e| e.execution_blake3),
                 })
-                .map(String::as_str),
+                .map(|claim| claim.path.as_str()),
             Some("r2/a.c")
         );
         assert_eq!(
@@ -2849,7 +2886,7 @@ mod tests {
                     entry: funcs[1].entry,
                     execution_blake3: funcs[1].execution.as_ref().map(|e| e.execution_blake3),
                 })
-                .map(String::as_str),
+                .map(|claim| claim.path.as_str()),
             Some("rizin/b.c")
         );
     }
@@ -2931,8 +2968,8 @@ mod tests {
         std::fs::write(
             dir.join("recovered_index.json"),
             r#"{"sources":{
-            "a.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]},
-            "b.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]}
+            "a.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"direct"}]},
+            "b.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"direct"}]}
         }}"#,
         )
         .unwrap();
@@ -2941,6 +2978,45 @@ mod tests {
         assert!(msg.contains("ghidra"), "{msg}");
         assert!(msg.contains("0x10") || msg.contains("10"), "{msg}");
         assert!(msg.contains("a.c") && msg.contains("b.c"), "{msg}");
+    }
+
+    #[test]
+    fn load_attribution_resolves_conflicts_by_confidence() {
+        // One identity claimed by a proximity row (a.c) and a dbt_exact row
+        // (b.c): the stronger tier wins, no error. Two same-tier (dbt_exact)
+        // claims for one identity remain a hard failure.
+        let dir = tmp("pme_sym_attr_tiered");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{
+            "a.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"proximity"}]},
+            "b.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"dbt_exact"}]}
+        }}"#,
+        )
+        .unwrap();
+        let attr = load_attribution(&dir).unwrap();
+        assert_eq!(
+            attr.get(&FunctionEvidenceKey {
+                owner: FunctionOwner::Ghidra,
+                entry: 0x10,
+                execution_blake3: None,
+            })
+            .map(|claim| (claim.path.as_str(), claim.confidence)),
+            Some(("b.c", Confidence::DbtExact))
+        );
+
+        std::fs::write(
+            dir.join("recovered_index.json"),
+            r#"{"sources":{
+            "c.c":{"functions":[{"tool":"ghidra","entry":"0x20","confidence":"dbt_exact"}]},
+            "d.c":{"functions":[{"tool":"ghidra","entry":"0x20","confidence":"dbt_exact"}]}
+        }}"#,
+        )
+        .unwrap();
+        let err = load_attribution(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("c.c") && msg.contains("d.c"), "{msg}");
     }
 
     #[test]
@@ -2962,8 +3038,8 @@ mod tests {
         std::fs::write(
             dir.join("recovered_index.json"),
             r#"{"sources":{
-            "ghidra/a.c":{"functions":[{"tool":"ghidra","entry":"0x10"}]},
-            "r2/b.c":{"functions":[{"tool":"radare2","entry":"0x10"}]}
+            "ghidra/a.c":{"functions":[{"tool":"ghidra","entry":"0x10","confidence":"direct"}]},
+            "r2/b.c":{"functions":[{"tool":"radare2","entry":"0x10","confidence":"direct"}]}
         }}"#,
         )
         .unwrap();
