@@ -139,6 +139,13 @@ struct RefRowJson {
 const REFERENCE_ISAS: [&str; 2] = ["arm", "thumb"];
 const REFERENCE_EVIDENCE_KINDS: [&str; 3] = ["movw_movt", "literal_load", "pc_relative"];
 
+/// The declared count is checked against the ceiling the moment it is seen
+/// (before any row streams), and streaming itself is bounded so a lying
+/// count cannot materialize unbounded rows.
+fn references_over_ceiling() -> String {
+    format!("references artifact exceeds the {MAX_REFERENCES}-row ceiling")
+}
+
 fn exact_row(row: RefRowJson) -> Result<ExactRow, DbtTraceError> {
     let record_address = reader::hex_word("reference record_address", &row.record_address)?;
     let function_entry = reader::hex_word("reference function_entry", &row.function_entry)?;
@@ -210,6 +217,9 @@ impl<'de> Visitor<'de> for RefsRows<'_> {
         while let Some(row) = seq.next_element::<RefRowJson>()? {
             let row = exact_row(row).map_err(serde::de::Error::custom)?;
             self.envelope.rows.push(row);
+            if self.envelope.rows.len() > MAX_REFERENCES {
+                return Err(serde::de::Error::custom(references_over_ceiling()));
+            }
         }
         Ok(())
     }
@@ -250,7 +260,13 @@ impl<'de> Visitor<'de> for RefsVisitor {
                         map.next_value()?,
                     )?;
                 }
-                "count" => set_once(&mut envelope.count, "count", map.next_value()?)?,
+                "count" => {
+                    let count: u64 = map.next_value()?;
+                    if count > MAX_REFERENCES as u64 {
+                        return Err(serde::de::Error::custom(references_over_ceiling()));
+                    }
+                    set_once(&mut envelope.count, "count", count)?;
+                }
                 "image" => {
                     set_once(
                         &mut envelope.image_blake3,
@@ -339,11 +355,6 @@ fn read_references(
         return Err(artifact(format!(
             "references artifact streamed {} rows but its envelope count is {count}",
             envelope.rows.len()
-        )));
-    }
-    if count > MAX_REFERENCES as u64 {
-        return Err(artifact(format!(
-            "references artifact exceeds the {MAX_REFERENCES}-row ceiling"
         )));
     }
     if !envelope.saw_references {
@@ -544,5 +555,23 @@ mod tests {
         let error = load_exact_index(tmp.path()).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("count"), "message was {message}");
+    }
+
+    #[test]
+    fn load_exact_index_rejects_an_over_ceiling_count_before_streaming() {
+        let tmp = fixture("exact-ceiling", true);
+        let refs_path = tmp.path().join("debug_traces/references.json");
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&refs_path).unwrap()).unwrap();
+
+        // An envelope count above the ceiling must fail on the ceiling itself
+        // (checked against the declared count before any row streams), not on
+        // the streamed-rows mismatch that would only fire after materializing.
+        let mut tampered = original.clone();
+        tampered["count"] = serde_json::json!(crate::dbt_traces::MAX_REFERENCES + 1);
+        std::fs::write(&refs_path, serde_json::to_string_pretty(&tampered).unwrap()).unwrap();
+        let error = load_exact_index(tmp.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ceiling"), "message was {message}");
     }
 }

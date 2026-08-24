@@ -100,33 +100,9 @@ pub(crate) fn read(
     runtime: &RuntimeImage<'_>,
     expected: &DbtContext<'_>,
 ) -> Result<ValidatedCatalog, DbtTraceError> {
-    let bytes = read_manifest_bounded(&dir.join("manifest.json"))?;
-    let wire = parse_manifest(&bytes)?;
+    let validated = validate_manifest(dir)?;
+    let wire = validated.wire;
 
-    let canonical = serialize_manifest(&wire)?;
-    if canonical != bytes {
-        return Err(artifact("manifest bytes are not canonical"));
-    }
-
-    if wire.format != FORMAT {
-        return Err(artifact(format!(
-            "manifest format {:?} does not match {:?}",
-            wire.format, FORMAT
-        )));
-    }
-    if wire.schema_version != SCHEMA_VERSION {
-        return Err(artifact(format!(
-            "manifest schema_version {} does not match {SCHEMA_VERSION}",
-            wire.schema_version
-        )));
-    }
-    if wire.tool_version != env!("CARGO_PKG_VERSION") {
-        return Err(artifact(format!(
-            "manifest tool_version {:?} does not match the compiled crate version {:?}",
-            wire.tool_version,
-            env!("CARGO_PKG_VERSION")
-        )));
-    }
     if wire.record_bytes != RECORD_BYTES {
         return Err(artifact(format!(
             "manifest scan.record_bytes {} does not match {RECORD_BYTES}",
@@ -176,24 +152,6 @@ pub(crate) fn read(
         )));
     }
 
-    let identity = wire.identity.clone().unwrap_or_default();
-    let mut body_wire = wire.clone();
-    body_wire.identity = None;
-    let body = serialize_manifest(&body_wire)?;
-    let manifest_blake3 = *blake3::hash(&body).as_bytes();
-    let recomputed = catalog_identity(
-        manifest_blake3,
-        wire.counts.records,
-        wire.counts.files,
-        wire.counts.messages,
-    );
-    if recomputed != identity {
-        return Err(artifact(
-            "manifest identity does not match the identity-less manifest body",
-        ));
-    }
-
-    validate_table_hashes(dir, &wire.tables)?;
     validate_string_table(&dir.join("files.json"), "files", "path", wire.counts.files)?;
     validate_string_table(
         &dir.join("messages.json"),
@@ -206,44 +164,20 @@ pub(crate) fn read(
 
     Ok(ValidatedCatalog {
         counts: wire.counts,
-        identity,
-        manifest_blake3,
+        identity: validated.identity,
+        manifest_blake3: validated.manifest_blake3,
         image_blake3: wire.image_blake3,
         scatter_entries_used: wire.scatter_entries_used,
     })
 }
 
-/// The manifest's binding of every table file: each table's blake3 must
-/// match the hash the manifest carries, so any tampered table is rejected.
-fn validate_table_hashes(dir: &Path, tables: &TableHashes) -> Result<(), DbtTraceError> {
-    for (name, file, bound) in [
-        ("files_blake3", "files.json", &tables.files),
-        ("messages_blake3", "messages.json", &tables.messages),
-        ("records_blake3", "records.json", &tables.records),
-        ("quarantine_blake3", "quarantine.json", &tables.quarantine),
-    ] {
-        let actual = crate::manifest::blake3_file(&dir.join(file))
-            .map_err(|error| artifact(format!("table {file} cannot be hashed: {error}")))?;
-        if &actual != bound {
-            return Err(artifact(format!(
-                "table {name} does not match the manifest hash"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The manifest-side half of `read` without a runtime view: canonical
-/// bytes, envelope fields, the identity recomputation, and the four table
-/// hash bindings. Runtime-less consumers that join catalog tables (the dbt
-/// exact index) bind to the catalog through this instead.
-pub(crate) struct ManifestBinding {
-    pub(crate) image_blake3: [u8; 32],
-    pub(crate) manifest_blake3: [u8; 32],
-    pub(crate) identity: String,
-}
-
-pub(crate) fn manifest_binding(dir: &Path) -> Result<ManifestBinding, DbtTraceError> {
+/// The manifest-side half of every catalog read: bounded canonical bytes,
+/// the format/schema/tool-version envelope pins, the four table-hash
+/// bindings, and the identity recomputation over the identity-less manifest
+/// body. Both `read` (which adds the scan pins, the runtime bindings, and
+/// the streaming table validation) and `manifest_binding` (the runtime-less
+/// consumer path) enter through here, so the two can never drift apart.
+fn validate_manifest(dir: &Path) -> Result<ValidatedManifest, DbtTraceError> {
     let bytes = read_manifest_bounded(&dir.join("manifest.json"))?;
     let wire = parse_manifest(&bytes)?;
 
@@ -288,61 +222,72 @@ pub(crate) fn manifest_binding(dir: &Path) -> Result<ManifestBinding, DbtTraceEr
         ));
     }
 
-    Ok(ManifestBinding {
-        image_blake3: wire.image_blake3,
-        manifest_blake3,
+    Ok(ValidatedManifest {
+        wire,
         identity,
+        manifest_blake3,
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesTableJson {
-    format: String,
-    schema_version: u64,
-    tool_version: String,
-    count: u64,
-    files: Vec<FilesEntryJson>,
+/// A catalog manifest that passed the shared envelope validation.
+struct ValidatedManifest {
+    wire: ManifestWire,
+    identity: String,
+    manifest_blake3: [u8; 32],
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesEntryJson {
-    id: u64,
-    path: String,
-}
-
-/// Source paths from `files.json`, indexed by file id (the entry index).
-pub(crate) fn file_paths(dir: &Path) -> Result<Vec<String>, DbtTraceError> {
-    let bytes = std::fs::read(dir.join("files.json"))
-        .map_err(|error| artifact(format!("files table read failed: {error}")))?;
-    let table: FilesTableJson = serde_json::from_slice(&bytes)
-        .map_err(|error| artifact(format!("files table rejected: {error}")))?;
-    if table.format != FORMAT {
-        return Err(artifact("files-table format mismatch"));
-    }
-    if table.schema_version != u64::from(SCHEMA_VERSION) {
-        return Err(artifact("files-table schema_version mismatch"));
-    }
-    if table.tool_version != env!("CARGO_PKG_VERSION") {
-        return Err(artifact("files-table tool_version mismatch"));
-    }
-    if table.count != table.files.len() as u64 {
-        return Err(artifact(format!(
-            "files-table envelope count {} does not match its {} entries",
-            table.count,
-            table.files.len()
-        )));
-    }
-    for (index, entry) in table.files.iter().enumerate() {
-        if entry.id != index as u64 {
+/// The manifest's binding of every table file: each table's blake3 must
+/// match the hash the manifest carries, so any tampered table is rejected.
+fn validate_table_hashes(dir: &Path, tables: &TableHashes) -> Result<(), DbtTraceError> {
+    for (name, file, bound) in [
+        ("files_blake3", "files.json", &tables.files),
+        ("messages_blake3", "messages.json", &tables.messages),
+        ("records_blake3", "records.json", &tables.records),
+        ("quarantine_blake3", "quarantine.json", &tables.quarantine),
+    ] {
+        let actual = crate::manifest::blake3_file(&dir.join(file))
+            .map_err(|error| artifact(format!("table {file} cannot be hashed: {error}")))?;
+        if &actual != bound {
             return Err(artifact(format!(
-                "files-table entry id {} is out of sequence, expected {index}",
-                entry.id
+                "table {name} does not match the manifest hash"
             )));
         }
     }
-    Ok(table.files.into_iter().map(|entry| entry.path).collect())
+    Ok(())
+}
+
+/// The runtime-less consumer's binding to a published catalog: everything
+/// `validate_manifest` authenticates plus the image digest. Consumers that
+/// join catalog tables (the dbt exact index) bind to the catalog through
+/// this instead of `read`.
+pub(crate) struct ManifestBinding {
+    pub(crate) image_blake3: [u8; 32],
+    pub(crate) manifest_blake3: [u8; 32],
+    pub(crate) identity: String,
+}
+
+pub(crate) fn manifest_binding(dir: &Path) -> Result<ManifestBinding, DbtTraceError> {
+    let validated = validate_manifest(dir)?;
+    Ok(ManifestBinding {
+        image_blake3: validated.wire.image_blake3,
+        manifest_blake3: validated.manifest_blake3,
+        identity: validated.identity,
+    })
+}
+
+/// Source paths from `files.json`, indexed by file id (the entry index).
+/// Streams through the shared string-table reader; with no manifest at
+/// hand, the envelope count is validated against the streamed entries.
+pub(crate) fn file_paths(dir: &Path) -> Result<Vec<String>, DbtTraceError> {
+    let mut paths = Vec::new();
+    read_string_table(
+        &dir.join("files.json"),
+        "files",
+        "path",
+        None,
+        Some(&mut paths),
+    )?;
+    Ok(paths)
 }
 
 fn read_manifest_bounded(path: &Path) -> Result<Vec<u8>, DbtTraceError> {
@@ -754,6 +699,9 @@ struct StringEntryVisitor<'scan> {
     value_key: &'static str,
     expected_id: u64,
     seen: &'scan mut usize,
+    /// When set, the entry's value is collected instead of discarded: the
+    /// one string-table reader serves both validation and `file_paths`.
+    sink: Option<&'scan mut Vec<String>>,
 }
 
 impl<'de> DeserializeSeed<'de> for StringEntryVisitor<'_> {
@@ -803,15 +751,16 @@ impl<'de> Visitor<'de> for StringEntryVisitor<'_> {
                 }
             }
         }
-        if value.is_none() {
-            return Err(de::Error::missing_field(self.value_key));
-        }
+        let value = value.ok_or_else(|| de::Error::missing_field(self.value_key))?;
         let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
         if id != self.expected_id {
             return Err(de::Error::custom(format!(
                 "string-table entry id {id} is out of sequence, expected {}",
                 self.expected_id
             )));
+        }
+        if let Some(sink) = self.sink {
+            sink.push(value);
         }
         *self.seen += 1;
         Ok(())
@@ -821,6 +770,7 @@ impl<'de> Visitor<'de> for StringEntryVisitor<'_> {
 struct StringEntries<'scan> {
     value_key: &'static str,
     seen: &'scan mut usize,
+    sink: Option<&'scan mut Vec<String>>,
 }
 
 impl<'de> DeserializeSeed<'de> for StringEntries<'_> {
@@ -841,7 +791,7 @@ impl<'de> Visitor<'de> for StringEntries<'_> {
         formatter.write_str("a string-table array")
     }
 
-    fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+    fn visit_seq<A>(mut self, mut seq: A) -> Result<(), A::Error>
     where
         A: SeqAccess<'de>,
     {
@@ -850,6 +800,7 @@ impl<'de> Visitor<'de> for StringEntries<'_> {
             value_key: self.value_key,
             expected_id,
             seen: self.seen,
+            sink: self.sink.as_deref_mut(),
         })? {
             expected_id += 1;
         }
@@ -860,8 +811,12 @@ impl<'de> Visitor<'de> for StringEntries<'_> {
 struct StringTableVisitor<'scan> {
     table_key: &'static str,
     value_key: &'static str,
-    expected_count: usize,
+    /// The manifest count the envelope must match, when a manifest is at
+    /// hand; `None` validates the envelope count against its own entries
+    /// only (the runtime-less `file_paths` path).
+    expected_count: Option<usize>,
     seen: &'scan mut usize,
+    sink: Option<&'scan mut Vec<String>>,
 }
 
 impl<'de> Visitor<'de> for StringTableVisitor<'_> {
@@ -871,7 +826,7 @@ impl<'de> Visitor<'de> for StringTableVisitor<'_> {
         formatter.write_str("a string table")
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    fn visit_map<A>(mut self, mut map: A) -> Result<(), A::Error>
     where
         A: MapAccess<'de>,
     {
@@ -914,6 +869,7 @@ impl<'de> Visitor<'de> for StringTableVisitor<'_> {
                     map.next_value_seed(StringEntries {
                         value_key: self.value_key,
                         seen: self.seen,
+                        sink: self.sink.as_deref_mut(),
                     })?;
                 }
                 other => {
@@ -933,10 +889,11 @@ impl<'de> Visitor<'de> for StringTableVisitor<'_> {
             return Err(de::Error::custom("string-table tool_version mismatch"));
         }
         let count = count.ok_or_else(|| de::Error::missing_field("count"))?;
-        if count != self.expected_count as u64 {
+        if let Some(expected) = self.expected_count
+            && count != expected as u64
+        {
             return Err(de::Error::custom(format!(
-                "string-table envelope count {count} does not match the manifest {}",
-                self.expected_count
+                "string-table envelope count {count} does not match the manifest {expected}"
             )));
         }
         if *self.seen as u64 != count {
@@ -952,11 +909,14 @@ impl<'de> Visitor<'de> for StringTableVisitor<'_> {
     }
 }
 
-fn validate_string_table(
+/// Stream one string table, validating its envelope, id sequence, and
+/// (when given) the manifest count; `sink` optionally collects the values.
+fn read_string_table(
     path: &Path,
     table_key: &'static str,
     value_key: &'static str,
-    expected_count: usize,
+    expected_count: Option<usize>,
+    sink: Option<&mut Vec<String>>,
 ) -> Result<(), DbtTraceError> {
     let file = std::fs::File::open(path)
         .map_err(|error| artifact(format!("{table_key} table open failed: {error}")))?;
@@ -967,11 +927,21 @@ fn validate_string_table(
         value_key,
         expected_count,
         seen: &mut seen,
+        sink,
     });
     match parsed.and_then(|()| deserializer.end()) {
         Ok(()) => Ok(()),
         Err(error) => Err(artifact(format!("{table_key} table rejected: {error}"))),
     }
+}
+
+fn validate_string_table(
+    path: &Path,
+    table_key: &'static str,
+    value_key: &'static str,
+    expected_count: usize,
+) -> Result<(), DbtTraceError> {
+    read_string_table(path, table_key, value_key, Some(expected_count), None)
 }
 
 #[derive(Deserialize)]
