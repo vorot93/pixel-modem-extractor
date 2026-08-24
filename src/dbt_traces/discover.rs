@@ -154,7 +154,7 @@ fn resolve_message(runtime: &RuntimeImage<'_>, pointer: u32) -> MessageResolutio
                     Err(_) => MessageResolution::Bad(QuarantineReason::MessageInvalidBytes),
                 };
             }
-            if byte != b'\t' && !(0x20..=0x7e).contains(&byte) {
+            if !matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e) {
                 return MessageResolution::Bad(QuarantineReason::MessageInvalidBytes);
             }
             bytes.push(byte);
@@ -636,6 +636,21 @@ mod tests {
         assert_eq!(discovery.record_count, 1);
         assert_eq!(discovery.unresolved_messages, 1);
         assert!(discovery.quarantined.is_empty());
+    }
+
+    #[test]
+    fn cr_and_lf_in_messages_are_discovered_not_quarantined() {
+        let (mut image, file_off, _) = layout();
+        image.resize(0x200 + 2 * RECORD_BYTES, 0);
+        image[0x140..0x148].copy_from_slice(b"line\n%d\0");
+        image[0x160..0x167].copy_from_slice(b"ret\r%d\0");
+        image[0x200..0x21c].copy_from_slice(&record(good_record(file_off, 0x140)));
+        image[0x21c..0x238].copy_from_slice(&record(good_record(file_off, 0x160)));
+        let (discovery, _dir) = discover_tmp(&image);
+        assert_eq!(discovery.record_count, 2);
+        assert!(discovery.quarantined.is_empty());
+        assert!(discovery.messages.iter().any(|text| text == "line\n%d"));
+        assert!(discovery.messages.iter().any(|text| text == "ret\r%d"));
     }
 
     #[test]
