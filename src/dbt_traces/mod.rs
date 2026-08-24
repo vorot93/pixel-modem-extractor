@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub(crate) mod discover;
+
 #[allow(dead_code)]
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-debug-traces-v1";
 #[allow(dead_code)]
@@ -38,6 +40,8 @@ pub enum DbtTraceError {
     ReferenceCap(usize),
     #[error("dbt traces: scatter discovery failed: {0}")]
     Scatter(#[source] crate::scatter::ScatterError),
+    #[error("dbt traces: runtime read failed: {0}")]
+    Runtime(#[from] crate::error::Error),
     #[error("dbt traces: artifact rejected: {0}")]
     Artifact(String),
 }
