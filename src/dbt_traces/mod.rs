@@ -112,6 +112,81 @@ pub fn run(input: &Path, _opts: &Opts, out: &Path) -> crate::error::Result<PathB
     Ok(out)
 }
 
+/// Rebuild the standalone runtime `run` used (TOC MAIN + scatter already
+/// under `out`) and publish `debug_traces/references.json` from the
+/// authenticated inventories in `decompiled_dir`.
+pub fn run_refs(out: &Path, input: &Path, decompiled_dir: &Path) -> crate::error::Result<usize> {
+    let data = std::fs::read(input)?;
+    let toc = crate::toc::Toc::parse(&data)?;
+    let main = toc
+        .entries
+        .iter()
+        .find(|image| image.name == "MAIN")
+        .ok_or_else(|| DbtTraceError::Artifact("no MAIN image in TOC".into()))?;
+    let start = main.offset as usize;
+    let end = start
+        .checked_add(main.size as usize)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| DbtTraceError::Artifact("MAIN image range escapes the TOC file".into()))?;
+    let raw = &data[start..end];
+    let base = main.load_addr;
+
+    let out = std::fs::canonicalize(out)?;
+    let map = out.join("scatter/MAIN/load_map.json");
+    let (runtime, scatter_load_map_blake3) = if map.exists() {
+        let digest = crate::execution_ranges::parse_blake3(&crate::manifest::blake3_file(&map)?)?;
+        let runtime =
+            crate::runtime_image::RuntimeImage::from_artifact(raw, base, &out, Some(&map))?;
+        (runtime, Some(digest))
+    } else {
+        (
+            crate::runtime_image::RuntimeImage::from_plan(raw, base, None)?,
+            None,
+        )
+    };
+    let image_blake3 = runtime.hash_range(base, raw.len() as u32)?;
+    let ctx = artifact::DbtContext {
+        label: "MAIN",
+        image_blake3,
+        scatter_load_map_blake3,
+    };
+
+    let catalog_dir = out.join("debug_traces");
+    let catalog = reader::read(&catalog_dir, &runtime, &ctx)?;
+    let mut record_addresses = Vec::with_capacity(catalog.counts.records);
+    for record in reader::iter_records(&catalog_dir) {
+        record_addresses.push(record?.address);
+    }
+
+    let functions_path = decompiled_dir.join("functions.json");
+    if !functions_path.exists() {
+        return Err(DbtTraceError::Artifact("no function inventories".into()).into());
+    }
+    let mut functions = refs::load_functions(decompiled_dir, &runtime)?.unwrap_or_default();
+    if let Some(thumb) = refs::load_thumb(decompiled_dir, &runtime)? {
+        functions.extend(thumb);
+    }
+    let thumb_path = decompiled_dir.join("thumb_functions.json");
+    let inputs = refs::RefsInputs {
+        functions_blake3: crate::manifest::blake3_file(&functions_path)?,
+        thumb_functions_blake3: if thumb_path.exists() {
+            Some(crate::manifest::blake3_file(&thumb_path)?)
+        } else {
+            None
+        },
+    };
+    let out_path = catalog_dir.join("references.json");
+    let outcome = refs::attribute(
+        &runtime,
+        &record_addresses,
+        &functions,
+        &catalog,
+        inputs,
+        &out_path,
+    )?;
+    Ok(outcome.count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
