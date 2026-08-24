@@ -52,8 +52,8 @@ pub enum Tier {
 }
 
 /// `symbols.json` format tag (v2 introduced the tagged evidence model and
-/// `name_conflicts`).
-pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v2";
+/// `name_conflicts`; v3 adds `dbt_source` evidence and its annotations).
+pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v3";
 
 /// Strict pass-2 map format name shared with the Java reader.
 pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v2";
@@ -66,7 +66,8 @@ pub const MAX_PRIMARY_CHARS: usize = 2000;
 
 /// Explicit naming authority. Lower rank (ordinal) is stronger; the order is
 /// the pinned precedence `__func__ > registration > pal_task > token >
-/// string_ref`. `file` evidence carries no authority (annotation-only).
+/// string_ref`. `file` and `dbt_source` evidence carry no authority
+/// (annotation-only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Authority {
@@ -151,6 +152,9 @@ pub enum TaggedEvidence {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         strings: Vec<String>,
     },
+    DbtSource {
+        path: String,
+    },
     StringRef {
         value: String,
         class: &'static str,
@@ -165,6 +169,7 @@ impl TaggedEvidence {
             Self::PalTask { .. } => "pal_task",
             Self::Token { .. } => "token",
             Self::File { .. } => "file",
+            Self::DbtSource { .. } => "dbt_source",
             Self::StringRef { .. } => "string_ref",
         }
     }
@@ -262,6 +267,10 @@ pub struct RawEvidence {
     pub tokens: Vec<(u32, String)>, // (token, raw DB string)
     pub file: Option<String>,       // attributed source path
     pub file_strings: Vec<String>,  // that file's attributed_strings
+    /// Distinct source paths attributed to this function by exact DBT trace
+    /// attribution (`Confidence::DbtExact`), sorted. Annotation-only like
+    /// `file`; `decide` caps the evidence/annotation pairs at six.
+    pub dbt_sources: Vec<String>,
     pub ident_guess: Option<(String, name_guess::Class)>, // string_ref_guess output
     /// Authoritative name recovered from a `{name, fn}` registration table
     /// (`reg_table::scan`). Outranks pal_task, token, and string-ref; only
@@ -537,6 +546,15 @@ pub fn decide(
             .collect::<Vec<_>>()
             .join(", ");
         ann.push(format!("file-strings: {joined}"));
+    }
+    // DBT-exact source attribution is annotation-only, like `file` evidence:
+    // it proposes no name and occupies no rank, so naming precedence is
+    // untouched. Mirrors the file-strings take(6) bound: at most six
+    // evidence/annotation pairs survive regardless of what the producer put
+    // in `dbt_sources`.
+    for path in raw.dbt_sources.iter().take(6) {
+        ev.push(TaggedEvidence::DbtSource { path: path.clone() });
+        ann.push(format!("dbt-source: {path}"));
     }
 
     // Registration evidence is always recorded (even when `__func__` outranks
@@ -2073,13 +2091,19 @@ pub(crate) fn build_map(
                 applied: app.desired_primary == f.name,
                 tasks: app.tasks.clone(),
             });
-        let file = attribution
-            .get(&FunctionEvidenceKey {
-                owner: f.owner,
-                entry: f.entry,
-                execution_blake3: f.execution.as_ref().map(|e| e.execution_blake3),
-            })
-            .map(|claim| claim.path.clone());
+        let claim = attribution.get(&FunctionEvidenceKey {
+            owner: f.owner,
+            entry: f.entry,
+            execution_blake3: f.execution.as_ref().map(|e| e.execution_blake3),
+        });
+        let file = claim.map(|claim| claim.path.clone());
+        // Exact DBT trace attribution rides the same lookup: only a DbtExact
+        // winner carries dbt-source evidence. Attribution resolves to one
+        // path per key, so the list is distinct and sorted by construction.
+        let dbt_sources = match claim {
+            Some(claim) if claim.confidence == Confidence::DbtExact => vec![claim.path.clone()],
+            _ => Vec::new(),
+        };
         let fstrings = file
             .as_ref()
             .and_then(|p| file_strings.get(p))
@@ -2110,6 +2134,7 @@ pub(crate) fn build_map(
             tokens: hits,
             file,
             file_strings: fstrings,
+            dbt_sources,
             ident_guess,
             registration: if is_real_name(&f.name) && !pal_applied {
                 None
@@ -2491,6 +2516,7 @@ mod tests {
             tokens: vec![],
             file: None,
             file_strings: vec![],
+            dbt_sources: vec![],
             ident_guess: None,
             registration: None,
             pal: None,
@@ -2541,6 +2567,57 @@ mod tests {
         assert_eq!(tier, Tier::None);
         assert!(ann.iter().any(|a| a.starts_with("file: HEDGE/LteRrc.c")));
         assert!(ann.iter().any(|a| a.starts_with("file-strings:")));
+    }
+
+    #[test]
+    fn dbt_exact_attribution_yields_dbt_source_evidence_and_annotation() {
+        let r = RawEvidence {
+            dbt_sources: vec!["modem/pal/msg.c".into()],
+            ..raw()
+        };
+        let (name, tier, ev, ann, conflicts) = decide("40e1bff4", &r);
+        // Annotation-only: no name proposal, no rank occupied, record-only tier.
+        assert_eq!(name, None);
+        assert_eq!(tier, Tier::None);
+        assert!(conflicts.is_empty());
+        assert!(ann.iter().any(|a| a == "dbt-source: modem/pal/msg.c"));
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            TaggedEvidence::DbtSource { path } if path == "modem/pal/msg.c"
+        )));
+    }
+
+    #[test]
+    fn dbt_annotations_are_bounded_to_six_distinct_paths() {
+        let r = RawEvidence {
+            dbt_sources: (1..=8).map(|i| format!("src/f{i}.c")).collect(),
+            ..raw()
+        };
+        let (_name, tier, ev, ann, _) = decide("40e1bff4", &r);
+        assert_eq!(tier, Tier::None);
+        let dbt_ann: Vec<&String> = ann
+            .iter()
+            .filter(|a| a.starts_with("dbt-source: "))
+            .collect();
+        assert_eq!(dbt_ann.len(), 6, "annotations were {ann:?}");
+        assert_eq!(dbt_ann[0], "dbt-source: src/f1.c");
+        assert_eq!(dbt_ann[5], "dbt-source: src/f6.c");
+        assert_eq!(ev.iter().filter(|e| e.kind() == "dbt_source").count(), 6);
+    }
+
+    #[test]
+    fn dbt_evidence_never_changes_a_winning_name_or_tier() {
+        // A recovered __func__ plus dbt evidence: the annotation rides along
+        // without touching the name or tier the stronger evidence won.
+        let r = RawEvidence {
+            func_name: Some("Real_Name".into()),
+            dbt_sources: vec!["modem/pal/msg.c".into()],
+            ..raw()
+        };
+        let (name, tier, _ev, ann, _) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Real_Name"));
+        assert_eq!(tier, Tier::Recovered);
+        assert!(ann.iter().any(|a| a == "dbt-source: modem/pal/msg.c"));
     }
 
     #[test]
@@ -3457,6 +3534,74 @@ mod tests {
         // decompiled.c rewritten in place
         let c = std::fs::read_to_string(dec.join("decompiled.c")).unwrap();
         assert!(c.contains("guess_") && !c.contains("FUN_10"));
+    }
+
+    #[test]
+    fn dbt_exact_attribution_surfaces_in_symbols_json() {
+        let root = tmp("pme_sym_dbt_source");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let image = vec![0u8; 0x20];
+        std::fs::write(
+            dec.join("functions.json"),
+            serde_json::to_vec(&vec![ghidra_function_in_image(
+                "FUN_10",
+                0x10,
+                0x18,
+                &[],
+                &image,
+                0,
+            )])
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x10: 4770 bx lr\n").unwrap();
+        std::fs::write(dec.join("decompiled.c"), "void FUN_10(void){}\n").unwrap();
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &image).unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(&manifest, r#"{"toc":[{"name":"MAIN","load_addr":0}]}"#).unwrap();
+        // One dbt_exact claim for this execution identity; a direct claim for
+        // a different entry proves the population is key- and tier-gated.
+        let (_, digest) = identity_for(&root.join("images/02_MAIN"), 0x10, &image, 0);
+        let source_tree = root.join("images/02_MAIN/source_tree");
+        std::fs::create_dir_all(&source_tree).unwrap();
+        std::fs::write(
+            source_tree.join("recovered_index.json"),
+            format!(
+                r#"{{"sources":{{
+                "modem/pal/msg.c":{{"functions":[{{"tool":"ghidra","execution_blake3":"{digest}","entry":"0x10","confidence":"dbt_exact"}}]}},
+                "other/prox.c":{{"functions":[{{"tool":"ghidra","entry":"0x14","confidence":"proximity"}}]}}
+            }}}}"#
+            ),
+        )
+        .unwrap();
+
+        symbolicate_image(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+        )
+        .unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dec.join("symbols.json")).unwrap()).unwrap();
+        assert_eq!(v["format"], "pixel-modem-extractor-symbols-v3");
+        assert_eq!(v["symbols"].as_array().unwrap().len(), 1);
+        let symbol = &v["symbols"][0];
+        let evidence = symbol["evidence"].as_array().unwrap();
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e["kind"] == "dbt_source" && e["path"] == "modem/pal/msg.c")
+        );
+        let annotations = symbol["annotations"].as_array().unwrap();
+        assert!(
+            annotations
+                .iter()
+                .any(|a| a == "dbt-source: modem/pal/msg.c"),
+            "annotations were {annotations:?}"
+        );
     }
 
     #[test]
