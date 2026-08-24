@@ -15,7 +15,7 @@ use crate::runtime_image::{RuntimeImage, StorageSpan};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-mod artifact;
+pub(crate) mod artifact;
 mod cfg;
 mod discover;
 mod table;

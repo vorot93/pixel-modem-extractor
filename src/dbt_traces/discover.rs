@@ -1,18 +1,15 @@
+use crate::runtime_image::{MAX_EXACT_READ, RuntimeImage, StorageKind};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::runtime_image::{MAX_EXACT_READ, RuntimeImage, StorageKind};
-
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct DbtOccurrence {
     pub address: u32,
     pub aligned: bool,
 }
 
-#[allow(dead_code)]
 pub(crate) fn sweep_occurrences(
     runtime: &RuntimeImage<'_>,
 ) -> Result<Vec<DbtOccurrence>, super::DbtTraceError> {
@@ -54,7 +51,6 @@ pub(crate) fn sweep_occurrences_capped(
     Ok(occurrences)
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum MessageRef {
     Text(u32),
@@ -64,23 +60,21 @@ pub(crate) enum MessageRef {
     },
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum UnmappedStorage {
     Unmapped,
     ScatterZero,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuarantineReason {
+    #[allow(dead_code)]
     MessageUnterminated,
     MessageOverCap,
     MessageInvalidBytes,
     PointerWrap,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuarantinedRecord {
     pub address: u32,
@@ -88,7 +82,6 @@ pub(crate) struct QuarantinedRecord {
     pub raw_words: [u32; 7],
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FourthCounts {
     pub parameter_count: u64,
@@ -96,7 +89,6 @@ pub(crate) struct FourthCounts {
     pub unknown: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct Discovery {
     pub spill_path: PathBuf,
@@ -348,15 +340,32 @@ fn classify_fourth(discovery: &mut Discovery, raw: u32) {
 #[cfg(test)]
 pub(crate) mod testkit {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(crate) const BASE: u32 = 0x4000_0000;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
-    pub(crate) fn unique_dir(prefix: &str) -> std::path::PathBuf {
+    pub(crate) struct TestDir(PathBuf);
+
+    impl TestDir {
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub(crate) fn unique_dir(prefix: &str) -> TestDir {
         let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("{prefix}-{n}-{}", std::process::id()))
+        let path = std::env::temp_dir().join(format!("{prefix}-{n}-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        TestDir(path)
     }
 
     pub(crate) fn ptr(offset: usize) -> u32 {
@@ -404,11 +413,11 @@ pub(crate) mod testkit {
         (image, 0x100, 0x140)
     }
 
-    pub(crate) fn discover_tmp(image: &[u8]) -> Discovery {
+    pub(crate) fn discover_tmp(image: &[u8]) -> (Discovery, TestDir) {
         let runtime = RuntimeImage::from_plan(image, BASE, None).unwrap();
         let dir = unique_dir("dbt-discover");
-        std::fs::create_dir_all(&dir).unwrap();
-        discover(&runtime, &dir).unwrap()
+        let discovery = discover(&runtime, dir.path()).unwrap();
+        (discovery, dir)
     }
 }
 
@@ -501,7 +510,7 @@ mod tests {
     fn valid_record_is_discovered_with_interned_strings() {
         let (mut image, file_off, msg_off) = layout();
         image[0x200..0x21c].copy_from_slice(&record(good_record(file_off, msg_off)));
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         assert_eq!(discovery.record_count, 1);
         assert_eq!(discovery.files, vec!["main.c".to_string()]);
         assert_eq!(discovery.messages, vec!["hello %d".to_string()]);
@@ -520,7 +529,7 @@ mod tests {
         let mut words = good_record(file_off, msg_off);
         words[6] = ptr(msg_off);
         image[0x240..0x25c].copy_from_slice(&record(words));
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         assert_eq!(discovery.record_count, 0);
         assert!(discovery.quarantined.is_empty());
     }
@@ -531,7 +540,7 @@ mod tests {
         let mut words = good_record(file_off, 0);
         words[4] = 0x7000_0000;
         image[0x200..0x21c].copy_from_slice(&record(words));
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         assert_eq!(discovery.record_count, 1);
         assert_eq!(discovery.unresolved_messages, 1);
         assert!(discovery.quarantined.is_empty());
@@ -545,7 +554,7 @@ mod tests {
         image[0x140..0x140 + MAX_MESSAGE_BYTES].fill(b'x');
         image[record_at..record_at + RECORD_BYTES]
             .copy_from_slice(&record(good_record(0x100, 0x140)));
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         assert_eq!(discovery.quarantined.len(), 1);
         assert!(matches!(
             discovery.quarantined[0].reason,
@@ -555,7 +564,7 @@ mod tests {
         let (mut image2, file_off, msg_off) = layout();
         image2[0x140..0x143].copy_from_slice(b"a\x01b");
         image2[0x200..0x21c].copy_from_slice(&record(good_record(file_off, msg_off)));
-        let discovery = discover_tmp(&image2);
+        let (discovery, _dir2) = discover_tmp(&image2);
         assert_eq!(discovery.quarantined.len(), 1);
         assert!(matches!(
             discovery.quarantined[0].reason,
@@ -569,7 +578,7 @@ mod tests {
         let mut words = good_record(file_off, 0);
         words[4] = u32::MAX - 2;
         image[0x200..0x21c].copy_from_slice(&record(words));
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         assert_eq!(discovery.quarantined.len(), 1);
         assert!(matches!(
             discovery.quarantined[0].reason,
@@ -590,8 +599,7 @@ mod tests {
         }
         let runtime = RuntimeImage::from_plan(&image, BASE, None).unwrap();
         let dir = super::testkit::unique_dir("dbt-cap");
-        std::fs::create_dir_all(&dir).unwrap();
-        let error = discover(&runtime, &dir).unwrap_err();
+        let error = discover(&runtime, dir.path()).unwrap_err();
         assert!(matches!(error, DbtTraceError::QuarantineCap(_)));
     }
 
@@ -605,7 +613,7 @@ mod tests {
             words[3] = *raw;
             image[at..at + RECORD_BYTES].copy_from_slice(&record(words));
         }
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         assert_eq!(discovery.fourth.parameter_count, 1);
         assert_eq!(discovery.fourth.sentinel, 1);
         assert_eq!(discovery.fourth.unknown, 1);
@@ -622,7 +630,7 @@ mod tests {
             words[1] = i as u32 + 1;
             image[at..at + RECORD_BYTES].copy_from_slice(&record(words));
         }
-        let discovery = discover_tmp(&image);
+        let (discovery, _dir) = discover_tmp(&image);
         let bytes = std::fs::read(&discovery.spill_path).unwrap();
         assert_eq!(bytes.len(), discovery.record_count * 30);
         for (i, chunk) in bytes.as_chunks::<30>().0.iter().enumerate() {
@@ -700,8 +708,7 @@ mod tests {
         };
         let runtime = RuntimeImage::from_plan(&raw, BASE, Some(&plan)).unwrap();
         let dir = super::testkit::unique_dir("dbt-scatter");
-        std::fs::create_dir_all(&dir).unwrap();
-        let discovery = discover(&runtime, &dir).unwrap();
+        let discovery = discover(&runtime, dir.path()).unwrap();
         assert_eq!(discovery.record_count, 1);
         assert_eq!(discovery.unresolved_messages, 1);
         assert!(discovery.messages.is_empty());

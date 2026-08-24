@@ -1,16 +1,14 @@
 use std::path::PathBuf;
 
+pub(crate) mod artifact;
 pub(crate) mod discover;
+pub(crate) mod wire;
 
-#[allow(dead_code)]
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-debug-traces-v1";
 #[allow(dead_code)]
 pub(crate) const REFS_FORMAT: &str = "pixel-modem-extractor-debug-trace-refs-v1";
-#[allow(dead_code)]
 pub(crate) const SCHEMA_VERSION: u32 = 1;
-#[allow(dead_code)]
 pub(crate) const RECORD_BYTES: usize = 28;
-#[allow(dead_code)]
 pub(crate) const HEADER: &[u8; 4] = b"DBT:";
 
 pub const MAX_OCCURRENCES: usize = 1_048_576;
