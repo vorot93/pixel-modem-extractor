@@ -5,8 +5,8 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
-    ExecutionIdentity, GhidraFunctionFields, OwnedExecutionIdentity,
-    execution_identity, read_ghidra_inventory_streaming,
+    ExecutionIdentity, GhidraFunctionFields, OwnedExecutionIdentity, execution_identity,
+    read_ghidra_inventory_streaming,
 };
 use crate::manifest::{blake3_bytes, blake3_file, load_addr_for_image};
 use crate::runtime_image::RuntimeImage;
