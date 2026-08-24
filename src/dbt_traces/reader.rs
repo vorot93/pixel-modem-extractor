@@ -26,6 +26,7 @@ pub(crate) struct ValidatedCatalog {
     pub(crate) counts: CatalogCounts,
     pub(crate) identity: String,
     pub(crate) manifest_blake3: [u8; 32],
+    pub(crate) image_blake3: [u8; 32],
     pub(crate) scatter_entries_used: Vec<usize>,
 }
 
@@ -223,6 +224,7 @@ pub(crate) fn read(
         counts: wire.counts,
         identity,
         manifest_blake3,
+        image_blake3: wire.image_blake3,
         scatter_entries_used: wire.scatter_entries_used,
     })
 }
@@ -1227,6 +1229,7 @@ mod tests {
             let validated = read(&parent.join("debug_traces"), runtime, ctx).unwrap();
             assert_eq!(validated.identity, materialized.identity);
             assert_eq!(validated.manifest_blake3, materialized.manifest_blake3);
+            assert_eq!(validated.image_blake3, ctx.image_blake3);
             assert_eq!(validated.counts.records, 3);
             assert_eq!(validated.counts.files, 1);
             assert_eq!(validated.counts.messages, 1);

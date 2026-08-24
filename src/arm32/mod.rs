@@ -22,6 +22,23 @@ const LR: Register = Register(14);
 const SP: Register = Register(13);
 const CORE_REGISTER_COUNT: u8 = 16;
 
+/// The visible PC value a PC-relative expression resolves against: Thumb
+/// ADR/LDR-literal forms align to four, while A32 PC-relative operands read
+/// PC as instruction-plus-eight.
+pub(crate) fn visible_pc(pc: u32, align_to_four: bool) -> u32 {
+    if align_to_four {
+        pc.wrapping_add(4) & !3
+    } else {
+        pc.wrapping_add(8)
+    }
+}
+
+/// Wrapping add of an i64 offset onto a u32 address: exact modular
+/// arithmetic through the low 32 bits for any offset magnitude.
+pub(crate) fn wrapping_offset(address: u32, offset: i64) -> u32 {
+    address.wrapping_add((offset & 0xFFFF_FFFF) as u32)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Register(pub(crate) u8);
 
