@@ -2,7 +2,7 @@
 
 use super::FORMAT_V4;
 use crate::execution_ranges::{
-    ExecutionProjection, ValidatedInventory, validate_ghidra_inventory_records,
+    ExecutionProjection, ValidatedInventory, read_ghidra_inventory_streaming,
 };
 use crate::manifest::blake3_file;
 use crate::runtime_image::RuntimeImage;
@@ -142,14 +142,9 @@ pub fn validate_artifact_files(
         require_u64(analysis, key);
     }
 
-    let functions_json: Value =
-        serde_json::from_slice(&std::fs::read(&functions_path).expect("functions.json readable"))
-            .expect("functions.json valid JSON");
-    let ghidra_records = ghidra_records(&functions_json);
-    let ghidra = inventory_counts(
-        &validate_ghidra_inventory_records(ghidra_records, ghidra_records.len(), &runtime)
-            .expect("Ghidra execution inventory valid"),
-    );
+    let streamed = read_ghidra_inventory_streaming(&functions_path, &runtime)
+        .expect("Ghidra execution inventory valid");
+    let ghidra = inventory_counts(&streamed.inventory);
     assert_eq!(
         ghidra.raw,
         report_image["functions"].as_u64().unwrap() as usize
@@ -566,12 +561,6 @@ fn inventory_counts(inventory: &ValidatedInventory) -> InventoryCounts {
             })
             .sum(),
     }
-}
-
-fn ghidra_records(functions_json: &Value) -> &[Value] {
-    functions_json
-        .as_array()
-        .expect("functions.json must be an array")
 }
 
 fn parse_global_address(value: &str) -> u32 {

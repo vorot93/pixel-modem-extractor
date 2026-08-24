@@ -82,7 +82,9 @@ complete validated function set because its decoder analyzes those records toget
 582,543,970 output bytes, ~248 seconds, and ~2.8 GB peak RSS for replay plus comparison; capture
 production itself measured ~0.3 GB. `thumb_enrich` streams `decompiled.c` and rewrites one function
 at a time, bounded by its ~86 MB body map plus one record (632 MB artifact A/B: 130 seconds,
-2.29 GB peak, byte-identical). `recover_source` uses a typed streaming reader, symbolication's
+2.29 GB peak, byte-identical). Ghidra `functions.json` loads through
+`read_ghidra_inventory_streaming` (one record at a time; the in-memory slice
+validator remains test-only). `recover_source` uses a typed streaming reader, symbolication's
 artifact rewrites stream through atomic v3-preserving writers, and ARM disassembly ranges are
 zero-copy borrowed views. The standalone symbolication A/B dropped from 24 GB to 1.8 GB with
 byte-identical output. A full dense-Thumb `decompose` now peaks at ~7.7 GB in Ghidra's own

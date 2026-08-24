@@ -5,8 +5,8 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::execution_ranges::{
-    ExecutionIdentity, FunctionOwner, OwnedExecutionIdentity, execution_identity,
-    validate_ghidra_inventory_records,
+    ExecutionIdentity, GhidraFunctionFields, OwnedExecutionIdentity, execution_identity,
+    read_ghidra_inventory_streaming,
 };
 use crate::manifest::{blake3_bytes, blake3_file, load_addr_for_image};
 use crate::runtime_image::RuntimeImage;
@@ -78,9 +78,9 @@ pub(crate) fn load_inputs(request: &RunRequest<'_>) -> Result<LoadedInputs> {
     let globals = parse_globals(&globals_json, request)?;
     drop(globals_json);
 
-    let (functions_blake3, functions_json) = read_json(&functions_path)?;
-    let ghidra = parse_ghidra_inventory(&functions_json, request, &runtime)?;
-    drop(functions_json);
+    let functions_blake3 = blake3_file(&functions_path)?;
+    let streamed = read_ghidra_inventory_streaming(&functions_path, &runtime)?;
+    let ghidra = parse_ghidra_inventory(&streamed.functions, request)?;
 
     let (thumb_functions_blake3, thumb) = match thumb_expected {
         None => {
@@ -263,23 +263,18 @@ fn parse_globals(value: &Value, request: &RunRequest<'_>) -> Result<Vec<Recovere
 }
 
 fn parse_ghidra_inventory(
-    value: &Value,
+    records: &[GhidraFunctionFields],
     request: &RunRequest<'_>,
-    runtime: &RuntimeImage<'_>,
 ) -> Result<ParsedInventory> {
-    let records = value
-        .as_array()
-        .ok_or_else(|| invalid("functions.json must be an array"))?;
     if records.len() != request.expected_ghidra_records {
         return Err(invalid(
             "raw ghidra count does not match the current-run request",
         ));
     }
-    let inventory = validate_ghidra_inventory_records(records, records.len(), runtime)?;
     let mut parsed = ParsedInventory::empty();
-    for (record, tagged) in records.iter().zip(&inventory.records) {
-        let execution = execution_identity(tagged.entry, &tagged.projection)?;
-        add_inventory_record(&mut parsed, record, tagged.owner, execution.as_ref(), true)?;
+    for record in records {
+        let execution = execution_identity(record.tagged.entry, &record.tagged.projection)?;
+        add_ghidra_inventory_record(&mut parsed, record, execution.as_ref())?;
     }
     validate_inventory_count(&parsed, records.len())?;
     if parsed.accepted != request.expected_ghidra_accepted
@@ -290,6 +285,54 @@ fn parse_ghidra_inventory(
         ));
     }
     Ok(parsed)
+}
+
+fn add_ghidra_inventory_record(
+    parsed: &mut ParsedInventory,
+    record: &GhidraFunctionFields,
+    execution: Option<&ExecutionIdentity>,
+) -> Result<()> {
+    if record.size >= 32 {
+        parsed.substantial = parsed
+            .substantial
+            .checked_add(1)
+            .ok_or_else(|| invalid("thumb substantial count overflow"))?;
+    }
+    match execution {
+        Some(identity) => {
+            if identity.entry != record.entry {
+                return Err(invalid(
+                    "inventory execution entry does not match its record",
+                ));
+            }
+            parsed.accepted = parsed
+                .accepted
+                .checked_add(1)
+                .ok_or_else(|| invalid("accepted inventory count overflow"))?;
+            parsed
+                .identities
+                .entry(OwnedExecutionIdentity {
+                    owner: record.tagged.owner,
+                    identity: identity.clone(),
+                })
+                .or_default()
+                .insert(FunctionContext {
+                    entry: record.entry,
+                    name: record.name.clone(),
+                });
+        }
+        None => {
+            parsed.quarantined = parsed
+                .quarantined
+                .checked_add(1)
+                .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
+            parsed.quarantine_errors = parsed
+                .quarantine_errors
+                .checked_add(record.quarantine_errors)
+                .ok_or_else(|| invalid("quarantine error count overflow"))?;
+        }
+    }
+    Ok(())
 }
 
 fn parse_thumb_inventory(
@@ -354,66 +397,6 @@ fn parse_thumb_inventory(
     }
     validate_inventory_count(&parsed, functions.len())?;
     Ok(parsed)
-}
-
-fn add_inventory_record(
-    parsed: &mut ParsedInventory,
-    record: &Value,
-    owner: FunctionOwner,
-    execution: Option<&ExecutionIdentity>,
-    require_end: bool,
-) -> Result<()> {
-    let object = record
-        .as_object()
-        .ok_or_else(|| invalid("inventory record must be an object"))?;
-    let name = required_string(object, "name")?.to_owned();
-    let entry = parse_canonical_hex(required_string(object, "entry")?)?;
-    if require_end {
-        let _end = parse_canonical_hex(required_string(object, "end")?)?;
-    }
-    let size = parse_positive_size(object.get("size").ok_or_else(|| invalid("missing size"))?)?;
-    if size >= 32 {
-        parsed.substantial = parsed
-            .substantial
-            .checked_add(1)
-            .ok_or_else(|| invalid("thumb substantial count overflow"))?;
-    }
-    match execution {
-        Some(identity) => {
-            if identity.entry != entry {
-                return Err(invalid(
-                    "inventory execution entry does not match its record",
-                ));
-            }
-            parsed.accepted = parsed
-                .accepted
-                .checked_add(1)
-                .ok_or_else(|| invalid("accepted inventory count overflow"))?;
-            parsed
-                .identities
-                .entry(OwnedExecutionIdentity {
-                    owner,
-                    identity: identity.clone(),
-                })
-                .or_default()
-                .insert(FunctionContext { entry, name });
-        }
-        None => {
-            parsed.quarantined = parsed
-                .quarantined
-                .checked_add(1)
-                .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
-            let errors = object
-                .get("decode_range_errors")
-                .and_then(Value::as_array)
-                .ok_or_else(|| invalid("quarantined record missing error list"))?;
-            parsed.quarantine_errors = parsed
-                .quarantine_errors
-                .checked_add(errors.len())
-                .ok_or_else(|| invalid("quarantine error count overflow"))?;
-        }
-    }
-    Ok(())
 }
 
 fn validate_inventory_count(parsed: &ParsedInventory, raw_count: usize) -> Result<()> {

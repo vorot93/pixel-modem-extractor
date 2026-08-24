@@ -760,41 +760,26 @@ fn parse_hex(s: &str) -> Result<u64> {
     u64::from_str_radix(t, 16).map_err(|e| Error::Serialize(format!("bad hex {s}: {e}")))
 }
 
-#[derive(Deserialize)]
-struct ArmFnJson {
-    name: String,
-    #[serde(default)]
-    original_name: Option<String>,
-    entry: String,
-    end: String,
-    #[serde(default)]
-    data_refs: Vec<String>,
-}
-
 fn load_functions<'a>(
     decompiled: &Path,
     index: &DisasmIndex<'a>,
     runtime: &crate::runtime_image::RuntimeImage<'_>,
 ) -> Result<Vec<FuncRec<'a>>> {
     let path = decompiled.join("functions.json");
-    let bytes = std::fs::read(&path)?;
-    let raw: Vec<serde_json::Value> =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
-    let inventory =
-        crate::execution_ranges::validate_ghidra_inventory_records(&raw, raw.len(), runtime)?;
-    let mut out = Vec::with_capacity(raw.len());
-    for (value, tagged) in raw.into_iter().zip(inventory.records) {
-        let f: ArmFnJson =
-            serde_json::from_value(value).map_err(|e| Error::Serialize(e.to_string()))?;
-        let entry = parse_hex(&f.entry)?;
-        let end = parse_hex(&f.end)?;
-        let execution =
-            crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)?;
-        let data_refs = f
+    let streamed = crate::execution_ranges::read_ghidra_inventory_streaming(&path, runtime)?;
+    let mut out = Vec::with_capacity(streamed.functions.len());
+    for record in streamed.functions {
+        let entry = u64::from(record.entry);
+        let end = u64::from(record.end);
+        let execution = crate::execution_ranges::execution_identity(
+            record.tagged.entry,
+            &record.tagged.projection,
+        )?;
+        let data_refs = record
             .data_refs
             .iter()
-            .map(|r| parse_hex(r))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|address| u64::from(*address))
+            .collect();
         let disasm = match &execution {
             Some(execution) if execution.decode_ranges.len() == 1 => {
                 let range = execution.decode_ranges[0];
@@ -811,7 +796,7 @@ fn load_functions<'a>(
         };
         out.push(FuncRec {
             arch: "arm",
-            name: f.original_name.unwrap_or(f.name),
+            name: record.original_name.unwrap_or(record.name),
             entry,
             end,
             data_refs,
@@ -1282,39 +1267,19 @@ pub(crate) fn write_pass2_symbol_map(
     let functions_path = image_dir.join("decompiled").join("functions.json");
     let functions_bytes = std::fs::read(&functions_path)?;
     let functions_blake3 = crate::manifest::blake3_bytes(&functions_bytes);
-    let records: Vec<serde_json::Value> = serde_json::from_slice(&functions_bytes)
-        .map_err(|e| Error::Serialize(format!("parse {}: {e}", functions_path.display())))?;
-
-    // Recompute every accepted execution through the runtime and pair it with
-    // its retained record identity (original primary + source).
-    #[derive(Deserialize)]
-    struct RecordIdentity {
-        name: String,
-        #[serde(default)]
-        original_name: Option<String>,
-        #[serde(default)]
-        primary_source: Option<String>,
-    }
-    let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
-        &records,
-        records.len(),
-        runtime,
-    )?;
+    let streamed =
+        crate::execution_ranges::read_ghidra_inventory_streaming(&functions_path, runtime)?;
     let mut executions: Vec<GhidraExecutionRecord> = Vec::new();
-    for (value, tagged) in records.iter().zip(&inventory.records) {
-        let identity: RecordIdentity = serde_json::from_value(value.clone())
-            .map_err(|e| Error::Serialize(format!("parse retained function record: {e}")))?;
-        let Some(execution) =
-            crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)?
+    for record in streamed.functions {
+        let Some(execution) = crate::execution_ranges::execution_identity(
+            record.tagged.entry,
+            &record.tagged.projection,
+        )?
         else {
-            // Quarantined record: no accepted projection, no execution, no
-            // decision. Every accepted execution is covered exactly once.
             continue;
         };
-        let original_source = match identity.primary_source.as_deref() {
-            Some("default") | Some("analysis") | Some("imported") | Some("user_defined") => {
-                identity.primary_source.as_deref().unwrap()
-            }
+        let original_source = match record.primary_source.as_str() {
+            "default" | "analysis" | "imported" | "user_defined" => record.primary_source.as_str(),
             other => {
                 return Err(Error::Serialize(format!(
                     "retained function record carries an unknown primary source {other:?}"
@@ -1330,7 +1295,7 @@ pub(crate) fn write_pass2_symbol_map(
                 .iter()
                 .map(DecodeRangeWire::from_authenticated)
                 .collect(),
-            original_primary: identity.original_name.unwrap_or(identity.name),
+            original_primary: record.original_name.unwrap_or(record.name),
             original_source: original_source.to_string(),
             first_isa: match execution
                 .decode_ranges
@@ -1694,14 +1659,9 @@ pub(crate) fn rewrite_functions_json(
     let fpath = decompiled.join("functions.json");
     if fpath.exists() {
         let source = std::fs::read(&fpath)?;
-        let records: Vec<serde_json::Value> = serde_json::from_slice(&source)
-            .map_err(|error| Error::Serialize(format!("parse {}: {error}", fpath.display())))?;
-        let validated = crate::execution_ranges::validate_ghidra_inventory_records(
-            &records,
-            records.len(),
-            runtime,
-        )?;
-        let executions = validated
+        let streamed = crate::execution_ranges::read_ghidra_inventory_streaming(&fpath, runtime)?;
+        let executions = streamed
+            .inventory
             .records
             .iter()
             .map(|record| {

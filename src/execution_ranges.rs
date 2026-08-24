@@ -1,8 +1,11 @@
 use crate::analysis_tool::AnalysisTool;
 use crate::error::{Error, Result};
 use crate::runtime_image::RuntimeImage;
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+use std::fmt;
+use std::path::Path;
 
 pub(crate) const MAX_EXECUTION_FUNCTIONS: usize = 262_144;
 pub(crate) const MAX_EXECUTION_RANGES: usize = 1_048_576;
@@ -637,6 +640,7 @@ pub(crate) fn validate_inventory_record(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn validate_inventory_records(
     records: &[Value],
     expected_raw_count: usize,
@@ -686,52 +690,242 @@ pub(crate) fn validate_inventory_records(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhidraFunctionFields {
+    pub name: String,
+    pub original_name: Option<String>,
+    pub primary_source: String,
+    pub entry: u32,
+    pub end: u32,
+    pub size: u64,
+    pub data_refs: Vec<u32>,
+    pub quarantine_errors: usize,
+    pub tagged: TaggedExecutionRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamedGhidraInventory {
+    pub inventory: ValidatedInventory,
+    pub functions: Vec<GhidraFunctionFields>,
+}
+
+const GHIDRA_REQUIRED_KEYS: [&str; 8] = [
+    "name",
+    "primary_source",
+    "entry",
+    "end",
+    "size",
+    "decode_ranges",
+    "decode_range_errors",
+    "data_refs",
+];
+const GHIDRA_ENRICHMENT_KEYS: [&str; 2] = ["original_name", "annotations"];
+
+fn validate_ghidra_record_shape(record: &Value) -> Result<&Map<String, Value>> {
+    let object = record
+        .as_object()
+        .ok_or_else(|| invalid("Ghidra function record must be an object"))?;
+    if GHIDRA_REQUIRED_KEYS
+        .iter()
+        .any(|key| !object.contains_key(*key))
+        || object.keys().any(|key| {
+            !GHIDRA_REQUIRED_KEYS.contains(&key.as_str())
+                && !GHIDRA_ENRICHMENT_KEYS.contains(&key.as_str())
+        })
+    {
+        return Err(invalid(
+            "Ghidra function record has unknown or missing fields",
+        ));
+    }
+    required_string(object, "name")?;
+    match required_string(object, "primary_source")? {
+        "default" | "analysis" | "imported" | "user_defined" => {}
+        _ => return Err(invalid("unknown Ghidra primary source")),
+    }
+    if object.contains_key("original_name") {
+        required_string(object, "original_name")?;
+    }
+    if object.get("annotations").is_some_and(|annotations| {
+        annotations
+            .as_array()
+            .is_none_or(|annotations| annotations.iter().any(|value| !value.is_string()))
+    }) {
+        return Err(invalid("Ghidra annotations must be an array of strings"));
+    }
+    Ok(object)
+}
+
+#[cfg(test)]
 pub(crate) fn validate_ghidra_inventory_records(
     records: &[Value],
     expected_raw_count: usize,
     runtime: &RuntimeImage<'_>,
 ) -> Result<ValidatedInventory> {
-    const REQUIRED_KEYS: [&str; 8] = [
-        "name",
-        "primary_source",
-        "entry",
-        "end",
-        "size",
-        "decode_ranges",
-        "decode_range_errors",
-        "data_refs",
-    ];
-    const ENRICHMENT_KEYS: [&str; 2] = ["original_name", "annotations"];
     for record in records {
-        let object = record
-            .as_object()
-            .ok_or_else(|| invalid("Ghidra function record must be an object"))?;
-        if REQUIRED_KEYS.iter().any(|key| !object.contains_key(*key))
-            || object.keys().any(|key| {
-                !REQUIRED_KEYS.contains(&key.as_str()) && !ENRICHMENT_KEYS.contains(&key.as_str())
-            })
-        {
-            return Err(invalid(
-                "Ghidra function record has unknown or missing fields",
-            ));
-        }
-        required_string(object, "name")?;
-        match required_string(object, "primary_source")? {
-            "default" | "analysis" | "imported" | "user_defined" => {}
-            _ => return Err(invalid("unknown Ghidra primary source")),
-        }
-        if object.contains_key("original_name") {
-            required_string(object, "original_name")?;
-        }
-        if object.get("annotations").is_some_and(|annotations| {
-            annotations
-                .as_array()
-                .is_none_or(|annotations| annotations.iter().any(|value| !value.is_string()))
-        }) {
-            return Err(invalid("Ghidra annotations must be an array of strings"));
-        }
+        validate_ghidra_record_shape(record)?;
     }
     validate_inventory_records(records, expected_raw_count, FunctionOwner::Ghidra, runtime)
+}
+
+pub(crate) fn read_ghidra_inventory_streaming(
+    path: &Path,
+    runtime: &RuntimeImage<'_>,
+) -> Result<StreamedGhidraInventory> {
+    read_ghidra_inventory_streaming_capped(path, runtime, MAX_EXECUTION_FUNCTIONS)
+}
+
+pub(crate) fn read_ghidra_inventory_streaming_capped(
+    path: &Path,
+    runtime: &RuntimeImage<'_>,
+    cap: usize,
+) -> Result<StreamedGhidraInventory> {
+    let file = std::fs::File::open(path)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let mut scan = GhidraInventoryScan {
+        runtime,
+        cap,
+        functions: Vec::new(),
+        projections: Vec::new(),
+        accepted_executions: BTreeSet::new(),
+        accepted: 0,
+        quarantined: 0,
+        budget: ExecutionBudget::default(),
+    };
+    let parsed = deserializer.deserialize_any(GhidraInventoryVisitor { scan: &mut scan });
+    match parsed.and_then(|()| deserializer.end()) {
+        Ok(()) => scan.finish(),
+        Err(error) => Err(invalid(&format!(
+            "parse Ghidra functions inventory: {error}"
+        ))),
+    }
+}
+
+struct GhidraInventoryScan<'runtime, 'data> {
+    runtime: &'runtime RuntimeImage<'data>,
+    cap: usize,
+    functions: Vec<GhidraFunctionFields>,
+    projections: Vec<ExecutionProjection>,
+    accepted_executions: BTreeSet<OwnedExecutionIdentity>,
+    accepted: usize,
+    quarantined: usize,
+    budget: ExecutionBudget,
+}
+
+impl GhidraInventoryScan<'_, '_> {
+    fn push(&mut self, record: Value) -> Result<()> {
+        if self.functions.len() >= self.cap {
+            return Err(invalid(
+                "execution function count exceeds the supported limit",
+            ));
+        }
+        let object = validate_ghidra_record_shape(&record)?;
+        let name = required_string(object, "name")?.to_owned();
+        let original_name = object
+            .get("original_name")
+            .map(|_| required_string(object, "original_name").map(str::to_owned))
+            .transpose()?;
+        let primary_source = required_string(object, "primary_source")?.to_owned();
+        let end = parse_hex(required_string(object, "end")?)?;
+        let size = object
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid("size must be a u64"))?;
+        let data_refs = object
+            .get("data_refs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("data_refs must be an array"))?
+            .iter()
+            .map(|value| {
+                parse_hex(
+                    value
+                        .as_str()
+                        .ok_or_else(|| invalid("data_ref must be a string"))?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let quarantine_errors = object
+            .get("decode_range_errors")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let (tagged, projection, identity) = validate_inventory_record(
+            &record,
+            FunctionOwner::Ghidra,
+            self.runtime,
+            &mut self.budget,
+        )?;
+        if let Some(identity) = identity {
+            self.accepted = self
+                .accepted
+                .checked_add(1)
+                .ok_or_else(|| invalid("accepted inventory count overflow"))?;
+            self.accepted_executions.insert(OwnedExecutionIdentity {
+                owner: FunctionOwner::Ghidra,
+                identity,
+            });
+        } else {
+            self.quarantined = self
+                .quarantined
+                .checked_add(1)
+                .ok_or_else(|| invalid("quarantined inventory count overflow"))?;
+        }
+        self.functions.push(GhidraFunctionFields {
+            name,
+            original_name,
+            primary_source,
+            entry: tagged.entry,
+            end,
+            size,
+            data_refs,
+            quarantine_errors,
+            tagged,
+        });
+        self.projections.push(projection);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<StreamedGhidraInventory> {
+        let raw_count = self.functions.len();
+        if !inventory_count_conserved(raw_count, &self.projections)
+            || self.accepted.checked_add(self.quarantined) != Some(raw_count)
+        {
+            return Err(invalid(
+                "raw inventory count does not equal accepted plus quarantined",
+            ));
+        }
+        Ok(StreamedGhidraInventory {
+            inventory: ValidatedInventory {
+                raw_count,
+                accepted: self.accepted,
+                quarantined: self.quarantined,
+                accepted_executions: self.accepted_executions.into_iter().collect(),
+                records: self.functions.iter().map(|f| f.tagged.clone()).collect(),
+            },
+            functions: self.functions,
+        })
+    }
+}
+
+struct GhidraInventoryVisitor<'scan, 'runtime, 'data> {
+    scan: &'scan mut GhidraInventoryScan<'runtime, 'data>,
+}
+
+impl<'de> Visitor<'de> for GhidraInventoryVisitor<'_, '_, '_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Ghidra functions array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(record) = seq.next_element::<Value>()? {
+            self.scan.push(record).map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_legacy_execution(
@@ -1524,5 +1718,81 @@ mod tests {
             );
         }
         assert!(validate_inventory_records(&[valid], 2, FunctionOwner::Ghidra, &runtime,).is_err());
+    }
+
+    fn ghidra_record(name: &str, entry: u32, end: u32, image: &[u8]) -> Value {
+        json!({
+            "name": name,
+            "primary_source": "default",
+            "entry": hex(entry),
+            "end": hex(end),
+            "size": u64::from(end - entry),
+            "decode_ranges": [{
+                "isa": "arm",
+                "start": hex(entry),
+                "end": hex(end),
+                "blake3": digest_hex(blake3::hash(&image[entry as usize..end as usize]).into()),
+            }],
+            "decode_range_errors": [],
+            "data_refs": [],
+        })
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_matches_the_slice_validator() {
+        let image = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let records = vec![
+            ghidra_record("FUN_0000", 0, 4, &image),
+            ghidra_record("FUN_0008", 8, 12, &image),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+
+        let sliced = validate_ghidra_inventory_records(&records, records.len(), &runtime).unwrap();
+        let streamed = read_ghidra_inventory_streaming(&path, &runtime).unwrap();
+
+        assert_eq!(streamed.inventory.raw_count, sliced.raw_count);
+        assert_eq!(streamed.inventory.accepted, sliced.accepted);
+        assert_eq!(streamed.inventory.records, sliced.records);
+        assert_eq!(streamed.functions[0].name, "FUN_0000");
+        assert_eq!(streamed.functions[1].name, "FUN_0008");
+        assert_eq!(streamed.functions[0].entry, 0);
+        assert_eq!(streamed.functions[1].entry, 8);
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_rejects_a_non_array() {
+        let image = [0u8; 4];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(&path, br#"{"functions":[]}"#).unwrap();
+        let error = read_ghidra_inventory_streaming(&path, &runtime).unwrap_err();
+        assert!(
+            error.to_string().contains("Ghidra functions array"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_enforces_the_function_cap() {
+        let image = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let records = vec![
+            ghidra_record("FUN_0000", 0, 4, &image),
+            ghidra_record("FUN_0008", 8, 12, &image),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+        let error = read_ghidra_inventory_streaming_capped(&path, &runtime, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("execution function count exceeds the supported limit"),
+            "{error}"
+        );
     }
 }
