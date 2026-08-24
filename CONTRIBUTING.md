@@ -91,6 +91,18 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   **Runtime PAL task inventory** below for the commands, the digest-population procedure, and
   the gating test (`no_corpus_environment_skips_independently`) that proves each leg skips
   only on unset/missing input.
+- **Private-corpus DBT debug-trace goldens** (`tests/dbt_traces_golden.rs`) consume the *same*
+  two retained MAIN files (`PME_S5400_MAIN` / `PME_S5300_MAIN`) through a TOC wrap (name
+  `MAIN`, base `0x40010000`, toc_index 3 for S5400 / 2 for S5300) and pin catalog counts,
+  fourth-word variants, and the populated `manifest_metadata_blake3`. Unique-message pins are
+  174,243 / 165,051. Each catalog test is gated only by its own variable and skips cleanly
+  when that variable is unset or its input is absent; a set path that is not a regular file
+  fails. `PME_DECOMPOSED_GOLDEN_DIR` gates the refs inventory lookup and skips when unset,
+  absent, or lacking `functions.json`. Serial-test note: none needed — no Ghidra legs.
+  Verify the no-corpus path with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN -u PME_DECOMPOSED_GOLDEN_DIR cargo test --test dbt_traces_golden -- --nocapture`.
+  These inputs and every generated payload remain outside git; tests commit only structural
+  metadata, addresses, counts, and hashes.
 - **Phase 3.0 production goldens** (`tests/globals_golden.rs` and
   `report_json_includes_globals_field` in `tests/decompose_golden.rs`) need
   `PME_RADIO_IMG`, Ghidra, and radare2. Run production-scale cases with
@@ -262,6 +274,13 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
 | `pal_tasks/table.rs` | Slot parsing, descriptor-v1 field relationships, and the deterministic application/label allocator |
 | `pal_tasks/artifact.rs` | Canonical authenticated v1 task manifest: serialize, strict typed reader, materialize, and clear |
+| `dbt_traces/mod.rs` | DBT debug-trace limits, `DbtTraceError`, standalone `decode-traces` run |
+| `dbt_traces/discover.rs` | `DBT:` sweep, threshold, quarantine, record-spill staging |
+| `dbt_traces/artifact.rs` | Five-table catalog serialize, staging rename, identity |
+| `dbt_traces/reader.rs` | Strict streaming catalog reader |
+| `dbt_traces/refs.rs` | Semantic record-address attribution over authenticated ranges |
+| `dbt_traces/exact.rs` | Exact-index consumer for `dbt_exact` / `dbt-source` |
+| `dbt_traces/wire.rs` | Canonical JSON writer shared by catalog and refs |
 | `source_tree.rs` | Reconstruct the source-tree layout from `__FILE__` strings |
 | `analysis_tool.rs` | Shared `AnalysisTool::{Ghidra, Radare2, Rizin}` downstream identity |
 | `recover_source.rs` | Attribute producer-owned Ghidra/Thumb functions to source paths |
@@ -720,6 +739,44 @@ hardcoded. Two reference images exercise both models end-to-end:
   evidence, never validity), fixed per-model addresses or strides, raw shape scanning, byte
   signatures for the loader, and any artifact-only or opt-in seeding fallback (a MAIN either
   proves its initializer or the command fails; it never ships half-seeded).
+
+### Debug-trace catalog
+
+- **Scan threshold then quarantine.** `dbt_traces::discover` sweeps every offset of every
+  byte-backed range for the four-byte `DBT:` header (alignment is recorded, never assumed).
+  An occurrence becomes a candidate only when the complete 28-byte record is byte-backed, word
+  7 resolves to a NUL-terminated string that satisfies the shared `is_src_path` classifier,
+  and word 6 (source line) is in `1..=MAX_LINE` (`1_048_575`). Below threshold is noise —
+  never a record, never an error. A candidate that then fails a message-pointer invariant is
+  quarantined as `{address, reason, raw_words}` with a typed reason:
+  `message_unterminated`, `message_over_cap`, `message_invalid_bytes`, `pointer_wrap`.
+  Crossing `MAX_QUARANTINED` fails the stage (sustained quarantine is structural). An
+  unmapped or scatter-zero message pointer is *not* a violation: it publishes as
+  `message.unresolved` with `storage ∈ {unmapped, scatter_zero}`. Message charset is
+  `0x20..=0x7e` plus `\t`/`\n`/`\r`; any other control or non-ASCII byte is
+  `message_invalid_bytes`. Source-path reads stay the shared printable-ASCII classifier.
+- **Named caps** (`dbt_traces/mod.rs`), all typed errors checked before allocation:
+
+  | Limit | Value | Rationale |
+  |---|---:|---|
+  | `MAX_OCCURRENCES` | 1,048,576 | 4× largest corpus sweep noise headroom |
+  | `MAX_RECORDS` | 1,048,576 | 4× corpus (247,205) |
+  | `MAX_UNIQUE_FILES` | 65,536 | 13× corpus (4,820) |
+  | `MAX_UNIQUE_MESSAGES` | 2,097,152 | 12× corpus (174,243) |
+  | `MAX_QUARANTINED` | 4,096 | sustained quarantine is structural |
+  | `MAX_MESSAGE_BYTES` | 4,096 | bounded string read window |
+  | `MAX_LINE` | 1,048,575 | threshold plausibility bound |
+  | `MAX_REFERENCES` | 4,194,304 | 16× records headroom |
+
+- **Record-spill staging.** Discovery writes each accepted record as a 30-byte frame to
+  `dbt_spill+{pid}/records.spill` and never accumulates the record set in memory. The only
+  in-memory tables are the interned unique files/messages (bounded by the caps above) and the
+  later sorted record-address vector. The spill directory is removed after publish on every
+  exit path; it is a different name from the catalog staging dir
+  (`debug_traces.staging+{pid}`) so the two cannot collide.
+- **Corpus pins and serial tests.** See the `dbt_traces_golden` bullet under **Tests**. The
+  populated `manifest_metadata_blake3` pins are the `pal_tasks_golden` empty-sentinel pattern
+  after population. No serial-test note is required: this increment has no Ghidra legs.
 
 - **CLI dispatch is thin.** `cli.rs` only parses args and resolves the `--out` default,
   then delegates to a module-level `run(...)`. Put new logic in the module, not in
