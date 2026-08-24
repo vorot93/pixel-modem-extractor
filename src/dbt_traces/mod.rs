@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub(crate) mod artifact;
 pub(crate) mod discover;
+pub(crate) mod reader;
 pub(crate) mod wire;
 
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-debug-traces-v1";

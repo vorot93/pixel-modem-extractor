@@ -1,4 +1,5 @@
-use super::discover::{Discovery, QuarantineReason};
+use super::discover::fourth_word_variant;
+use super::discover::{Discovery, FourthCounts, QuarantineReason};
 use super::wire::JsonWriter;
 use super::{DbtTraceError, FORMAT, HEADER, RECORD_BYTES, SCHEMA_VERSION};
 use crate::manifest::blake3_fixed;
@@ -8,7 +9,7 @@ use std::io::{BufReader, Read as _, Write};
 use std::path::Path;
 
 const SPILL_FRAME_BYTES: usize = 30;
-const THRESHOLD: &str = "byte-backed 28-byte record; source-file pointer resolves to a NUL-terminated string satisfying the shared source-path classifier; source line in 1..=1048575";
+pub(crate) const THRESHOLD: &str = "byte-backed 28-byte record; source-file pointer resolves to a NUL-terminated string satisfying the shared source-path classifier; source line in 1..=1048575";
 
 /// The identity a reader must pin: the image label, the raw image
 /// digest, and the complete scatter dependency.
@@ -18,6 +19,7 @@ pub(crate) struct DbtContext<'a> {
     pub scatter_load_map_blake3: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct CatalogCounts {
     pub(crate) records: usize,
     pub(crate) files: usize,
@@ -28,17 +30,45 @@ pub(crate) struct CatalogCounts {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub(crate) struct MaterializedCatalog {
     pub(crate) manifest_blake3: [u8; 32],
     pub(crate) identity: String,
     pub(crate) counts: CatalogCounts,
 }
 
-struct TableHashes {
-    files: String,
-    messages: String,
-    records: String,
-    quarantine: String,
+#[derive(Clone)]
+pub(crate) struct TableHashes {
+    pub(crate) files: String,
+    pub(crate) messages: String,
+    pub(crate) records: String,
+    pub(crate) quarantine: String,
+}
+
+/// The typed manifest: the reader re-serializes a parsed manifest through
+/// `serialize_manifest` to enforce canonical bytes, so the writer and the
+/// reader share one wire definition.
+#[derive(Clone)]
+pub(crate) struct ManifestWire {
+    pub(crate) format: String,
+    pub(crate) schema_version: u32,
+    pub(crate) tool_version: String,
+    pub(crate) label: String,
+    pub(crate) image_blake3: [u8; 32],
+    pub(crate) scatter_load_map_blake3: Option<[u8; 32]>,
+    pub(crate) scatter_entries_used: Vec<usize>,
+    pub(crate) base_addr: u32,
+    pub(crate) image_size: u32,
+    pub(crate) record_bytes: usize,
+    pub(crate) header: String,
+    pub(crate) occurrences: usize,
+    pub(crate) aligned_records: usize,
+    pub(crate) unaligned_records: usize,
+    pub(crate) threshold: String,
+    pub(crate) counts: CatalogCounts,
+    pub(crate) fourth: FourthCounts,
+    pub(crate) tables: TableHashes,
+    pub(crate) identity: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -130,22 +160,57 @@ fn write_catalog(
         unresolved_messages: discovery.unresolved_messages,
         occurrences: discovery.occurrences,
     };
-    let body = serialize_manifest(discovery, runtime, ctx, &counts, &tables, None)?;
+    let mut wire = manifest_wire(discovery, runtime, ctx, counts, tables);
+    let body = serialize_manifest(&wire)?;
     let manifest_blake3 = *blake3::hash(&body).as_bytes();
     let identity = format!(
         "v1:{}:{}:{}:{}",
         blake3_fixed(manifest_blake3),
-        counts.records,
-        counts.files,
-        counts.messages
+        wire.counts.records,
+        wire.counts.files,
+        wire.counts.messages
     );
-    let manifest = serialize_manifest(discovery, runtime, ctx, &counts, &tables, Some(&identity))?;
+    wire.identity = Some(identity.clone());
+    let manifest = serialize_manifest(&wire)?;
     write_atomic(&staging.join("manifest.json"), &manifest)?;
     Ok(MaterializedCatalog {
         manifest_blake3,
         identity,
-        counts,
+        counts: wire.counts,
     })
+}
+
+fn manifest_wire(
+    discovery: &Discovery,
+    runtime: &RuntimeImage<'_>,
+    ctx: &DbtContext<'_>,
+    counts: CatalogCounts,
+    tables: TableHashes,
+) -> ManifestWire {
+    let (base_addr, image_size) = runtime.image_bounds();
+    ManifestWire {
+        format: FORMAT.to_string(),
+        schema_version: SCHEMA_VERSION,
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        label: ctx.label.to_string(),
+        image_blake3: ctx.image_blake3,
+        scatter_load_map_blake3: ctx.scatter_load_map_blake3,
+        scatter_entries_used: discovery.scatter_entries_used.iter().copied().collect(),
+        base_addr,
+        image_size,
+        record_bytes: RECORD_BYTES,
+        header: std::str::from_utf8(HEADER)
+            .expect("DBT header is ASCII")
+            .to_string(),
+        occurrences: counts.occurrences,
+        aligned_records: discovery.aligned_records,
+        unaligned_records: discovery.unaligned_records,
+        threshold: THRESHOLD.to_string(),
+        counts,
+        fourth: discovery.fourth,
+        tables,
+        identity: None,
+    }
 }
 
 fn sorted_remap(table: &[String]) -> Vec<u32> {
@@ -261,6 +326,9 @@ fn write_record(
     let file_idx = frame_u32(frame, 21);
     let message_kind = frame[25];
     let message_ref = frame_u32(frame, 26);
+    let file_id = *file_id.get(file_idx as usize).ok_or_else(|| {
+        DbtTraceError::Artifact(format!("spill file index {file_idx} out of range"))
+    })?;
 
     json.open_object()?;
     json.key(true, "address")?;
@@ -276,14 +344,17 @@ fn write_record(
     json.key(true, "raw")?;
     json.u64_value(u64::from(fourth_raw))?;
     json.key(false, "variant")?;
-    json.string_value(fourth_variant(fourth_raw))?;
+    json.string_value(fourth_word_variant(fourth_raw).as_str())?;
     json.close_object()?;
     json.key(false, "message")?;
     json.open_object()?;
     match message_kind {
         0 => {
+            let text_id = *message_id.get(message_ref as usize).ok_or_else(|| {
+                DbtTraceError::Artifact(format!("spill message ref {message_ref} out of range"))
+            })?;
             json.key(true, "text_id")?;
-            json.u64_value(u64::from(message_id[message_ref as usize]))?;
+            json.u64_value(u64::from(text_id))?;
         }
         storage => {
             json.key(true, "unresolved")?;
@@ -303,7 +374,7 @@ fn write_record(
     json.key(false, "source")?;
     json.open_object()?;
     json.key(true, "file_id")?;
-    json.u64_value(u64::from(file_id[file_idx as usize]))?;
+    json.u64_value(u64::from(file_id))?;
     json.key(false, "line")?;
     json.u64_value(u64::from(line))?;
     json.close_object()?;
@@ -328,16 +399,6 @@ fn write_record(
     json.close_array()?;
     json.close_object()?;
     Ok(())
-}
-
-fn fourth_variant(raw: u32) -> &'static str {
-    if raw <= 32 {
-        "parameter_count"
-    } else if raw == 0xfecdba98 {
-        "sentinel_fecdba98"
-    } else {
-        "unknown"
-    }
 }
 
 fn canonical_spans(spans: Vec<StorageSpan>) -> Result<Vec<StorageSpan>, DbtTraceError> {
@@ -406,46 +467,38 @@ fn terminated(json: JsonWriter<Vec<u8>>) -> Vec<u8> {
     bytes
 }
 
-fn serialize_manifest(
-    discovery: &Discovery,
-    runtime: &RuntimeImage<'_>,
-    ctx: &DbtContext<'_>,
-    counts: &CatalogCounts,
-    tables: &TableHashes,
-    identity: Option<&str>,
-) -> Result<Vec<u8>, DbtTraceError> {
-    let (base_addr, size) = runtime.image_bounds();
+pub(crate) fn serialize_manifest(wire: &ManifestWire) -> Result<Vec<u8>, DbtTraceError> {
     let mut json = JsonWriter::new(Vec::new());
     json.open_object()?;
     json.key(true, "format")?;
-    json.string_value(FORMAT)?;
+    json.string_value(&wire.format)?;
     json.key(false, "schema_version")?;
-    json.u64_value(u64::from(SCHEMA_VERSION))?;
+    json.u64_value(u64::from(wire.schema_version))?;
     json.key(false, "tool_version")?;
-    json.string_value(env!("CARGO_PKG_VERSION"))?;
+    json.string_value(&wire.tool_version)?;
 
     json.key(false, "image")?;
     json.open_object()?;
     json.key(true, "label")?;
-    json.string_value(ctx.label)?;
+    json.string_value(&wire.label)?;
     json.key(false, "base_addr")?;
-    json.u32_hex_value(base_addr)?;
+    json.u32_hex_value(wire.base_addr)?;
     json.key(false, "size")?;
-    json.u64_value(u64::from(size))?;
+    json.u64_value(u64::from(wire.image_size))?;
     json.key(false, "blake3")?;
-    json.hex_value(&ctx.image_blake3)?;
+    json.hex_value(&wire.image_blake3)?;
     json.close_object()?;
 
     json.key(false, "runtime_view")?;
     json.open_object()?;
     json.key(true, "scatter_load_map_blake3")?;
-    match ctx.scatter_load_map_blake3 {
+    match wire.scatter_load_map_blake3 {
         Some(digest) => json.hex_value(&digest)?,
         None => json.null_value()?,
     }
     json.key(false, "scatter_entries_used")?;
     json.open_array()?;
-    for (index, entry) in discovery.scatter_entries_used.iter().enumerate() {
+    for (index, entry) in wire.scatter_entries_used.iter().enumerate() {
         json.element(index == 0)?;
         json.u64_value(*entry as u64)?;
     }
@@ -455,55 +508,55 @@ fn serialize_manifest(
     json.key(false, "scan")?;
     json.open_object()?;
     json.key(true, "record_bytes")?;
-    json.u64_value(RECORD_BYTES as u64)?;
+    json.u64_value(wire.record_bytes as u64)?;
     json.key(false, "header")?;
-    json.string_value(std::str::from_utf8(HEADER).expect("DBT header is ASCII"))?;
+    json.string_value(&wire.header)?;
     json.key(false, "occurrences")?;
-    json.u64_value(counts.occurrences as u64)?;
+    json.u64_value(wire.occurrences as u64)?;
     json.key(false, "aligned_records")?;
-    json.u64_value(discovery.aligned_records as u64)?;
+    json.u64_value(wire.aligned_records as u64)?;
     json.key(false, "unaligned_records")?;
-    json.u64_value(discovery.unaligned_records as u64)?;
+    json.u64_value(wire.unaligned_records as u64)?;
     json.key(false, "threshold")?;
-    json.string_value(THRESHOLD)?;
+    json.string_value(&wire.threshold)?;
     json.close_object()?;
 
     json.key(false, "counts")?;
     json.open_object()?;
     json.key(true, "records")?;
-    json.u64_value(counts.records as u64)?;
+    json.u64_value(wire.counts.records as u64)?;
     json.key(false, "files")?;
-    json.u64_value(counts.files as u64)?;
+    json.u64_value(wire.counts.files as u64)?;
     json.key(false, "messages")?;
-    json.u64_value(counts.messages as u64)?;
+    json.u64_value(wire.counts.messages as u64)?;
     json.key(false, "quarantined")?;
-    json.u64_value(counts.quarantined as u64)?;
+    json.u64_value(wire.counts.quarantined as u64)?;
     json.key(false, "unresolved_messages")?;
-    json.u64_value(counts.unresolved_messages as u64)?;
+    json.u64_value(wire.counts.unresolved_messages as u64)?;
     json.key(false, "fourth_word_variants")?;
     json.open_object()?;
     json.key(true, "parameter_count")?;
-    json.u64_value(discovery.fourth.parameter_count)?;
+    json.u64_value(wire.fourth.parameter_count)?;
     json.key(false, "sentinel_fecdba98")?;
-    json.u64_value(discovery.fourth.sentinel)?;
+    json.u64_value(wire.fourth.sentinel)?;
     json.key(false, "unknown")?;
-    json.u64_value(discovery.fourth.unknown)?;
+    json.u64_value(wire.fourth.unknown)?;
     json.close_object()?;
     json.close_object()?;
 
     json.key(false, "tables")?;
     json.open_object()?;
     json.key(true, "files_blake3")?;
-    json.string_value(&tables.files)?;
+    json.string_value(&wire.tables.files)?;
     json.key(false, "messages_blake3")?;
-    json.string_value(&tables.messages)?;
+    json.string_value(&wire.tables.messages)?;
     json.key(false, "records_blake3")?;
-    json.string_value(&tables.records)?;
+    json.string_value(&wire.tables.records)?;
     json.key(false, "quarantine_blake3")?;
-    json.string_value(&tables.quarantine)?;
+    json.string_value(&wire.tables.quarantine)?;
     json.close_object()?;
 
-    if let Some(identity) = identity {
+    if let Some(identity) = &wire.identity {
         json.key(false, "identity")?;
         json.string_value(identity)?;
     }
@@ -612,5 +665,50 @@ mod tests {
                 .is_none()
         );
         assert!(!dir.exists());
+    }
+
+    fn corrupt_spill_discovery(tmp: &std::path::Path, frame: [u8; 30]) -> Discovery {
+        let spill_path = tmp.join("records.spill");
+        std::fs::write(&spill_path, frame).unwrap();
+        Discovery {
+            spill_path,
+            record_count: 1,
+            files: vec!["main.c".to_string()],
+            messages: vec!["hello %d".to_string()],
+            ..Discovery::default()
+        }
+    }
+
+    fn frame_with(file_idx: u32, message_kind: u8, message_ref: u32) -> [u8; 30] {
+        let mut frame = [0u8; 30];
+        frame[0..4].copy_from_slice(&0x4000_0200u32.to_le_bytes());
+        frame[4] = 1;
+        frame[21..25].copy_from_slice(&file_idx.to_le_bytes());
+        frame[25] = message_kind;
+        frame[26..30].copy_from_slice(&message_ref.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn write_records_rejects_out_of_range_spill_remaps() {
+        let tmp = unique_dir("spill-oob");
+        let ctx = DbtContext {
+            label: "02_MAIN",
+            image_blake3: [7u8; 32],
+            scatter_load_map_blake3: None,
+        };
+        for (frame, needle) in [
+            (frame_with(5, 0, 0), "spill file index 5 out of range"),
+            (frame_with(0, 0, 9), "spill message ref 9 out of range"),
+        ] {
+            let discovery = corrupt_spill_discovery(tmp.path(), frame);
+            let (image, _, _) = layout();
+            let runtime = RuntimeImage::from_plan(&image, BASE, None).unwrap();
+            let error = publish(&discovery, &runtime, &ctx, tmp.path(), false).unwrap_err();
+            let DbtTraceError::Artifact(message) = &error else {
+                panic!("expected Artifact error, got {error:?}");
+            };
+            assert!(message.contains(needle), "message was {message}");
+        }
     }
 }

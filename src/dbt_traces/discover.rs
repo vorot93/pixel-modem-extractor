@@ -327,19 +327,49 @@ fn quarantine(
     Ok(())
 }
 
-fn classify_fourth(discovery: &mut Discovery, raw: u32) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FourthVariant {
+    ParameterCount,
+    SentinelFecdba98,
+    Unknown,
+}
+
+impl FourthVariant {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FourthVariant::ParameterCount => "parameter_count",
+            FourthVariant::SentinelFecdba98 => "sentinel_fecdba98",
+            FourthVariant::Unknown => "unknown",
+        }
+    }
+}
+
+/// The single fourth-word classifier shared by discovery counting and record serialization.
+pub(crate) fn fourth_word_variant(raw: u32) -> FourthVariant {
     if raw <= 32 {
-        discovery.fourth.parameter_count += 1;
+        FourthVariant::ParameterCount
     } else if raw == 0xfecdba98 {
-        discovery.fourth.sentinel += 1;
+        FourthVariant::SentinelFecdba98
     } else {
-        discovery.fourth.unknown += 1;
+        FourthVariant::Unknown
+    }
+}
+
+fn classify_fourth(discovery: &mut Discovery, raw: u32) {
+    match fourth_word_variant(raw) {
+        FourthVariant::ParameterCount => discovery.fourth.parameter_count += 1,
+        FourthVariant::SentinelFecdba98 => discovery.fourth.sentinel += 1,
+        FourthVariant::Unknown => discovery.fourth.unknown += 1,
     }
 }
 
 #[cfg(test)]
 pub(crate) mod testkit {
     use super::*;
+    use crate::dbt_traces::RECORD_BYTES;
+    use crate::scatter::{
+        Descriptor, HandlerMap, LoadPlan, Operation, PlannedEntry, PlannedOutput,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -419,6 +449,72 @@ pub(crate) mod testkit {
         let discovery = discover(&runtime, dir.path()).unwrap();
         (discovery, dir)
     }
+
+    pub(crate) struct ScatterFixture {
+        pub(crate) raw: Vec<u8>,
+        pub(crate) plan: LoadPlan,
+        #[allow(dead_code)]
+        pub(crate) scatter_base: u32,
+        pub(crate) zero_base: u32,
+    }
+
+    pub(crate) fn scatter_fixture() -> ScatterFixture {
+        let scatter_base = BASE + 0x1000;
+        let zero_base = BASE + 0x2000;
+        let mut payload = vec![0u8; 0x9c];
+        payload[0x00..0x07].copy_from_slice(b"main.c\0");
+        let mut words = good_record(0x1000, 0);
+        words[4] = zero_base;
+        payload[0x80..0x80 + RECORD_BYTES].copy_from_slice(&record(words));
+        let raw = vec![0x55u8; 16];
+        let plan = LoadPlan {
+            image_base: BASE,
+            image_size: raw.len() as u32,
+            loader_address: BASE,
+            literal_pair_address: BASE + 4,
+            table_start: BASE,
+            table_end: BASE + 16,
+            handlers: HandlerMap {
+                null: BASE,
+                copy: BASE + 1,
+                decompress1: BASE + 4,
+                zero: BASE + 9,
+            },
+            entries: vec![
+                PlannedEntry {
+                    index: 3,
+                    descriptor: Descriptor {
+                        source: BASE,
+                        destination: scatter_base,
+                        size: payload.len() as u32,
+                        handler: BASE + 4,
+                    },
+                    operation: Operation::Decompress1,
+                    compressed_size: Some(2),
+                    output: PlannedOutput::Bytes(payload),
+                },
+                PlannedEntry {
+                    index: 4,
+                    descriptor: Descriptor {
+                        source: BASE,
+                        destination: zero_base,
+                        size: 0x1000,
+                        handler: BASE + 9,
+                    },
+                    operation: Operation::Zero,
+                    compressed_size: None,
+                    output: PlannedOutput::ZeroFill,
+                },
+            ],
+            logical_output_size: (0x9c + 0x1000) as u64,
+        };
+        ScatterFixture {
+            raw,
+            plan,
+            scatter_base,
+            zero_base,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -427,9 +523,6 @@ mod tests {
     use super::*;
     use crate::dbt_traces::{
         DbtTraceError, HEADER, MAX_MESSAGE_BYTES, MAX_QUARANTINED, RECORD_BYTES,
-    };
-    use crate::scatter::{
-        Descriptor, HandlerMap, LoadPlan, Operation, PlannedEntry, PlannedOutput,
     };
 
     fn runtime(bytes: &[u8]) -> RuntimeImage<'_> {
@@ -657,56 +750,8 @@ mod tests {
 
     #[test]
     fn scatter_backed_records_collect_provenance_and_zero_fill_messages_stay_unresolved() {
-        let scatter_base = BASE + 0x1000;
-        let zero_base = BASE + 0x2000;
-        let mut payload = vec![0u8; 0x9c];
-        payload[0x00..0x07].copy_from_slice(b"main.c\0");
-        let mut words = good_record(0x1000, 0);
-        words[4] = zero_base;
-        payload[0x80..0x80 + RECORD_BYTES].copy_from_slice(&record(words));
-        let raw = vec![0x55u8; 16];
-        let plan = LoadPlan {
-            image_base: BASE,
-            image_size: raw.len() as u32,
-            loader_address: BASE,
-            literal_pair_address: BASE + 4,
-            table_start: BASE,
-            table_end: BASE + 16,
-            handlers: HandlerMap {
-                null: BASE,
-                copy: BASE + 1,
-                decompress1: BASE + 4,
-                zero: BASE + 9,
-            },
-            entries: vec![
-                PlannedEntry {
-                    index: 3,
-                    descriptor: Descriptor {
-                        source: BASE,
-                        destination: scatter_base,
-                        size: payload.len() as u32,
-                        handler: BASE + 4,
-                    },
-                    operation: Operation::Decompress1,
-                    compressed_size: Some(2),
-                    output: PlannedOutput::Bytes(payload),
-                },
-                PlannedEntry {
-                    index: 4,
-                    descriptor: Descriptor {
-                        source: BASE,
-                        destination: zero_base,
-                        size: 0x1000,
-                        handler: BASE + 9,
-                    },
-                    operation: Operation::Zero,
-                    compressed_size: None,
-                    output: PlannedOutput::ZeroFill,
-                },
-            ],
-            logical_output_size: (0x9c + 0x1000) as u64,
-        };
-        let runtime = RuntimeImage::from_plan(&raw, BASE, Some(&plan)).unwrap();
+        let fixture = super::testkit::scatter_fixture();
+        let runtime = RuntimeImage::from_plan(&fixture.raw, BASE, Some(&fixture.plan)).unwrap();
         let dir = super::testkit::unique_dir("dbt-scatter");
         let discovery = discover(&runtime, dir.path()).unwrap();
         assert_eq!(discovery.record_count, 1);
@@ -725,7 +770,7 @@ mod tests {
         assert_eq!(bytes[25], 2);
         assert_eq!(
             u32::from_le_bytes(bytes[26..30].try_into().unwrap()),
-            zero_base
+            fixture.zero_base
         );
     }
 }
