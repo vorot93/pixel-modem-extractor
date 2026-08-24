@@ -279,7 +279,10 @@ impl<'a, 'img> RangeWalk<'a, 'img> {
 
     /// Resolve a MOVW low-half write through a register-consistent MOVT in
     /// the same linear span: at most 32 instructions, killed by any other
-    /// write to the destination or any non-linear transfer.
+    /// write to the destination or any non-linear transfer. The inner walk
+    /// decodes through the IT-state shared with the outer range walk, which
+    /// then re-decodes the same span — fixture-equivalent today; revisit if
+    /// IT-block fixtures appear.
     fn movw_movt_value(
         &mut self,
         movw_pc: u32,
@@ -465,7 +468,7 @@ fn isa_name(isa: DecodeIsa) -> &'static str {
     }
 }
 
-fn producer_name(producer: AnalysisTool) -> &'static str {
+pub(crate) fn producer_name(producer: AnalysisTool) -> &'static str {
     match producer {
         AnalysisTool::Ghidra => "ghidra",
         AnalysisTool::Radare2 => "radare2",

@@ -160,6 +160,80 @@ fn decompose_produces_unified_tree() {
         );
     }
 
+    // DBT debug traces (Task 8): `debug_traces` sits directly after
+    // `thumb_enrich`, `debug_traces_refs` directly after it, both before
+    // `source_tree` — exact DBT record evidence (file + line) outranks the
+    // adjacency-derived attribution the source tree produces from the same
+    // inputs. A real MAIN with no DBT records is a legitimate clean absence
+    // (ok row, zero counts, catalog cleared), so the ordering is what is
+    // pinned here, not the counts.
+    let thumb_index = stage_names
+        .iter()
+        .position(|name| name == "thumb_enrich")
+        .expect("thumb_enrich stage");
+    let dbt_index = stage_names
+        .iter()
+        .position(|name| name == "debug_traces")
+        .expect("debug_traces stage");
+    let dbt_refs_index = stage_names
+        .iter()
+        .position(|name| name == "debug_traces_refs")
+        .expect("debug_traces_refs stage");
+    let source_tree_index = stage_names
+        .iter()
+        .position(|name| name == "source_tree")
+        .expect("source_tree stage");
+    assert_eq!(
+        dbt_index,
+        thumb_index + 1,
+        "debug_traces must immediately follow thumb_enrich: {stage_names:?}"
+    );
+    assert_eq!(
+        dbt_refs_index,
+        dbt_index + 1,
+        "debug_traces_refs must immediately follow debug_traces: {stage_names:?}"
+    );
+    assert!(
+        source_tree_index > dbt_refs_index,
+        "source_tree must follow debug_traces_refs: {stage_names:?}"
+    );
+    for index in [dbt_index, dbt_refs_index] {
+        let stage = &report["stages"].as_array().unwrap()[index];
+        assert!(
+            stage["status"] == "ok" || stage["status"] == "skipped" || stage["status"] == "failed",
+            "unexpected dbt stage status: {stage}"
+        );
+        if stage["status"] == "skipped" {
+            assert!(
+                stage["reason"].as_str().is_some(),
+                "a skipped dbt stage must carry its reason: {stage}"
+            );
+        }
+    }
+    let main_row = report["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|stage| stage["stage"] == "decompile"))
+        .and_then(|stage| stage["images"].as_array())
+        .and_then(|imgs| imgs.iter().find(|i| i["image"] == "02_MAIN"))
+        .expect("02_MAIN entry missing from decompile stage");
+    let dbt_fields = [
+        "dbt_records",
+        "dbt_files",
+        "dbt_messages",
+        "dbt_quarantined",
+        "dbt_unresolved_messages",
+        "dbt_references",
+        "dbt_refs_producers",
+    ];
+    let carries = main_row.get("dbt_records").is_some();
+    for field in dbt_fields {
+        assert_eq!(
+            main_row.get(field).is_some(),
+            carries,
+            "02_MAIN must carry every dbt counter or none: {main_row}"
+        );
+    }
+
     // Phase 1: pass 2 ran on at least one image (02_MAIN on real firmware has
     // token-derived names). pass2_applied is recorded into the decompile stage's
     // per-image report.

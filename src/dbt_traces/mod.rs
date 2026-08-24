@@ -3,12 +3,10 @@ use std::path::{Path, PathBuf};
 pub(crate) mod artifact;
 pub(crate) mod discover;
 pub(crate) mod reader;
-#[allow(dead_code)]
 pub(crate) mod refs;
 pub(crate) mod wire;
 
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-debug-traces-v1";
-#[allow(dead_code)]
 pub(crate) const REFS_FORMAT: &str = "pixel-modem-extractor-debug-trace-refs-v1";
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 pub(crate) const RECORD_BYTES: usize = 28;

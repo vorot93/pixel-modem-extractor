@@ -29,10 +29,14 @@ pub(crate) struct CatalogCounts {
     pub(crate) occurrences: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct MaterializedCatalog {
+    /// Unconsumed beyond construction: the decompose stage reports counts
+    /// only, and the standalone command prints the directory. Retained as
+    /// the published identity for future consumers.
+    #[allow(dead_code)]
     pub(crate) manifest_blake3: [u8; 32],
+    #[allow(dead_code)]
     pub(crate) identity: String,
     pub(crate) counts: CatalogCounts,
 }

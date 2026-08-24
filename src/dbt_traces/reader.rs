@@ -20,20 +20,24 @@ const QUARANTINE_REASONS: [&str; 4] = [
     "pointer_wrap",
 ];
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ValidatedCatalog {
     pub(crate) counts: CatalogCounts,
     pub(crate) identity: String,
     pub(crate) manifest_blake3: [u8; 32],
     pub(crate) image_blake3: [u8; 32],
+    /// Validated during `read`; unconsumed by callers beyond that check.
+    #[allow(dead_code)]
     pub(crate) scatter_entries_used: Vec<usize>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct RecordWire {
     pub(crate) address: u32,
+    /// Carried on the wire and validated; reference attribution binds
+    /// addresses only.
+    #[allow(dead_code)]
     pub(crate) file_id: u32,
+    #[allow(dead_code)]
     pub(crate) line: u32,
 }
 
@@ -92,7 +96,6 @@ fn bounded_u32(field: &str, value: u64) -> Result<u32, DbtTraceError> {
     u32::try_from(value).map_err(|_| artifact(format!("field {field} overflows u32")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn read(
     dir: &Path,
     runtime: &RuntimeImage<'_>,
@@ -1157,7 +1160,6 @@ impl Iterator for RecordIter {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn iter_records(dir: &Path) -> impl Iterator<Item = Result<RecordWire, DbtTraceError>> {
     let (stream, open_error) = match std::fs::File::open(dir.join("records.json")) {
         Ok(file) => (
