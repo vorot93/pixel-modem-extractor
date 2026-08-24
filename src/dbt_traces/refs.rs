@@ -515,10 +515,25 @@ mod tests {
     const ADR_PLUS_4: [u8; 2] = [0x01, 0xa0];
     const LDR_R0_PC4: [u8; 2] = [0x01, 0x48];
     const B_FWD_2: [u8; 2] = [0x01, 0xe0];
+    // A32 encodings re-derived from the arm32 decoder fixtures
+    // (a32_movw, a32_movt, a32_literal_load, a32_pc_address).
+    const A32_MOVW_R0_0200: [u8; 4] = [0x00, 0x02, 0x00, 0xe3];
+    const A32_MOVT_R0_4000: [u8; 4] = [0x00, 0x00, 0x44, 0xe3];
+    const A32_LDR_R0_PC0: [u8; 4] = [0x00, 0x00, 0x9f, 0xe5];
+    const A32_ADD_R0_PC_8: [u8; 4] = [0x08, 0x00, 0x8f, 0xe2];
 
     fn thumb_range(runtime: &RuntimeImage<'_>, start: u32, end: u32) -> AuthenticatedDecodeRange {
         AuthenticatedDecodeRange {
             isa: DecodeIsa::Thumb,
+            start,
+            end,
+            blake3: runtime.hash_range(start, end - start).unwrap(),
+        }
+    }
+
+    fn arm_range(runtime: &RuntimeImage<'_>, start: u32, end: u32) -> AuthenticatedDecodeRange {
+        AuthenticatedDecodeRange {
+            isa: DecodeIsa::Arm,
             start,
             end,
             blake3: runtime.hash_range(start, end - start).unwrap(),
@@ -682,6 +697,65 @@ mod tests {
         let row = &refs["references"][0];
         assert_eq!(row["record_address"], "0x40000200");
         assert_eq!(row["pc"], "0x400001f4");
+        assert_eq!(row["evidence_kind"], "pc_relative");
+    }
+
+    #[test]
+    fn a32_movw_movt_materialization_attributes_the_record() {
+        let mut image = vec![0u8; 0x10];
+        image[0x00..0x04].copy_from_slice(&A32_MOVW_R0_0200);
+        image[0x04..0x08].copy_from_slice(&A32_MOVT_R0_4000);
+        let runtime = RuntimeImage::from_plan(&image, BASE, None).unwrap();
+        let functions = vec![function(
+            FunctionOwner::Ghidra,
+            "a32_materializer",
+            vec![arm_range(&runtime, BASE, BASE + 8)],
+        )];
+        let (outcome, refs) = run_attribute("refs-a32-movw", &image, &functions);
+        assert_eq!(outcome.count, 1);
+        let row = &refs["references"][0];
+        assert_eq!(row["record_address"], "0x40000200");
+        assert_eq!(row["pc"], "0x40000000");
+        assert_eq!(row["isa"], "arm");
+        assert_eq!(row["evidence_kind"], "movw_movt");
+    }
+
+    #[test]
+    fn a32_literal_load_resolves_through_the_pool() {
+        let mut image = vec![0u8; 0x10];
+        image[0x00..0x04].copy_from_slice(&A32_LDR_R0_PC0);
+        image[0x08..0x0c].copy_from_slice(&RECORD.to_le_bytes());
+        let runtime = RuntimeImage::from_plan(&image, BASE, None).unwrap();
+        let functions = vec![function(
+            FunctionOwner::Ghidra,
+            "a32_loader",
+            vec![arm_range(&runtime, BASE, BASE + 4)],
+        )];
+        let (outcome, refs) = run_attribute("refs-a32-literal", &image, &functions);
+        assert_eq!(outcome.count, 1);
+        let row = &refs["references"][0];
+        assert_eq!(row["record_address"], "0x40000200");
+        assert_eq!(row["pc"], "0x40000000");
+        assert_eq!(row["isa"], "arm");
+        assert_eq!(row["evidence_kind"], "literal_load");
+    }
+
+    #[test]
+    fn a32_pc_relative_form_attributes_with_unaligned_visible_pc() {
+        let mut image = vec![0u8; 0x200];
+        image[0x1f0..0x1f4].copy_from_slice(&A32_ADD_R0_PC_8);
+        let runtime = RuntimeImage::from_plan(&image, BASE, None).unwrap();
+        let functions = vec![function(
+            FunctionOwner::Ghidra,
+            "a32_adr_fn",
+            vec![arm_range(&runtime, BASE + 0x1f0, BASE + 0x1f4)],
+        )];
+        let (outcome, refs) = run_attribute("refs-a32-adr", &image, &functions);
+        assert_eq!(outcome.count, 1);
+        let row = &refs["references"][0];
+        assert_eq!(row["record_address"], "0x40000200");
+        assert_eq!(row["pc"], "0x400001f0");
+        assert_eq!(row["isa"], "arm");
         assert_eq!(row["evidence_kind"], "pc_relative");
     }
 

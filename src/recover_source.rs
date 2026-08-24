@@ -794,9 +794,33 @@ fn build_index(
             }
         })
         .collect();
+    let index_attributions = |items: &[Attribution]| -> Vec<IndexAttribution> {
+        items
+            .iter()
+            .map(|a| {
+                let (region_index, run_index) = owner_fields(a.function.owner);
+                let source_artifact = a
+                    .source_artifact
+                    .clone()
+                    .unwrap_or_else(|| a.function.source_artifact.clone());
+                IndexAttribution {
+                    tool: a.function.tool,
+                    region_index,
+                    run_index,
+                    execution_blake3: digest(a.function.execution_blake3),
+                    name: a.function.name.clone(),
+                    entry: hx(a.function.entry),
+                    end: hx(a.function.end),
+                    confidence: a.confidence,
+                    reason: a.reason.clone(),
+                    source_artifact,
+                }
+            })
+            .collect()
+    };
     let mut sources = BTreeMap::new();
     for source in &source_tree.entries {
-        let items = attrs.get(&source.path).cloned().unwrap_or_default();
+        let items = attrs.get(&source.path).map(Vec::as_slice).unwrap_or(&[]);
         sources.insert(
             source.path.clone(),
             IndexSource {
@@ -806,28 +830,19 @@ fn build_index(
                     .unwrap_or(&source.leaf)
                     .display()
                     .to_string(),
-                functions: items
-                    .into_iter()
-                    .map(|a| {
-                        let (region_index, run_index) = owner_fields(a.function.owner);
-                        let source_artifact = a
-                            .source_artifact
-                            .clone()
-                            .unwrap_or_else(|| a.function.source_artifact.clone());
-                        IndexAttribution {
-                            tool: a.function.tool,
-                            region_index,
-                            run_index,
-                            execution_blake3: digest(a.function.execution_blake3),
-                            name: a.function.name,
-                            entry: hx(a.function.entry),
-                            end: hx(a.function.end),
-                            confidence: a.confidence,
-                            reason: a.reason,
-                            source_artifact,
-                        }
-                    })
-                    .collect(),
+                functions: index_attributions(items),
+            },
+        );
+    }
+    for (path, items) in attrs {
+        if sources.contains_key(path) {
+            continue;
+        }
+        sources.insert(
+            path.clone(),
+            IndexSource {
+                leaf: format!("tree/{path}"),
+                functions: index_attributions(items),
             },
         );
     }
@@ -1696,6 +1711,68 @@ mod tests {
         let leaf = std::fs::read_to_string(st.join("tree/foo/b.cc")).unwrap();
         assert!(leaf.contains("dbt exact reference"));
         assert!(leaf.contains("confidence : dbt_exact"));
+    }
+
+    #[test]
+    fn dbt_exact_index_row_survives_when_path_is_absent_from_source_tree() {
+        let st = temp_dir("recover_dbt_exact_absent_path");
+        std::fs::create_dir_all(st.join("tree/foo")).unwrap();
+        std::fs::write(st.join("tree/foo/a.cc"), b"// only __FILE__ path\n").unwrap();
+        std::fs::write(
+            st.join("manifest.json"),
+            r#"{
+              "files": {
+                "foo/a.cc": {"occurrences": [{"vaddr": "0x8000", "offset": 80}]}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let decompiled = temp_dir("recover_dbt_exact_absent_decompiled");
+        write_ghidra_functions(
+            &decompiled,
+            vec![ghidra_function("FUN_4000", 0x4000, 0x4010, &[])],
+        );
+        std::fs::write(
+            decompiled.join("decompiled.c"),
+            "// FUN_4000 @ 4000\nint FUN_4000(void) {\n    return 3;\n}\n\n",
+        )
+        .unwrap();
+        std::fs::write(decompiled.join("disasm.lst"), "4000: 00  nop\n").unwrap();
+
+        let dbt = crate::dbt_traces::exact::ExactIndex {
+            by_function: BTreeMap::from([(
+                crate::execution_ranges::FunctionEvidenceKey {
+                    owner: crate::execution_ranges::FunctionOwner::Ghidra,
+                    entry: 0x4000,
+                    execution_blake3: None,
+                },
+                "foo/absent.cc".to_string(),
+            )]),
+            ambiguous: Vec::new(),
+        };
+        let index = st.join("recovered_index.json");
+        run(
+            &st,
+            &decompiled,
+            &test_runtime(),
+            &index,
+            &Opts::default(),
+            Some(&dbt),
+        )
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        let dbt_row = &json["sources"]["foo/absent.cc"]["functions"][0];
+        assert_eq!(dbt_row["name"], "FUN_4000");
+        assert_eq!(dbt_row["confidence"], "dbt_exact");
+        assert_eq!(dbt_row["reason"], "dbt exact reference");
+        assert_eq!(dbt_row["source_artifact"], "debug_traces/references.json");
+        assert!(
+            !st.join("tree/foo/absent.cc").exists(),
+            "dbt-only paths must not invent source leaves"
+        );
     }
 
     #[test]

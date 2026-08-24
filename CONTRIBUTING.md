@@ -274,7 +274,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
 | `pal_tasks/table.rs` | Slot parsing, descriptor-v1 field relationships, and the deterministic application/label allocator |
 | `pal_tasks/artifact.rs` | Canonical authenticated v1 task manifest: serialize, strict typed reader, materialize, and clear |
-| `dbt_traces/mod.rs` | DBT debug-trace limits, `DbtTraceError`, standalone `decode-traces` run |
+| `dbt_traces/mod.rs` | DBT debug-trace limits, `DbtTraceError`, standalone `decode-traces` run (this-run scatter bind only) |
 | `dbt_traces/discover.rs` | `DBT:` sweep, threshold, quarantine, record-spill staging |
 | `dbt_traces/artifact.rs` | Five-table catalog serialize, staging rename, identity |
 | `dbt_traces/reader.rs` | Strict streaming catalog reader |
@@ -283,7 +283,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `dbt_traces/wire.rs` | Canonical JSON writer shared by catalog and refs |
 | `source_tree.rs` | Reconstruct the source-tree layout from `__FILE__` strings |
 | `analysis_tool.rs` | Shared `AnalysisTool::{Ghidra, Radare2, Rizin}` downstream identity |
-| `recover_source.rs` | Attribute producer-owned Ghidra/Thumb functions to source paths |
+| `recover_source.rs` | Attribute producer-owned Ghidra/Thumb functions to source paths; union dbt-only paths into the recovered index |
 | `decode_rf.rs` | Decode the RF_CFG calibration databases |
 | `hwcfg.rs` | Summarize `hardware_config.json` + RF_CFG coverage |
 | `tokens.rs` | Decode the Pigweed `pw_token_db` |
@@ -768,6 +768,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   | `MAX_LINE` | 1,048,575 | threshold plausibility bound |
   | `MAX_REFERENCES` | 4,194,304 | 16× records headroom |
 
+- **Standalone scatter bind is this-run only.** `decode-traces` binds
+  `scatter/MAIN/load_map.json` only when this invocation just materialized it.
+  Clean absence (`discover → Ok(None)`) clears the owned `scatter/MAIN`
+  directory and uses a raw-only view — leftover maps from a prior `--out`
+  reuse are never rebound. Other files under `--out` are left alone.
+- **`dbt_exact` index rows are not gated on `__FILE__`.**
+  `recover_source::build_index` unions attribution keys that are absent from
+  the source-tree scan so a DBT-claimed path still gets a `dbt_exact` row.
+  No source leaf is invented on disk for those paths.
 - **Record-spill staging.** Discovery writes each accepted record as a 30-byte frame to
   `dbt_spill+{pid}/records.spill` and never accumulates the record set in memory. The only
   in-memory tables are the interned unique files/messages (bounded by the caps above) and the
