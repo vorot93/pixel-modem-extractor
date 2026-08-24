@@ -465,23 +465,12 @@ pub fn run_with_evidence_projection(
 
     let arm_path = decompiled.join("functions.json");
     if arm_path.exists() {
-        let arm_text = std::fs::read_to_string(&arm_path)?;
-        let arm_v: serde_json::Value = serde_json::from_str(&arm_text)
-            .map_err(|e| Error::Serialize(format!("parse functions.json: {e}")))?;
-        let records = arm_v
-            .as_array()
-            .ok_or_else(|| Error::Serialize("functions.json must be an array".into()))?;
-        let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
-            records,
-            records.len(),
-            &runtime,
-        )?;
-        for (record, tagged) in records.iter().zip(inventory.records) {
-            let execution = execution_identity(tagged.entry, &tagged.projection)?;
-            if let Some(parsed) = parse_function(
-                record,
-                Arch::Arm,
-                FunctionOwner::Ghidra,
+        let streamed =
+            crate::execution_ranges::read_ghidra_inventory_streaming(&arm_path, &runtime)?;
+        for record in streamed.functions {
+            let execution = execution_identity(record.tagged.entry, &record.tagged.projection)?;
+            if let Some(parsed) = parse_ghidra_function(
+                &record,
                 execution.as_ref(),
                 recovered_function_names,
                 evidence_names,
@@ -960,6 +949,50 @@ fn function_disassembly(
 /// skipped — same posture as Phase 1's symbolicate loaders).
 /// `recovered_function_names` enriches `Function.recovered_name` if Phase 1
 /// supplied a name for this function's entry address.
+fn parse_ghidra_function(
+    record: &crate::execution_ranges::GhidraFunctionFields,
+    execution: Option<&ExecutionIdentity>,
+    recovered_function_names: &HashMap<String, String>,
+    evidence_names: Option<&FunctionEvidenceNameProjection>,
+) -> Option<Function> {
+    let entry = u64::from(record.entry);
+    let source_name = record
+        .original_name
+        .clone()
+        .unwrap_or_else(|| record.name.clone());
+    let execution_blake3 = execution.map(|identity| identity.execution_blake3);
+    let ghidra_name = evidence_names
+        .and_then(|projection| {
+            projection.name_for_identity(Arch::Arm, FunctionOwner::Ghidra, entry, execution_blake3)
+        })
+        .map(str::to_owned)
+        .unwrap_or(source_name);
+    let canonical = format!("{entry:x}");
+    Some(Function {
+        entry,
+        owner: FunctionOwner::Ghidra,
+        execution_blake3,
+        decode_ranges: execution
+            .map(|identity| {
+                identity
+                    .decode_ranges
+                    .iter()
+                    .map(|range| (u64::from(range.start), u64::from(range.end)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        arch: Arch::Arm,
+        ghidra_name,
+        recovered_name: recovered_function_names.get(&canonical).cloned(),
+        data_refs: record
+            .data_refs
+            .iter()
+            .map(|address| u64::from(*address))
+            .collect(),
+        body: None,
+    })
+}
+
 fn parse_function(
     v: &serde_json::Value,
     arch: Arch,

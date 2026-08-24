@@ -13,7 +13,7 @@ use crate::dbt_traces::wire::JsonWriter;
 use crate::dbt_traces::{DbtTraceError, MAX_REFERENCES, REFS_FORMAT, SCHEMA_VERSION};
 use crate::execution_ranges::{
     AuthenticatedDecodeRange, DecodeIsa, ExecutionIdentity, FunctionOwner, execution_identity,
-    validate_ghidra_inventory_records,
+    read_ghidra_inventory_streaming,
 };
 use crate::runtime_image::RuntimeImage;
 use crate::thumb_analysis::read_thumb_functions_streaming;
@@ -324,22 +324,19 @@ pub(crate) fn load_functions(
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)?;
-    let raw: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
-        .map_err(|error| artifact(format!("functions inventory parsing failed: {error}")))?;
-    let inventory = validate_ghidra_inventory_records(&raw, raw.len(), runtime)
-        .map_err(DbtTraceError::Runtime)?;
-    let mut functions = Vec::with_capacity(inventory.records.len());
-    for (value, tagged) in raw.iter().zip(&inventory.records) {
-        let Some(identity) =
-            execution_identity(tagged.entry, &tagged.projection).map_err(DbtTraceError::Runtime)?
+    let streamed =
+        read_ghidra_inventory_streaming(&path, runtime).map_err(DbtTraceError::Runtime)?;
+    let mut functions = Vec::with_capacity(streamed.functions.len());
+    for function in streamed.functions {
+        let Some(identity) = execution_identity(function.tagged.entry, &function.tagged.projection)
+            .map_err(DbtTraceError::Runtime)?
         else {
             continue;
         };
         functions.push(RefFunction {
-            owner: tagged.owner,
+            owner: function.tagged.owner,
             identity,
-            name: inventory_name(value)?,
+            name: function.original_name.unwrap_or(function.name),
         });
     }
     Ok(Some(functions))
@@ -369,22 +366,6 @@ pub(crate) fn load_thumb(
         })
         .collect();
     Ok(Some(functions))
-}
-
-fn inventory_name(value: &serde_json::Value) -> Result<String, DbtTraceError> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| artifact("inventory record must be an object"))?;
-    let original = object.get("original_name").and_then(|name| name.as_str());
-    let name = object
-        .get("name")
-        .and_then(|name| name.as_str())
-        .ok_or_else(|| artifact("inventory record lacks a name"))?;
-    Ok(original.unwrap_or(name).to_string())
-}
-
-fn artifact(message: impl Into<String>) -> DbtTraceError {
-    DbtTraceError::Artifact(message.into())
 }
 
 fn write_references(

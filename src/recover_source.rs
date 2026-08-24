@@ -383,24 +383,30 @@ impl RecoveredFunctions {
         dir: &Path,
         runtime: &crate::runtime_image::RuntimeImage<'_>,
     ) -> Result<Self> {
-        let ghidra_reader =
-            std::io::BufReader::new(std::fs::File::open(dir.join("functions.json"))?);
         let bodies = parse_decompiled_bodies(&std::fs::read_to_string(dir.join("decompiled.c"))?);
         let mut skipped = 0usize;
         let mut functions = Vec::new();
 
-        let ghidra_file: Vec<serde_json::Value> = serde_json::from_reader(ghidra_reader)
-            .map_err(|e| Error::Serialize(format!("functions.json: {e}")))?;
-        let inventory = crate::execution_ranges::validate_ghidra_inventory_records(
-            &ghidra_file,
-            ghidra_file.len(),
+        let streamed = crate::execution_ranges::read_ghidra_inventory_streaming(
+            &dir.join("functions.json"),
             runtime,
         )?;
-        for (value, tagged) in ghidra_file.into_iter().zip(inventory.records) {
-            let f: GhidraFunctionJson = serde_json::from_value(value)
-                .map_err(|e| Error::Serialize(format!("functions.json: {e}")))?;
-            let execution =
-                crate::execution_ranges::execution_identity(tagged.entry, &tagged.projection)?;
+        for record in streamed.functions {
+            let execution = crate::execution_ranges::execution_identity(
+                record.tagged.entry,
+                &record.tagged.projection,
+            )?;
+            let f = GhidraFunctionJson {
+                name: record.name,
+                entry: format!("0x{:x}", record.entry),
+                end: Some(format!("0x{:x}", record.end)),
+                size: record.size,
+                data_refs: record
+                    .data_refs
+                    .iter()
+                    .map(|address| format!("0x{address:x}"))
+                    .collect(),
+            };
             let Some(function) = recovered_ghidra_function(f, &bodies, execution.as_ref()) else {
                 skipped += 1;
                 continue;

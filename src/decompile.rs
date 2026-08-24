@@ -10,10 +10,7 @@
 
 use crate::{
     error::{Error, Result},
-    execution_ranges::{
-        OwnedExecutionIdentity, TaggedExecutionRecord, parse_blake3,
-        validate_ghidra_inventory_records,
-    },
+    execution_ranges::{OwnedExecutionIdentity, TaggedExecutionRecord, parse_blake3},
     pal_tasks::{self, TaskArtifactContext},
     runtime_image::RuntimeImage,
     scatter,
@@ -713,12 +710,6 @@ pub(crate) struct TerminalInventorySummary {
     pub thumb_records: Vec<TaggedExecutionRecord>,
 }
 
-fn read_json(path: &Path, description: &str) -> Result<serde_json::Value> {
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| Error::Serialize(format!("parse {description}: {error}")))
-}
-
 fn inventory_counts(
     inventory: &crate::execution_ranges::ValidatedInventory,
 ) -> ExecutionInventoryCounts {
@@ -938,15 +929,10 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
 ) -> std::result::Result<TerminalInventorySummary, TerminalValidationFailure> {
-    let ghidra_json = read_json(ghidra_functions_path, "Ghidra functions inventory")
-        .map_err(TerminalValidationFailure::ghidra)?;
-    let ghidra_records = ghidra_json.as_array().ok_or_else(|| {
-        TerminalValidationFailure::ghidra(Error::Serialize(
-            "Ghidra functions inventory must be an array".into(),
-        ))
-    })?;
-    let ghidra = validate_ghidra_inventory_records(ghidra_records, ghidra_records.len(), runtime)
-        .map_err(TerminalValidationFailure::ghidra)?;
+    let streamed =
+        crate::execution_ranges::read_ghidra_inventory_streaming(ghidra_functions_path, runtime)
+            .map_err(TerminalValidationFailure::ghidra)?;
+    let ghidra = streamed.inventory;
     let mut accepted_identities: BTreeSet<OwnedExecutionIdentity> =
         ghidra.accepted_executions.iter().cloned().collect();
 
