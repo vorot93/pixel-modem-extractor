@@ -2852,6 +2852,20 @@ fn headless_process_args(
     Ok(Some(args))
 }
 
+fn tail_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
 /// Extract the `N` from the summary line
 /// `ApplySymbols: image=<image> applied N names, M plate comments over E
 /// executions`. `None` when the line is missing or the count is not an
@@ -3302,7 +3316,13 @@ pub fn run_two_pass(
                 .unwrap_or_else(|| "none".to_string());
             let pal_identity = input.pal_identity_or_none().to_string();
             if let Err(error) = export_attempt.validate_current(&pal_identity, &symbol_map_hash) {
-                let reason = format!("incomplete current export: {error}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let reason = format!(
+                    "incomplete current export: {error}\nstdout tail:\n{}\nstderr tail:\n{}",
+                    tail_text(&stdout, 2048),
+                    tail_text(&stderr, 2048)
+                );
                 ir.pass2_error = Some(reason.clone());
                 outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
                 continue;
@@ -4641,7 +4661,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             );
         }
         for pinned in [
-            "PHASE_BUDGET_MS = 15 * 60_000L",
+            "budgetMsOverride(\"PME_TAME_PHASE_BUDGET_MS\", 15 * 60_000L)",
             "MAX_REGIONS = 4096",
             "MAX_REGION_AGGREGATE_BYTES = 512L * 1024L * 1024L",
             "MAX_STREAM_RECORDS = 1_000_000",
