@@ -487,7 +487,7 @@ fn image_matches(want: Option<&str>, label: &str, name: &str) -> bool {
 /// The `--run` skip decision (pure — no process spawn, no I/O): `Some(stats)`
 /// iff `classify`'s battery is unanimously opaque, meaning Ghidra's standard
 /// import recovers nothing (0 functions, 0-byte exports; measured on mustang
-/// `01_PSP` — see the spike capture in CONTRIBUTING). `None` sends the image
+/// `01_PSP` — see the spike capture in AGENTS). `None` sends the image
 /// to Ghidra exactly as today; a partially-encrypted image is never skipped
 /// (any single test refusal fails closed to `not_opaque`).
 fn opaque_skip(bytes: &[u8]) -> Option<crate::classify::BatteryStats> {

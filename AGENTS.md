@@ -2047,7 +2047,7 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **Design before code.** Non-trivial work gets a written design spec and an
   implementation plan before implementation begins. Keep process artifacts
   outside the repository; durable outcomes land in this file, the README, and
-  code comments. Read this CONTRIBUTING.md and the
+  code comments. Read this AGENTS.md and the
   README before starting non-trivial work — they capture why approaches were
   chosen or rejected, which the code alone can't tell you.
 - **Test first**, keep changes small and reviewable.

@@ -1693,7 +1693,7 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // deferring the decompiled.c rewrite so its idempotency sentinel does not
         // block pass 2; (2) run globals (writes globals.json); (3) finalize again —
         // now the string-ref tier activates, and this pass rewrites decompiled.c
-        // with the full name set. See CONTRIBUTING (symbolication) for the rationale.
+        // with the full name set. See AGENTS (symbolication) for the rationale.
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
         });
@@ -1723,7 +1723,7 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // and the pass-1 functions.json / thumb_functions.json inventory,
         // never decompiled.c; and pass 2 is `-process -noanalysis`, so it
         // never changes function boundaries — the pass-1 inventory the shape
-        // stage consumes is identical pre/post pass 2. See CONTRIBUTING
+        // stage consumes is identical pre/post pass 2. See AGENTS
         // (Phase 3.2) for the full rationale.
         run_step(SymbolRouteStep::RunGlobalShapes);
         run_step(SymbolRouteStep::DispatchPass2);

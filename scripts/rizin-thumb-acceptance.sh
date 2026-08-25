@@ -242,6 +242,6 @@ run_leg cheetah-fallback "$cheetah_img" true
 
 note "all four legs completed under $accept_root"
 printf 'Compare each fresh sidecar against the retained pre-v3 tree and audit the\n'
-printf 'gates in CONTRIBUTING (raw/substantial/accepted/quarantined counts, accepted\n'
+printf 'gates in AGENTS (raw/substantial/accepted/quarantined counts, accepted\n'
 printf 'execution identities, region ownership, cheetah 0x42310000, globals yield and\n'
 printf 'conflicts, wall time, and maximum RSS from the .time files).\n'
