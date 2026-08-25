@@ -1890,6 +1890,7 @@ struct TerminalPalMap {
 fn load_terminal_pal_maps(
     images_dir: &Path,
     report: &decompile::DecompileReport,
+    ghidra_dir: &Path,
 ) -> (HashMap<String, TerminalPalMap>, Vec<(String, String)>) {
     let mut maps = HashMap::new();
     let mut errors = Vec::new();
@@ -1901,8 +1902,8 @@ fn load_terminal_pal_maps(
         };
         let label = &image.label;
         let image_dir = images_dir.join(label);
-        let manifest_path = image_dir.join("pal_tasks").join(PAL_MANIFEST_FILE);
-        let scatter_manifest = match state.scatter {
+        let terminal_manifest = image_dir.join("pal_tasks").join(PAL_MANIFEST_FILE);
+        let terminal_scatter = match state.scatter {
             decompile::RuntimeScatterState::Present => {
                 Some(image_dir.join("scatter").join("load_map.json"))
             }
@@ -1913,19 +1914,54 @@ fn load_terminal_pal_maps(
             label,
             image.image_start,
             state.scatter,
-            &manifest_path,
+            &terminal_manifest,
             &map.identity,
         ) {
             Ok(artifact) => {
-                maps.insert(
-                    label.clone(),
-                    TerminalPalMap {
-                        identity: artifact.identity.clone(),
-                        manifest_path,
-                        scatter_manifest,
-                        context: pal_pass2_context(&artifact),
-                    },
-                );
+                // Pass-2 manifest arguments must sit inside the Ghidra kit
+                // root (see `stage_pass2_manifest`); a restage failure is a
+                // fail-closed per-image error, never a silent skip.
+                let restage = (|| -> Result<(PathBuf, Option<PathBuf>)> {
+                    let staged_manifest =
+                        ghidra_dir.join("pal_tasks").join(label).join(PAL_MANIFEST_FILE);
+                    stage_pass2_manifest(ghidra_dir, &terminal_manifest, &staged_manifest)?;
+                    let staged_scatter = match &terminal_scatter {
+                        Some(terminal) => {
+                            let staged = ghidra_dir
+                                .join("scatter")
+                                .join(label)
+                                .join("load_map.json");
+                            stage_pass2_manifest(ghidra_dir, terminal, &staged)?;
+                            Some(staged)
+                        }
+                        None => None,
+                    };
+                    // `readPal` re-authenticates the raw image at its pass-1
+                    // kit path (`<ghidra>/images/<label>`), which the marshal
+                    // moved to `images/<label>/<label>.bin`; restage those
+                    // bytes as well so the BLAKE3 check binds the same image.
+                    let staged_raw = ghidra_dir.join("images").join(label);
+                    std::fs::create_dir_all(staged_raw.parent().expect("raw image parent"))?;
+                    std::fs::copy(image_dir.join(format!("{label}.bin")), &staged_raw)?;
+                    Ok((staged_manifest, staged_scatter))
+                })();
+                match restage {
+                    Ok((manifest_path, scatter_manifest)) => {
+                        maps.insert(
+                            label.clone(),
+                            TerminalPalMap {
+                                identity: artifact.identity.clone(),
+                                manifest_path,
+                                scatter_manifest,
+                                context: pal_pass2_context(&artifact),
+                            },
+                        );
+                    }
+                    Err(error) => errors.push((
+                        label.clone(),
+                        format!("pass-2 PAL manifest restage: {error}"),
+                    )),
+                }
             }
             Err(error) => errors.push((label.clone(), format!("terminal PAL manifest: {error}"))),
         }
@@ -2010,6 +2046,19 @@ fn pal_pass2_context(
         scatter_load_map_blake3,
         applications,
     }
+}
+
+/// Re-materialize one terminal manifest at its pass-1 source location under
+/// the Ghidra kit root. The pass-1 marshal moves the terminal bytes to
+/// `images/<label>/`, but `ApplySymbols`/`ExportDecomp` authenticate every
+/// manifest argument as canonically contained in the kit root they are
+/// handed — pass 2 runs against `<out>/ghidra`, so the terminal bytes are
+/// copied back. The copies are intermediate pass-2 state under the pruned
+/// `ghidra/` tree; the terminal artifacts stay authoritative.
+fn stage_pass2_manifest(ghidra_dir: &Path, terminal: &Path, staged: &Path) -> Result<()> {
+    std::fs::create_dir_all(staged.parent().expect("staged manifest parent"))?;
+    std::fs::copy(terminal, staged)?;
+    Ok(())
 }
 
 fn prepare_pass2_inputs(
@@ -3273,7 +3322,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         (HashMap::new(), Vec::new())
     } else {
         let (pal_maps, pal_errors) = match pass1_report.as_ref() {
-            Some(report) => load_terminal_pal_maps(&images_dir, report),
+            Some(report) => load_terminal_pal_maps(&images_dir, report, &ghidra_dir),
             None => (HashMap::new(), Vec::new()),
         };
         terminal_pal_maps = pal_maps;
@@ -3443,7 +3492,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             } else {
                 derive_global_types_maps(&images_dir, &ghidra_dir)
             };
-            let inputs = prepare_pass2_inputs(
+            let mut inputs = prepare_pass2_inputs(
                 &function_maps,
                 &prepared_global_maps,
                 &global_types_maps,
