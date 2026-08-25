@@ -123,6 +123,7 @@ public class ApplyThumbNames extends HeadlessScript {
         int created = 0;
         int reapplied = 0;
         int skippedExisting = 0;
+        boolean authenticatedConflictSkip = false;
         int skippedCollision = 0;
         long phaseDeadline = System.currentTimeMillis() + PHASE_BUDGET_MS;
 
@@ -162,13 +163,48 @@ public class ApplyThumbNames extends HeadlessScript {
                             PalTasksSupport.programAddress(currentProgram, range.end - 1));
                 }
 
+                // A Ghidra function overlapping the authenticated span must
+                // never be damaged by the carve — skip (counted) instead.
+                for (ghidra.program.model.listing.Instruction insn : currentProgram
+                        .getListing().getInstructions(authenticated, true)) {
+                    if (functions.getFunctionContaining(insn.getAddress()) != null) {
+                        skippedExisting++;
+                        authenticatedConflictSkip = true;
+                        break;
+                    }
+                }
+                if (authenticatedConflictSkip) {
+                    authenticatedConflictSkip = false;
+                    continue;
+                }
+
                 // 1. Declare the Thumb context over the first instruction.
+                // Ghidra may already have disassembled these bytes in ARM
+                // mode (unowned — no function claimed them); clearing those
+                // instructions resolves the context conflict, and the whole
+                // script transaction still rolls back atomically on failure.
                 RegisterValue priorContext =
                         currentProgram.getProgramContext().getRegisterValue(tMode, entry);
                 Address firstEnd = entry.add(creation.decodeRanges.get(0).end
                         - creation.decodeRanges.get(0).start - 1);
-                currentProgram.getProgramContext().setValue(tMode, entry, firstEnd,
-                        BigInteger.ONE);
+                try {
+                    currentProgram.getProgramContext()
+                            .setValue(tMode, entry, firstEnd, BigInteger.ONE);
+                }
+                catch (ghidra.program.model.listing.ContextChangeException conflict) {
+                    for (ghidra.program.model.address.AddressRange range : authenticated) {
+                        currentProgram.getListing().clearCodeUnits(range.getMinAddress(),
+                                range.getMaxAddress(), false);
+                    }
+                    try {
+                        currentProgram.getProgramContext()
+                                .setValue(tMode, entry, firstEnd, BigInteger.ONE);
+                    }
+                    catch (ghidra.program.model.listing.ContextChangeException retry) {
+                        fail("the creation ISA context could not be declared at " + entry
+                                + ": " + retry.getMessage());
+                    }
+                }
                 final RegisterValue priorFinal = priorContext;
                 final Address firstEndFinal = firstEnd;
                 undoJournal.add(() -> {
