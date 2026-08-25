@@ -4379,7 +4379,10 @@ fn apply_pal_tasks_rejects_entry_timeout_and_rolls_back() {
         "timeout",
         None,
         &[
-            ("PER_ENTRY_BUDGET_MS = 30_000L", "PER_ENTRY_BUDGET_MS = 1L"),
+            (
+                "budgetOverride(\"PME_PAL_ENTRY_BUDGET_MS\", 30_000L)",
+                "budgetOverride(\"PME_PAL_ENTRY_BUDGET_MS\", 1L)",
+            ),
             (
                 "TimeoutTaskMonitor entryMonitor = newEntryMonitor(remainingPhaseMs);",
                 concat!(
@@ -5591,7 +5594,10 @@ fn datamark_rejects_deadline_and_rolls_back() {
         &home,
         "deadline",
         &[
-            ("PHASE_BUDGET_MS = 15 * 60_000L", "PHASE_BUDGET_MS = 1L"),
+            (
+                "budgetMsOverride(\"PME_TAME_PHASE_BUDGET_MS\", 15 * 60_000L)",
+                "budgetMsOverride(\"PME_TAME_PHASE_BUDGET_MS\", 1L)",
+            ),
             ("planGaps();", "Thread.sleep(50);\n            planGaps();"),
         ],
         "the TameAnalysis phase budget was exhausted",
@@ -6817,9 +6823,9 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     patch_apply_symbols_script(
         &state.kit.out,
         &[(
-            "                    comments++;",
+            "                comments++;",
             concat!(
-                "                    comments++;",
+                "                comments++;",
                 "\n                    if (comments == 1) {",
                 "\n                        throw new IllegalStateException(",
                 "\n                                \"injected pass-2 failure after several mutations\");",

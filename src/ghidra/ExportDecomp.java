@@ -449,8 +449,20 @@ public class ExportDecomp extends HeadlessScript {
             long end = PalTasksSupport.functionEnd(currentProgram, fn);
             PalTasksSupport.DecodeProjection projection =
                     PalTasksSupport.decodeProjection(currentProgram, monitor, fn);
+            // Ghidra mirrors a referenced function's primary onto its thunks
+            // whenever either is renamed, so pass-2 naming decisions must
+            // know the thunk relation. External thunks (referenced symbol,
+            // no in-program function) carry no relation.
+            String thunkOf = "null";
+            if (fn.isThunk()) {
+                Function referenced = fn.getThunkedFunction(false);
+                if (referenced != null && !referenced.isExternal()) {
+                    thunkOf = String.format("\"0x%x\"",
+                            referenced.getEntryPoint().getOffset());
+                }
+            }
             w.print(String.format(
-                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s}",
+                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s, \"thunk_of\": %s}",
                 name,
                 PalTasksSupport.primarySource(fn.getSymbol().getSource()),
                 entry,
@@ -458,7 +470,8 @@ public class ExportDecomp extends HeadlessScript {
                 fn.getBody().getNumAddresses(),
                 decodeRangesJson(projection.ranges),
                 decodeErrorsJson(projection.errors),
-                dataRefsJson(fn)));
+                dataRefsJson(fn),
+                thunkOf));
         }
         if (!first) {
             w.println();

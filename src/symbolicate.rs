@@ -1161,6 +1161,9 @@ struct GhidraExecutionRecord {
     original_source: String,
     /// First decode-range ISA ("arm" | "thumb") for the sort key.
     first_isa: &'static str,
+    /// Entry of the in-program function this thunk forwards to, when the
+    /// retained record carries the relation.
+    thunk_of: Option<u32>,
     execution_digest: [u8; 32],
 }
 
@@ -1306,6 +1309,7 @@ pub(crate) fn write_pass2_symbol_map(
                 crate::execution_ranges::DecodeIsa::Arm => "arm",
                 crate::execution_ranges::DecodeIsa::Thumb => "thumb",
             },
+            thunk_of: record.thunk_of,
             execution_digest: execution.execution_blake3,
         });
     }
@@ -1321,6 +1325,7 @@ pub(crate) fn write_pass2_symbol_map(
     // symbol for that exact execution identity.
     let mut decisions: Vec<DecisionBlock<'_>> = Vec::with_capacity(executions.len());
     let mut applied_decision_count = 0usize;
+    let mut renamed: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
     for (index, execution) in executions.iter().enumerate() {
         let symbol = symbols
             .iter()
@@ -1382,6 +1387,7 @@ pub(crate) fn write_pass2_symbol_map(
                     Tier::Provisional | Tier::None => "analysis",
                 };
                 applied_decision_count += 1;
+                renamed.insert(execution.entry, name.as_str());
                 (name.as_str(), source, "rename")
             }
             _ => (
@@ -1403,6 +1409,45 @@ pub(crate) fn write_pass2_symbol_map(
             annotations: &symbol.annotations,
             pal_transition,
         });
+    }
+
+    // Ghidra mirrors a referenced function's post-rename primary onto every
+    // thunk of it, recursively through thunk chains (the direct thunk of the
+    // renamed target and every thunk of that thunk follow the new primary;
+    // each thunk's own symbol source is left unchanged). A preserve decision
+    // for such a thunk would fail ApplySymbols' postflight, so the map
+    // encodes the drift it cannot forbid as an explicit `mirror` decision:
+    // the final primary is the chain-root target's renamed primary, the
+    // final source is the thunk's unchanged original source, and
+    // ApplySymbols verifies without mutating (the mirror already happened
+    // through the target's rename). A thunk with its own authorized rename
+    // keeps that decision; the Java side orders thunk renames after
+    // non-thunk renames so the independent name wins over Ghidra's mirror.
+    let thunk_targets: std::collections::HashMap<u32, Option<u32>> = executions
+        .iter()
+        .map(|execution| (execution.entry, execution.thunk_of))
+        .collect();
+    for (decision, execution) in decisions.iter_mut().zip(&executions) {
+        if decision.action != "preserve" {
+            continue;
+        }
+        let mut target = execution.thunk_of;
+        let mut hops = 0usize;
+        while let Some(target_entry) = target {
+            if let Some(&mirrored) = renamed.get(&target_entry) {
+                decision.final_primary = mirrored;
+                decision.action = "mirror";
+                break;
+            }
+            // A cycle or an unbounded chain cannot occur in a validated
+            // Ghidra inventory (thunk graphs are acyclic), but the hop bound
+            // keeps a malformed map from spinning here regardless.
+            hops += 1;
+            if hops > executions.len() {
+                break;
+            }
+            target = thunk_targets.get(&target_entry).copied().flatten();
+        }
     }
 
     let (pal_identity, manifest_blake3, scatter_blake3) = match pal {
@@ -4559,6 +4604,103 @@ mod tests {
             ghidra_symbol_at(load_addr + 0x200, out[1].1.execution_blake3, None),
         ];
         (symbols, out)
+    }
+
+    #[test]
+    fn map_emits_mirror_decisions_for_thunk_chains_of_renamed_targets() {
+        let dir = map_fixture_tree("thunk_chain");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let target_entry = load_addr + 0x100;
+        let direct_entry = load_addr + 0x200;
+        let chained_entry = load_addr + 0x300;
+        let mut target = ghidra_function_in_image(
+            "FUN_target",
+            target_entry,
+            target_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        target["name"] = serde_json::json!("FUN_target");
+        let mut direct = ghidra_function_in_image(
+            "thunk_FUN_target",
+            direct_entry,
+            direct_entry + 4,
+            &[],
+            &image,
+            load_addr,
+        );
+        direct["thunk_of"] = serde_json::json!(format!("0x{target_entry:x}"));
+        let mut chained = ghidra_function_in_image(
+            "thunk_thunk_FUN_target",
+            chained_entry,
+            chained_entry + 4,
+            &[],
+            &image,
+            load_addr,
+        );
+        chained["thunk_of"] = serde_json::json!(format!("0x{direct_entry:x}"));
+        write_map_functions(&dir, &[chained, direct, target]);
+
+        let mut symbols = Vec::new();
+        for entry in [target_entry, direct_entry, chained_entry] {
+            let (identity, _) = identity_for(&dir, entry, &image, load_addr);
+            let mut symbol = ghidra_symbol_at(entry, identity.execution_blake3, None);
+            symbol.original_name = if entry == target_entry {
+                "FUN_target".to_string()
+            } else if entry == direct_entry {
+                "thunk_FUN_target".to_string()
+            } else {
+                "thunk_thunk_FUN_target".to_string()
+            };
+            if entry == target_entry {
+                symbol.name = Some("AtiParsePlusCOPS".to_string());
+                symbol.tier = Tier::Recovered;
+            }
+            symbols.push(symbol);
+        }
+
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.execution_count, 3);
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        let decisions = parsed["symbols"].as_array().unwrap();
+        let by_original = |name: &str| {
+            decisions
+                .iter()
+                .find(|d| d["original_primary"] == name)
+                .unwrap_or_else(|| panic!("no decision for {name}"))
+                .clone()
+        };
+        let target_decision = by_original("FUN_target");
+        assert_eq!(target_decision["action"], "rename");
+        assert_eq!(target_decision["final_primary"], "AtiParsePlusCOPS");
+        // Ghidra mirrors the renamed primary onto every thunk in the chain,
+        // recursively; the map must expect exactly that, keeping each
+        // thunk's own source.
+        let direct_decision = by_original("thunk_FUN_target");
+        assert_eq!(direct_decision["action"], "mirror");
+        assert_eq!(direct_decision["final_primary"], "AtiParsePlusCOPS");
+        assert_eq!(direct_decision["final_source"], "default");
+        let chained_decision = by_original("thunk_thunk_FUN_target");
+        assert_eq!(chained_decision["action"], "mirror");
+        assert_eq!(chained_decision["final_primary"], "AtiParsePlusCOPS");
+        assert_eq!(chained_decision["final_source"], "default");
+        // A mirror never counts as an applied decision.
+        assert_eq!(written.applied_decision_count, 1);
     }
 
     #[test]

@@ -116,8 +116,10 @@ final class PalTasksSupport {
     static final int MAX_FUNCTIONS = 262_144;
     /** Aggregate task-function-body bytes the export postflight may walk. */
     static final long MAX_TASK_BODY_BYTES = 64L * 1024L * 1024L;
-    /** One deadline covering the export preflight/verification walk. */
-    static final long EXPORT_VALIDATION_BUDGET_MS = 15 * 60_000L;
+    /** One deadline covering the export preflight/verification walk;
+     * overridable for acceptance-scale corpora (see budgetMsOverride). */
+    static final long EXPORT_VALIDATION_BUDGET_MS =
+            budgetMsOverride("PME_EXPORT_VALIDATION_BUDGET_MS", 15 * 60_000L);
     /** Compact Java preflight metadata retained by ApplySymbols. */
     static final long MAX_APPLY_PREFLIGHT_METADATA = 128L * 1024L * 1024L;
 
@@ -419,6 +421,27 @@ final class PalTasksSupport {
         PalError(String message) {
             super(message);
         }
+    }
+
+    /** Wall-clock override in milliseconds from the environment; absent,
+     * malformed, or non-positive handling follows budgetMsOverride. */
+    static long budgetMsOverride(String variable, long fallback) {
+        String value = System.getenv(variable);
+        if (value == null) {
+            return fallback;
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        }
+        catch (NumberFormatException error) {
+            throw new IllegalArgumentException(
+                    variable + " is not a whole number of milliseconds: " + value);
+        }
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(variable + " must be positive: " + value);
+        }
+        return parsed;
     }
 
     private static void fail(String message) {
@@ -2811,8 +2834,9 @@ final class PalTasksSupport {
             String finalSource = requireSourceName(stringValue(reader, "final_source"));
             name(reader, "action");
             String action = stringValue(reader, "action");
-            if (!"preserve".equals(action) && !"rename".equals(action)) {
-                fail("decision action is not preserve or rename");
+            if (!"preserve".equals(action) && !"rename".equals(action)
+                    && !"mirror".equals(action)) {
+                fail("decision action is not preserve, rename, or mirror");
             }
             name(reader, "annotations");
             List<String> annotations = new ArrayList<>();
@@ -2861,6 +2885,18 @@ final class PalTasksSupport {
                 }
                 if (palTransition) {
                     fail("a preserve decision carries a PAL transition");
+                }
+            }
+            else if ("mirror".equals(action)) {
+                // Ghidra mirrors a referenced function's post-rename primary
+                // onto its thunks; the mirror decision only verifies that
+                // drift, so the source must stay the thunk's original and
+                // no PAL transition may ride along.
+                if (!originalSource.equals(finalSource)) {
+                    fail("a mirror decision changes the primary source");
+                }
+                if (palTransition) {
+                    fail("a mirror decision carries a PAL transition");
                 }
             }
             else if ("default".equals(finalSource)) {

@@ -699,6 +699,11 @@ pub(crate) struct GhidraFunctionFields {
     pub end: u32,
     pub size: u64,
     pub data_refs: Vec<u32>,
+    /// Entry of the in-program function this thunk forwards to. Ghidra
+    /// mirrors the referenced function's primary onto its thunks on every
+    /// rename, so naming decisions need the relation; `None` covers
+    /// non-thunks and external thunks (no in-program target).
+    pub thunk_of: Option<u32>,
     pub quarantine_errors: usize,
     pub tagged: TaggedExecutionRecord,
 }
@@ -720,6 +725,7 @@ const GHIDRA_REQUIRED_KEYS: [&str; 8] = [
     "data_refs",
 ];
 const GHIDRA_ENRICHMENT_KEYS: [&str; 2] = ["original_name", "annotations"];
+const GHIDRA_OPTIONAL_KEYS: [&str; 1] = ["thunk_of"];
 
 fn validate_ghidra_record_shape(record: &Value) -> Result<&Map<String, Value>> {
     let object = record
@@ -731,6 +737,7 @@ fn validate_ghidra_record_shape(record: &Value) -> Result<&Map<String, Value>> {
         || object.keys().any(|key| {
             !GHIDRA_REQUIRED_KEYS.contains(&key.as_str())
                 && !GHIDRA_ENRICHMENT_KEYS.contains(&key.as_str())
+                && !GHIDRA_OPTIONAL_KEYS.contains(&key.as_str())
         })
     {
         return Err(invalid(
@@ -848,6 +855,14 @@ impl GhidraInventoryScan<'_, '_> {
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
+        let thunk_of = match object.get("thunk_of") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                Some(parse_hex(value.as_str().ok_or_else(|| {
+                    invalid("thunk_of must be a hex address string or null")
+                })?)?)
+            }
+        };
         let (tagged, projection, identity) = validate_inventory_record(
             &record,
             FunctionOwner::Ghidra,
@@ -877,6 +892,7 @@ impl GhidraInventoryScan<'_, '_> {
             end,
             size,
             data_refs,
+            thunk_of,
             quarantine_errors,
             tagged,
         });
