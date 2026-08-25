@@ -902,10 +902,15 @@ hardcoded. Two reference images exercise both models end-to-end:
   the regenerated `decompiled.c`. (Global-alias rejection is therefore
   best-effort at that stage: `globals.json` does not exist yet, so `global_names`
   is empty there; the finalize re-run and the standalone `symbolicate` subcommand
-  do have it.) **Measured yield (real end-to-end, gated
-  `registration_yield_on_retained_tree`): ~233 mustang / 101 cheetah, all
-  `Recovered`, ~100% precision** (verified table structure — e.g. cheetah's
-  `AtiParsePlusCUSD`, `AtiQuePlusCPIN`, `AtiRspPlusCMGD`). This is a small,
+  do have it.) **Measured yield on the 2026-08-25 fresh goldens: 113 mustang /
+  77 cheetah registration evidence names, all `Recovered`, ~100% precision**
+  (e.g. `AtiParsePlusCUSD`, `AtiQuePlusCPLS`, `RCSSH_SessMgr_*`). The older
+  ~233/101 figures measured the pre-regeneration corpus state and are not
+  reproducible on it — the ISR-named pairs (`PICH_HISR` etc.) have no
+  pointer materialization in the current image (2026-08-26 ISR spike). A
+  pass-2 application gap also surfaced: mustang's final `functions.json`
+  carries **0** `Ati*` names from 113 evidence entries (cheetah applies
+  24/77) — open follow-up. This is a small,
   high-value, precision-over-volume lever (contrast string-ref's ~8.7k @ 53%).
   **Deliberately not built:** call-site `Register(name, fn)` registration
   (validated yield ~10 — the pointer is rarely materialized into a catchable arg
