@@ -1926,12 +1926,12 @@ fn load_terminal_pal_maps(
                         .join("pal_tasks")
                         .join(label)
                         .join(PAL_MANIFEST_FILE);
-                    stage_pass2_manifest(ghidra_dir, &terminal_manifest, &staged_manifest)?;
+                    stage_pass2_manifest(&terminal_manifest, &staged_manifest)?;
                     let staged_scatter = match &terminal_scatter {
                         Some(terminal) => {
                             let staged =
                                 ghidra_dir.join("scatter").join(label).join("load_map.json");
-                            stage_pass2_manifest(ghidra_dir, terminal, &staged)?;
+                            stage_pass2_manifest(terminal, &staged)?;
                             Some(staged)
                         }
                         None => None,
@@ -2055,7 +2055,7 @@ fn pal_pass2_context(
 /// handed — pass 2 runs against `<out>/ghidra`, so the terminal bytes are
 /// copied back. The copies are intermediate pass-2 state under the pruned
 /// `ghidra/` tree; the terminal artifacts stay authoritative.
-fn stage_pass2_manifest(ghidra_dir: &Path, terminal: &Path, staged: &Path) -> Result<()> {
+fn stage_pass2_manifest(terminal: &Path, staged: &Path) -> Result<()> {
     std::fs::create_dir_all(staged.parent().expect("staged manifest parent"))?;
     std::fs::copy(terminal, staged)?;
     Ok(())
@@ -3492,7 +3492,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             } else {
                 derive_global_types_maps(&images_dir, &ghidra_dir)
             };
-            let mut inputs = prepare_pass2_inputs(
+            let inputs = prepare_pass2_inputs(
                 &function_maps,
                 &prepared_global_maps,
                 &global_types_maps,
