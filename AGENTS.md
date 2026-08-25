@@ -462,6 +462,16 @@ module; when a file outgrows that, split it.
 
 ## Multiple models (model-agnostic design)
 
+- **Version drops are full recompiles — cross-build name transfer is closed.**
+  Measured on the only same-variant pair obtainable (`g5400i` Jun 2025 ↔ Apr
+  2026, ~10 months): strict 1:1 exact-byte function matching transfers zero
+  names in either direction (MAIN survives ~5% byte-identical; drift p50 is
+  207 differing words with 0% ≤2-word; the matched set carries no naming
+  evidence). Cross-model (mustang↔cheetah) measured identically closed
+  (2026-08-16). Do not build name-transfer/knowledge-diff features on
+  exact-byte matching; structural matching stays rejected under the
+  fail-closed naming discipline. (Process artifacts under `~/.superpowers`.)
+
 The extractor targets the Shannon **S5300 / S5400** family and adds **no per-model code** — the core
 is TOC-driven and structural, and everything model-specific is *derived* from the image, never
 hardcoded. Two reference images exercise both models end-to-end:
