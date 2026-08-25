@@ -1963,7 +1963,14 @@ fn revalidate_initializer(wire: &WireManifest, runtime: &RuntimeImage<'_>) -> Re
     }
 
     // Control addresses stay mapped, distinct where the proof needs them,
-    // and the guard branch resolves to the declared join.
+    // and the guard branch resolves to the declared join. `count_global` is
+    // deliberately absent from this list: the initializer only *stores* the
+    // task count there, so it names runtime-writable RAM that the static
+    // raw+scatter image model carries no readable obligation for (the real
+    // Mustang plan points it ~11 MB past the raw image, outside every
+    // scatter destination, and the write is real). Every address the proof
+    // must read — CFG, guard branch, table slots, entries, names — stays
+    // fail-closed mapped.
     for (address, what) in [
         (initializer.cfg_entry, "initializer cfg_entry"),
         (initializer.loop_start, "initializer loop_start"),
@@ -1977,7 +1984,6 @@ fn revalidate_initializer(wire: &WireManifest, runtime: &RuntimeImage<'_>) -> Re
         (initializer.guard_fallthrough, "capacity guard fallthrough"),
         (initializer.suffix_loop, "initializer suffix_loop"),
         (initializer.join, "initializer join"),
-        (initializer.count_global, "initializer count_global"),
     ] {
         require_mapped(runtime, address, what)?;
     }
