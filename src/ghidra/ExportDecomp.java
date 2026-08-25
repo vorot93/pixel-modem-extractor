@@ -244,6 +244,11 @@ public class ExportDecomp extends HeadlessScript {
      * Pass-2 identity comparison: every current function's authenticated
      * execution must appear in the retained map with the exact digest, and
      * every map execution must still exist — program drift fails closed.
+     * Entries from the map's `creations` section are exempt from the digest
+     * comparison: their Ghidra-side body was carved in this same pass by
+     * ApplyThumbNames over authenticated ranges (name, source, and range
+     * coverage verified there), and Ghidra's flow disassembly may legitimately
+     * extend beyond the producer's ranges.
      */
     private void verifyBodiesAgainstMap(PalTasksSupport.SymbolMap map) throws Exception {
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -251,11 +256,18 @@ public class ExportDecomp extends HeadlessScript {
         for (PalTasksSupport.MapExecution execution : map.executions) {
             expected.put(execution.entry, execution.executionBlake3);
         }
+        java.util.Set<Long> created = new java.util.HashSet<Long>();
+        for (PalTasksSupport.MapCreation creation : map.creations) {
+            created.add(creation.entry);
+        }
         FunctionIterator iterator = functions.getFunctions(true);
         int compared = 0;
         while (iterator.hasNext()) {
             checkDeadline();
             Function function = iterator.next();
+            if (created.contains(function.getEntryPoint().getOffset())) {
+                continue; // an ApplyThumbNames creation, verified by its own postflight
+            }
             PalTasksSupport.DecodeProjection projection =
                     PalTasksSupport.decodeProjection(currentProgram, monitor, function);
             if (!projection.errors.isEmpty()) {

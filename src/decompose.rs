@@ -116,6 +116,8 @@ pub struct ImageReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_applied: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub globals_applied: Option<usize>,
@@ -271,6 +273,7 @@ impl ImageReport {
             terminal_error: r.terminal_error.clone(),
             exit,
             pass2_applied: r.pass2_applied,
+            pass2_created: r.pass2_created,
             pass2_error: r.pass2_error.clone(),
             globals_applied: r.globals_applied,
             globals_apply_skipped: r.globals_apply_skipped,
@@ -1824,7 +1827,8 @@ fn prepare_function_map(
         function_names,
         evidence_name_projection,
     } = bundle;
-    let (pass2_map, validation_error) = if map.applied_decision_count > 0
+    let (pass2_map, validation_error) = if (map.applied_decision_count > 0
+        || map.creation_count > 0)
         && let Some(execution_count) = NonZeroUsize::new(map.execution_count)
     {
         let functions_path = image_dir.join("decompiled").join("functions.json");
@@ -3806,6 +3810,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -4073,6 +4078,8 @@ mod tests {
             globals::FunctionEvidenceNameProjection::from_symbols(&symbols);
         symbolicate::Pass2MapBundle {
             map: symbolicate::WrittenSymbolMap {
+                creation_count: 0,
+                creation_skips: Default::default(),
                 path: map_path.to_path_buf(),
                 map_blake3: "0".repeat(64),
                 functions_blake3: "1".repeat(64),
@@ -5925,6 +5932,7 @@ mod tests {
                         terminal_error: None,
                         exit: None,
                         pass2_applied: None,
+                        pass2_created: None,
                         pass2_error: None,
                         globals_applied: None,
                         globals_apply_skipped: None,
@@ -5986,6 +5994,7 @@ mod tests {
                         terminal_error: None,
                         exit: Some(1),
                         pass2_applied: None,
+                        pass2_created: None,
                         pass2_error: None,
                         globals_applied: None,
                         globals_apply_skipped: None,
@@ -6258,6 +6267,7 @@ mod tests {
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -6312,6 +6322,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -6416,6 +6427,7 @@ mod tests {
                 thumb_error: None,
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_created: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -6451,6 +6463,7 @@ mod tests {
                 thumb_error: None,
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_created: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -6525,6 +6538,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -6598,6 +6612,7 @@ mod tests {
             terminal_error: None,
             exit: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             globals_applied: None,
             globals_apply_skipped: None,
@@ -6661,6 +6676,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: Some(81_763), // post-enrich
             thumb_tighten_error: None,
@@ -6734,6 +6750,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8096,6 +8113,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8356,6 +8374,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8401,6 +8420,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: Some(3),
             thumb_tighten_error: None,
@@ -8445,6 +8465,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8490,6 +8511,7 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,

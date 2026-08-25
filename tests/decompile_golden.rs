@@ -2032,6 +2032,12 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         arm.extend([0xfe, 0xff, 0xff, 0xea]); // b .
     }
     arm.extend([0x78, 0x56, 0x34, 0x12]);
+    // Two Thumb halfwords at 0x24 (`push {r7}`; `pop {r7}`): real,
+    // flow-through Thumb code that nothing references, so Ghidra's own
+    // inventory never discovers it — the pass-2 creation path
+    // (ApplyThumbNames) must carve it from the authenticated producer record
+    // and name it.
+    arm.extend([0x80, 0xb5, 0x80, 0xbc]);
     // Ghidra's ARM vector analysis names the image-start functions with
     // IMPORTED-sourced primaries; the strict pass-2 contract protects them
     // (the token rename downgrades to preserve) while the decision's token
@@ -2099,23 +2105,31 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     {"id":"rizin","executable":"/usr/bin/rizin","version":"rizin fixture","command":"aaa;aflj;pdfj @@F;axlj"}
   ],
   "regions": [{
-    "start":"0x0","end":"0x2",
+    "start":"0x0","end":"0x28",
     "attempts":[
       {"producer":"radare2","status":"failed","stdout":null,"error":"radare2 fixture failure"},
       {"producer":"rizin","status":"succeeded","stdout":{"path":"thumb/00000000.rizin.stdout","bytes":1,"blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"error":null}
     ],
-    "function_runs":[{"producer":"rizin","first_function":0,"function_count":1,"substantial":0,"accepted":1,"quarantined":0}]
+    "function_runs":[{"producer":"rizin","first_function":0,"function_count":2,"substantial":0,"accepted":2,"quarantined":0}]
   }],
   "functions": [{
     "name":"retained_thumb_fixture","entry":"0x0","end":"0x2","size":2,
     "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2","blake3":"__RANGE_BLAKE3__"}],
     "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":[]
+  }, {
+    "name":"retained_thumb_created","entry":"0x24","end":"0x28","size":4,
+    "decode_ranges":[{"isa":"thumb","start":"0x24","end":"0x28","blake3":"__CREATED_BLAKE3__"}],
+    "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":["0x20"]
   }]
 }"#)
     .unwrap()
     .replace(
         "__RANGE_BLAKE3__",
         blake3::hash(&arm[..2]).to_hex().as_ref(),
+    )
+    .replace(
+        "__CREATED_BLAKE3__",
+        blake3::hash(&arm[0x24..0x28]).to_hex().as_ref(),
     )
     .into_bytes();
     std::fs::write(
@@ -2140,6 +2154,13 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     std::fs::copy(
         out.join("export/00_BOOT/disasm.lst"),
         boot_dir.join("decompiled/disasm.lst"),
+    )
+    .unwrap();
+    // The retained Thumb artifact must be visible to the map builder so the
+    // named thumb-only record reaches the creation section.
+    std::fs::copy(
+        out.join("export/00_BOOT/thumb_functions.json"),
+        boot_dir.join("decompiled/thumb_functions.json"),
     )
     .unwrap();
     let tree_manifest = dir.join("manifest.json");
@@ -2248,6 +2269,14 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     );
     assert_eq!(boot.globals_applied, Some(1));
     assert_eq!(boot.globals_apply_skipped, Some(1));
+    // The named thumb-only record (token evidence on an entry Ghidra never
+    // discovered) must be carved and named in this same pass-2 process.
+    assert_eq!(
+        boot.pass2_created,
+        Some(1),
+        "pass2_created: {:?}",
+        boot.pass2_error
+    );
     assert!(
         boot.globals_apply_error.is_none(),
         "globals_apply_error: {:?}",
@@ -2260,7 +2289,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         "the imported vector primary must survive pass 2:\n{c}"
     );
     assert!(
-        !c.contains("guess_boot_reset_handler"),
+        !c.contains("guess_boot_reset_handler_00000000"),
         "a guess name displaced a protected imported primary:\n{c}"
     );
     let annotation = "logs: \"reset handler (%d)\" [BOOT]";
@@ -2322,6 +2351,16 @@ public class ProbeProperty extends GhidraScript {
         serde_json::from_slice(&std::fs::read(exp.join("functions.json")).unwrap()).unwrap();
     for function in final_functions.as_array().unwrap() {
         let entry = function["entry"].as_str().unwrap();
+        // The carved creation has no pass-1 projection; every pass-1 record
+        // must keep its exact projection.
+        if entry == "0x24" {
+            assert_eq!(
+                function["name"], "guess_boot_reset_handler_d_00000024",
+                "the created function must carry its token name"
+            );
+            assert_eq!(function["primary_source"], "analysis");
+            continue;
+        }
         assert_eq!(
             serde_json::json!({
                 "decode_ranges": function["decode_ranges"],
@@ -3367,8 +3406,8 @@ fn pal_support_strict_parsers_registry_and_digests() {
     std::fs::write(case_root.join("symbol_map.json"), &symbol_map).unwrap();
     let bad_symbol_map = replace_once(
         &symbol_map,
-        "\"format\": \"pixel-modem-extractor-symbol-map-v2\",",
-        "\"format\": \"pixel-modem-extractor-symbol-map-v2\",\n  \"unexpected\": true,",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v3\",",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v3\",\n  \"unexpected\": true,",
     );
     std::fs::write(case_root.join("symbol_map_bad.json"), &bad_symbol_map).unwrap();
 
@@ -6381,7 +6420,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     // The map itself carries the exact PAL binding and the authorized
     // transition on the registration rename.
     let map_text = std::fs::read_to_string(&state.map_path).unwrap();
-    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v2\""));
+    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v3\""));
     assert!(map_text.contains(&format!("\"identity\": \"{}\"", state.kit.identity)));
     assert!(map_text.contains("\"from\": \"pal_owned\""));
     assert!(map_text.contains("\"to\": \"pass2_owned\""));

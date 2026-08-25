@@ -31,6 +31,7 @@ const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
 const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
+const APPLY_THUMB_NAMES_JAVA: &str = include_str!("ghidra/ApplyThumbNames.java");
 const APPLY_PAL_TASKS_JAVA: &str = include_str!("ghidra/ApplyPalTasks.java");
 const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
@@ -562,6 +563,11 @@ pub struct ImageResult {
     /// reported applying. `None` when no function-map invocation occurred
     /// (including a globals-only invocation) or no valid function summary was parsed.
     pub pass2_applied: Option<usize>,
+    /// Pass-2 creation outcome: count of functions `ApplyThumbNames.java`
+    /// reported creating (named producer-authenticated Thumb functions the
+    /// Ghidra analyzer never discovered). `None` when no function-map
+    /// invocation occurred or no valid creation summary was parsed.
+    pub pass2_created: Option<usize>,
     /// Reason-only pass-2 failure text: late typed-map validation, analyzeHeadless
     /// spawn/non-zero process failure, or caller-owned-export refresh failure.
     pub pass2_error: Option<String>,
@@ -1768,6 +1774,7 @@ fn run_report_impl(
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
+    std::fs::write(scripts.join("ApplyThumbNames.java"), APPLY_THUMB_NAMES_JAVA)?;
     std::fs::write(scripts.join("ApplyGlobals.java"), APPLY_GLOBALS_JAVA)?;
     std::fs::write(
         scripts.join("ApplyGlobalTypes.java"),
@@ -2428,6 +2435,7 @@ fn run_report_impl(
                     thumb_error: r.thumb_error,
                     terminal_error: r.terminal_error,
                     pass2_applied: None,
+                    pass2_created: None,
                     pass2_error: None,
                     thumb_decompiled: r.thumb_decompiled,
                     thumb_tighten_error: r.tighten_error,
@@ -2831,6 +2839,19 @@ fn headless_process_args(
             map.path().to_string_lossy().into_owned(),
         ]);
     }
+    // Creation of named producer-authenticated Thumb functions rides in the
+    // symbol map itself, so the script vector is appended whenever a
+    // function map is present (it no-ops on an empty `creations` array).
+    if let Some(map) = function_map {
+        args.extend([
+            "-postScript".to_string(),
+            "ApplyThumbNames.java".to_string(),
+            label.to_string(),
+            map.image_blake3().to_string(),
+            map.path().to_string_lossy().into_owned(),
+            map.map_blake3().to_string(),
+        ]);
+    }
     let map_argument = function_map
         .map(|map| map.path().to_string_lossy().into_owned())
         .unwrap_or_else(|| "-".to_string());
@@ -2870,6 +2891,28 @@ fn tail_text(text: &str, max_chars: usize) -> String {
 /// `ApplySymbols: image=<image> applied N names, M plate comments over E
 /// executions`. `None` when the line is missing or the count is not an
 /// integer — the caller treats `None` as "no information from pass 2".
+/// Extract the `N` from the summary line
+/// `ApplyThumbNames: image=<image> created N functions, R reapplied,
+/// skipped_existing=…, skipped_collision=… over C creations`. `None` when the
+/// line is missing or the count is not an integer — the caller treats `None`
+/// as "no information from pass 2".
+fn parse_thumb_names_summary(stdout: &str) -> Option<usize> {
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix("ApplyThumbNames:") else {
+            continue;
+        };
+        let Some(idx) = rest.find("created ") else {
+            continue;
+        };
+        let after = &rest[idx + "created ".len()..];
+        let end = after.find(' ').unwrap_or(after.len());
+        if let Ok(n) = after[..end].parse::<usize>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
 fn parse_pass2_summary(stdout: &str) -> Option<usize> {
     for line in stdout.lines() {
         let Some(rest) = line.strip_prefix("ApplySymbols:") else {
@@ -3331,6 +3374,7 @@ pub fn run_two_pass(
             let stdout = String::from_utf8_lossy(&output.stdout);
             if applies_functions {
                 ir.pass2_applied = parse_pass2_summary(&stdout);
+                ir.pass2_created = parse_thumb_names_summary(&stdout);
             }
             if applies_globals {
                 match parse_apply_globals_summary(&stdout, &ir.label) {
@@ -7044,6 +7088,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_created: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -7506,6 +7551,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 thumb_error: None,
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_created: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -7555,6 +7601,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 ),
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_created: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -7605,6 +7652,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_created: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -7755,7 +7803,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let source = PAL_TASKS_SUPPORT_JAVA;
         for owned in [
             "pixel-modem-extractor-pal-tasks-v1",
-            "pixel-modem-extractor-symbol-map-v2",
+            "pixel-modem-extractor-symbol-map-v3",
             "PixelModemExtractor_PalTasks_v1",
             "PixelModemExtractor.PalTasks.v1.Ownership",
             "PixelModemExtractor.PalTasks\"",
@@ -7792,6 +7840,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 out.join("scripts/ApplyPalTasks.java").to_string_lossy(),
                 out.join("scripts/ApplyScatterLoad.java").to_string_lossy(),
                 out.join("scripts/ApplySymbols.java").to_string_lossy(),
+                out.join("scripts/ApplyThumbNames.java").to_string_lossy(),
                 out.join("scripts/ExportDecomp.java").to_string_lossy(),
                 out.join("scripts/PalTasksSupport.java").to_string_lossy(),
                 out.join("scripts/TameAnalysis.java").to_string_lossy(),

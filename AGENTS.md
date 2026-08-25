@@ -947,10 +947,33 @@ hardcoded. Two reference images exercise both models end-to-end:
   saved-project process for each image having at least one of the three
   inputs, with each applicable post-script independently optional and always
   in the fixed order `ApplySymbols.java -> ApplyGlobals.java ->
-  ApplyGlobalTypes.java -> ExportDecomp.java` (an image with none of the
-  three inputs starts no pass-2 process at all) — see **Ghidra 12 headless
+  ApplyGlobalTypes.java -> ApplyThumbNames.java -> ExportDecomp.java` (an
+  image with none of the three inputs starts no pass-2 process at all;
+  `ApplyThumbNames.java` rides in the function map and runs whenever one is
+  present, no-op on an empty `creations` array) — see **Ghidra 12 headless
   API notes** below for the argument-construction details and the all-three
   example.
+
+  **Pass-2 creation of named producer-owned Thumb functions.** The symbol map
+  is `pixel-modem-extractor-symbol-map-v3` with a `creations` section: named
+  (`Recovered` or provisional) Thumb executions authenticated by a validated
+  producer inventory (radare2/Rizin strict v3) whose entry Ghidra's own
+  inventory never discovered — measured ~4.2k on mustang MAIN (112 recovered
+  incl. the AT-command handlers, ~4.1k guesses) and ~2.8k on cheetah.
+  `ApplyThumbNames.java` declares the TMode context at the entry, disassembles
+  over the authenticated ranges (flow-enabled, analysis disabled, budgeted),
+  creates + names the function (`USER_DEFINED` for recovered, `ANALYSIS` for
+  provisional), verifies the entry instruction is inside the created body
+  (full-range coverage is deliberately NOT required — Ghidra's flow owns how
+  far the body extends), and rolls back transactionally on any failure.
+  Fail-closed rules: a pre-existing Ghidra function at the entry is skipped,
+  never displaced; duplicate requested names are skips (never suffixed
+  variants); ambiguous same-entry names and name collisions are counted at
+  map-build; `ExportDecomp`'s identity postflight exempts creation entries
+  from the pass-1 digest comparison. Report surface: per-image
+  `pass2_created`. Budgets: `PME_THUMB_CREATE_ENTRY_BUDGET_MS` (30 s) /
+  `PME_THUMB_CREATE_PHASE_BUDGET_MS` (60 min). Downstream,
+  `thumb_enrich_post_pass2` fills the new functions' `body_c` for free.
 
   Symbol-map preparation is also fail-closed without discarding partial work:
   any per-component error makes the aggregate `symbol_map` stage failed, every
@@ -2008,7 +2031,8 @@ hardcoded. Two reference images exercise both models end-to-end:
     re-probing the exact mirroring rule.
   - **Wall-clock budgets are env-overridable.** `PME_PAL_ENTRY_BUDGET_MS`,
     `PME_PAL_PHASE_BUDGET_MS`, `PME_EXPORT_VALIDATION_BUDGET_MS`,
-    `PME_TAME_PHASE_BUDGET_MS` (positive whole ms; malformed values fail the
+    `PME_TAME_PHASE_BUDGET_MS`, `PME_THUMB_CREATE_ENTRY_BUDGET_MS`,
+    `PME_THUMB_CREATE_PHASE_BUDGET_MS` (positive whole ms; malformed values fail the
     script loudly). Defaults stay source-pinned by contract tests. The real
     Mustang MAIN exceeds the stock defaults legitimately (one PAL entry
     disassembly >30 s at `432e1838`; export verification >15 min), so
@@ -2030,7 +2054,7 @@ hardcoded. Two reference images exercise both models end-to-end:
     `Some`, in that fixed order), always followed by
     `-postScript ExportDecomp.java <out>`. All-three example:
 
-        -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ApplyGlobalTypes.java <global_types_map> -postScript ExportDecomp.java <out>
+        -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ApplyGlobalTypes.java <global_types_map> -postScript ApplyThumbNames.java <label> <image_blake3> <function_map> <map_blake3> -postScript ExportDecomp.java <out>
 
     At least one of the three typed maps must be `Some` or
     `headless_process_args` returns `Ok(None)` (nothing scheduled for that

@@ -75,7 +75,7 @@ import org.bouncycastle.crypto.digests.Blake3Digest;
 
 final class PalTasksSupport {
     static final String PAL_FORMAT = "pixel-modem-extractor-pal-tasks-v1";
-    static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v2";
+    static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v3";
     static final String RESERVED_NAMESPACE = "PixelModemExtractor_PalTasks_v1";
     static final String OWNERSHIP_MAP = "PixelModemExtractor.PalTasks.v1.Ownership";
     static final String PAL_PROPERTY = "PixelModemExtractor.PalTasks";
@@ -111,6 +111,9 @@ final class PalTasksSupport {
     static final int MAX_ANNOTATIONS_PER_DECISION = 256;
     static final int MAX_ANNOTATION_UTF8_BYTES = 4096;
     static final long MAX_ANNOTATION_AGGREGATE_BYTES = 64L * 1024L * 1024L;
+    /** Upper bound on creation entries in one pass-2 symbol map (the Rust
+     * writer enforces the same bound before serialization). */
+    static final int MAX_MAP_CREATIONS = 65_536;
     static final long DESCRIPTOR_PROJECTION_OFFSET = 0x24;
     static final int MAX_CODE_UNITS = 4_194_304;
     static final int MAX_FUNCTIONS = 262_144;
@@ -635,6 +638,25 @@ final class PalTasksSupport {
         }
     }
 
+    /** One named producer-authenticated Thumb entry to create in the Ghidra
+     * program during pass 2 (ApplyThumbNames). */
+    static final class MapCreation {
+        final long entry;
+        final String executionBlake3;
+        final List<ExecutionRangeWire> decodeRanges;
+        final String finalPrimary;
+        final String finalSource;
+
+        MapCreation(long entry, String executionBlake3, List<ExecutionRangeWire> decodeRanges,
+                String finalPrimary, String finalSource) {
+            this.entry = entry;
+            this.executionBlake3 = executionBlake3;
+            this.decodeRanges = decodeRanges;
+            this.finalPrimary = finalPrimary;
+            this.finalSource = finalSource;
+        }
+    }
+
     static final class SymbolMap {
         final String imageLabel;
         final long imageBase;
@@ -646,12 +668,13 @@ final class PalTasksSupport {
         final String functionsBlake3;
         final List<MapExecution> executions;
         final List<MapDecision> decisions;
+        final List<MapCreation> creations;
         final String mapBlake3;
 
         SymbolMap(String imageLabel, long imageBase, long imageSize, String imageBlake3,
                 String palIdentity, String manifestBlake3, String scatterLoadMapBlake3,
                 String functionsBlake3, List<MapExecution> executions,
-                List<MapDecision> decisions, String mapBlake3) {
+                List<MapDecision> decisions, List<MapCreation> creations, String mapBlake3) {
             this.imageLabel = imageLabel;
             this.imageBase = imageBase;
             this.imageSize = imageSize;
@@ -662,6 +685,7 @@ final class PalTasksSupport {
             this.functionsBlake3 = functionsBlake3;
             this.executions = executions;
             this.decisions = decisions;
+            this.creations = creations;
             this.mapBlake3 = mapBlake3;
         }
     }
@@ -2654,7 +2678,7 @@ final class PalTasksSupport {
             return new SymbolMap(wire.imageLabel, wire.imageBase, wire.imageSize,
                     wire.imageBlake3, wire.palIdentity, wire.manifestBlake3,
                     wire.scatterLoadMapBlake3, wire.functionsBlake3, wire.executions,
-                    wire.decisions, mapBlake3);
+                    wire.decisions, wire.creations, mapBlake3);
         }
         catch (PalError error) {
             throw new Exception(error.getMessage(), error);
@@ -2675,6 +2699,7 @@ final class PalTasksSupport {
         String functionsBlake3;
         List<MapExecution> executions = new ArrayList<>();
         List<MapDecision> decisions = new ArrayList<>();
+        List<MapCreation> creations = new ArrayList<>();
     }
 
     private static SymbolMapWire readSymbolMapObject(JsonReader reader) throws IOException {
@@ -2905,12 +2930,87 @@ final class PalTasksSupport {
             wire.decisions.add(new MapDecision(execution, originalPrimary, originalSource,
                     finalPrimary, finalSource, action, annotations, palTransition));
         }
-        endArray(reader, "symbols");
-        endObject(reader, "symbols");
-        if (wire.decisions.size() != wire.executions.size()) {
-            fail("symbol decisions do not cover every execution exactly once");
-        }
-        return wire;
+         endArray(reader, "symbols");
+         if (wire.decisions.size() != wire.executions.size()) {
+             fail("symbol decisions do not cover every execution exactly once");
+         }
+
+         name(reader, "creations");
+         beginArray(reader, "creations");
+         java.util.HashSet<Long> creationEntries = new java.util.HashSet<>();
+         java.util.HashSet<String> creationNames = new java.util.HashSet<>();
+         while (arrayHasNext(reader)) {
+             if (wire.creations.size() >= MAX_MAP_CREATIONS) {
+                 fail("symbol map exceeds the creation count limit");
+             }
+             reader.beginObject();
+             name(reader, "entry");
+             long entry = addressValue(reader, "creation entry");
+             if ((entry & 1L) != 0) {
+                 fail("creation entry carries the Thumb bit");
+             }
+             if (!creationEntries.add(entry)) {
+                 fail("duplicate creation entry");
+             }
+             name(reader, "execution_blake3");
+             String executionBlake3 = hashValue(reader, "creation execution_blake3");
+             name(reader, "decode_ranges");
+             beginArray(reader, "decode_ranges");
+             List<ExecutionRangeWire> ranges = new ArrayList<>();
+             long creationPreviousEnd = -1;
+             long creationCharged = 0;
+             while (arrayHasNext(reader)) {
+                 reader.beginObject();
+                 name(reader, "isa");
+                 String isa = requireIsa(stringValue(reader, "decode range isa"));
+                 name(reader, "start");
+                 long start = addressValue(reader, "decode range start");
+                 name(reader, "end");
+                 long end = addressValue(reader, "decode range end");
+                 name(reader, "blake3");
+                 String blake3 = hashValue(reader, "decode range blake3");
+                 endObject(reader, "blake3");
+                 if (end <= start) {
+                     fail("decode range end is not after its start");
+                 }
+                 if (creationPreviousEnd != -1 && start < creationPreviousEnd) {
+                     fail("decode ranges are not sorted or overlap");
+                 }
+                 creationPreviousEnd = end;
+                 creationCharged =
+                         checkedAdd(creationCharged, end - start, "charged range bytes");
+                 if (creationCharged > MAX_CHARGED_RANGE_BYTES) {
+                     fail("symbol map exceeds the aggregate range limit");
+                 }
+                 ranges.add(new ExecutionRangeWire(isa, start, end, blake3));
+             }
+             endArray(reader, "decode_ranges");
+             if (ranges.isEmpty()) {
+                 fail("a creation carries no authenticated decode ranges");
+             }
+             if (ranges.get(0).start != entry) {
+                 fail("a creation's first decode range does not start at its entry");
+             }
+             name(reader, "final_primary");
+             String primary = mapString(reader, "creation final_primary");
+             if (primary.length() > MAX_SYMBOL_LEAF_CHARS) {
+                 fail("a creation primary exceeds the Ghidra symbol leaf limit");
+             }
+             if (!creationNames.add(primary)) {
+                 fail("duplicate creation primary " + primary);
+             }
+             name(reader, "final_source");
+             String source = requireSourceName(stringValue(reader, "final_source"));
+             if ("default".equals(source)) {
+                 fail("a creation produces a default source");
+             }
+             endObject(reader, "final_source");
+             wire.creations.add(
+                     new MapCreation(entry, executionBlake3, ranges, primary, source));
+         }
+         endArray(reader, "creations");
+         endObject(reader, "creations");
+         return wire;
     }
 
     private static String requireSourceName(String source) {
