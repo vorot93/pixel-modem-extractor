@@ -1922,15 +1922,15 @@ fn load_terminal_pal_maps(
                 // root (see `stage_pass2_manifest`); a restage failure is a
                 // fail-closed per-image error, never a silent skip.
                 let restage = (|| -> Result<(PathBuf, Option<PathBuf>)> {
-                    let staged_manifest =
-                        ghidra_dir.join("pal_tasks").join(label).join(PAL_MANIFEST_FILE);
+                    let staged_manifest = ghidra_dir
+                        .join("pal_tasks")
+                        .join(label)
+                        .join(PAL_MANIFEST_FILE);
                     stage_pass2_manifest(ghidra_dir, &terminal_manifest, &staged_manifest)?;
                     let staged_scatter = match &terminal_scatter {
                         Some(terminal) => {
-                            let staged = ghidra_dir
-                                .join("scatter")
-                                .join(label)
-                                .join("load_map.json");
+                            let staged =
+                                ghidra_dir.join("scatter").join(label).join("load_map.json");
                             stage_pass2_manifest(ghidra_dir, terminal, &staged)?;
                             Some(staged)
                         }

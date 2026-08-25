@@ -634,6 +634,13 @@ hardcoded. Two reference images exercise both models end-to-end:
 
 ### Runtime PAL task inventory
 
+- **`count_global` names runtime-writable RAM, not a statically readable address.**
+  The initializer only *stores* the task count there; the real Mustang plan
+  points it ~11 MB past the raw image, outside every scatter destination, and
+  the write is real (133 named tasks validate against hashed slots). The
+  strict reader therefore maps-checks every address the proof must *read*
+  (CFG, guard branch, table slots, entries, names) but deliberately not
+  `count_global` — treat it as store-only provenance.
 - **Discovery proves the initializer semantically; nothing else nominates a candidate.**
   `pal_tasks::discover` finds every materialization of the nine-byte anchor `PALTskTm\0`
   (`ADR`-family, PC-relative literal load, or register-consistent `MOVW`/`MOVT`), keeps the ones
@@ -1970,6 +1977,34 @@ hardcoded. Two reference images exercise both models end-to-end:
     exports explicitly marked current by the producing report.
   - **Gson IS bundled** with Ghidra (`Ghidra/Framework/Generic/lib/gson-*.jar`)
     and on the headless script classpath — use it for JSON in scripts.
+  - **Ghidra mirrors renames onto thunks, recursively, but only auto-named
+    ones.** Renaming a function re-points every thunk that forwards to it
+    (chains included — `getFunctionThunkAddresses(true)`) to the new primary,
+    while leaving each thunk's own symbol source untouched. A thunk carrying
+    a *custom* primary (e.g. an applied `pal_TaskEntry_*` label) is NOT
+    mirrored. The pass-2 map encodes this as explicit `mirror` decisions
+    (`thunk_of` is exported per function record; the builder chain-walks
+    renamed targets), and `ApplySymbols` postflight accepts exactly the two
+    deterministic outcomes — the mirrored final primary or the untouched
+    original — with the source pinned to the thunk's own. Pass-2 renames are
+    ordered non-thunk-first so an authorized independent thunk rename
+    deterministically overrides the mirror. Verified empirically with a
+    minimal headless probe; do not "fix" the either/or acceptance without
+    re-probing the exact mirroring rule.
+  - **Wall-clock budgets are env-overridable.** `PME_PAL_ENTRY_BUDGET_MS`,
+    `PME_PAL_PHASE_BUDGET_MS`, `PME_EXPORT_VALIDATION_BUDGET_MS`,
+    `PME_TAME_PHASE_BUDGET_MS` (positive whole ms; malformed values fail the
+    script loudly). Defaults stay source-pinned by contract tests. The real
+    Mustang MAIN exceeds the stock defaults legitimately (one PAL entry
+    disassembly >30 s at `432e1838`; export verification >15 min), so
+    acceptance-scale runs set these — budgets gate wall-clock only and change
+    no output bytes.
+  - **Pass-2 manifest arguments must sit inside the Ghidra kit root.**
+    `readPal` authenticates the task manifest, the scatter load map, *and*
+    the raw image (`<ghidra>/images/<label>`) by canonical containment — all
+    three are terminal-moved to `images/<label>/` by the pass-1 marshal, so
+    `load_terminal_pal_maps` restages byte-identical copies at their pass-1
+    kit paths before building pass-2 inputs.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
     vectors, all after `<projectDir> <projectName> -process <label> -noanalysis
     -scriptPath …`, are `-postScript ApplySymbols.java <function_map>`,
