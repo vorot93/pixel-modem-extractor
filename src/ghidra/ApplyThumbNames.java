@@ -265,18 +265,15 @@ public class ApplyThumbNames extends HeadlessScript {
                             + entry + ": " + error.getMessage());
                 }
 
-                // 4. The created function must sit at the entry with its first
-                // authenticated instruction inside the body. Full-range
+                // 4. The created function must sit at the entry with its
+                // first instruction actually disassembled. Full-range
                 // coverage is deliberately NOT required: the authenticated
                 // ranges gate WHICH entries are eligible (a validated
                 // producer execution), while Ghidra's own flow analysis owns
-                // how far the body extends.
-                AddressSetView body = function.getBody();
-                if (!body.contains(entry,
-                        entry.add(creation.decodeRanges.get(0).end
-                                - creation.decodeRanges.get(0).start - 1))) {
-                    fail("the created body does not contain the entry instruction at "
-                            + entry + " (body=" + body + ")");
+                // how far the body extends — a range may legitimately span
+                // a branch Ghidra splits into separate body blocks.
+                if (currentProgram.getListing().getInstructionAt(entry) == null) {
+                    fail("the created function has no instruction at the entry " + entry);
                 }
                 touched.add(function);
                 created++;

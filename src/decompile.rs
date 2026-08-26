@@ -911,12 +911,17 @@ impl TerminalValidationFailure {
 /// Validate one complete terminal Ghidra/optional-Thumb pair. When
 /// `expected_current` is supplied, every normalized tagged source record must
 /// match the already-validated current producer result before refresh.
+/// `allowed_new_ghidra` relaxes that comparison for pass-2 creation: the
+/// staged inventory may carry exactly that many additional Ghidra functions
+/// carved by `ApplyThumbNames` (their pass-1-record digests are verified
+/// in-process by ExportDecomp's postflight).
 pub(crate) fn validate_terminal_inventory_pair(
     ghidra_functions_path: &Path,
     thumb_functions_path: &Path,
     runtime: &RuntimeImage<'_>,
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
+    allowed_new_ghidra: usize,
 ) -> Result<TerminalInventorySummary> {
     validate_terminal_inventory_pair_staged(
         ghidra_functions_path,
@@ -924,6 +929,7 @@ pub(crate) fn validate_terminal_inventory_pair(
         runtime,
         expected_thumb_substantial,
         expected_current,
+        allowed_new_ghidra,
     )
     .map_err(|failure| failure.error)
 }
@@ -934,6 +940,7 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
     runtime: &RuntimeImage<'_>,
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
+    allowed_new_ghidra: usize,
 ) -> std::result::Result<TerminalInventorySummary, TerminalValidationFailure> {
     let streamed =
         crate::execution_ranges::read_ghidra_inventory_streaming(ghidra_functions_path, runtime)
@@ -980,21 +987,37 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
         ghidra_records: ghidra.records,
         thumb_records,
     };
-    if let Some(expected) = expected_current
-        && &summary != expected
-    {
-        // The comparison spans both stages; a differing Thumb ledger is the
-        // only way this can be a Thumb-stage problem.
-        let thumb = summary.thumb_metadata != expected.thumb_metadata
-            || summary.thumb != expected.thumb
-            || summary.thumb_substantial != expected.thumb_substantial
-            || summary.thumb_records != expected.thumb_records;
-        return Err(TerminalValidationFailure {
-            thumb,
-            error: Error::Serialize(
-                "terminal execution inventory differs from the current producer result".into(),
-            ),
-        });
+    if let Some(expected) = expected_current {
+        let thumb_unchanged = summary.thumb_metadata == expected.thumb_metadata
+            && summary.thumb == expected.thumb
+            && summary.thumb_substantial == expected.thumb_substantial
+            && summary.thumb_records == expected.thumb_records;
+        // With creations allowed, every count delta must be exactly the
+        // creation allowance on the Ghidra accepted/raw pair; the identities
+        // grow by the same amount. Record-level equality of the pass-1 set
+        // is enforced in-process by ExportDecomp's map postflight.
+        let ghidra_ok = if allowed_new_ghidra == 0 {
+            summary.ghidra == expected.ghidra
+                && summary.ghidra_records == expected.ghidra_records
+                && summary.accepted_identities == expected.accepted_identities
+        } else {
+            summary.ghidra.quarantined == expected.ghidra.quarantined
+                && summary.ghidra.raw == expected.ghidra.raw + allowed_new_ghidra
+                && summary.ghidra.accepted == expected.ghidra.accepted + allowed_new_ghidra
+                && summary.accepted_identities.len()
+                    == expected.accepted_identities.len() + allowed_new_ghidra
+        };
+        if !thumb_unchanged || !ghidra_ok {
+            // The comparison spans both stages; a differing Thumb ledger is the
+            // only way this can be a Thumb-stage problem.
+            let thumb = !thumb_unchanged;
+            return Err(TerminalValidationFailure {
+                thumb,
+                error: Error::Serialize(
+                    "terminal execution inventory differs from the current producer result".into(),
+                ),
+            });
+        }
     }
     Ok(summary)
 }
@@ -1016,12 +1039,16 @@ pub(crate) fn validate_image_terminal_inventory(
         ));
     }
     let runtime = RuntimeImage::for_image_dir(&raw, image.image_start, image_dir)?;
+    // Pass-2 creation (ApplyThumbNames) legitimately grows the Ghidra
+    // inventory by exactly the reported created count.
+    let allowed_new_ghidra = image.pass2_created.unwrap_or(0);
     let summary = validate_terminal_inventory_pair(
         ghidra_functions_path,
         thumb_functions_path,
         &runtime,
         image.thumb_functions,
         expected_current,
+        allowed_new_ghidra,
     )?;
     let raw_functions = match image.outcome {
         ImageOutcome::Analyzed(raw) => raw,
@@ -1048,7 +1075,16 @@ pub(crate) fn validate_image_terminal_inventory(
         summary.thumb.map(|thumb| thumb.accepted),
         summary.thumb.map(|thumb| thumb.quarantined),
     );
-    if summary.ghidra.raw != raw_functions || reported != validated {
+    // Pass-2 creation grows the Ghidra inventory by exactly the created
+    // count (accepted; created functions carry valid projections), so the
+    // reported-vs-validated comparison applies the same allowance.
+    let expected_validated = (
+        reported.0.map(|n| n + allowed_new_ghidra),
+        reported.1,
+        reported.2,
+        reported.3,
+    );
+    if summary.ghidra.raw != raw_functions + allowed_new_ghidra || validated != expected_validated {
         return Err(Error::Serialize(format!(
             "terminal inventory counters do not match current producer report: raw {raw_functions}, reported {reported:?}, validated {validated:?}"
         )));
@@ -2277,6 +2313,7 @@ fn run_report_impl(
                             &runtime,
                             thumb_functions,
                             None,
+                            0,
                         )
                     })
                     .and_then(|summary| {
@@ -6065,7 +6102,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         .unwrap();
 
         let summary =
-            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None)
+            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None, 0)
                 .unwrap();
 
         assert_eq!(summary.ghidra.raw, 2);
@@ -6086,7 +6123,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .any(|execution| execution.identity.decode_ranges[0].isa == DecodeIsa::Thumb)
         );
         assert!(
-            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), None, None).is_err(),
+            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), None, None, 0)
+                .is_err(),
             "an unexpected retained Thumb inventory is stale current-run state"
         );
 
@@ -6102,6 +6140,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 &test_runtime(),
                 Some(0),
                 Some(&summary),
+                0,
             )
             .is_err(),
             "a stale pass-1 Ghidra inventory without mandatory ranges must fail"
@@ -6132,6 +6171,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 &test_runtime(),
                 Some(0),
                 Some(&summary),
+                0,
             )
             .is_err(),
             "pass 2 must not silently change a current quarantine projection"
@@ -6367,7 +6407,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let thumb = root.path().join("thumb_functions.json");
         std::fs::write(&ghidra, b"[]").unwrap();
         std::fs::write(&thumb, artifact).unwrap();
-        validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None).unwrap()
+        validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None, 0)
+            .unwrap()
     }
 
     fn currentness_error(
