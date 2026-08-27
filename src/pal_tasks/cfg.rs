@@ -5,14 +5,16 @@
 // unconditional direct branch may leave it as a typed external edge.
 
 use crate::arm32::{
-    AddressBase, AddressOffset, BranchPredicate, ControlFlow, DecodedInstruction, FlagEffect,
-    FlagWriter, InstructionDecoder, ItRangeState, Operand, PureRustDecoder, Shift, ValueEffect,
-    ValueExpr,
+    BranchPredicate, ControlFlow, DecodedInstruction, FlagEffect, FlagWriter, InstructionDecoder,
+    ItRangeState, PureRustDecoder, Register,
 };
 use crate::execution_ranges::DecodeIsa;
 use crate::pal_tasks::{CFG_WINDOW_BYTES, semantic_cfg_limits};
 use crate::runtime_image::RuntimeImage;
-use crate::semantic_cfg::{BoundaryKind, CallPolicy, SemanticCfg};
+use crate::semantic_cfg::{
+    BoundaryKind, CallPolicy, DataflowOverlay, DataflowState as SharedDataflowState, ExactJoin,
+    ExactPolicy, ExactTransfer, RegisterState, SemanticCfg, TransferContext,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const THUMB: DecodeIsa = DecodeIsa::Thumb;
@@ -312,53 +314,37 @@ impl LocalCfg {
         }
     }
 
-    /// Solve the definition-aware dataflow over the graph. Facts merge
-    /// only on exact `(value, current definition, root definition)`
-    /// triples; NZCV definitions are tracked separately. Direct and
-    /// exception call boundaries clobber exactly the volatile contract
-    /// the shared decoder reports.
+    /// Project the shared exact-dataflow solution into PAL's root/current
+    /// value facts and PAL-only NZCV overlay.
     pub(crate) fn dataflow<'image, 'data>(
         &self,
         image: &'image RuntimeImage<'data>,
         call_results: &'image BTreeMap<u32, u32>,
     ) -> DataflowStates<'_, 'image, 'data> {
-        let mut states: BTreeMap<u32, FactState> =
-            BTreeMap::from([(self.entry(), FactState::EMPTY)]);
-        let mut queue = VecDeque::from([self.entry()]);
-        while let Some(pc) = queue.pop_front() {
-            let Some(instruction) = self.instruction(pc) else {
-                continue;
-            };
-            let mut output = states[&pc];
-            apply_instruction_effect(image, pc, instruction, &mut output, call_results);
-            for successor in self.successors(pc).into_iter().flatten() {
-                if !self.contains_node(*successor) {
-                    continue;
-                }
-                let merged = match states.get(successor) {
-                    None => output,
-                    Some(current) => FactState {
-                        registers: std::array::from_fn(|register| {
-                            (current.registers[register] == output.registers[register])
-                                .then_some(current.registers[register])
-                                .flatten()
-                        }),
-                        flags: (current.flags == output.flags)
-                            .then_some(current.flags)
-                            .flatten(),
-                    },
-                };
-                if states.get(successor) != Some(&merged) {
-                    states.insert(*successor, merged);
-                    queue.push_back(*successor);
-                }
+        let solved = self.semantic.solve_dataflow(
+            image,
+            ExactPolicy::new(
+                ExactJoin::ValueDefinitionRoot,
+                ExactTransfer::ImmediateAndLsr,
+            ),
+            PalOverlay { call_results },
+        );
+        let mut states = BTreeMap::new();
+        let mut after_states = BTreeMap::new();
+        for (pc, _) in self.instructions() {
+            if let Some(state) = solved.before(pc) {
+                states.insert(pc, project_pal_state(state));
+            }
+            if let Some(state) = solved.after(pc) {
+                after_states.insert(pc, project_pal_state(state));
             }
         }
         DataflowStates {
-            cfg: self,
-            image,
-            call_results,
+            _cfg: self,
+            _image: image,
+            _call_results: call_results,
             states,
+            after_states,
         }
     }
 }
@@ -387,19 +373,13 @@ pub(crate) struct FactState {
     pub flags: Option<FlagFact>,
 }
 
-impl FactState {
-    const EMPTY: FactState = FactState {
-        registers: [None; 16],
-        flags: None,
-    };
-}
-
 /// Solved per-instruction fact states for one local CFG.
 pub(crate) struct DataflowStates<'cfg, 'image, 'data> {
-    cfg: &'cfg LocalCfg,
-    image: &'image RuntimeImage<'data>,
-    call_results: &'image BTreeMap<u32, u32>,
+    _cfg: &'cfg LocalCfg,
+    _image: &'image RuntimeImage<'data>,
+    _call_results: &'image BTreeMap<u32, u32>,
     states: BTreeMap<u32, FactState>,
+    after_states: BTreeMap<u32, FactState>,
 }
 
 impl DataflowStates<'_, '_, '_> {
@@ -410,171 +390,74 @@ impl DataflowStates<'_, '_, '_> {
 
     /// The fact state after the instruction at `pc` executes.
     pub(crate) fn after(&self, pc: u32) -> Option<FactState> {
-        let mut state = *self.states.get(&pc)?;
-        let instruction = self.cfg.instruction(pc)?;
-        apply_instruction_effect(self.image, pc, instruction, &mut state, self.call_results);
-        Some(state)
+        self.after_states.get(&pc).copied()
     }
 }
 
-fn apply_instruction_effect(
-    image: &RuntimeImage<'_>,
-    pc: u32,
-    instruction: &DecodedInstruction,
-    state: &mut FactState,
-    call_results: &BTreeMap<u32, u32>,
-) {
-    if let Some(boundary) = instruction.flow.call_boundary(instruction.links_lr) {
-        for register in &boundary.volatile {
-            if let Some(fact) = state.registers.get_mut(usize::from(register.0)) {
-                *fact = None;
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct PalOverlayState {
+    flags: Option<FlagFact>,
+}
+
+struct PalOverlay<'results> {
+    call_results: &'results BTreeMap<u32, u32>,
+}
+
+impl DataflowOverlay for PalOverlay<'_> {
+    type State = PalOverlayState;
+
+    fn join(&self, left: &Self::State, right: &Self::State) -> Self::State {
+        PalOverlayState {
+            flags: (left.flags == right.flags).then_some(left.flags).flatten(),
+        }
+    }
+
+    fn apply(
+        &self,
+        context: TransferContext<'_>,
+        registers: &mut RegisterState,
+        state: &mut Self::State,
+    ) {
+        state.flags = if context.call_boundary && context.call_flags_unknown {
+            None
+        } else {
+            match context.instruction.flags {
+                FlagEffect::Written(FlagWriter::Compare) => {
+                    (!context.predicated).then_some(FlagFact {
+                        definition: context.pc,
+                    })
+                }
+                FlagEffect::Clobbered => None,
+                FlagEffect::Preserved => state.flags,
             }
-        }
-        if boundary.flags_unknown {
-            state.flags = None;
-        }
-        if let ControlFlow::DirectCall { target } = instruction.flow
-            && let Some(value) = call_results.get(&target)
+        };
+        if let ControlFlow::DirectCall { target } = context.instruction.flow
+            && let Some(value) = self.call_results.get(&target)
         {
-            state.registers[0] = Some(ValueFact {
-                value: *value,
-                definition: pc,
-                root: pc,
-            });
+            registers.define(Register(0), *value, context.pc);
         }
-        return;
-    }
-
-    // A predicated instruction may or may not perform its writes; its
-    // written registers and flags become unknown.
-    let predicated = instruction.conditional && matches!(instruction.flow, ControlFlow::Linear);
-    match &instruction.effect {
-        ValueEffect::RegisterWrite { dst, value } => {
-            state.registers[usize::from(dst.0)] = if predicated {
-                None
-            } else {
-                evaluate_value_expr(pc, value, state)
-            };
-        }
-        ValueEffect::Shift { dst, source, shift } => {
-            state.registers[usize::from(dst.0)] = match (predicated, shift) {
-                (false, Shift::Lsr(amount)) => state.registers[usize::from(source.0)].map(|fact| {
-                    let value = if *amount >= 32 {
-                        0
-                    } else {
-                        fact.value >> *amount
-                    };
-                    ValueFact {
-                        value,
-                        definition: pc,
-                        root: fact.root,
-                    }
-                }),
-                _ => None,
-            };
-        }
-        ValueEffect::LiteralWordLoad { dst, address } => {
-            state.registers[usize::from(dst.0)] = if predicated {
-                None
-            } else {
-                resolve_literal_word(image, pc, address).map(|value| ValueFact {
-                    value,
-                    definition: pc,
-                    root: pc,
-                })
-            };
-        }
-        ValueEffect::Memory(_) => {
-            // Loaded destinations and address writeback bases become
-            // unknown; stores leave register facts untouched.
-            for register in &instruction.writes {
-                state.registers[usize::from(register.0)] = None;
-            }
-        }
-        ValueEffect::Compare { .. } | ValueEffect::None => {}
-        ValueEffect::Unsupported => {
-            for register in &instruction.writes {
-                state.registers[usize::from(register.0)] = None;
-            }
-        }
-    }
-
-    state.flags = match instruction.flags {
-        FlagEffect::Written(FlagWriter::Compare) => {
-            (!predicated).then_some(FlagFact { definition: pc })
-        }
-        FlagEffect::Clobbered => None,
-        FlagEffect::Preserved => state.flags,
-    };
-}
-
-fn evaluate_value_expr(pc: u32, expr: &ValueExpr, state: &FactState) -> Option<ValueFact> {
-    match expr {
-        ValueExpr::Immediate(value) => Some(ValueFact {
-            value: *value,
-            definition: pc,
-            root: pc,
-        }),
-        ValueExpr::Register(source) => {
-            state.registers[usize::from(source.0)].map(|fact| ValueFact {
-                value: fact.value,
-                definition: pc,
-                root: fact.root,
-            })
-        }
-        ValueExpr::ReplaceHighHalf { source, high } => {
-            state.registers[usize::from(source.0)].map(|fact| ValueFact {
-                value: (u32::from(*high) << 16) | (fact.value & 0xffff),
-                definition: pc,
-                root: fact.root,
-            })
-        }
-        ValueExpr::Add {
-            left,
-            right: Operand::Immediate(addend),
-        } => state.registers[usize::from(left.0)].and_then(|fact| {
-            fact.value.checked_add(*addend).map(|value| ValueFact {
-                value,
-                definition: pc,
-                root: fact.root,
-            })
-        }),
-        ValueExpr::Sub {
-            left,
-            right: Operand::Immediate(subtrahend),
-        } => state.registers[usize::from(left.0)].and_then(|fact| {
-            fact.value.checked_sub(*subtrahend).map(|value| ValueFact {
-                value,
-                definition: pc,
-                root: fact.root,
-            })
-        }),
-        ValueExpr::ArchitecturalPc {
-            addend,
-            align_to_four,
-        } => Some(ValueFact {
-            value: wrapping_offset(visible_pc(pc, *align_to_four), *addend),
-            definition: pc,
-            root: pc,
-        }),
-        ValueExpr::Add { .. } | ValueExpr::Sub { .. } => None,
     }
 }
 
-fn resolve_literal_word(
-    image: &RuntimeImage<'_>,
-    pc: u32,
-    address: &crate::arm32::AddressExpr,
-) -> Option<u32> {
-    let crate::arm32::AddressExpr {
-        base: AddressBase::ArchitecturalPc { align_to_four },
-        offset: AddressOffset::Immediate(offset),
-    } = address
-    else {
-        return None;
-    };
-    let literal = wrapping_offset(visible_pc(pc, *align_to_four), *offset);
-    image.read_u32(literal).ok()
+fn project_pal_state(state: &SharedDataflowState<PalOverlayState>) -> FactState {
+    let mut registers = [None; 16];
+    for (register, value) in state.registers().iter() {
+        let Some(definition) = value.definition() else {
+            continue;
+        };
+        let Some(root) = value.root() else {
+            continue;
+        };
+        registers[usize::from(register.0)] = Some(ValueFact {
+            value: value.value,
+            definition,
+            root,
+        });
+    }
+    FactState {
+        registers,
+        flags: state.overlay().flags,
+    }
 }
 
 #[cfg(test)]
@@ -874,6 +757,54 @@ mod tests {
                 value: BASE + 0x1c,
                 definition: BASE + 0x02,
                 root: BASE + 0x02,
+            })
+        );
+    }
+
+    #[test]
+    fn pal_overlay_injects_call_result_and_tracks_flags() {
+        let bytes = assemble(
+            0x20,
+            &[
+                (0x00, enc(&T32::Adr_T1(low(4), 0x18))),
+                (0x02, enc(&T32::Cmp_Immediate_T1(low(6), 3))),
+                (0x04, enc(&T32::Bl_T1(0x18))),
+                (0x08, enc(&T32::Mov_Register_T1(gpr(4), gpr(0)))),
+                (0x0a, enc(&T32::Cmp_Immediate_T1(low(4), 1))),
+                (0x0c, enc(&T32::Bx_T1(gpr(14)))),
+            ],
+        );
+        let image = raw_image(&bytes);
+        let cfg = decode_entry_rooted_cfg(&image, BASE).expect("call overlay fixture decodes");
+        let target = match cfg.instruction(BASE + 0x04).unwrap().flow {
+            crate::arm32::ControlFlow::DirectCall { target } => target,
+            _ => panic!("fixture instruction is not a direct call"),
+        };
+        let call_results = BTreeMap::from([(target, 0x4455_6677)]);
+        let states = cfg.dataflow(&image, &call_results);
+
+        let after_call = states.after(BASE + 0x04).expect("call output state");
+        assert_eq!(
+            after_call.registers[0],
+            Some(ValueFact {
+                value: 0x4455_6677,
+                definition: BASE + 0x04,
+                root: BASE + 0x04,
+            })
+        );
+        assert_eq!(after_call.flags, None);
+        assert_eq!(
+            states.after(BASE + 0x08).unwrap().registers[4],
+            Some(ValueFact {
+                value: 0x4455_6677,
+                definition: BASE + 0x08,
+                root: BASE + 0x04,
+            })
+        );
+        assert_eq!(
+            states.after(BASE + 0x0a).unwrap().flags,
+            Some(FlagFact {
+                definition: BASE + 0x0a,
             })
         );
     }

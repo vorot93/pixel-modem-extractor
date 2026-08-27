@@ -12,6 +12,7 @@ use crate::execution_ranges::DecodeIsa;
 use crate::runtime_image::RuntimeImage;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CfgLimits {
@@ -37,10 +38,147 @@ pub(crate) enum CallPolicy {
     FallthroughAndHandoff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactJoin {
+    Value,
+    ValueDefinitionRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactTransfer {
+    Complete,
+    ImmediateAndLsr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactPolicy {
+    join: ExactJoin,
+    transfer: ExactTransfer,
+}
+
+impl ExactPolicy {
+    pub(crate) const fn new(join: ExactJoin, transfer: ExactTransfer) -> Self {
+        Self { join, transfer }
+    }
+
+    const fn complete() -> Self {
+        Self::new(ExactJoin::Value, ExactTransfer::Complete)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DefinitionLineage {
+    definition: u32,
+    root: u32,
+}
+
+const DEFINITION_CHUNK: usize = 64;
+
+#[derive(Debug, Clone)]
+struct DefinitionSet(Arc<DefinitionNode>);
+
+#[derive(Debug)]
+enum DefinitionNode {
+    Chain {
+        chunk: Box<[u32]>,
+        previous: Option<DefinitionSet>,
+    },
+    Union {
+        left: DefinitionSet,
+        right: DefinitionSet,
+    },
+}
+
+impl DefinitionSet {
+    fn single(pc: u32) -> Self {
+        Self(Arc::new(DefinitionNode::Chain {
+            chunk: Box::new([pc]),
+            previous: None,
+        }))
+    }
+
+    fn insert(&self, pc: u32) -> Self {
+        if let DefinitionNode::Chain { chunk, previous } = self.0.as_ref()
+            && chunk.len() < DEFINITION_CHUNK
+        {
+            let mut next = Vec::with_capacity(chunk.len() + 1);
+            next.extend_from_slice(chunk);
+            next.push(pc);
+            return Self(Arc::new(DefinitionNode::Chain {
+                chunk: next.into_boxed_slice(),
+                previous: previous.clone(),
+            }));
+        }
+        Self(Arc::new(DefinitionNode::Chain {
+            chunk: Box::new([pc]),
+            previous: Some(self.clone()),
+        }))
+    }
+
+    fn union(&self, other: &Self) -> Self {
+        if Arc::ptr_eq(&self.0, &other.0) || self == other {
+            return self.clone();
+        }
+        Self(Arc::new(DefinitionNode::Union {
+            left: self.clone(),
+            right: other.clone(),
+        }))
+    }
+
+    fn collect(&self) -> BTreeSet<u32> {
+        let mut definitions = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![self.clone()];
+        while let Some(current) = pending.pop() {
+            let identity = Arc::as_ptr(&current.0) as usize;
+            if !visited.insert(identity) {
+                continue;
+            }
+            match current.0.as_ref() {
+                DefinitionNode::Chain { chunk, previous } => {
+                    definitions.extend(chunk.iter().copied());
+                    if let Some(previous) = previous {
+                        pending.push(previous.clone());
+                    }
+                }
+                DefinitionNode::Union { left, right } => {
+                    pending.push(right.clone());
+                    pending.push(left.clone());
+                }
+            }
+        }
+        definitions
+    }
+}
+
+impl PartialEq for DefinitionSet {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.collect() == other.collect()
+    }
+}
+
+impl Eq for DefinitionSet {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExactValue {
     pub value: u32,
-    pub definitions: BTreeSet<u32>,
+    definitions: DefinitionSet,
+    lineage: Option<DefinitionLineage>,
+}
+
+impl ExactValue {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn definitions(&self) -> BTreeSet<u32> {
+        self.definitions.collect()
+    }
+
+    pub(crate) fn definition(&self) -> Option<u32> {
+        self.lineage.map(|lineage| lineage.definition)
+    }
+
+    pub(crate) fn root(&self) -> Option<u32> {
+        self.lineage.map(|lineage| lineage.root)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -50,6 +188,84 @@ impl RegisterState {
     pub(crate) fn get(&self, register: Register) -> Option<&ExactValue> {
         self.0.get(&register)
     }
+
+    pub(crate) fn define(&mut self, register: Register, value: u32, pc: u32) {
+        self.0.insert(register, exact_definition(value, pc));
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Register, &'_ ExactValue)> {
+        self.0.iter().map(|(register, value)| (*register, value))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TransferContext<'instruction> {
+    pub pc: u32,
+    pub instruction: &'instruction DecodedInstruction,
+    pub call_boundary: bool,
+    pub call_flags_unknown: bool,
+    pub predicated: bool,
+}
+
+pub(crate) trait DataflowOverlay {
+    type State: Clone + Default + PartialEq + Eq;
+
+    fn join(&self, left: &Self::State, right: &Self::State) -> Self::State;
+
+    fn apply(
+        &self,
+        context: TransferContext<'_>,
+        registers: &mut RegisterState,
+        state: &mut Self::State,
+    );
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct DataflowState<State> {
+    registers: RegisterState,
+    overlay: State,
+}
+
+impl<State> DataflowState<State> {
+    pub(crate) const fn registers(&self) -> &RegisterState {
+        &self.registers
+    }
+
+    pub(crate) const fn overlay(&self) -> &State {
+        &self.overlay
+    }
+}
+
+pub(crate) struct DataflowResult<State> {
+    before: BTreeMap<u32, DataflowState<State>>,
+    after: BTreeMap<u32, DataflowState<State>>,
+}
+
+impl<State> DataflowResult<State> {
+    pub(crate) fn before(&self, pc: u32) -> Option<&DataflowState<State>> {
+        self.before.get(&pc)
+    }
+
+    pub(crate) fn after(&self, pc: u32) -> Option<&DataflowState<State>> {
+        self.after.get(&pc)
+    }
+
+    fn into_before(self) -> BTreeMap<u32, RegisterState> {
+        self.before
+            .into_iter()
+            .map(|(pc, state)| (pc, state.registers))
+            .collect()
+    }
+}
+
+struct NoOverlay;
+
+impl DataflowOverlay for NoOverlay {
+    type State = ();
+
+    fn join(&self, _: &Self::State, _: &Self::State) -> Self::State {}
+
+    fn apply(&self, _: TransferContext<'_>, _: &mut RegisterState, _: &mut Self::State) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -128,12 +344,34 @@ impl fmt::Display for SemanticCfgError {
 
 impl std::error::Error for SemanticCfgError {}
 
+#[derive(Debug, Clone, Default)]
+struct DominatorTree {
+    immediate: BTreeMap<u32, u32>,
+    intervals: BTreeMap<u32, (usize, usize)>,
+}
+
+impl DominatorTree {
+    fn dominates(&self, dominator: u32, node: u32) -> bool {
+        if !self.immediate.contains_key(&dominator) || !self.immediate.contains_key(&node) {
+            return false;
+        }
+        self.intervals
+            .get(&dominator)
+            .zip(self.intervals.get(&node))
+            .is_some_and(
+                |(&(dominator_start, dominator_end), &(node_start, node_end))| {
+                    dominator_start <= node_start && node_end <= dominator_end
+                },
+            )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SemanticCfg {
     entry: u32,
     isa: DecodeIsa,
     instructions: BTreeMap<u32, DecodedInstruction>,
-    dominators: BTreeMap<u32, BTreeSet<u32>>,
+    dominators: DominatorTree,
     handoffs: Vec<Handoff>,
     exact_register_states: BTreeMap<u32, RegisterState>,
     successors: BTreeMap<u32, BTreeSet<u32>>,
@@ -176,14 +414,14 @@ impl SemanticCfg {
             builder.handoffs.into_iter().collect(),
             BTreeMap::new(),
         );
-        cfg.exact_register_states = solve_exact_register_states(runtime, &cfg);
+        cfg.exact_register_states = cfg
+            .solve_dataflow(runtime, ExactPolicy::complete(), NoOverlay)
+            .into_before();
         Ok(cfg)
     }
 
     pub(crate) fn dominates(&self, dominator: u32, node: u32) -> bool {
-        self.dominators
-            .get(&node)
-            .is_some_and(|dominators| dominators.contains(&dominator))
+        self.dominators.dominates(dominator, node)
     }
 
     pub(crate) const fn handoffs(&self) -> &[Handoff] {
@@ -261,6 +499,65 @@ impl SemanticCfg {
         )
     }
 
+    pub(crate) fn solve_dataflow<Overlay: DataflowOverlay>(
+        &self,
+        runtime: &RuntimeImage<'_>,
+        policy: ExactPolicy,
+        overlay: Overlay,
+    ) -> DataflowResult<Overlay::State> {
+        if !self.instructions.contains_key(&self.entry) {
+            return DataflowResult {
+                before: BTreeMap::new(),
+                after: BTreeMap::new(),
+            };
+        }
+        let entry_state = DataflowState::default();
+        let mut before = BTreeMap::from([(self.entry, entry_state.clone())]);
+        let mut after = BTreeMap::new();
+        let mut pending = VecDeque::from([self.entry]);
+        let mut queued = BTreeSet::from([self.entry]);
+        while let Some(pc) = pending.pop_front() {
+            queued.remove(&pc);
+            let Some(mut output) = before.get(&pc).cloned() else {
+                continue;
+            };
+            let Some(instruction) = self.instructions.get(&pc) else {
+                continue;
+            };
+            let context =
+                apply_exact_effect(runtime, pc, instruction, &mut output.registers, policy);
+            overlay.apply(context, &mut output.registers, &mut output.overlay);
+            if after.get(&pc) == Some(&output) {
+                continue;
+            }
+            after.insert(pc, output.clone());
+            for successor in self.successors.get(&pc).into_iter().flatten() {
+                if !self.instructions.contains_key(successor) {
+                    continue;
+                }
+                let Some(mut joined) = join_predecessor_states(
+                    *successor,
+                    &self.predecessors,
+                    &after,
+                    policy,
+                    &overlay,
+                ) else {
+                    continue;
+                };
+                if *successor == self.entry {
+                    joined = entry_state.clone();
+                }
+                if before.get(successor) != Some(&joined) {
+                    before.insert(*successor, joined);
+                    if queued.insert(*successor) {
+                        pending.push_back(*successor);
+                    }
+                }
+            }
+        }
+        DataflowResult { before, after }
+    }
+
     fn from_graph(
         entry: u32,
         isa: DecodeIsa,
@@ -282,7 +579,7 @@ impl SemanticCfg {
                 }
             }
         }
-        let dominators = compute_dominators(entry, &reachable, &predecessors);
+        let dominators = compute_dominators(entry, &reachable, &successors, &predecessors);
         Self {
             entry,
             isa,
@@ -427,7 +724,7 @@ impl<'runtime, 'data> CfgBuilder<'runtime, 'data> {
                 let bytes = if wide {
                     self.charge_bytes(2)?;
                     let Some(bytes) = self.executable_bytes(pc, 4) else {
-                        return Ok(DecodedAt::Boundary(BoundaryKind::DecodeFailure));
+                        return Ok(DecodedAt::Boundary(BoundaryKind::Unmapped));
                     };
                     bytes
                 } else {
@@ -539,7 +836,11 @@ impl<'runtime, 'data> CfgBuilder<'runtime, 'data> {
                     pc,
                     kind: BoundaryKind::Indirect,
                 });
-                Ok(())
+                if instruction.links_lr {
+                    self.schedule(pc, next, true)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -723,204 +1024,305 @@ fn reachable_instructions(
 fn compute_dominators(
     entry: u32,
     reachable: &BTreeSet<u32>,
+    successors: &BTreeMap<u32, BTreeSet<u32>>,
     predecessors: &BTreeMap<u32, BTreeSet<u32>>,
-) -> BTreeMap<u32, BTreeSet<u32>> {
-    let mut dominators: BTreeMap<u32, BTreeSet<u32>> = reachable
+) -> DominatorTree {
+    if !reachable.contains(&entry) {
+        return DominatorTree::default();
+    }
+    let order = reverse_postorder(entry, reachable, successors);
+    let positions: BTreeMap<u32, usize> = order
         .iter()
-        .map(|pc| {
-            if *pc == entry {
-                (*pc, BTreeSet::from([entry]))
-            } else {
-                (*pc, reachable.clone())
-            }
-        })
+        .enumerate()
+        .map(|(position, pc)| (*pc, position))
         .collect();
+    let mut immediate = BTreeMap::from([(entry, entry)]);
     loop {
         let mut changed = false;
-        for pc in reachable.iter().copied().filter(|pc| *pc != entry) {
-            let mut next = predecessors
+        for pc in order.iter().copied().filter(|pc| *pc != entry) {
+            let mut resolved = predecessors
                 .get(&pc)
                 .into_iter()
                 .flatten()
-                .filter_map(|predecessor| dominators.get(predecessor).cloned())
-                .reduce(|left, right| left.intersection(&right).copied().collect())
-                .unwrap_or_default();
-            next.insert(pc);
-            if dominators.get(&pc) != Some(&next) {
-                dominators.insert(pc, next);
+                .copied()
+                .filter(|predecessor| immediate.contains_key(predecessor));
+            let Some(mut next) = resolved.next() else {
+                continue;
+            };
+            for predecessor in resolved {
+                next = intersect_dominators(next, predecessor, &immediate, &positions);
+            }
+            if immediate.get(&pc) != Some(&next) {
+                immediate.insert(pc, next);
                 changed = true;
             }
         }
         if !changed {
-            return dominators;
+            break;
         }
+    }
+
+    let mut children: BTreeMap<u32, BTreeSet<u32>> = immediate
+        .keys()
+        .copied()
+        .map(|pc| (pc, BTreeSet::new()))
+        .collect();
+    for (node, parent) in &immediate {
+        if node != parent {
+            children.entry(*parent).or_default().insert(*node);
+        }
+    }
+    let mut starts = BTreeMap::new();
+    let mut intervals = BTreeMap::new();
+    let mut clock = 0usize;
+    let mut pending = vec![(entry, false)];
+    while let Some((node, exiting)) = pending.pop() {
+        if exiting {
+            let start = starts[&node];
+            intervals.insert(node, (start, clock));
+            clock += 1;
+            continue;
+        }
+        starts.insert(node, clock);
+        clock += 1;
+        pending.push((node, true));
+        for child in children.get(&node).into_iter().flatten().rev() {
+            pending.push((*child, false));
+        }
+    }
+    DominatorTree {
+        immediate,
+        intervals,
     }
 }
 
-fn solve_exact_register_states(
-    runtime: &RuntimeImage<'_>,
-    cfg: &SemanticCfg,
-) -> BTreeMap<u32, RegisterState> {
-    if !cfg.instructions.contains_key(&cfg.entry) {
-        return BTreeMap::new();
-    }
-    let mut inputs = BTreeMap::from([(cfg.entry, RegisterState::default())]);
-    let mut outputs: BTreeMap<u32, RegisterState> = BTreeMap::new();
-    let mut pending = VecDeque::from([cfg.entry]);
-    let mut queued = BTreeSet::from([cfg.entry]);
-    while let Some(pc) = pending.pop_front() {
-        queued.remove(&pc);
-        let Some(input) = inputs.get(&pc).cloned() else {
-            continue;
-        };
-        let Some(instruction) = cfg.instructions.get(&pc) else {
-            continue;
-        };
-        let output = apply_exact_effect(runtime, pc, instruction, input);
-        if outputs.get(&pc) == Some(&output) {
+fn reverse_postorder(
+    entry: u32,
+    reachable: &BTreeSet<u32>,
+    successors: &BTreeMap<u32, BTreeSet<u32>>,
+) -> Vec<u32> {
+    let mut visited = BTreeSet::new();
+    let mut postorder = Vec::with_capacity(reachable.len());
+    let mut pending = vec![(entry, false)];
+    while let Some((node, exiting)) = pending.pop() {
+        if exiting {
+            postorder.push(node);
             continue;
         }
-        outputs.insert(pc, output);
-        for successor in cfg.successors.get(&pc).into_iter().flatten() {
-            if !cfg.instructions.contains_key(successor) {
-                continue;
-            }
-            let Some(mut joined) = join_predecessor_outputs(*successor, cfg, &outputs) else {
-                continue;
-            };
-            if *successor == cfg.entry {
-                joined = RegisterState::default();
-            }
-            if inputs.get(successor) != Some(&joined) {
-                inputs.insert(*successor, joined);
-                if queued.insert(*successor) {
-                    pending.push_back(*successor);
-                }
+        if !visited.insert(node) {
+            continue;
+        }
+        pending.push((node, true));
+        for successor in successors.get(&node).into_iter().flatten().rev() {
+            if reachable.contains(successor) && !visited.contains(successor) {
+                pending.push((*successor, false));
             }
         }
     }
-    for pc in cfg.instructions.keys() {
-        inputs.entry(*pc).or_default();
-    }
-    inputs
+    postorder.reverse();
+    postorder
 }
 
-fn join_predecessor_outputs(
+fn intersect_dominators(
+    mut left: u32,
+    mut right: u32,
+    immediate: &BTreeMap<u32, u32>,
+    positions: &BTreeMap<u32, usize>,
+) -> u32 {
+    while left != right {
+        while positions[&left] > positions[&right] {
+            left = immediate[&left];
+        }
+        while positions[&right] > positions[&left] {
+            right = immediate[&right];
+        }
+    }
+    left
+}
+
+fn join_dataflow_states<Overlay: DataflowOverlay>(
+    left: &DataflowState<Overlay::State>,
+    right: &DataflowState<Overlay::State>,
+    policy: ExactPolicy,
+    overlay: &Overlay,
+) -> DataflowState<Overlay::State> {
+    DataflowState {
+        registers: join_register_states(&left.registers, &right.registers, policy),
+        overlay: overlay.join(&left.overlay, &right.overlay),
+    }
+}
+
+fn join_predecessor_states<Overlay: DataflowOverlay>(
     node: u32,
-    cfg: &SemanticCfg,
-    outputs: &BTreeMap<u32, RegisterState>,
-) -> Option<RegisterState> {
-    cfg.predecessors
+    predecessors: &BTreeMap<u32, BTreeSet<u32>>,
+    outputs: &BTreeMap<u32, DataflowState<Overlay::State>>,
+    policy: ExactPolicy,
+    overlay: &Overlay,
+) -> Option<DataflowState<Overlay::State>> {
+    let mut incoming = predecessors
         .get(&node)?
         .iter()
-        .filter_map(|predecessor| outputs.get(predecessor).cloned())
-        .reduce(join_register_states)
+        .filter_map(|predecessor| outputs.get(predecessor));
+    let mut joined = incoming.next()?.clone();
+    for state in incoming {
+        joined = join_dataflow_states(&joined, state, policy, overlay);
+    }
+    Some(joined)
 }
 
-fn join_register_states(left: RegisterState, right: RegisterState) -> RegisterState {
+fn join_register_states(
+    left: &RegisterState,
+    right: &RegisterState,
+    policy: ExactPolicy,
+) -> RegisterState {
     let mut joined = BTreeMap::new();
-    for (register, left_value) in left.0 {
-        let Some(right_value) = right.0.get(&register) else {
+    for (register, left_value) in &left.0 {
+        let Some(right_value) = right.0.get(register) else {
             continue;
         };
         if left_value.value != right_value.value {
             continue;
         }
-        let mut definitions = left_value.definitions;
-        definitions.extend(right_value.definitions.iter().copied());
+        if policy.join == ExactJoin::ValueDefinitionRoot
+            && (left_value.lineage.is_none() || left_value.lineage != right_value.lineage)
+        {
+            continue;
+        }
+        let definitions = left_value.definitions.union(&right_value.definitions);
         joined.insert(
-            register,
+            *register,
             ExactValue {
                 value: left_value.value,
                 definitions,
+                lineage: (left_value.lineage == right_value.lineage)
+                    .then_some(left_value.lineage)
+                    .flatten(),
             },
         );
     }
     RegisterState(joined)
 }
 
-fn apply_exact_effect(
+fn apply_exact_effect<'instruction>(
     runtime: &RuntimeImage<'_>,
     pc: u32,
-    instruction: &DecodedInstruction,
-    mut state: RegisterState,
-) -> RegisterState {
-    if let Some(boundary) = instruction.flow.call_boundary(instruction.links_lr) {
+    instruction: &'instruction DecodedInstruction,
+    state: &mut RegisterState,
+    policy: ExactPolicy,
+) -> TransferContext<'instruction> {
+    let boundary = instruction.flow.call_boundary(instruction.links_lr);
+    let call_boundary = boundary.is_some();
+    let call_flags_unknown = boundary
+        .as_ref()
+        .is_some_and(|boundary| boundary.flags_unknown);
+    let predicated = instruction.conditional && matches!(instruction.flow, ControlFlow::Linear);
+    if let Some(boundary) = boundary {
         for register in boundary.volatile {
             state.0.remove(&register);
         }
-        return state;
-    }
-    if instruction.conditional {
+    } else if instruction.conditional {
         for register in &instruction.writes {
             state.0.remove(register);
         }
-        return state;
+    } else {
+        match &instruction.effect {
+            ValueEffect::RegisterWrite { dst, value } => {
+                if let Some(value) = evaluate_value_expr(pc, value, state, policy) {
+                    state.0.insert(*dst, value);
+                } else {
+                    state.0.remove(dst);
+                }
+            }
+            ValueEffect::Shift { dst, source, shift } => {
+                let supported =
+                    policy.transfer == ExactTransfer::Complete || matches!(shift, Shift::Lsr(_));
+                if supported
+                    && let Some(value) = state.0.get(source).cloned()
+                    && let Some(shifted) = shift_value(value.value, *shift)
+                {
+                    state.0.insert(*dst, derived_value(value, shifted, pc));
+                } else {
+                    state.0.remove(dst);
+                }
+            }
+            ValueEffect::LiteralWordLoad { dst, address } => {
+                if let Some(value) = resolve_literal_word(runtime, pc, address) {
+                    state.0.insert(*dst, exact_definition(value, pc));
+                } else {
+                    state.0.remove(dst);
+                }
+            }
+            ValueEffect::Memory(_) | ValueEffect::Unsupported => {
+                for register in &instruction.writes {
+                    state.0.remove(register);
+                }
+            }
+            ValueEffect::Compare { .. } | ValueEffect::None => {}
+        }
     }
-    match &instruction.effect {
-        ValueEffect::RegisterWrite { dst, value } => {
-            if let Some(value) = evaluate_value_expr(pc, value, &state) {
-                state.0.insert(*dst, value);
-            } else {
-                state.0.remove(dst);
-            }
-        }
-        ValueEffect::Shift { dst, source, shift } => {
-            if let Some(mut value) = state.0.get(source).cloned()
-                && let Some(shifted) = shift_value(value.value, *shift)
-            {
-                value.value = shifted;
-                value.definitions.insert(pc);
-                state.0.insert(*dst, value);
-            } else {
-                state.0.remove(dst);
-            }
-        }
-        ValueEffect::LiteralWordLoad { dst, address } => {
-            if let Some(value) = resolve_literal_word(runtime, pc, address) {
-                state.0.insert(*dst, exact_definition(value, pc));
-            } else {
-                state.0.remove(dst);
-            }
-        }
-        ValueEffect::Memory(_) | ValueEffect::Unsupported => {
-            for register in &instruction.writes {
-                state.0.remove(register);
-            }
-        }
-        ValueEffect::Compare { .. } | ValueEffect::None => {}
+    TransferContext {
+        pc,
+        instruction,
+        call_boundary,
+        call_flags_unknown,
+        predicated,
     }
-    state
 }
 
 fn evaluate_value_expr(
     pc: u32,
     expression: &ValueExpr,
     state: &RegisterState,
+    policy: ExactPolicy,
 ) -> Option<ExactValue> {
     match expression {
         ValueExpr::Immediate(value) => Some(exact_definition(*value, pc)),
-        ValueExpr::Register(source) => derived_value(state.get(*source)?.clone(), pc),
+        ValueExpr::Register(source) => {
+            let value = state.get(*source)?.clone();
+            let copied = value.value;
+            Some(derived_value(value, copied, pc))
+        }
         ValueExpr::ReplaceHighHalf { source, high } => {
-            let mut value = state.get(*source)?.clone();
-            value.value = (u32::from(*high) << 16) | (value.value & 0xffff);
-            value.definitions.insert(pc);
-            Some(value)
+            let value = state.get(*source)?.clone();
+            let replaced = (u32::from(*high) << 16) | (value.value & 0xffff);
+            Some(derived_value(value, replaced, pc))
         }
         ValueExpr::Add { left, right } => {
+            let register_operand = matches!(right, Operand::Register { .. });
+            if policy.transfer == ExactTransfer::ImmediateAndLsr && register_operand {
+                return None;
+            }
             let mut value = state.get(*left)?.clone();
-            let (right, definitions) = operand_value(right, state)?;
-            value.value = value.value.checked_add(right)?;
-            value.definitions.extend(definitions);
-            value.definitions.insert(pc);
+            let (right_value, definitions) = operand_value(right, state)?;
+            value.value = value.value.checked_add(right_value)?;
+            if let Some(definitions) = definitions {
+                value.definitions = value.definitions.union(&definitions);
+            }
+            value.definitions = value.definitions.insert(pc);
+            if register_operand {
+                value.lineage = None;
+            } else if let Some(lineage) = &mut value.lineage {
+                lineage.definition = pc;
+            }
             Some(value)
         }
         ValueExpr::Sub { left, right } => {
+            let register_operand = matches!(right, Operand::Register { .. });
+            if policy.transfer == ExactTransfer::ImmediateAndLsr && register_operand {
+                return None;
+            }
             let mut value = state.get(*left)?.clone();
-            let (right, definitions) = operand_value(right, state)?;
-            value.value = value.value.checked_sub(right)?;
-            value.definitions.extend(definitions);
-            value.definitions.insert(pc);
+            let (right_value, definitions) = operand_value(right, state)?;
+            value.value = value.value.checked_sub(right_value)?;
+            if let Some(definitions) = definitions {
+                value.definitions = value.definitions.union(&definitions);
+            }
+            value.definitions = value.definitions.insert(pc);
+            if register_operand {
+                value.lineage = None;
+            } else if let Some(lineage) = &mut value.lineage {
+                lineage.definition = pc;
+            }
             Some(value)
         }
         ValueExpr::ArchitecturalPc {
@@ -933,12 +1335,15 @@ fn evaluate_value_expr(
     }
 }
 
-fn operand_value(operand: &Operand, state: &RegisterState) -> Option<(u32, BTreeSet<u32>)> {
+fn operand_value(operand: &Operand, state: &RegisterState) -> Option<(u32, Option<DefinitionSet>)> {
     match operand {
-        Operand::Immediate(value) => Some((*value, BTreeSet::new())),
+        Operand::Immediate(value) => Some((*value, None)),
         Operand::Register { register, shift } => {
             let value = state.get(*register)?;
-            Some((shift_value(value.value, *shift)?, value.definitions.clone()))
+            Some((
+                shift_value(value.value, *shift)?,
+                Some(value.definitions.clone()),
+            ))
         }
     }
 }
@@ -983,13 +1388,21 @@ fn resolve_literal_word(
 fn exact_definition(value: u32, pc: u32) -> ExactValue {
     ExactValue {
         value,
-        definitions: BTreeSet::from([pc]),
+        definitions: DefinitionSet::single(pc),
+        lineage: Some(DefinitionLineage {
+            definition: pc,
+            root: pc,
+        }),
     }
 }
 
-fn derived_value(mut value: ExactValue, pc: u32) -> Option<ExactValue> {
-    value.definitions.insert(pc);
-    Some(value)
+fn derived_value(mut value: ExactValue, derived: u32, pc: u32) -> ExactValue {
+    value.value = derived;
+    value.definitions = value.definitions.insert(pc);
+    if let Some(lineage) = &mut value.lineage {
+        lineage.definition = pc;
+    }
+    value
 }
 
 fn is_aligned(pc: u32, isa: DecodeIsa) -> bool {
@@ -1020,7 +1433,10 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundaryKind, CallPolicy, CfgLimits, SemanticCfg, SemanticCfgError};
+    use super::{
+        BoundaryKind, CallPolicy, CfgLimits, DataflowOverlay, ExactJoin, ExactPolicy,
+        ExactTransfer, RegisterState, SemanticCfg, SemanticCfgError, TransferContext,
+    };
     use crate::arm32::Register;
     use crate::execution_ranges::DecodeIsa;
     use crate::runtime_image::RuntimeImage;
@@ -1069,6 +1485,37 @@ mod tests {
         .expect("fixture CFG decodes")
     }
 
+    #[derive(Clone, Default, PartialEq, Eq)]
+    struct TestOverlayState {
+        calls: usize,
+    }
+
+    struct TestOverlay;
+
+    impl DataflowOverlay for TestOverlay {
+        type State = TestOverlayState;
+
+        fn join(&self, left: &Self::State, right: &Self::State) -> Self::State {
+            if left == right {
+                left.clone()
+            } else {
+                Self::State::default()
+            }
+        }
+
+        fn apply(
+            &self,
+            context: TransferContext<'_>,
+            registers: &mut RegisterState,
+            state: &mut Self::State,
+        ) {
+            if context.call_boundary {
+                state.calls += 1;
+                registers.define(Register(0), 0x55, context.pc);
+            }
+        }
+    }
+
     #[test]
     fn real_a32_direct_edges_compute_dominance() {
         let bytes = arm_diamond(1, 2);
@@ -1100,7 +1547,7 @@ mod tests {
             .get(Register(0))
             .expect("MOVW fact reaches the branch");
         assert_eq!(value.value, 0x1234);
-        assert_eq!(value.definitions, BTreeSet::from([0]));
+        assert_eq!(value.definitions(), BTreeSet::from([0]));
     }
 
     #[test]
@@ -1148,6 +1595,65 @@ mod tests {
     }
 
     #[test]
+    fn linked_indirect_call_retains_clobbered_fallthrough() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&arm_mov_immediate(0, 0x12));
+        bytes.extend_from_slice(&arm_mov_immediate(4, 0x34));
+        // blx r1: the target is unresolved, but LR receives the return site.
+        bytes.extend_from_slice(&0xe12f_ff31u32.to_le_bytes());
+        bytes.extend_from_slice(&0xeaff_fffeu32.to_le_bytes());
+
+        let cfg = decode(&bytes, DecodeIsa::Arm);
+
+        assert!(
+            cfg.handoffs()
+                .iter()
+                .any(|edge| edge.pc == 8 && edge.kind == BoundaryKind::Indirect)
+        );
+        assert_eq!(cfg.successors(8), Some(&BTreeSet::from([12])));
+        let fallthrough = &cfg.exact_register_states()[&12];
+        assert_eq!(fallthrough.get(Register(0)), None);
+        assert_eq!(
+            fallthrough.get(Register(4)).map(|value| value.value),
+            Some(0x34)
+        );
+    }
+
+    #[test]
+    fn shared_dataflow_overlay_runs_after_call_clobber() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&arm_mov_immediate(0, 0x12));
+        // bl 0x40 from 0x4: target = PC+8 + (13 << 2).
+        bytes.extend_from_slice(&0xeb00_000du32.to_le_bytes());
+        bytes.extend_from_slice(&0xeaff_fffeu32.to_le_bytes());
+        let runtime = runtime(&bytes);
+        let cfg = SemanticCfg::decode(
+            &runtime,
+            0,
+            DecodeIsa::Arm,
+            CfgLimits::exception_roots(),
+            CallPolicy::Fallthrough,
+        )
+        .expect("overlay fixture CFG decodes");
+
+        let states = cfg.solve_dataflow(
+            &runtime,
+            ExactPolicy::new(ExactJoin::Value, ExactTransfer::Complete),
+            TestOverlay,
+        );
+        let fallthrough = states.before(8).expect("call fallthrough state");
+
+        assert_eq!(fallthrough.overlay().calls, 1);
+        assert_eq!(
+            fallthrough
+                .registers()
+                .get(Register(0))
+                .map(|value| value.value),
+            Some(0x55)
+        );
+    }
+
+    #[test]
     fn agreeing_predecessors_union_exact_value_definitions() {
         let bytes = arm_diamond(7, 7);
         let cfg = decode(&bytes, DecodeIsa::Arm);
@@ -1156,7 +1662,7 @@ mod tests {
             .expect("equal path values survive");
 
         assert_eq!(value.value, 7);
-        assert_eq!(value.definitions, BTreeSet::from([4, 12]));
+        assert_eq!(value.definitions(), BTreeSet::from([4, 12]));
     }
 
     #[test]
@@ -1181,7 +1687,7 @@ mod tests {
             .expect("ADD result reaches the branch");
 
         assert_eq!(value.value, 3);
-        assert_eq!(value.definitions, BTreeSet::from([0, 4, 8]));
+        assert_eq!(value.definitions(), BTreeSet::from([0, 4, 8]));
     }
 
     #[test]
@@ -1225,14 +1731,14 @@ mod tests {
     }
 
     #[test]
-    fn truncated_t32_instruction_is_a_decode_failure_boundary() {
+    fn missing_wide_t32_continuation_is_an_unmapped_boundary() {
         // The first halfword of movw r0, #0x1234 is a valid wide prefix, but
         // the second halfword is deliberately absent.
         let cfg = decode(&[0x41, 0xf2], DecodeIsa::Thumb);
 
         assert!(cfg.instructions().is_empty());
         assert_eq!(cfg.handoffs()[0].pc, 0);
-        assert_eq!(cfg.handoffs()[0].kind, BoundaryKind::DecodeFailure);
+        assert_eq!(cfg.handoffs()[0].kind, BoundaryKind::Unmapped);
     }
 
     #[test]
@@ -1373,5 +1879,36 @@ mod tests {
                 limit: 10,
             })
         ));
+    }
+
+    #[test]
+    fn maximal_thumb_copy_chain_collects_every_definition() {
+        const BYTES: usize = 64 * 1024;
+        const INSTRUCTIONS: usize = BYTES / 2;
+        let mut bytes = Vec::with_capacity(BYTES);
+        // movs r0, #1
+        bytes.extend_from_slice(&[0x01, 0x20]);
+        // mov r0, r0
+        for _ in 1..INSTRUCTIONS - 1 {
+            bytes.extend_from_slice(&[0x00, 0x46]);
+        }
+        // bx lr
+        bytes.extend_from_slice(&[0x70, 0x47]);
+        assert_eq!(bytes.len(), BYTES);
+
+        let cfg = decode(&bytes, DecodeIsa::Thumb);
+        let return_pc = u32::try_from(BYTES - 2).unwrap();
+        let definitions = cfg.exact_register_states()[&return_pc]
+            .get(Register(0))
+            .expect("copy chain reaches the return")
+            .definitions();
+
+        assert_eq!(cfg.instructions().len(), INSTRUCTIONS);
+        assert!(cfg.dominates(0, return_pc));
+        assert!(cfg.dominates(return_pc - 2, return_pc));
+        assert!(!cfg.dominates(return_pc, return_pc - 2));
+        assert_eq!(definitions.len(), INSTRUCTIONS - 1);
+        assert_eq!(definitions.first(), Some(&0));
+        assert_eq!(definitions.last(), Some(&(return_pc - 2)));
     }
 }
