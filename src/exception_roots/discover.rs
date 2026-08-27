@@ -163,6 +163,9 @@ fn classify_slots(
     runtime: &RuntimeImage<'_>,
     table_address: u32,
 ) -> Option<[ClassifiedSlot; VECTOR_SLOTS]> {
+    if !table_address.is_multiple_of(SLOT_BYTES) {
+        return None;
+    }
     let decoder = PureRustDecoder;
     let mut slots = Vec::with_capacity(VECTOR_SLOTS);
     for (index, role) in ExceptionRole::ALL.into_iter().enumerate() {
@@ -509,6 +512,10 @@ fn runtime_error(
 #[cfg(test)]
 mod tests {
     use super::{assemble_plan, build_roots_and_applications, discover, validate_table};
+    use crate::arm32::{
+        AddressBase, ControlFlow, InstructionDecoder, PureRustDecoder, Register, ValueEffect,
+        ValueExpr,
+    };
     use crate::exception_roots::{
         ExceptionRole, ExceptionRootError, MAX_ROOTS, MAX_TABLES, RelocationEvidence, RootIsa,
         SlotForm, VectorTableKind,
@@ -784,6 +791,30 @@ mod tests {
     }
 
     #[test]
+    fn two_mod_four_image_base_is_clean_absence_before_slot_decode() {
+        let base = BASE + 2;
+        let mut fixture = VectorFixture {
+            base,
+            raw: vec![0; IMAGE_SIZE],
+            plan: None,
+        };
+        for index in 0..8 {
+            let offset = u32::try_from(index).unwrap() * 4;
+            let slot = base + offset;
+            let literal = BASE + 0x40 + offset;
+            let target = ARM_TARGET_START + offset;
+            fixture.write_u32(slot, a32_ldr_pc(slot, literal));
+            fixture.write_u32(literal, target);
+            fixture.write_u32(target, ARM_NOP);
+        }
+
+        assert_eq!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN").unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn complete_literal_table_yields_ordered_roots() {
         let fixture = vector_fixture(8, TargetLayout::DistinctArm);
         let runtime = fixture.runtime();
@@ -900,6 +931,119 @@ mod tests {
                 "encoding {invalid:#010x}"
             );
         }
+    }
+
+    #[test]
+    fn register_indirect_pc_transfer_never_crosses_threshold() {
+        let encoding = 0xe591_f000u32; // ldr pc, [r1]
+        let decoder = PureRustDecoder;
+        let mut state = decoder.begin_range(RootIsa::Arm.decode_isa());
+        let instruction = decoder
+            .decode_one(
+                &mut state,
+                RootIsa::Arm.decode_isa(),
+                BASE,
+                &encoding.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(instruction.flow, ControlFlow::Barrier));
+        let ValueEffect::Memory(memory) = &instruction.effect else {
+            panic!("register-indirect PC load lost its memory effect");
+        };
+        assert_eq!(memory.transfers.len(), 1);
+        assert_eq!(
+            memory.transfers[0].address.base,
+            AddressBase::Register(Register(1))
+        );
+        assert_eq!(memory.transfers[0].value, Some(Register(15)));
+
+        let mut fixture = full_literal_fixture(TargetLayout::DistinctArm);
+        fixture.write_u32(BASE, encoding);
+        assert_eq!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn computed_pc_write_never_crosses_threshold() {
+        let encoding = 0xe1a0_f001u32; // mov pc, r1
+        let decoder = PureRustDecoder;
+        let mut state = decoder.begin_range(RootIsa::Arm.decode_isa());
+        let instruction = decoder
+            .decode_one(
+                &mut state,
+                RootIsa::Arm.decode_isa(),
+                BASE,
+                &encoding.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(instruction.flow, ControlFlow::Barrier));
+        assert_eq!(
+            instruction.effect,
+            ValueEffect::RegisterWrite {
+                dst: Register(15),
+                value: ValueExpr::Register(Register(1)),
+            }
+        );
+
+        let mut fixture = full_literal_fixture(TargetLayout::DistinctArm);
+        fixture.write_u32(BASE, encoding);
+        assert_eq!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn return_never_crosses_threshold() {
+        let encoding = 0xe12f_ff1eu32; // bx lr
+        let decoder = PureRustDecoder;
+        let mut state = decoder.begin_range(RootIsa::Arm.decode_isa());
+        let instruction = decoder
+            .decode_one(
+                &mut state,
+                RootIsa::Arm.decode_isa(),
+                BASE,
+                &encoding.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(instruction.flow, ControlFlow::Return));
+        assert_eq!(instruction.effect, ValueEffect::None);
+        assert_eq!(instruction.reads, [Register(14)].into_iter().collect());
+
+        let mut fixture = full_literal_fixture(TargetLayout::DistinctArm);
+        fixture.write_u32(BASE, encoding);
+        assert_eq!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn exception_call_never_crosses_threshold() {
+        let encoding = 0xef00_0000u32; // svc #0
+        let decoder = PureRustDecoder;
+        let mut state = decoder.begin_range(RootIsa::Arm.decode_isa());
+        let instruction = decoder
+            .decode_one(
+                &mut state,
+                RootIsa::Arm.decode_isa(),
+                BASE,
+                &encoding.to_le_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(instruction.flow, ControlFlow::ExceptionCall));
+        assert_eq!(instruction.effect, ValueEffect::None);
+        assert!(instruction.reads.is_empty());
+        assert!(instruction.writes.is_empty());
+
+        let mut fixture = full_literal_fixture(TargetLayout::DistinctArm);
+        fixture.write_u32(BASE, encoding);
+        assert_eq!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN").unwrap(),
+            None
+        );
     }
 
     #[test]
