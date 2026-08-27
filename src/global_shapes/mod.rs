@@ -695,8 +695,8 @@ mod tests {
     };
     use crate::arm32::{
         AccessKind, AddressBase, AddressExpr, AddressOffset, DecodeError, DecoderIdentity,
-        InstructionDecoder, MemoryEffect, MemoryTransfer, PureRustDecoder, Register, ValueEffect,
-        ValueExpr,
+        InstructionDecoder, MemoryEffect, MemoryTransfer, PureRustDecoder, Register, SystemEffect,
+        ValueEffect, ValueExpr,
     };
     use crate::error::Error;
     use crate::execution_ranges::DecodeIsa as Isa;
@@ -1122,6 +1122,7 @@ mod tests {
             reads: BTreeSet::new(),
             writes: writes.into_iter().collect(),
             effect,
+            system: SystemEffect::None,
             flags: crate::arm32::FlagEffect::Preserved,
             flow,
         }

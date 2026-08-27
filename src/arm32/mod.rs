@@ -43,6 +43,53 @@ pub(crate) fn wrapping_offset(address: u32, offset: i64) -> u32 {
 pub(crate) struct Register(pub(crate) u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemDirection {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoprocessorTransfer {
+    pub direction: SystemDirection,
+    pub coprocessor: u8,
+    pub opcode1: u8,
+    pub rt: Register,
+    pub crn: u8,
+    pub crm: u8,
+    pub opcode2: u8,
+    pub unconditional_extension: bool,
+}
+
+impl CoprocessorTransfer {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_vbar_write(self) -> bool {
+        self.direction == SystemDirection::Write
+            && !self.unconditional_extension
+            && self.coprocessor == 15
+            && self.opcode1 == 0
+            && self.crn == 12
+            && self.crm == 0
+            && self.opcode2 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemEffect {
+    None,
+    CoprocessorTransfer(CoprocessorTransfer),
+}
+
+impl SystemEffect {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn transfer(self) -> Option<CoprocessorTransfer> {
+        match self {
+            Self::None => None,
+            Self::CoprocessorTransfer(transfer) => Some(transfer),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Shift {
     Lsl(u8),
     Lsr(u8),
@@ -253,6 +300,7 @@ pub(crate) struct DecodedInstruction {
     pub reads: BTreeSet<Register>,
     pub writes: BTreeSet<Register>,
     pub effect: ValueEffect,
+    pub system: SystemEffect,
     pub flags: FlagEffect,
     pub flow: ControlFlow,
 }
@@ -276,6 +324,11 @@ impl DecodedInstruction {
 
     fn with_link(mut self) -> Self {
         self.links_lr = true;
+        self
+    }
+
+    fn with_system(mut self, system: SystemEffect) -> Self {
+        self.system = system;
         self
     }
 }
@@ -467,6 +520,28 @@ fn gpr(reg: Arm32GeneralPurposeRegister) -> Register {
     Register(reg.as_operand_bits())
 }
 
+fn system_transfer(
+    direction: SystemDirection,
+    coprocessor: u8,
+    opcode1: u8,
+    rt: Arm32GeneralPurposeRegister,
+    crn: u8,
+    crm: u8,
+    opcode2: u8,
+    unconditional_extension: bool,
+) -> SystemEffect {
+    SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+        direction,
+        coprocessor,
+        opcode1,
+        rt: gpr(rt),
+        crn,
+        crm,
+        opcode2,
+        unconditional_extension,
+    })
+}
+
 fn low_reg(reg: Arm32LowGeneralPurposeRegister) -> Register {
     Register(reg.as_operand_bits())
 }
@@ -531,6 +606,7 @@ fn insn(
         reads,
         writes,
         effect,
+        system: SystemEffect::None,
         flags,
         flow,
     }
@@ -3242,10 +3318,21 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
         ArmA32Instruction::Msr_Immediate_A1(cond, _, _, _) => {
             a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new())
         }
-        ArmA32Instruction::Mrc_A1(cond, _, _, rt, _, _, _) => {
-            a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rt)]))
+        ArmA32Instruction::Mrc_A1(cond, coprocessor, opcode1, rt, crn, crm, opcode2) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rt)])).with_system(
+                system_transfer(
+                    SystemDirection::Read,
+                    *coprocessor,
+                    *opcode1,
+                    *rt,
+                    *crn,
+                    *crm,
+                    *opcode2,
+                    false,
+                ),
+            )
         }
-        ArmA32Instruction::Mrc2_A1(_, _, rt, _, _, _) => unsupported(
+        ArmA32Instruction::Mrc2_A1(coprocessor, opcode1, rt, crn, crm, opcode2) => unsupported(
             Isa::Arm,
             pc,
             length,
@@ -3253,11 +3340,32 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
             BTreeSet::new(),
             set([gpr(*rt)]),
             ControlFlow::Linear,
-        ),
-        ArmA32Instruction::Mcr_A1(cond, _, _, rt, _, _, _) => {
-            a32_linear(pc, length, *cond, set([gpr(*rt)]), BTreeSet::new())
+        )
+        .with_system(system_transfer(
+            SystemDirection::Read,
+            *coprocessor,
+            *opcode1,
+            *rt,
+            *crn,
+            *crm,
+            *opcode2,
+            true,
+        )),
+        ArmA32Instruction::Mcr_A1(cond, coprocessor, opcode1, rt, crn, crm, opcode2) => {
+            a32_linear(pc, length, *cond, set([gpr(*rt)]), BTreeSet::new()).with_system(
+                system_transfer(
+                    SystemDirection::Write,
+                    *coprocessor,
+                    *opcode1,
+                    *rt,
+                    *crn,
+                    *crm,
+                    *opcode2,
+                    false,
+                ),
+            )
         }
-        ArmA32Instruction::Mcr2_A1(_, _, rt, _, _, _) => unsupported(
+        ArmA32Instruction::Mcr2_A1(coprocessor, opcode1, rt, crn, crm, opcode2) => unsupported(
             Isa::Arm,
             pc,
             length,
@@ -3265,7 +3373,17 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
             set([gpr(*rt)]),
             BTreeSet::new(),
             ControlFlow::Linear,
-        ),
+        )
+        .with_system(system_transfer(
+            SystemDirection::Write,
+            *coprocessor,
+            *opcode1,
+            *rt,
+            *crn,
+            *crm,
+            *opcode2,
+            true,
+        )),
         ArmA32Instruction::Mrrc_A1(cond, _, _, rt, rt2, _) => a32_linear(
             pc,
             length,
@@ -3611,12 +3729,44 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         ArmT32Instruction::Pld_Immediate_T1(rn, _) | ArmT32Instruction::Pli_Immediate_T1(rn, _) => {
             t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
         }
-        ArmT32Instruction::Coproc_Mcr_T1(_, false, _, _, rt, _, _, _) => {
-            t32_linear(pc, length, set([gpr(*rt)]), BTreeSet::new())
-        }
-        ArmT32Instruction::Coproc_Mcr_T1(_, true, _, _, rt, _, _, _) => {
-            t32_linear(pc, length, BTreeSet::new(), set([gpr(*rt)]))
-        }
+        ArmT32Instruction::Coproc_Mcr_T1(
+            two,
+            false,
+            coprocessor,
+            opcode1,
+            rt,
+            crn,
+            crm,
+            opcode2,
+        ) => t32_linear(pc, length, set([gpr(*rt)]), BTreeSet::new()).with_system(system_transfer(
+            SystemDirection::Write,
+            *coprocessor,
+            *opcode1,
+            *rt,
+            *crn,
+            *crm,
+            *opcode2,
+            *two,
+        )),
+        ArmT32Instruction::Coproc_Mcr_T1(
+            two,
+            true,
+            coprocessor,
+            opcode1,
+            rt,
+            crn,
+            crm,
+            opcode2,
+        ) => t32_linear(pc, length, BTreeSet::new(), set([gpr(*rt)])).with_system(system_transfer(
+            SystemDirection::Read,
+            *coprocessor,
+            *opcode1,
+            *rt,
+            *crn,
+            *crm,
+            *opcode2,
+            *two,
+        )),
         ArmT32Instruction::Coproc_Mcrr_T1(_, false, _, _, rt, rt2, _) => {
             t32_linear(pc, length, set([gpr(*rt), gpr(*rt2)]), BTreeSet::new())
         }
@@ -3822,6 +3972,183 @@ mod tests {
             ValueEffect::Memory(effect) => effect.transfers.first(),
             _ => None,
         }
+    }
+
+    #[test]
+    fn a32_vbar_write_preserves_every_system_operand() {
+        // `mcr p15, #0, r0, c12, c0, #0` (0xee0c0f10).
+        let insn = super::decode_a32(0x1000, &[0x10, 0x0f, 0x0c, 0xee]).unwrap();
+        assert_eq!(
+            insn.system,
+            SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+                direction: SystemDirection::Write,
+                coprocessor: 15,
+                opcode1: 0,
+                rt: Register(0),
+                crn: 12,
+                crm: 0,
+                opcode2: 0,
+                unconditional_extension: false,
+            })
+        );
+        assert!(insn.system.transfer().unwrap().is_vbar_write());
+        assert_eq!(insn.effect, ValueEffect::Unsupported);
+        assert_eq!(insn.reads, regs(&[R0]));
+        assert!(insn.writes.is_empty());
+        assert_eq!(insn.flags, FlagEffect::Clobbered);
+        assert_eq!(insn.flow, ControlFlow::Linear);
+    }
+
+    #[test]
+    fn a32_mrc_preserves_read_direction_and_every_system_operand() {
+        // `mrcne p14, #0, r0, c1, c2, #3` (0x1e110e72).
+        let insn = super::decode_a32(0x1000, &[0x72, 0x0e, 0x11, 0x1e]).unwrap();
+        assert_eq!(
+            insn.system,
+            SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+                direction: SystemDirection::Read,
+                coprocessor: 14,
+                opcode1: 0,
+                rt: Register(0),
+                crn: 1,
+                crm: 2,
+                opcode2: 3,
+                unconditional_extension: false,
+            })
+        );
+        assert!(!insn.system.transfer().unwrap().is_vbar_write());
+        assert!(insn.reads.is_empty());
+        assert_eq!(insn.writes, regs(&[R0]));
+        assert_eq!(insn.effect, ValueEffect::Unsupported);
+        assert_eq!(insn.flags, FlagEffect::Clobbered);
+        assert!(insn.conditional);
+        assert_eq!(insn.flow, ControlFlow::Linear);
+    }
+
+    #[test]
+    fn a32_extension_transfers_preserve_direction_and_every_system_operand() {
+        // `mcr2 p9, #3, r8, c4, c5, #2` (0xfe648955).
+        let write = super::decode_a32(0x1000, &[0x55, 0x89, 0x64, 0xfe]).unwrap();
+        assert_eq!(
+            write.system,
+            SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+                direction: SystemDirection::Write,
+                coprocessor: 9,
+                opcode1: 3,
+                rt: Register(8),
+                crn: 4,
+                crm: 5,
+                opcode2: 2,
+                unconditional_extension: true,
+            })
+        );
+        assert_eq!(write.reads, regs(&[Register(8)]));
+        assert!(write.writes.is_empty());
+        assert_eq!(write.effect, ValueEffect::Unsupported);
+        assert_eq!(write.flags, FlagEffect::Clobbered);
+        assert_eq!(write.flow, ControlFlow::Linear);
+
+        // `mrc2 p14, #7, r6, c1, c2, #5` (0xfef16eb2).
+        let read = super::decode_a32(0x1004, &[0xb2, 0x6e, 0xf1, 0xfe]).unwrap();
+        assert_eq!(
+            read.system,
+            SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+                direction: SystemDirection::Read,
+                coprocessor: 14,
+                opcode1: 7,
+                rt: Register(6),
+                crn: 1,
+                crm: 2,
+                opcode2: 5,
+                unconditional_extension: true,
+            })
+        );
+        assert!(read.reads.is_empty());
+        assert_eq!(read.writes, regs(&[Register(6)]));
+        assert_eq!(read.effect, ValueEffect::Unsupported);
+        assert_eq!(read.flags, FlagEffect::Clobbered);
+        assert_eq!(read.flow, ControlFlow::Linear);
+    }
+
+    #[test]
+    fn t32_mrc_direction_and_extension_are_not_collapsed() {
+        // `mrc p15, #0, r1, c0, c0, #0`.
+        let insn = super::decode_t32(
+            &mut ItRangeState::default(),
+            0x2000,
+            &[0x10, 0xee, 0x10, 0x1f],
+        )
+        .unwrap();
+        let transfer = insn.system.transfer().expect("coprocessor transfer");
+        assert_eq!(transfer.direction, SystemDirection::Read);
+        assert_eq!(transfer.coprocessor, 15);
+        assert_eq!(transfer.rt, Register(1));
+        assert_eq!(transfer.opcode1, 0);
+        assert_eq!(transfer.crn, 0);
+        assert_eq!(transfer.crm, 0);
+        assert_eq!(transfer.opcode2, 0);
+        assert!(!transfer.unconditional_extension);
+        assert!(!transfer.is_vbar_write());
+        assert!(insn.reads.is_empty());
+        assert_eq!(insn.writes, regs(&[R1]));
+        assert_eq!(insn.effect, ValueEffect::Unsupported);
+        assert_eq!(insn.flags, FlagEffect::Clobbered);
+        assert_eq!(insn.flow, ControlFlow::Linear);
+    }
+
+    #[test]
+    fn t32_extension_transfers_preserve_direction_and_every_system_operand() {
+        // `mcr2 p14, #1, r2, c3, c4, #2`.
+        let write = super::decode_t32(
+            &mut ItRangeState::default(),
+            0x2000,
+            &[0x23, 0xfe, 0x54, 0x2e],
+        )
+        .unwrap();
+        assert_eq!(
+            write.system,
+            SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+                direction: SystemDirection::Write,
+                coprocessor: 14,
+                opcode1: 1,
+                rt: Register(2),
+                crn: 3,
+                crm: 4,
+                opcode2: 2,
+                unconditional_extension: true,
+            })
+        );
+        assert_eq!(write.reads, regs(&[R2]));
+        assert!(write.writes.is_empty());
+        assert_eq!(write.effect, ValueEffect::Unsupported);
+        assert_eq!(write.flags, FlagEffect::Clobbered);
+        assert_eq!(write.flow, ControlFlow::Linear);
+
+        // `mrc2 p14, #7, r6, c1, c2, #5`.
+        let read = super::decode_t32(
+            &mut ItRangeState::default(),
+            0x2004,
+            &[0xf1, 0xfe, 0xb2, 0x6e],
+        )
+        .unwrap();
+        assert_eq!(
+            read.system,
+            SystemEffect::CoprocessorTransfer(CoprocessorTransfer {
+                direction: SystemDirection::Read,
+                coprocessor: 14,
+                opcode1: 7,
+                rt: Register(6),
+                crn: 1,
+                crm: 2,
+                opcode2: 5,
+                unconditional_extension: true,
+            })
+        );
+        assert!(read.reads.is_empty());
+        assert_eq!(read.writes, regs(&[Register(6)]));
+        assert_eq!(read.effect, ValueEffect::Unsupported);
+        assert_eq!(read.flags, FlagEffect::Clobbered);
+        assert_eq!(read.flow, ControlFlow::Linear);
     }
 
     #[test]
@@ -4366,7 +4693,16 @@ mod tests {
             effect,
             flags,
             flow,
+            system: SystemEffect::None,
         }
+    }
+
+    fn expected_transfer(
+        mut instruction: DecodedInstruction,
+        transfer: CoprocessorTransfer,
+    ) -> DecodedInstruction {
+        instruction.system = SystemEffect::CoprocessorTransfer(transfer);
+        instruction
     }
 
     fn write(dst: Register, value: ValueExpr) -> ValueEffect {
@@ -5654,14 +5990,26 @@ mod tests {
                 name: "t32_mcr",
                 isa: Isa::Thumb,
                 bytes: &[0x00, 0xee, 0x10, 0x1f],
-                expected: expected(
-                    Isa::Thumb,
-                    4,
-                    false,
-                    &[R1],
-                    &[],
-                    ValueEffect::Unsupported,
-                    linear(),
+                expected: expected_transfer(
+                    expected(
+                        Isa::Thumb,
+                        4,
+                        false,
+                        &[R1],
+                        &[],
+                        ValueEffect::Unsupported,
+                        linear(),
+                    ),
+                    CoprocessorTransfer {
+                        direction: SystemDirection::Write,
+                        coprocessor: 15,
+                        opcode1: 0,
+                        rt: R1,
+                        crn: 0,
+                        crm: 0,
+                        opcode2: 0,
+                        unconditional_extension: false,
+                    },
                 ),
             },
             NamedFixture {

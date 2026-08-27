@@ -466,7 +466,9 @@ fn invalid(message: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arm32::{DecodeError, DecoderIdentity, FlagEffect, Operand, PureRustDecoder};
+    use crate::arm32::{
+        DecodeError, DecoderIdentity, FlagEffect, Operand, PureRustDecoder, SystemEffect,
+    };
     use crate::error::Error;
     use crate::execution_ranges::ExecutionIdentity;
     use std::cell::RefCell;
@@ -577,6 +579,7 @@ mod tests {
                     reads: BTreeSet::new(),
                     writes: BTreeSet::new(),
                     effect: ValueEffect::None,
+                    system: SystemEffect::None,
                     flags: FlagEffect::Preserved,
                     flow: arm32::ControlFlow::Linear,
                 }),
@@ -594,6 +597,7 @@ mod tests {
             reads: BTreeSet::new(),
             writes: BTreeSet::new(),
             effect: ValueEffect::None,
+            system: SystemEffect::None,
             flags: FlagEffect::Preserved,
             flow: arm32::ControlFlow::Linear,
         }
@@ -656,6 +660,7 @@ mod tests {
                 left: Register(1),
                 right: Operand::Immediate(0),
             },
+            system: SystemEffect::None,
             flags: FlagEffect::Written(arm32::FlagWriter::Compare),
             flow: arm32::ControlFlow::Linear,
         };
@@ -677,6 +682,7 @@ mod tests {
             reads: BTreeSet::from([Register(0)]),
             writes: BTreeSet::new(),
             effect: ValueEffect::None,
+            system: SystemEffect::None,
             flags: FlagEffect::Preserved,
             flow: arm32::ControlFlow::Barrier,
         };
