@@ -123,6 +123,7 @@ public class ApplySymbols extends HeadlessScript {
         final Function function;
         final boolean rename;
         final boolean transition;
+        final boolean thunk;
 
         Planned(PalTasksSupport.MapExecution execution, PalTasksSupport.MapDecision decision,
                 Function function, boolean rename, boolean transition) {
@@ -131,6 +132,7 @@ public class ApplySymbols extends HeadlessScript {
             this.function = function;
             this.rename = rename;
             this.transition = transition;
+            this.thunk = function.isThunk();
         }
     }
 
@@ -189,8 +191,8 @@ public class ApplySymbols extends HeadlessScript {
             PalTasksSupport.validateApplied(currentProgram, manifest, palIdentity);
         }
         else {
-            if (taskManifest != null || scatterManifest != null) {
-                fail("identity none requires the literal '-' manifest arguments");
+            if (taskManifest != null) {
+                fail("identity none requires the literal '-' task manifest");
             }
             if (!PalTasksSupport.NONE_IDENTITY.equals(map.palIdentity)) {
                 fail("the symbol map binds a PAL identity the invocation does not declare");
@@ -200,7 +202,7 @@ public class ApplySymbols extends HeadlessScript {
 
         String property = currentProgram.getOptions(Program.PROGRAM_INFO)
                 .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-        String expectedProperty = expectedProperty(map);
+        String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
         // The property must be absent (first application) or exactly the
         // expected identity (an idempotent replay); a different prior map is
         // stale. Which case holds is re-derived per decision below from the
@@ -241,11 +243,6 @@ public class ApplySymbols extends HeadlessScript {
         }
         return new Preflight(map, label, imageBlake3, palIdentity, palPresent,
                 planned, registry);
-    }
-
-    /** The exact SymbolPass2 property value for this invocation. */
-    private static String expectedProperty(PalTasksSupport.SymbolMap map) {
-        return "v2:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":" + map.executions.size();
     }
 
     /**
@@ -406,48 +403,20 @@ public class ApplySymbols extends HeadlessScript {
         }
 
         void applyAll() throws Exception {
-            Listing listing = currentProgram.getListing();
+            // Ghidra mirrors a referenced function's post-rename primary onto
+            // its thunks, so every non-thunk rename is applied before any
+            // thunk mutation: an authorized independent thunk rename then
+            // deterministically overrides the mirror, and a `mirror`
+            // decision (rename == false) only ever verifies the mirrored
+            // primary at postflight.
             for (Planned plan : preflight.planned) {
-                Address entry = plan.function.getEntryPoint();
-                if (plan.rename) {
-                    final Function function = plan.function;
-                    final String priorName = function.getName();
-                    final SourceType priorSource = function.getSymbol().getSource();
-                    final String finalName = plan.decision.finalPrimary;
-                    final SourceType finalSource = plan.decision.finalSource.equals("user_defined")
-                            ? SourceType.USER_DEFINED : SourceType.ANALYSIS;
-                    try {
-                        function.setName(finalName, finalSource);
-                    }
-                    catch (ghidra.util.exception.DuplicateNameException
-                            | ghidra.util.exception.InvalidInputException error) {
-                        fail("the pass-2 rename to " + finalName + " failed at " + entry
-                                + ": " + error.getMessage());
-                    }
-                    journal(() -> function.setName(priorName, priorSource));
-                    renames++;
+                if (!plan.thunk) {
+                    applyOne(plan);
                 }
-                if (plan.transition && plan.rename) {
-                    applyRegistryTransition(plan);
-                }
-                if (!plan.decision.annotations.isEmpty()) {
-                    StringBuilder text = new StringBuilder();
-                    for (String annotation : plan.decision.annotations) {
-                        if (text.length() > 0) {
-                            text.append("\n// ");
-                        }
-                        text.append(annotation);
-                    }
-                    CodeUnit unit = listing.getCodeUnitContaining(entry);
-                    if (unit == null) {
-                        fail("no code unit exists at the annotation entry " + entry);
-                    }
-                    final CodeUnit finalUnit = unit;
-                    final String priorComment = unit.getComment(CommentType.PLATE);
-                    final String newComment = text.toString();
-                    finalUnit.setComment(CommentType.PLATE, newComment);
-                    journal(() -> finalUnit.setComment(CommentType.PLATE, priorComment));
-                    comments++;
+            }
+            for (Planned plan : preflight.planned) {
+                if (plan.thunk) {
+                    applyOne(plan);
                 }
             }
 
@@ -462,17 +431,27 @@ public class ApplySymbols extends HeadlessScript {
                 PalTasksSupport.validateAbsent(currentProgram);
             }
             for (Planned plan : preflight.planned) {
-                if (!plan.function.getName().equals(plan.decision.finalPrimary)
-                        || !PalTasksSupport.primarySource(
-                                plan.function.getSymbol().getSource())
-                                .equals(plan.decision.finalSource)) {
+                String current = plan.function.getName();
+                String source =
+                        PalTasksSupport.primarySource(plan.function.getSymbol().getSource());
+                // A `mirror` decision covers Ghidra's thunk-name mirroring,
+                // which follows the renamed target only while the thunk
+                // still carries its auto-derived primary (a custom thunk
+                // name — e.g. an applied PAL task label — is left alone).
+                // Both deterministic outcomes are accepted: the mirrored
+                // final primary or the untouched original; the source must
+                // stay the thunk's own either way.
+                boolean primaryOk = current.equals(plan.decision.finalPrimary)
+                        || ("mirror".equals(plan.decision.action)
+                                && current.equals(plan.decision.originalPrimary));
+                if (!primaryOk || !source.equals(plan.decision.finalSource)) {
                     fail("verification lost the applied primary at "
                             + plan.function.getEntryPoint());
                 }
             }
             currentProgram.getOptions(Program.PROGRAM_INFO)
                     .setString(PalTasksSupport.SYMBOL_PASS2_PROPERTY,
-                            expectedProperty(preflight.map));
+                            PalTasksSupport.expectedSymbolPass2Property(preflight.map));
             // Bypass GhidraScript.println (which routes through Msg.info and
             // gets wrapped as "INFO  ApplySymbols.java> ... (GhidraScript)"):
             // emit on stdout verbatim so the Rust driver's parse_pass2_summary
@@ -482,6 +461,51 @@ public class ApplySymbols extends HeadlessScript {
                     + preflight.map.executions.size() + " executions";
             System.out.println(summary);
             println(summary);
+        }
+
+        private void applyOne(Planned plan) throws Exception {
+            Listing listing = currentProgram.getListing();
+            Address entry = plan.function.getEntryPoint();
+            if (plan.rename) {
+                final Function function = plan.function;
+                final String priorName = function.getName();
+                final SourceType priorSource = function.getSymbol().getSource();
+                final String finalName = plan.decision.finalPrimary;
+                final SourceType finalSource = plan.decision.finalSource.equals("user_defined")
+                        ? SourceType.USER_DEFINED : SourceType.ANALYSIS;
+                try {
+                    function.setName(finalName, finalSource);
+                }
+                catch (ghidra.util.exception.DuplicateNameException
+                        | ghidra.util.exception.InvalidInputException error) {
+                    fail("the pass-2 rename to " + finalName + " failed at " + entry
+                            + ": " + error.getMessage());
+                }
+                journal(() -> function.setName(priorName, priorSource));
+                renames++;
+            }
+            if (plan.transition && plan.rename) {
+                applyRegistryTransition(plan);
+            }
+            if (!plan.decision.annotations.isEmpty()) {
+                StringBuilder text = new StringBuilder();
+                for (String annotation : plan.decision.annotations) {
+                    if (text.length() > 0) {
+                        text.append("\n// ");
+                    }
+                    text.append(annotation);
+                }
+                CodeUnit unit = listing.getCodeUnitContaining(entry);
+                if (unit == null) {
+                    fail("no code unit exists at the annotation entry " + entry);
+                }
+                final CodeUnit finalUnit = unit;
+                final String priorComment = unit.getComment(CommentType.PLATE);
+                final String newComment = text.toString();
+                finalUnit.setComment(CommentType.PLATE, newComment);
+                journal(() -> finalUnit.setComment(CommentType.PLATE, priorComment));
+                comments++;
+            }
         }
 
         /**

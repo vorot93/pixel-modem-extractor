@@ -240,6 +240,17 @@ fn inspect_saved_project_with_args(
     script: &str,
     script_args: &[String],
 ) -> std::process::Output {
+    inspect_saved_project_with_args_and_env(home, out, label, script, script_args, &[])
+}
+
+fn inspect_saved_project_with_args_and_env(
+    home: &std::path::Path,
+    out: &std::path::Path,
+    label: &str,
+    script: &str,
+    script_args: &[String],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let config = out.join("ghidra_config");
     let cache = out.join("ghidra_cache");
     let temp = out.join("ghidra_tmp");
@@ -266,6 +277,7 @@ fn inspect_saved_project_with_args(
     .env("XDG_CONFIG_HOME", config)
     .env("XDG_CACHE_HOME", cache)
     .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+    .envs(environment.iter().copied())
     .output()
     .unwrap()
 }
@@ -447,12 +459,13 @@ fn run_saved_project_export(
 
 /// A `PreparedSymbolPass2Map` over the retained pass-1 files of a small
 /// synthesized image tree: `<dir>/<label>/{<label>.bin, decompiled/
-/// functions.json}` plus the written v2 map at `map_path`.
+/// functions.json}` plus the written v3 map at `map_path`.
 fn prepared_symbol_map(
     dir: &std::path::Path,
     label: &str,
     map_path: &std::path::Path,
     execution_count: usize,
+    creation_requests: Vec<pixel_modem_extractor::symbolicate::Pass2CreationRequest>,
 ) -> pixel_modem_extractor::decompile::PreparedSymbolPass2Map {
     let image_dir = dir.join(label);
     pixel_modem_extractor::decompile::PreparedSymbolPass2Map::new(
@@ -460,7 +473,9 @@ fn prepared_symbol_map(
         &image_dir.join("decompiled/functions.json"),
         &image_dir.join(format!("{label}.bin")),
         label,
-        NonZeroUsize::new(execution_count).unwrap(),
+        execution_count,
+        usize::from(execution_count != 0),
+        creation_requests,
     )
     .unwrap()
 }
@@ -2032,6 +2047,14 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         arm.extend([0xfe, 0xff, 0xff, 0xea]); // b .
     }
     arm.extend([0x78, 0x56, 0x34, 0x12]);
+    // Two Thumb halfwords at 0x24 (`push {r7}`; `pop {r7,pc}`): real,
+    // flow-through Thumb code that nothing references, so Ghidra's own
+    // inventory never discovers it — the pass-2 creation path
+    // (ApplyThumbNames) must carve it from the authenticated producer record
+    // and name it.
+    arm.extend([0x80, 0xb5, 0x80, 0xbd]);
+    arm.extend([0; 8]);
+    arm.extend([0x70, 0x47]); // bx lr at 0x30: isolated collision-skip fixture.
     // Ghidra's ARM vector analysis names the image-start functions with
     // IMPORTED-sourced primaries; the strict pass-2 contract protects them
     // (the token rename downgrades to preserve) while the decision's token
@@ -2099,23 +2122,47 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     {"id":"rizin","executable":"/usr/bin/rizin","version":"rizin fixture","command":"aaa;aflj;pdfj @@F;axlj"}
   ],
   "regions": [{
-    "start":"0x0","end":"0x2",
+    "start":"0x0","end":"0x32",
     "attempts":[
       {"producer":"radare2","status":"failed","stdout":null,"error":"radare2 fixture failure"},
       {"producer":"rizin","status":"succeeded","stdout":{"path":"thumb/00000000.rizin.stdout","bytes":1,"blake3":"0000000000000000000000000000000000000000000000000000000000000000"},"error":null}
     ],
-    "function_runs":[{"producer":"rizin","first_function":0,"function_count":1,"substantial":0,"accepted":1,"quarantined":0}]
+    "function_runs":[{"producer":"rizin","first_function":0,"function_count":4,"substantial":0,"accepted":4,"quarantined":0}]
   }],
   "functions": [{
     "name":"retained_thumb_fixture","entry":"0x0","end":"0x2","size":2,
     "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2","blake3":"__RANGE_BLAKE3__"}],
     "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":[]
+  }, {
+    "name":"retained_thumb_created","entry":"0x24","end":"0x28","size":4,
+    "decode_ranges":[{"isa":"thumb","start":"0x24","end":"0x28","blake3":"__CREATED_BLAKE3__"}],
+    "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":["0x20"]
+  }, {
+    "name":"retained_thumb_overlap","entry":"0x26","end":"0x28","size":2,
+    "decode_ranges":[{"isa":"thumb","start":"0x26","end":"0x28","blake3":"__OVERLAP_BLAKE3__"}],
+    "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":["0x20"]
+  }, {
+    "name":"retained_thumb_collision","entry":"0x30","end":"0x32","size":2,
+    "decode_ranges":[{"isa":"thumb","start":"0x30","end":"0x32","blake3":"__COLLISION_BLAKE3__"}],
+    "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":["0x20"]
   }]
 }"#)
     .unwrap()
     .replace(
         "__RANGE_BLAKE3__",
         blake3::hash(&arm[..2]).to_hex().as_ref(),
+    )
+    .replace(
+        "__CREATED_BLAKE3__",
+        blake3::hash(&arm[0x24..0x28]).to_hex().as_ref(),
+    )
+    .replace(
+        "__OVERLAP_BLAKE3__",
+        blake3::hash(&arm[0x26..0x28]).to_hex().as_ref(),
+    )
+    .replace(
+        "__COLLISION_BLAKE3__",
+        blake3::hash(&arm[0x30..0x32]).to_hex().as_ref(),
     )
     .into_bytes();
     std::fs::write(
@@ -2124,7 +2171,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     )
     .unwrap();
 
-    // Build the strict v2 symbol map from the retained pass-1 tree. Token
+    // Build the strict v3 symbol map from the retained pass-1 tree. Token
     // 0x20 (a genuine LDR data reference) drives one provisional rename; the
     // retained file is hashed verbatim through the same builder the decompose
     // pipeline uses.
@@ -2140,6 +2187,13 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     std::fs::copy(
         out.join("export/00_BOOT/disasm.lst"),
         boot_dir.join("decompiled/disasm.lst"),
+    )
+    .unwrap();
+    // The retained Thumb artifact must be visible to the map builder so the
+    // named thumb-only record reaches the creation section.
+    std::fs::copy(
+        out.join("export/00_BOOT/thumb_functions.json"),
+        boot_dir.join("decompiled/thumb_functions.json"),
     )
     .unwrap();
     let tree_manifest = dir.join("manifest.json");
@@ -2164,18 +2218,279 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         bundle.map.applied_decision_count >= 1,
         "the token reference must schedule pass 2"
     );
+    assert_eq!(
+        bundle.map.creation_count, 3,
+        "all authenticated Thumb entries must reach the runtime classifier"
+    );
+    let map_text = std::fs::read_to_string(&map_path).unwrap();
+    let written: serde_json::Value = serde_json::from_str(&map_text).unwrap();
+    assert_eq!(
+        written["executions"].as_array().map(Vec::len),
+        Some(bundle.map.execution_count),
+        "the written map must carry the measured execution count"
+    );
+    let valid_primary = "\"final_primary\": \"guess_boot_reset_handler_d_00000030\"";
+    assert_eq!(map_text.matches(valid_primary).count(), 1);
+    let created_execution_blake3 = written["creations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|creation| creation["entry"] == "0x00000024")
+        .and_then(|creation| creation["execution_blake3"].as_str())
+        .expect("the creation fixture must carry its execution identity")
+        .to_string();
+    // A valid global symbol elsewhere in memory reserves the requested 0x30
+    // primary. ApplyThumbNames must classify it as a collision without
+    // touching the candidate entry.
+    let seed_collision = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.symbol.SourceType;
+
+public class SeedThumbCreationCollision extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        currentProgram.getSymbolTable().createLabel(toAddr(0x2c),
+                "guess_boot_reset_handler_d_00000030", SourceType.USER_DEFINED);
+    }
+}
+"#;
+    std::fs::write(
+        out.join("scripts/SeedThumbCreationCollision.java"),
+        seed_collision,
+    )
+    .unwrap();
+    let seeded = inspect_saved_project(&home, &out, "00_BOOT", "SeedThumbCreationCollision.java");
+    assert!(
+        seeded.status.success(),
+        "collision seeding failed:\n{}",
+        process_diagnostics(&seeded)
+    );
     let symbol_map = prepared_symbol_map(
         &images_dir,
         "00_BOOT",
         &map_path,
         bundle.map.execution_count,
+        bundle.map.creation_requests.clone(),
     );
-    let written: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&map_path).unwrap()).unwrap();
+
+    // A separate creation-only saved project proves that ExportDecomp never
+    // inserts its pass-1 entry fallback after a map-authenticated zero-function
+    // postflight. Every creation name is reserved by an unrelated global
+    // label, so ApplyThumbNames must classify all requests as collisions.
+    let creation_only_out = dir.join("creation-only-out");
+    let creation_only_pass1 =
+        pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &creation_only_out)
+            .unwrap();
+    assert!(
+        creation_only_pass1
+            .images
+            .iter()
+            .any(|result| result.label == "00_BOOT"),
+        "creation-only fixture pass 1 did not analyze 00_BOOT"
+    );
+    let creation_only_functions_path = creation_only_out.join("export/00_BOOT/functions.json");
+    let creation_only_functions = std::fs::read(&creation_only_functions_path).unwrap();
+    let creation_only_functions_blake3 =
+        blake3::hash(&creation_only_functions).to_hex().to_string();
+    let retained_functions_blake3 = written["functions_blake3"].as_str().unwrap();
+    let retained_hash_field = format!("\"functions_blake3\": \"{retained_functions_blake3}\"");
+    assert_eq!(map_text.matches(&retained_hash_field).count(), 1);
+    let creation_only_map = map_text.replacen(
+        &retained_hash_field,
+        &format!("\"functions_blake3\": \"{creation_only_functions_blake3}\""),
+        1,
+    );
+    let executions_start = creation_only_map.find("  \"executions\": [").unwrap();
+    let creations_start = creation_only_map.find("  \"creations\": [").unwrap();
+    assert!(executions_start < creations_start);
+    let creation_only_map = format!(
+        "{}  \"executions\": [],\n  \"symbols\": [],\n{}",
+        &creation_only_map[..executions_start],
+        &creation_only_map[creations_start..],
+    );
+    let creation_only_maps_dir = creation_only_out.join("symbol_maps");
+    std::fs::create_dir_all(&creation_only_maps_dir).unwrap();
+    let creation_only_map_path = creation_only_maps_dir.join("00_BOOT-creation-only.json");
+    let creation_only_map_bytes = creation_only_map.into_bytes();
+    std::fs::write(&creation_only_map_path, &creation_only_map_bytes).unwrap();
+    let creation_only_symbol_map = pixel_modem_extractor::decompile::PreparedSymbolPass2Map::new(
+        &creation_only_map_path,
+        &creation_only_functions_path,
+        &boot_dir.join("00_BOOT.bin"),
+        "00_BOOT",
+        0,
+        0,
+        bundle.map.creation_requests.clone(),
+    )
+    .unwrap();
+    assert_eq!(creation_only_symbol_map.execution_count(), 0);
+    assert_eq!(creation_only_symbol_map.applied_decision_count(), 0);
+    assert_eq!(creation_only_symbol_map.creation_count(), 3);
+
+    let collision_names = bundle
+        .map
+        .creation_requests
+        .iter()
+        .map(|request| format!("\"{}\"", request.final_primary))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let seed_creation_only = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.SourceType;
+import java.util.ArrayList;
+import java.util.List;
+
+public class SeedCreationOnlyCollisionProject extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        FunctionManager functions = currentProgram.getFunctionManager();
+        List<Address> entries = new ArrayList<Address>();
+        FunctionIterator current = functions.getFunctions(true);
+        while (current.hasNext()) {
+            entries.add(current.next().getEntryPoint());
+        }
+        for (Address entry : entries) {
+            if (!functions.removeFunction(entry)) {
+                throw new AssertionError("could not remove function at " + entry);
+            }
+        }
+        if (functions.getFunctionCount() != 0) {
+            throw new AssertionError("saved project still has functions");
+        }
+        String[] names = new String[] { __COLLISION_NAMES__ };
+        long[] addresses = new long[] { 0x28L, 0x2aL, 0x2cL };
+        if (names.length != addresses.length) {
+            throw new AssertionError("creation collision fixture count changed");
+        }
+        for (int index = 0; index < names.length; index++) {
+            currentProgram.getSymbolTable().createLabel(toAddr(addresses[index]), names[index],
+                    SourceType.USER_DEFINED);
+        }
+        System.out.println("SeedCreationOnlyCollisionProject: ready");
+    }
+}
+"#
+    .replace("__COLLISION_NAMES__", &collision_names);
+    std::fs::write(
+        creation_only_out.join("scripts/SeedCreationOnlyCollisionProject.java"),
+        seed_creation_only,
+    )
+    .unwrap();
+    let creation_only_seeded = inspect_saved_project(
+        &home,
+        &creation_only_out,
+        "00_BOOT",
+        "SeedCreationOnlyCollisionProject.java",
+    );
+    let creation_only_seed_diagnostics = process_diagnostics(&creation_only_seeded);
+    let creation_only_seed_stdout = String::from_utf8_lossy(&creation_only_seeded.stdout);
+    assert!(
+        creation_only_seeded.status.success()
+            && creation_only_seed_stdout
+                .lines()
+                .any(|line| line == "SeedCreationOnlyCollisionProject: ready"),
+        "creation-only project seeding did not complete:\n{creation_only_seed_diagnostics}"
+    );
+
+    let creation_only_root = std::fs::canonicalize(&creation_only_out).unwrap();
+    let creation_only_config = creation_only_out.join("ghidra_config");
+    let creation_only_cache = creation_only_out.join("ghidra_cache");
+    let creation_only_temp = creation_only_out.join("ghidra_tmp");
+    let creation_only_java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        creation_only_config.display(),
+        creation_only_cache.display(),
+        creation_only_temp.display(),
+        creation_only_temp.display()
+    );
+    let creation_only_attempt = std::process::Command::new(
+        analyze_headless_in_home(&home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(creation_only_out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .arg("-process")
+    .arg("00_BOOT")
+    .arg("-noanalysis")
+    .arg("-scriptPath")
+    .arg(creation_only_out.join("scripts"))
+    .arg("-postScript")
+    .arg("ApplyThumbNames.java")
+    .arg("00_BOOT")
+    .arg(creation_only_symbol_map.image_blake3())
+    .arg(creation_only_symbol_map.path())
+    .arg(creation_only_symbol_map.map_blake3())
+    .arg("-postScript")
+    .arg("ApplySymbols.java")
+    .arg(&creation_only_root)
+    .arg("00_BOOT")
+    .arg(creation_only_symbol_map.image_blake3())
+    .arg("none")
+    .arg("-")
+    .arg("-")
+    .arg(&creation_only_functions_path)
+    .arg(creation_only_symbol_map.functions_blake3())
+    .arg(creation_only_symbol_map.path())
+    .arg(creation_only_symbol_map.map_blake3())
+    .arg("-postScript")
+    .arg("ExportDecomp.java")
+    .arg(creation_only_out.join("export/00_BOOT"))
+    .arg(&creation_only_root)
+    .arg("00_BOOT")
+    .arg("none")
+    .arg("-")
+    .arg("-")
+    .arg(creation_only_symbol_map.path())
+    .arg(creation_only_symbol_map.map_blake3())
+    .env("XDG_CONFIG_HOME", creation_only_config)
+    .env("XDG_CACHE_HOME", creation_only_cache)
+    .env("GHIDRA_HEADLESS_JAVA_OPTIONS", creation_only_java_options)
+    .output()
+    .unwrap();
+    let creation_only_diagnostics = process_diagnostics(&creation_only_attempt);
+    assert!(
+        creation_only_attempt.status.success(),
+        "creation-only pass 2 failed:\n{creation_only_diagnostics}"
+    );
+    let creation_only_stdout = String::from_utf8_lossy(&creation_only_attempt.stdout);
+    let creation_only_summary: serde_json::Value = creation_only_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("ApplyThumbNames: "))
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .unwrap_or_else(|| {
+            panic!("creation-only pass 2 emitted no Thumb summary:\n{creation_only_diagnostics}")
+        });
     assert_eq!(
-        written["executions"].as_array().map(Vec::len),
-        Some(bundle.map.execution_count),
-        "the written map must carry the measured execution count"
+        creation_only_summary,
+        serde_json::json!({
+            "image": "00_BOOT",
+            "status": "ok",
+            "candidates": 3,
+            "created": 0,
+            "reapplied": 0,
+            "skipped_existing": 0,
+            "skipped_collision": 3,
+        }),
+        "creation-only runtime classification changed:\n{creation_only_diagnostics}"
+    );
+    let creation_only_export = creation_only_out.join("export/00_BOOT");
+    assert_eq!(
+        std::fs::read(creation_only_out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
+            creation_only_symbol_map.map_blake3(),
+        ),
+        "creation-only export marker did not bind the strict-v3 map"
+    );
+    let creation_only_functions: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(creation_only_export.join("functions.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        creation_only_functions.as_array().unwrap().is_empty(),
+        "map-authenticated pass 2 inserted an unowned fallback function:\n{creation_only_functions}"
     );
 
     let global_map_path = maps_dir.join("00_BOOT-globals.json");
@@ -2214,6 +2529,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
                 "00_BOOT",
                 &map_path,
                 bundle.map.execution_count,
+                bundle.map.creation_requests.clone(),
             )),
             global_map: Some(prepared_pass2_map(&global_map_path, 2)),
             global_types_map: None,
@@ -2221,8 +2537,239 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         },
     )]);
 
-    // Pass 2: pass pass1_report in (do NOT re-run pass 1).
-    let rep2 = pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &inputs)
+    let apply_thumb_path = out.join("scripts/ApplyThumbNames.java");
+    let apply_thumb_source = std::fs::read_to_string(&apply_thumb_path).unwrap();
+    let thumb_apply_args = vec![
+        "00_BOOT".to_string(),
+        symbol_map.image_blake3().to_string(),
+        symbol_map.path().to_string_lossy().into_owned(),
+        symbol_map.map_blake3().to_string(),
+    ];
+    let rollback_probe = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.listing.Program;
+import ghidra.program.model.util.StringPropertyMap;
+import java.math.BigInteger;
+
+public class ProbeThumbCreationRollback extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        for (long raw = 0x24; raw <= 0x27; raw++) {
+            Address address = toAddr(raw);
+            if (currentProgram.getFunctionManager().getFunctionContaining(address) != null) {
+                throw new AssertionError("the failed creation left a function at "
+                        + address);
+            }
+            if (currentProgram.getListing().getInstructionContaining(address) != null) {
+                throw new AssertionError("the failed creation left an instruction at "
+                        + address);
+            }
+            RegisterValue value = currentProgram.getProgramContext()
+                    .getRegisterValue(tMode, address);
+            if (value != null && value.hasValue()
+                    && BigInteger.ONE.equals(value.getUnsignedValue())) {
+                throw new AssertionError("the failed creation left Thumb context at "
+                        + address);
+            }
+        }
+        StringPropertyMap ownership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ThumbNames.v1.Ownership");
+        if (ownership != null) {
+            throw new AssertionError("the failed creation left an ownership property map");
+        }
+        if (currentProgram.getOptions(Program.PROGRAM_INFO)
+                .getString("PixelModemExtractor.SymbolPass2", null) != null) {
+            throw new AssertionError("ApplySymbols ran before creation preflight completed");
+        }
+        System.out.println("ProbeThumbCreationRollback: clean");
+    }
+}
+"#;
+    std::fs::write(
+        out.join("scripts/ProbeThumbCreationRollback.java"),
+        rollback_probe,
+    )
+    .unwrap();
+
+    // Expiry while the ownership value is finalized must remain bound to the
+    // original per-entry mutation monitor. The helper computes the digest,
+    // emits an exact marker, then sleeps beyond this command's positive entry
+    // budget; accepting the returned value would incorrectly reset the clock
+    // at postflight.
+    let pal_support_path = out.join("scripts/PalTasksSupport.java");
+    let pal_support_source = std::fs::read_to_string(&pal_support_path).unwrap();
+    let ownership_value_site = concat!(
+        "        return \"v1:\" + map.mapBlake3 + \":\" + creation.executionBlake3 + \":\"\n",
+        "                + function.getID() + \":\" + function.getSymbol().getID() + \":\"\n",
+        "                + currentExecutionDigest(function.getProgram(), monitor, function);\n",
+    );
+    assert_eq!(pal_support_source.matches(ownership_value_site).count(), 1);
+    let ownership_value_fault = concat!(
+        "        String value = \"v1:\" + map.mapBlake3 + \":\" + creation.executionBlake3 + \":\"\n",
+        "                + function.getID() + \":\" + function.getSymbol().getID() + \":\"\n",
+        "                + currentExecutionDigest(function.getProgram(), monitor, function);\n",
+        "        System.out.println(\"ThumbCreationOwnershipDeadlineFault: hashed\");\n",
+        "        long budget = Long.parseLong(\n",
+        "                System.getenv(\"PME_THUMB_CREATE_ENTRY_BUDGET_MS\"));\n",
+        "        Thread.sleep(Math.addExact(budget, 100L));\n",
+        "        return value;\n",
+    );
+    std::fs::write(
+        &pal_support_path,
+        pal_support_source.replace(ownership_value_site, ownership_value_fault),
+    )
+    .unwrap();
+    let ownership_deadline_attempt = inspect_saved_project_with_args_and_env(
+        &home,
+        &out,
+        "00_BOOT",
+        "ApplyThumbNames.java",
+        &thumb_apply_args,
+        &[("PME_THUMB_CREATE_ENTRY_BUDGET_MS", "1000")],
+    );
+    let ownership_deadline_diagnostics = process_diagnostics(&ownership_deadline_attempt);
+    let ownership_deadline_stdout = String::from_utf8_lossy(&ownership_deadline_attempt.stdout);
+    assert!(
+        ownership_deadline_stdout
+            .lines()
+            .any(|line| line == "ThumbCreationOwnershipDeadlineFault: hashed"),
+        "ownership deadline fault did not finish hashing:\n{ownership_deadline_diagnostics}"
+    );
+    assert!(
+        ownership_deadline_diagnostics
+            .contains("the per-entry ApplyThumbNames ownership budget was exhausted at 00000024"),
+        "the expired ownership monitor was accepted:\n{ownership_deadline_diagnostics}"
+    );
+    assert!(
+        !ownership_deadline_stdout
+            .lines()
+            .any(|line| line.starts_with("ApplyThumbNames: {")),
+        "an expired ownership monitor emitted a success summary:\n{ownership_deadline_diagnostics}"
+    );
+    let ownership_deadline_rolled_back =
+        inspect_saved_project(&home, &out, "00_BOOT", "ProbeThumbCreationRollback.java");
+    let ownership_rollback_diagnostics = process_diagnostics(&ownership_deadline_rolled_back);
+    let ownership_rollback_stdout = String::from_utf8_lossy(&ownership_deadline_rolled_back.stdout);
+    assert!(
+        ownership_deadline_rolled_back.status.success()
+            && ownership_rollback_stdout
+                .lines()
+                .any(|line| line == "ProbeThumbCreationRollback: clean"),
+        "ownership deadline left pass-2 creation residue:\n{ownership_rollback_diagnostics}"
+    );
+    std::fs::write(&pal_support_path, &pal_support_source).unwrap();
+
+    // Expiry after postflight and conservation must still enter the mutation
+    // catch, reverse the journal, and abort the saved-project transaction.
+    let deadline_fault_site = concat!(
+        "            if (classified != map.creations.size()) {\n",
+        "                fail(\"the ApplyThumbNames classification did not conserve candidates\");\n",
+        "            }\n",
+    );
+    assert_eq!(apply_thumb_source.matches(deadline_fault_site).count(), 1);
+    let deadline_fault = format!(
+        r#"{deadline_fault_site}            System.out.println("ApplyThumbNamesDeadlineFault: reached");
+            while (System.currentTimeMillis() <= phaseDeadline) {{
+                Thread.sleep(1L);
+            }}
+"#
+    );
+    std::fs::write(
+        &apply_thumb_path,
+        apply_thumb_source.replace(deadline_fault_site, &deadline_fault),
+    )
+    .unwrap();
+    let deadline_attempt = inspect_saved_project_with_args_and_env(
+        &home,
+        &out,
+        "00_BOOT",
+        "ApplyThumbNames.java",
+        &thumb_apply_args,
+        &[("PME_THUMB_CREATE_PHASE_BUDGET_MS", "5000")],
+    );
+    let deadline_diagnostics = process_diagnostics(&deadline_attempt);
+    let deadline_stdout = String::from_utf8_lossy(&deadline_attempt.stdout);
+    assert!(
+        deadline_stdout
+            .lines()
+            .any(|line| line == "ApplyThumbNamesDeadlineFault: reached"),
+        "deadline fault did not reach the final phase gate:\n{deadline_diagnostics}"
+    );
+    assert!(
+        !deadline_stdout
+            .lines()
+            .any(|line| line.starts_with("ApplyThumbNames: {")),
+        "an expired creation phase emitted a success summary:\n{deadline_diagnostics}"
+    );
+    assert!(
+        deadline_diagnostics.contains("the ApplyThumbNames phase budget was exhausted before"),
+        "the deadline attempt failed for the wrong reason:\n{deadline_diagnostics}"
+    );
+    let deadline_rolled_back =
+        inspect_saved_project(&home, &out, "00_BOOT", "ProbeThumbCreationRollback.java");
+    let deadline_rollback_diagnostics = process_diagnostics(&deadline_rolled_back);
+    let deadline_rollback_stdout = String::from_utf8_lossy(&deadline_rolled_back.stdout);
+    assert!(
+        deadline_rolled_back.status.success(),
+        "deadline expiry left pass-2 creation residue:\n{deadline_rollback_diagnostics}"
+    );
+    assert!(
+        deadline_rollback_stdout
+            .lines()
+            .any(|line| line == "ProbeThumbCreationRollback: clean"),
+        "deadline rollback probe did not complete cleanly:\n{deadline_rollback_diagnostics}"
+    );
+    std::fs::write(&apply_thumb_path, &apply_thumb_source).unwrap();
+
+    // A deterministic failure after the first creation must roll the whole
+    // script transaction back before the successful pass-2 attempt.
+    let fault_site = "                created++;\n";
+    assert_eq!(apply_thumb_source.matches(fault_site).count(), 1);
+    std::fs::write(
+        &apply_thumb_path,
+        apply_thumb_source.replace(
+            fault_site,
+            "                created++;\n                throw new RuntimeException(\"injected post-create rollback\");\n",
+        ),
+    )
+    .unwrap();
+    let mut fault_inputs = inputs.clone();
+    fault_inputs.get_mut("00_BOOT").unwrap().global_map = None;
+    let failed_attempt =
+        pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &fault_inputs)
+            .unwrap()
+            .report;
+    let failed_boot = failed_attempt
+        .images
+        .iter()
+        .find(|result| result.label == "00_BOOT")
+        .unwrap();
+    assert!(
+        failed_boot.pass2_error.is_some(),
+        "injected rollback fault unexpectedly produced a current export"
+    );
+    let rolled_back =
+        inspect_saved_project(&home, &out, "00_BOOT", "ProbeThumbCreationRollback.java");
+    let rollback_diagnostics = process_diagnostics(&rolled_back);
+    let rollback_stdout = String::from_utf8_lossy(&rolled_back.stdout);
+    assert!(
+        rolled_back.status.success(),
+        "creation rollback probe failed:\n{rollback_diagnostics}"
+    );
+    assert!(
+        rollback_stdout
+            .lines()
+            .any(|line| line == "ProbeThumbCreationRollback: clean"),
+        "creation rollback probe did not complete cleanly:\n{rollback_diagnostics}"
+    );
+    std::fs::write(&apply_thumb_path, apply_thumb_source).unwrap();
+
+    // Pass 2: pass the failed attempt's report in (do NOT re-run pass 1).
+    let rep2 = pixel_modem_extractor::decompile::run_two_pass(failed_attempt, &opts, &out, &inputs)
         .unwrap()
         .report;
     let exp = out.join("export").join("00_BOOT");
@@ -2248,6 +2795,20 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     );
     assert_eq!(boot.globals_applied, Some(1));
     assert_eq!(boot.globals_apply_skipped, Some(1));
+    // The named thumb-only record (token evidence on an entry Ghidra never
+    // discovered) must be carved and named in this same pass-2 process.
+    assert_eq!(
+        boot.pass2_thumb_names,
+        Some(pixel_modem_extractor::decompile::AppliedThumbNames {
+            candidates: 3,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 1,
+            skipped_collision: 1,
+        }),
+        "ApplyThumbNames summary: {:?}",
+        boot.pass2_error
+    );
     assert!(
         boot.globals_apply_error.is_none(),
         "globals_apply_error: {:?}",
@@ -2260,7 +2821,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         "the imported vector primary must survive pass 2:\n{c}"
     );
     assert!(
-        !c.contains("guess_boot_reset_handler"),
+        !c.contains("guess_boot_reset_handler_00000000"),
         "a guess name displaced a protected imported primary:\n{c}"
     );
     let annotation = "logs: \"reset handler (%d)\" [BOOT]";
@@ -2287,12 +2848,17 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     let property_probe = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.util.StringPropertyMap;
 
 public class ProbeProperty extends GhidraScript {
     @Override
     public void run() throws Exception {
         System.out.println("ProbeProperty: " + currentProgram.getOptions(Program.PROGRAM_INFO)
                 .getString("PixelModemExtractor.SymbolPass2", null));
+        StringPropertyMap ownership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ThumbNames.v1.Ownership");
+        System.out.println("ProbeThumbOwnership: "
+                + (ownership == null ? null : ownership.getString(toAddr(0x24))));
     }
 }
 "#;
@@ -2315,6 +2881,28 @@ public class ProbeProperty extends GhidraScript {
         symbol_map.pass2_property(),
         "the SymbolPass2 property must bind the map, functions hash, and count"
     );
+    let reported_ownership = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("ProbeThumbOwnership: "))
+        .unwrap_or_else(|| panic!("no ownership line:\n{stdout}"))
+        .trim_end_matches(" (GhidraScript)");
+    let ownership_parts = reported_ownership.split(':').collect::<Vec<_>>();
+    assert_eq!(ownership_parts.len(), 6, "ownership grammar");
+    assert_eq!(ownership_parts[0], "v1");
+    assert_eq!(ownership_parts[1], symbol_map.map_blake3());
+    assert_eq!(ownership_parts[2], created_execution_blake3);
+    assert!(ownership_parts[3].parse::<u64>().is_ok(), "function ID");
+    assert!(
+        ownership_parts[4].parse::<u64>().is_ok(),
+        "primary symbol ID"
+    );
+    assert!(
+        ownership_parts[5].len() == 64
+            && ownership_parts[5]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "Ghidra execution digest"
+    );
 
     // The export's mandatory execution projections are unchanged from pass 1
     // and the retained Thumb sidecar is preserved byte-for-byte.
@@ -2322,6 +2910,16 @@ public class ProbeProperty extends GhidraScript {
         serde_json::from_slice(&std::fs::read(exp.join("functions.json")).unwrap()).unwrap();
     for function in final_functions.as_array().unwrap() {
         let entry = function["entry"].as_str().unwrap();
+        // The carved creation has no pass-1 projection; every pass-1 record
+        // must keep its exact projection.
+        if entry == "0x24" {
+            assert_eq!(
+                function["name"], "guess_boot_reset_handler_d_00000024",
+                "the created function must carry its token name"
+            );
+            assert_eq!(function["primary_source"], "analysis");
+            continue;
+        }
         assert_eq!(
             serde_json::json!({
                 "decode_ranges": function["decode_ranges"],
@@ -2331,6 +2929,87 @@ public class ProbeProperty extends GhidraScript {
             "pass 2 changed mandatory execution projection for {entry}"
         );
     }
+    assert!(
+        final_functions
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|function| function["entry"] != "0x26" && function["entry"] != "0x30"),
+        "runtime skips must not create overlapping or colliding functions"
+    );
+    let probe_skips = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.util.StringPropertyMap;
+import java.math.BigInteger;
+
+public class ProbeThumbCreationSkips extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        StringPropertyMap ownership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ThumbNames.v1.Ownership");
+        long[][] ranges = new long[][] { { 0x26L, 0x27L }, { 0x30L, 0x31L } };
+        for (long[] range : ranges) {
+            Address entry = toAddr(range[0]);
+            boolean acceptedOverlap = range[0] == 0x26L;
+            if (currentProgram.getFunctionManager().getFunctionAt(entry) != null) {
+                throw new AssertionError("a skipped creation left a function at " + entry);
+            }
+            Function containing =
+                    currentProgram.getFunctionManager().getFunctionContaining(entry);
+            if (acceptedOverlap
+                    ? containing == null || !containing.getEntryPoint().equals(toAddr(0x24))
+                    : containing != null) {
+                throw new AssertionError("a skipped creation changed containing-function state at "
+                        + entry);
+            }
+            if (ownership != null && ownership.getString(entry) != null) {
+                throw new AssertionError("a skipped creation left ownership at " + entry);
+            }
+            for (long raw = range[0]; raw <= range[1]; raw++) {
+                Address address = toAddr(raw);
+                boolean hasInstruction =
+                        currentProgram.getListing().getInstructionContaining(address) != null;
+                if (hasInstruction != acceptedOverlap) {
+                    throw new AssertionError("a skipped creation changed instruction state at "
+                            + address);
+                }
+                RegisterValue value = currentProgram.getProgramContext()
+                        .getRegisterValue(tMode, address);
+                boolean isThumb = value != null && value.hasValue()
+                        && BigInteger.ONE.equals(value.getUnsignedValue());
+                if (isThumb != acceptedOverlap) {
+                    throw new AssertionError("a skipped creation changed TMode state at "
+                            + address);
+                }
+            }
+        }
+        System.out.println("ProbeThumbCreationSkips: clean");
+    }
+}
+"#;
+    std::fs::write(
+        out.join("scripts/ProbeThumbCreationSkips.java"),
+        probe_skips,
+    )
+    .unwrap();
+    let probed = inspect_saved_project(&home, &out, "00_BOOT", "ProbeThumbCreationSkips.java");
+    let probe_diagnostics = process_diagnostics(&probed);
+    let probe_stdout = String::from_utf8_lossy(&probed.stdout);
+    assert!(
+        probed.status.success(),
+        "creation-skip probe failed:\n{probe_diagnostics}"
+    );
+    assert!(
+        probe_stdout
+            .lines()
+            .any(|line| line == "ProbeThumbCreationSkips: clean"),
+        "creation-skip probe did not complete cleanly:\n{probe_diagnostics}"
+    );
     assert_eq!(
         std::fs::read(exp.join("thumb_functions.json")).unwrap(),
         retained_thumb,
@@ -2347,6 +3026,7 @@ public class ProbeProperty extends GhidraScript {
                 "00_BOOT",
                 &map_path,
                 bundle.map.execution_count,
+                bundle.map.creation_requests.clone(),
             )),
             global_map: None,
             global_types_map: None,
@@ -2358,9 +3038,190 @@ public class ProbeProperty extends GhidraScript {
         .report;
     let boot = replay.images.iter().find(|r| r.label == "00_BOOT").unwrap();
     assert_eq!(boot.pass2_applied, Some(0), "{:?}", boot.pass2_error);
+    assert_eq!(
+        boot.pass2_thumb_names,
+        Some(pixel_modem_extractor::decompile::AppliedThumbNames {
+            candidates: 3,
+            created: 0,
+            reapplied: 1,
+            skipped_existing: 1,
+            skipped_collision: 1,
+        })
+    );
     assert!(boot.pass2_error.is_none());
     let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
     assert!(c.contains("Reset"));
+
+    // Current program bytes, not map text alone, authenticate a creation.
+    let mutate_creation = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+
+public class MutateThumbCreation extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        currentProgram.getListing().clearCodeUnits(toAddr(0x24), toAddr(0x25), false);
+        currentProgram.getMemory().setByte(toAddr(0x24), (byte) 0x81);
+        System.out.println("MutateThumbCreation: "
+                + Integer.toHexString(currentProgram.getMemory().getByte(toAddr(0x24)) & 0xff));
+    }
+}
+"#;
+    std::fs::write(
+        out.join("scripts/MutateThumbCreation.java"),
+        mutate_creation,
+    )
+    .unwrap();
+    let mutated = inspect_saved_project(&home, &out, "00_BOOT", "MutateThumbCreation.java");
+    assert!(
+        mutated.status.success(),
+        "creation byte mutation failed:\n{}",
+        process_diagnostics(&mutated)
+    );
+    assert!(
+        String::from_utf8_lossy(&mutated.stdout).contains("MutateThumbCreation: 81"),
+        "creation byte mutation did not persist in-process:\n{}",
+        process_diagnostics(&mutated)
+    );
+    let rejected_bytes = inspect_saved_project_with_args(
+        &home,
+        &out,
+        "00_BOOT",
+        "ApplyThumbNames.java",
+        &thumb_apply_args,
+    );
+    let diagnostics = process_diagnostics(&rejected_bytes);
+    assert!(
+        diagnostics.contains("creation decode range BLAKE3 changed"),
+        "mutated creation bytes were not rejected:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("ApplyThumbNames: {"),
+        "a rejected byte identity emitted a success summary:\n{diagnostics}"
+    );
+
+    // Repair the externally-mutated byte, then remove only the ownership
+    // record. An exact current name/source without that binding is not replay.
+    let remove_ownership = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class RemoveThumbCreationOwnership extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        currentProgram.getListing().clearCodeUnits(toAddr(0x24), toAddr(0x25), false);
+        currentProgram.getMemory().setByte(toAddr(0x24), (byte) 0x80);
+        StringPropertyMap ownership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ThumbNames.v1.Ownership");
+        if (ownership == null || !ownership.remove(toAddr(0x24))) {
+            throw new AssertionError("the creation ownership was not present");
+        }
+    }
+}
+"#;
+    std::fs::write(
+        out.join("scripts/RemoveThumbCreationOwnership.java"),
+        remove_ownership,
+    )
+    .unwrap();
+    let removed =
+        inspect_saved_project(&home, &out, "00_BOOT", "RemoveThumbCreationOwnership.java");
+    assert!(
+        removed.status.success(),
+        "ownership removal failed:\n{}",
+        process_diagnostics(&removed)
+    );
+    let rejected_unowned = inspect_saved_project_with_args(
+        &home,
+        &out,
+        "00_BOOT",
+        "ApplyThumbNames.java",
+        &thumb_apply_args,
+    );
+    let diagnostics = process_diagnostics(&rejected_unowned);
+    assert!(
+        diagnostics.contains("exact Thumb creation replay lacks ownership"),
+        "unowned exact replay was not rejected:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("ApplyThumbNames: {"),
+        "an unowned replay emitted a success summary:\n{diagnostics}"
+    );
+
+    // Restoring the old registry bytes cannot bless a replacement function:
+    // concrete function and primary-symbol IDs are part of ownership.
+    let replace_creation = r#"//@category PixelModemTest
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class ReplaceThumbCreation extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1) {
+            throw new AssertionError("expected the prior ownership value");
+        }
+        Address entry = toAddr(0x24);
+        StringPropertyMap ownership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ThumbNames.v1.Ownership");
+        ownership.add(entry, args[0]);
+        currentProgram.getFunctionManager().removeFunction(entry);
+        currentProgram.getListing().clearCodeUnits(entry, toAddr(0x27), false);
+        AddressSet authenticated = new AddressSet(entry, toAddr(0x27));
+        DisassembleCommand disassemble = new DisassembleCommand(entry, authenticated, true);
+        disassemble.enableCodeAnalysis(false);
+        if (!disassemble.applyTo(currentProgram, monitor)) {
+            throw new AssertionError("replacement disassembly failed");
+        }
+        CreateFunctionCmd create = new CreateFunctionCmd(null, entry,
+                disassemble.getDisassembledAddressSet(), SourceType.ANALYSIS);
+        if (!create.applyTo(currentProgram, monitor)) {
+            throw new AssertionError("replacement function creation failed");
+        }
+        Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+        function.setName("guess_boot_reset_handler_d_00000024", SourceType.ANALYSIS);
+        System.out.println("ReplaceThumbCreation: replaced");
+    }
+}
+"#;
+    std::fs::write(
+        out.join("scripts/ReplaceThumbCreation.java"),
+        replace_creation,
+    )
+    .unwrap();
+    let replaced = inspect_saved_project_with_args(
+        &home,
+        &out,
+        "00_BOOT",
+        "ReplaceThumbCreation.java",
+        &[reported_ownership.to_string()],
+    );
+    assert!(
+        String::from_utf8_lossy(&replaced.stdout).contains("ReplaceThumbCreation: replaced"),
+        "creation replacement failed:\n{}",
+        process_diagnostics(&replaced)
+    );
+    let rejected_replacement = inspect_saved_project_with_args(
+        &home,
+        &out,
+        "00_BOOT",
+        "ApplyThumbNames.java",
+        &thumb_apply_args,
+    );
+    let diagnostics = process_diagnostics(&rejected_replacement);
+    assert!(
+        diagnostics.contains("owned Thumb creation identity changed"),
+        "replacement function inherited ownership:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("ApplyThumbNames: {"),
+        "a replacement function emitted a replay summary:\n{diagnostics}"
+    );
 
     // --- Second kit: the ApplyGlobals ownership battery without a function
     // map (the SymbolPass2 property of the first kit would reject a
@@ -2751,7 +3612,7 @@ fn run_report_skips_opaque_image_without_spawning_ghidra() {
 /// Drives `PalTasksSupport` inside real Ghidra against the canonical
 /// fixture kit and malformed variants: digest vectors, strict parsing,
 /// path containment, raw/scatter byte tampering, storage/task/application
-/// partition rejections, the v2 symbol-map reader, and the applied-state
+/// partition rejections, the v3 symbol-map reader, and the applied-state
 /// registry lifecycle (absence, application, identity-only, corruptions).
 const PAL_SUPPORT_PROBE_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
@@ -3353,7 +4214,7 @@ fn pal_support_strict_parsers_registry_and_digests() {
         std::fs::write(case_dir.join("expected.txt"), "escapes the import-kit root").unwrap();
     }
 
-    // The strict v2 symbol-map fixtures.
+    // The strict v3 symbol-map fixtures.
     let functions_bytes = b"[{\"name\": \"FUN_40010400\"}]\n".as_slice();
     let functions_hash = pal_fixture::blake3_hex(functions_bytes);
     std::fs::write(case_root.join("functions.json"), functions_bytes).unwrap();
@@ -3367,8 +4228,8 @@ fn pal_support_strict_parsers_registry_and_digests() {
     std::fs::write(case_root.join("symbol_map.json"), &symbol_map).unwrap();
     let bad_symbol_map = replace_once(
         &symbol_map,
-        "\"format\": \"pixel-modem-extractor-symbol-map-v2\",",
-        "\"format\": \"pixel-modem-extractor-symbol-map-v2\",\n  \"unexpected\": true,",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v3\",",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v3\",\n  \"unexpected\": true,",
     );
     std::fs::write(case_root.join("symbol_map_bad.json"), &bad_symbol_map).unwrap();
 
@@ -4379,7 +5240,10 @@ fn apply_pal_tasks_rejects_entry_timeout_and_rolls_back() {
         "timeout",
         None,
         &[
-            ("PER_ENTRY_BUDGET_MS = 30_000L", "PER_ENTRY_BUDGET_MS = 1L"),
+            (
+                "budgetOverride(\"PME_PAL_ENTRY_BUDGET_MS\", 30_000L)",
+                "budgetOverride(\"PME_PAL_ENTRY_BUDGET_MS\", 1L)",
+            ),
             (
                 "TimeoutTaskMonitor entryMonitor = newEntryMonitor(remainingPhaseMs);",
                 concat!(
@@ -5591,7 +6455,10 @@ fn datamark_rejects_deadline_and_rolls_back() {
         &home,
         "deadline",
         &[
-            ("PHASE_BUDGET_MS = 15 * 60_000L", "PHASE_BUDGET_MS = 1L"),
+            (
+                "budgetMsOverride(\"PME_TAME_PHASE_BUDGET_MS\", 15 * 60_000L)",
+                "budgetMsOverride(\"PME_TAME_PHASE_BUDGET_MS\", 1L)",
+            ),
             ("planGaps();", "Thread.sleep(50);\n            planGaps();"),
         ],
         "the TameAnalysis phase budget was exhausted",
@@ -5615,12 +6482,98 @@ fn datamark_rejects_aggregate_limit_and_rolls_back() {
     );
 }
 
+/// Removing the deadline gate after the final decompiler call and before its
+/// temporary is published lets an expired export write a current completion
+/// marker. The one-function fixture makes that final-operation boundary exact.
+#[test]
+fn export_rejects_deadline_expiry_after_final_decompile_operation() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+    let kit = generate_tame_kit(&home, "export_final_deadline");
+    let seeded = tame_import(&home, &kit, true);
+    assert!(
+        seeded.contains("TameSeed: ok"),
+        "seed run failed:\n{seeded}"
+    );
+
+    let script_path = kit.out.join("scripts/ExportDecomp.java");
+    let script = std::fs::read_to_string(&script_path).unwrap();
+    let final_operation = concat!(
+        "                if (res != null && res.decompileCompleted() ",
+        "&& res.getDecompiledFunction() != null) {\n",
+    );
+    assert_eq!(script.matches(final_operation).count(), 1);
+    let deadline_fault = concat!(
+        "                System.out.println(\"ExportDecompFinalOperationDeadlineFault: expired\");\n",
+        "                deadline = System.currentTimeMillis();\n",
+        "                if (res != null && res.decompileCompleted() ",
+        "&& res.getDecompiledFunction() != null) {\n",
+    );
+    std::fs::write(
+        &script_path,
+        script.replacen(final_operation, deadline_fault, 1),
+    )
+    .unwrap();
+
+    let root = std::fs::canonicalize(&kit.out).unwrap();
+    let completion = kit.out.join("export/00_BOOT.complete");
+    assert!(
+        !completion.exists(),
+        "fixture started with a completion marker"
+    );
+    let args: Vec<String> = [
+        "-process".to_string(),
+        "00_BOOT".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+        kit.out
+            .join("export/00_BOOT")
+            .to_string_lossy()
+            .into_owned(),
+        root.to_string_lossy().into_owned(),
+        "00_BOOT".to_string(),
+        "none".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        "none".to_string(),
+    ]
+    .into();
+    let diagnostics = tame_stdout(&tame_headless(&home, &kit, &args));
+    assert!(
+        diagnostics
+            .lines()
+            .any(|line| line == "ExportDecompFinalOperationDeadlineFault: expired"),
+        "deadline fault did not return from the final decompiler call:\n{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("REPORT SCRIPT ERROR")
+            && diagnostics.contains("the export verification deadline was exhausted"),
+        "the expired final operation was accepted:\n{diagnostics}"
+    );
+    assert!(
+        !kit.out.join("export/00_BOOT/decompiled.c").exists(),
+        "the expired final operation published decompiled.c"
+    );
+    assert!(
+        !completion.exists(),
+        "the expired final operation published a current completion marker"
+    );
+
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
 // -------------------------------------------------------------------------
 // Task 11: authenticated symbol pass 2 and export cutover
 // -------------------------------------------------------------------------
 
 /// The canonical pass-2 kit state: PAL applied, pass-1 export produced, and
-/// the strict v2 map built from the retained tree with the registration-rank
+/// the strict v3 map built from the retained tree with the registration-rank
 /// rename of the alpha task primary.
 struct Pass2Kit {
     kit: PalApplyKit,
@@ -5636,7 +6589,7 @@ fn blake3_of(path: &std::path::Path) -> String {
     blake3::hash(&std::fs::read(path).unwrap()).to_string()
 }
 
-/// Builds the retained images tree and derives the strict v2 symbol map with
+/// Builds the retained images tree and derives the strict v3 symbol map with
 /// the PAL context from the fixture manifest geometry.
 fn build_pal_pass2_kit(
     home: &std::path::Path,
@@ -6375,7 +7328,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     // The map itself carries the exact PAL binding and the authorized
     // transition on the registration rename.
     let map_text = std::fs::read_to_string(&state.map_path).unwrap();
-    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v2\""));
+    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v3\""));
     assert!(map_text.contains(&format!("\"identity\": \"{}\"", state.kit.identity)));
     assert!(map_text.contains("\"from\": \"pal_owned\""));
     assert!(map_text.contains("\"to\": \"pass2_owned\""));
@@ -6817,9 +7770,9 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     patch_apply_symbols_script(
         &state.kit.out,
         &[(
-            "                    comments++;",
+            "                comments++;",
             concat!(
-                "                    comments++;",
+                "                comments++;",
                 "\n                    if (comments == 1) {",
                 "\n                        throw new IllegalStateException(",
                 "\n                                \"injected pass-2 failure after several mutations\");",

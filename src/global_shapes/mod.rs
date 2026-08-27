@@ -2378,7 +2378,7 @@ mod tests {
             eprintln!("skip: PME_GOLDEN_DIR not found: {}", dir.display());
             return;
         }
-        // Recorded v2-era status split on mustang 02_MAIN (CONTRIBUTING
+        // Recorded v2-era status split on mustang 02_MAIN (AGENTS
         // "Phase 3.2 production baselines"). The current engine is monotone
         // vs v2: `inferred` may only grow out of `no_evidence`; `conflicting`
         // must not increase.

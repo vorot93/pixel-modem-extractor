@@ -55,7 +55,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class TameAnalysis extends HeadlessScript {
-    private static final long PHASE_BUDGET_MS = 15 * 60_000L;
+    private static final long PHASE_BUDGET_MS =
+            PalTasksSupport.budgetMsOverride("PME_TAME_PHASE_BUDGET_MS", 15 * 60_000L);
     private static final int MAX_REGIONS = 4096;
     private static final long MAX_REGION_AGGREGATE_BYTES = 512L * 1024L * 1024L;
     private static final int MAX_STREAM_RECORDS = 1_000_000;

@@ -72,11 +72,36 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 public class ApplyPalTasks extends HeadlessScript {
-    private static final long PER_ENTRY_BUDGET_MS = 30_000L;
-    private static final long PHASE_BUDGET_MS = 15 * 60_000L;
+    // Wall-clock budgets are overridable for acceptance-scale corpora (the
+    // stock Mustang MAIN disassembly at one entry can legitimately exceed
+    // the default 30 s); a malformed or non-positive override fails loudly.
+    private static final long PER_ENTRY_BUDGET_MS =
+            budgetOverride("PME_PAL_ENTRY_BUDGET_MS", 30_000L);
+    private static final long PHASE_BUDGET_MS =
+            budgetOverride("PME_PAL_PHASE_BUDGET_MS", 15 * 60_000L);
     private static final long MAX_NEWLY_DEFINED_BYTES = 64L * 1024L * 1024L;
 
     private static final String ZERO_SCATTER_PREFIX = "SCATTER_ZERO_";
+
+    private static long budgetOverride(String variable, long fallback) {
+        String value = System.getenv(variable);
+        if (value == null) {
+            return fallback;
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        }
+        catch (NumberFormatException error) {
+            throw new IllegalArgumentException(
+                    variable + " is not a whole number of milliseconds: " + value);
+        }
+        if (parsed <= 0) {
+            throw new IllegalArgumentException(
+                    variable + " must be positive: " + value);
+        }
+        return parsed;
+    }
 
     private static void fail(String message) {
         throw new PalTasksSupport.PalError(message);

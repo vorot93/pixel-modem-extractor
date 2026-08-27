@@ -19,9 +19,11 @@
 // compares every current body to the retained pass-1 map exactly (a changed
 // range boundary, ISA, byte, or hash fails). The verification walk runs under
 // one 15-minute deadline and, for a present manifest, a 64-MiB aggregate
-// task-function-body ceiling. Outputs are published atomically (temporary
-// files moved into place) and the exact three-line v3 marker is replaced
-// LAST:
+// task-function-body ceiling. Monitor-aware operations inherit headless
+// cancellation and receive only the remaining deadline; every long operation
+// is checked on return. Outputs are published atomically (temporary files moved
+// into place) only after a direct deadline gate, and the exact three-line v3
+// marker is replaced LAST under the same gate:
 //
 // pixel-modem-extractor-ghidra-export-v3
 // pal_tasks=<identity-or-none>
@@ -44,8 +46,9 @@
 //   - UseHexadecimal: TRUE (default). Display-only; matches disasm.lst.
 //
 // Pass 2 of `decompose` re-runs this script unchanged after the applicable
-// ApplySymbols/ApplyGlobals/ApplyGlobalTypes application — getC() then emits
-// regenerated C with names + plate comments baked in.
+// fixed-order ApplyThumbNames -> ApplySymbols -> ApplyGlobals ->
+// ApplyGlobalTypes application; getC() then emits regenerated C with names +
+// plate comments baked in.
 //@category PixelModem
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -61,6 +64,8 @@ import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.util.StringPropertyMap;
+import ghidra.util.task.TimeoutTaskMonitor;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -73,6 +78,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 
 public class ExportDecomp extends HeadlessScript {
     private static final String COMPLETION_FORMAT = "pixel-modem-extractor-ghidra-export-v3";
@@ -86,6 +92,7 @@ public class ExportDecomp extends HeadlessScript {
 
     private long deadline;
     private long taskBodyBytes;
+    private TimeoutTaskMonitor deadlineTaskMonitor;
 
     @Override
     public void run() throws Exception {
@@ -119,18 +126,22 @@ public class ExportDecomp extends HeadlessScript {
             }
             PalTasksSupport.PalManifest manifest =
                     PalTasksSupport.readPal(canonicalRoot, label, taskManifest, scatterManifest);
+            checkDeadline();
             String identity = PalTasksSupport.expectedPalIdentity(manifest);
             if (!identity.equals(palIdentity)) {
                 fail("the expected PAL identity does not match the manifest");
             }
             PalTasksSupport.validateApplied(currentProgram, manifest, identity);
+            checkDeadline();
             chargeTaskBodies(manifest);
+            checkDeadline();
         }
         else {
             if (taskManifest != null) {
                 fail("identity none requires the literal '-' task manifest");
             }
             PalTasksSupport.validateAbsent(currentProgram);
+            checkDeadline();
         }
 
         // Symbol map / pass-2 property contract.
@@ -152,14 +163,14 @@ public class ExportDecomp extends HeadlessScript {
                 fail("a present symbol map requires its expected BLAKE3");
             }
             map = PalTasksSupport.readSymbolMapForExport(mapFile, mapHash);
+            checkDeadline();
             if (!map.imageLabel.equals(label)) {
                 fail("the symbol map was built for image " + map.imageLabel);
             }
             if (!palIdentity.equals(map.palIdentity)) {
                 fail("the symbol map PAL identity does not match the invocation");
             }
-            String expectedProperty = "v2:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":"
-                    + map.executions.size();
+            String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
             String property = currentProgram.getOptions(
                     ghidra.program.model.listing.Program.PROGRAM_INFO)
                     .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
@@ -168,14 +179,17 @@ public class ExportDecomp extends HeadlessScript {
                         + " but found " + property);
             }
             verifyBodiesAgainstMap(map);
+            checkDeadline();
             symbolMapArgument = map.mapBlake3;
         }
 
         FunctionManager fm = currentProgram.getFunctionManager();
         Listing listing = currentProgram.getListing();
 
-        // Entry-function fallback: a tiny anchorless blob may yield no functions.
-        if (fm.getFunctionCount() == 0) {
+        // Pass-1/single-pass entry fallback: a tiny anchorless blob may yield
+        // no functions. A present map has already authenticated the exact
+        // pass-2 function set, which this fallback must never mutate.
+        if (map == null && fm.getFunctionCount() == 0) {
             Address base = currentProgram.getImageBase();
             try {
                 disassemble(base);
@@ -184,6 +198,7 @@ public class ExportDecomp extends HeadlessScript {
             catch (Exception e) {
                 fail("the entry-function fallback failed: " + e.getMessage());
             }
+            checkDeadline();
         }
 
         outDir.mkdirs();
@@ -230,6 +245,7 @@ public class ExportDecomp extends HeadlessScript {
             long bytes = 0;
             AddressRangeIterator ranges = function.getBody().getAddressRanges();
             while (ranges.hasNext()) {
+                checkDeadline();
                 ghidra.program.model.address.AddressRange range = ranges.next();
                 bytes = Math.addExact(bytes, range.getLength());
             }
@@ -244,25 +260,86 @@ public class ExportDecomp extends HeadlessScript {
      * Pass-2 identity comparison: every current function's authenticated
      * execution must appear in the retained map with the exact digest, and
      * every map execution must still exist — program drift fails closed.
+     * Entries from the map's `creations` section have a separate identity:
+     * current memory must still authenticate the producer ranges, and every
+     * project-owned creation must retain its map/execution registry binding,
+     * concrete function/symbol IDs, Ghidra execution digest, and accepted
+     * Thumb projection. ApplyThumbNames passes the explicit returned
+     * disassembly set to CreateFunctionCmd, and the final body must remain
+     * wholly inside the authenticated producer ranges rather than expand
+     * through open-ended flow.
      */
     private void verifyBodiesAgainstMap(PalTasksSupport.SymbolMap map) throws Exception {
         FunctionManager functions = currentProgram.getFunctionManager();
         Map<Long, String> expected = new HashMap<Long, String>();
         for (PalTasksSupport.MapExecution execution : map.executions) {
+            checkDeadline();
             expected.put(execution.entry, execution.executionBlake3);
+        }
+        java.util.Set<Long> created = new java.util.HashSet<Long>();
+        StringPropertyMap creationOwnership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(PalTasksSupport.THUMB_CREATION_OWNERSHIP_MAP);
+        for (PalTasksSupport.MapCreation creation : map.creations) {
+            withinDeadline((operationMonitor) -> {
+                PalTasksSupport.validateThumbCreationExecution(
+                        currentProgram, operationMonitor, creation);
+                return null;
+            });
+            String owned = creationOwnership == null ? null
+                    : creationOwnership.getString(
+                            PalTasksSupport.programAddress(currentProgram, creation.entry));
+            if (owned != null) {
+                withinDeadline((operationMonitor) -> {
+                    PalTasksSupport.validateOwnedThumbCreation(currentProgram, operationMonitor,
+                            creationOwnership, map, creation);
+                    return null;
+                });
+            }
+            else {
+                Function function = functions.getFunctionAt(
+                        PalTasksSupport.programAddress(currentProgram, creation.entry));
+                if (function != null && creation.finalPrimary.equals(function.getName())
+                        && creation.finalSource.equals(PalTasksSupport.primarySource(
+                                function.getSymbol().getSource()))) {
+                    fail("an exact Thumb creation lacks ownership at "
+                            + function.getEntryPoint());
+                }
+            }
+            created.add(creation.entry);
+        }
+        if (creationOwnership != null) {
+            AddressIterator owned = creationOwnership.getPropertyIterator();
+            while (owned.hasNext()) {
+                checkDeadline();
+                Address address = owned.next();
+                if (!address.getAddressSpace().equals(
+                        currentProgram.getAddressFactory().getDefaultAddressSpace())) {
+                    fail("the Thumb creation registry uses a non-default address space at "
+                            + address);
+                }
+                if (!created.contains(address.getOffset())) {
+                    fail("the Thumb creation registry has an entry absent from the map at "
+                            + address);
+                }
+            }
         }
         FunctionIterator iterator = functions.getFunctions(true);
         int compared = 0;
         while (iterator.hasNext()) {
             checkDeadline();
             Function function = iterator.next();
+            if (created.contains(function.getEntryPoint().getOffset())) {
+                continue; // an owned ApplyThumbNames creation, revalidated above
+            }
             PalTasksSupport.DecodeProjection projection =
-                    PalTasksSupport.decodeProjection(currentProgram, monitor, function);
+                    withinDeadline((operationMonitor) -> PalTasksSupport.decodeProjection(
+                            currentProgram, operationMonitor, function));
             if (!projection.errors.isEmpty()) {
                 continue; // a quarantined record carries no execution identity
             }
-            String digest = PalTasksSupport.currentExecutionDigest(currentProgram, monitor,
-                    function);
+            String digest = withinDeadline((operationMonitor) ->
+                    PalTasksSupport.currentExecutionDigest(
+                            currentProgram, operationMonitor, function));
             long entry = function.getEntryPoint().getOffset();
             String expectedDigest = expected.remove(entry);
             if (expectedDigest == null) {
@@ -278,11 +355,58 @@ public class ExportDecomp extends HeadlessScript {
         if (!expected.isEmpty() || compared != map.executions.size()) {
             fail("the current function set does not cover every pass-1 execution exactly once");
         }
+        checkDeadline();
+    }
+
+    private interface DeadlineOperation<T> {
+        T run(TimeoutTaskMonitor operationMonitor) throws Exception;
+    }
+
+    private long remainingDeadline() {
+        long remaining = deadline - System.currentTimeMillis();
+        if (remaining <= 0) {
+            fail("the export verification deadline was exhausted");
+        }
+        if (monitor.isCancelled()) {
+            fail("the export verification was cancelled");
+        }
+        return remaining;
     }
 
     private void checkDeadline() {
-        if (System.currentTimeMillis() >= deadline) {
+        remainingDeadline();
+    }
+
+    private void checkDeadline(TimeoutTaskMonitor operationMonitor) {
+        if (operationMonitor.didTimeout() || System.currentTimeMillis() >= deadline) {
             fail("the export verification deadline was exhausted");
+        }
+        if (operationMonitor.isCancelled() || monitor.isCancelled()) {
+            fail("the export verification was cancelled");
+        }
+    }
+
+    private TimeoutTaskMonitor deadlineMonitor() {
+        if (deadlineTaskMonitor == null) {
+            // One timer enforces the absolute phase deadline. Completed
+            // TimeoutTaskMonitors retain their timer, so one per function
+            // would accumulate until the deadline on production inventories.
+            deadlineTaskMonitor = TimeoutTaskMonitor.timeoutIn(
+                    remainingDeadline(), TimeUnit.MILLISECONDS, monitor);
+        }
+        return deadlineTaskMonitor;
+    }
+
+    private <T> T withinDeadline(DeadlineOperation<T> operation) throws Exception {
+        TimeoutTaskMonitor operationMonitor = deadlineMonitor();
+        try {
+            T result = operation.run(operationMonitor);
+            checkDeadline(operationMonitor);
+            return result;
+        }
+        catch (Exception error) {
+            checkDeadline(operationMonitor);
+            throw error;
         }
     }
 
@@ -301,6 +425,7 @@ public class ExportDecomp extends HeadlessScript {
         }
         checkWriter(w, temporary);
         File destination = new File(outDir, name);
+        checkDeadline();
         Files.move(temporary.toPath(), destination.toPath(),
                 StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         temporaries.remove(temporary);
@@ -308,6 +433,7 @@ public class ExportDecomp extends HeadlessScript {
 
     private void writeCompletionMarker(File outDir, String palIdentity, String symbolMap)
             throws Exception {
+        checkDeadline();
         File parent = outDir.getParentFile();
         if (parent == null) {
             throw new Exception("export directory has no parent for completion marker");
@@ -320,6 +446,7 @@ public class ExportDecomp extends HeadlessScript {
                 writer.write("pal_tasks=" + palIdentity + "\n");
                 writer.write("symbol_map=" + symbolMap + "\n");
             }
+            checkDeadline();
             Files.move(temporary.toPath(), marker.toPath(),
                     StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         }
@@ -360,6 +487,7 @@ public class ExportDecomp extends HeadlessScript {
         StringBuilder out = new StringBuilder("[");
         boolean first = true;
         for (PalTasksSupport.DecodeRange range : ranges) {
+            checkDeadline();
             if (!first) out.append(", ");
             first = false;
             out.append(String.format(
@@ -377,6 +505,7 @@ public class ExportDecomp extends HeadlessScript {
         StringBuilder out = new StringBuilder("[");
         boolean first = true;
         for (PalTasksSupport.DecodeError error : errors) {
+            checkDeadline();
             if (!first) out.append(", ");
             first = false;
             out.append(String.format(
@@ -398,9 +527,11 @@ public class ExportDecomp extends HeadlessScript {
         Set<Long> refs = new TreeSet<Long>();
         AddressIterator addrs = fn.getBody().getAddresses(true);
         while (addrs.hasNext()) {
+            checkDeadline();
             Address from = addrs.next();
             Reference[] fromRefs = currentProgram.getReferenceManager().getReferencesFrom(from);
             for (Reference ref : fromRefs) {
+                checkDeadline();
                 RefType type = ref.getReferenceType();
                 if (type != null && type.isFlow()) {
                     continue;
@@ -448,9 +579,22 @@ public class ExportDecomp extends HeadlessScript {
             long entry = fn.getEntryPoint().getOffset();
             long end = PalTasksSupport.functionEnd(currentProgram, fn);
             PalTasksSupport.DecodeProjection projection =
-                    PalTasksSupport.decodeProjection(currentProgram, monitor, fn);
+                    withinDeadline((operationMonitor) -> PalTasksSupport.decodeProjection(
+                            currentProgram, operationMonitor, fn));
+            // Ghidra mirrors a referenced function's primary onto its thunks
+            // whenever either is renamed, so pass-2 naming decisions must
+            // know the thunk relation. External thunks (referenced symbol,
+            // no in-program function) carry no relation.
+            String thunkOf = "null";
+            if (fn.isThunk()) {
+                Function referenced = fn.getThunkedFunction(false);
+                if (referenced != null && !referenced.isExternal()) {
+                    thunkOf = String.format("\"0x%x\"",
+                            referenced.getEntryPoint().getOffset());
+                }
+            }
             w.print(String.format(
-                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s}",
+                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s, \"thunk_of\": %s}",
                 name,
                 PalTasksSupport.primarySource(fn.getSymbol().getSource()),
                 entry,
@@ -458,7 +602,9 @@ public class ExportDecomp extends HeadlessScript {
                 fn.getBody().getNumAddresses(),
                 decodeRangesJson(projection.ranges),
                 decodeErrorsJson(projection.errors),
-                dataRefsJson(fn)));
+                dataRefsJson(fn),
+                thunkOf));
+            checkDeadline();
         }
         if (!first) {
             w.println();
@@ -491,13 +637,17 @@ public class ExportDecomp extends HeadlessScript {
             for (Function fn : fm.getFunctions(true)) {
                 checkDeadline();
                 w.println("// " + fn.getName() + " @ " + fn.getEntryPoint());
-                DecompileResults res = dif.decompileFunction(fn, 60, monitor);
+                DecompileResults res = withinDeadline((operationMonitor) ->
+                        dif.decompileFunction(fn, 60, operationMonitor));
                 if (res != null && res.decompileCompleted() && res.getDecompiledFunction() != null) {
-                    w.println(res.getDecompiledFunction().getC());
+                    String body = res.getDecompiledFunction().getC();
+                    checkDeadline();
+                    w.println(body);
                 } else {
                     w.println("// <decompilation failed>");
                 }
                 w.println();
+                checkDeadline();
             }
         }
         finally {

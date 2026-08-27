@@ -1076,7 +1076,7 @@ pub(super) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A minimal canonical `pixel-modem-extractor-symbol-map-v2` covering the
+/// A minimal canonical `pixel-modem-extractor-symbol-map-v3` covering the
 /// two fixture executions (one PAL rename decision, one preserve), with
 /// the exact ordered fields the strict reader enforces.
 pub(super) fn canonical_symbol_map(
@@ -1099,7 +1099,7 @@ pub(super) fn canonical_symbol_map(
 
     let mut json = Json::new();
     json.open_object();
-    json.string_field(true, "format", "pixel-modem-extractor-symbol-map-v2");
+    json.string_field(true, "format", "pixel-modem-extractor-symbol-map-v3");
     json.key(false, "image");
     json.open_object();
     json.string_field(true, "label", LABEL);
@@ -1186,6 +1186,34 @@ pub(super) fn canonical_symbol_map(
     json.close_array();
     json.key(false, "pal_transition");
     json.out.push_str("null");
+    json.close_object();
+    json.close_array();
+    json.key(false, "creations");
+    json.open_array();
+    json.element(true);
+    json.open_object();
+    json.string_field(true, "entry", &address(0x4001_0500));
+    json.string_field(
+        false,
+        "execution_blake3",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    json.key(false, "decode_ranges");
+    json.open_array();
+    json.element(true);
+    json.open_object();
+    json.string_field(true, "isa", "thumb");
+    json.string_field(false, "start", &address(0x4001_0500));
+    json.string_field(false, "end", &address(0x4001_0504));
+    json.string_field(
+        false,
+        "blake3",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    json.close_object();
+    json.close_array();
+    json.string_field(false, "final_primary", "created_thumb_fn");
+    json.string_field(false, "final_source", "user_defined");
     json.close_object();
     json.close_array();
     json.close_object();

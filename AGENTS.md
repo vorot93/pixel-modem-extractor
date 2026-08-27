@@ -311,7 +311,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -461,6 +461,16 @@ module; when a file outgrows that, split it.
   with no dense Thumb region to succeed without the required primary.
 
 ## Multiple models (model-agnostic design)
+
+- **Version drops are full recompiles — cross-build name transfer is closed.**
+  Measured on the only same-variant pair obtainable (`g5400i` Jun 2025 ↔ Apr
+  2026, ~10 months): strict 1:1 exact-byte function matching transfers zero
+  names in either direction (MAIN survives ~5% byte-identical; drift p50 is
+  207 differing words with 0% ≤2-word; the matched set carries no naming
+  evidence). Cross-model (mustang↔cheetah) measured identically closed
+  (2026-08-16). Do not build name-transfer/knowledge-diff features on
+  exact-byte matching; structural matching stays rejected under the
+  fail-closed naming discipline. (Process artifacts under `~/.superpowers`.)
 
 The extractor targets the Shannon **S5300 / S5400** family and adds **no per-model code** — the core
 is TOC-driven and structural, and everything model-specific is *derived* from the image, never
@@ -634,6 +644,13 @@ hardcoded. Two reference images exercise both models end-to-end:
 
 ### Runtime PAL task inventory
 
+- **`count_global` names runtime-writable RAM, not a statically readable address.**
+  The initializer only *stores* the task count there; the real Mustang plan
+  points it ~11 MB past the raw image, outside every scatter destination, and
+  the write is real (133 named tasks validate against hashed slots). The
+  strict reader therefore maps-checks every address the proof must *read*
+  (CFG, guard branch, table slots, entries, names) but deliberately not
+  `count_global` — treat it as store-only provenance.
 - **Discovery proves the initializer semantically; nothing else nominates a candidate.**
   `pal_tasks::discover` finds every materialization of the nine-byte anchor `PALTskTm\0`
   (`ADR`-family, PC-relative literal load, or register-consistent `MOVW`/`MOVT`), keeps the ones
@@ -885,17 +902,42 @@ hardcoded. Two reference images exercise both models end-to-end:
   the regenerated `decompiled.c`. (Global-alias rejection is therefore
   best-effort at that stage: `globals.json` does not exist yet, so `global_names`
   is empty there; the finalize re-run and the standalone `symbolicate` subcommand
-  do have it.) **Measured yield (real end-to-end, gated
-  `registration_yield_on_retained_tree`): ~233 mustang / 101 cheetah, all
-  `Recovered`, ~100% precision** (verified table structure — e.g. cheetah's
-  `AtiParsePlusCUSD`, `AtiQuePlusCPIN`, `AtiRspPlusCMGD`). This is a small,
-  high-value, precision-over-volume lever (contrast string-ref's ~8.7k @ 53%).
+  do have it.) **Measured yield on the 2026-08-25 fresh goldens: 113 mustang /
+  77 cheetah registration evidence names, all `Recovered`, ~100% precision**
+  (e.g. `AtiParsePlusCUSD`, `AtiQuePlusCPLS`, `RCSSH_SessMgr_*`). The older
+  ~233/101 figures measured the pre-regeneration corpus state and are not
+  reproducible on it — the ISR-named pairs (`PICH_HISR` etc.) have no
+  pointer materialization in the current image (2026-08-26 ISR spike).
+  Fresh clean-root pass-2 acceptance on both models (2026-08-27, Ghidra
+  12.1.2_DEV, radare2 6.1.4) closes the old final-application gap: bounded
+  registration representatives nominated through rename and creation routes
+  all reached the final `functions.json`. Final symbolication can legitimately
+  omit their `kind: "registration"` evidence after pass 2 because the scanner
+  defers when the refreshed program already carries the applied real name.
+  Audit a rename through its symbol-map `symbols[]` decision, the
+  `ApplySymbols` summary, and the final inventory. Audit a creation or owned
+  replay through its symbol-map `creations[]` request, the conserving
+  `ApplyThumbNames` summary, and the final inventory; `report.json` pairs the
+  bound map count (`pass2_creation_candidates`) with its classification as
+  `pass2_created`, `pass2_creation_reapplied`,
+  `pass2_creation_skipped_existing`, and `pass2_creation_skipped_collision`.
+  A smaller final registration-evidence set does not by itself mean the name
+  was lost. This remains a small, high-value, precision-over-volume lever
+  (contrast string-ref's ~8.7k @ 53%).
   **Deliberately not built:** call-site `Register(name, fn)` registration
   (validated yield ~10 — the pointer is rarely materialized into a catchable arg
   register; see the `2026-08-14-registration-naming` findings). Per-function
-  provenance is the `kind:"registration"` evidence in `symbols.json`; there is no
-  standalone table-level sidecar (the `RegScan::entries` inventory is its natural
-  source if one is ever wanted).
+  discovery-time provenance is the `kind:"registration"` evidence in
+  `symbols.json`; rename decisions also retain a `registration: "<base>"`
+  annotation in the symbol map. A `creations[]` record retains the exact
+  nominated entry, execution, name, and source but not the registration evidence
+  kind, and final symbolication may omit that original `symbols.json` evidence as
+  described above. After finalization, use final `symbols.json` evidence where it
+  remains, the map annotation for a rename, or a retained pre-finalization
+  `symbols.json` for a creation's registration provenance; the creation map,
+  `ApplyThumbNames`/report classification, and final inventory prove application.
+  There is no standalone table-level sidecar (the `RegScan::entries` inventory is
+  its natural source if one is ever wanted).
 - **`disasm_index::DisasmIndex` (shared infra).** Address-indexed view of a
   `disasm.lst`-format file, O(log L + k) per `slice_for` lookup. Built ONCE
   per image; consumed by `symbolicate::load_functions` (the ARM function
@@ -917,18 +959,95 @@ hardcoded. Two reference images exercise both models end-to-end:
   below). `decompile::run_two_pass` accepts a typed per-image input with up to
   three optional maps — function, global, and global-types. Each map is
   constructed only from a non-empty regular file, stores its canonical
-  absolute path and non-zero count, and is revalidated immediately before
-  Ghidra arguments are built. Initial validation is component-local (an
+  absolute path, and is revalidated immediately before Ghidra arguments are
+  built. Global/global-type maps have non-zero counts; a function map may have
+  zero Ghidra executions when its non-empty `creations` section alone schedules
+  pass 2, and retains those exact entry/name/source requests. Initial validation is component-local (an
   invalid map is omitted without suppressing its valid siblings); a late
   identity/type change fails the whole scheduled image rather than changing
   its script set. It starts exactly one `analyzeHeadless -process -noanalysis`
   saved-project process for each image having at least one of the three
-  inputs, with each applicable post-script independently optional and always
-  in the fixed order `ApplySymbols.java -> ApplyGlobals.java ->
-  ApplyGlobalTypes.java -> ExportDecomp.java` (an image with none of the
-  three inputs starts no pass-2 process at all) — see **Ghidra 12 headless
-  API notes** below for the argument-construction details and the all-three
-  example.
+  inputs. With all maps present, the fixed post-script order is
+  `ApplyThumbNames.java -> ApplySymbols.java -> ApplyGlobals.java ->
+  ApplyGlobalTypes.java -> ExportDecomp.java`. Each map remains independently
+  optional; `ApplyThumbNames.java` rides in the function map and runs first
+  whenever one is present (a no-op on an empty `creations` array), while an
+  image with none of the three inputs starts no pass-2 process at all. Creation
+  runs first so malformed producer or ownership state cannot follow another
+  pass-2 mutation. A later script failure may leave an owned creation in the
+  saved project; an identical retry must revalidate it as `reapplied` before
+  Rust publishes an export. See **Ghidra 12 headless API notes** below for the
+  argument-construction details and the all-three example.
+
+  **Pass-2 creation of named producer-owned Thumb functions.** The symbol map
+  is `pixel-modem-extractor-symbol-map-v3` with a `creations` section: named
+  (`Recovered` or provisional) Thumb executions authenticated by a validated
+  producer inventory (radare2/Rizin strict v3) whose entry Ghidra's own
+  inventory never discovered. Readable v1/v2 legacy records remain valid
+  consumer evidence but are never creation authority; only a concrete
+  strict-v3 radare2/Rizin producer run may enter `creations`. Fresh clean-root
+  acceptance (2026-08-27) observed 169 candidates / 165 exact creations on
+  mustang MAIN and 64 / 64 on cheetah; these are corpus/tool observations, not
+  universal inventory promises. The earlier ~4.2k / ~2.8k development-tree
+  estimates are superseded and are not fresh-root acceptance baselines.
+  Every validated retained Ghidra entry excludes creation, whether its
+  projection is accepted or quarantined: both mean Ghidra discovered the
+  function. Quarantined records remain excluded from map executions and
+  decisions; they supply only this entry-level creation exclusion.
+  `ApplyThumbNames.java` first classifies every request without mutation:
+  exact replay, existing-function/authenticated-span overlap, invalid or
+  colliding name, or planned creation (earlier canonical plans reserve their
+  authenticated spans). It then declares TMode, disassembles only inside the
+  authenticated address set (flow-enabled, analysis disabled, budgeted), and
+  passes the explicit returned disassembly set to `CreateFunctionCmd` before
+  naming each planned function (`USER_DEFINED` for recovered, `ANALYSIS` for
+  provisional). The final function body must remain wholly inside the
+  authenticated ranges and never expands through unconstrained control flow.
+  The script rolls back transactionally on any failure. Fail-closed rules:
+  existing-entry handling is exhaustive and ordered: an owned matching existing
+  function is fully revalidated and counted `reapplied`; an exact name/source
+  existing function without ownership is a hard failure; any other existing
+  entry function is preserved and counted `skipped_existing`;
+  duplicate requested names are skips (never suffixed variants); ambiguous
+  same-entry names and name collisions are counted at map-build; a creation
+  whose first authenticated decode range does not start at the entry is skipped
+  at map-build (`not_entry_start`) rather than emitted — radare2 multi-chunk
+  records can carry a prior range (68 named on mustang MAIN, 2026-08-26) and
+  the Java reader rejects the whole map if any one fails that check.
+
+  Every created function is registered in
+  `PixelModemExtractor.ThumbNames.v1.Ownership` as
+  `v1:<map_blake3>:<producer_execution_blake3>:<function_id>:<primary_symbol_id>:<ghidra_execution_blake3>`.
+  A saved-project retry counts an identical creation as `reapplied` only after
+  revalidating that ownership value, the concrete function and symbol, the
+  primary/source, the accepted Thumb projection, current memory, and the Ghidra
+  execution digest.
+
+  The script emits exactly one strict conserving `ApplyThumbNames: {json}`
+  summary. Rust requires the scheduled image and candidate count, classifies
+  `created + reapplied + skipped_existing + skipped_collision == candidates`,
+  and treats a missing, duplicate, malformed, wrong-image, or non-conserving
+  summary as a pass-2 failure before marking the export current. Rust terminal
+  validation uses the pass-1 producer inventory as its baseline, accounts for
+  both newly created and same-map owned-replayed functions, proves every
+  retained Ghidra execution survived, and permits only accepted Thumb additions
+  with the exact requested entry/name/source; aggregate growth can never
+  authorize identity substitution. It validates and publishes exactly
+  `decompiled.c`, `disasm.lst`, and `functions.json`, preserving every sidecar,
+  then refreshes the current `ImageResult` raw/accepted/quarantined inventory
+  and report counters from the committed terminal summary. `ExportDecomp`'s
+  identity postflight exempts creation entries from the pass-1 digest comparison
+  only because these Java and Rust checks own them. Its tiny-anchorless
+  image-base entry fallback is pass-1/single-pass only: a present symbol map may
+  validly retain zero functions, and the exporter never mutates that
+  map-authenticated pass-2 state after postflight. Report surface: map planning
+  (`pass2_creation_candidates`, nested `pass2_creation_map_skips`) plus runtime
+  `pass2_created`, `pass2_creation_reapplied`,
+  `pass2_creation_skipped_existing`, and
+  `pass2_creation_skipped_collision`; the four runtime counts conserve the
+  candidate count. Budgets: `PME_THUMB_CREATE_ENTRY_BUDGET_MS` (30 s) /
+  `PME_THUMB_CREATE_PHASE_BUDGET_MS` (60 min). Downstream,
+  `thumb_enrich_post_pass2` fills the new functions' `body_c` for free.
 
   Symbol-map preparation is also fail-closed without discarding partial work:
   any per-component error makes the aggregate `symbol_map` stage failed, every
@@ -1970,17 +2089,52 @@ hardcoded. Two reference images exercise both models end-to-end:
     exports explicitly marked current by the producing report.
   - **Gson IS bundled** with Ghidra (`Ghidra/Framework/Generic/lib/gson-*.jar`)
     and on the headless script classpath — use it for JSON in scripts.
+  - **Ghidra mirrors renames onto thunks, recursively, but only auto-named
+    ones.** Renaming a function re-points every thunk that forwards to it
+    (chains included — `getFunctionThunkAddresses(true)`) to the new primary,
+    while leaving each thunk's own symbol source untouched. A thunk carrying
+    a *custom* primary (e.g. an applied `pal_TaskEntry_*` label) is NOT
+    mirrored. The pass-2 map encodes this as explicit `mirror` decisions
+    (`thunk_of` is exported per function record; the builder chain-walks
+    renamed targets), and `ApplySymbols` postflight accepts exactly the two
+    deterministic outcomes — the mirrored final primary or the untouched
+    original — with the source pinned to the thunk's own. Pass-2 renames are
+    ordered non-thunk-first so an authorized independent thunk rename
+    deterministically overrides the mirror. Verified empirically with a
+    minimal headless probe; do not "fix" the either/or acceptance without
+    re-probing the exact mirroring rule.
+  - **Wall-clock budgets are env-overridable.** `PME_PAL_ENTRY_BUDGET_MS`,
+    `PME_PAL_PHASE_BUDGET_MS`, `PME_EXPORT_VALIDATION_BUDGET_MS`,
+    `PME_TAME_PHASE_BUDGET_MS`, `PME_THUMB_CREATE_ENTRY_BUDGET_MS`,
+    `PME_THUMB_CREATE_PHASE_BUDGET_MS` (positive whole ms; malformed values fail the
+    script loudly). Defaults stay source-pinned by contract tests. The real
+    Mustang MAIN exceeds the stock defaults legitimately (one PAL entry
+    disassembly >30 s at `432e1838`; export verification >15 min), so
+    acceptance-scale runs set these — budgets gate wall-clock only and change
+    no output bytes. `ExportDecomp` lazily derives one parented timeout monitor
+    from the remaining export budget and reuses it for every monitor-aware
+    validation, projection/hash, and decompilation operation. One shared monitor
+    is load-bearing: Ghidra 12's completed `TimeoutTaskMonitor`s retain their
+    scheduled timer, while cancelling one also cancels its parent. The exporter
+    checks each long operation on return and gates every temporary-to-terminal
+    move, including the v3 completion marker. Deadline expiry can therefore
+    leave no current marker without accumulating one pending timer per function.
+  - **Pass-2 manifest arguments must sit inside the Ghidra kit root.**
+    `readPal` authenticates the task manifest, the scatter load map, *and*
+    the raw image (`<ghidra>/images/<label>`) by canonical containment — all
+    three are terminal-moved to `images/<label>/` by the pass-1 marshal, so
+    `load_terminal_pal_maps` restages byte-identical copies at their pass-1
+    kit paths before building pass-2 inputs.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
-    vectors, all after `<projectDir> <projectName> -process <label> -noanalysis
-    -scriptPath …`, are `-postScript ApplySymbols.java <function_map>`,
-    `-postScript ApplyGlobals.java <global_map>`, and
-    `-postScript ApplyGlobalTypes.java <global_types_map>` — each
-    independently optional (`headless_process_args` appends whichever of
-    `Pass2Input.function_map` / `global_map` / `global_types_map` is
-    `Some`, in that fixed order), always followed by
-    `-postScript ExportDecomp.java <out>`. All-three example:
+    vectors all follow `<projectDir> <projectName> -process <label> -noanalysis
+    -scriptPath …`. A function map appends `ApplyThumbNames.java` first and
+    then `ApplySymbols.java`; global and global-types maps independently append
+    `ApplyGlobals.java` and `ApplyGlobalTypes.java`. Every scheduled vector
+    ends with `ExportDecomp.java`, so the all-map order is exactly
+    `ApplyThumbNames.java -> ApplySymbols.java -> ApplyGlobals.java ->
+    ApplyGlobalTypes.java -> ExportDecomp.java`. All-three example:
 
-        -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ApplyGlobalTypes.java <global_types_map> -postScript ExportDecomp.java <out>
+        -postScript ApplyThumbNames.java <label> <image_blake3> <function_map> <map_blake3> -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ApplyGlobalTypes.java <global_types_map> -postScript ExportDecomp.java <out>
 
     At least one of the three typed maps must be `Some` or
     `headless_process_args` returns `Ok(None)` (nothing scheduled for that
@@ -1997,7 +2151,8 @@ hardcoded. Two reference images exercise both models end-to-end:
     defaults; this is why `ExportDecomp.java` doesn't call it.
 - **Pass-2 fail-closed surface.** `decompile::ImageResult` carries
   `pass2_applied: Option<usize>` (count of names `ApplySymbols.java` reported
-  applying — parsed from its summary line on stdout) and `pass2_error:
+  applying — parsed from its summary line on stdout), the typed conserving
+  `pass2_thumb_names` result plus its prepared creation plan, and `pass2_error:
   Option<String>` (set for late typed-map validation, analyzeHeadless spawn or
   non-zero process failure, or the caller's owned-export refresh failure;
   process failures include a ~2 KB tail of stderr). A pass-2 failure does **not**
@@ -2005,14 +2160,16 @@ hardcoded. Two reference images exercise both models end-to-end:
   valid `decompiled.c`. `run_two_pass` returns an explicit outcome for every
   scheduled label, including labels absent from the pass-1 report. The caller
   combines process outcomes with exact-export refresh outcomes into the
-  separate `decompile_pass2` stage; the pass-1 `decompile` stage stays intact.
+  separate `decompile_pass2` stage; a committed refresh updates the current
+  inventory counters from its validated terminal summary, while the pass-1
+  `decompile` stage stays intact.
 
 ## How we work here
 
 - **Design before code.** Non-trivial work gets a written design spec and an
   implementation plan before implementation begins. Keep process artifacts
   outside the repository; durable outcomes land in this file, the README, and
-  code comments. Read this file and the
+  code comments. Read this AGENTS.md and the
   README before starting non-trivial work — they capture why approaches were
   chosen or rejected, which the code alone can't tell you.
 - **Test first**, keep changes small and reviewable.

@@ -31,6 +31,7 @@ const APPLY_SYMBOLS_JAVA: &str = include_str!("ghidra/ApplySymbols.java");
 const APPLY_GLOBALS_JAVA: &str = include_str!("ghidra/ApplyGlobals.java");
 const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java");
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
+const APPLY_THUMB_NAMES_JAVA: &str = include_str!("ghidra/ApplyThumbNames.java");
 const APPLY_PAL_TASKS_JAVA: &str = include_str!("ghidra/ApplyPalTasks.java");
 const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
@@ -487,7 +488,7 @@ fn image_matches(want: Option<&str>, label: &str, name: &str) -> bool {
 /// The `--run` skip decision (pure — no process spawn, no I/O): `Some(stats)`
 /// iff `classify`'s battery is unanimously opaque, meaning Ghidra's standard
 /// import recovers nothing (0 functions, 0-byte exports; measured on mustang
-/// `01_PSP` — see the spike capture in CONTRIBUTING). `None` sends the image
+/// `01_PSP` — see the spike capture in AGENTS). `None` sends the image
 /// to Ghidra exactly as today; a partially-encrypted image is never skipped
 /// (any single test refusal fails closed to `not_opaque`).
 fn opaque_skip(bytes: &[u8]) -> Option<crate::classify::BatteryStats> {
@@ -562,6 +563,13 @@ pub struct ImageResult {
     /// reported applying. `None` when no function-map invocation occurred
     /// (including a globals-only invocation) or no valid function summary was parsed.
     pub pass2_applied: Option<usize>,
+    /// Creation candidates and map-build refusals prepared after pass 1.
+    /// `None` means no symbol map was successfully built for this image.
+    pub pass2_creation_plan: Option<Pass2CreationPlan>,
+    /// Pass-2 creation outcome from `ApplyThumbNames.java`. Every prepared
+    /// creation candidate is classified exactly once; `None` means no
+    /// function-map invocation completed with a valid current-run summary.
+    pub pass2_thumb_names: Option<AppliedThumbNames>,
     /// Reason-only pass-2 failure text: late typed-map validation, analyzeHeadless
     /// spawn/non-zero process failure, or caller-owned-export refresh failure.
     pub pass2_error: Option<String>,
@@ -626,6 +634,31 @@ pub struct AppliedPalTasks {
     pub names_applied: usize,
     pub names_preserved: usize,
     pub shared_entries: usize,
+}
+
+/// The parsed `ApplyThumbNames: {json}` current-run summary for one scheduled
+/// symbol map. Every candidate is classified exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedThumbNames {
+    pub candidates: usize,
+    pub created: usize,
+    pub reapplied: usize,
+    pub skipped_existing: usize,
+    pub skipped_collision: usize,
+}
+
+/// Static pass-2 creation diagnostics retained from symbol-map construction.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Pass2CreationPlan {
+    pub candidates: usize,
+    pub skips: crate::symbolicate::Pass2CreationSkips,
+    pub(crate) requests: Vec<crate::symbolicate::Pass2CreationRequest>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalCreationExpectation<'a> {
+    summary: &'a AppliedThumbNames,
+    requests: &'a [crate::symbolicate::Pass2CreationRequest],
 }
 
 /// A decompile run's per-image outcomes plus the `ghidra_load.json` path.
@@ -905,12 +938,16 @@ impl TerminalValidationFailure {
 /// Validate one complete terminal Ghidra/optional-Thumb pair. When
 /// `expected_current` is supplied, every normalized tagged source record must
 /// match the already-validated current producer result before refresh.
+/// A pass-2 creation expectation permits only the reported created count and
+/// binds every addition to an exact map entry/name/source while preserving
+/// every retained Ghidra execution record.
 pub(crate) fn validate_terminal_inventory_pair(
     ghidra_functions_path: &Path,
     thumb_functions_path: &Path,
     runtime: &RuntimeImage<'_>,
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
+    creation: Option<TerminalCreationExpectation<'_>>,
 ) -> Result<TerminalInventorySummary> {
     validate_terminal_inventory_pair_staged(
         ghidra_functions_path,
@@ -918,8 +955,184 @@ pub(crate) fn validate_terminal_inventory_pair(
         runtime,
         expected_thumb_substantial,
         expected_current,
+        creation,
     )
     .map_err(|failure| failure.error)
+}
+
+fn retained_ghidra_record_delta(
+    staged: &[TaggedExecutionRecord],
+    retained: &[TaggedExecutionRecord],
+) -> Option<usize> {
+    let mut staged: Vec<_> = staged.iter().collect();
+    let mut retained: Vec<_> = retained.iter().collect();
+    staged.sort_unstable();
+    retained.sort_unstable();
+    let (mut staged_index, mut retained_index, mut additions) = (0, 0, 0usize);
+    while staged_index < staged.len() {
+        if retained_index == retained.len() {
+            return additions.checked_add(staged.len() - staged_index);
+        }
+        match staged[staged_index].cmp(retained[retained_index]) {
+            std::cmp::Ordering::Less => {
+                additions = additions.checked_add(1)?;
+                staged_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                staged_index += 1;
+                retained_index += 1;
+            }
+            std::cmp::Ordering::Greater => return None,
+        }
+    }
+    (retained_index == retained.len()).then_some(additions)
+}
+
+fn validate_terminal_creation_functions(
+    staged: &[crate::execution_ranges::GhidraFunctionFields],
+    retained: Option<&[TaggedExecutionRecord]>,
+    expected: TerminalCreationExpectation<'_>,
+) -> Result<()> {
+    if expected.requests.len() != expected.summary.candidates {
+        return Err(Error::Serialize(
+            "prepared creation requests do not match the reported candidate count".into(),
+        ));
+    }
+    let classified = expected
+        .summary
+        .created
+        .checked_add(expected.summary.reapplied)
+        .and_then(|count| count.checked_add(expected.summary.skipped_existing))
+        .and_then(|count| count.checked_add(expected.summary.skipped_collision))
+        .ok_or_else(|| Error::Serialize("creation summary count overflow".into()))?;
+    if classified != expected.summary.candidates {
+        return Err(Error::Serialize(
+            "creation summary does not conserve candidates".into(),
+        ));
+    }
+
+    let mut staged_by_entry = std::collections::BTreeMap::new();
+    for function in staged {
+        if staged_by_entry.insert(function.entry, function).is_some() {
+            return Err(Error::Serialize(format!(
+                "terminal Ghidra inventory repeats entry 0x{:x}",
+                function.entry
+            )));
+        }
+    }
+    let mut requests_by_entry = std::collections::BTreeMap::new();
+    for request in expected.requests {
+        if !matches!(request.final_source.as_str(), "analysis" | "user_defined") {
+            return Err(Error::Serialize(format!(
+                "creation request at 0x{:x} has invalid source {:?}",
+                request.entry, request.final_source
+            )));
+        }
+        if requests_by_entry.insert(request.entry, request).is_some() {
+            return Err(Error::Serialize(format!(
+                "creation requests repeat entry 0x{:x}",
+                request.entry
+            )));
+        }
+    }
+
+    let exact_requests = expected
+        .requests
+        .iter()
+        .filter(|request| {
+            staged_by_entry.get(&request.entry).is_some_and(|function| {
+                function.name == request.final_primary
+                    && function.primary_source == request.final_source
+                    && matches!(
+                        &function.tagged.projection,
+                        crate::execution_ranges::ExecutionProjection::Accepted(ranges)
+                            if ranges.iter().any(|range| {
+                                range.start == function.entry
+                                    && range.isa
+                                        == crate::execution_ranges::DecodeIsa::Thumb
+                            })
+                    )
+            })
+        })
+        .count();
+    let expected_exact = expected
+        .summary
+        .created
+        .checked_add(expected.summary.reapplied)
+        .ok_or_else(|| Error::Serialize("creation exact-match count overflow".into()))?;
+    if exact_requests != expected_exact {
+        return Err(Error::Serialize(format!(
+            "terminal creation identities do not match created + reapplied: expected {expected_exact}, found {exact_requests}"
+        )));
+    }
+
+    let Some(retained) = retained else {
+        return Ok(());
+    };
+    let mut retained_entries = BTreeSet::new();
+    for record in retained {
+        if !retained_entries.insert(record.entry) {
+            return Err(Error::Serialize(format!(
+                "retained Ghidra inventory repeats entry 0x{:x}",
+                record.entry
+            )));
+        }
+        let function = staged_by_entry.get(&record.entry).ok_or_else(|| {
+            Error::Serialize(format!(
+                "terminal Ghidra inventory lost retained entry 0x{:x}",
+                record.entry
+            ))
+        })?;
+        if function.tagged != *record {
+            return Err(Error::Serialize(format!(
+                "terminal Ghidra inventory changed retained entry 0x{:x}",
+                record.entry
+            )));
+        }
+    }
+
+    let additions: Vec<_> = staged
+        .iter()
+        .filter(|function| !retained_entries.contains(&function.entry))
+        .collect();
+    if additions.len() != expected.summary.created {
+        return Err(Error::Serialize(format!(
+            "terminal Ghidra inventory added {} functions, expected {}",
+            additions.len(),
+            expected.summary.created
+        )));
+    }
+    for function in additions {
+        let request = requests_by_entry.get(&function.entry).ok_or_else(|| {
+            Error::Serialize(format!(
+                "terminal Ghidra inventory added unrequested entry 0x{:x}",
+                function.entry
+            ))
+        })?;
+        if function.name != request.final_primary || function.primary_source != request.final_source
+        {
+            return Err(Error::Serialize(format!(
+                "terminal Ghidra creation at 0x{:x} changed its requested name or source",
+                function.entry
+            )));
+        }
+        let accepted_thumb_entry = match &function.tagged.projection {
+            crate::execution_ranges::ExecutionProjection::Accepted(ranges) => {
+                ranges.iter().any(|range| {
+                    range.start == function.entry
+                        && range.isa == crate::execution_ranges::DecodeIsa::Thumb
+                })
+            }
+            crate::execution_ranges::ExecutionProjection::Quarantined(_) => false,
+        };
+        if !accepted_thumb_entry {
+            return Err(Error::Serialize(format!(
+                "terminal Ghidra creation at 0x{:x} lacks a Thumb projection at its entry",
+                function.entry
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_terminal_inventory_pair_staged(
@@ -928,10 +1141,13 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
     runtime: &RuntimeImage<'_>,
     expected_thumb_substantial: Option<usize>,
     expected_current: Option<&TerminalInventorySummary>,
+    creation: Option<TerminalCreationExpectation<'_>>,
 ) -> std::result::Result<TerminalInventorySummary, TerminalValidationFailure> {
+    let allowed_new_ghidra = creation.map_or(0, |expected| expected.summary.created);
     let streamed =
         crate::execution_ranges::read_ghidra_inventory_streaming(ghidra_functions_path, runtime)
             .map_err(TerminalValidationFailure::ghidra)?;
+    let ghidra_functions = streamed.functions;
     let ghidra = streamed.inventory;
     let mut accepted_identities: BTreeSet<OwnedExecutionIdentity> =
         ghidra.accepted_executions.iter().cloned().collect();
@@ -974,21 +1190,55 @@ pub(crate) fn validate_terminal_inventory_pair_staged(
         ghidra_records: ghidra.records,
         thumb_records,
     };
-    if let Some(expected) = expected_current
-        && &summary != expected
+    if expected_current.is_none()
+        && let Some(creation) = creation
     {
-        // The comparison spans both stages; a differing Thumb ledger is the
-        // only way this can be a Thumb-stage problem.
-        let thumb = summary.thumb_metadata != expected.thumb_metadata
-            || summary.thumb != expected.thumb
-            || summary.thumb_substantial != expected.thumb_substantial
-            || summary.thumb_records != expected.thumb_records;
-        return Err(TerminalValidationFailure {
-            thumb,
-            error: Error::Serialize(
-                "terminal execution inventory differs from the current producer result".into(),
-            ),
-        });
+        validate_terminal_creation_functions(&ghidra_functions, None, creation)
+            .map_err(TerminalValidationFailure::ghidra)?;
+    }
+    if let Some(expected) = expected_current {
+        let thumb_unchanged = summary.thumb_metadata == expected.thumb_metadata
+            && summary.thumb == expected.thumb
+            && summary.thumb_substantial == expected.thumb_substantial
+            && summary.thumb_records == expected.thumb_records;
+        // With creations allowed, every count delta must be exactly the
+        // creation allowance on the Ghidra accepted/raw pair; the identities
+        // grow by the same amount. Record-level equality of the pass-1 set
+        // is enforced in-process by ExportDecomp's map postflight.
+        let ghidra_ok = if let Some(creation) = creation {
+            summary.ghidra.quarantined == expected.ghidra.quarantined
+                && expected.ghidra.raw.checked_add(allowed_new_ghidra) == Some(summary.ghidra.raw)
+                && expected.ghidra.accepted.checked_add(allowed_new_ghidra)
+                    == Some(summary.ghidra.accepted)
+                && expected
+                    .accepted_identities
+                    .len()
+                    .checked_add(allowed_new_ghidra)
+                    == Some(summary.accepted_identities.len())
+                && retained_ghidra_record_delta(&summary.ghidra_records, &expected.ghidra_records)
+                    == Some(allowed_new_ghidra)
+                && validate_terminal_creation_functions(
+                    &ghidra_functions,
+                    Some(&expected.ghidra_records),
+                    creation,
+                )
+                .is_ok()
+        } else {
+            summary.ghidra == expected.ghidra
+                && summary.ghidra_records == expected.ghidra_records
+                && summary.accepted_identities == expected.accepted_identities
+        };
+        if !thumb_unchanged || !ghidra_ok {
+            // The comparison spans both stages; a differing Thumb ledger is the
+            // only way this can be a Thumb-stage problem.
+            let thumb = !thumb_unchanged;
+            return Err(TerminalValidationFailure {
+                thumb,
+                error: Error::Serialize(
+                    "terminal execution inventory differs from the current producer result".into(),
+                ),
+            });
+        }
     }
     Ok(summary)
 }
@@ -1010,12 +1260,47 @@ pub(crate) fn validate_image_terminal_inventory(
         ));
     }
     let runtime = RuntimeImage::for_image_dir(&raw, image.image_start, image_dir)?;
+    // Pass-2 creation (ApplyThumbNames) may grow the Ghidra inventory only by
+    // exact entry/name/source requests retained from this run's symbol map.
+    let creation = match (
+        image.pass2_thumb_names.as_ref(),
+        image.pass2_creation_plan.as_ref(),
+    ) {
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(Error::Serialize(
+                "ApplyThumbNames summary has no prepared creation plan".into(),
+            ));
+        }
+        (Some(summary), Some(plan)) => {
+            if summary.candidates != plan.candidates || plan.requests.len() != plan.candidates {
+                return Err(Error::Serialize(
+                    "ApplyThumbNames summary does not match the prepared creation plan".into(),
+                ));
+            }
+            Some(TerminalCreationExpectation {
+                summary,
+                requests: &plan.requests,
+            })
+        }
+    };
+    let current_owned_creations = creation
+        .map(|expected| {
+            expected
+                .summary
+                .created
+                .checked_add(expected.summary.reapplied)
+                .ok_or_else(|| Error::Serialize("current creation count overflow".into()))
+        })
+        .transpose()?
+        .unwrap_or(0);
     let summary = validate_terminal_inventory_pair(
         ghidra_functions_path,
         thumb_functions_path,
         &runtime,
         image.thumb_functions,
         expected_current,
+        creation,
     )?;
     let raw_functions = match image.outcome {
         ImageOutcome::Analyzed(raw) => raw,
@@ -1042,7 +1327,20 @@ pub(crate) fn validate_image_terminal_inventory(
         summary.thumb.map(|thumb| thumb.accepted),
         summary.thumb.map(|thumb| thumb.quarantined),
     );
-    if summary.ghidra.raw != raw_functions || reported != validated {
+    // The producer report is the pass-1 baseline. Current output includes
+    // both creations made now and exact owned creations replayed from an
+    // earlier application of this same map.
+    let expected_validated = (
+        reported
+            .0
+            .and_then(|count| count.checked_add(current_owned_creations)),
+        reported.1,
+        reported.2,
+        reported.3,
+    );
+    if raw_functions.checked_add(current_owned_creations) != Some(summary.ghidra.raw)
+        || validated != expected_validated
+    {
         return Err(Error::Serialize(format!(
             "terminal inventory counters do not match current producer report: raw {raw_functions}, reported {reported:?}, validated {validated:?}"
         )));
@@ -1749,11 +2047,11 @@ fn run_report_impl(
     let runtime_analysis = generate_runtime_analysis(&toc, &data, out)?;
 
     // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,ApplyPalTasks,
-    //    PalTasksSupport,TameAnalysis,ExportDecomp,ApplySymbols,ApplyGlobals,
-    //    ApplyGlobalTypes}.java
+    //    PalTasksSupport,TameAnalysis,ApplyThumbNames,ApplySymbols,ApplyGlobals,
+    //    ApplyGlobalTypes,ExportDecomp}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
-    //    writes the decompiled C / disasm listing / function inventory; ApplySymbols,
-    //    ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
+    //    writes the decompiled C / disasm listing / function inventory; ApplyThumbNames,
+    //    ApplySymbols, ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
     //    ApplyPalTasks transactionally seeds PAL task functions before analysis;
     //    PalTasksSupport is the package-private strict PAL support class every
     //    PAL-aware script shares - no script may grow a second parser.)
@@ -1768,6 +2066,7 @@ fn run_report_impl(
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
+    std::fs::write(scripts.join("ApplyThumbNames.java"), APPLY_THUMB_NAMES_JAVA)?;
     std::fs::write(scripts.join("ApplyGlobals.java"), APPLY_GLOBALS_JAVA)?;
     std::fs::write(
         scripts.join("ApplyGlobalTypes.java"),
@@ -2270,6 +2569,7 @@ fn run_report_impl(
                             &runtime,
                             thumb_functions,
                             None,
+                            None,
                         )
                     })
                     .and_then(|summary| {
@@ -2428,6 +2728,8 @@ fn run_report_impl(
                     thumb_error: r.thumb_error,
                     terminal_error: r.terminal_error,
                     pass2_applied: None,
+                    pass2_creation_plan: None,
+                    pass2_thumb_names: None,
                     pass2_error: None,
                     thumb_decompiled: r.thumb_decompiled,
                     thumb_tighten_error: r.tighten_error,
@@ -2545,10 +2847,10 @@ impl RetainedPass2File {
                 absolute_path.display()
             )));
         }
-        let bytes = std::fs::read(&absolute_path)?;
+        let blake3 = crate::manifest::blake3_file(&absolute_path)?;
         Ok(Self {
             absolute_path,
-            blake3: crate::manifest::blake3_bytes(&bytes),
+            blake3,
         })
     }
 
@@ -2575,11 +2877,18 @@ impl RetainedPass2File {
                 canonical.display()
             )));
         }
+        let current = crate::manifest::blake3_file(&self.absolute_path)?;
+        if current != self.blake3 {
+            return Err(Error::DecomposeIncomplete(format!(
+                "{what} contents changed after preparation: {}",
+                self.absolute_path.display()
+            )));
+        }
         Ok(())
     }
 }
 
-/// The authenticated function-map input for pass 2: the strict v2 symbol map
+/// The authenticated function-map input for pass 2: the strict v3 symbol map
 /// and the retained pass-1 files it binds, plus the image identity the
 /// ten-argument `ApplySymbols` and eight-argument `ExportDecomp` contracts
 /// consume. The PAL identity and its manifest paths live on
@@ -2592,7 +2901,9 @@ pub struct PreparedSymbolPass2Map {
     functions: RetainedPass2File,
     image: RetainedPass2File,
     image_label: String,
-    execution_count: NonZeroUsize,
+    execution_count: usize,
+    applied_decision_count: usize,
+    creation_requests: Vec<crate::symbolicate::Pass2CreationRequest>,
 }
 
 impl PreparedSymbolPass2Map {
@@ -2601,8 +2912,41 @@ impl PreparedSymbolPass2Map {
         functions_path: &Path,
         image_path: &Path,
         image_label: &str,
-        execution_count: NonZeroUsize,
+        execution_count: usize,
+        applied_decision_count: usize,
+        creation_requests: Vec<crate::symbolicate::Pass2CreationRequest>,
     ) -> Result<Self> {
+        if applied_decision_count > execution_count {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 applicable decisions exceed the execution count".into(),
+            ));
+        }
+        if applied_decision_count == 0 && creation_requests.is_empty() {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 function map has no applicable decisions or creations".into(),
+            ));
+        }
+        let mut prior_entry = None;
+        let mut names = BTreeSet::new();
+        for request in &creation_requests {
+            if prior_entry.is_some_and(|entry| request.entry <= entry) {
+                return Err(Error::DecomposeIncomplete(
+                    "pass-2 creation requests are not in unique entry order".into(),
+                ));
+            }
+            prior_entry = Some(request.entry);
+            if !names.insert(request.final_primary.as_str()) {
+                return Err(Error::DecomposeIncomplete(
+                    "pass-2 creation requests repeat a primary name".into(),
+                ));
+            }
+            if !matches!(request.final_source.as_str(), "analysis" | "user_defined") {
+                return Err(Error::DecomposeIncomplete(format!(
+                    "pass-2 creation request has invalid source {:?}",
+                    request.final_source
+                )));
+            }
+        }
         Ok(Self {
             map: RetainedPass2File::prepare(map_path, "pass-2 symbol map")?,
             functions: RetainedPass2File::prepare(
@@ -2612,6 +2956,8 @@ impl PreparedSymbolPass2Map {
             image: RetainedPass2File::prepare(image_path, "raw image")?,
             image_label: image_label.to_string(),
             execution_count,
+            applied_decision_count,
+            creation_requests,
         })
     }
 
@@ -2640,7 +2986,19 @@ impl PreparedSymbolPass2Map {
     /// The number of accepted Ghidra executions the map covers (also the
     /// decision count).
     pub fn execution_count(&self) -> usize {
-        self.execution_count.get()
+        self.execution_count
+    }
+
+    pub fn applied_decision_count(&self) -> usize {
+        self.applied_decision_count
+    }
+
+    pub fn creation_count(&self) -> usize {
+        self.creation_requests.len()
+    }
+
+    pub(crate) fn creation_requests(&self) -> &[crate::symbolicate::Pass2CreationRequest] {
+        &self.creation_requests
     }
 
     /// The exact `PixelModemExtractor.SymbolPass2` property value
@@ -2651,7 +3009,7 @@ impl PreparedSymbolPass2Map {
             "v2:{}:{}:{}",
             self.map.blake3(),
             self.functions.blake3(),
-            self.execution_count.get()
+            self.execution_count
         )
     }
 
@@ -2729,6 +3087,10 @@ pub struct Pass2Input {
 }
 
 impl Pass2Input {
+    fn has_maps(&self) -> bool {
+        self.function_map.is_some() || self.global_map.is_some() || self.global_types_map.is_some()
+    }
+
     fn pal_identity_or_none(&self) -> &str {
         if self.pal_identity.is_empty() {
             "none"
@@ -2740,10 +3102,11 @@ impl Pass2Input {
 
 /// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
 /// `-process` mode on the existing project so there is no re-import and no
-/// re-analysis: the requested `ApplySymbols.java`, `ApplyGlobals.java`, and
-/// `ApplyGlobalTypes.java` scripts run in that order, then `ExportDecomp.java`
-/// regenerates the export with applied function names, global names, and
-/// global types baked in.
+/// re-analysis: `ApplyThumbNames.java` first authenticates and applies the
+/// symbol map's creation section before any other pass-2 mutation; then the
+/// requested `ApplySymbols.java`, `ApplyGlobals.java`, and
+/// `ApplyGlobalTypes.java` scripts run in that order, followed by
+/// `ExportDecomp.java`.
 ///
 /// `ApplySymbols` consumes exactly ten arguments (kit root, image label,
 /// image BLAKE3, PAL identity, task manifest, scatter manifest, retained
@@ -2760,7 +3123,7 @@ fn headless_process_args(
     let function_map = input.function_map.as_ref();
     let global_map = input.global_map.as_ref();
     let global_types_map = input.global_types_map.as_ref();
-    if function_map.is_none() && global_map.is_none() && global_types_map.is_none() {
+    if !input.has_maps() {
         return Ok(None);
     }
 
@@ -2795,6 +3158,19 @@ fn headless_process_args(
         "-scriptPath".to_string(),
         format!("{root}/scripts"),
     ];
+    // Creation preflight must precede every other pass-2 mutation. A failure
+    // here leaves function/global/type application untouched; a later failure
+    // can safely replay an already-owned creation.
+    if let Some(map) = function_map {
+        args.extend([
+            "-postScript".to_string(),
+            "ApplyThumbNames.java".to_string(),
+            label.to_string(),
+            map.image_blake3().to_string(),
+            map.path().to_string_lossy().into_owned(),
+            map.map_blake3().to_string(),
+        ]);
+    }
     if let Some(map) = function_map {
         if map.image_label() != label {
             return Err(Error::DecomposeIncomplete(format!(
@@ -2852,10 +3228,91 @@ fn headless_process_args(
     Ok(Some(args))
 }
 
+fn tail_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
 /// Extract the `N` from the summary line
 /// `ApplySymbols: image=<image> applied N names, M plate comments over E
 /// executions`. `None` when the line is missing or the count is not an
 /// integer — the caller treats `None` as "no information from pass 2".
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyThumbNamesWire {
+    image: String,
+    status: String,
+    candidates: usize,
+    created: usize,
+    reapplied: usize,
+    skipped_existing: usize,
+    skipped_collision: usize,
+}
+
+fn parse_apply_thumb_names_summary(
+    stdout: &str,
+    expected_image: &str,
+    expected_candidates: usize,
+) -> std::result::Result<AppliedThumbNames, String> {
+    let mut payloads = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyThumbNames: "));
+    let payload = payloads
+        .next()
+        .ok_or_else(|| "missing ApplyThumbNames summary".to_string())?;
+    if payloads.next().is_some() {
+        return Err("duplicate ApplyThumbNames summary".to_string());
+    }
+    let wire: ApplyThumbNamesWire = serde_json::from_str(payload)
+        .map_err(|error| format!("malformed ApplyThumbNames summary: {error}"))?;
+    if wire.image != expected_image {
+        return Err(format!(
+            "ApplyThumbNames summary image {:?} does not match {:?}",
+            wire.image, expected_image
+        ));
+    }
+    if wire.status != "ok" {
+        return Err(format!(
+            "unknown ApplyThumbNames summary status {:?}",
+            wire.status
+        ));
+    }
+    if wire.candidates != expected_candidates {
+        return Err(format!(
+            "ApplyThumbNames summary candidates {} do not match prepared map {expected_candidates}",
+            wire.candidates
+        ));
+    }
+    let classified = wire
+        .created
+        .checked_add(wire.reapplied)
+        .and_then(|count| count.checked_add(wire.skipped_existing))
+        .and_then(|count| count.checked_add(wire.skipped_collision))
+        .ok_or_else(|| "ApplyThumbNames summary count overflow".to_string())?;
+    if classified != wire.candidates {
+        return Err(format!(
+            "non-conserving ApplyThumbNames summary: candidates {}, classified {classified}",
+            wire.candidates
+        ));
+    }
+    Ok(AppliedThumbNames {
+        candidates: wire.candidates,
+        created: wire.created,
+        reapplied: wire.reapplied,
+        skipped_existing: wire.skipped_existing,
+        skipped_collision: wire.skipped_collision,
+    })
+}
+
 fn parse_pass2_summary(stdout: &str) -> Option<usize> {
     for line in stdout.lines() {
         let Some(rest) = line.strip_prefix("ApplySymbols:") else {
@@ -3188,15 +3645,28 @@ fn parse_apply_global_types_summary(
 /// Pass 2 of two-pass decompile. Accepts the pass-1 `report` (callers run pass 1
 /// via `run_report` separately and pass its result here — running pass 1 again
 /// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
-/// `inputs.get(&label)` contains a prepared non-zero function or global count
-/// with its corresponding map path. This function records late map validation and
-/// spawn/non-zero process failures into `ImageResult.pass2_error`, rather than
-/// propagating them — pass 1 already produced a valid `decompiled.c`. The caller
-/// additionally records owned-export refresh failures in `pass2_error`.
+/// `inputs.get(&label)` contains at least one prepared function, global, or
+/// global-types map (a function map may be creation-only). This function records
+/// late map validation and spawn/non-zero process failures into
+/// `ImageResult.pass2_error`, rather than propagating them — pass 1 already
+/// produced a valid `decompiled.c`. The caller additionally records owned-export
+/// refresh failures in `pass2_error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pass2ProcessOutcome {
     ProcessSucceeded,
     Failed(String),
+}
+
+fn reset_pass2_runtime_results(image: &mut ImageResult) {
+    image.pass2_error = None;
+    image.pass2_applied = None;
+    image.pass2_thumb_names = None;
+    image.globals_applied = None;
+    image.globals_apply_skipped = None;
+    image.globals_apply_error = None;
+    image.global_types_applied = None;
+    image.global_types_apply_skipped = None;
+    image.global_types_apply_error = None;
 }
 
 #[derive(Debug)]
@@ -3223,10 +3693,12 @@ pub fn run_two_pass(
     let state_home = GhidraStateHome::new()?;
     state_home.create_subdirs()?;
 
+    for image in &mut report.images {
+        reset_pass2_runtime_results(image);
+    }
+
     for (label, input) in inputs {
-        if (input.function_map.is_some() || input.global_map.is_some())
-            && !report.images.iter().any(|image| image.label == *label)
-        {
+        if input.has_maps() && !report.images.iter().any(|image| image.label == *label) {
             outcomes.insert(
                 label.clone(),
                 Pass2ProcessOutcome::Failed("input label absent from pass-1 report".to_string()),
@@ -3238,7 +3710,27 @@ pub fn run_two_pass(
         let Some(input) = inputs.get(&ir.label) else {
             continue;
         };
-        ir.pass2_error = None;
+        if let Some(map) = input.function_map.as_ref() {
+            match ir.pass2_creation_plan.as_ref() {
+                Some(plan)
+                    if plan.candidates != map.creation_count()
+                        || plan.requests != map.creation_requests() =>
+                {
+                    let reason = "map validation: prepared creation plan changed".to_string();
+                    ir.pass2_error = Some(reason.clone());
+                    outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                    continue;
+                }
+                Some(_) => {}
+                None => {
+                    ir.pass2_creation_plan = Some(Pass2CreationPlan {
+                        candidates: map.creation_count(),
+                        skips: Default::default(),
+                        requests: map.creation_requests().to_vec(),
+                    });
+                }
+            }
+        }
         let args = match headless_process_args(&root_str, &ir.label, input) {
             Ok(Some(args)) => args,
             Ok(None) => continue,
@@ -3252,20 +3744,6 @@ pub fn run_two_pass(
 
         let applies_functions = input.function_map.is_some();
         let applies_globals = input.global_map.is_some();
-        let applies_global_types = input.global_types_map.is_some();
-        if applies_functions {
-            ir.pass2_applied = None;
-        }
-        if applies_globals {
-            ir.globals_applied = None;
-            ir.globals_apply_skipped = None;
-            ir.globals_apply_error = None;
-        }
-        if applies_global_types {
-            ir.global_types_applied = None;
-            ir.global_types_apply_skipped = None;
-            ir.global_types_apply_error = None;
-        }
 
         tracing::info!("ghidra: pass 2 application for {}", ir.label);
         let mut export_attempt = match GhidraExportAttempt::begin(&root, &ir.label) {
@@ -3302,16 +3780,36 @@ pub fn run_two_pass(
                 .unwrap_or_else(|| "none".to_string());
             let pal_identity = input.pal_identity_or_none().to_string();
             if let Err(error) = export_attempt.validate_current(&pal_identity, &symbol_map_hash) {
-                let reason = format!("incomplete current export: {error}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let reason = format!(
+                    "incomplete current export: {error}\nstdout tail:\n{}\nstderr tail:\n{}",
+                    tail_text(&stdout, 2048),
+                    tail_text(&stderr, 2048)
+                );
                 ir.pass2_error = Some(reason.clone());
                 outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
                 continue;
             }
-            export_attempt.mark_current();
             let stdout = String::from_utf8_lossy(&output.stdout);
             if applies_functions {
                 ir.pass2_applied = parse_pass2_summary(&stdout);
+                let expected_candidates = input
+                    .function_map
+                    .as_ref()
+                    .expect("applies_functions requires a function map")
+                    .creation_count();
+                match parse_apply_thumb_names_summary(&stdout, &ir.label, expected_candidates) {
+                    Ok(summary) => ir.pass2_thumb_names = Some(summary),
+                    Err(error) => {
+                        let reason = format!("ApplyThumbNames summary: {error}");
+                        ir.pass2_error = Some(reason.clone());
+                        outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                        continue;
+                    }
+                }
             }
+            export_attempt.mark_current();
             if applies_globals {
                 match parse_apply_globals_summary(&stdout, &ir.label) {
                     Ok(summary @ ApplyGlobalsSummary::Ok { .. }) => {
@@ -4641,7 +5139,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             );
         }
         for pinned in [
-            "PHASE_BUDGET_MS = 15 * 60_000L",
+            "budgetMsOverride(\"PME_TAME_PHASE_BUDGET_MS\", 15 * 60_000L)",
             "MAX_REGIONS = 4096",
             "MAX_REGION_AGGREGATE_BYTES = 512L * 1024L * 1024L",
             "MAX_STREAM_RECORDS = 1_000_000",
@@ -4876,7 +5374,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     &relative_function_path,
                     &image_path,
                     "02_MAIN",
-                    std::num::NonZeroUsize::new(1).unwrap(),
+                    1,
+                    1,
+                    Vec::new(),
                 )
                 .unwrap(),
             ),
@@ -4944,6 +5444,27 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn prepared_symbol_map_rejects_noop_function_input() {
+        let root = tempfile::tempdir().unwrap();
+        let map = root.path().join("symbol_map.json");
+        let functions = root.path().join("functions.json");
+        let image = root.path().join("02_MAIN.bin");
+        std::fs::write(&map, b"map").unwrap();
+        std::fs::write(&functions, b"functions").unwrap();
+        std::fs::write(&image, b"image").unwrap();
+
+        let error =
+            PreparedSymbolPass2Map::new(&map, &functions, &image, "02_MAIN", 1, 0, Vec::new())
+                .expect_err("preserve-only executions and zero creations must not schedule pass 2");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no applicable decisions or creations")
+        );
+    }
+
+    #[test]
     fn validated_headless_process_args_rejects_late_disappearance() {
         for missing_map in ["functions.json", "globals.json", "symbol_map.json"] {
             let root = std::env::temp_dir().join(format!(
@@ -4968,7 +5489,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                         &relative_spelling_from_current_dir(&function_path),
                         &image_path,
                         "02_MAIN",
-                        NonZeroUsize::new(1).unwrap(),
+                        1,
+                        1,
+                        Vec::new(),
                     )
                     .unwrap(),
                 ),
@@ -5002,6 +5525,90 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             }
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn validated_headless_process_args_rejects_late_content_change() {
+        let root = tempfile::tempdir().unwrap();
+        let function_path = root.path().join("functions.json");
+        let map_path = root.path().join("symbol_map.json");
+        let image_path = root.path().join("02_MAIN.bin");
+        std::fs::write(&function_path, b"functions").unwrap();
+        std::fs::write(&map_path, b"original map").unwrap();
+        std::fs::write(&image_path, b"image").unwrap();
+        let input = Pass2Input {
+            function_map: Some(
+                PreparedSymbolPass2Map::new(
+                    &map_path,
+                    &function_path,
+                    &image_path,
+                    "02_MAIN",
+                    1,
+                    1,
+                    Vec::new(),
+                )
+                .unwrap(),
+            ),
+            ..Pass2Input::default()
+        };
+        std::fs::write(&map_path, b"changed map").unwrap();
+
+        let error = headless_process_args("/out", "02_MAIN", &input)
+            .expect_err("retained map content changed after preparation");
+
+        assert!(error.to_string().contains("contents changed"));
+    }
+
+    #[test]
+    fn pass2_runtime_results_clear_even_when_component_is_not_scheduled() {
+        let mut image = ImageResult {
+            label: "02_MAIN".into(),
+            outcome: ImageOutcome::Analyzed(1),
+            classification: Some("not_opaque"),
+            thumb_functions: None,
+            thumb_regions_requested: None,
+            thumb_regions_succeeded: None,
+            thumb_regions_failed: None,
+            thumb_radare2_runs: None,
+            thumb_rizin_runs: None,
+            ghidra_execution_accepted: Some(1),
+            ghidra_execution_quarantined: Some(0),
+            thumb_execution_accepted: None,
+            thumb_execution_quarantined: None,
+            image_start: 0,
+            image_len: 1,
+            thumb_error: None,
+            terminal_error: None,
+            pass2_applied: Some(7),
+            pass2_creation_plan: None,
+            pass2_thumb_names: Some(AppliedThumbNames {
+                candidates: 1,
+                created: 1,
+                reapplied: 0,
+                skipped_existing: 0,
+                skipped_collision: 0,
+            }),
+            pass2_error: Some("stale".into()),
+            thumb_decompiled: None,
+            thumb_tighten_error: None,
+            thumb_enrich_error: None,
+            globals_error: None,
+            globals_recovered: None,
+            globals_applied: None,
+            globals_apply_skipped: None,
+            globals_apply_error: None,
+            global_types_applied: None,
+            global_types_apply_skipped: None,
+            global_types_apply_error: None,
+            globals_provisional: None,
+            globals_provisional_suppressed: None,
+            pal_applied: None,
+        };
+        reset_pass2_runtime_results(&mut image);
+
+        assert_eq!(image.pass2_applied, None);
+        assert_eq!(image.pass2_thumb_names, None);
+        assert_eq!(image.pass2_error, None);
     }
 
     fn relative_spelling_from_current_dir(path: &Path) -> PathBuf {
@@ -5059,7 +5666,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             &functions_path,
             &image_path,
             label,
-            NonZeroUsize::new(3).unwrap(),
+            3,
+            3,
+            Vec::new(),
         )
         .unwrap()
     }
@@ -5131,12 +5740,18 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ExportDecomp must consume exactly its eight arguments"
         );
         let apply_position = apply_at;
+        let thumb_position = args
+            .iter()
+            .position(|arg| arg == "ApplyThumbNames.java")
+            .unwrap();
         assert!(
-            args.iter()
-                .position(|arg| arg == "ApplyGlobals.java")
-                .is_some_and(|globals| globals > apply_position)
+            thumb_position < apply_position
+                && args
+                    .iter()
+                    .position(|arg| arg == "ApplyGlobals.java")
+                    .is_some_and(|globals| globals > apply_position)
                 && apply_position < export_at,
-            "order must be ApplySymbols -> ApplyGlobals -> ExportDecomp"
+            "order must be ApplyThumbNames -> ApplySymbols -> ApplyGlobals -> ExportDecomp"
         );
     }
 
@@ -5409,6 +6024,51 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Omitting `global_types_map` from the absent-label preflight loses the
+    /// promised per-label failure and leaves only an aggregate count mismatch.
+    #[test]
+    fn global_types_only_absent_pass1_label_gets_explicit_failed_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        std::fs::create_dir_all(ghidra_home.join("support")).unwrap();
+        std::fs::write(ghidra_home.join("support/analyzeHeadless"), b"unused").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let type_map_path = dir.path().join("global-types.json");
+        std::fs::write(&type_map_path, b"type map").unwrap();
+        let input = Pass2Input {
+            global_types_map: Some(
+                PreparedPass2Map::new(&type_map_path, NonZeroUsize::new(1).unwrap()).unwrap(),
+            ),
+            ..Pass2Input::default()
+        };
+        let report = DecompileReport {
+            images: Vec::new(),
+            spec_path: out.join("ghidra_load.json"),
+            current_exports: BTreeSet::new(),
+            runtime_scatter: HashMap::new(),
+            runtime_tasks: HashMap::new(),
+        };
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+
+        let result = run_two_pass(
+            report,
+            &opts,
+            &out,
+            &HashMap::from([("07_MISSING".to_string(), input)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.outcomes.get("07_MISSING"),
+            Some(&Pass2ProcessOutcome::Failed(
+                "input label absent from pass-1 report".to_string()
+            ))
+        );
+    }
+
     #[test]
     fn parse_pass2_summary_reads_applied_count() {
         let stdout = "...\nApplySymbols: image=02_MAIN applied 42 names, 7 plate comments over 6 executions\n";
@@ -5595,6 +6255,55 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(
             parse_apply_globals_summary(&ok_globals_summary(6, 1, 1, 1, 1, 1), "02_MAIN").is_err()
         );
+    }
+
+    #[test]
+    fn parse_thumb_names_summary_reads_conserving_json() {
+        let line = r#"ApplyThumbNames: {"image":"02_MAIN","status":"ok","candidates":3,"created":1,"reapplied":0,"skipped_existing":1,"skipped_collision":1}"#;
+        assert_eq!(
+            parse_apply_thumb_names_summary(line, "02_MAIN", 3).unwrap(),
+            AppliedThumbNames {
+                candidates: 3,
+                created: 1,
+                reapplied: 0,
+                skipped_existing: 1,
+                skipped_collision: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_thumb_names_summary_requires_exactly_one_interface_line() {
+        let line = r#"ApplyThumbNames: {"image":"02_MAIN","status":"ok","candidates":0,"created":0,"reapplied":0,"skipped_existing":0,"skipped_collision":0}"#;
+        assert!(parse_apply_thumb_names_summary("ordinary Ghidra output", "02_MAIN", 0).is_err());
+        assert!(parse_apply_thumb_names_summary(&format!("{line}\n{line}"), "02_MAIN", 0).is_err());
+    }
+
+    #[test]
+    fn parse_thumb_names_summary_rejects_non_conserving_counts() {
+        let line = r#"ApplyThumbNames: {"image":"02_MAIN","status":"ok","candidates":4,"created":1,"reapplied":0,"skipped_existing":1,"skipped_collision":1}"#;
+        assert!(parse_apply_thumb_names_summary(line, "02_MAIN", 4).is_err());
+    }
+
+    #[test]
+    fn parse_thumb_names_summary_rejects_non_ok_or_incomplete_payloads() {
+        for line in [
+            r#"ApplyThumbNames: {"image":"02_MAIN","status":"error","candidates":1,"created":1,"reapplied":0,"skipped_existing":0,"skipped_collision":0}"#,
+            r#"ApplyThumbNames: {"image":"02_MAIN","status":"ok","created":1}"#,
+            r#"ApplyThumbNames: {"image":"02_MAIN","status":"ok","candidates":1,"created":-1,"reapplied":0,"skipped_existing":0,"skipped_collision":0}"#,
+        ] {
+            assert!(
+                parse_apply_thumb_names_summary(line, "02_MAIN", 1).is_err(),
+                "malformed summary unexpectedly accepted: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_thumb_names_summary_rejects_wrong_image_or_candidate_count() {
+        let line = r#"ApplyThumbNames: {"image":"02_MAIN","status":"ok","candidates":3,"created":1,"reapplied":0,"skipped_existing":1,"skipped_collision":1}"#;
+        assert!(parse_apply_thumb_names_summary(line, "01_MAIN", 3).is_err());
+        assert!(parse_apply_thumb_names_summary(line, "02_MAIN", 4).is_err());
     }
 
     #[test]
@@ -6001,7 +6710,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         .unwrap();
 
         let summary =
-            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None)
+            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None, None)
                 .unwrap();
 
         assert_eq!(summary.ghidra.raw, 2);
@@ -6022,7 +6731,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .any(|execution| execution.identity.decode_ranges[0].isa == DecodeIsa::Thumb)
         );
         assert!(
-            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), None, None).is_err(),
+            validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), None, None, None,)
+                .is_err(),
             "an unexpected retained Thumb inventory is stale current-run state"
         );
 
@@ -6038,6 +6748,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 &test_runtime(),
                 Some(0),
                 Some(&summary),
+                None,
             )
             .is_err(),
             "a stale pass-1 Ghidra inventory without mandatory ranges must fail"
@@ -6068,12 +6779,274 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 &test_runtime(),
                 Some(0),
                 Some(&summary),
+                None,
             )
             .is_err(),
             "pass 2 must not silently change a current quarantine projection"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn terminal_ghidra_record(
+        entry: u32,
+        isa: &str,
+        name: &str,
+        primary_source: &str,
+    ) -> serde_json::Value {
+        let end = entry + 4;
+        serde_json::json!({
+            "name": name,
+            "primary_source": primary_source,
+            "entry": format!("0x{entry:x}"),
+            "end": format!("0x{end:x}"),
+            "size": 4,
+            "decode_ranges": [{
+                "isa": isa,
+                "start": format!("0x{entry:x}"),
+                "end": format!("0x{end:x}"),
+                "blake3": crate::manifest::blake3_bytes(&[0; 4]),
+            }],
+            "decode_range_errors": [],
+            "data_refs": [],
+        })
+    }
+
+    #[test]
+    fn terminal_inventory_rejects_retained_identity_substitution_with_matching_growth() {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("functions.json");
+        let absent_thumb = root.path().join("thumb_functions.json");
+        let a = terminal_ghidra_record(0x4000, "arm", "a", "default");
+        let b = terminal_ghidra_record(0x4004, "arm", "b", "default");
+        std::fs::write(&ghidra, serde_json::to_vec(&vec![a, b.clone()]).unwrap()).unwrap();
+        let retained = validate_terminal_inventory_pair(
+            &ghidra,
+            &absent_thumb,
+            &test_runtime(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let c = terminal_ghidra_record(0x4008, "thumb", "created_c", "analysis");
+        let d = terminal_ghidra_record(0x400c, "thumb", "created_d", "analysis");
+        std::fs::write(&ghidra, serde_json::to_vec(&vec![b, c, d]).unwrap()).unwrap();
+        let summary = AppliedThumbNames {
+            candidates: 1,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 0,
+            skipped_collision: 0,
+        };
+        let request = crate::symbolicate::Pass2CreationRequest {
+            entry: 0x4008,
+            final_primary: "created_c".to_string(),
+            final_source: "analysis".to_string(),
+        };
+
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &absent_thumb,
+                &test_runtime(),
+                None,
+                Some(&retained),
+                Some(TerminalCreationExpectation {
+                    summary: &summary,
+                    requests: std::slice::from_ref(&request),
+                }),
+            )
+            .is_err(),
+            "aggregate growth must not hide replacement of a retained identity"
+        );
+    }
+
+    #[test]
+    fn terminal_inventory_binds_created_entry_name_and_source_to_the_map() {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("functions.json");
+        let absent_thumb = root.path().join("thumb_functions.json");
+        let retained_record = terminal_ghidra_record(0x4000, "arm", "retained", "default");
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&vec![retained_record.clone()]).unwrap(),
+        )
+        .unwrap();
+        let retained = validate_terminal_inventory_pair(
+            &ghidra,
+            &absent_thumb,
+            &test_runtime(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let summary = AppliedThumbNames {
+            candidates: 1,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 0,
+            skipped_collision: 0,
+        };
+        let request = crate::symbolicate::Pass2CreationRequest {
+            entry: 0x4008,
+            final_primary: "created".to_string(),
+            final_source: "analysis".to_string(),
+        };
+
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&vec![
+                retained_record.clone(),
+                terminal_ghidra_record(0x4008, "arm", "created", "analysis"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &absent_thumb,
+                &test_runtime(),
+                None,
+                None,
+                Some(TerminalCreationExpectation {
+                    summary: &summary,
+                    requests: std::slice::from_ref(&request),
+                }),
+            )
+            .is_err(),
+            "first placement must require an accepted Thumb range at the entry"
+        );
+
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&vec![
+                retained_record.clone(),
+                terminal_ghidra_record(0x4008, "thumb", "created", "analysis"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_terminal_inventory_pair(
+                &ghidra,
+                &absent_thumb,
+                &test_runtime(),
+                None,
+                Some(&retained),
+                Some(TerminalCreationExpectation {
+                    summary: &summary,
+                    requests: std::slice::from_ref(&request),
+                }),
+            )
+            .is_ok()
+        );
+
+        for created in [
+            terminal_ghidra_record(0x400c, "thumb", "created", "analysis"),
+            terminal_ghidra_record(0x4008, "thumb", "wrong", "analysis"),
+            terminal_ghidra_record(0x4008, "thumb", "created", "user_defined"),
+            terminal_ghidra_record(0x4008, "arm", "created", "analysis"),
+        ] {
+            std::fs::write(
+                &ghidra,
+                serde_json::to_vec(&vec![retained_record.clone(), created]).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                validate_terminal_inventory_pair(
+                    &ghidra,
+                    &absent_thumb,
+                    &test_runtime(),
+                    None,
+                    Some(&retained),
+                    Some(TerminalCreationExpectation {
+                        summary: &summary,
+                        requests: std::slice::from_ref(&request),
+                    }),
+                )
+                .is_err(),
+                "unrequested or drifted created function was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_creation_accepts_later_thumb_range_starting_at_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("functions.json");
+        let absent_thumb = root.path().join("thumb_functions.json");
+        let retained_record = terminal_ghidra_record(0x4000, "arm", "retained", "default");
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&vec![retained_record.clone()]).unwrap(),
+        )
+        .unwrap();
+        let retained = validate_terminal_inventory_pair(
+            &ghidra,
+            &absent_thumb,
+            &test_runtime(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let created = serde_json::json!({
+            "name": "created",
+            "primary_source": "analysis",
+            "entry": "0x4008",
+            "end": "0x400c",
+            "size": 6,
+            "decode_ranges": [
+                {
+                    "isa": "thumb",
+                    "start": "0x4004",
+                    "end": "0x4006",
+                    "blake3": crate::manifest::blake3_bytes(&[0; 2]),
+                },
+                {
+                    "isa": "thumb",
+                    "start": "0x4008",
+                    "end": "0x400c",
+                    "blake3": crate::manifest::blake3_bytes(&[0; 4]),
+                }
+            ],
+            "decode_range_errors": [],
+            "data_refs": [],
+        });
+        std::fs::write(
+            &ghidra,
+            serde_json::to_vec(&vec![retained_record, created]).unwrap(),
+        )
+        .unwrap();
+        let summary = AppliedThumbNames {
+            candidates: 1,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 0,
+            skipped_collision: 0,
+        };
+        let request = crate::symbolicate::Pass2CreationRequest {
+            entry: 0x4008,
+            final_primary: "created".to_string(),
+            final_source: "analysis".to_string(),
+        };
+
+        validate_terminal_inventory_pair(
+            &ghidra,
+            &absent_thumb,
+            &test_runtime(),
+            None,
+            Some(&retained),
+            Some(TerminalCreationExpectation {
+                summary: &summary,
+                requests: std::slice::from_ref(&request),
+            }),
+        )
+        .expect("any accepted Thumb range may start at the function entry");
     }
 
     const TERMINAL_V3_ARTIFACT: &str = r#"{
@@ -6303,7 +7276,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let thumb = root.path().join("thumb_functions.json");
         std::fs::write(&ghidra, b"[]").unwrap();
         std::fs::write(&thumb, artifact).unwrap();
-        validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None).unwrap()
+        validate_terminal_inventory_pair(&ghidra, &thumb, &test_runtime(), Some(0), None, None)
+            .unwrap()
     }
 
     fn currentness_error(
@@ -7024,6 +7998,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 thumb_error: Some("radare2 parser rejected empty stdout".into()),
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_creation_plan: None,
+                pass2_thumb_names: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -7486,6 +8462,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 thumb_error: None,
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_creation_plan: None,
+                pass2_thumb_names: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -7535,6 +8513,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 ),
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_creation_plan: None,
+                pass2_thumb_names: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -7585,6 +8565,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -7695,6 +8677,88 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn symbol_map_creation_limits() {
+        // A giant map is not a practical unit fixture, so pin the parser's
+        // combined execution-plus-creation accounting at its source boundary.
+        let creations = PAL_TASKS_SUPPORT_JAVA
+            .split_once("name(reader, \"creations\");")
+            .expect("PalTasksSupport must parse creations")
+            .1
+            .split_once("endArray(reader, \"creations\");")
+            .expect("PalTasksSupport must finish the creations array")
+            .0;
+        let parser = creations.split_whitespace().collect::<Vec<_>>().join(" ");
+        let unique_position = |needle: &str| {
+            let positions = parser
+                .match_indices(needle)
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                positions.len(),
+                1,
+                "creations parser must contain exactly one {needle:?}"
+            );
+            positions[0]
+        };
+
+        let loops = parser
+            .match_indices("while (arrayHasNext(reader)) {")
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            loops.len(),
+            2,
+            "creations parser must contain exactly its outer creation loop and inner range loop"
+        );
+        let outer_loop = loops[0];
+        let inner_loop = loops[1];
+        let inner_loop_end = unique_position("} endArray(reader, \"decode_ranges\");");
+        let range_total = unique_position("long creationRangeTotal = totalRanges;");
+        let charged_total = unique_position("long creationChargedTotal = chargedBytes;");
+        let range_guard =
+            unique_position("if (creationRangeTotal >= MAX_EXECUTION_RANGES_TOTAL) {");
+        let per_creation_add = unique_position(
+            "creationCharged = checkedAdd(creationCharged, end - start, \"charged range bytes\");",
+        );
+        let per_creation_guard =
+            unique_position("if (creationCharged > MAX_CHARGED_RANGE_BYTES) {");
+        let combined_add = unique_position(
+            "creationChargedTotal = checkedAdd(creationChargedTotal, end - start, \"aggregate creation charged range bytes\");",
+        );
+        let combined_guard =
+            unique_position("if (creationChargedTotal > MAX_CHARGED_RANGE_BYTES) {");
+        let range_increment = unique_position("creationRangeTotal++;");
+        let accept =
+            unique_position("ranges.add(new ExecutionRangeWire(isa, start, end, blake3));");
+
+        assert!(
+            range_total < outer_loop && charged_total < outer_loop,
+            "aggregate creation totals must be initialized before the outer creation loop"
+        );
+        assert!(
+            outer_loop < inner_loop,
+            "the outer creation loop must precede the inner range loop"
+        );
+        for (relationship, position) in [
+            ("aggregate range guard", range_guard),
+            ("per-creation charged-byte addition", per_creation_add),
+            ("per-creation charged-byte guard", per_creation_guard),
+            ("aggregate charged-byte addition", combined_add),
+            ("aggregate charged-byte guard", combined_guard),
+            ("aggregate range increment", range_increment),
+            ("range acceptance", accept),
+        ] {
+            assert!(
+                inner_loop < position && position < inner_loop_end,
+                "{relationship} must remain inside the inner range loop"
+            );
+        }
+        assert!(range_guard < range_increment && range_increment < accept);
+        assert!(per_creation_add < per_creation_guard && per_creation_guard < accept);
+        assert!(combined_add < combined_guard && combined_guard < accept);
+    }
+
+    #[test]
     fn generated_kit_stages_pal_support() {
         // The Rust-side Ghidra leaf limit and the Java-side runtime
         // assertion must pin the same 2000-character ceiling.
@@ -7735,9 +8799,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let source = PAL_TASKS_SUPPORT_JAVA;
         for owned in [
             "pixel-modem-extractor-pal-tasks-v1",
-            "pixel-modem-extractor-symbol-map-v2",
+            "pixel-modem-extractor-symbol-map-v3",
             "PixelModemExtractor_PalTasks_v1",
             "PixelModemExtractor.PalTasks.v1.Ownership",
+            "PixelModemExtractor.ThumbNames.v1.Ownership",
             "PixelModemExtractor.PalTasks\"",
             "PixelModemExtractor.SymbolPass2",
             "pixel-modem-extractor-execution-v1",
@@ -7772,6 +8837,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 out.join("scripts/ApplyPalTasks.java").to_string_lossy(),
                 out.join("scripts/ApplyScatterLoad.java").to_string_lossy(),
                 out.join("scripts/ApplySymbols.java").to_string_lossy(),
+                out.join("scripts/ApplyThumbNames.java").to_string_lossy(),
                 out.join("scripts/ExportDecomp.java").to_string_lossy(),
                 out.join("scripts/PalTasksSupport.java").to_string_lossy(),
                 out.join("scripts/TameAnalysis.java").to_string_lossy(),
@@ -7798,6 +8864,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     path.display()
                 );
             }
+            let normalized = other.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !normalized.contains("static final String THUMB_CREATION_OWNERSHIP_MAP"),
+                "{} redeclares THUMB_CREATION_OWNERSHIP_MAP owned by PalTasksSupport",
+                path.display()
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8127,6 +9199,14 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert!(EXPORT_DECOMP_JAVA.contains("StandardCopyOption.ATOMIC_MOVE"));
         assert!(EXPORT_DECOMP_JAVA.contains("StandardCopyOption.REPLACE_EXISTING"));
+    }
+
+    #[test]
+    fn export_fallback_is_limited_to_map_absent_runs() {
+        assert!(
+            EXPORT_DECOMP_JAVA.contains("if (map == null && fm.getFunctionCount() == 0)"),
+            "the entry fallback must never mutate map-authenticated pass-2 state"
+        );
     }
 
     #[test]

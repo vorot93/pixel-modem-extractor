@@ -56,10 +56,15 @@ pub enum Tier {
 pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v3";
 
 /// Strict pass-2 map format name shared with the Java reader.
-pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v2";
+pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v3";
 
 /// Interface limits for the strict map (mirrored by `PalTasksSupport.java`).
 pub const MAX_MAP_ANNOTATIONS_PER_DECISION: usize = 256;
+
+/// Upper bound on creation entries in one pass-2 symbol map. The measured
+/// corpus peak is ~4.2k (mustang MAIN, all tiers); the bound leaves 15x
+/// headroom while keeping a malformed map bounded.
+pub const MAX_MAP_CREATIONS: usize = 65_536;
 pub const MAX_MAP_ANNOTATION_UTF8_BYTES: usize = 4096;
 pub const MAX_MAP_ANNOTATION_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_PRIMARY_CHARS: usize = 2000;
@@ -1095,10 +1100,12 @@ fn write_symbols_json(
 }
 
 /// Serializable shape of the strict pass-2 symbol map
-/// (`pixel-modem-extractor-symbol-map-v2`), consumed by `ApplySymbols.java`
-/// (application) and `ExportDecomp.java` (postflight identity comparison)
-/// through the shared `PalTasksSupport` reader. Field order below is the
-/// canonical wire order; the Java reader enforces it exactly.
+/// (`pixel-modem-extractor-symbol-map-v3`), consumed first by
+/// `ApplyThumbNames.java` (creation of named functions Ghidra never discovered),
+/// then by `ApplySymbols.java` (application), and finally by
+/// `ExportDecomp.java` (postflight identity comparison) through the shared
+/// `PalTasksSupport` reader. Field order below is the canonical wire order; the
+/// Java reader enforces it exactly.
 #[derive(Serialize)]
 struct SymbolMapFile<'a> {
     format: &'static str,
@@ -1107,6 +1114,7 @@ struct SymbolMapFile<'a> {
     functions_blake3: &'a str,
     executions: Vec<ExecutionBlock<'a>>,
     symbols: Vec<DecisionBlock<'a>>,
+    creations: Vec<CreationBlock<'a>>,
 }
 
 #[derive(Serialize)]
@@ -1144,6 +1152,22 @@ struct DecisionBlock<'a> {
     pal_transition: Option<PalTransition>,
 }
 
+/// One function to *create* in the Ghidra program during pass 2: a named,
+/// producer-authenticated Thumb execution whose entry Ghidra's own inventory
+/// never discovered (dense-Thumb functions owned by radare2/Rizin). Ghidra
+/// disassembles only inside the authenticated address set and passes the
+/// explicit returned set to `CreateFunctionCmd`; the final body must remain
+/// wholly inside those ranges, so a name never reaches the program without a
+/// validated execution identity behind it.
+#[derive(Serialize)]
+struct CreationBlock<'a> {
+    entry: String,
+    execution_blake3: String,
+    decode_ranges: &'a [DecodeRangeWire],
+    final_primary: &'a str,
+    final_source: &'static str,
+}
+
 #[derive(Serialize)]
 struct PalTransition {
     from: &'static str,
@@ -1161,6 +1185,9 @@ struct GhidraExecutionRecord {
     original_source: String,
     /// First decode-range ISA ("arm" | "thumb") for the sort key.
     first_isa: &'static str,
+    /// Entry of the in-program function this thunk forwards to, when the
+    /// retained record carries the relation.
+    thunk_of: Option<u32>,
     execution_digest: [u8; 32],
 }
 
@@ -1175,8 +1202,23 @@ pub struct WrittenSymbolMap {
     /// Accepted Ghidra executions covered (== decisions).
     pub execution_count: usize,
     /// Decisions that apply anything (a rename or at least one annotation) —
-    /// the pass-2 scheduling gate.
+    /// together with `creation_count`, the pass-2 scheduling gate.
     pub applied_decision_count: usize,
+    /// Named producer-authenticated Thumb entries Ghidra never discovered,
+    /// to create in the Ghidra program during pass 2.
+    pub creation_count: usize,
+    /// Exact entry/name/source requests serialized in `creations`, retained
+    /// for Rust-side terminal validation after Ghidra exports pass 2.
+    pub creation_requests: Vec<Pass2CreationRequest>,
+    /// Why named entries did not become creations (report diagnostics).
+    pub creation_skips: Pass2CreationSkips,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pass2CreationRequest {
+    pub entry: u32,
+    pub final_primary: String,
+    pub final_source: String,
 }
 
 fn map_string_check(value: &str, what: &str) -> Result<()> {
@@ -1269,6 +1311,11 @@ pub(crate) fn write_pass2_symbol_map(
     let functions_blake3 = crate::manifest::blake3_bytes(&functions_bytes);
     let streamed =
         crate::execution_ranges::read_ghidra_inventory_streaming(&functions_path, runtime)?;
+    let ghidra_entries: std::collections::HashSet<u32> = streamed
+        .functions
+        .iter()
+        .map(|record| record.tagged.entry)
+        .collect();
     let mut executions: Vec<GhidraExecutionRecord> = Vec::new();
     for record in streamed.functions {
         let Some(execution) = crate::execution_ranges::execution_identity(
@@ -1306,6 +1353,7 @@ pub(crate) fn write_pass2_symbol_map(
                 crate::execution_ranges::DecodeIsa::Arm => "arm",
                 crate::execution_ranges::DecodeIsa::Thumb => "thumb",
             },
+            thunk_of: record.thunk_of,
             execution_digest: execution.execution_blake3,
         });
     }
@@ -1321,6 +1369,7 @@ pub(crate) fn write_pass2_symbol_map(
     // symbol for that exact execution identity.
     let mut decisions: Vec<DecisionBlock<'_>> = Vec::with_capacity(executions.len());
     let mut applied_decision_count = 0usize;
+    let mut renamed: std::collections::HashMap<u32, &str> = std::collections::HashMap::new();
     for (index, execution) in executions.iter().enumerate() {
         let symbol = symbols
             .iter()
@@ -1381,7 +1430,7 @@ pub(crate) fn write_pass2_symbol_map(
                     Tier::Recovered => "user_defined",
                     Tier::Provisional | Tier::None => "analysis",
                 };
-                applied_decision_count += 1;
+                renamed.insert(execution.entry, name.as_str());
                 (name.as_str(), source, "rename")
             }
             _ => (
@@ -1390,7 +1439,7 @@ pub(crate) fn write_pass2_symbol_map(
                 "preserve",
             ),
         };
-        if !symbol.annotations.is_empty() {
+        if action == "rename" || !symbol.annotations.is_empty() {
             applied_decision_count += 1;
         }
         decisions.push(DecisionBlock {
@@ -1405,6 +1454,150 @@ pub(crate) fn write_pass2_symbol_map(
         });
     }
 
+    // Ghidra mirrors a referenced function's post-rename primary onto every
+    // thunk of it, recursively through thunk chains (the direct thunk of the
+    // renamed target and every thunk of that thunk follow the new primary;
+    // each thunk's own symbol source is left unchanged). A preserve decision
+    // for such a thunk would fail ApplySymbols' postflight, so the map
+    // encodes the drift it cannot forbid as an explicit `mirror` decision:
+    // the final primary is the chain-root target's renamed primary, the
+    // final source is the thunk's unchanged original source, and
+    // ApplySymbols verifies without mutating (the mirror already happened
+    // through the target's rename). A thunk with its own authorized rename
+    // keeps that decision; the Java side orders thunk renames after
+    // non-thunk renames so the independent name wins over Ghidra's mirror.
+    let thunk_targets: std::collections::HashMap<u32, Option<u32>> = executions
+        .iter()
+        .map(|execution| (execution.entry, execution.thunk_of))
+        .collect();
+    for (decision, execution) in decisions.iter_mut().zip(&executions) {
+        if decision.action != "preserve" {
+            continue;
+        }
+        let mut target = execution.thunk_of;
+        let mut hops = 0usize;
+        while let Some(target_entry) = target {
+            if let Some(&mirrored) = renamed.get(&target_entry) {
+                decision.final_primary = mirrored;
+                decision.action = "mirror";
+                break;
+            }
+            // A cycle or an unbounded chain cannot occur in a validated
+            // Ghidra inventory (thunk graphs are acyclic), but the hop bound
+            // keeps a malformed map from spinning here regardless.
+            hops += 1;
+            if hops > executions.len() {
+                break;
+            }
+            target = thunk_targets.get(&target_entry).copied().flatten();
+        }
+    }
+
+    // Creations: named, producer-authenticated Thumb executions whose entry
+    // Ghidra's inventory never discovered. Only a symbol with a decided name
+    // AND an authenticated execution identity (accepted decode ranges) may
+    // create a Ghidra function; entries Ghidra knows stay on the rename path
+    // above. Two named symbols at one entry with different names are an
+    // ambiguity refused (never arbitrated), and a creation whose name
+    // collides with any decision's final primary or another creation's name
+    // is skipped — the tool never invents suffixed variants (the
+    // ApplyGlobals skip precedent).
+    let taken_names: std::collections::HashSet<&str> = decisions
+        .iter()
+        .map(|decision| decision.final_primary)
+        .collect();
+    let mut creation_candidates: BTreeMap<u32, Vec<&Symbol>> = BTreeMap::new();
+    for symbol in symbols {
+        if !matches!(
+            symbol.owner,
+            FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2
+                    | crate::analysis_tool::AnalysisTool::Rizin,
+                ..
+            }
+        ) || symbol.name.is_none()
+            || symbol.execution_blake3.is_none()
+            || symbol.decode_ranges.is_empty()
+        {
+            continue;
+        }
+        let Ok(entry) = u32::from_str_radix(symbol.address.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let entry = entry & !1;
+        if ghidra_entries.contains(&entry) {
+            continue;
+        }
+        creation_candidates.entry(entry).or_default().push(symbol);
+    }
+    let mut creation_skips: Pass2CreationSkips = Default::default();
+    let mut eligible = Vec::new();
+    for (entry, candidates) in creation_candidates {
+        let symbol = candidates[0];
+        let primary = symbol.name.as_deref().expect("named candidate");
+        let final_source = match symbol.tier {
+            Tier::Recovered => "user_defined",
+            Tier::Provisional | Tier::None => "analysis",
+        };
+        if candidates.iter().any(|candidate| {
+            candidate.name.as_deref() != Some(primary)
+                || candidate.owner != symbol.owner
+                || candidate.execution_blake3 != symbol.execution_blake3
+                || candidate.decode_ranges != symbol.decode_ranges
+                || match candidate.tier {
+                    Tier::Recovered => "user_defined",
+                    Tier::Provisional | Tier::None => "analysis",
+                } != final_source
+        }) {
+            creation_skips.ambiguous += 1;
+            continue;
+        }
+        if primary.chars().count() > MAX_PRIMARY_CHARS {
+            creation_skips.name_limit += 1;
+            continue;
+        }
+        map_string_check(primary, "creation primary")?;
+        let first_start = symbol
+            .decode_ranges
+            .first()
+            .and_then(|range| u32::from_str_radix(range.start.trim_start_matches("0x"), 16).ok());
+        if first_start != Some(entry) {
+            creation_skips.not_entry_start += 1;
+            continue;
+        }
+        eligible.push((entry, symbol, primary, final_source));
+    }
+    let mut name_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, _, primary, _) in &eligible {
+        *name_counts.entry(primary).or_default() += 1;
+    }
+    let mut creations: Vec<CreationBlock<'_>> = Vec::new();
+    let mut creation_requests = Vec::new();
+    for (entry, symbol, primary, final_source) in eligible {
+        if taken_names.contains(primary) || name_counts[primary] != 1 {
+            creation_skips.collision += 1;
+            continue;
+        }
+        if creations.len() >= MAX_MAP_CREATIONS {
+            creation_skips.limit += 1;
+            continue;
+        }
+        creation_requests.push(Pass2CreationRequest {
+            entry,
+            final_primary: primary.to_string(),
+            final_source: final_source.to_string(),
+        });
+        creations.push(CreationBlock {
+            entry: format!("0x{entry:08x}"),
+            execution_blake3: crate::manifest::blake3_fixed(
+                symbol.execution_blake3.expect("authenticated candidate"),
+            ),
+            decode_ranges: &symbol.decode_ranges,
+            final_primary: primary,
+            final_source,
+        });
+    }
+
     let (pal_identity, manifest_blake3, scatter_blake3) = match pal {
         None => ("none", None, None),
         Some(ctx) => (
@@ -1415,6 +1608,7 @@ pub(crate) fn write_pass2_symbol_map(
     };
     let image_size = u64::try_from(image_bytes.len())
         .map_err(|_| Error::Serialize("image size does not fit the map domain".into()))?;
+    let creation_count_value = creations.len();
     let file = SymbolMapFile {
         format: SYMBOL_MAP_FORMAT,
         image: ImageBlock {
@@ -1439,6 +1633,7 @@ pub(crate) fn write_pass2_symbol_map(
             })
             .collect(),
         symbols: decisions,
+        creations,
     };
     let mut bytes =
         serde_json::to_vec_pretty(&file).map_err(|e| Error::Serialize(e.to_string()))?;
@@ -1459,7 +1654,29 @@ pub(crate) fn write_pass2_symbol_map(
         functions_blake3,
         execution_count: executions.len(),
         applied_decision_count,
+        creation_count: creation_count_value,
+        creation_requests,
+        creation_skips,
     })
+}
+
+/// Why named thumb-only entries did not become creation candidates. All
+/// counts are report-facing diagnostics; a skip never fails the map.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Pass2CreationSkips {
+    /// Two named symbols at one entry with different names.
+    pub ambiguous: usize,
+    /// The requested name collides with a decision's or another creation's
+    /// final primary.
+    pub collision: usize,
+    /// The requested name exceeds `MAX_PRIMARY_CHARS`.
+    pub name_limit: usize,
+    /// The map already carries `MAX_MAP_CREATIONS` creations.
+    pub limit: usize,
+    /// The first authenticated decode range does not start at the (Thumb-bit
+    /// stripped) entry, so ApplyThumbNames cannot declare TMode from the entry
+    /// over that range. Skip rather than emit a map the Java reader rejects.
+    pub not_entry_start: usize,
 }
 
 /// The complete result of preparing one image's pass-2 symbol map: the
@@ -1477,7 +1694,7 @@ pub struct Pass2MapBundle {
 /// Build the ranked symbol set for one image and write its strict pass-2 map
 /// to `map_out_path`. One call covers: `build_map` (ranked decisions), the
 /// exact retained-file hash, the runtime-recomputed execution inventory, the
-/// decision cross-checks, and the atomic v2 write.
+/// decision cross-checks, and the atomic v3 write.
 pub fn prepare_pass2_symbol_map(
     map_out_path: &Path,
     image_dir: &Path,
@@ -4225,7 +4442,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Task 11: ranked authority + strict symbol-map v2
+    // Task 11: ranked authority + strict symbol-map v3
     // ------------------------------------------------------------------
 
     fn pal_ref(name: &str, index: u32) -> PalTaskRef {
@@ -4562,6 +4779,641 @@ mod tests {
     }
 
     #[test]
+    fn map_creates_only_from_named_strict_v3_thumb_runs() {
+        let dir = map_fixture_tree("creations");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        // One Ghidra function (renamed) and two named thumb-only symbols at
+        // entries Ghidra never discovered. Readable legacy evidence is not
+        // creation authority; only the concrete strict-v3 run may create.
+        let ghidra_entry = load_addr + 0x100;
+        let legacy_entry = load_addr + 0x280;
+        let strict_v3_entry = load_addr + 0x300;
+        let record = ghidra_function_in_image(
+            "FUN_target",
+            ghidra_entry,
+            ghidra_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        write_map_functions(&dir, &[record]);
+
+        let (identity, _) = identity_for(&dir, ghidra_entry, &image, load_addr);
+        let mut ghidra_symbol = ghidra_symbol_at(ghidra_entry, identity.execution_blake3, None);
+        ghidra_symbol.original_name = "FUN_target".into();
+        ghidra_symbol.name = Some("RealName".into());
+        ghidra_symbol.tier = Tier::Recovered;
+
+        let thumb_symbol = |entry, owner, digest, name: &str| Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner,
+            execution_blake3: Some(digest),
+            decode_ranges: vec![DecodeRangeWire {
+                isa: "thumb",
+                start: format!("0x{entry:x}"),
+                end: format!("0x{:x}", entry + 4),
+                blake3: blake3::hash(
+                    &image[(entry - load_addr) as usize..(entry - load_addr + 4) as usize],
+                )
+                .to_hex()
+                .to_string(),
+            }],
+            name_conflicts: Vec::new(),
+            original_name: "thumb_only".into(),
+            name: Some(name.into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        };
+        let legacy_symbol = thumb_symbol(
+            legacy_entry,
+            FunctionOwner::Legacy {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+            },
+            [7u8; 32],
+            "LegacyName",
+        );
+        let strict_v3_digest = [8u8; 32];
+        let strict_v3_symbol = thumb_symbol(
+            strict_v3_entry,
+            FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index: 2,
+                run_index: 1,
+            },
+            strict_v3_digest,
+            "AtiParsePlusCOPS",
+        );
+
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &[ghidra_symbol, legacy_symbol, strict_v3_symbol],
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.creation_count, 1);
+        assert_eq!(
+            written.creation_requests,
+            vec![Pass2CreationRequest {
+                entry: strict_v3_entry,
+                final_primary: "AtiParsePlusCOPS".to_string(),
+                final_source: "user_defined".to_string(),
+            }]
+        );
+        assert_eq!(written.creation_skips.ambiguous, 0);
+        assert_eq!(written.creation_skips.collision, 0);
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        let creations = parsed["creations"].as_array().unwrap();
+        assert_eq!(creations.len(), 1);
+        assert_eq!(creations[0]["entry"], format!("0x{strict_v3_entry:08x}"));
+        assert_eq!(creations[0]["final_primary"], "AtiParsePlusCOPS");
+        assert_eq!(creations[0]["final_source"], "user_defined");
+        assert_eq!(
+            creations[0]["execution_blake3"],
+            strict_v3_digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(creations[0]["decode_ranges"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn map_counts_rename_with_annotations_as_one_applicable_decision() {
+        let dir = map_fixture_tree("rename_with_annotations");
+        let image = vec![0u8; 0x200];
+        let image_path = dir.join("02_MAIN.bin");
+        std::fs::write(&image_path, &image).unwrap();
+        let load_addr = 0x4000_0000u32;
+        let entry = load_addr + 0x100;
+        let record =
+            ghidra_function_in_image("FUN_target", entry, entry + 8, &[], &image, load_addr);
+        write_map_functions(&dir, &[record]);
+        let (identity, _) = identity_for(&dir, entry, &image, load_addr);
+        let mut symbol = ghidra_symbol_at(entry, identity.execution_blake3, Some("RealName"));
+        symbol.original_name = "FUN_target".into();
+        symbol.annotations = vec!["source: registration table".into()];
+
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &[symbol],
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.execution_count, 1);
+        assert_eq!(written.applied_decision_count, 1);
+
+        let prepared = crate::decompile::PreparedSymbolPass2Map::new(
+            &map_path,
+            &dir.join("decompiled/functions.json"),
+            &image_path,
+            "02_MAIN",
+            written.execution_count,
+            written.applied_decision_count,
+            written.creation_requests,
+        )
+        .unwrap();
+        assert_eq!(prepared.applied_decision_count(), 1);
+    }
+
+    #[test]
+    fn map_skips_ambiguous_and_colliding_creations() {
+        let dir = map_fixture_tree("creation_skips");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let ghidra_entry = load_addr + 0x100;
+        let ambiguous_entry = load_addr + 0x200;
+        let colliding_entry = load_addr + 0x300;
+        let record = ghidra_function_in_image(
+            "FUN_target",
+            ghidra_entry,
+            ghidra_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        write_map_functions(&dir, &[record]);
+        let (identity, _) = identity_for(&dir, ghidra_entry, &image, load_addr);
+        let mut ghidra_symbol = ghidra_symbol_at(ghidra_entry, identity.execution_blake3, None);
+        ghidra_symbol.original_name = "FUN_target".into();
+        ghidra_symbol.name = Some("SharedName".into());
+        ghidra_symbol.tier = Tier::Recovered;
+
+        let mk = |entry: u32, name: Option<&str>| Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner: FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            },
+            execution_blake3: Some([9u8; 32]),
+            decode_ranges: vec![DecodeRangeWire {
+                isa: "thumb",
+                start: format!("0x{entry:x}"),
+                end: format!("0x{:x}", entry + 4),
+                blake3: blake3::hash(
+                    &image[(entry - load_addr) as usize..(entry - load_addr + 4) as usize],
+                )
+                .to_hex()
+                .to_string(),
+            }],
+            name_conflicts: Vec::new(),
+            original_name: "thumb_only".into(),
+            name: name.map(str::to_string),
+            tier: Tier::Provisional,
+            evidence: vec![],
+            annotations: vec![],
+        };
+        // Two different names at one entry -> ambiguous skip.
+        // One name colliding with the decision's final primary -> collision skip.
+        let symbols = vec![
+            ghidra_symbol,
+            mk(ambiguous_entry, Some("NameA")),
+            mk(ambiguous_entry, Some("NameB")),
+            mk(colliding_entry, Some("SharedName")),
+        ];
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.creation_count, 0);
+        assert_eq!(written.creation_skips.ambiguous, 1);
+        assert_eq!(written.creation_skips.collision, 1);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        assert_eq!(parsed["creations"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn map_skips_same_entry_with_distinct_execution_identities() {
+        let dir = map_fixture_tree("creation_identity_ambiguity");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let ghidra_entry = load_addr + 0x100;
+        let thumb_entry = load_addr + 0x200;
+        let record = ghidra_function_in_image(
+            "FUN_target",
+            ghidra_entry,
+            ghidra_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        write_map_functions(&dir, &[record]);
+        let (identity, _) = identity_for(&dir, ghidra_entry, &image, load_addr);
+        let mut ghidra_symbol = ghidra_symbol_at(ghidra_entry, identity.execution_blake3, None);
+        ghidra_symbol.original_name = "FUN_target".into();
+        let range = DecodeRangeWire {
+            isa: "thumb",
+            start: format!("0x{thumb_entry:08x}"),
+            end: format!("0x{:08x}", thumb_entry + 4),
+            blake3: blake3::hash(
+                &image[(thumb_entry - load_addr) as usize..(thumb_entry - load_addr + 4) as usize],
+            )
+            .to_hex()
+            .to_string(),
+        };
+        let mk = |owner, digest| Symbol {
+            address: format!("0x{thumb_entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner,
+            execution_blake3: Some([digest; 32]),
+            decode_ranges: vec![range.clone()],
+            name_conflicts: Vec::new(),
+            original_name: "thumb_only".into(),
+            name: Some("AtiParsePlusCOPS".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        };
+        let symbols = vec![
+            ghidra_symbol,
+            mk(
+                FunctionOwner::Run {
+                    producer: crate::analysis_tool::AnalysisTool::Radare2,
+                    region_index: 0,
+                    run_index: 0,
+                },
+                7,
+            ),
+            mk(
+                FunctionOwner::Run {
+                    producer: crate::analysis_tool::AnalysisTool::Radare2,
+                    region_index: 1,
+                    run_index: 0,
+                },
+                8,
+            ),
+        ];
+        let map_path = dir.join("map.json");
+
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+
+        assert_eq!(written.creation_count, 0);
+        assert_eq!(written.creation_skips.ambiguous, 1);
+    }
+
+    #[test]
+    fn map_skips_every_entry_requesting_the_same_creation_name() {
+        let dir = map_fixture_tree("creation_duplicate_names");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let ghidra_entry = load_addr + 0x100;
+        let record = ghidra_function_in_image(
+            "FUN_target",
+            ghidra_entry,
+            ghidra_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        write_map_functions(&dir, &[record]);
+        let (identity, _) = identity_for(&dir, ghidra_entry, &image, load_addr);
+        let mut ghidra_symbol = ghidra_symbol_at(ghidra_entry, identity.execution_blake3, None);
+        ghidra_symbol.original_name = "FUN_target".into();
+        let mk = |entry: u32| Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner: FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            },
+            execution_blake3: Some([7u8; 32]),
+            decode_ranges: vec![DecodeRangeWire {
+                isa: "thumb",
+                start: format!("0x{entry:08x}"),
+                end: format!("0x{:08x}", entry + 4),
+                blake3: blake3::hash(
+                    &image[(entry - load_addr) as usize..(entry - load_addr + 4) as usize],
+                )
+                .to_hex()
+                .to_string(),
+            }],
+            name_conflicts: Vec::new(),
+            original_name: "thumb_only".into(),
+            name: Some("SharedCreationName".into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        };
+        let symbols = vec![ghidra_symbol, mk(load_addr + 0x200), mk(load_addr + 0x300)];
+        let map_path = dir.join("map.json");
+
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+
+        assert_eq!(written.creation_count, 0);
+        assert_eq!(written.creation_skips.collision, 2);
+    }
+
+    #[test]
+    fn map_serializes_creations_in_entry_order() {
+        let dir = map_fixture_tree("creation_order");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let ghidra_entry = load_addr + 0x100;
+        let record = ghidra_function_in_image(
+            "FUN_target",
+            ghidra_entry,
+            ghidra_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        write_map_functions(&dir, &[record]);
+        let (identity, _) = identity_for(&dir, ghidra_entry, &image, load_addr);
+        let mut ghidra_symbol = ghidra_symbol_at(ghidra_entry, identity.execution_blake3, None);
+        ghidra_symbol.original_name = "FUN_target".into();
+        let mk = |entry: u32, name: &str| Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner: FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            },
+            execution_blake3: Some([entry as u8; 32]),
+            decode_ranges: vec![DecodeRangeWire {
+                isa: "thumb",
+                start: format!("0x{entry:08x}"),
+                end: format!("0x{:08x}", entry + 4),
+                blake3: blake3::hash(
+                    &image[(entry - load_addr) as usize..(entry - load_addr + 4) as usize],
+                )
+                .to_hex()
+                .to_string(),
+            }],
+            name_conflicts: Vec::new(),
+            original_name: "thumb_only".into(),
+            name: Some(name.into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        };
+        let symbols = vec![
+            ghidra_symbol,
+            mk(load_addr + 0x300, "NameThree"),
+            mk(load_addr + 0x180, "NameOne"),
+            mk(load_addr + 0x280, "NameTwo"),
+        ];
+        let map_path = dir.join("map.json");
+
+        write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        let entries: Vec<&str> = parsed["creations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|creation| creation["entry"].as_str().unwrap())
+            .collect();
+        assert_eq!(entries, vec!["0x40000180", "0x40000280", "0x40000300"]);
+    }
+
+    #[test]
+    fn map_skips_creation_whose_first_decode_range_does_not_start_at_entry() {
+        let dir = map_fixture_tree("creation_first_range");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let ghidra_entry = load_addr + 0x100;
+        let ok_entry = load_addr + 0x300;
+        let split_entry = load_addr + 0x280;
+        let prior = load_addr + 0x200;
+        let record = ghidra_function_in_image(
+            "FUN_target",
+            ghidra_entry,
+            ghidra_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        write_map_functions(&dir, &[record]);
+        let (identity, _) = identity_for(&dir, ghidra_entry, &image, load_addr);
+        let mut ghidra_symbol = ghidra_symbol_at(ghidra_entry, identity.execution_blake3, None);
+        ghidra_symbol.original_name = "FUN_target".into();
+        ghidra_symbol.name = Some("RealName".into());
+        ghidra_symbol.tier = Tier::Recovered;
+
+        let range = |start: u32, end: u32| DecodeRangeWire {
+            isa: "thumb",
+            start: format!("0x{start:08x}"),
+            end: format!("0x{end:08x}"),
+            blake3: blake3::hash(&image[(start - load_addr) as usize..(end - load_addr) as usize])
+                .to_hex()
+                .to_string(),
+        };
+        let mk = |entry: u32, ranges: Vec<DecodeRangeWire>, name: &str| Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner: FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            },
+            execution_blake3: Some([7u8; 32]),
+            decode_ranges: ranges,
+            name_conflicts: Vec::new(),
+            original_name: "thumb_only".into(),
+            name: Some(name.into()),
+            tier: Tier::Recovered,
+            evidence: vec![],
+            annotations: vec![],
+        };
+        let symbols = vec![
+            ghidra_symbol,
+            mk(
+                ok_entry,
+                vec![range(ok_entry, ok_entry + 4)],
+                "AtiParsePlusCOPS",
+            ),
+            mk(
+                split_entry,
+                vec![range(prior, prior + 8), range(split_entry, split_entry + 4)],
+                "AtiParsePlusCUSD",
+            ),
+        ];
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.creation_count, 1);
+        assert_eq!(written.creation_skips.not_entry_start, 1);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        let creations = parsed["creations"].as_array().unwrap();
+        assert_eq!(creations.len(), 1);
+        assert_eq!(creations[0]["entry"], format!("0x{ok_entry:08x}"));
+        assert_eq!(creations[0]["final_primary"], "AtiParsePlusCOPS");
+    }
+
+    #[test]
+    fn map_emits_mirror_decisions_for_thunk_chains_of_renamed_targets() {
+        let dir = map_fixture_tree("thunk_chain");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let target_entry = load_addr + 0x100;
+        let direct_entry = load_addr + 0x200;
+        let chained_entry = load_addr + 0x300;
+        let mut target = ghidra_function_in_image(
+            "FUN_target",
+            target_entry,
+            target_entry + 8,
+            &[],
+            &image,
+            load_addr,
+        );
+        target["name"] = serde_json::json!("FUN_target");
+        let mut direct = ghidra_function_in_image(
+            "thunk_FUN_target",
+            direct_entry,
+            direct_entry + 4,
+            &[],
+            &image,
+            load_addr,
+        );
+        direct["thunk_of"] = serde_json::json!(format!("0x{target_entry:x}"));
+        let mut chained = ghidra_function_in_image(
+            "thunk_thunk_FUN_target",
+            chained_entry,
+            chained_entry + 4,
+            &[],
+            &image,
+            load_addr,
+        );
+        chained["thunk_of"] = serde_json::json!(format!("0x{direct_entry:x}"));
+        write_map_functions(&dir, &[chained, direct, target]);
+
+        let mut symbols = Vec::new();
+        for entry in [target_entry, direct_entry, chained_entry] {
+            let (identity, _) = identity_for(&dir, entry, &image, load_addr);
+            let mut symbol = ghidra_symbol_at(entry, identity.execution_blake3, None);
+            symbol.original_name = if entry == target_entry {
+                "FUN_target".to_string()
+            } else if entry == direct_entry {
+                "thunk_FUN_target".to_string()
+            } else {
+                "thunk_thunk_FUN_target".to_string()
+            };
+            if entry == target_entry {
+                symbol.name = Some("AtiParsePlusCOPS".to_string());
+                symbol.tier = Tier::Recovered;
+            }
+            symbols.push(symbol);
+        }
+
+        let map_path = dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        assert_eq!(written.execution_count, 3);
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        let decisions = parsed["symbols"].as_array().unwrap();
+        let by_original = |name: &str| {
+            decisions
+                .iter()
+                .find(|d| d["original_primary"] == name)
+                .unwrap_or_else(|| panic!("no decision for {name}"))
+                .clone()
+        };
+        let target_decision = by_original("FUN_target");
+        assert_eq!(target_decision["action"], "rename");
+        assert_eq!(target_decision["final_primary"], "AtiParsePlusCOPS");
+        // Ghidra mirrors the renamed primary onto every thunk in the chain,
+        // recursively; the map must expect exactly that, keeping each
+        // thunk's own source.
+        let direct_decision = by_original("thunk_FUN_target");
+        assert_eq!(direct_decision["action"], "mirror");
+        assert_eq!(direct_decision["final_primary"], "AtiParsePlusCOPS");
+        assert_eq!(direct_decision["final_source"], "default");
+        let chained_decision = by_original("thunk_thunk_FUN_target");
+        assert_eq!(chained_decision["action"], "mirror");
+        assert_eq!(chained_decision["final_primary"], "AtiParsePlusCOPS");
+        assert_eq!(chained_decision["final_source"], "default");
+        // A mirror never counts as an applied decision.
+        assert_eq!(written.applied_decision_count, 1);
+    }
+
+    #[test]
     fn map_v2_field_order_is_exact_and_functions_blake3_covers_retained_bytes() {
         let dir = map_fixture_tree("order");
         let image = vec![0u8; 0x400];
@@ -4695,8 +5547,32 @@ mod tests {
             "end": format!("0x{:08x}", load_addr + 0x308),
         }]);
 
-        let (symbols, executions) =
+        let (mut symbols, executions) =
             two_execution_fixture(&dir, &image, load_addr, ["default", "default"]);
+        let quarantined_entry = load_addr + 0x300;
+        symbols.push(Symbol {
+            address: format!("0x{quarantined_entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner: FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index: 1,
+                run_index: 0,
+            },
+            execution_blake3: Some([0x33; 32]),
+            decode_ranges: vec![DecodeRangeWire {
+                isa: "thumb",
+                start: format!("0x{quarantined_entry:x}"),
+                end: format!("0x{:x}", quarantined_entry + 4),
+                blake3: blake3::hash(&image[0x300..0x304]).to_hex().to_string(),
+            }],
+            original_name: "thumb_at_quarantined_ghidra_entry".into(),
+            name: Some("RecoveredAtQuarantinedEntry".into()),
+            tier: Tier::Recovered,
+            evidence: Vec::new(),
+            annotations: Vec::new(),
+            name_conflicts: Vec::new(),
+        });
         let bytes = std::fs::read(dir.join("decompiled/functions.json")).unwrap();
         let mut records: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         records.push(quarantined);
@@ -4715,6 +5591,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(written.execution_count, 2, "quarantined record leaked in");
+        assert_eq!(
+            written.creation_count, 0,
+            "a retained quarantined Ghidra entry authorized Thumb creation"
+        );
+        assert!(written.creation_requests.is_empty());
 
         let parsed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();

@@ -116,6 +116,18 @@ pub struct ImageReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_applied: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_creation_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_creation_map_skips: Option<symbolicate::Pass2CreationSkips>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_creation_reapplied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_creation_skipped_existing: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass2_creation_skipped_collision: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pass2_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub globals_applied: Option<usize>,
@@ -271,6 +283,21 @@ impl ImageReport {
             terminal_error: r.terminal_error.clone(),
             exit,
             pass2_applied: r.pass2_applied,
+            pass2_creation_candidates: r.pass2_creation_plan.as_ref().map(|plan| plan.candidates),
+            pass2_creation_map_skips: r.pass2_creation_plan.as_ref().map(|plan| plan.skips),
+            pass2_created: r.pass2_thumb_names.as_ref().map(|summary| summary.created),
+            pass2_creation_reapplied: r
+                .pass2_thumb_names
+                .as_ref()
+                .map(|summary| summary.reapplied),
+            pass2_creation_skipped_existing: r
+                .pass2_thumb_names
+                .as_ref()
+                .map(|summary| summary.skipped_existing),
+            pass2_creation_skipped_collision: r
+                .pass2_thumb_names
+                .as_ref()
+                .map(|summary| summary.skipped_collision),
             pass2_error: r.pass2_error.clone(),
             globals_applied: r.globals_applied,
             globals_apply_skipped: r.globals_apply_skipped,
@@ -1097,10 +1124,95 @@ fn refresh_decompiled(
     ghidra_dir: &Path,
     images_dir: &Path,
     image: &decompile::ImageResult,
-) -> Result<()> {
+) -> Result<decompile::TerminalInventorySummary> {
     let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
     let mut validate = decompile::validate_image_terminal_inventory;
     refresh_decompiled_with(ghidra_dir, images_dir, image, &mut rename, &mut validate)
+}
+
+fn refresh_decompiled_and_update(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    image: &mut decompile::ImageResult,
+) -> Result<()> {
+    let summary = refresh_decompiled(ghidra_dir, images_dir, image)?;
+    match image.outcome {
+        ImageOutcome::Analyzed(_) => image.outcome = ImageOutcome::Analyzed(summary.ghidra.raw),
+        _ => {
+            return Err(Error::Serialize(
+                "pass-2 refresh belongs to a non-analyzed image".into(),
+            ));
+        }
+    }
+    image.ghidra_execution_accepted = Some(summary.ghidra.accepted);
+    image.ghidra_execution_quarantined = Some(summary.ghidra.quarantined);
+    image.thumb_functions = summary.thumb_substantial;
+    image.thumb_execution_accepted = summary.thumb.map(|thumb| thumb.accepted);
+    image.thumb_execution_quarantined = summary.thumb.map(|thumb| thumb.quarantined);
+    Ok(())
+}
+
+fn pass1_creation_baseline(image: &decompile::ImageResult) -> Result<decompile::ImageResult> {
+    let mut retained = image.clone();
+    let Some(summary) = retained.pass2_thumb_names.as_mut() else {
+        return Ok(retained);
+    };
+    let owned = summary
+        .created
+        .checked_add(summary.reapplied)
+        .ok_or_else(|| Error::Serialize("pass-1 creation baseline count overflow".into()))?;
+    summary.created = 0;
+    summary.reapplied = 0;
+    summary.skipped_collision = summary
+        .skipped_collision
+        .checked_add(owned)
+        .ok_or_else(|| Error::Serialize("pass-1 creation baseline count overflow".into()))?;
+    Ok(retained)
+}
+
+fn retained_creation_baseline(image: &decompile::ImageResult) -> Result<decompile::ImageResult> {
+    let mut retained = image.clone();
+    let Some(summary) = retained.pass2_thumb_names.as_mut() else {
+        return Ok(retained);
+    };
+    let newly_created = summary.created;
+    summary.created = summary.reapplied;
+    summary.reapplied = 0;
+    summary.skipped_collision = summary
+        .skipped_collision
+        .checked_add(newly_created)
+        .ok_or_else(|| Error::Serialize("retained creation baseline count overflow".into()))?;
+    Ok(retained)
+}
+
+fn committed_creation_view(image: &decompile::ImageResult) -> Result<decompile::ImageResult> {
+    let mut committed = image.clone();
+    let Some(summary) = committed.pass2_thumb_names.as_mut() else {
+        return Ok(committed);
+    };
+    let newly_created = summary.created;
+    if newly_created == 0 {
+        return Ok(committed);
+    }
+    summary.created = 0;
+    summary.reapplied = summary
+        .reapplied
+        .checked_add(newly_created)
+        .ok_or_else(|| Error::Serialize("committed creation count overflow".into()))?;
+    Ok(committed)
+}
+
+fn unpublished_replay_view(image: &decompile::ImageResult) -> Result<decompile::ImageResult> {
+    let mut unpublished = image.clone();
+    let Some(summary) = unpublished.pass2_thumb_names.as_mut() else {
+        return Ok(unpublished);
+    };
+    summary.created = summary
+        .created
+        .checked_add(summary.reapplied)
+        .ok_or_else(|| Error::Serialize("unpublished replay count overflow".into()))?;
+    summary.reapplied = 0;
+    Ok(unpublished)
 }
 
 fn refresh_decompiled_with<R, V>(
@@ -1109,7 +1221,7 @@ fn refresh_decompiled_with<R, V>(
     image: &decompile::ImageResult,
     rename: &mut R,
     validate: &mut V,
-) -> Result<()>
+) -> Result<decompile::TerminalInventorySummary>
 where
     R: FnMut(&Path, &Path) -> std::io::Result<()>,
     V: FnMut(
@@ -1154,20 +1266,39 @@ where
     }
 
     let dest = images_dir.join(label).join("decompiled");
-    let retained = if dest.exists() {
-        Some(validate(
+    let (retained, staged_image) = if dest.exists() {
+        // A prior saved-project transaction can commit before export or host
+        // publication fails. Prefer pristine pass 1; only fall back to the
+        // fully-published replay baseline when pass 1 does not validate.
+        let pass1_image = pass1_creation_baseline(image)?;
+        match validate(
             &dest.join("functions.json"),
             &dest.join("thumb_functions.json"),
-            image,
+            &pass1_image,
             None,
-        )?)
+        ) {
+            Ok(summary) => (Some(summary), unpublished_replay_view(image)?),
+            Err(pass1_error) => {
+                let replayed_image = retained_creation_baseline(image)?;
+                if replayed_image.pass2_thumb_names == pass1_image.pass2_thumb_names {
+                    return Err(pass1_error);
+                }
+                let summary = validate(
+                    &dest.join("functions.json"),
+                    &dest.join("thumb_functions.json"),
+                    &replayed_image,
+                    None,
+                )?;
+                (Some(summary), image.clone())
+            }
+        }
     } else {
-        None
+        (None, image.clone())
     };
     let staged = validate(
         &export.join("functions.json"),
         &dest.join("thumb_functions.json"),
-        image,
+        &staged_image,
         retained.as_ref(),
     )?;
     if !dest.exists() {
@@ -1177,18 +1308,22 @@ where
             std::fs::create_dir_all(parent)?;
         }
         rename(&export, &dest)?;
-        if let Err(error) = validate(
+        let committed_image = committed_creation_view(image)?;
+        let final_summary = match validate(
             &dest.join("functions.json"),
             &dest.join("thumb_functions.json"),
-            image,
+            &committed_image,
             Some(&staged),
         ) {
-            return match rename(&dest, &export) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(transaction_rollback_error(error, &[rollback])),
-            };
-        }
-        return Ok(());
+            Ok(summary) => summary,
+            Err(error) => {
+                return match rename(&dest, &export) {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(transaction_rollback_error(error, &[rollback])),
+                };
+            }
+        };
+        return Ok(final_summary);
     }
 
     // Destination exists: move the old owned trio aside, install the staged
@@ -1226,16 +1361,19 @@ where
         }
         installed.push(*name);
     }
-    if let Err(error) = validate(
+    let final_summary = match validate(
         &dest.join("functions.json"),
         &dest.join("thumb_functions.json"),
-        image,
+        &staged_image,
         Some(retained.as_ref().unwrap_or(&staged)),
     ) {
-        let rollback_errors =
-            rollback_refresh(&export, &dest, &backup, &installed, &backed_up, rename);
-        return Err(transaction_rollback_error(error, &rollback_errors));
-    }
+        Ok(summary) => summary,
+        Err(error) => {
+            let rollback_errors =
+                rollback_refresh(&export, &dest, &backup, &installed, &backed_up, rename);
+            return Err(transaction_rollback_error(error, &rollback_errors));
+        }
+    };
 
     // Validation is the commit point. Cleanup failures cannot make the
     // destination partially old/new, so retain recoverable artifacts and warn.
@@ -1256,7 +1394,7 @@ where
             "pass-2 refresh for {label} committed but could not remove empty export directory: {error}"
         );
     }
-    Ok(())
+    Ok(final_summary)
 }
 
 fn rollback_refresh<R>(
@@ -1301,13 +1439,24 @@ fn transaction_rollback_error(original: Error, rollback_errors: &[std::io::Error
     ))
 }
 
+fn refresh_pass2_outputs(
+    outcomes: &HashMap<String, decompile::Pass2ProcessOutcome>,
+    images: &mut [decompile::ImageResult],
+    ghidra_dir: &Path,
+    images_dir: &Path,
+) -> (usize, Vec<(String, String)>) {
+    refresh_pass2_outputs_with(outcomes, images, |image| {
+        refresh_decompiled_and_update(ghidra_dir, images_dir, image)
+    })
+}
+
 fn refresh_pass2_outputs_with<F>(
     outcomes: &HashMap<String, decompile::Pass2ProcessOutcome>,
     images: &mut [decompile::ImageResult],
     mut refresh: F,
 ) -> (usize, Vec<(String, String)>)
 where
-    F: FnMut(&decompile::ImageResult) -> Result<()>,
+    F: FnMut(&mut decompile::ImageResult) -> Result<()>,
 {
     let mut labels: Vec<&str> = outcomes.keys().map(String::as_str).collect();
     labels.sort_unstable();
@@ -1327,7 +1476,7 @@ where
                     ));
                     continue;
                 };
-                match refresh(&images[index]) {
+                match refresh(&mut images[index]) {
                     Ok(()) => refreshed += 1,
                     Err(error) => {
                         let reason = format!("refresh: {error}");
@@ -1628,6 +1777,7 @@ fn finalize(
 /// retained for downstream orchestration.
 struct PreparedFunctionMap {
     pass2_map: Option<decompile::PreparedSymbolPass2Map>,
+    creation_plan: decompile::Pass2CreationPlan,
     function_names: HashMap<String, String>,
     evidence_name_projection: globals::FunctionEvidenceNameProjection,
 }
@@ -1693,7 +1843,7 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // deferring the decompiled.c rewrite so its idempotency sentinel does not
         // block pass 2; (2) run globals (writes globals.json); (3) finalize again —
         // now the string-ref tier activates, and this pass rewrites decompiled.c
-        // with the full name set. See CONTRIBUTING (symbolication) for the rationale.
+        // with the full name set. See AGENTS (symbolication) for the rationale.
         run_step(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
         });
@@ -1723,7 +1873,7 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // and the pass-1 functions.json / thumb_functions.json inventory,
         // never decompiled.c; and pass 2 is `-process -noanalysis`, so it
         // never changes function boundaries — the pass-1 inventory the shape
-        // stage consumes is identical pre/post pass 2. See CONTRIBUTING
+        // stage consumes is identical pre/post pass 2. See AGENTS
         // (Phase 3.2) for the full rationale.
         run_step(SymbolRouteStep::RunGlobalShapes);
         run_step(SymbolRouteStep::DispatchPass2);
@@ -1780,11 +1930,9 @@ fn symbol_map_stage(
     mut errors: Vec<(String, String)>,
     duration_ms: u128,
 ) -> StageReport {
-    let total: usize = function_maps
+    let has_output = function_maps
         .values()
-        .filter_map(|prepared| prepared.pass2_map.as_ref())
-        .map(|map| map.execution_count())
-        .sum();
+        .any(|prepared| prepared.pass2_map.is_some());
     if !errors.is_empty() {
         errors.sort();
         let error = errors
@@ -1795,14 +1943,14 @@ fn symbol_map_stage(
         return StageReport {
             stage: "symbol_map",
             status: "failed",
-            output: (total > 0).then(|| "ghidra/symbol_maps/".to_string()),
+            output: has_output.then(|| "ghidra/symbol_maps/".to_string()),
             reason: None,
             error: Some(error),
             images: Vec::new(),
             duration_ms,
         };
     }
-    if total == 0 {
+    if !has_output {
         StageReport::skipped("symbol_map", "no symbols recovered")
     } else {
         StageReport::ok("symbol_map", "ghidra/symbol_maps/", duration_ms)
@@ -1824,8 +1972,12 @@ fn prepare_function_map(
         function_names,
         evidence_name_projection,
     } = bundle;
-    let (pass2_map, validation_error) = if map.applied_decision_count > 0
-        && let Some(execution_count) = NonZeroUsize::new(map.execution_count)
+    let creation_plan = decompile::Pass2CreationPlan {
+        candidates: map.creation_count,
+        skips: map.creation_skips,
+        requests: map.creation_requests,
+    };
+    let (pass2_map, validation_error) = if map.applied_decision_count > 0 || map.creation_count > 0
     {
         let functions_path = image_dir.join("decompiled").join("functions.json");
         let image_path = image_dir.join(format!("{label}.bin"));
@@ -1834,9 +1986,15 @@ fn prepare_function_map(
             &functions_path,
             &image_path,
             label,
-            execution_count,
+            map.execution_count,
+            map.applied_decision_count,
+            creation_plan.requests.clone(),
         ) {
-            Ok(prepared) => (Some(prepared), None),
+            Ok(prepared) if prepared.map_blake3() == map.map_blake3 => (Some(prepared), None),
+            Ok(_) => (
+                None,
+                Some("function map validation: written map identity changed".to_string()),
+            ),
             Err(error) => (None, Some(format!("function map validation: {error}"))),
         }
     } else {
@@ -1846,11 +2004,23 @@ fn prepare_function_map(
     (
         PreparedFunctionMap {
             pass2_map,
+            creation_plan,
             function_names,
             evidence_name_projection,
         },
         validation_error,
     )
+}
+
+fn retain_pass2_creation_plans(
+    images: &mut [decompile::ImageResult],
+    function_maps: &HashMap<String, PreparedFunctionMap>,
+) {
+    for image in images {
+        image.pass2_creation_plan = function_maps
+            .get(&image.label)
+            .map(|prepared| prepared.creation_plan.clone());
+    }
 }
 
 fn take_globals_function_inputs(
@@ -1890,6 +2060,7 @@ struct TerminalPalMap {
 fn load_terminal_pal_maps(
     images_dir: &Path,
     report: &decompile::DecompileReport,
+    ghidra_dir: &Path,
 ) -> (HashMap<String, TerminalPalMap>, Vec<(String, String)>) {
     let mut maps = HashMap::new();
     let mut errors = Vec::new();
@@ -1901,8 +2072,8 @@ fn load_terminal_pal_maps(
         };
         let label = &image.label;
         let image_dir = images_dir.join(label);
-        let manifest_path = image_dir.join("pal_tasks").join(PAL_MANIFEST_FILE);
-        let scatter_manifest = match state.scatter {
+        let terminal_manifest = image_dir.join("pal_tasks").join(PAL_MANIFEST_FILE);
+        let terminal_scatter = match state.scatter {
             decompile::RuntimeScatterState::Present => {
                 Some(image_dir.join("scatter").join("load_map.json"))
             }
@@ -1913,19 +2084,54 @@ fn load_terminal_pal_maps(
             label,
             image.image_start,
             state.scatter,
-            &manifest_path,
+            &terminal_manifest,
             &map.identity,
         ) {
             Ok(artifact) => {
-                maps.insert(
-                    label.clone(),
-                    TerminalPalMap {
-                        identity: artifact.identity.clone(),
-                        manifest_path,
-                        scatter_manifest,
-                        context: pal_pass2_context(&artifact),
-                    },
-                );
+                // Pass-2 manifest arguments must sit inside the Ghidra kit
+                // root (see `stage_pass2_manifest`); a restage failure is a
+                // fail-closed per-image error, never a silent skip.
+                let restage = (|| -> Result<(PathBuf, Option<PathBuf>)> {
+                    let staged_manifest = ghidra_dir
+                        .join("pal_tasks")
+                        .join(label)
+                        .join(PAL_MANIFEST_FILE);
+                    stage_pass2_manifest(&terminal_manifest, &staged_manifest)?;
+                    let staged_scatter = match &terminal_scatter {
+                        Some(terminal) => {
+                            let staged =
+                                ghidra_dir.join("scatter").join(label).join("load_map.json");
+                            stage_pass2_manifest(terminal, &staged)?;
+                            Some(staged)
+                        }
+                        None => None,
+                    };
+                    // `readPal` re-authenticates the raw image at its pass-1
+                    // kit path (`<ghidra>/images/<label>`), which the marshal
+                    // moved to `images/<label>/<label>.bin`; restage those
+                    // bytes as well so the BLAKE3 check binds the same image.
+                    let staged_raw = ghidra_dir.join("images").join(label);
+                    std::fs::create_dir_all(staged_raw.parent().expect("raw image parent"))?;
+                    std::fs::copy(image_dir.join(format!("{label}.bin")), &staged_raw)?;
+                    Ok((staged_manifest, staged_scatter))
+                })();
+                match restage {
+                    Ok((manifest_path, scatter_manifest)) => {
+                        maps.insert(
+                            label.clone(),
+                            TerminalPalMap {
+                                identity: artifact.identity.clone(),
+                                manifest_path,
+                                scatter_manifest,
+                                context: pal_pass2_context(&artifact),
+                            },
+                        );
+                    }
+                    Err(error) => errors.push((
+                        label.clone(),
+                        format!("pass-2 PAL manifest restage: {error}"),
+                    )),
+                }
             }
             Err(error) => errors.push((label.clone(), format!("terminal PAL manifest: {error}"))),
         }
@@ -2010,6 +2216,19 @@ fn pal_pass2_context(
         scatter_load_map_blake3,
         applications,
     }
+}
+
+/// Re-materialize one terminal manifest at its pass-1 source location under
+/// the Ghidra kit root. The pass-1 marshal moves the terminal bytes to
+/// `images/<label>/`, but `ApplySymbols`/`ExportDecomp` authenticate every
+/// manifest argument as canonically contained in the kit root they are
+/// handed — pass 2 runs against `<out>/ghidra`, so the terminal bytes are
+/// copied back. The copies are intermediate pass-2 state under the pruned
+/// `ghidra/` tree; the terminal artifacts stay authoritative.
+fn stage_pass2_manifest(terminal: &Path, staged: &Path) -> Result<()> {
+    std::fs::create_dir_all(staged.parent().expect("staged manifest parent"))?;
+    std::fs::copy(terminal, staged)?;
+    Ok(())
 }
 
 fn prepare_pass2_inputs(
@@ -2884,7 +3103,7 @@ fn record_globals_stage(
 /// `<out>/ghidra/symbol_maps/<label>.json`. Returns `(successes, errors)`:
 /// each success is `(label, PreparedFunctionMap)`; each error is `(label,
 /// message)`. Surfaces
-/// I/O / parse failures (token DB, build_map, the v2 map write) so the caller
+/// I/O / parse failures (token DB, build_map, the v3 map write) so the caller
 /// can distinguish "no symbols recovered" from "stage errored" — the previous
 /// all-`unwrap_or_default` / `.is_ok()` shape silently swallowed real failures
 /// into a benign-looking `symbol_map: skipped`.
@@ -3273,7 +3492,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         (HashMap::new(), Vec::new())
     } else {
         let (pal_maps, pal_errors) = match pass1_report.as_ref() {
-            Some(report) => load_terminal_pal_maps(&images_dir, report),
+            Some(report) => load_terminal_pal_maps(&images_dir, report, &ghidra_dir),
             None => (HashMap::new(), Vec::new()),
         };
         terminal_pal_maps = pal_maps;
@@ -3298,6 +3517,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             symbol_map_errors,
             t.elapsed().as_millis(),
         ));
+    }
+    if let Some(report) = pass1_report.as_mut() {
+        retain_pass2_creation_plans(&mut report.images, &function_maps);
     }
 
     // Phase 3.0 globals options are route-independent.
@@ -3472,10 +3694,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     retained_pass1_images = rep.images.clone();
                     match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &inputs) {
                         Ok(mut pass2) => {
-                            let (refreshed_count, errors) = refresh_pass2_outputs_with(
+                            let (refreshed_count, errors) = refresh_pass2_outputs(
                                 &pass2.outcomes,
                                 &mut pass2.report.images,
-                                |label| refresh_decompiled(&ghidra_dir, &images_dir, label),
+                                &ghidra_dir,
+                                &images_dir,
                             );
                             let elapsed = pass2_started.elapsed().as_millis();
                             pass2_elapsed_ms = elapsed;
@@ -3757,6 +3980,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -3997,7 +4222,9 @@ mod tests {
             &functions_path,
             &image_path,
             label,
-            NonZeroUsize::new(count).unwrap(),
+            count,
+            count,
+            Vec::new(),
         )
         .unwrap()
     }
@@ -4022,10 +4249,14 @@ mod tests {
             .collect();
         let evidence_name_projection =
             globals::FunctionEvidenceNameProjection::from_symbols(&symbols);
+        let map_blake3 = crate::manifest::blake3_file(map_path).unwrap_or_else(|_| "0".repeat(64));
         symbolicate::Pass2MapBundle {
             map: symbolicate::WrittenSymbolMap {
+                creation_count: 0,
+                creation_requests: Vec::new(),
+                creation_skips: Default::default(),
                 path: map_path.to_path_buf(),
-                map_blake3: "0".repeat(64),
+                map_blake3,
                 functions_blake3: "1".repeat(64),
                 execution_count,
                 applied_decision_count,
@@ -4117,6 +4348,63 @@ mod tests {
                 ("ef".to_string(), "provisional_name".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn prepared_function_map_schedules_creation_only_map() {
+        let image_dir = PathBuf::from("target/pme_pass2_creation_only_image");
+        let map_path = PathBuf::from("target/pme_task11_decompose_maps/creation-only.json");
+        std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
+        std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
+        std::fs::write(&map_path, b"map").unwrap();
+        std::fs::write(image_dir.join("decompiled/functions.json"), b"functions").unwrap();
+        std::fs::write(image_dir.join("02_MAIN.bin"), b"image").unwrap();
+        let mut bundle = test_bundle(&map_path, Vec::new(), 0, 0);
+        bundle.map.creation_count = 2;
+        bundle.map.creation_requests = vec![
+            symbolicate::Pass2CreationRequest {
+                entry: 0x4000,
+                final_primary: "created_a".to_string(),
+                final_source: "analysis".to_string(),
+            },
+            symbolicate::Pass2CreationRequest {
+                entry: 0x4002,
+                final_primary: "created_b".to_string(),
+                final_source: "analysis".to_string(),
+            },
+        ];
+        bundle.map.creation_skips = symbolicate::Pass2CreationSkips {
+            ambiguous: 3,
+            collision: 4,
+            name_limit: 5,
+            limit: 6,
+            not_entry_start: 7,
+        };
+
+        let (prepared, validation_error) =
+            prepare_function_map("02_MAIN", &image_dir, &map_path, bundle);
+
+        assert!(validation_error.is_none());
+        assert!(
+            prepared.pass2_map.is_some(),
+            "a creation-only map must schedule pass 2"
+        );
+        assert_eq!(prepared.pass2_map.as_ref().unwrap().creation_count(), 2);
+        assert_eq!(prepared.creation_plan.candidates, 2);
+        assert_eq!(prepared.creation_plan.skips.ambiguous, 3);
+        assert_eq!(prepared.creation_plan.skips.collision, 4);
+        assert_eq!(prepared.creation_plan.skips.name_limit, 5);
+        assert_eq!(prepared.creation_plan.skips.limit, 6);
+        assert_eq!(prepared.creation_plan.skips.not_entry_start, 7);
+        let function_maps = HashMap::from([("02_MAIN".to_string(), prepared)]);
+        let mut images = vec![analyzed_image("02_MAIN")];
+        retain_pass2_creation_plans(&mut images, &function_maps);
+        assert_eq!(
+            images[0].pass2_creation_plan.as_ref().unwrap().candidates,
+            2
+        );
+        let stage = symbol_map_stage(&function_maps, Vec::new(), 0);
+        assert_eq!(stage.status, "ok");
     }
 
     #[test]
@@ -4214,6 +4502,7 @@ mod tests {
                 "02_MAIN".to_string(),
                 PreparedFunctionMap {
                     pass2_map: Some(prepared_symbol_test_map("functions-02_MAIN", "02_MAIN", 3)),
+                    creation_plan: Default::default(),
                     function_names: HashMap::new(),
                     evidence_name_projection: Default::default(),
                 },
@@ -4222,6 +4511,7 @@ mod tests {
                 "03_APM".to_string(),
                 PreparedFunctionMap {
                     pass2_map: Some(prepared_symbol_test_map("functions-03_APM", "03_APM", 2)),
+                    creation_plan: Default::default(),
                     function_names: HashMap::new(),
                     evidence_name_projection: Default::default(),
                 },
@@ -4487,6 +4777,7 @@ mod tests {
             "02_MAIN".to_string(),
             PreparedFunctionMap {
                 pass2_map: Some(prepared_symbol_test_map("mixed-survivor", "02_MAIN", 3)),
+                creation_plan: Default::default(),
                 function_names: HashMap::new(),
                 evidence_name_projection: Default::default(),
             },
@@ -4584,8 +4875,8 @@ mod tests {
             decompile::Pass2ProcessOutcome::ProcessSucceeded,
         )]);
 
-        let (refreshed, errors) = refresh_pass2_outputs_with(&outcomes, &mut images, |label| {
-            refresh_decompiled(&root.join("ghidra"), &root.join("images"), label)
+        let (refreshed, errors) = refresh_pass2_outputs_with(&outcomes, &mut images, |image| {
+            refresh_decompiled_and_update(&root.join("ghidra"), &root.join("images"), image)
         });
 
         assert_eq!(refreshed, 0);
@@ -4613,8 +4904,8 @@ mod tests {
             decompile::Pass2ProcessOutcome::ProcessSucceeded,
         )]);
 
-        let (refreshed, errors) = refresh_pass2_outputs_with(&outcomes, &mut images, |label| {
-            refresh_decompiled(&root.join("ghidra"), &root.join("images"), label)
+        let (refreshed, errors) = refresh_pass2_outputs_with(&outcomes, &mut images, |image| {
+            refresh_decompiled_and_update(&root.join("ghidra"), &root.join("images"), image)
         });
 
         assert_eq!(refreshed, 0);
@@ -5247,6 +5538,7 @@ mod tests {
                     "02_MAIN",
                     2,
                 )),
+                creation_plan: Default::default(),
                 function_names: HashMap::from([
                     ("40".to_string(), "RecoveredMain".to_string()),
                     ("44".to_string(), "guess_main_44".to_string()),
@@ -5367,6 +5659,7 @@ mod tests {
             "02_MAIN".to_string(),
             PreparedFunctionMap {
                 pass2_map: Some(prepared_symbol_test_map("failure-functions", "02_MAIN", 1)),
+                creation_plan: Default::default(),
                 function_names: HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
                 evidence_name_projection: Default::default(),
             },
@@ -5474,6 +5767,7 @@ mod tests {
                     "02_MAIN",
                     3,
                 )),
+                creation_plan: Default::default(),
                 function_names: HashMap::new(),
                 evidence_name_projection: Default::default(),
             },
@@ -5558,8 +5852,8 @@ mod tests {
             decompile::Pass2ProcessOutcome::ProcessSucceeded,
         )]);
         let (refreshed, refresh_errors) =
-            refresh_pass2_outputs_with(&outcomes, std::slice::from_mut(&mut image), |label| {
-                refresh_decompiled(&ghidra_dir, &images_dir, label)
+            refresh_pass2_outputs_with(&outcomes, std::slice::from_mut(&mut image), |image| {
+                refresh_decompiled_and_update(&ghidra_dir, &images_dir, image)
             });
         let pass2_stage = decompile_pass2_stage(1, refreshed, refresh_errors, 8);
         let stage = globals_apply_stage(false, &prepared, Some(&[image]), 9);
@@ -5809,6 +6103,7 @@ mod tests {
             "02_MAIN".to_string(),
             PreparedFunctionMap {
                 pass2_map: Some(prepared_symbol_test_map("moved-functions", "02_MAIN", 1)),
+                creation_plan: Default::default(),
                 function_names: HashMap::from([("40".to_string(), "RecoveredMain".to_string())]),
                 evidence_name_projection: globals::FunctionEvidenceNameProjection::default(),
             },
@@ -5876,6 +6171,12 @@ mod tests {
                         terminal_error: None,
                         exit: None,
                         pass2_applied: None,
+                        pass2_creation_candidates: None,
+                        pass2_creation_map_skips: None,
+                        pass2_created: None,
+                        pass2_creation_reapplied: None,
+                        pass2_creation_skipped_existing: None,
+                        pass2_creation_skipped_collision: None,
                         pass2_error: None,
                         globals_applied: None,
                         globals_apply_skipped: None,
@@ -5937,6 +6238,12 @@ mod tests {
                         terminal_error: None,
                         exit: Some(1),
                         pass2_applied: None,
+                        pass2_creation_candidates: None,
+                        pass2_creation_map_skips: None,
+                        pass2_created: None,
+                        pass2_creation_reapplied: None,
+                        pass2_creation_skipped_existing: None,
+                        pass2_creation_skipped_collision: None,
                         pass2_error: None,
                         globals_applied: None,
                         globals_apply_skipped: None,
@@ -6209,6 +6516,8 @@ mod tests {
             thumb_error: Some("radare2 parser rejected empty stdout".into()),
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -6263,6 +6572,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -6367,6 +6678,8 @@ mod tests {
                 thumb_error: None,
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_creation_plan: None,
+                pass2_thumb_names: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -6402,6 +6715,8 @@ mod tests {
                 thumb_error: None,
                 terminal_error: None,
                 pass2_applied: None,
+                pass2_creation_plan: None,
+                pass2_thumb_names: None,
                 pass2_error: None,
                 thumb_decompiled: None,
                 thumb_tighten_error: None,
@@ -6476,6 +6791,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -6549,6 +6866,12 @@ mod tests {
             terminal_error: None,
             exit: None,
             pass2_applied: None,
+            pass2_creation_candidates: None,
+            pass2_creation_map_skips: None,
+            pass2_created: None,
+            pass2_creation_reapplied: None,
+            pass2_creation_skipped_existing: None,
+            pass2_creation_skipped_collision: None,
             pass2_error: None,
             globals_applied: None,
             globals_apply_skipped: None,
@@ -6612,6 +6935,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: Some(81_763), // post-enrich
             thumb_tighten_error: None,
@@ -6685,6 +7010,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -7573,6 +7900,7 @@ mod tests {
         let mut function_maps = HashMap::new();
         let prepared = PreparedFunctionMap {
             pass2_map: Some(prepared_symbol_test_map("pal_wire", label, 1)),
+            creation_plan: Default::default(),
             function_names: HashMap::new(),
             evidence_name_projection: Default::default(),
         };
@@ -7583,6 +7911,7 @@ mod tests {
             "01_PSP".to_string(),
             PreparedFunctionMap {
                 pass2_map: Some(prepared_symbol_test_map("pal_wire_psp", "01_PSP", 1)),
+                creation_plan: Default::default(),
                 function_names: HashMap::new(),
                 evidence_name_projection: Default::default(),
             },
@@ -7706,6 +8035,231 @@ mod tests {
             "successful refresh must remove the transaction backup"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_decompiled_validates_retained_inventory_before_creation_delta() {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("ghidra");
+        let images = root.path().join("images");
+        let label = "02_MAIN";
+        let dest = images.join(label).join("decompiled");
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(images.join(label).join(format!("{label}.bin")), [0u8; 0x40]).unwrap();
+        let retained = tagged_functions("retained");
+        let created = serde_json::json!({
+            "name": "created_thumb",
+            "primary_source": "analysis",
+            "entry": "0x4004",
+            "end": "0x4008",
+            "size": 4,
+            "decode_ranges": [{
+                "isa": "thumb",
+                "start": "0x4004",
+                "end": "0x4008",
+                "blake3": "ec2bd03bf86b935fa34d71ad7ebb049f1f10f87d343e521511d8f9e6625620cd"
+            }],
+            "decode_range_errors": [],
+            "data_refs": []
+        });
+        let mut staged: Vec<serde_json::Value> = serde_json::from_slice(&retained).unwrap();
+        staged.push(created);
+        let staged_bytes = serde_json::to_vec(&staged).unwrap();
+        for (name, old, new) in [
+            ("decompiled.c", b"OLD_C".as_slice(), b"NEW_C".as_slice()),
+            ("disasm.lst", b"OLD_LST".as_slice(), b"NEW_LST".as_slice()),
+            (
+                "functions.json",
+                retained.as_slice(),
+                staged_bytes.as_slice(),
+            ),
+        ] {
+            std::fs::write(dest.join(name), old).unwrap();
+            std::fs::write(export.join(name), new).unwrap();
+        }
+        let mut image = tagged_image(label, false);
+        image.pass2_creation_plan = Some(decompile::Pass2CreationPlan {
+            candidates: 1,
+            skips: Default::default(),
+            requests: vec![symbolicate::Pass2CreationRequest {
+                entry: 0x4004,
+                final_primary: "created_thumb".to_string(),
+                final_source: "analysis".to_string(),
+            }],
+        });
+        image.pass2_thumb_names = Some(decompile::AppliedThumbNames {
+            candidates: 1,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 0,
+            skipped_collision: 0,
+        });
+
+        let outcomes = HashMap::from([(
+            label.to_string(),
+            decompile::Pass2ProcessOutcome::ProcessSucceeded,
+        )]);
+        let (refreshed, errors) = refresh_pass2_outputs(
+            &outcomes,
+            std::slice::from_mut(&mut image),
+            &ghidra,
+            &images,
+        );
+
+        assert_eq!(refreshed, 1);
+        assert!(errors.is_empty());
+        assert!(matches!(image.outcome, ImageOutcome::Analyzed(2)));
+        assert_eq!(image.ghidra_execution_accepted, Some(2));
+        assert_eq!(image.ghidra_execution_quarantined, Some(0));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(dest.join("functions.json")).unwrap()
+            )
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn refresh_decompiled_first_placement_applies_creation_delta_once() {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra = root.path().join("ghidra");
+        let images = root.path().join("images");
+        let label = "02_MAIN";
+        let dest = images.join(label).join("decompiled");
+        let export = ghidra.join("export").join(label);
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::create_dir_all(images.join(label)).unwrap();
+        std::fs::write(images.join(label).join(format!("{label}.bin")), [0u8; 0x40]).unwrap();
+        let retained = tagged_functions("retained");
+        let created = serde_json::json!({
+            "name": "created_thumb",
+            "primary_source": "analysis",
+            "entry": "0x4004",
+            "end": "0x4008",
+            "size": 4,
+            "decode_ranges": [{
+                "isa": "thumb",
+                "start": "0x4004",
+                "end": "0x4008",
+                "blake3": "ec2bd03bf86b935fa34d71ad7ebb049f1f10f87d343e521511d8f9e6625620cd"
+            }],
+            "decode_range_errors": [],
+            "data_refs": []
+        });
+        let mut staged: Vec<serde_json::Value> = serde_json::from_slice(&retained).unwrap();
+        staged.push(created);
+        for (name, bytes) in [
+            ("decompiled.c", b"NEW_C".as_slice()),
+            ("disasm.lst", b"NEW_LST".as_slice()),
+            (
+                "functions.json",
+                serde_json::to_vec(&staged).unwrap().as_slice(),
+            ),
+        ] {
+            std::fs::write(export.join(name), bytes).unwrap();
+        }
+        let mut image = tagged_image(label, false);
+        image.pass2_creation_plan = Some(decompile::Pass2CreationPlan {
+            candidates: 1,
+            skips: Default::default(),
+            requests: vec![symbolicate::Pass2CreationRequest {
+                entry: 0x4004,
+                final_primary: "created_thumb".to_string(),
+                final_source: "analysis".to_string(),
+            }],
+        });
+        image.pass2_thumb_names = Some(decompile::AppliedThumbNames {
+            candidates: 1,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 0,
+            skipped_collision: 0,
+        });
+
+        refresh_decompiled(&ghidra, &images, &image)
+            .expect("final validation must not apply the creation delta twice");
+
+        assert!(dest.join("functions.json").is_file());
+        assert!(!export.exists());
+    }
+
+    #[test]
+    fn refresh_decompiled_replay_accepts_published_or_unpublished_owned_creation() {
+        for published in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let ghidra = root.path().join("ghidra");
+            let images = root.path().join("images");
+            let label = "02_MAIN";
+            let dest = images.join(label).join("decompiled");
+            let export = ghidra.join("export").join(label);
+            std::fs::create_dir_all(&dest).unwrap();
+            std::fs::create_dir_all(&export).unwrap();
+            std::fs::write(images.join(label).join(format!("{label}.bin")), [0u8; 0x40]).unwrap();
+            let retained = tagged_functions("retained");
+            let created = serde_json::json!({
+                "name": "created_thumb",
+                "primary_source": "analysis",
+                "entry": "0x4004",
+                "end": "0x4008",
+                "size": 4,
+                "decode_ranges": [{
+                    "isa": "thumb",
+                    "start": "0x4004",
+                    "end": "0x4008",
+                    "blake3": "ec2bd03bf86b935fa34d71ad7ebb049f1f10f87d343e521511d8f9e6625620cd"
+                }],
+                "decode_range_errors": [],
+                "data_refs": []
+            });
+            let mut replayed: Vec<serde_json::Value> = serde_json::from_slice(&retained).unwrap();
+            replayed.push(created);
+            let replayed = serde_json::to_vec(&replayed).unwrap();
+            let prior_functions = if published {
+                replayed.as_slice()
+            } else {
+                retained.as_slice()
+            };
+            for (name, old, new) in [
+                ("decompiled.c", b"OLD_C".as_slice(), b"NEW_C".as_slice()),
+                ("disasm.lst", b"OLD_LST".as_slice(), b"NEW_LST".as_slice()),
+                ("functions.json", prior_functions, replayed.as_slice()),
+            ] {
+                std::fs::write(dest.join(name), old).unwrap();
+                std::fs::write(export.join(name), new).unwrap();
+            }
+            let mut image = tagged_image(label, false);
+            image.pass2_creation_plan = Some(decompile::Pass2CreationPlan {
+                candidates: 1,
+                skips: Default::default(),
+                requests: vec![symbolicate::Pass2CreationRequest {
+                    entry: 0x4004,
+                    final_primary: "created_thumb".to_string(),
+                    final_source: "analysis".to_string(),
+                }],
+            });
+            image.pass2_thumb_names = Some(decompile::AppliedThumbNames {
+                candidates: 1,
+                created: 0,
+                reapplied: 1,
+                skipped_existing: 0,
+                skipped_collision: 0,
+            });
+
+            refresh_decompiled(&ghidra, &images, &image)
+                .unwrap_or_else(|error| panic!("published={published}: {error}"));
+
+            assert_eq!(
+                std::fs::read(dest.join("functions.json")).unwrap(),
+                replayed
+            );
+            assert!(!export.exists());
+        }
     }
 
     #[test]
@@ -8047,6 +8601,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8307,6 +8863,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8352,6 +8910,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: Some(3),
             thumb_tighten_error: None,
@@ -8376,6 +8936,42 @@ mod tests {
     }
 
     #[test]
+    fn image_report_serializes_pass2_creation_plan_and_runtime_conservation() {
+        let mut result = analyzed_image("02_MAIN");
+        result.pass2_creation_plan = Some(decompile::Pass2CreationPlan {
+            candidates: 3,
+            skips: symbolicate::Pass2CreationSkips {
+                ambiguous: 1,
+                collision: 2,
+                name_limit: 3,
+                limit: 4,
+                not_entry_start: 5,
+            },
+            requests: Vec::new(),
+        });
+        result.pass2_thumb_names = Some(decompile::AppliedThumbNames {
+            candidates: 3,
+            created: 1,
+            reapplied: 0,
+            skipped_existing: 1,
+            skipped_collision: 1,
+        });
+
+        let json = serde_json::to_value(ImageReport::from_result(&result)).unwrap();
+
+        assert_eq!(json["pass2_creation_candidates"], 3);
+        assert_eq!(json["pass2_creation_map_skips"]["ambiguous"], 1);
+        assert_eq!(json["pass2_creation_map_skips"]["collision"], 2);
+        assert_eq!(json["pass2_creation_map_skips"]["name_limit"], 3);
+        assert_eq!(json["pass2_creation_map_skips"]["limit"], 4);
+        assert_eq!(json["pass2_creation_map_skips"]["not_entry_start"], 5);
+        assert_eq!(json["pass2_created"], 1);
+        assert_eq!(json["pass2_creation_reapplied"], 0);
+        assert_eq!(json["pass2_creation_skipped_existing"], 1);
+        assert_eq!(json["pass2_creation_skipped_collision"], 1);
+    }
+
+    #[test]
     fn image_report_serializes_phase3_globals_fields_as_none_when_absent() {
         let r = decompile::ImageResult {
             label: "02_MAIN".into(),
@@ -8396,6 +8992,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,
@@ -8441,6 +9039,8 @@ mod tests {
             thumb_error: None,
             terminal_error: None,
             pass2_applied: None,
+            pass2_creation_plan: None,
+            pass2_thumb_names: None,
             pass2_error: None,
             thumb_decompiled: None,
             thumb_tighten_error: None,

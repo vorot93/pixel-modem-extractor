@@ -250,6 +250,36 @@ fn decompose_produces_unified_tree() {
         "expected at least one image with pass2_applied set"
     );
     for image in decompile_stage["images"].as_array().unwrap() {
+        if let Some(candidates) = image
+            .get("pass2_creation_candidates")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let skips = image["pass2_creation_map_skips"]
+                .as_object()
+                .expect("creation candidates require map-build skip diagnostics");
+            for field in [
+                "ambiguous",
+                "collision",
+                "name_limit",
+                "limit",
+                "not_entry_start",
+            ] {
+                assert!(skips[field].is_u64(), "missing {field}: {image}");
+            }
+            if let Some(created) = image
+                .get("pass2_created")
+                .and_then(serde_json::Value::as_u64)
+            {
+                let reapplied = image["pass2_creation_reapplied"].as_u64().unwrap();
+                let skipped_existing = image["pass2_creation_skipped_existing"].as_u64().unwrap();
+                let skipped_collision = image["pass2_creation_skipped_collision"].as_u64().unwrap();
+                assert_eq!(
+                    candidates,
+                    created + reapplied + skipped_existing + skipped_collision,
+                    "ApplyThumbNames runtime counts must conserve candidates: {image}"
+                );
+            }
+        }
         let Some(functions) = image.get("functions").and_then(serde_json::Value::as_u64) else {
             continue;
         };
@@ -855,7 +885,7 @@ fn report_json_includes_global_shapes_fields() {
         // Task 5's input-safe reorder moved `global_shapes` to run *before*
         // `DispatchPass2` (which pushes the real `thumb_enrich_post_pass2`) so
         // a later pass-2 post-script can apply the recovered shapes as types —
-        // see CONTRIBUTING.md's "Phase 3.2: global storage-shape recovery".
+        // see AGENTS.md's "Phase 3.2: global storage-shape recovery".
         // `decompile_pass2`'s stage `reason` is the only route signal already
         // present in report.json: it is exactly "--no-symbol-pass" on that
         // route and never on the normal route (previously this assertion only
@@ -932,7 +962,7 @@ fn report_json_includes_global_shapes_fields() {
 /// `report.json` golden cannot observe a second run. That guarantee comes
 /// from `ApplyGlobalTypes.java` widening only already-undefined bytes
 /// (`CLEAR_ALL_UNDEFINED_CONFLICT_DATA`) plus the DEFAULT-only Ghidra
-/// re-apply and unit-test coverage described in CONTRIBUTING.md's Phase 3.2
+/// re-apply and unit-test coverage described in AGENTS.md's Phase 3.2
 /// type-application notes.
 #[test]
 fn global_types_applied_on_retained_tree() {
@@ -991,7 +1021,7 @@ fn global_types_applied_on_retained_tree() {
     // 3 unknown; task-9-brief.md, Fidelity/scope decisions) was measured on
     // the retained CHEETAH `01_MAIN` tree, not this test's MUSTANG `02_MAIN`
     // target — `02_MAIN` has a different, smaller inferred count (125 per
-    // the Phase 3.2 production baseline in CONTRIBUTING.md) and no
+    // the Phase 3.2 production baseline in AGENTS.md) and no
     // independently measured scalar/array/unknown split of its own, so a
     // healthy run here applies some unmeasured number up to that ~125
     // ceiling, not the cheetah figure. Pin only the non-zero floor; a
@@ -1129,7 +1159,7 @@ fn report_json_includes_pal_fields() {
 /// content carries Ghidra run-to-run jitter — the symbol arrays themselves
 /// reproduced byte-identically), `images/*/source_tree/` (recovered-code
 /// enrichment derives from the same jittery Ghidra evidence), and everything
-/// under `images/*/decompiled/`. See CONTRIBUTING "Hashing and golden
+/// under `images/*/decompiled/`. See AGENTS "Hashing and golden
 /// identity".
 #[test]
 fn decompose_pinned_surfaces_match_reference() {

@@ -33,7 +33,7 @@ pub const FORMAT_V1: &str = "pixel-modem-extractor-globals-v1";
 /// of `movw`/`movt` lines strictly between two PCs — an approximation of the
 /// design spec's instruction-count metric; the pre-check confirmed this
 /// approximation grounds the K pinning). The production pre-check pinned this
-/// value at 4; `CONTRIBUTING.md` records the metric and revalidation contract.
+/// value at 4; `AGENTS.md` records the metric and revalidation contract.
 /// Do not edit ad hoc — rerun the pre-check if a new firmware variant regresses.
 /// Mirrors Phase 2.1's `TIGHTEN_EXTRA` provenance rule (see
 /// `src/ghidra/TameAnalysis.java`).
