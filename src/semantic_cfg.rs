@@ -822,7 +822,11 @@ impl<'runtime, 'data> CfgBuilder<'runtime, 'data> {
                     pc,
                     kind: BoundaryKind::ExceptionCall,
                 });
-                self.schedule(pc, next, true)
+                if self.calls == CallPolicy::Fallthrough {
+                    self.schedule(pc, next, true)
+                } else {
+                    Ok(())
+                }
             }
             ControlFlow::Return => {
                 self.handoffs.insert(Handoff {
@@ -836,7 +840,7 @@ impl<'runtime, 'data> CfgBuilder<'runtime, 'data> {
                     pc,
                     kind: BoundaryKind::Indirect,
                 });
-                if instruction.links_lr {
+                if instruction.links_lr && self.calls == CallPolicy::Fallthrough {
                     self.schedule(pc, next, true)
                 } else {
                     Ok(())
@@ -1567,6 +1571,8 @@ mod tests {
                 .iter()
                 .any(|edge| edge.pc == 8 && edge.kind == BoundaryKind::Call)
         );
+        assert_eq!(cfg.successors(8), Some(&BTreeSet::from([12])));
+        assert!(!cfg.instructions().contains_key(&0x40));
         let before_vbar = &cfg.exact_register_states()[&12];
         assert_eq!(before_vbar.get(Register(0)), None);
         assert_eq!(
@@ -1595,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_indirect_call_retains_clobbered_fallthrough() {
+    fn linked_indirect_stops_exception_prefix_but_pal_policy_retains_fallthrough() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&arm_mov_immediate(0, 0x12));
         bytes.extend_from_slice(&arm_mov_immediate(4, 0x34));
@@ -1610,6 +1616,17 @@ mod tests {
                 .iter()
                 .any(|edge| edge.pc == 8 && edge.kind == BoundaryKind::Indirect)
         );
+        assert_eq!(cfg.successors(8), None);
+        assert!(!cfg.instructions().contains_key(&12));
+
+        let cfg = SemanticCfg::decode(
+            &runtime(&bytes),
+            0,
+            DecodeIsa::Arm,
+            CfgLimits::exception_roots(),
+            CallPolicy::Fallthrough,
+        )
+        .expect("PAL fallthrough policy decodes");
         assert_eq!(cfg.successors(8), Some(&BTreeSet::from([12])));
         let fallthrough = &cfg.exact_register_states()[&12];
         assert_eq!(fallthrough.get(Register(0)), None);
@@ -1694,21 +1711,36 @@ mod tests {
     fn return_boundary_is_typed() {
         let returned = decode(&0xe12f_ff1eu32.to_le_bytes(), DecodeIsa::Arm);
         assert_eq!(returned.handoffs()[0].kind, BoundaryKind::Return);
+        assert_eq!(returned.successors(0), None);
+        assert_eq!(
+            returned.instructions().keys().copied().collect::<Vec<_>>(),
+            [0]
+        );
     }
 
     #[test]
-    fn exception_boundary_is_typed_and_retains_fallthrough() {
+    fn exception_boundary_stops_exception_prefix_but_pal_policy_retains_fallthrough() {
         let mut exception = Vec::new();
         exception.extend_from_slice(&0xef00_0000u32.to_le_bytes());
         exception.extend_from_slice(&0xeaff_fffeu32.to_le_bytes());
-        let exception = decode(&exception, DecodeIsa::Arm);
+        let cfg = decode(&exception, DecodeIsa::Arm);
         assert!(
-            exception
-                .handoffs()
+            cfg.handoffs()
                 .iter()
                 .any(|edge| edge.pc == 0 && edge.kind == BoundaryKind::ExceptionCall)
         );
-        assert!(exception.instructions().contains_key(&4));
+        assert_eq!(cfg.successors(0), None);
+        assert!(!cfg.instructions().contains_key(&4));
+
+        let cfg = SemanticCfg::decode(
+            &runtime(&exception),
+            0,
+            DecodeIsa::Arm,
+            CfgLimits::exception_roots(),
+            CallPolicy::Fallthrough,
+        )
+        .expect("PAL fallthrough policy decodes");
+        assert!(cfg.instructions().contains_key(&4));
     }
 
     #[test]

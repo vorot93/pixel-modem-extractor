@@ -1,13 +1,14 @@
 use super::{
     ExceptionApplication, ExceptionClaim, ExceptionRole, ExceptionRoot, ExceptionRootError,
-    ExceptionRootPlan, MAX_ROOTS, MAX_TABLES, RelocationEvidence, RootIsa, SlotForm, VECTOR_SLOTS,
-    VectorSlot, VectorTable, VectorTableKind,
+    ExceptionRootPlan, MAX_ROOTS, MAX_TABLES, MAX_VBAR_WRITES, RelocationEvidence, RootIsa,
+    SlotForm, VECTOR_SLOTS, VbarWriteEvidence, VectorSlot, VectorTable, VectorTableKind,
 };
 use crate::arm32::{
     AddressBase, AddressOffset, BranchPredicate, ControlFlow, InstructionDecoder, PureRustDecoder,
     Register, ValueEffect,
 };
 use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
+use crate::semantic_cfg::{BoundaryKind, CallPolicy, CfgLimits, SemanticCfg, SemanticCfgError};
 use std::collections::{BTreeMap, BTreeSet};
 
 const SLOT_BYTES: u32 = 4;
@@ -44,15 +45,225 @@ pub(crate) fn discover(
     else {
         return Ok(None);
     };
+    let (relocation, relocated_table) = prove_reset_vbar(runtime, &initial_table)?;
+    let mut tables = vec![initial_table.clone()];
+    if let Some(relocated_table) = relocated_table {
+        tables.push(relocated_table);
+    }
     assemble_plan(
         runtime,
         label,
         toc_name,
         initial_table.clone(),
-        vec![initial_table],
-        RelocationEvidence::NotObserved,
+        tables,
+        relocation,
     )
     .map(Some)
+}
+
+fn prove_reset_vbar(
+    runtime: &RuntimeImage<'_>,
+    initial_table: &VectorTable,
+) -> Result<(RelocationEvidence, Option<VectorTable>), ExceptionRootError> {
+    let reset = initial_table
+        .slots
+        .iter()
+        .find(|slot| slot.role == ExceptionRole::Reset)
+        .ok_or_else(|| malformed(initial_table.address, "validated table has no reset slot"))?;
+    let cfg = match SemanticCfg::decode(
+        runtime,
+        reset.entry,
+        reset.isa.decode_isa(),
+        CfgLimits::exception_roots(),
+        CallPolicy::FallthroughAndHandoff,
+    ) {
+        Ok(cfg) => cfg,
+        Err(SemanticCfgError::ResourceLimit {
+            what,
+            actual,
+            limit,
+        }) => {
+            return Err(ExceptionRootError::ResourceLimit {
+                what,
+                actual,
+                limit,
+            });
+        }
+        Err(error) => {
+            return Ok((
+                RelocationEvidence::AnalysisIncomplete {
+                    observations: Vec::new(),
+                    handoffs: Vec::new(),
+                    reason: Some(error.to_string()),
+                },
+                None,
+            ));
+        }
+    };
+    let mut observations = Vec::new();
+    for (pc, instruction) in cfg.instructions() {
+        let Some(transfer) = instruction.system.transfer() else {
+            continue;
+        };
+        if !transfer.is_vbar_write() {
+            continue;
+        }
+        let actual =
+            observations
+                .len()
+                .checked_add(1)
+                .ok_or(ExceptionRootError::ResourceLimit {
+                    what: "VBAR write observations",
+                    actual: u64::MAX,
+                    limit: MAX_VBAR_WRITES as u64,
+                })?;
+        if actual > MAX_VBAR_WRITES {
+            return Err(ExceptionRootError::ResourceLimit {
+                what: "VBAR write observations",
+                actual: actual as u64,
+                limit: MAX_VBAR_WRITES as u64,
+            });
+        }
+        let dominates_handoffs = cfg
+            .handoffs()
+            .iter()
+            .all(|handoff| cfg.dominates(*pc, handoff.pc));
+        let value = cfg
+            .exact_register_states()
+            .get(pc)
+            .and_then(|state| state.get(transfer.rt));
+        observations.push(VbarWriteEvidence {
+            pc: *pc,
+            isa: RootIsa::from_decode_isa(instruction.isa),
+            source_register: transfer.rt.0,
+            conditional: instruction.conditional,
+            exact_value: value.map(|value| value.value),
+            definitions: value
+                .map(|value| value.definitions().into_iter().collect())
+                .unwrap_or_default(),
+            dominates_handoffs,
+        });
+    }
+    observations.sort_by_key(|observation| observation.pc);
+    observations.dedup();
+    if cfg
+        .handoffs()
+        .iter()
+        .any(|handoff| is_incomplete_boundary(handoff.kind))
+    {
+        return Ok((
+            RelocationEvidence::AnalysisIncomplete {
+                observations,
+                handoffs: cfg.handoffs().to_vec(),
+                reason: None,
+            },
+            None,
+        ));
+    }
+    let candidates = observations
+        .iter()
+        .filter(|observation| {
+            !observation.conditional
+                && observation.dominates_handoffs
+                && observation.exact_value.is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let values = candidates
+        .iter()
+        .filter_map(|candidate| candidate.exact_value)
+        .collect::<BTreeSet<_>>();
+    let Some(selected) = select_final_vbar(&cfg, &candidates) else {
+        if !observations.is_empty() {
+            if values.len() > 1 {
+                return Err(ExceptionRootError::Ambiguous {
+                    values: values.into_iter().collect(),
+                });
+            }
+            return Ok((RelocationEvidence::Unresolved { observations }, None));
+        }
+        return Ok((RelocationEvidence::NotObserved, None));
+    };
+    if !selection_is_final(&cfg, &selected, &observations) {
+        return Ok((RelocationEvidence::Unresolved { observations }, None));
+    }
+    let value = selected
+        .exact_value
+        .expect("selecting VBAR candidates carry exact values");
+    if value == initial_table.address {
+        return Ok((
+            RelocationEvidence::ConfirmedInitial {
+                selected,
+                observations,
+            },
+            None,
+        ));
+    }
+    if classify_slots(runtime, value).is_none() {
+        return Ok((RelocationEvidence::Unresolved { observations }, None));
+    }
+    let relocated = match validate_table(runtime, value, VectorTableKind::Relocated) {
+        Ok(Some(table)) => table,
+        Ok(None) => {
+            return Err(malformed(
+                value,
+                "relocated table fell below threshold during strict validation",
+            ));
+        }
+        Err(error @ ExceptionRootError::ResourceLimit { .. }) => return Err(error),
+        Err(error) => {
+            return Err(malformed(
+                value,
+                format!("relocated table strict validation failed: {error}"),
+            ));
+        }
+    };
+    Ok((
+        RelocationEvidence::Relocated {
+            selected,
+            table_address: value,
+            observations,
+        },
+        Some(relocated),
+    ))
+}
+
+fn selection_is_final(
+    cfg: &SemanticCfg,
+    selected: &VbarWriteEvidence,
+    observations: &[VbarWriteEvidence],
+) -> bool {
+    observations.iter().all(|other| {
+        other.pc == selected.pc
+            || (other.exact_value.is_some() && other.exact_value == selected.exact_value)
+            || cfg.dominates(other.pc, selected.pc)
+    })
+}
+
+fn select_final_vbar(
+    cfg: &SemanticCfg,
+    candidates: &[VbarWriteEvidence],
+) -> Option<VbarWriteEvidence> {
+    let mut final_candidates = candidates.iter().filter(|candidate| {
+        candidates
+            .iter()
+            .all(|other| other.pc == candidate.pc || cfg.dominates(other.pc, candidate.pc))
+    });
+    let selected = final_candidates.next().cloned();
+    if final_candidates.next().is_none() {
+        return selected;
+    }
+    None
+}
+
+fn is_incomplete_boundary(kind: BoundaryKind) -> bool {
+    matches!(
+        kind,
+        BoundaryKind::ExceptionCall
+            | BoundaryKind::Indirect
+            | BoundaryKind::Unmapped
+            | BoundaryKind::DecodeFailure
+    )
 }
 
 /// Classify all eight A32 slots before resolving any literal or target. A
@@ -531,6 +742,9 @@ mod tests {
     const ARM_NOP: u32 = 0xe1a0_0000;
     const THUMB_BX_LR: u16 = 0x4770;
     const ARM_TARGET_START: u32 = BASE + 0x100;
+    const RESET_ENTRY: u32 = BASE + 0x400;
+    const RELOCATED_TABLE: u32 = BASE + 0x1000;
+    const RESET_IMAGE_SIZE: usize = 0x2000;
     const COPY_HANDLER: u32 = BASE + 0x280;
     const ZERO_HANDLER: u32 = BASE + 0x284;
     const EXPECTED_ROLES: [ExceptionRole; 8] = [
@@ -548,6 +762,12 @@ mod tests {
     enum TargetLayout {
         DistinctArm,
         Shared(ExceptionRole, ExceptionRole),
+    }
+
+    #[derive(Clone, Copy)]
+    enum VbarValue {
+        Initial,
+        SecondValidTable,
     }
 
     struct VectorFixture {
@@ -631,6 +851,26 @@ mod tests {
             | ((words as u32) & 0x00ff_ffff)
     }
 
+    // A32 MOVW/MOVT encodings derived directly from the architectural
+    // immediate split: imm4 occupies bits 19:16 and imm12 bits 11:0.
+    fn a32_mov_half(register: u8, immediate: u16, high: bool) -> u32 {
+        let opcode = if high { 0xe340_0000 } else { 0xe300_0000 };
+        opcode
+            | ((u32::from(immediate) & 0xf000) << 4)
+            | (u32::from(register) << 12)
+            | (u32::from(immediate) & 0x0fff)
+    }
+
+    // A32 MCR p15, 0, Rt, c12, c0, 0. This test encoder is independent of
+    // the production classifier and varies only the architectural Rt field.
+    fn a32_vbar_write_with_condition(register: u8, condition: u8) -> u32 {
+        (u32::from(condition) << 28) | 0x0e0c_0f10 | (u32::from(register) << 12)
+    }
+
+    fn a32_vbar_write(register: u8) -> u32 {
+        a32_vbar_write_with_condition(register, 0xe)
+    }
+
     fn target_for_role(role: ExceptionRole) -> u32 {
         ARM_TARGET_START + u32::try_from(role_index(role)).unwrap() * 4
     }
@@ -655,6 +895,128 @@ mod tests {
                 write_bytes(raw, base, entry, &THUMB_BX_LR.to_le_bytes());
             }
         }
+    }
+
+    fn reset_tables_fixture() -> VectorFixture {
+        let mut fixture = VectorFixture {
+            base: BASE,
+            raw: vec![0; RESET_IMAGE_SIZE],
+            plan: None,
+        };
+        let initial_targets: [u32; 8] =
+            std::array::from_fn(|index| RESET_ENTRY + u32::try_from(index).unwrap() * 0x40);
+        write_literal_table(&mut fixture.raw, BASE, BASE, BASE + 0x40, initial_targets);
+        let relocated_targets =
+            std::array::from_fn(|index| BASE + 0x1800 + u32::try_from(index).unwrap() * 4);
+        write_literal_table(
+            &mut fixture.raw,
+            BASE,
+            RELOCATED_TABLE,
+            RELOCATED_TABLE + 0x40,
+            relocated_targets,
+        );
+
+        fixture
+    }
+
+    fn write_reset_program(fixture: &mut VectorFixture, instructions: &[u32]) {
+        for (index, instruction) in instructions.iter().copied().enumerate() {
+            fixture.write_u32(RESET_ENTRY + u32::try_from(index).unwrap() * 4, instruction);
+        }
+    }
+
+    fn reset_fixture_with_program(instructions: &[u32]) -> VectorFixture {
+        let mut fixture = reset_tables_fixture();
+        write_reset_program(&mut fixture, instructions);
+        fixture
+    }
+
+    fn materialize(register: u8, value: u32) -> [u32; 2] {
+        [
+            a32_mov_half(register, value as u16, false),
+            a32_mov_half(register, (value >> 16) as u16, true),
+        ]
+    }
+
+    fn t32_mov_half(register: u8, immediate: u16, high: bool) -> [u8; 4] {
+        let immediate = u32::from(immediate);
+        let mut first = if high { 0xf2c0 } else { 0xf240 };
+        first |= (immediate >> 12) & 0xf;
+        first |= ((immediate >> 11) & 1) << 10;
+        let second = ((immediate >> 8) & 7) << 12 | (u32::from(register) << 8) | (immediate & 0xff);
+        let first = (first as u16).to_le_bytes();
+        let second = (second as u16).to_le_bytes();
+        [first[0], first[1], second[0], second[1]]
+    }
+
+    fn t32_vbar_write(register: u8) -> [u8; 4] {
+        let first = 0xee0cu16.to_le_bytes();
+        let second = (0x0f10u16 | (u16::from(register) << 12)).to_le_bytes();
+        [first[0], first[1], second[0], second[1]]
+    }
+
+    fn thumb_reset_fixture(value: u32, tail: &[u8]) -> VectorFixture {
+        let mut fixture = reset_tables_fixture();
+        fixture.set_pointer(0, RESET_ENTRY | 1);
+        let mut program = Vec::new();
+        program.extend_from_slice(&t32_mov_half(0, value as u16, false));
+        program.extend_from_slice(&t32_mov_half(0, (value >> 16) as u16, true));
+        program.extend_from_slice(&t32_vbar_write(0));
+        program.extend_from_slice(tail);
+        write_bytes(&mut fixture.raw, BASE, RESET_ENTRY, &program);
+        fixture
+    }
+
+    fn reset_vbar_fixture(value: VbarValue) -> VectorFixture {
+        let selected = match value {
+            VbarValue::Initial => BASE,
+            VbarValue::SecondValidTable => RELOCATED_TABLE,
+        };
+        let [movw, movt] = materialize(0, selected);
+        reset_fixture_with_program(&[
+            movw,
+            movt,
+            a32_vbar_write(0),
+            0xe12f_ff1e, // bx lr
+        ])
+    }
+
+    fn set_relocated_pointer(fixture: &mut VectorFixture, slot: usize, pointer: u32) {
+        fixture.write_u32(
+            RELOCATED_TABLE + 0x40 + u32::try_from(slot).unwrap() * 4,
+            pointer,
+        );
+    }
+
+    fn ordered_vbar_fixture(first: u32, second: u32) -> VectorFixture {
+        let [first_movw, first_movt] = materialize(0, first);
+        let [second_movw, second_movt] = materialize(1, second);
+        reset_fixture_with_program(&[
+            first_movw,
+            first_movt,
+            a32_vbar_write(0),
+            second_movw,
+            second_movt,
+            a32_vbar_write(1),
+            0xe12f_ff1e,
+        ])
+    }
+
+    fn branching_vbar_fixture() -> VectorFixture {
+        let right = RESET_ENTRY + 20;
+        let [left_movw, left_movt] = materialize(0, BASE);
+        let [right_movw, right_movt] = materialize(1, RELOCATED_TABLE);
+        reset_fixture_with_program(&[
+            a32_branch(RESET_ENTRY, right, 0x1, false),
+            left_movw,
+            left_movt,
+            a32_vbar_write(0),
+            a32_branch(RESET_ENTRY + 16, RESET_ENTRY + 16, 0xe, false),
+            right_movw,
+            right_movt,
+            a32_vbar_write(1),
+            a32_branch(RESET_ENTRY + 32, RESET_ENTRY + 32, 0xe, false),
+        ])
     }
 
     fn full_literal_fixture(layout: TargetLayout) -> VectorFixture {
@@ -791,6 +1153,507 @@ mod tests {
     }
 
     #[test]
+    fn dominating_exact_vbar_confirms_initial_table() {
+        let fixture = reset_vbar_fixture(VbarValue::Initial);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::ConfirmedInitial {
+            selected,
+            observations,
+        } = plan.relocation
+        else {
+            panic!("expected confirmed-initial evidence");
+        };
+        assert_eq!(selected.pc, RESET_ENTRY + 8);
+        assert_eq!(selected.isa, RootIsa::Arm);
+        assert_eq!(selected.source_register, 0);
+        assert_eq!(selected.exact_value, Some(BASE));
+        assert_eq!(selected.definitions, [RESET_ENTRY, RESET_ENTRY + 4]);
+        assert!(selected.dominates_handoffs);
+        assert!(!selected.conditional);
+        assert_eq!(observations, [selected]);
+    }
+
+    #[test]
+    fn proven_relocated_table_contributes_roots() {
+        let fixture = reset_vbar_fixture(VbarValue::SecondValidTable);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::Relocated {
+            selected,
+            table_address,
+            observations,
+        } = plan.relocation
+        else {
+            panic!("expected relocated evidence");
+        };
+        assert_eq!(selected.exact_value, Some(RELOCATED_TABLE));
+        assert_eq!(table_address, RELOCATED_TABLE);
+        assert_eq!(observations, [selected]);
+        assert_eq!(plan.tables.len(), 2);
+        assert_eq!(plan.roots.len(), 16);
+        assert_eq!(plan.applications.len(), 16);
+        assert!(
+            plan.applications
+                .iter()
+                .all(|application| application.desired_primary.is_none())
+        );
+    }
+
+    #[test]
+    fn relocated_role_agreement_recomputes_one_global_application_plan() {
+        let mut fixture = reset_vbar_fixture(VbarValue::SecondValidTable);
+        let initial_targets: [u32; 8] =
+            std::array::from_fn(|index| RESET_ENTRY + u32::try_from(index).unwrap() * 0x40);
+        for (index, target) in initial_targets.into_iter().enumerate() {
+            set_relocated_pointer(&mut fixture, index, target);
+        }
+
+        let first = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+        let second = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.tables.len(), 2);
+        assert_eq!(first.roots.len(), 8);
+        assert_eq!(first.applications.len(), 8);
+        let reset = first
+            .applications
+            .iter()
+            .find(|application| application.entry == RESET_ENTRY)
+            .unwrap();
+        assert_eq!(reset.desired_primary.as_deref(), Some("Reset"));
+        assert_eq!(reset.claims.len(), 2);
+        assert_eq!(
+            reset.role_labels,
+            ["exception_reset_40010000", "exception_reset_40011000"]
+        );
+    }
+
+    #[test]
+    fn every_relocated_post_threshold_target_failure_is_malformed() {
+        let bad_target = BASE + 0x3000;
+        for slot in 0..8 {
+            let mut fixture = reset_vbar_fixture(VbarValue::SecondValidTable);
+            set_relocated_pointer(&mut fixture, slot, bad_target);
+            let result = discover(&fixture.runtime(), "01_MAIN", "MAIN");
+            assert!(
+                matches!(
+                    &result,
+                    Err(ExceptionRootError::Malformed { table, context })
+                        if *table == RELOCATED_TABLE
+                            && context.contains("target instruction")
+                ),
+                "slot {slot}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relocated_post_threshold_literal_isa_decode_and_identity_failures_are_malformed() {
+        let mut bad_literal = reset_vbar_fixture(VbarValue::SecondValidTable);
+        let literal = BASE + RESET_IMAGE_SIZE as u32;
+        bad_literal.write_u32(RELOCATED_TABLE, a32_ldr_pc(RELOCATED_TABLE, literal));
+
+        let mut zero_target = reset_vbar_fixture(VbarValue::SecondValidTable);
+        let zero = BASE + 0x3000;
+        set_relocated_pointer(&mut zero_target, 0, zero);
+        attach_plan(&mut zero_target, vec![zero_entry(0, zero, 4)]);
+
+        let mut misaligned = reset_vbar_fixture(VbarValue::SecondValidTable);
+        set_relocated_pointer(&mut misaligned, 0, BASE + 0x1802);
+
+        let mut undecodable = reset_vbar_fixture(VbarValue::SecondValidTable);
+        let invalid_thumb = BASE + 0x1d00;
+        undecodable.write_u16(invalid_thumb, 0xbfe8);
+        set_relocated_pointer(&mut undecodable, 0, invalid_thumb | 1);
+
+        let mut cross_isa = reset_vbar_fixture(VbarValue::SecondValidTable);
+        set_relocated_pointer(&mut cross_isa, 0, BASE + 0x1800);
+        set_relocated_pointer(&mut cross_isa, 1, BASE + 0x1801);
+
+        for (name, fixture) in [
+            ("literal", bad_literal),
+            ("zero", zero_target),
+            ("alignment", misaligned),
+            ("decode", undecodable),
+            ("identity", cross_isa),
+        ] {
+            let result = discover(&fixture.runtime(), "01_MAIN", "MAIN");
+            assert!(
+                matches!(
+                    result,
+                    Err(ExceptionRootError::Malformed {
+                        table: RELOCATED_TABLE,
+                        ..
+                    })
+                ),
+                "{name} failure: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_vbar_is_limited_evidence_and_never_selects() {
+        let [movw, movt] = materialize(0, BASE);
+        let fixture = reset_fixture_with_program(&[
+            movw,
+            movt,
+            a32_vbar_write_with_condition(0, 0x1),
+            0xe12f_ff1e,
+        ]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+            panic!("conditional VBAR must remain unresolved");
+        };
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].conditional);
+        assert_eq!(observations[0].exact_value, Some(BASE));
+        assert_eq!(plan.tables.len(), 1);
+    }
+
+    #[test]
+    fn later_conditional_or_unknown_write_blocks_an_earlier_exact_selection() {
+        let [initial_movw, initial_movt] = materialize(0, BASE);
+        let [relocated_movw, relocated_movt] = materialize(1, RELOCATED_TABLE);
+        let conditional = reset_fixture_with_program(&[
+            initial_movw,
+            initial_movt,
+            a32_vbar_write(0),
+            relocated_movw,
+            relocated_movt,
+            a32_vbar_write_with_condition(1, 0x1),
+            0xe12f_ff1e,
+        ]);
+        let unknown = reset_fixture_with_program(&[
+            initial_movw,
+            initial_movt,
+            a32_vbar_write(0),
+            a32_vbar_write(2),
+            0xe12f_ff1e,
+        ]);
+
+        for fixture in [conditional, unknown] {
+            let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+                .unwrap()
+                .unwrap();
+            let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+                panic!("a potentially later write must block exact selection");
+            };
+            assert_eq!(observations.len(), 2);
+            assert_eq!(plan.tables.len(), 1);
+        }
+    }
+
+    #[test]
+    fn final_exact_write_overwrites_earlier_limited_evidence() {
+        let [movw, movt] = materialize(0, BASE);
+        let fixture = reset_fixture_with_program(&[
+            a32_vbar_write(2),
+            movw,
+            movt,
+            a32_vbar_write(0),
+            0xe12f_ff1e,
+        ]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::ConfirmedInitial {
+            selected,
+            observations,
+        } = plan.relocation
+        else {
+            panic!("final exact write must overwrite earlier unknown evidence");
+        };
+        assert_eq!(selected.pc, RESET_ENTRY + 12);
+        assert_eq!(observations.len(), 2);
+    }
+
+    #[test]
+    fn extension_and_operand_near_misses_are_not_vbar_observations() {
+        let [movw, movt] = materialize(0, BASE);
+        for transfer in [
+            a32_vbar_write_with_condition(0, 0xf), // mcr2 extension form
+            0xee0b_0f10,                           // mcr p15, 0, r0, c11, c0, 0
+            0xee0c_0f11,                           // mcr p15, 0, r0, c12, c1, 0
+        ] {
+            let fixture = reset_fixture_with_program(&[movw, movt, transfer, 0xe12f_ff1e]);
+            let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.relocation, RelocationEvidence::NotObserved);
+        }
+    }
+
+    #[test]
+    fn unknown_vbar_source_is_unresolved_limited_evidence() {
+        let fixture = reset_fixture_with_program(&[a32_vbar_write(2), 0xe12f_ff1e]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+            panic!("unknown VBAR source must remain unresolved");
+        };
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].source_register, 2);
+        assert_eq!(observations[0].exact_value, None);
+        assert!(observations[0].dominates_handoffs);
+    }
+
+    #[test]
+    fn direct_call_clobbers_vbar_source_on_the_only_retained_fallthrough() {
+        let [movw, movt] = materialize(0, BASE);
+        let call_pc = RESET_ENTRY + 8;
+        let fixture = reset_fixture_with_program(&[
+            movw,
+            movt,
+            a32_branch(call_pc, BASE + 0x1f00, 0xe, true),
+            a32_vbar_write(0),
+            0xe12f_ff1e,
+        ]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+            panic!("call-clobbered VBAR source must remain unresolved");
+        };
+        assert_eq!(observations[0].exact_value, None);
+        assert!(!observations[0].dominates_handoffs);
+    }
+
+    #[test]
+    fn exact_vbar_after_startup_call_does_not_dominate_the_handoff() {
+        let [movw, movt] = materialize(4, BASE);
+        let fixture = reset_fixture_with_program(&[
+            a32_branch(RESET_ENTRY, BASE + 0x1f00, 0xe, true),
+            movw,
+            movt,
+            a32_vbar_write(4),
+            0xe12f_ff1e,
+        ]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+            panic!("post-handoff VBAR must remain unresolved");
+        };
+        assert_eq!(observations[0].exact_value, Some(BASE));
+        assert!(!observations[0].dominates_handoffs);
+    }
+
+    #[test]
+    fn outside_zero_fill_and_mapped_non_table_values_are_unresolved() {
+        let cases = [0x5000_0000, BASE + 0x3000, BASE + 0x1c00];
+        for (index, value) in cases.into_iter().enumerate() {
+            let [movw, movt] = materialize(0, value);
+            let mut fixture =
+                reset_fixture_with_program(&[movw, movt, a32_vbar_write(0), 0xe12f_ff1e]);
+            if index == 1 {
+                attach_plan(&mut fixture, vec![zero_entry(0, value, TABLE_SIZE)]);
+            }
+            let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+                .unwrap()
+                .unwrap();
+            let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+                panic!("value {value:#010x} must remain unresolved");
+            };
+            assert_eq!(observations[0].exact_value, Some(value));
+            assert_eq!(plan.tables.len(), 1);
+        }
+    }
+
+    #[test]
+    fn completed_return_prefix_without_vbar_is_not_observed() {
+        let fixture = reset_fixture_with_program(&[0xe12f_ff1e]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(plan.relocation, RelocationEvidence::NotObserved);
+    }
+
+    #[test]
+    fn thumb_reset_prefix_uses_the_table_selected_isa() {
+        let fixture = thumb_reset_fixture(BASE, &THUMB_BX_LR.to_le_bytes());
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::ConfirmedInitial { selected, .. } = plan.relocation else {
+            panic!("Thumb reset prefix must confirm the initial table");
+        };
+        assert_eq!(selected.pc, RESET_ENTRY + 8);
+        assert_eq!(selected.isa, RootIsa::Thumb);
+        assert_eq!(selected.exact_value, Some(BASE));
+    }
+
+    #[test]
+    fn decode_unmapped_indirect_and_exception_boundaries_are_incomplete() {
+        let [movw, movt] = materialize(0, BASE);
+        let branch_pc = RESET_ENTRY + 12;
+        let cases = [
+            (
+                vec![movw, movt, a32_vbar_write(0), 0xe12f_ff11],
+                crate::semantic_cfg::BoundaryKind::Indirect,
+            ),
+            (
+                vec![movw, movt, a32_vbar_write(0), 0xef00_0000],
+                crate::semantic_cfg::BoundaryKind::ExceptionCall,
+            ),
+            (
+                vec![
+                    movw,
+                    movt,
+                    a32_vbar_write(0),
+                    a32_branch(branch_pc, BASE + 0x3000, 0xe, false),
+                ],
+                crate::semantic_cfg::BoundaryKind::Unmapped,
+            ),
+        ];
+        for (program, expected) in cases {
+            let fixture = reset_fixture_with_program(&program);
+            let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+                .unwrap()
+                .unwrap();
+            let RelocationEvidence::AnalysisIncomplete {
+                observations,
+                handoffs,
+                reason,
+            } = plan.relocation
+            else {
+                panic!("{expected:?} boundary must make analysis incomplete");
+            };
+            assert_eq!(observations[0].exact_value, Some(BASE));
+            assert!(handoffs.iter().any(|handoff| handoff.kind == expected));
+            assert_eq!(reason, None);
+            assert_eq!(plan.tables.len(), 1);
+        }
+
+        let fixture = thumb_reset_fixture(BASE, &0xbfe8u16.to_le_bytes());
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+        let RelocationEvidence::AnalysisIncomplete { handoffs, .. } = plan.relocation else {
+            panic!("decode barrier must make analysis incomplete");
+        };
+        assert!(
+            handoffs.iter().any(|handoff| {
+                handoff.kind == crate::semantic_cfg::BoundaryKind::DecodeFailure
+            })
+        );
+    }
+
+    #[test]
+    fn reset_cfg_default_byte_budget_is_a_typed_resource_failure() {
+        let mut fixture = reset_tables_fixture();
+        let attempted = 64 * 1024 / 4 + 1;
+        fixture
+            .raw
+            .resize((RESET_ENTRY - BASE) as usize + attempted * 4, 0);
+        write_reset_program(&mut fixture, &vec![ARM_NOP; attempted]);
+
+        assert!(matches!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN"),
+            Err(ExceptionRootError::ResourceLimit {
+                what: "charged bytes",
+                actual: 65_540,
+                limit: 65_536,
+            })
+        ));
+    }
+
+    #[test]
+    fn strict_dominance_order_selects_the_final_distinct_write() {
+        let fixture = ordered_vbar_fixture(RELOCATED_TABLE, BASE);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+        let RelocationEvidence::ConfirmedInitial {
+            selected,
+            observations,
+        } = plan.relocation
+        else {
+            panic!("final initial-table write must win strict order");
+        };
+        assert_eq!(selected.pc, RESET_ENTRY + 20);
+        assert_eq!(selected.exact_value, Some(BASE));
+        assert_eq!(observations.len(), 2);
+        assert_eq!(plan.tables.len(), 1);
+
+        let fixture = ordered_vbar_fixture(BASE, RELOCATED_TABLE);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+        let RelocationEvidence::Relocated {
+            selected,
+            table_address,
+            ..
+        } = plan.relocation
+        else {
+            panic!("final relocated-table write must win strict order");
+        };
+        assert_eq!(selected.pc, RESET_ENTRY + 20);
+        assert_eq!(table_address, RELOCATED_TABLE);
+        assert_eq!(plan.tables.len(), 2);
+    }
+
+    #[test]
+    fn incomparable_distinct_selecting_values_are_ambiguous() {
+        let error = discover(&branching_vbar_fixture().runtime(), "01_MAIN", "MAIN").unwrap_err();
+        assert_eq!(
+            error,
+            ExceptionRootError::Ambiguous {
+                values: vec![BASE, RELOCATED_TABLE]
+            }
+        );
+    }
+
+    #[test]
+    fn vbar_observation_cap_accepts_sixty_four_and_rejects_sixty_five() {
+        let [movw, movt] = materialize(0, BASE);
+        let mut program = vec![movw, movt];
+        program.extend(std::iter::repeat_n(a32_vbar_write(0), 64));
+        program.push(0xe12f_ff1e);
+        let fixture = reset_fixture_with_program(&program);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+        let RelocationEvidence::ConfirmedInitial {
+            selected,
+            observations,
+        } = plan.relocation
+        else {
+            panic!("64 exact observations must remain valid");
+        };
+        assert_eq!(observations.len(), 64);
+        assert_eq!(selected.pc, RESET_ENTRY + 8 + 63 * 4);
+
+        program.insert(program.len() - 1, a32_vbar_write(0));
+        let fixture = reset_fixture_with_program(&program);
+        assert!(matches!(
+            discover(&fixture.runtime(), "01_MAIN", "MAIN"),
+            Err(ExceptionRootError::ResourceLimit {
+                what: "VBAR write observations",
+                actual: 65,
+                limit: 64,
+            })
+        ));
+    }
+
+    #[test]
     fn two_mod_four_image_base_is_clean_absence_before_slot_decode() {
         let base = BASE + 2;
         let mut fixture = VectorFixture {
@@ -841,7 +1704,10 @@ mod tests {
                 .map(|index| ARM_TARGET_START + index * 4)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(plan.relocation, RelocationEvidence::NotObserved);
+        assert!(matches!(
+            plan.relocation,
+            RelocationEvidence::AnalysisIncomplete { .. }
+        ));
     }
 
     #[test]

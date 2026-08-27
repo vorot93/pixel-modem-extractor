@@ -1,10 +1,11 @@
 // ARM exception-vector discovery: closed domain types, strict limits, and
-// the crate boundary. Initial-table classification and root planning live in
-// `discover`; reset-side VBAR relocation proof is added separately.
+// the crate boundary. Table classification, reset-side VBAR proof, and one
+// global root/application allocation live in `discover`.
 
 use crate::error::Error;
 use crate::execution_ranges::DecodeIsa;
 use crate::runtime_image::StorageSpan;
+use crate::semantic_cfg::Handoff;
 use std::fmt;
 
 mod discover;
@@ -15,6 +16,7 @@ pub(crate) use discover::discover;
 pub(crate) const VECTOR_SLOTS: usize = 8;
 pub(crate) const MAX_TABLES: usize = 2;
 pub(crate) const MAX_ROOTS: usize = 16;
+pub(crate) const MAX_VBAR_WRITES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ExceptionRole {
@@ -65,6 +67,19 @@ impl ExceptionRole {
             Self::Fiq => "FIQ",
         }
     }
+
+    pub(crate) const fn slot_index(self) -> usize {
+        match self {
+            Self::Reset => 0,
+            Self::UndefinedInstruction => 1,
+            Self::SupervisorCall => 2,
+            Self::PrefetchAbort => 3,
+            Self::DataAbort => 4,
+            Self::Reserved => 5,
+            Self::Irq => 6,
+            Self::Fiq => 7,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,20 +89,31 @@ pub(crate) enum RootIsa {
 }
 
 impl RootIsa {
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Arm => "arm",
+            Self::Thumb => "thumb",
+        }
+    }
+
     pub(crate) const fn decode_isa(self) -> DecodeIsa {
         match self {
             Self::Arm => DecodeIsa::Arm,
             Self::Thumb => DecodeIsa::Thumb,
         }
     }
+
+    pub(crate) const fn from_decode_isa(isa: DecodeIsa) -> Self {
+        match isa {
+            DecodeIsa::Arm => Self::Arm,
+            DecodeIsa::Thumb => Self::Thumb,
+        }
+    }
 }
 
 impl fmt::Display for RootIsa {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Arm => "arm",
-            Self::Thumb => "thumb",
-        })
+        f.write_str(self.as_wire())
     }
 }
 
@@ -95,6 +121,19 @@ impl fmt::Display for RootIsa {
 pub(crate) enum SlotForm {
     DirectBranch,
     LiteralLoad { literal_address: u32 },
+}
+
+impl SlotForm {
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::DirectBranch => "direct_branch",
+            Self::LiteralLoad { .. } => "literal_load",
+        }
+    }
+
+    pub(crate) const fn is_literal_load(self) -> bool {
+        matches!(self, Self::LiteralLoad { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -155,8 +194,36 @@ pub(crate) struct ExceptionApplication {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VbarWriteEvidence {
+    pub pc: u32,
+    pub isa: RootIsa,
+    pub source_register: u8,
+    pub conditional: bool,
+    pub exact_value: Option<u32>,
+    pub definitions: Vec<u32>,
+    pub dominates_handoffs: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RelocationEvidence {
+    ConfirmedInitial {
+        selected: VbarWriteEvidence,
+        observations: Vec<VbarWriteEvidence>,
+    },
+    Relocated {
+        selected: VbarWriteEvidence,
+        table_address: u32,
+        observations: Vec<VbarWriteEvidence>,
+    },
+    Unresolved {
+        observations: Vec<VbarWriteEvidence>,
+    },
     NotObserved,
+    AnalysisIncomplete {
+        observations: Vec<VbarWriteEvidence>,
+        handoffs: Vec<Handoff>,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,5 +312,47 @@ impl std::error::Error for ExceptionRootError {}
 impl From<ExceptionRootError> for Error {
     fn from(error: ExceptionRootError) -> Self {
         Error::BadExceptionRoots(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExceptionRole, RootIsa, SlotForm};
+    use crate::execution_ranges::DecodeIsa;
+
+    #[test]
+    fn closed_domain_wire_names_and_conversions_are_total() {
+        assert_eq!(
+            ExceptionRole::ALL.map(ExceptionRole::as_wire),
+            [
+                "reset",
+                "undefined_instruction",
+                "supervisor_call",
+                "prefetch_abort",
+                "data_abort",
+                "reserved",
+                "irq",
+                "fiq",
+            ]
+        );
+        assert_eq!(
+            ExceptionRole::ALL.map(ExceptionRole::slot_index),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(RootIsa::Arm.as_wire(), "arm");
+        assert_eq!(RootIsa::Thumb.as_wire(), "thumb");
+        assert_eq!(RootIsa::from_decode_isa(DecodeIsa::Arm), RootIsa::Arm);
+        assert_eq!(RootIsa::from_decode_isa(DecodeIsa::Thumb), RootIsa::Thumb);
+        assert_eq!(RootIsa::Arm.decode_isa(), DecodeIsa::Arm);
+        assert_eq!(RootIsa::Thumb.decode_isa(), DecodeIsa::Thumb);
+
+        let direct = SlotForm::DirectBranch;
+        let literal = SlotForm::LiteralLoad {
+            literal_address: 0x4001_0040,
+        };
+        assert_eq!(direct.as_wire(), "direct_branch");
+        assert_eq!(literal.as_wire(), "literal_load");
+        assert!(!direct.is_literal_load());
+        assert!(literal.is_literal_load());
     }
 }
