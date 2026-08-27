@@ -1,7 +1,7 @@
-// Entry-rooted bounded local CFG over the shared arm32 decoder, with
-// definition-aware dataflow and the graph queries the induction proofs
+// PAL-specific proof facade over the shared bounded semantic CFG, plus the
+// definition-aware flag/value facts and graph queries the induction proofs
 // use. Every node is decoded from the mandatory CFG entry; conditional
-// successors must resolve inside the window, and only an explicit
+// successors must resolve inside the PAL window, and only an explicit
 // unconditional direct branch may leave it as a typed external edge.
 
 use crate::arm32::{
@@ -10,8 +10,9 @@ use crate::arm32::{
     ValueExpr,
 };
 use crate::execution_ranges::DecodeIsa;
-use crate::pal_tasks::{CFG_MAX_INSTRUCTIONS, CFG_WINDOW_BYTES};
+use crate::pal_tasks::{CFG_WINDOW_BYTES, semantic_cfg_limits};
 use crate::runtime_image::RuntimeImage;
+use crate::semantic_cfg::{BoundaryKind, CallPolicy, SemanticCfg};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const THUMB: DecodeIsa = DecodeIsa::Thumb;
@@ -65,112 +66,46 @@ pub(super) fn decode_with(
 /// failures also reject. A below-threshold rejection yields `None`.
 pub(super) fn decode_entry_rooted_cfg(image: &RuntimeImage<'_>, entry: u32) -> Option<LocalCfg> {
     let end = entry.checked_add(CFG_WINDOW_BYTES)?;
-    if !entry.is_multiple_of(2) {
-        return None;
-    }
-    let decoder = PureRustDecoder;
-    let mut state = decoder.begin_range(THUMB);
-    let mut decoded: BTreeMap<u32, (DecodedInstruction, u32, BTreeSet<u32>)> = BTreeMap::new();
-    let mut pending = VecDeque::from([entry]);
-
-    while let Some(pc) = pending.pop_front() {
-        if decoded.contains_key(&pc) {
-            continue;
-        }
-        if pc < entry || pc >= end || !pc.is_multiple_of(2) || decoded.len() == CFG_MAX_INSTRUCTIONS
-        {
-            return None;
-        }
-        let instruction = decode_with(image, &decoder, &mut state, pc)?;
-        // An IT block opens predicated flow this bounded proof cannot
-        // resolve; reject rather than continue past it.
-        if state.is_open() {
-            return None;
-        }
-        let next = pc.checked_add(u32::from(instruction.length))?;
-        if next > end {
-            return None;
-        }
-        if decoded
-            .range(pc.saturating_sub(3)..next)
-            .any(|(_, (_, prior_end, _))| *prior_end > pc)
-        {
-            return None;
-        }
-        // An unresolved transfer (an indirect PC write, table branch,
-        // register BLX, or other barrier) rejects the candidate.
-        if matches!(instruction.flow, ControlFlow::Barrier) {
-            return None;
-        }
-
-        let (targets, internal_required) = successors_of(&instruction, next);
-        if targets.iter().any(|target| target % 2 != 0) {
-            return None;
-        }
-        if internal_required
-            && targets
-                .iter()
-                .any(|target| *target < entry || *target >= end)
-        {
-            return None;
-        }
-        decoded.insert(
-            pc,
-            (
-                instruction,
-                next,
-                targets.iter().copied().collect::<BTreeSet<_>>(),
-            ),
-        );
-        pending.extend(
-            targets
-                .into_iter()
-                .filter(|target| *target >= entry && *target < end),
-        );
-    }
-
-    let nodes = decoded
-        .into_iter()
-        .map(|(pc, (instruction, _, successors))| {
-            (
-                pc,
-                CfgNode {
-                    instruction,
-                    successors,
-                },
+    let semantic = SemanticCfg::decode_with_address_window(
+        image,
+        entry,
+        THUMB,
+        semantic_cfg_limits(),
+        CallPolicy::Fallthrough,
+        Some(CFG_WINDOW_BYTES),
+    )
+    .ok()?;
+    if !semantic.instructions().contains_key(&entry)
+        || semantic.handoffs().iter().any(|handoff| {
+            matches!(
+                handoff.kind,
+                BoundaryKind::Call | BoundaryKind::Indirect | BoundaryKind::DecodeFailure
             )
         })
-        .collect();
-    Some(LocalCfg::new(entry, nodes))
-}
-
-/// The direct successors of one decoded instruction plus whether every
-/// one of them must decode inside the window.
-fn successors_of(instruction: &DecodedInstruction, next: u32) -> (Vec<u32>, bool) {
-    match instruction.flow {
-        ControlFlow::Linear => (vec![next], true),
-        ControlFlow::DirectBranch {
-            target,
-            fallthrough: Some(fallthrough),
-            ..
-        } => (vec![target, fallthrough], true),
-        // An unconditional direct branch may leave the window as a typed
-        // external edge.
-        ControlFlow::DirectBranch { target, .. } => (vec![target], false),
-        // Modeled direct calls and return-capable exception calls use
-        // only their architectural return-site continuation.
-        ControlFlow::DirectCall { .. } | ControlFlow::ExceptionCall => (vec![next], true),
-        ControlFlow::Return => (Vec::new(), false),
-        // Unreachable: barriers are rejected before successors are
-        // requested.
-        ControlFlow::Barrier => (Vec::new(), false),
+    {
+        return None;
     }
-}
-
-#[derive(Debug, Clone)]
-struct CfgNode {
-    instruction: DecodedInstruction,
-    successors: BTreeSet<u32>,
+    let cfg = LocalCfg { semantic };
+    if !cfg.has_only_unconditional_external_exits()
+        || cfg.external_edges().iter().any(|(_, target)| {
+            // An explicit unconditional branch may leave the local window;
+            // an unmapped target inside it remains a failed required decode.
+            *target >= entry && *target < end
+        })
+        || cfg
+            .semantic
+            .handoffs()
+            .iter()
+            .filter(|handoff| handoff.kind == BoundaryKind::Unmapped)
+            .any(|handoff| {
+                !cfg.external_edges()
+                    .iter()
+                    .any(|(source, _)| *source == handoff.pc)
+            })
+    {
+        return None;
+    }
+    Some(cfg)
 }
 
 /// A local control-flow graph rooted at one unique recognized prologue.
@@ -180,106 +115,36 @@ struct CfgNode {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // graph queries beyond Task 4's own use are Task 5's proof surface
 pub(crate) struct LocalCfg {
-    entry: u32,
-    nodes: BTreeMap<u32, CfgNode>,
-    predecessors: BTreeMap<u32, BTreeSet<u32>>,
-    external_edges: BTreeSet<(u32, u32)>,
-    reachable: BTreeSet<u32>,
-    dominators: BTreeMap<u32, BTreeSet<u32>>,
+    semantic: SemanticCfg,
 }
 
 #[allow(dead_code)] // graph queries beyond Task 4's own use are Task 5's proof surface
 impl LocalCfg {
-    fn new(entry: u32, nodes: BTreeMap<u32, CfgNode>) -> Self {
-        let mut reachable = BTreeSet::from([entry]);
-        let mut queue = VecDeque::from([entry]);
-        while let Some(pc) = queue.pop_front() {
-            for successor in nodes.get(&pc).into_iter().flat_map(|node| &node.successors) {
-                if nodes.contains_key(successor) && reachable.insert(*successor) {
-                    queue.push_back(*successor);
-                }
-            }
-        }
-
-        let mut predecessors: BTreeMap<u32, BTreeSet<u32>> =
-            reachable.iter().map(|pc| (*pc, BTreeSet::new())).collect();
-        let mut external_edges = BTreeSet::new();
-        for (source, node) in &nodes {
-            if !reachable.contains(source) {
-                continue;
-            }
-            for target in &node.successors {
-                if let Some(incoming) = predecessors.get_mut(target) {
-                    incoming.insert(*source);
-                } else {
-                    external_edges.insert((*source, *target));
-                }
-            }
-        }
-
-        let mut dominators: BTreeMap<u32, BTreeSet<u32>> = reachable
-            .iter()
-            .map(|pc| {
-                if *pc == entry {
-                    (*pc, BTreeSet::from([entry]))
-                } else {
-                    (*pc, reachable.clone())
-                }
-            })
-            .collect();
-        loop {
-            let mut changed = false;
-            for pc in reachable.iter().copied().filter(|pc| *pc != entry) {
-                let incoming = &predecessors[&pc];
-                let mut next = incoming
-                    .iter()
-                    .map(|predecessor| dominators[predecessor].clone())
-                    .reduce(|left, right| left.intersection(&right).copied().collect())
-                    .unwrap_or_default();
-                next.insert(pc);
-                if dominators[&pc] != next {
-                    dominators.insert(pc, next);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        Self {
-            entry,
-            nodes,
-            predecessors,
-            external_edges,
-            reachable,
-            dominators,
-        }
-    }
-
     pub(crate) const fn entry(&self) -> u32 {
-        self.entry
+        self.semantic.entry()
     }
 
     pub(crate) fn contains_node(&self, pc: u32) -> bool {
-        self.nodes.contains_key(&pc)
+        self.semantic.instructions().contains_key(&pc)
     }
 
     pub(crate) fn instruction(&self, pc: u32) -> Option<&DecodedInstruction> {
-        self.nodes.get(&pc).map(|node| &node.instruction)
+        self.semantic.instructions().get(&pc)
     }
 
     pub(crate) fn instructions(&self) -> impl Iterator<Item = (u32, &'_ DecodedInstruction)> {
-        self.nodes.iter().map(|(pc, node)| (*pc, &node.instruction))
+        self.semantic
+            .instructions()
+            .iter()
+            .map(|(pc, instruction)| (*pc, instruction))
     }
 
     pub(crate) fn successors(&self, pc: u32) -> Option<&BTreeSet<u32>> {
-        self.nodes.get(&pc).map(|node| &node.successors)
+        self.semantic.successors(pc)
     }
 
     pub(crate) fn predecessors(&self, pc: u32) -> &BTreeSet<u32> {
-        static EMPTY: BTreeSet<u32> = BTreeSet::new();
-        self.predecessors.get(&pc).unwrap_or(&EMPTY)
+        self.semantic.predecessors(pc)
     }
 
     pub(crate) fn has_edge(&self, source: u32, target: u32) -> bool {
@@ -288,26 +153,24 @@ impl LocalCfg {
     }
 
     pub(crate) const fn external_edges(&self) -> &BTreeSet<(u32, u32)> {
-        &self.external_edges
+        self.semantic.external_edges()
     }
 
     pub(crate) const fn reachable(&self) -> &BTreeSet<u32> {
-        &self.reachable
+        self.semantic.reachable()
     }
 
     pub(crate) fn dominates(&self, dominator: u32, node: u32) -> bool {
-        self.dominators
-            .get(&node)
-            .is_some_and(|dominators| dominators.contains(&dominator))
+        self.semantic.dominates(dominator, node)
     }
 
     /// Every external edge must originate from an explicit unconditional
     /// direct branch.
     pub(crate) fn has_only_unconditional_external_exits(&self) -> bool {
-        self.external_edges.iter().all(|(source, _)| {
-            self.nodes.get(source).is_some_and(|node| {
+        self.external_edges().iter().all(|(source, _)| {
+            self.instruction(*source).is_some_and(|instruction| {
                 matches!(
-                    node.instruction.flow,
+                    instruction.flow,
                     ControlFlow::DirectBranch {
                         fallthrough: None,
                         predicate: BranchPredicate::Always,
@@ -327,7 +190,7 @@ impl LocalCfg {
                 continue;
             }
             for successor in self.successors(pc).into_iter().flatten() {
-                if self.nodes.contains_key(successor) && reachable.insert(*successor) {
+                if self.contains_node(*successor) && reachable.insert(*successor) {
                     queue.push_back(*successor);
                 }
             }
@@ -428,7 +291,7 @@ impl LocalCfg {
             }
             for successor in self.successors(pc).into_iter().flatten() {
                 if *successor != blocked_node
-                    && self.nodes.contains_key(successor)
+                    && self.contains_node(*successor)
                     && visited.insert(*successor)
                 {
                     queue.push_back(*successor);
@@ -444,22 +307,9 @@ impl LocalCfg {
     /// program counter, so the induced theorem is rooted exactly like a
     /// fresh decode of that region.
     pub(crate) fn induced_subgraph(&self, nodes: &BTreeSet<u32>) -> LocalCfg {
-        let filtered: BTreeMap<u32, CfgNode> = self
-            .nodes
-            .iter()
-            .filter(|(pc, _)| nodes.contains(pc))
-            .map(|(pc, node)| {
-                (
-                    *pc,
-                    CfgNode {
-                        instruction: node.instruction.clone(),
-                        successors: node.successors.clone(),
-                    },
-                )
-            })
-            .collect();
-        let entry = filtered.keys().next().copied().unwrap_or(self.entry);
-        LocalCfg::new(entry, filtered)
+        LocalCfg {
+            semantic: self.semantic.induced_subgraph(nodes),
+        }
     }
 
     /// Solve the definition-aware dataflow over the graph. Facts merge
@@ -472,16 +322,17 @@ impl LocalCfg {
         image: &'image RuntimeImage<'data>,
         call_results: &'image BTreeMap<u32, u32>,
     ) -> DataflowStates<'_, 'image, 'data> {
-        let mut states: BTreeMap<u32, FactState> = BTreeMap::from([(self.entry, FactState::EMPTY)]);
-        let mut queue = VecDeque::from([self.entry]);
+        let mut states: BTreeMap<u32, FactState> =
+            BTreeMap::from([(self.entry(), FactState::EMPTY)]);
+        let mut queue = VecDeque::from([self.entry()]);
         while let Some(pc) = queue.pop_front() {
-            let Some(node) = self.nodes.get(&pc) else {
+            let Some(instruction) = self.instruction(pc) else {
                 continue;
             };
             let mut output = states[&pc];
-            apply_instruction_effect(image, pc, &node.instruction, &mut output, call_results);
-            for successor in &node.successors {
-                if !self.nodes.contains_key(successor) {
+            apply_instruction_effect(image, pc, instruction, &mut output, call_results);
+            for successor in self.successors(pc).into_iter().flatten() {
+                if !self.contains_node(*successor) {
                     continue;
                 }
                 let merged = match states.get(successor) {

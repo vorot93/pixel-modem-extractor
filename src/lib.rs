@@ -26,6 +26,7 @@ pub mod recover_source;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod runtime_image;
 pub mod scatter;
+pub(crate) mod semantic_cfg;
 pub mod source_tree;
 pub mod symbolicate;
 pub mod thumb_analysis;

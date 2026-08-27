@@ -1,8 +1,9 @@
 // PAL task initializer discovery: shared types, named limits, and the
 // structured domain error. The bounded anchor sweep and unique-prologue
-// root selection live in `discover`; the entry-rooted CFG, its
-// definition-aware dataflow, and the graph queries used by the induction
-// proofs live in `cfg`. The counting-loop, dual-exit, suffix, and
+// root selection live in `discover`; shared entry-rooted traversal lives
+// in `semantic_cfg`, while PAL's definition/flag facts and the graph queries
+// used by the induction proofs live behind the facade in `cfg`. The
+// counting-loop, dual-exit, suffix, and
 // slot-base proofs assemble the initializer candidates defined here;
 // `table` validates their slots and allocates deterministic
 // applications, `discover` returns the final plan boundary, and
@@ -12,6 +13,7 @@
 use crate::arm32::Register;
 use crate::error::Error;
 use crate::runtime_image::{RuntimeImage, StorageSpan};
+use crate::semantic_cfg::CfgLimits;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -89,6 +91,17 @@ pub(crate) const PROLOGUE_WINDOW_BYTES: u32 = 256;
 pub(crate) const CFG_WINDOW_BYTES: u32 = 512;
 /// Instruction budget the entry-rooted local CFG may decode.
 pub(crate) const CFG_MAX_INSTRUCTIONS: usize = 256;
+
+/// Shared semantic-CFG limits that preserve PAL's established 512-byte / 256
+/// instruction local proof. A block always starts at an instruction, so the
+/// instruction cap is also a behavior-neutral block ceiling.
+pub(super) const fn semantic_cfg_limits() -> CfgLimits {
+    CfgLimits {
+        max_charged_bytes: CFG_WINDOW_BYTES as u64,
+        max_instructions: CFG_MAX_INSTRUCTIONS,
+        max_blocks: CFG_MAX_INSTRUCTIONS,
+    }
+}
 /// Unique semantic candidate tuples that may reach table validation.
 pub(crate) const MAX_CANDIDATE_TUPLES: usize = 64;
 /// One non-refundable budget shared by every slot byte hashed, bounded
