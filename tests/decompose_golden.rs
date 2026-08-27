@@ -250,6 +250,36 @@ fn decompose_produces_unified_tree() {
         "expected at least one image with pass2_applied set"
     );
     for image in decompile_stage["images"].as_array().unwrap() {
+        if let Some(candidates) = image
+            .get("pass2_creation_candidates")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let skips = image["pass2_creation_map_skips"]
+                .as_object()
+                .expect("creation candidates require map-build skip diagnostics");
+            for field in [
+                "ambiguous",
+                "collision",
+                "name_limit",
+                "limit",
+                "not_entry_start",
+            ] {
+                assert!(skips[field].is_u64(), "missing {field}: {image}");
+            }
+            if let Some(created) = image
+                .get("pass2_created")
+                .and_then(serde_json::Value::as_u64)
+            {
+                let reapplied = image["pass2_creation_reapplied"].as_u64().unwrap();
+                let skipped_existing = image["pass2_creation_skipped_existing"].as_u64().unwrap();
+                let skipped_collision = image["pass2_creation_skipped_collision"].as_u64().unwrap();
+                assert_eq!(
+                    candidates,
+                    created + reapplied + skipped_existing + skipped_collision,
+                    "ApplyThumbNames runtime counts must conserve candidates: {image}"
+                );
+            }
+        }
         let Some(functions) = image.get("functions").and_then(serde_json::Value::as_u64) else {
             continue;
         };

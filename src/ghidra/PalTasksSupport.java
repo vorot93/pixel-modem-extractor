@@ -1,7 +1,7 @@
 // PalTasksSupport.java - the one shared strict PAL support class for
 // pixel-modem-extractor Ghidra scripts. Package-private on purpose: every
 // PAL-aware script in the generated kit (ApplyPalTasks, TameAnalysis,
-// ApplySymbols, ExportDecomp) parses PAL manifests, the v2 symbol map,
+// ApplySymbols, ExportDecomp) parses PAL manifests, the v3 symbol map,
 // the ownership registry, and the domain-separated digest grammars through
 // this single copy; no script may grow a second permissive parser or trust
 // a summary/property in place of inspecting the concrete program state.
@@ -22,6 +22,7 @@ import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.CodeUnit;
@@ -78,6 +79,8 @@ final class PalTasksSupport {
     static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v3";
     static final String RESERVED_NAMESPACE = "PixelModemExtractor_PalTasks_v1";
     static final String OWNERSHIP_MAP = "PixelModemExtractor.PalTasks.v1.Ownership";
+    static final String THUMB_CREATION_OWNERSHIP_MAP =
+            "PixelModemExtractor.ThumbNames.v1.Ownership";
     static final String PAL_PROPERTY = "PixelModemExtractor.PalTasks";
     static final String SYMBOL_PASS2_PROPERTY = "PixelModemExtractor.SymbolPass2";
     static final String NONE_IDENTITY = "none";
@@ -409,6 +412,111 @@ final class PalTasksSupport {
             checkedRange(fn.getEntryPoint().getOffset(), 0, UINT32_MAX, "function entry"), wire);
     }
 
+    static String expectedSymbolPass2Property(SymbolMap map) {
+        return "v2:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":"
+                + map.executions.size();
+    }
+
+    static String thumbCreationOwnershipValue(SymbolMap map, MapCreation creation,
+            Function function, TaskMonitor monitor) throws Exception {
+        return "v1:" + map.mapBlake3 + ":" + creation.executionBlake3 + ":"
+                + function.getID() + ":" + function.getSymbol().getID() + ":"
+                + currentExecutionDigest(function.getProgram(), monitor, function);
+    }
+
+    static ThumbCreationOwnership parseThumbCreationOwnership(String value) {
+        if (value == null) {
+            fail("Thumb creation ownership is missing");
+        }
+        String[] parts = value.split(":", -1);
+        if (parts.length != 6 || !"v1".equals(parts[0])) {
+            fail("Thumb creation ownership does not have the exact v1 grammar");
+        }
+        return new ThumbCreationOwnership(
+                requireHashText(parts[1], "Thumb creation map BLAKE3"),
+                requireHashText(parts[2], "Thumb creation producer execution BLAKE3"),
+                requireNonNegative(parts[3], "Thumb creation function ID"),
+                requireNonNegative(parts[4], "Thumb creation primary symbol ID"),
+                requireHashText(parts[5], "Thumb creation Ghidra execution BLAKE3"));
+    }
+
+    static void validateThumbCreationOwnershipIdentity(String value, SymbolMap map,
+            MapCreation creation) {
+        ThumbCreationOwnership parsed = parseThumbCreationOwnership(value);
+        if (!map.mapBlake3.equals(parsed.mapBlake3)
+                || !creation.executionBlake3.equals(parsed.producerExecutionBlake3)) {
+            fail("the Thumb creation ownership does not bind the current map execution");
+        }
+    }
+
+    /** Re-authenticate the producer execution against current program memory. */
+    static void validateThumbCreationExecution(Program program, TaskMonitor monitor,
+            MapCreation creation) throws Exception {
+        for (ExecutionRangeWire range : creation.decodeRanges) {
+            if (!"thumb".equals(range.isa)) {
+                fail("a creation decode range is not Thumb at "
+                        + programAddress(program, creation.entry));
+            }
+            String actual = hashMemory(program, monitor, range.start, range.end);
+            if (!range.blake3.equals(actual)) {
+                fail("a creation decode range BLAKE3 changed at "
+                        + programAddress(program, range.start));
+            }
+        }
+        String actualExecution = executionDigestHex(creation.entry, creation.decodeRanges);
+        if (!creation.executionBlake3.equals(actualExecution)) {
+            fail("a creation execution digest does not match its authenticated ranges at "
+                    + programAddress(program, creation.entry));
+        }
+    }
+
+    /** Validate one registry-owned creation without trusting its current name. */
+    static void validateOwnedThumbCreation(Program program, TaskMonitor monitor,
+            StringPropertyMap ownership, SymbolMap map, MapCreation creation) throws Exception {
+        Address entry = programAddress(program, creation.entry);
+        if (ownership == null) {
+            fail("the Thumb creation ownership changed at " + entry);
+        }
+        ThumbCreationOwnership parsed =
+                parseThumbCreationOwnership(ownership.getString(entry));
+        if (!map.mapBlake3.equals(parsed.mapBlake3)
+                || !creation.executionBlake3.equals(parsed.producerExecutionBlake3)) {
+            fail("the Thumb creation ownership changed at " + entry);
+        }
+        Function function = program.getFunctionManager().getFunctionAt(entry);
+        if (function == null || !creation.finalPrimary.equals(function.getName())
+                || !creation.finalSource.equals(primarySource(function.getSymbol().getSource()))) {
+            fail("the owned Thumb creation changed at " + entry);
+        }
+        if (function.getID() != parsed.functionId
+                || function.getSymbol().getID() != parsed.primarySymbolId) {
+            fail("the owned Thumb creation identity changed at " + entry);
+        }
+        DecodeProjection projection = decodeProjection(program, monitor, function);
+        if (!projection.errors.isEmpty()) {
+            fail("the owned Thumb creation is quarantined at " + entry);
+        }
+        boolean entryStartsThumbRange = false;
+        for (DecodeRange range : projection.ranges) {
+            entryStartsThumbRange |= range.start == creation.entry && "thumb".equals(range.isa);
+        }
+        if (!entryStartsThumbRange) {
+            fail("the owned Thumb creation has no Thumb range at its entry " + entry);
+        }
+        AddressSet authenticated = new AddressSet();
+        for (ExecutionRangeWire range : creation.decodeRanges) {
+            authenticated.add(programAddress(program, range.start),
+                    programAddress(program, range.end - 1));
+        }
+        if (!authenticated.contains(function.getBody())) {
+            fail("the owned Thumb creation body leaves authenticated memory at " + entry);
+        }
+        String currentDigest = currentExecutionDigest(program, monitor, function);
+        if (!parsed.ghidraExecutionBlake3.equals(currentDigest)) {
+            fail("the owned Thumb creation body changed at " + entry);
+        }
+    }
+
     private static final Pattern ADDRESS_TEXT = Pattern.compile("^0x[0-9a-f]{8}$");
     private static final Pattern HASH_TEXT = Pattern.compile("^[0-9a-f]{64}$");
     private static final Pattern SAFE_LABEL = Pattern.compile("^[A-Za-z0-9_.-]+$");
@@ -654,6 +762,23 @@ final class PalTasksSupport {
             this.decodeRanges = decodeRanges;
             this.finalPrimary = finalPrimary;
             this.finalSource = finalSource;
+        }
+    }
+
+    static final class ThumbCreationOwnership {
+        final String mapBlake3;
+        final String producerExecutionBlake3;
+        final long functionId;
+        final long primarySymbolId;
+        final String ghidraExecutionBlake3;
+
+        ThumbCreationOwnership(String mapBlake3, String producerExecutionBlake3,
+                long functionId, long primarySymbolId, String ghidraExecutionBlake3) {
+            this.mapBlake3 = mapBlake3;
+            this.producerExecutionBlake3 = producerExecutionBlake3;
+            this.functionId = functionId;
+            this.primarySymbolId = primarySymbolId;
+            this.ghidraExecutionBlake3 = ghidraExecutionBlake3;
         }
     }
 
@@ -1697,7 +1822,7 @@ final class PalTasksSupport {
     }
 
     // -------------------------------------------------------------------------
-    // Strict symbol-map v2 reader
+    // Strict symbol-map v3 reader
     // -------------------------------------------------------------------------
 
     static SymbolMap readSymbolMap(File retainedFunctions, String functionsHash, File map,
@@ -2665,7 +2790,7 @@ final class PalTasksSupport {
     }
 
     // -------------------------------------------------------------------------
-    // Symbol-map v2 parsing
+    // Symbol-map v3 parsing
     // -------------------------------------------------------------------------
 
     private static SymbolMap parseSymbolMap(Reader reader, String mapBlake3) throws Exception {
@@ -2939,6 +3064,8 @@ final class PalTasksSupport {
          beginArray(reader, "creations");
          java.util.HashSet<Long> creationEntries = new java.util.HashSet<>();
          java.util.HashSet<String> creationNames = new java.util.HashSet<>();
+         long creationRangeTotal = totalRanges;
+         long creationChargedTotal = chargedBytes;
          while (arrayHasNext(reader)) {
              if (wire.creations.size() >= MAX_MAP_CREATIONS) {
                  fail("symbol map exceeds the creation count limit");
@@ -2956,11 +3083,17 @@ final class PalTasksSupport {
              String executionBlake3 = hashValue(reader, "creation execution_blake3");
              name(reader, "decode_ranges");
              beginArray(reader, "decode_ranges");
-             List<ExecutionRangeWire> ranges = new ArrayList<>();
-             long creationPreviousEnd = -1;
-             long creationCharged = 0;
-             while (arrayHasNext(reader)) {
-                 reader.beginObject();
+              List<ExecutionRangeWire> ranges = new ArrayList<>();
+              long creationPreviousEnd = -1;
+              long creationCharged = 0;
+              while (arrayHasNext(reader)) {
+                  if (ranges.size() >= MAX_EXECUTION_RANGES_EACH) {
+                      fail("a creation exceeds the per-execution range limit");
+                  }
+                  if (creationRangeTotal >= MAX_EXECUTION_RANGES_TOTAL) {
+                      fail("symbol map exceeds the aggregate creation range limit");
+                  }
+                  reader.beginObject();
                  name(reader, "isa");
                  String isa = requireIsa(stringValue(reader, "decode range isa"));
                  name(reader, "start");
@@ -2977,12 +3110,18 @@ final class PalTasksSupport {
                      fail("decode ranges are not sorted or overlap");
                  }
                  creationPreviousEnd = end;
-                 creationCharged =
-                         checkedAdd(creationCharged, end - start, "charged range bytes");
-                 if (creationCharged > MAX_CHARGED_RANGE_BYTES) {
-                     fail("symbol map exceeds the aggregate range limit");
-                 }
-                 ranges.add(new ExecutionRangeWire(isa, start, end, blake3));
+                  creationCharged =
+                          checkedAdd(creationCharged, end - start, "charged range bytes");
+                  if (creationCharged > MAX_CHARGED_RANGE_BYTES) {
+                      fail("a creation exceeds the per-execution charged range limit");
+                  }
+                  creationChargedTotal = checkedAdd(creationChargedTotal, end - start,
+                          "aggregate creation charged range bytes");
+                  if (creationChargedTotal > MAX_CHARGED_RANGE_BYTES) {
+                      fail("symbol map exceeds the aggregate creation range limit");
+                  }
+                  creationRangeTotal++;
+                  ranges.add(new ExecutionRangeWire(isa, start, end, blake3));
              }
              endArray(reader, "decode_ranges");
              if (ranges.isEmpty()) {

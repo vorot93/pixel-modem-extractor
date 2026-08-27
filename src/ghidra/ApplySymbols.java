@@ -202,7 +202,7 @@ public class ApplySymbols extends HeadlessScript {
 
         String property = currentProgram.getOptions(Program.PROGRAM_INFO)
                 .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-        String expectedProperty = expectedProperty(map);
+        String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
         // The property must be absent (first application) or exactly the
         // expected identity (an idempotent replay); a different prior map is
         // stale. Which case holds is re-derived per decision below from the
@@ -243,11 +243,6 @@ public class ApplySymbols extends HeadlessScript {
         }
         return new Preflight(map, label, imageBlake3, palIdentity, palPresent,
                 planned, registry);
-    }
-
-    /** The exact SymbolPass2 property value for this invocation. */
-    private static String expectedProperty(PalTasksSupport.SymbolMap map) {
-        return "v2:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":" + map.executions.size();
     }
 
     /**
@@ -456,7 +451,7 @@ public class ApplySymbols extends HeadlessScript {
             }
             currentProgram.getOptions(Program.PROGRAM_INFO)
                     .setString(PalTasksSupport.SYMBOL_PASS2_PROPERTY,
-                            expectedProperty(preflight.map));
+                            PalTasksSupport.expectedSymbolPass2Property(preflight.map));
             // Bypass GhidraScript.println (which routes through Msg.info and
             // gets wrapped as "INFO  ApplySymbols.java> ... (GhidraScript)"):
             // emit on stdout verbatim so the Rust driver's parse_pass2_summary
