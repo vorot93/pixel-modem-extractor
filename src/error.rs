@@ -24,6 +24,8 @@ pub enum Error {
     BadPalTasks(String),
     #[error("dbt trace analysis failed: {0}")]
     BadDbtTraces(String),
+    #[error("bad exception-root evidence: {0}")]
+    BadExceptionRoots(String),
     #[error("size mismatch for {name}: expected {expected}, got {actual}")]
     SizeMismatch {
         name: String,

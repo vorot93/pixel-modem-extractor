@@ -1,0 +1,249 @@
+// ARM exception-vector discovery: closed domain types, strict limits, and
+// the crate boundary. Initial-table classification and root planning live in
+// `discover`; reset-side VBAR relocation proof is added separately.
+
+use crate::error::Error;
+use crate::execution_ranges::DecodeIsa;
+use crate::runtime_image::StorageSpan;
+use std::fmt;
+
+mod discover;
+
+#[allow(unused_imports)]
+pub(crate) use discover::discover;
+
+pub(crate) const VECTOR_SLOTS: usize = 8;
+pub(crate) const MAX_TABLES: usize = 2;
+pub(crate) const MAX_ROOTS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ExceptionRole {
+    Reset,
+    UndefinedInstruction,
+    SupervisorCall,
+    PrefetchAbort,
+    DataAbort,
+    Reserved,
+    Irq,
+    Fiq,
+}
+
+impl ExceptionRole {
+    pub(crate) const ALL: [Self; VECTOR_SLOTS] = [
+        Self::Reset,
+        Self::UndefinedInstruction,
+        Self::SupervisorCall,
+        Self::PrefetchAbort,
+        Self::DataAbort,
+        Self::Reserved,
+        Self::Irq,
+        Self::Fiq,
+    ];
+
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::UndefinedInstruction => "undefined_instruction",
+            Self::SupervisorCall => "supervisor_call",
+            Self::PrefetchAbort => "prefetch_abort",
+            Self::DataAbort => "data_abort",
+            Self::Reserved => "reserved",
+            Self::Irq => "irq",
+            Self::Fiq => "fiq",
+        }
+    }
+
+    pub(crate) const fn preferred_primary(self) -> &'static str {
+        match self {
+            Self::Reset => "Reset",
+            Self::UndefinedInstruction => "UndefinedInstruction",
+            Self::SupervisorCall => "SupervisorCall",
+            Self::PrefetchAbort => "PrefetchAbort",
+            Self::DataAbort => "DataAbort",
+            Self::Reserved => "Reserved",
+            Self::Irq => "IRQ",
+            Self::Fiq => "FIQ",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RootIsa {
+    Arm,
+    Thumb,
+}
+
+impl RootIsa {
+    pub(crate) const fn decode_isa(self) -> DecodeIsa {
+        match self {
+            Self::Arm => DecodeIsa::Arm,
+            Self::Thumb => DecodeIsa::Thumb,
+        }
+    }
+}
+
+impl fmt::Display for RootIsa {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Arm => "arm",
+            Self::Thumb => "thumb",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotForm {
+    DirectBranch,
+    LiteralLoad { literal_address: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum VectorTableKind {
+    Initial,
+    Relocated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VectorSlot {
+    pub role: ExceptionRole,
+    pub address: u32,
+    pub form: SlotForm,
+    pub slot_blake3: [u8; 32],
+    pub literal_blake3: Option<[u8; 32]>,
+    pub literal_storage: Vec<StorageSpan>,
+    pub entry: u32,
+    pub isa: RootIsa,
+    pub instruction_size: u8,
+    pub instruction_blake3: [u8; 32],
+    pub instruction_storage: Vec<StorageSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VectorTable {
+    pub kind: VectorTableKind,
+    pub address: u32,
+    pub blake3: [u8; 32],
+    pub storage: Vec<StorageSpan>,
+    pub slots: Vec<VectorSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ExceptionClaim {
+    pub table_kind: VectorTableKind,
+    pub table_address: u32,
+    pub slot_address: u32,
+    pub role: ExceptionRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExceptionRoot {
+    pub entry: u32,
+    pub isa: RootIsa,
+    pub instruction_size: u8,
+    pub instruction_blake3: [u8; 32],
+    pub storage: Vec<StorageSpan>,
+    pub claims: Vec<ExceptionClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExceptionApplication {
+    pub entry: u32,
+    pub isa: RootIsa,
+    pub desired_primary: Option<String>,
+    pub claims: Vec<ExceptionClaim>,
+    pub role_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelocationEvidence {
+    NotObserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExceptionRootPlan {
+    pub image_label: String,
+    pub toc_name: String,
+    pub image_base: u32,
+    pub image_size: u32,
+    pub initial_table: VectorTable,
+    pub relocation: RelocationEvidence,
+    pub tables: Vec<VectorTable>,
+    pub roots: Vec<ExceptionRoot>,
+    pub applications: Vec<ExceptionApplication>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExceptionRootError {
+    Malformed {
+        table: u32,
+        context: String,
+    },
+    Ambiguous {
+        values: Vec<u32>,
+    },
+    Decode {
+        pc: u32,
+        isa: RootIsa,
+        reason: String,
+    },
+    Runtime {
+        address: u32,
+        size: u32,
+        reason: String,
+    },
+    ResourceLimit {
+        what: &'static str,
+        actual: u64,
+        limit: u64,
+    },
+    #[allow(dead_code)]
+    Artifact(String),
+}
+
+impl fmt::Display for ExceptionRootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed { table, context } => {
+                write!(f, "malformed exception table at {table:#010x}: {context}")
+            }
+            Self::Ambiguous { values } => {
+                write!(f, "ambiguous exception-root values:")?;
+                for value in values {
+                    write!(f, " {value:#010x}")?;
+                }
+                Ok(())
+            }
+            Self::Decode { pc, isa, reason } => {
+                write!(
+                    f,
+                    "exception-root decode failed at {pc:#010x} ({isa}): {reason}"
+                )
+            }
+            Self::Runtime {
+                address,
+                size,
+                reason,
+            } => write!(
+                f,
+                "exception-root runtime range {address:#010x}+{size:#x} is unusable: {reason}"
+            ),
+            Self::ResourceLimit {
+                what,
+                actual,
+                limit,
+            } => write!(
+                f,
+                "exception-root {what} count {actual} exceeds the limit {limit}"
+            ),
+            Self::Artifact(reason) => write!(f, "exception-root artifact error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ExceptionRootError {}
+
+impl From<ExceptionRootError> for Error {
+    fn from(error: ExceptionRootError) -> Self {
+        Error::BadExceptionRoots(error.to_string())
+    }
+}

@@ -9,6 +9,8 @@ pub mod decompile;
 pub mod decompose;
 pub mod disasm_index;
 pub mod error;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod exception_roots;
 pub(crate) mod execution_ranges;
 pub mod ext4;
 pub mod fbpk;
