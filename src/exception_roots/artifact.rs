@@ -1612,12 +1612,13 @@ fn open_manifest_file(path: &Path, expected_label: &str) -> Result<File> {
         .parent()
         .ok_or_else(|| invalid("manifest path has no output root"))?;
     require_real_directory(output_root, "manifest output root")?;
-    let trusted = crate::scatter::TrustedDirectory::new(parent, "exception-root manifest parent")
-        .map_err(|error| {
-        invalid(format!(
-            "manifest parent cannot be opened securely: {error}"
-        ))
-    })?;
+    let trusted =
+        crate::trusted_fs::TrustedDirectory::new(parent, "exception-root manifest parent")
+            .map_err(|error| {
+                invalid(format!(
+                    "manifest parent cannot be opened securely: {error}"
+                ))
+            })?;
     trusted
         .open_regular_file_with_parent(Path::new(ARTIFACT_FILE_NAME), "exception-root manifest")
         .map(|(file, _)| file)

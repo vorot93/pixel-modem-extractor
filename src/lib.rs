@@ -35,3 +35,4 @@ pub mod thumb_analysis;
 pub mod toc;
 pub mod tokens;
 pub mod tree_hash;
+pub(crate) mod trusted_fs;

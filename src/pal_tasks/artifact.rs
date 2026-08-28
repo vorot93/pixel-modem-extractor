@@ -2501,7 +2501,7 @@ fn revalidate_applications(
 // Secure manifest open
 // ---------------------------------------------------------------------------
 
-/// Open the manifest through scatter's handle-anchored
+/// Open the manifest through the shared handle-anchored
 /// `TrustedDirectory`: the parent directory is opened without following
 /// links and the leaf is opened relative to that retained capability,
 /// with a regular-file check — the same proven containment the scatter
@@ -2516,7 +2516,7 @@ fn open_manifest_file(path: &Path) -> Result<File> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("manifest path has no parent directory"))?;
-    let trusted = crate::scatter::TrustedDirectory::new(parent, "pal task manifest parent")
+    let trusted = crate::trusted_fs::TrustedDirectory::new(parent, "pal task manifest parent")
         .map_err(|error| {
             invalid(format!(
                 "manifest parent cannot be opened securely: {error}"
