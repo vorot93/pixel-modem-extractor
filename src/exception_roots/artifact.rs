@@ -280,6 +280,42 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), old_bytes);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preserves_existing_manifest_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let materialized = materialize(&plan, context, root.path()).unwrap();
+        let path = root.path().join(materialized.relative_path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let expected_mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
+
+        materialize(
+            &plan,
+            ExceptionArtifactContext {
+                image_blake3: [7; 32],
+                ..context
+            },
+            root.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().mode() & 0o7777,
+            expected_mode
+        );
+    }
+
     #[test]
     fn oversized_serialized_manifest_is_rejected_before_opening_the_destination() {
         let raw = canonical_raw_fixture();
@@ -725,6 +761,166 @@ mod tests {
         assert!(!root.path().join("exception_roots/01_MAIN").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn materialize_parent_swap_never_updates_the_replacement_tree() {
+        use std::os::unix::fs::symlink;
+
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        materialize(&plan, context, root.path()).unwrap();
+        let old_path = root.path().join("exception_roots/01_MAIN/roots.json");
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let retained = outside.path().join("retained-label");
+        let replacement = outside.path().join("replacement-label");
+        std::fs::create_dir(&replacement).unwrap();
+        let replacement_manifest = replacement.join("roots.json");
+        std::fs::write(&replacement_manifest, b"replacement must survive").unwrap();
+        let label = old_path.parent().unwrap().to_path_buf();
+        let retained_for_hook = retained.clone();
+        let replacement_for_hook = replacement.clone();
+        super::set_before_materialize_publication(move || {
+            std::fs::rename(&label, &retained_for_hook).unwrap();
+            symlink(&replacement_for_hook, &label).unwrap();
+        });
+
+        materialize(
+            &plan,
+            ExceptionArtifactContext {
+                image_blake3: [7; 32],
+                ..context
+            },
+            root.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&replacement_manifest).unwrap(),
+            b"replacement must survive"
+        );
+        assert_ne!(
+            std::fs::read(retained.join("roots.json")).unwrap(),
+            old_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_parent_swap_never_unlinks_the_replacement_tree() {
+        use std::os::unix::fs::symlink;
+
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        materialize(&plan, context, root.path()).unwrap();
+        let label = root.path().join("exception_roots/01_MAIN");
+        let outside = tempfile::tempdir().unwrap();
+        let retained = outside.path().join("retained-label");
+        let replacement = outside.path().join("replacement-label");
+        std::fs::create_dir(&replacement).unwrap();
+        let replacement_manifest = replacement.join("roots.json");
+        std::fs::write(&replacement_manifest, b"replacement must survive").unwrap();
+        let label_for_hook = label.clone();
+        let retained_for_hook = retained.clone();
+        let replacement_for_hook = replacement.clone();
+        super::set_before_clear_unlink(move || {
+            std::fs::rename(&label_for_hook, &retained_for_hook).unwrap();
+            symlink(&replacement_for_hook, &label_for_hook).unwrap();
+        });
+
+        super::clear_materialized(root.path(), "01_MAIN").unwrap();
+
+        assert_eq!(
+            std::fs::read(&replacement_manifest).unwrap(),
+            b"replacement must survive"
+        );
+        assert!(!retained.join("roots.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_setup_swap_cannot_select_the_replacement_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let materialized = materialize(&plan, context, root.path()).unwrap();
+        let manifest = root.path().join(&materialized.relative_path);
+        std::fs::write(&manifest, b"invalid retained manifest").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = materialize(&plan, context, outside.path()).unwrap();
+        let replacement = outside
+            .path()
+            .join(external.relative_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let replacement_bytes = std::fs::read(replacement.join("roots.json")).unwrap();
+        let retained = outside.path().join("retained-invalid-label");
+        let label = manifest.parent().unwrap().to_path_buf();
+        let label_for_hook = label.clone();
+        let retained_for_hook = retained.clone();
+        let replacement_for_hook = replacement.clone();
+        super::set_before_reader_setup(move || {
+            std::fs::rename(&label_for_hook, &retained_for_hook).unwrap();
+            symlink(&replacement_for_hook, &label_for_hook).unwrap();
+        });
+
+        let result = read(&manifest, &runtime, context);
+
+        assert!(result.is_err(), "reader selected the replacement manifest");
+        assert_eq!(
+            std::fs::read(replacement.join("roots.json")).unwrap(),
+            replacement_bytes
+        );
+    }
+
+    #[test]
+    fn post_unlink_cleanup_failure_returns_success_and_manifest_stays_absent() {
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let materialized = materialize(&plan, context, root.path()).unwrap();
+        let manifest = root.path().join(materialized.relative_path);
+        super::set_label_cleanup_failure(std::io::ErrorKind::PermissionDenied);
+
+        super::clear_materialized(root.path(), "01_MAIN").unwrap();
+
+        assert!(!manifest.exists());
+        assert!(manifest.parent().unwrap().is_dir());
+    }
+
     #[test]
     fn all_relocation_variants_round_trip_with_exact_variant_fields() {
         let mut not_observed = canonical_raw_fixture();
@@ -898,6 +1094,88 @@ mod tests {
     }
 
     #[test]
+    fn portable_labels_are_rejected_before_filesystem_effects() {
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let canonical = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let invalid = [
+            String::new(),
+            ".".to_owned(),
+            "..".to_owned(),
+            "a".repeat(256),
+            "01_MAIN.".to_owned(),
+            "01_MAIN ".to_owned(),
+            "CON".to_owned(),
+            "prn.txt".to_owned(),
+            "AuX.log".to_owned(),
+            "nul.bin".to_owned(),
+            "com1".to_owned(),
+            "COM9.ext".to_owned(),
+            "lpt1".to_owned(),
+            "LpT9.cfg".to_owned(),
+            "bad:name".to_owned(),
+            "bad*name".to_owned(),
+            "bad/name".to_owned(),
+            "bad\\name".to_owned(),
+            "bad\0name".to_owned(),
+        ];
+
+        for label in invalid {
+            let mut plan = canonical.clone();
+            plan.image_label = label.clone();
+            let context = ExceptionArtifactContext {
+                label: &label,
+                toc_name: "MAIN",
+                image_blake3: *blake3::hash(&raw).as_bytes(),
+                scatter_load_map_blake3: None,
+            };
+            let root = tempfile::tempdir().unwrap();
+
+            let error = materialize(&plan, context, root.path()).unwrap_err();
+
+            assert!(
+                error.to_string().contains("invalid artifact label"),
+                "unexpected rejection for {label:?}: {error}"
+            );
+            assert!(
+                !root.path().join("exception_roots").exists(),
+                "invalid label {label:?} caused a filesystem effect"
+            );
+        }
+    }
+
+    #[test]
+    fn materialize_rejects_allocator_drift_before_output_root_access() {
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let mut plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let application = plan
+            .applications
+            .iter_mut()
+            .find(|application| application.desired_primary.is_some())
+            .unwrap();
+        application.desired_primary = Some("ValidButWrong".to_owned());
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let holder = tempfile::tempdir().unwrap();
+        let absent_root = holder.path().join("must-not-be-opened");
+
+        let error = materialize(&plan, context, &absent_root).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("canonical root/application allocation"),
+            "unexpected rejection: {error}"
+        );
+        assert!(!absent_root.exists());
+    }
+
+    #[test]
     fn materialize_rejects_out_of_limit_scatter_provenance() {
         let (raw, mut scatter) = scatter_fixture();
         scatter.entries[0].index = 256;
@@ -920,6 +1198,7 @@ mod tests {
         assert!(!root.path().join("exception_roots").exists());
     }
 }
+use super::discover::build_roots_and_applications;
 use super::{
     ExceptionApplication, ExceptionClaim, ExceptionRole, ExceptionRoot, ExceptionRootError,
     ExceptionRootPlan, MAX_ROOTS, MAX_TABLES, MAX_VBAR_WRITES, RelocationEvidence, RootIsa,
@@ -928,12 +1207,12 @@ use super::{
 use crate::arm32::{InstructionDecoder, PureRustDecoder};
 use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
 use crate::semantic_cfg::{BoundaryKind, Handoff};
-use atomic_write_file::AtomicWriteFile;
+use crate::trusted_fs::TrustedDirectory;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-exception-roots-v1";
 
@@ -943,7 +1222,12 @@ const ARTIFACT_FILE_NAME: &str = "roots.json";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_REASON_BYTES: usize = 2048;
 const MAX_SYMBOL_LEAF_BYTES: usize = 2000;
+const MAX_PATH_COMPONENT_BYTES: usize = 255;
 const TABLE_BYTES: u32 = VECTOR_SLOTS as u32 * 4;
+const WINDOWS_RESERVED_DEVICE_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
 
 type Result<T> = std::result::Result<T, ExceptionRootError>;
 
@@ -1134,16 +1418,19 @@ pub(crate) fn materialize(
         )));
     }
 
-    require_real_root(root)?;
-    let exception_dir = owned_directory(&root.join("exception_roots"), true)?
-        .ok_or_else(|| invalid("the artifact exception_roots directory cannot be created"))?;
-    let label_dir = owned_directory(&exception_dir.join(context.label), true)?
-        .ok_or_else(|| invalid("the artifact label directory cannot be created"))?;
-    let target = label_dir.join(ARTIFACT_FILE_NAME);
-    require_regular_destination_or_absent(&target)?;
+    let trusted_root =
+        TrustedDirectory::new(root, "artifact root").map_err(|error| invalid(error.to_string()))?;
+    let exception_dir = trusted_root
+        .open_or_create_directory_child("exception_roots", "artifact exception_roots directory")
+        .map_err(|error| invalid(error.to_string()))?;
+    let label_dir = exception_dir
+        .open_or_create_directory_child(context.label, "artifact label directory")
+        .map_err(|error| invalid(error.to_string()))?;
 
     let manifest_blake3 = *blake3::hash(&bytes).as_bytes();
-    let mut file = AtomicWriteFile::open(&target)
+    run_before_materialize_publication();
+    let mut file = label_dir
+        .atomic_write_file(ARTIFACT_FILE_NAME, "manifest destination")
         .map_err(|error| invalid(format!("atomic manifest publication failed: {error}")))?;
     file.write_all(&bytes)
         .map_err(|error| invalid(format!("atomic manifest write failed: {error}")))?;
@@ -1164,60 +1451,33 @@ pub(crate) fn materialize(
 
 pub(crate) fn clear_materialized(root: &Path, label: &str) -> Result<()> {
     validate_label(label, "artifact label")?;
-    match fs::symlink_metadata(root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(invalid(format!(
-                "artifact root metadata is unavailable: {error}"
-            )));
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(invalid("artifact root is not a real directory"));
-        }
-        Ok(_) => {}
-    }
-    let Some(exception_dir) = owned_directory(&root.join("exception_roots"), false)? else {
+    let Some(trusted_root) = TrustedDirectory::open_existing(root, "artifact root")
+        .map_err(|error| invalid(error.to_string()))?
+    else {
         return Ok(());
     };
-    let label_dir = exception_dir.join(label);
-    let metadata = match fs::symlink_metadata(&label_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(invalid(format!(
-                "owned label directory metadata is unavailable: {error}"
-            )));
-        }
+    let Some(exception_dir) = trusted_root
+        .open_directory_child("exception_roots", "artifact exception_roots directory")
+        .map_err(|error| invalid(error.to_string()))?
+    else {
+        return Ok(());
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid(
-            "owned label path is not a real directory and never becomes absence",
-        ));
-    }
+    let Some(label_dir) = exception_dir
+        .open_directory_child(label, "owned label directory")
+        .map_err(|error| invalid(error.to_string()))?
+    else {
+        return Ok(());
+    };
 
-    let manifest = label_dir.join(ARTIFACT_FILE_NAME);
-    match fs::symlink_metadata(&manifest) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(invalid(
-                "owned manifest path is not a regular file and never becomes absence",
-            ));
-        }
-        Ok(_) => fs::remove_file(&manifest)
-            .map_err(|error| invalid(format!("owned manifest cannot be removed: {error}")))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(invalid(format!(
-                "owned manifest metadata is unavailable: {error}"
-            )));
-        }
-    }
-    match fs::remove_dir(&label_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
-        Err(error) => Err(invalid(format!(
-            "owned label directory cannot be removed: {error}"
-        ))),
-    }
+    run_before_clear_unlink();
+    label_dir
+        .unlink_regular_file_if_exists(ARTIFACT_FILE_NAME, "owned manifest")
+        .map_err(|error| invalid(error.to_string()))?;
+
+    // Manifest unlink or confirmed absence is the clear commit. Directory cleanup is optional
+    // ownership hygiene and cannot retroactively turn that committed result into failure.
+    let _ = remove_label_directory(&exception_dir, label, &label_dir);
+    Ok(())
 }
 
 pub(crate) fn read(
@@ -1225,6 +1485,8 @@ pub(crate) fn read(
     runtime: &RuntimeImage<'_>,
     expected: ExceptionArtifactContext<'_>,
 ) -> Result<ValidatedExceptionRoots> {
+    validate_label(expected.label, "artifact label")?;
+    validate_label(expected.toc_name, "artifact TOC name")?;
     let mut file = open_manifest_file(path, expected.label)?;
     let length = file
         .metadata()
@@ -1482,11 +1744,19 @@ fn identity(manifest_blake3: [u8; 32], tables: usize, roots: usize) -> String {
 
 fn validate_label(value: &str, what: &str) -> Result<()> {
     let safe = !value.is_empty()
+        && value.len() <= MAX_PATH_COMPONENT_BYTES
         && value != "."
         && value != ".."
+        && !value.ends_with(['.', ' '])
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        && !WINDOWS_RESERVED_DEVICE_NAMES.iter().any(|reserved| {
+            value
+                .split_once('.')
+                .map_or(value, |(stem, _)| stem)
+                .eq_ignore_ascii_case(reserved)
+        });
     if safe {
         Ok(())
     } else {
@@ -1505,31 +1775,6 @@ fn validate_symbol(value: &str, what: &str) -> Result<()> {
     } else {
         Err(invalid(format!("{what} is not a bounded symbol leaf")))
     }
-}
-
-fn require_regular_destination_or_absent(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(invalid("manifest destination is a symlink"))
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            Err(invalid("manifest destination is not a regular file"))
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(invalid(format!(
-            "manifest destination metadata is unavailable: {error}"
-        ))),
-    }
-}
-
-fn require_real_root(root: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(root)
-        .map_err(|error| invalid(format!("artifact root metadata is unavailable: {error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid("artifact root is not a real directory"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1556,33 +1801,92 @@ fn run_before_commit() -> Result<()> {
     Ok(())
 }
 
-fn owned_directory(path: &Path, create: bool) -> Result<Option<PathBuf>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| {
-                invalid(format!("artifact directory cannot be created: {error}"))
-            })?;
-            fs::symlink_metadata(path).map_err(|error| {
-                invalid(format!(
-                    "artifact directory metadata is unavailable after creation: {error}"
-                ))
-            })?
+#[cfg(all(test, unix))]
+thread_local! {
+    static BEFORE_MATERIALIZE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_CLEAR_UNLINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_READER_SETUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn set_before_materialize_publication(hook: impl FnOnce() + 'static) {
+    BEFORE_MATERIALIZE_PUBLICATION.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+#[cfg(all(test, unix))]
+fn set_before_clear_unlink(hook: impl FnOnce() + 'static) {
+    BEFORE_CLEAR_UNLINK.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+#[cfg(all(test, unix))]
+fn set_before_reader_setup(hook: impl FnOnce() + 'static) {
+    BEFORE_READER_SETUP.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+fn run_before_materialize_publication() {
+    #[cfg(all(test, unix))]
+    BEFORE_MATERIALIZE_PUBLICATION.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
         }
-        Err(error) => {
-            return Err(invalid(format!(
-                "artifact directory metadata is unavailable: {error}"
-            )));
+    });
+}
+
+fn run_before_clear_unlink() {
+    #[cfg(all(test, unix))]
+    BEFORE_CLEAR_UNLINK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
         }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    });
+}
+
+fn run_before_reader_setup() {
+    #[cfg(all(test, unix))]
+    BEFORE_READER_SETUP.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static LABEL_CLEANUP_FAILURE: std::cell::RefCell<Option<std::io::ErrorKind>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_label_cleanup_failure(kind: std::io::ErrorKind) {
+    LABEL_CLEANUP_FAILURE.with(|slot| {
+        assert!(slot.borrow_mut().replace(kind).is_none());
+    });
+}
+
+fn remove_label_directory(
+    parent: &TrustedDirectory,
+    label: &str,
+    child: &TrustedDirectory,
+) -> Result<()> {
+    #[cfg(test)]
+    if let Some(kind) = LABEL_CLEANUP_FAILURE.with(|slot| slot.borrow_mut().take()) {
         return Err(invalid(format!(
-            "artifact directory {} is not an owned real directory",
-            path.display()
+            "injected label cleanup failure: {}",
+            std::io::Error::from(kind)
         )));
     }
-    Ok(Some(path.to_path_buf()))
+    parent
+        .remove_child_directory_if_empty(label, child, "owned label directory")
+        .map_err(|error| invalid(error.to_string()))
 }
 
 fn open_manifest_file(path: &Path, expected_label: &str) -> Result<File> {
@@ -1600,38 +1904,34 @@ fn open_manifest_file(path: &Path, expected_label: &str) -> Result<File> {
             "manifest label directory does not match the expected image label",
         ));
     }
-    require_real_directory(parent, "manifest label directory")?;
     let exception_dir = parent
         .parent()
         .ok_or_else(|| invalid("manifest path has no exception_roots directory"))?;
     if exception_dir.file_name().and_then(|name| name.to_str()) != Some("exception_roots") {
         return Err(invalid("manifest path escapes exception_roots/<label>"));
     }
-    require_real_directory(exception_dir, "manifest exception_roots directory")?;
     let output_root = exception_dir
         .parent()
         .ok_or_else(|| invalid("manifest path has no output root"))?;
-    require_real_directory(output_root, "manifest output root")?;
-    let trusted =
-        crate::trusted_fs::TrustedDirectory::new(parent, "exception-root manifest parent")
-            .map_err(|error| {
-                invalid(format!(
-                    "manifest parent cannot be opened securely: {error}"
-                ))
-            })?;
-    trusted
+    let trusted_root =
+        TrustedDirectory::new(output_root, "manifest output root").map_err(|error| {
+            invalid(format!(
+                "manifest output root cannot be opened securely: {error}"
+            ))
+        })?;
+    let trusted_exception = trusted_root
+        .open_directory_child("exception_roots", "manifest exception_roots directory")
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| invalid("manifest exception_roots directory does not exist"))?;
+    let trusted_label = trusted_exception
+        .open_directory_child(expected_label, "manifest label directory")
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| invalid("manifest label directory does not exist"))?;
+    run_before_reader_setup();
+    trusted_label
         .open_regular_file_with_parent(Path::new(ARTIFACT_FILE_NAME), "exception-root manifest")
         .map(|(file, _)| file)
         .map_err(|error| invalid(error.to_string()))
-}
-
-fn require_real_directory(path: &Path, what: &str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| invalid(format!("{what} metadata is unavailable: {error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(invalid(format!("{what} is not a real directory")));
-    }
-    Ok(())
 }
 
 impl WireManifest {
@@ -2248,6 +2548,18 @@ fn validate_plan(plan: &ExceptionRootPlan, context: &ExceptionArtifactContext<'_
         validate_table(table, &format!("tables[{table_index}]"))?;
     }
     validate_table(&plan.initial_table, "initial_table")?;
+
+    let (canonical_roots, canonical_applications) = build_roots_and_applications(&plan.tables)
+        .map_err(|error| {
+            invalid(format!(
+                "canonical root/application allocation failed: {error}"
+            ))
+        })?;
+    if plan.roots != canonical_roots || plan.applications != canonical_applications {
+        return Err(invalid(
+            "plan does not match the canonical root/application allocation",
+        ));
+    }
 
     if plan.roots.is_empty()
         || plan.roots.len() > MAX_ROOTS

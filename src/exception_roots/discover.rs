@@ -546,7 +546,7 @@ fn reject_cross_isa_aliases<'a>(
     }
 }
 
-fn build_roots_and_applications(
+pub(super) fn build_roots_and_applications(
     tables: &[VectorTable],
 ) -> Result<(Vec<ExceptionRoot>, Vec<ExceptionApplication>), ExceptionRootError> {
     reject_cross_isa_aliases(tables.iter().flat_map(|table| table.slots.iter()))?;

@@ -308,6 +308,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `blake3` helpers |
 | `tree_hash.rs` | `pme-paq-v1` whole-tree hash behind the `tree-hash` subcommand (fail-closed tree validation) |
+| `trusted_fs.rs` | Retained directory capabilities, no-follow traversal, and handle-relative atomic leaf mutation |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
@@ -315,6 +316,21 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
+
+### Trusted artifact filesystem
+
+- **The capability is the authority.** `TrustedDirectory` acquires the requested root with one
+  final-component no-follow/reparse-point open and uses that same object for every descendant
+  operation. Never reintroduce a metadata/canonicalize check followed by a path reopen: a rename
+  between those calls can redirect a reader, publication, or clear into a replacement tree.
+- **Mutation is handle-relative on both platform families.** Unix uses `mkdirat`/`openat`/
+  `renameat`/`unlinkat`; Windows uses `NtCreateFile` plus `NtSetInformationFile` rename and
+  disposition requests rooted at retained handles. Atomic replacement syncs complete temporary
+  bytes first, preserves an existing Unix leaf's mode/owner, and keeps pre-commit failures from
+  changing the old complete leaf.
+- **Clear commits at the owned leaf.** Once the regular leaf was unlinked or confirmed absent,
+  removing an empty owned directory is best-effort hygiene. A cleanup failure must not turn the
+  committed clear into an error, and an identity mismatch must not remove a replacement directory.
 
 ### Dense Thumb analyzer invariants
 
