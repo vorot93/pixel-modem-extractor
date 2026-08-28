@@ -3,11 +3,11 @@
 //
 //   arg[0] = mode: "tighten" (Phase 2+ default) or "datamark" (Phase-1
 //             fallback, also used by --no-thumb-decompile).
-//   arg[1] = expected PAL identity: "none" (every current caller until the
-//             PAL task-inventory generation supplies a present one) or the
-//             v1 present grammar. Validated through PalTasksSupport — this
-//             script owns no second registry parser or digest.
-//   arg[2..] = datamark only: sorted, non-overlapping "addrHex:lenHex"
+//   arg[1] = expected exception-root identity or "none". Validated through
+//             ExceptionRootsSupport; this script owns no registry parser.
+//   arg[2] = expected PAL identity or "none". Validated through
+//             PalTasksSupport.
+//   arg[3..] = datamark only: sorted, non-overlapping "addrHex:lenHex"
 //             regions (tighten accepts none).
 //
 // tighten mutates and verifies analyzer options only; it never data-marks
@@ -18,7 +18,7 @@
 // maximal undefined gaps BEFORE any mutation, creates byte arrays of at
 // most 16 MiB exactly partitioning those gaps, then rescans once: preserved
 // units/count/digest identical, created arrays exact, total count additive,
-// function digest identical, and the applied PAL state still valid. Any
+// function digest identical, and the applied exception/PAL state still valid. Any
 // failure undoes the journaled mutations in reverse order, aborts the
 // script transaction with end(false), and rethrows — no partial
 // data-marking survives. Every argument and region check runs before the
@@ -143,17 +143,20 @@ public class TameAnalysis extends HeadlessScript {
 
     private final class Preflight {
         final String mode;
-        final String identity;
+        final String exceptionIdentity;
+        final String palIdentity;
         final List<Region> regions;
         final String codeUnitsDigest;
         final String functionDigest;
         final long unitsBefore;
         final long functionsBefore;
 
-        Preflight(String mode, String identity, List<Region> regions, String codeUnitsDigest,
-                String functionDigest, long unitsBefore, long functionsBefore) {
+        Preflight(String mode, String exceptionIdentity, String palIdentity,
+                List<Region> regions, String codeUnitsDigest, String functionDigest,
+                long unitsBefore, long functionsBefore) {
             this.mode = mode;
-            this.identity = identity;
+            this.exceptionIdentity = exceptionIdentity;
+            this.palIdentity = palIdentity;
             this.regions = regions;
             this.codeUnitsDigest = codeUnitsDigest;
             this.functionDigest = functionDigest;
@@ -164,28 +167,29 @@ public class TameAnalysis extends HeadlessScript {
 
     private Preflight preflight() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length < 2) {
-            fail("expected the mode and PAL identity arguments");
+        if (args.length < 3) {
+            fail("expected the mode, exception-root identity, and PAL identity arguments");
         }
         String mode = args[0];
         if (!"tighten".equals(mode) && !"datamark".equals(mode)) {
             fail("unknown mode '" + mode + "' (expected 'tighten' or 'datamark')");
         }
-        String identity = args[1];
+        String exceptionIdentity = args[1];
+        String palIdentity = args[2];
         List<Region> regions = new ArrayList<>();
         if ("tighten".equals(mode)) {
-            if (args.length != 2) {
+            if (args.length != 3) {
                 fail("tighten mode accepts no region arguments");
             }
         }
         else {
-            if (args.length - 2 > MAX_REGIONS) {
+            if (args.length - 3 > MAX_REGIONS) {
                 fail("the region count exceeds " + MAX_REGIONS);
             }
             long aggregate = 0;
             long previousStart = -1;
             long previousEnd = -1;
-            for (int index = 2; index < args.length; index++) {
+            for (int index = 3; index < args.length; index++) {
                 Region region = parseRegion(args[index]);
                 if (region.start < previousStart) {
                     fail("regions are not sorted by start address at 0x"
@@ -205,25 +209,38 @@ public class TameAnalysis extends HeadlessScript {
             requireMapped(regions);
         }
 
-        // Exact PAL property/absence validation through the one shared
-        // support class (PalTasksSupport owns the registry grammar).
-        if (PalTasksSupport.NONE_IDENTITY.equals(identity)) {
-            PalTasksSupport.validateAbsent(currentProgram);
-        }
-        else {
-            PalTasksSupport.validateAppliedIdentity(currentProgram, identity);
-        }
+        validateExceptionState(exceptionIdentity);
+        validatePalState(palIdentity);
 
         if ("tighten".equals(mode)) {
-            return new Preflight(mode, identity, regions, null, null, 0, 0);
+            return new Preflight(mode, exceptionIdentity, palIdentity,
+                    regions, null, null, 0, 0);
         }
         checkDeadline();
         String codeUnitsDigest = PalTasksSupport.codeUnitsDigestHex(currentProgram, null);
         String functionDigest = PalTasksSupport.functionBodiesDigestHex(currentProgram);
         long unitsBefore = currentProgram.getListing().getNumCodeUnits();
         long functionsBefore = countFunctions();
-        return new Preflight(mode, identity, regions, codeUnitsDigest, functionDigest,
-                unitsBefore, functionsBefore);
+        return new Preflight(mode, exceptionIdentity, palIdentity, regions,
+                codeUnitsDigest, functionDigest, unitsBefore, functionsBefore);
+    }
+
+    private void validateExceptionState(String identity) {
+        if (PalTasksSupport.NONE_IDENTITY.equals(identity)) {
+            ExceptionRootsSupport.validateAbsent(currentProgram);
+        }
+        else {
+            ExceptionRootsSupport.validateAppliedIdentity(currentProgram, identity);
+        }
+    }
+
+    private void validatePalState(String identity) throws Exception {
+        if (PalTasksSupport.NONE_IDENTITY.equals(identity)) {
+            PalTasksSupport.validateAbsent(currentProgram);
+        }
+        else {
+            PalTasksSupport.validateAppliedIdentity(currentProgram, identity);
+        }
     }
 
     private long countFunctions() {
@@ -355,10 +372,15 @@ public class TameAnalysis extends HeadlessScript {
                 disable(opts, TIGHTEN_EXTRA);
                 verifyDisabled(opts, DISABLE);
                 verifyDisabled(opts, TIGHTEN_EXTRA);
+                validateExceptionState(preflight.exceptionIdentity);
+                validatePalState(preflight.palIdentity);
                 println("TameAnalysis: mode=tighten (Phase 2+)");
                 return;
             }
             disable(opts, DISABLE);
+            // Root instructions are proven defined code immediately before
+            // gap planning, so datamark can only fill genuinely undefined bytes.
+            validateExceptionState(preflight.exceptionIdentity);
             planGaps();
             createArrays();
             verifyRescan();
@@ -561,12 +583,8 @@ public class TameAnalysis extends HeadlessScript {
                     .equals(preflight.functionDigest)) {
                 fail("the function bodies changed during data-marking");
             }
-            if (PalTasksSupport.NONE_IDENTITY.equals(preflight.identity)) {
-                PalTasksSupport.validateAbsent(currentProgram);
-            }
-            else {
-                PalTasksSupport.validateAppliedIdentity(currentProgram, preflight.identity);
-            }
+            validateExceptionState(preflight.exceptionIdentity);
+            validatePalState(preflight.palIdentity);
         }
 
         private void printSummary() {
@@ -591,7 +609,7 @@ public class TameAnalysis extends HeadlessScript {
                     listed++;
                 }
             }
-            println("TameAnalysis: {\"mode\":\"datamark\",\"identity\":\"" + preflight.identity
+            println("TameAnalysis: {\"mode\":\"datamark\",\"identity\":\"" + preflight.palIdentity
                     + "\",\"regions\":" + preflight.regions.size() + ",\"region_bytes\":"
                     + regionBytes + ",\"gaps\":" + gaps.size() + ",\"gap_bytes\":" + gapBytes
                     + ",\"arrays\":" + arraysCreated + ",\"units_before\":"

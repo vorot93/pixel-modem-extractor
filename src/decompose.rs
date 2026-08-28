@@ -3996,6 +3996,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         }
     }
@@ -6532,6 +6535,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         });
         assert_eq!(image.status, "failed");
@@ -6588,6 +6594,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         });
 
@@ -6694,6 +6703,9 @@ mod tests {
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                exception_state: decompile::RuntimeExceptionState::Unmanaged,
+                exception_roots_applied: None,
+                exception_error: None,
                 pal_applied: None,
             },
             decompile::ImageResult {
@@ -6731,6 +6743,9 @@ mod tests {
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                exception_state: decompile::RuntimeExceptionState::Unmanaged,
+                exception_roots_applied: None,
+                exception_error: None,
                 pal_applied: None,
             },
         ];
@@ -6807,6 +6822,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
@@ -6951,6 +6969,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         }];
 
@@ -7026,6 +7047,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
@@ -8617,6 +8641,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         };
 
@@ -8879,6 +8906,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         };
         let report = ImageReport::from_result(&r);
@@ -8926,6 +8956,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         };
         let report = ImageReport::from_result(&r);
@@ -9008,6 +9041,9 @@ mod tests {
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         };
         let report = ImageReport::from_result(&r);
@@ -9046,6 +9082,9 @@ mod tests {
             thumb_tighten_error: None,
             thumb_enrich_error: None,
             globals_recovered: Some(137),
+            exception_state: decompile::RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
             globals_error: Some("malformed functions.json".into()),
             globals_applied: None,

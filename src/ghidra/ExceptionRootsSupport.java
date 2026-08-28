@@ -8,6 +8,7 @@ import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.util.PseudoDisassemblerContext;
 import ghidra.app.util.PseudoInstruction;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.RegisterValue;
@@ -2114,6 +2115,220 @@ final class ExceptionRootsSupport {
         }
         validateNamespaceInventory(program, namespace, manifest);
         return new AppliedState(shared);
+    }
+
+    /**
+     * Identity-only postflight for scripts that intentionally receive no
+     * manifest path. The ownership registry is the concrete state authority;
+     * its complete function, instruction, primary, and label identities must
+     * conserve the table/root counts carried by the invocation identity.
+     */
+    static AppliedState validateAppliedIdentity(Program program, String expectedIdentity) {
+        String[] identity = parseIdentity(expectedIdentity);
+        String manifestBlake3 = identity[1];
+        int tableCount = (int) unsigned(identity[2], MAX_TABLES,
+                "exception-root identity table count");
+        int rootCount = (int) unsigned(identity[3], MAX_ROOTS,
+                "exception-root identity root count");
+        if (tableCount == 0 || rootCount == 0) {
+            fail("a present exception-root identity has zero tables or roots");
+        }
+
+        StringPropertyMap registry = currentRegistry(program);
+        Namespace namespace = currentNamespace(program);
+        if (registry == null || namespace == null || registry.getSize() != rootCount) {
+            fail("exception-root terminal ownership state is incomplete");
+        }
+        Register tMode = program.getLanguage().getRegister("TMode");
+        if (tMode == null) fail("the current language has no TMode register");
+
+        Set<Address> registered = new HashSet<Address>();
+        AddressIterator properties = registry.getPropertyIterator();
+        while (properties.hasNext()) {
+            Address entry = properties.next();
+            if (!registered.add(entry)) {
+                fail("the exception-root registry carries a duplicate entry");
+            }
+        }
+        Set<String> tables = new HashSet<String>();
+        Set<String> claims = new HashSet<String>();
+        int labelCount = 0;
+        int shared = 0;
+        for (Address entry : registered) {
+            RegistryEntry prior = parseRegistry(registry.getString(entry));
+            if (!manifestBlake3.equals(prior.manifestBlake3)
+                    || entry.getOffset() != prior.entry) {
+                fail("exception-root registry does not bind the invocation identity at " + entry);
+            }
+            Function function = program.getFunctionManager().getFunctionAt(entry);
+            validateRegistryRoot(program, function, prior, tMode);
+
+            List<LabelEntry> labels = labelsAt(program, namespace, entry);
+            if (labels.size() != prior.labelIds.size()) {
+                fail("exception-root label inventory is stale at " + entry);
+            }
+            Set<String> entryRoles = new HashSet<String>();
+            for (int index = 0; index < labels.size(); index++) {
+                LabelEntry label = labels.get(index);
+                if (label.id != prior.labelIds.get(index).longValue()
+                        || label.source != SourceType.ANALYSIS
+                        || label.type != SymbolType.LABEL) {
+                    fail("exception-root label binding is stale at " + entry);
+                }
+                String[] parsed = parseRoleLabel(label.name);
+                tables.add(parsed[1]);
+                if (!claims.add(parsed[1] + ":" + parsed[0])) {
+                    fail("exception-root role label is duplicated: " + label.name);
+                }
+                entryRoles.add(parsed[0]);
+                labelCount = Math.addExact(labelCount, 1);
+            }
+            if (!labelsDigest(labels).equals(prior.labelsBlake3)) {
+                fail("exception-root label digest is stale at " + entry);
+            }
+            validateRegistryPrimary(function, prior, entryRoles, entry);
+            if (entryRoles.size() > 1) shared = Math.addExact(shared, 1);
+        }
+        int expectedLabels = Math.multiplyExact(tableCount, SLOTS_PER_TABLE);
+        if (tables.size() != tableCount || claims.size() != expectedLabels
+                || labelCount != expectedLabels) {
+            fail("exception-root role labels do not conserve the invocation identity");
+        }
+        SymbolIterator symbols = program.getSymbolTable().getSymbols(namespace);
+        int namespaceLabels = 0;
+        while (symbols.hasNext()) {
+            Symbol symbol = symbols.next();
+            namespaceLabels = Math.addExact(namespaceLabels, 1);
+            if (symbol.getAddress() == null || !registered.contains(symbol.getAddress())
+                    || symbol.getSource() != SourceType.ANALYSIS
+                    || symbol.getSymbolType() != SymbolType.LABEL) {
+                fail("exception-root reserved namespace contains unregistered state");
+            }
+        }
+        if (namespaceLabels != labelCount) {
+            fail("exception-root reserved namespace inventory is stale or partial");
+        }
+        return new AppliedState(shared);
+    }
+
+    static void validateAbsent(Program program) {
+        StringPropertyMap registry = currentRegistry(program);
+        if (registry != null && registry.getSize() != 0) {
+            fail("the exception-root ownership registry is not empty");
+        }
+        Namespace namespace = currentNamespace(program);
+        if (namespace != null) {
+            SymbolIterator symbols = program.getSymbolTable().getSymbols(namespace);
+            if (symbols.hasNext()) {
+                fail("the exception-root reserved namespace is not empty");
+            }
+        }
+    }
+
+    private static void validateRegistryRoot(Program program, Function function,
+            RegistryEntry prior, Register tMode) {
+        Address entry = PmeScriptSupport.programAddress(program, prior.entry);
+        if (function == null || function.getID() != prior.functionId
+                || !function.getEntryPoint().equals(entry)) {
+            fail("exception-root registry function binding is stale at " + entry);
+        }
+        if (!"created".equals(prior.functionDisposition)
+                && !"foreign".equals(prior.functionDisposition)) {
+            fail("exception-root function disposition is invalid at " + entry);
+        }
+        Instruction instruction = program.getListing().getInstructionAt(entry);
+        if (instruction == null || instruction.isLengthOverridden()
+                || ("arm".equals(prior.isa) && instruction.getLength() != 4)
+                || ("thumb".equals(prior.isa)
+                        && instruction.getLength() != 2 && instruction.getLength() != 4)) {
+            fail("exception-root instruction length is stale at " + entry);
+        }
+        try {
+            if (!PmeScriptSupport.blake3Hex(instruction.getBytes())
+                    .equals(prior.instructionBlake3)) {
+                fail("exception-root instruction bytes are stale at " + entry);
+            }
+        }
+        catch (MemoryAccessException error) {
+            throw new RootError("exception-root instruction is unreadable at " + entry, error);
+        }
+        BigInteger expected = "thumb".equals(prior.isa) ? BigInteger.ONE : BigInteger.ZERO;
+        Address end = PmeScriptSupport.programAddress(program,
+                prior.entry + instruction.getLength() - 1L);
+        Address cursor = entry;
+        while (true) {
+            RegisterValue value = program.getProgramContext().getRegisterValue(tMode, cursor);
+            if (value == null || !value.hasValue()
+                    || !expected.equals(value.getUnsignedValue())) {
+                fail("exception-root instruction ISA is stale at " + entry);
+            }
+            if (cursor.equals(end)) break;
+            cursor = cursor.next();
+            if (cursor == null) fail("exception-root instruction span wraps at " + entry);
+        }
+        if (!function.getBody().contains(entry, end)) {
+            fail("exception-root function body does not contain its instruction at " + entry);
+        }
+    }
+
+    private static void validateRegistryPrimary(Function function, RegistryEntry prior,
+            Set<String> entryRoles, Address entry) {
+        Symbol primary = function.getSymbol();
+        String source = PmeScriptSupport.primarySource(primary.getSource());
+        String digest = PmeScriptSupport.blake3Hex(PmeScriptSupport.boundedUtf8(
+                primary.getName(), MAX_SYMBOL_UTF8_BYTES, "exception-root primary"));
+        if (prior.primaryId == null || prior.primaryId.longValue() != primary.getID()
+                || !source.equals(prior.primarySource)
+                || !digest.equals(prior.primaryNameBlake3)) {
+            fail("exception-root primary binding is stale at " + entry);
+        }
+        if ("exception_owned".equals(prior.primaryDisposition)) {
+            if (entryRoles.size() != 1 || primary.getSource() != SourceType.ANALYSIS
+                    || !primary.getName().equals(primaryForRole(entryRoles.iterator().next()))) {
+                fail("owned exception primary is stale at " + entry);
+            }
+        }
+        else if ("preserved".equals(prior.primaryDisposition)) {
+            if (entryRoles.size() != 1 || primary.getSource() == SourceType.DEFAULT) {
+                fail("preserved exception primary is stale at " + entry);
+            }
+        }
+        else if ("not_requested".equals(prior.primaryDisposition)) {
+            if (entryRoles.size() < 2) {
+                fail("not-requested exception primary is stale at " + entry);
+            }
+        }
+        else {
+            fail("unknown exception primary disposition at " + entry);
+        }
+    }
+
+    private static String[] parseRoleLabel(String leaf) {
+        String prefix = "exception_";
+        int split = leaf.lastIndexOf('_');
+        if (!leaf.startsWith(prefix) || split <= prefix.length()
+                || split + 9 != leaf.length()) {
+            fail("exception-root role label is not canonical: " + leaf);
+        }
+        String role = role(leaf.substring(prefix.length(), split),
+                "exception-root role label");
+        String table = leaf.substring(split + 1);
+        if (!table.matches("[0-9a-f]{8}")) {
+            fail("exception-root role label table address is not canonical: " + leaf);
+        }
+        return new String[] { role, table };
+    }
+
+    private static String[] parseIdentity(String value) {
+        if (value == null) fail("exception-root identity is missing");
+        String[] parts = value.split(":", -1);
+        if (parts.length != 4 || !IDENTITY_VERSION.equals(parts[0])) {
+            fail("exception-root identity is not the v1 grammar");
+        }
+        hash(parts[1], "exception-root identity manifest BLAKE3");
+        unsigned(parts[2], MAX_TABLES, "exception-root identity table count");
+        unsigned(parts[3], MAX_ROOTS, "exception-root identity root count");
+        return parts;
     }
 
     private static void validateNamespaceInventory(Program program, Namespace namespace,

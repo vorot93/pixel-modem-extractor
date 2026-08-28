@@ -4,12 +4,14 @@
 //! exporter); the opt-in `--run` drives `analyzeHeadless` headless to export
 //! decompiled C, a disassembly listing, a function inventory, and a saved project,
 //! with radare2 primary and optional failure-only Rizin covering dense Thumb regions.
-//! One MAIN generation loop discovers the scatter load map and the PAL task table
-//! together, so every kit and run carries explicit runtime analysis state: the
-//! scatter map, the authenticated PAL task manifest, and their identities.
+//! Generation discovers MAIN scatter once, builds one runtime view per embedded
+//! image, discovers exception roots for every image, then discovers MAIN PAL
+//! tasks from the shared view. Every kit and run therefore carries explicit
+//! current state rather than inferring it from artifact existence.
 
 use crate::{
     error::{Error, Result},
+    exception_roots::{self, ExceptionArtifactContext, MaterializedExceptionRoots},
     execution_ranges::{OwnedExecutionIdentity, TaggedExecutionRecord, parse_blake3},
     pal_tasks::{self, TaskArtifactContext},
     runtime_image::RuntimeImage,
@@ -33,8 +35,10 @@ const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
 const APPLY_THUMB_NAMES_JAVA: &str = include_str!("ghidra/ApplyThumbNames.java");
 const APPLY_PAL_TASKS_JAVA: &str = include_str!("ghidra/ApplyPalTasks.java");
+const APPLY_EXCEPTION_ROOTS_JAVA: &str = include_str!("ghidra/ApplyExceptionRoots.java");
 const PME_SCRIPT_SUPPORT_JAVA: &str = include_str!("ghidra/PmeScriptSupport.java");
 const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
+const EXCEPTION_ROOTS_SUPPORT_JAVA: &str = include_str!("ghidra/ExceptionRootsSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 #[cfg(test)]
@@ -50,17 +54,20 @@ fn test_runtime() -> RuntimeImage<'static> {
 /// (`-process`) so the two argument vectors never drift on a rename.
 const GHIDRA_PROJECT_NAME: &str = "pixel-modem";
 const GHIDRA_EXPORT_FILES: [&str; 3] = ["functions.json", "disasm.lst", "decompiled.c"];
-const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v3";
+const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v4";
 
-/// The exact v3 completion marker bytes: three lines, each newline-terminated.
-/// `pal_identity` is the PAL task identity or `none`; `symbol_map` is the
-/// lowercase pass-2 symbol-map BLAKE3 or `none`. Both Rust and the generated
-/// `run_ghidra.sh` construct these bytes from current generation state and
-/// compare the marker exactly — it is a postflight attestation, not an echo
-/// of the program property.
-pub fn export_completion_marker(pal_identity: &str, symbol_map: &str) -> Vec<u8> {
-    format!("{GHIDRA_EXPORT_COMPLETION}\npal_tasks={pal_identity}\nsymbol_map={symbol_map}\n")
-        .into_bytes()
+/// Exact v4 completion-marker bytes. Each identity is this run's explicit
+/// present identity or `none`; `symbol_map` is the lowercase pass-2 map BLAKE3
+/// or `none`. Rust-driven and generated runs compare these bytes verbatim.
+pub fn export_completion_marker(
+    exception_identity: &str,
+    pal_identity: &str,
+    symbol_map: &str,
+) -> Vec<u8> {
+    format!(
+        "{GHIDRA_EXPORT_COMPLETION}\nexception_roots={exception_identity}\npal_tasks={pal_identity}\nsymbol_map={symbol_map}\n"
+    )
+    .into_bytes()
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +113,8 @@ pub struct ImageSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_load_map: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_root_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pal_task_map: Option<String>,
 }
 
@@ -149,6 +158,7 @@ pub fn build_load_spec(
                 entry_point: format!("0x{:08x}", e.load_addr),
                 blake3: crate::manifest::blake3_bytes(&data[start..end]),
                 runtime_load_map: None,
+                exception_root_map: None,
                 pal_task_map: None,
             })
         })
@@ -172,6 +182,15 @@ pub struct PalScriptPlan<'a> {
     pub identity: &'a str,
 }
 
+/// A scheduled exception-root invocation for one image: the manifest path
+/// relative to `root` plus the exact expected identity shared by every
+/// pass-1 script and terminal marker.
+#[derive(Debug, Clone, Copy)]
+pub struct ExceptionRootScriptPlan<'a> {
+    pub manifest: &'a str,
+    pub identity: &'a str,
+}
+
 /// The `analyzeHeadless` argument vector for one image — the single source of
 /// truth used both to serialize `run_ghidra.sh` and to spawn under `--run`.
 /// `root` is the path prefix (an absolute out dir for `--run`, or `$HERE` in the
@@ -180,14 +199,14 @@ pub struct PalScriptPlan<'a> {
 /// `mode` is "tighten" (Phase 2+ default — attempt Thumb) or "datamark" (Phase-1
 /// fallback — mark regions as data). When "tighten", the `thumb_regions` arg is
 /// ignored (no data-marks passed to the script). Immediately after the mode the
-/// pre-script consumes the expected PAL identity — `none` when this run's
-/// generation loop measured no present map, else the manifest identity.
+/// pre-script consumes exception-root then PAL identities, each `none` unless
+/// this run's generation loop measured a present manifest.
 ///
 /// `pal` schedules the PAL task-manifest application for this image, built
 /// from this run's present generation state. When present the pre-script
-/// order is `ApplyScatterLoad`, `ApplyPalTasks`, `TameAnalysis`, and
-/// `TameAnalysis`/`ExportDecomp` receive the plan's identity; a PAL map
-/// without a scatter map passes `-` as `ApplyPalTasks`'s scatter argument.
+/// order is `ApplyScatterLoad`, `ApplyExceptionRoots`, `ApplyPalTasks`,
+/// `TameAnalysis`, and `TameAnalysis`/`ExportDecomp` receive both identities; a
+/// PAL map without a scatter map passes `-` as `ApplyPalTasks`'s scatter argument.
 #[allow(clippy::too_many_arguments)]
 fn headless_args(
     root: &str,
@@ -195,6 +214,7 @@ fn headless_args(
     processor: &str,
     base_addr: u32,
     runtime_load_map: Option<&str>,
+    exception_roots: Option<ExceptionRootScriptPlan<'_>>,
     pal: Option<PalScriptPlan<'_>>,
     thumb_regions: &[(u32, u32)],
     mode: &str,
@@ -222,28 +242,42 @@ fn headless_args(
             format!("{root}/{relative_path}"),
         ]);
     }
+    let scatter_argument = runtime_load_map
+        .map(|scatter_relative| format!("{root}/{scatter_relative}"))
+        .unwrap_or_else(|| "-".to_string());
+    if let Some(plan) = exception_roots {
+        args.extend([
+            "-preScript".to_string(),
+            "ApplyExceptionRoots.java".to_string(),
+            root.to_string(),
+            label.to_string(),
+            format!("{root}/{}", plan.manifest),
+            scatter_argument.clone(),
+            plan.identity.to_string(),
+        ]);
+    }
     if let Some(plan) = pal {
-        let scatter_argument = runtime_load_map
-            .map(|scatter_relative| format!("{root}/{scatter_relative}"))
-            .unwrap_or_else(|| "-".to_string());
         args.extend([
             "-preScript".to_string(),
             "ApplyPalTasks.java".to_string(),
             root.to_string(),
             label.to_string(),
             format!("{root}/{}", plan.manifest),
-            scatter_argument,
+            scatter_argument.clone(),
         ]);
     }
-    // Pre-script (runs before auto-analysis): TameAnalysis takes `mode` as its
-    // arg[0], then the expected PAL identity (`none` only when this run has
-    // no present PAL plan; a discovered plan carries its manifest identity). In `datamark` mode it also disables the Aggressive Instruction
+    // Pre-script (runs before auto-analysis): TameAnalysis takes `mode`, the
+    // expected exception identity, then the expected PAL identity. In
+    // `datamark` mode it also disables the Aggressive Instruction
     // Finder and marks the dense high-entropy regions passed below (each as
     // "addrHex:lenHex") as data. In `tighten` mode no regions are passed.
     args.extend([
         "-preScript".to_string(),
         "TameAnalysis.java".to_string(),
         mode.to_string(),
+        exception_roots
+            .map(|plan| plan.identity.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         pal.map(|plan| plan.identity.to_string())
             .unwrap_or_else(|| "none".to_string()),
     ]);
@@ -252,16 +286,16 @@ fn headless_args(
             args.push(format!("{addr:08x}:{len:x}"));
         }
     }
-    // ExportDecomp (post): the strict eight-argument contract — output
-    // directory, canonical kit root, image label, PAL identity (`none`
-    // when no map is present), task manifest (`-` under the same
-    // nullability rule as ApplyPalTasks), scatter manifest when
-    // ApplyScatterLoad was scheduled (`-` otherwise), pass-1 symbol map
-    // (`-` for pass 1 and generated single-pass kits), and the expected
-    // map BLAKE3 (literal `none` with `-`).
-    let scatter_argument = runtime_load_map
-        .map(|scatter_relative| format!("{root}/{scatter_relative}"))
-        .unwrap_or_else(|| "-".to_string());
+    // ExportDecomp receives explicit exception/PAL identity-manifest pairs,
+    // the shared scatter dependency, and the pass-1 symbol-map pair. No
+    // script infers currentness from path or project-state existence.
+    let (exception_identity, exception_manifest) = match exception_roots {
+        Some(plan) => (
+            plan.identity.to_string(),
+            format!("{root}/{}", plan.manifest),
+        ),
+        None => ("none".to_string(), "-".to_string()),
+    };
     let (pal_identity, pal_manifest) = match pal {
         Some(plan) => (
             plan.identity.to_string(),
@@ -275,6 +309,8 @@ fn headless_args(
         format!("{root}/export/{label}"),
         root.to_string(),
         label.to_string(),
+        exception_identity,
+        exception_manifest,
         pal_identity,
         pal_manifest,
         scatter_argument,
@@ -617,6 +653,15 @@ pub struct ImageResult {
     /// the same address (tier-conflict suppression — the gate-relevant metric).
     /// None when Phase 3.0.1 didn't run for this image; Some(0) is a valid value.
     pub globals_provisional_suppressed: Option<usize>,
+    /// Explicit generation state measured before any image filter or opaque
+    /// skip. Physical artifact existence is never substituted for this state.
+    pub(crate) exception_state: RuntimeExceptionState,
+    /// Strict current-run `ApplyExceptionRoots` summary for a present map.
+    /// `None` means application did not complete or was not invoked.
+    pub exception_roots_applied: Option<AppliedExceptionRoots>,
+    /// Reason-only exception application/currentness failure. Exclusive with
+    /// `exception_roots_applied`; process failures remain on `outcome`.
+    pub exception_error: Option<String>,
     /// The current-run `ApplyPalTasks` summary for a present PAL map:
     /// task count, application entries, created/existing functions, names
     /// applied/preserved, and shared entries. `None` when no PAL map was
@@ -634,6 +679,21 @@ pub struct AppliedPalTasks {
     pub functions_existing: usize,
     pub names_applied: usize,
     pub names_preserved: usize,
+    pub shared_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedExceptionRoots {
+    pub tables: usize,
+    pub roles: usize,
+    pub entries: usize,
+    pub functions_created: usize,
+    pub functions_reapplied: usize,
+    pub functions_existing: usize,
+    pub names_applied: usize,
+    pub names_reapplied: usize,
+    pub names_preserved: usize,
+    pub names_not_requested: usize,
     pub shared_entries: usize,
 }
 
@@ -669,6 +729,7 @@ pub struct DecompileReport {
     pub spec_path: PathBuf,
     current_exports: BTreeSet<String>,
     runtime_scatter: HashMap<String, RuntimeScatterState>,
+    runtime_exception_roots: HashMap<String, RuntimeExceptionState>,
     runtime_tasks: HashMap<String, RuntimeTaskState>,
 }
 
@@ -689,6 +750,13 @@ impl DecompileReport {
             .get(label)
             .cloned()
             .unwrap_or(RuntimeTaskState::Unmanaged)
+    }
+
+    pub(crate) fn runtime_exception_state(&self, label: &str) -> RuntimeExceptionState {
+        self.runtime_exception_roots
+            .get(label)
+            .cloned()
+            .unwrap_or(RuntimeExceptionState::Unmanaged)
     }
 
     /// One image's coherent runtime analysis state: the scatter and PAL
@@ -718,6 +786,13 @@ pub(crate) enum RuntimeTaskState {
     Unmanaged,
     Absent,
     Present(crate::pal_tasks::MaterializedTaskMap),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeExceptionState {
+    Unmanaged,
+    Absent,
+    Present(MaterializedExceptionRoots),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1397,6 +1472,7 @@ impl GhidraExportRun {
 
     fn validate_current(
         &self,
+        exception_identity: &str,
         pal_identity: &str,
         symbol_map: &str,
     ) -> std::result::Result<(), String> {
@@ -1412,7 +1488,7 @@ impl GhidraExportRun {
         }
         let marker = std::fs::read(&self.completion)
             .map_err(|error| format!("current Ghidra export lacks completion marker: {error}"))?;
-        let expected = export_completion_marker(pal_identity, symbol_map);
+        let expected = export_completion_marker(exception_identity, pal_identity, symbol_map);
         if marker != expected {
             return Err("current Ghidra export has an invalid completion marker".to_string());
         }
@@ -1699,6 +1775,7 @@ fn write_run_script(
     toc: &Toc,
     processor: &str,
     runtime_load_maps: &HashMap<String, String>,
+    runtime_exception_states: &HashMap<String, RuntimeExceptionState>,
     runtime_task_states: &HashMap<String, RuntimeTaskState>,
 ) -> Result<()> {
     let mut s = String::new();
@@ -1751,6 +1828,13 @@ fn write_run_script(
         // `run_report` under `--run` only when `mode=datamark` actually needs them.
         let mode = "tighten";
         let label = e.label();
+        let exception_plan = match runtime_exception_states.get(&label) {
+            Some(RuntimeExceptionState::Present(map)) => Some(ExceptionRootScriptPlan {
+                manifest: &map.relative_path,
+                identity: &map.identity,
+            }),
+            _ => None,
+        };
         let pal_plan = match runtime_task_states.get(&label) {
             Some(RuntimeTaskState::Present(map)) => Some(PalScriptPlan {
                 manifest: &map.relative_path,
@@ -1773,6 +1857,7 @@ fn write_run_script(
             processor,
             e.load_addr,
             runtime_load_maps.get(&label).map(String::as_str),
+            exception_plan,
             pal_plan,
             &[],
             mode,
@@ -1794,12 +1879,11 @@ fn write_run_script(
                 shell_arg(&format!("{export_dir}/{name}"))
             ));
         }
-        // The exact three-line v3 marker, constructed from the same current
-        // generation state (this image's PAL identity, or `none` when the
-        // generation loop measured no present map) the script compares
-        // against.
+        // The exact four-line v4 marker is constructed from the same current
+        // per-image exception/PAL generation state as the invocation.
+        let exception_identity = exception_plan.map(|plan| plan.identity).unwrap_or("none");
         let pal_identity = pal_plan.map(|plan| plan.identity).unwrap_or("none");
-        let marker = export_completion_marker(pal_identity, "none");
+        let marker = export_completion_marker(exception_identity, pal_identity, "none");
         let marker_lines: Vec<String> = String::from_utf8(marker)
             .expect("the completion marker is ASCII")
             .lines()
@@ -1832,12 +1916,13 @@ fn write_run_script(
 }
 
 /// The generation loop's per-image runtime analysis products: scatter
-/// paths/states plus the explicit PAL task states. Every entry is
-/// measured by this run — currentness is never inferred from artifact
+/// paths/states plus explicit exception-root and PAL task states. Every entry
+/// is measured by this run; currentness is never inferred from artifact
 /// existence on disk.
 struct RuntimeAnalysis {
     scatter_paths: HashMap<String, String>,
     scatter_states: HashMap<String, RuntimeScatterState>,
+    exception_roots: HashMap<String, RuntimeExceptionState>,
     tasks: HashMap<String, RuntimeTaskState>,
 }
 
@@ -1847,19 +1932,16 @@ fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<Runti
         data,
         out,
         |image, base| scatter::discover(image, base).map_err(|error| error.to_string()),
+        exception_roots::discover,
         pal_tasks::discover,
     )
 }
 
-/// One MAIN loop: discover scatter once, publish or clear the owned
-/// scatter artifact, build the `RuntimeImage` over that single result,
-/// then run PAL discovery and publish or clear the owned task manifest.
-/// Publication is atomic replacement; the owned artifact is cleared only
-/// after a successful no-candidate result. A failed discovery or
-/// publication never pre-clears — older complete physical bytes may
-/// remain on disk, but the propagated error returns no consumable
-/// current state. Discovery seams are injected so tests can pin the
-/// one-scatter-discovery contract.
+/// Generate the runtime-analysis artifacts in dependency order: MAIN scatter
+/// once, one runtime view per embedded image, exception roots for every image,
+/// then MAIN PAL against the already-built view. Publication is atomic
+/// replacement; an owned artifact is cleared only after successful absence.
+/// Any discovery or publication error returns no consumable current state.
 #[allow(clippy::type_complexity)]
 fn generate_runtime_analysis_with(
     toc: &Toc,
@@ -1869,6 +1951,14 @@ fn generate_runtime_analysis_with(
         &[u8],
         u32,
     ) -> std::result::Result<Option<scatter::LoadPlan>, String>,
+    mut discover_exception_roots: impl FnMut(
+        &RuntimeImage<'_>,
+        &str,
+        &str,
+    ) -> std::result::Result<
+        Option<exception_roots::ExceptionRootPlan>,
+        exception_roots::ExceptionRootError,
+    >,
     mut discover_tasks: impl FnMut(
         &RuntimeImage<'_>,
         &str,
@@ -1879,18 +1969,21 @@ fn generate_runtime_analysis_with(
 ) -> Result<RuntimeAnalysis> {
     let mut scatter_paths = HashMap::new();
     let mut scatter_states = HashMap::new();
+    let mut scatter_blake3s = HashMap::new();
+    let mut exception_states = HashMap::new();
     let mut tasks = HashMap::new();
-    for entry in toc
-        .embedded()
-        .into_iter()
-        .filter(|entry| entry.name == "MAIN")
-    {
+    let entries = toc.embedded();
+
+    // Scatter is structurally MAIN-only and discovered exactly once. All
+    // later consumers use this materialized result rather than rediscovering
+    // from bytes or inferring currentness from a path.
+    if let Some(entry) = entries.iter().copied().find(|entry| entry.name == "MAIN") {
         let label = entry.label();
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
         let image = &data[start..end];
         let scatter_plan = discover_scatter(image, entry.load_addr).map_err(Error::BadScatter)?;
-        let scatter_map = match scatter_plan {
+        match scatter_plan {
             Some(plan) => {
                 let materialized = scatter::materialize(&plan, image, &label, out)?;
                 tracing::info!(
@@ -1899,33 +1992,80 @@ fn generate_runtime_analysis_with(
                 );
                 scatter_states.insert(label.clone(), RuntimeScatterState::Present);
                 scatter_paths.insert(label.clone(), materialized.relative_path.clone());
-                Some(materialized)
+                scatter_blake3s.insert(label, parse_blake3(&materialized.blake3)?);
             }
             None => {
                 scatter::clear_materialized(out, &label)?;
                 tracing::info!("scatter: {label} has no load-map candidate; keeping raw mapping");
-                scatter_states.insert(label.clone(), RuntimeScatterState::Absent);
-                None
+                scatter_states.insert(label, RuntimeScatterState::Absent);
             }
-        };
+        }
+    }
+
+    // Build every runtime view once. Exception discovery and MAIN PAL share
+    // these exact views, including the one current scatter artifact above.
+    let mut runtimes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let label = entry.label();
+        let start = entry.offset as usize;
+        let end = start + entry.size as usize;
+        let image = data.get(start..end).ok_or_else(|| Error::SizeMismatch {
+            name: label.clone(),
+            expected: entry.size as u64,
+            actual: data.len().saturating_sub(start) as u64,
+        })?;
         let runtime = RuntimeImage::from_artifact(
             image,
             entry.load_addr,
             out,
-            scatter_map
-                .as_ref()
-                .map(|map| out.join(&map.relative_path))
+            scatter_paths
+                .get(&label)
+                .map(|path| out.join(path))
                 .as_deref(),
         )?;
-        let context = TaskArtifactContext {
-            label: &label,
+        runtimes.push((entry, label, image, runtime));
+    }
+
+    // Architectural exception roots are image-generic. A later image filter
+    // or opaque classification cannot suppress this generation-time proof.
+    for (entry, label, image, runtime) in &runtimes {
+        let context = ExceptionArtifactContext {
+            label,
+            toc_name: &entry.name,
             image_blake3: *blake3::hash(image).as_bytes(),
-            scatter_load_map_blake3: scatter_map
-                .as_ref()
-                .map(|map| parse_blake3(&map.blake3))
-                .transpose()?,
+            scatter_load_map_blake3: scatter_blake3s.get(label).copied(),
         };
-        match discover_tasks(&runtime, &label)? {
+        match discover_exception_roots(runtime, label, &entry.name)? {
+            Some(plan) => {
+                let materialized = exception_roots::materialize(&plan, context, out)?;
+                tracing::info!(
+                    "exception roots: {label} -> {} ({})",
+                    materialized.relative_path,
+                    materialized.identity
+                );
+                exception_states
+                    .insert(label.clone(), RuntimeExceptionState::Present(materialized));
+            }
+            None => {
+                exception_roots::clear_materialized(out, label)?;
+                tracing::info!("exception roots: {label} has no vector-table candidate");
+                exception_states.insert(label.clone(), RuntimeExceptionState::Absent);
+            }
+        }
+    }
+
+    // PAL remains MAIN-only and consumes the same runtime object exception
+    // discovery just used; there is no path-based scatter rediscovery.
+    if let Some((_, label, image, runtime)) = runtimes
+        .iter()
+        .find(|(entry, _, _, _)| entry.name == "MAIN")
+    {
+        let context = TaskArtifactContext {
+            label,
+            image_blake3: *blake3::hash(image).as_bytes(),
+            scatter_load_map_blake3: scatter_blake3s.get(label).copied(),
+        };
+        match discover_tasks(runtime, label)? {
             Some(plan) => {
                 let materialized = pal_tasks::materialize(&plan, context, out)?;
                 tracing::info!(
@@ -1933,18 +2073,19 @@ fn generate_runtime_analysis_with(
                     materialized.relative_path,
                     materialized.identity
                 );
-                tasks.insert(label, RuntimeTaskState::Present(materialized));
+                tasks.insert(label.clone(), RuntimeTaskState::Present(materialized));
             }
             None => {
-                pal_tasks::clear_materialized(out, &label)?;
+                pal_tasks::clear_materialized(out, label)?;
                 tracing::info!("pal: {label} has no task-table candidate; keeping raw analysis");
-                tasks.insert(label, RuntimeTaskState::Absent);
+                tasks.insert(label.clone(), RuntimeTaskState::Absent);
             }
         }
     }
     Ok(RuntimeAnalysis {
         scatter_paths,
         scatter_states,
+        exception_roots: exception_states,
         tasks,
     })
 }
@@ -2047,15 +2188,17 @@ fn run_report_impl(
 
     let runtime_analysis = generate_runtime_analysis(&toc, &data, out)?;
 
-    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,ApplyPalTasks,
-    //    PmeScriptSupport,PalTasksSupport,TameAnalysis,ApplyThumbNames,
+    // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,
+    //    ApplyExceptionRoots,ApplyPalTasks,PmeScriptSupport,
+    //    ExceptionRootsSupport,PalTasksSupport,TameAnalysis,ApplyThumbNames,
     //    ApplySymbols,ApplyGlobals,ApplyGlobalTypes,ExportDecomp}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplyThumbNames,
     //    ApplySymbols, ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
-    //    ApplyPalTasks transactionally seeds PAL task functions before analysis;
-    //    PmeScriptSupport owns generic script utilities and PalTasksSupport owns
-    //    the strict PAL schema - no script may grow a second parser.)
+    //    ApplyExceptionRoots and ApplyPalTasks transactionally seed their
+    //    functions before analysis; PmeScriptSupport owns generic script
+    //    utilities, while each domain support owns its strict schema - no
+    //    script may grow a second parser.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(
@@ -2064,10 +2207,18 @@ fn run_report_impl(
     )?;
     std::fs::write(scripts.join("ApplyPalTasks.java"), APPLY_PAL_TASKS_JAVA)?;
     std::fs::write(
+        scripts.join("ApplyExceptionRoots.java"),
+        APPLY_EXCEPTION_ROOTS_JAVA,
+    )?;
+    std::fs::write(
         scripts.join("PmeScriptSupport.java"),
         PME_SCRIPT_SUPPORT_JAVA,
     )?;
     std::fs::write(scripts.join("PalTasksSupport.java"), PAL_TASKS_SUPPORT_JAVA)?;
+    std::fs::write(
+        scripts.join("ExceptionRootsSupport.java"),
+        EXCEPTION_ROOTS_SUPPORT_JAVA,
+    )?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
     std::fs::write(scripts.join("ApplySymbols.java"), APPLY_SYMBOLS_JAVA)?;
@@ -2086,6 +2237,10 @@ fn run_report_impl(
     let mut spec = build_load_spec(&toc, &data, source_name, &opts.processor)?;
     for image in &mut spec.images {
         image.runtime_load_map = runtime_analysis.scatter_paths.get(&image.name).cloned();
+        image.exception_root_map = match runtime_analysis.exception_roots.get(&image.name) {
+            Some(RuntimeExceptionState::Present(map)) => Some(map.relative_path.clone()),
+            _ => None,
+        };
         image.pal_task_map = match runtime_analysis.tasks.get(&image.name) {
             Some(RuntimeTaskState::Present(map)) => Some(map.relative_path.clone()),
             _ => None,
@@ -2103,6 +2258,7 @@ fn run_report_impl(
         &toc,
         &opts.processor,
         &runtime_analysis.scatter_paths,
+        &runtime_analysis.exception_roots,
         &runtime_analysis.tasks,
     )?;
 
@@ -2147,6 +2303,9 @@ fn run_report_impl(
             // definitively zero so downstream stages don't enqueue
             // work against an empty decompiled.c.
             thumb_decompiled: Option<usize>,
+            exception_state: RuntimeExceptionState,
+            exception_roots_applied: Option<AppliedExceptionRoots>,
+            exception_error: Option<String>,
             /// The current-run `ApplyPalTasks` summary when a present PAL
             /// map was applied by this run's import.
             pal_applied: Option<AppliedPalTasks>,
@@ -2157,6 +2316,11 @@ fn run_report_impl(
             if !image_matches(want, &label, &e.name) {
                 continue;
             }
+            let exception_state = runtime_analysis
+                .exception_roots
+                .get(&label)
+                .cloned()
+                .unwrap_or(RuntimeExceptionState::Unmanaged);
             let start = (e.offset as usize).min(data.len());
             let end = (e.offset as usize + e.size as usize).min(data.len());
             let img = &data[start..end];
@@ -2190,6 +2354,9 @@ fn run_report_impl(
                         terminal_error: None,
                         tighten_error: None,
                         thumb_decompiled: None,
+                        exception_state,
+                        exception_roots_applied: None,
+                        exception_error: None,
                         pal_applied: None,
                     });
                     continue;
@@ -2225,6 +2392,9 @@ fn run_report_impl(
                     terminal_error: None,
                     tighten_error: None,
                     thumb_decompiled: None,
+                    exception_state,
+                    exception_roots_applied: None,
+                    exception_error: None,
                     pal_applied: None,
                 });
                 continue;
@@ -2243,6 +2413,16 @@ fn run_report_impl(
                     regions.len()
                 );
             }
+            let exception_plan = match &exception_state {
+                RuntimeExceptionState::Present(map) => Some(ExceptionRootScriptPlan {
+                    manifest: &map.relative_path,
+                    identity: &map.identity,
+                }),
+                RuntimeExceptionState::Unmanaged | RuntimeExceptionState::Absent => None,
+            };
+            let exception_identity = exception_plan
+                .map(|plan| plan.identity.to_string())
+                .unwrap_or_else(|| "none".to_string());
             let pal_plan = match runtime_analysis.tasks.get(&label) {
                 Some(RuntimeTaskState::Present(map)) => Some(PalScriptPlan {
                     manifest: &map.relative_path,
@@ -2262,6 +2442,7 @@ fn run_report_impl(
                     .scatter_paths
                     .get(&label)
                     .map(String::as_str),
+                exception_plan,
                 pal_plan,
                 &regions,
                 mode,
@@ -2414,6 +2595,7 @@ fn run_report_impl(
                                 .scatter_paths
                                 .get(&label)
                                 .map(String::as_str),
+                            exception_plan,
                             pal_plan,
                             &regions,
                             "datamark",
@@ -2464,36 +2646,70 @@ fn run_report_impl(
                 captured_stdout = stdout;
                 Some(status)
             };
+            let mut exception_roots_applied: Option<AppliedExceptionRoots> = None;
+            let mut exception_error = None;
             let mut pal_applied: Option<AppliedPalTasks> = None;
             let mut terminal_error = None;
             let mut outcome = match status.as_ref() {
                 Some(status) if status.success() => {
-                    // The export must be exactly this run's: the v3 marker
-                    // binds the PAL identity this run scheduled, and a
-                    // present PAL map must produce exactly one well-formed
-                    // `ApplyPalTasks` summary carrying the same identity.
-                    // Anything else is terminal-invalid, never a Ghidra
-                    // process failure.
-                    let validated = export_attempt
-                        .validate_current(&pal_identity, "none")
-                        .and_then(|()| match &pal_plan {
-                            Some(plan) => parse_apply_pal_tasks_summary(
+                    // Currentness is explicit and conserving: exact v4 marker,
+                    // one strict exception summary when present, then the PAL
+                    // summary under its independent present-state rule.
+                    let mut exception_currentness_error = None;
+                    let validated = (|| {
+                        if let Err(reason) = export_attempt.validate_current(
+                            &exception_identity,
+                            &pal_identity,
+                            "none",
+                        ) {
+                            if matches!(exception_state, RuntimeExceptionState::Present(_)) {
+                                exception_currentness_error = Some(reason.clone());
+                            }
+                            return Err(reason);
+                        }
+                        let roots = match &exception_state {
+                            RuntimeExceptionState::Present(map) => {
+                                match parse_apply_exception_roots_summary(
+                                    &captured_stdout,
+                                    &label,
+                                    &map.identity,
+                                )
+                                .and_then(|summary| {
+                                    validate_applied_exception_roots(&summary, map)?;
+                                    Ok(summary)
+                                }) {
+                                    Ok(summary) => Some(summary),
+                                    Err(reason) => {
+                                        exception_currentness_error = Some(reason.clone());
+                                        return Err(reason);
+                                    }
+                                }
+                            }
+                            RuntimeExceptionState::Unmanaged | RuntimeExceptionState::Absent => {
+                                None
+                            }
+                        };
+                        let pal = match &pal_plan {
+                            Some(plan) => Some(parse_apply_pal_tasks_summary(
                                 &captured_stdout,
                                 &label,
                                 plan.identity,
-                            )
-                            .map(Some),
-                            None => Ok(None),
-                        });
+                            )?),
+                            None => None,
+                        };
+                        Ok((roots, pal))
+                    })();
                     match validated {
-                        Ok(summary) => {
-                            pal_applied = summary;
+                        Ok((roots, pal)) => {
+                            exception_roots_applied = roots;
+                            pal_applied = pal;
                             ImageOutcome::Analyzed(count_functions(&export_attempt.directory))
                         }
                         Err(reason) => {
                             tracing::warn!(
                                 "ghidra: {label} current export is not this run's: {reason}"
                             );
+                            exception_error = exception_currentness_error;
                             terminal_error = Some(reason);
                             ImageOutcome::TerminalInvalid
                         }
@@ -2641,6 +2857,9 @@ fn run_report_impl(
                 terminal_error,
                 tighten_error,
                 thumb_decompiled: thumb_decompiled_override,
+                exception_state,
+                exception_roots_applied,
+                exception_error,
                 pal_applied,
             });
         }
@@ -2749,6 +2968,9 @@ fn run_report_impl(
                     global_types_apply_error: None,
                     globals_provisional: None,
                     globals_provisional_suppressed: None,
+                    exception_state: r.exception_state,
+                    exception_roots_applied: r.exception_roots_applied,
+                    exception_error: r.exception_error,
                     pal_applied: r.pal_applied,
                 }
             })
@@ -2770,6 +2992,7 @@ fn run_report_impl(
         spec_path,
         current_exports,
         runtime_scatter: runtime_analysis.scatter_states,
+        runtime_exception_roots: runtime_analysis.exception_roots,
         runtime_tasks: runtime_analysis.tasks,
     })
 }
@@ -2777,6 +3000,14 @@ fn run_report_impl(
 /// Convert structured per-image outcomes into the standalone `decompile` failure,
 /// after every selected image has had a chance to run.
 fn report_failure(report: &DecompileReport) -> Option<Error> {
+    for image in &report.images {
+        if image.exception_state != report.runtime_exception_state(&image.label) {
+            return Some(Error::DecomposeIncomplete(format!(
+                "exception-root state drifted for {}",
+                image.label
+            )));
+        }
+    }
     // Only a real `analyzeHeadless` failure is a Ghidra failure.
     if let Some(code) = report.images.iter().find_map(|r| match r.outcome {
         ImageOutcome::Failed(c) => Some(c),
@@ -2795,6 +3026,11 @@ fn report_failure(report: &DecompileReport) -> Option<Error> {
             image: failed.join(", "),
             code,
         });
+    }
+    if let Some(reasons) = labelled_reasons(report, |image| image.exception_error.as_deref()) {
+        return Some(Error::DecomposeIncomplete(format!(
+            "exception-root application failed on {reasons}"
+        )));
     }
     // Thumb-stage reasons come first: for a rejected export they are the root
     // cause, and the terminal reason is its consequence.
@@ -3116,10 +3352,10 @@ impl Pass2Input {
 /// `ApplySymbols` consumes exactly ten arguments (kit root, image label,
 /// image BLAKE3, PAL identity, task manifest, scatter manifest, retained
 /// pass-1 functions.json, its BLAKE3, symbol map, its BLAKE3) and
-/// `ExportDecomp` exactly eight (output directory, kit root, image label,
-/// PAL identity, task manifest, scatter manifest, pass-1 symbol map, expected
-/// map BLAKE3); both hashes are computed by the driver from retained current
-/// inputs before the spawn.
+/// `ExportDecomp` exactly ten (output directory, kit root, image label,
+/// exception identity/manifest, PAL identity/manifest, scatter manifest,
+/// pass-1 symbol map, expected map BLAKE3). Task 8 supplies present pass-2
+/// exception context; until then pass 2 states explicit absence.
 fn headless_process_args(
     root: &str,
     label: &str,
@@ -3224,6 +3460,8 @@ fn headless_process_args(
         format!("{root}/export/{label}"),
         root.to_string(),
         label.to_string(),
+        "none".to_string(),
+        "-".to_string(),
         pal_identity,
         pal_manifest,
         scatter_manifest,
@@ -3333,6 +3571,121 @@ fn parse_pass2_summary(stdout: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyExceptionRootsWire {
+    image: String,
+    status: String,
+    identity: String,
+    tables: usize,
+    roles: usize,
+    entries: usize,
+    functions_created: usize,
+    functions_reapplied: usize,
+    functions_existing: usize,
+    names_applied: usize,
+    names_reapplied: usize,
+    names_preserved: usize,
+    names_not_requested: usize,
+    shared_entries: usize,
+}
+
+fn parse_apply_exception_roots_summary(
+    stdout: &str,
+    expected_image: &str,
+    expected_identity: &str,
+) -> std::result::Result<AppliedExceptionRoots, String> {
+    let mut payloads = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyExceptionRoots: "));
+    let payload = payloads
+        .next()
+        .ok_or_else(|| "missing ApplyExceptionRoots summary".to_string())?;
+    if payloads.next().is_some() {
+        return Err("duplicate ApplyExceptionRoots summaries".to_string());
+    }
+    let wire: ApplyExceptionRootsWire = serde_json::from_str(payload)
+        .map_err(|error| format!("malformed ApplyExceptionRoots summary: {error}"))?;
+    if wire.image != expected_image {
+        return Err(format!(
+            "ApplyExceptionRoots summary image {:?} does not match {:?}",
+            wire.image, expected_image
+        ));
+    }
+    if wire.status != "ok" {
+        return Err(format!(
+            "ApplyExceptionRoots summary status {:?} is not \"ok\"",
+            wire.status
+        ));
+    }
+    if wire.identity != expected_identity {
+        return Err(
+            "ApplyExceptionRoots summary identity does not match this run's root map".to_string(),
+        );
+    }
+    let functions = wire
+        .functions_created
+        .checked_add(wire.functions_reapplied)
+        .and_then(|count| count.checked_add(wire.functions_existing))
+        .ok_or_else(|| "ApplyExceptionRoots function counts overflow".to_string())?;
+    let names = wire
+        .names_applied
+        .checked_add(wire.names_reapplied)
+        .and_then(|count| count.checked_add(wire.names_preserved))
+        .and_then(|count| count.checked_add(wire.names_not_requested))
+        .ok_or_else(|| "ApplyExceptionRoots name counts overflow".to_string())?;
+    if functions != wire.entries || names != wire.entries {
+        return Err(format!(
+            "non-conserving ApplyExceptionRoots summary: entries {}, functions {functions}, names {names}",
+            wire.entries
+        ));
+    }
+    if wire.shared_entries > wire.names_not_requested {
+        return Err(
+            "non-conserving ApplyExceptionRoots summary: shared entries exceed names not requested"
+                .to_string(),
+        );
+    }
+    Ok(AppliedExceptionRoots {
+        tables: wire.tables,
+        roles: wire.roles,
+        entries: wire.entries,
+        functions_created: wire.functions_created,
+        functions_reapplied: wire.functions_reapplied,
+        functions_existing: wire.functions_existing,
+        names_applied: wire.names_applied,
+        names_reapplied: wire.names_reapplied,
+        names_preserved: wire.names_preserved,
+        names_not_requested: wire.names_not_requested,
+        shared_entries: wire.shared_entries,
+    })
+}
+
+fn validate_applied_exception_roots(
+    applied: &AppliedExceptionRoots,
+    expected: &MaterializedExceptionRoots,
+) -> std::result::Result<(), String> {
+    let expected_roles = expected
+        .tables
+        .checked_mul(exception_roots::VECTOR_SLOTS)
+        .ok_or_else(|| "expected exception-root role count overflows".to_string())?;
+    if applied.tables != expected.tables
+        || applied.roles != expected_roles
+        || applied.entries != expected.roots
+    {
+        return Err(format!(
+            "ApplyExceptionRoots summary does not match the current manifest: tables {} != {}, roles {} != {}, entries {} != {}",
+            applied.tables,
+            expected.tables,
+            applied.roles,
+            expected_roles,
+            applied.entries,
+            expected.roots
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the strict `ApplyPalTasks: {json}` current-run summary of one
@@ -3784,7 +4137,9 @@ pub fn run_two_pass(
                 .map(|map| map.map_blake3().to_string())
                 .unwrap_or_else(|| "none".to_string());
             let pal_identity = input.pal_identity_or_none().to_string();
-            if let Err(error) = export_attempt.validate_current(&pal_identity, &symbol_map_hash) {
+            if let Err(error) =
+                export_attempt.validate_current("none", &pal_identity, &symbol_map_hash)
+            {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let reason = format!(
@@ -4659,6 +5014,7 @@ mod tests {
             r#"#!/bin/sh
 set -eu
 export_dir=
+exception_identity=none
 pal_identity=none
 map_hash=none
 state=0
@@ -4671,11 +5027,13 @@ for arg in "$@"; do
     1) export_dir=$arg; state=2 ;;
     2) state=3 ;;
     3) state=4 ;;
-    4) pal_identity=$arg; state=5 ;;
+    4) exception_identity=$arg; state=5 ;;
     5) state=6 ;;
-    6) state=7 ;;
+    6) pal_identity=$arg; state=7 ;;
     7) state=8 ;;
-    8) map_hash=$arg; state=0 ;;
+    8) state=9 ;;
+    9) state=10 ;;
+    10) map_hash=$arg; state=0 ;;
     *) : ;;
   esac
 done
@@ -4688,7 +5046,7 @@ printf '%s
 export_root=$(dirname "$export_dir")
 label=$(basename "$export_dir")
 printf '%s
-' 'pixel-modem-extractor-ghidra-export-v3' "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
+' 'pixel-modem-extractor-ghidra-export-v4' "exception_roots=$exception_identity" "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
 "#,
         );
     }
@@ -4698,7 +5056,7 @@ printf '%s
     /// canonical kit root exactly, the generated script embeds the same
     /// argv over `$HERE`, the two differ only in root expansion, and the
     /// run consumes the strict `ApplyPalTasks` summary and identity-bound
-    /// v3 marker. Exercised under tighten (default), datamark
+    /// v4 marker. Exercised under tighten (default), datamark
     /// (`--no-thumb-decompile`), and a scatter+PAL MAIN.
     #[cfg(unix)]
     #[test]
@@ -4770,6 +5128,7 @@ printf '%s
                 "ARM:LE:32:v7",
                 PAL_BASE,
                 scatter_arg,
+                None,
                 Some(PalScriptPlan {
                     manifest: &map.relative_path,
                     identity: &map.identity,
@@ -4797,6 +5156,7 @@ printf '%s
                 "ARM:LE:32:v7",
                 PAL_BASE,
                 scatter_arg,
+                None,
                 Some(PalScriptPlan {
                     manifest: &map.relative_path,
                     identity: &map.identity,
@@ -4856,7 +5216,8 @@ printf '%s
                 "{case}: ApplyPalTasks precedes TameAnalysis"
             );
             assert_eq!(recorded[tame_at + 1], mode);
-            assert_eq!(recorded[tame_at + 2], map.identity);
+            assert_eq!(recorded[tame_at + 2], "none");
+            assert_eq!(recorded[tame_at + 3], map.identity);
         };
 
         run_once(
@@ -4874,11 +5235,367 @@ printf '%s
         run_once(&craft_scatter_pal_main_image(), true, false, "pal_scatter");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exception_runtime_applies_present_generation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(
+            &modem,
+            craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &fixture)]),
+        )
+        .unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_recording_headless(&ghidra_home);
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_skip_opaque = true;
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/tools/r2",
+                "radare2 exception fixture",
+            ),
+            rizin: None,
+        };
+
+        let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools).unwrap();
+        let image = &report.images[0];
+        let RuntimeExceptionState::Present(map) = &image.exception_state else {
+            panic!("the selected image must retain its present generation state");
+        };
+        assert_eq!(
+            image.exception_roots_applied,
+            Some(AppliedExceptionRoots {
+                tables: 1,
+                roles: 8,
+                entries: 7,
+                functions_created: 7,
+                functions_reapplied: 0,
+                functions_existing: 0,
+                names_applied: 6,
+                names_reapplied: 0,
+                names_preserved: 0,
+                names_not_requested: 1,
+                shared_entries: 1,
+            })
+        );
+        assert_eq!(image.exception_error, None);
+        assert!(matches!(image.outcome, ImageOutcome::Analyzed(_)));
+        assert_eq!(
+            std::fs::read(out.join("export/00_BOOT.complete")).unwrap(),
+            export_completion_marker(&map.identity, "none", "none")
+        );
+        for (name, bytes) in [
+            (
+                "ApplyExceptionRoots.java",
+                APPLY_EXCEPTION_ROOTS_JAVA.as_bytes(),
+            ),
+            (
+                "ExceptionRootsSupport.java",
+                EXCEPTION_ROOTS_SUPPORT_JAVA.as_bytes(),
+            ),
+        ] {
+            assert_eq!(
+                std::fs::read(out.join("scripts").join(name)).unwrap(),
+                bytes,
+                "generated kit did not stage {name}"
+            );
+        }
+
+        let argv = std::fs::read_to_string(out.join("export/00_BOOT/argv.txt")).unwrap();
+        let argv = argv.lines().collect::<Vec<_>>();
+        let exception_at = argv
+            .iter()
+            .position(|arg| *arg == "ApplyExceptionRoots.java")
+            .unwrap();
+        let tame_at = argv
+            .iter()
+            .position(|arg| *arg == "TameAnalysis.java")
+            .unwrap();
+        assert!(exception_at < tame_at);
+        assert_eq!(argv[exception_at + 4], "-");
+        assert_eq!(argv[exception_at + 5], map.identity);
+        assert_eq!(
+            &argv[tame_at + 1..=tame_at + 3],
+            ["tighten", &map.identity, "none"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exception_runtime_rejects_bad_summaries_and_marker_without_stale_exports() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        for (case, mutate, expected) in [
+            ("missing", "missing", "missing ApplyExceptionRoots summary"),
+            (
+                "duplicate",
+                "duplicate",
+                "duplicate ApplyExceptionRoots summaries",
+            ),
+            (
+                "malformed",
+                "malformed",
+                "malformed ApplyExceptionRoots summary",
+            ),
+            (
+                "wrong_summary_identity",
+                "wrong_summary_identity",
+                "summary identity does not match",
+            ),
+            (
+                "wrong_marker_identity",
+                "wrong_marker_identity",
+                "invalid completion marker",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let modem = dir.path().join("modem.bin");
+            std::fs::write(
+                &modem,
+                craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &fixture)]),
+            )
+            .unwrap();
+            let ghidra_home = dir.path().join("fake-ghidra");
+            write_recording_headless(&ghidra_home);
+            let headless = ghidra_home.join("support/analyzeHeadless");
+            let mut script = std::fs::read_to_string(&headless).unwrap();
+            let summary_line = script
+                .lines()
+                .find(|line| line.contains("printf 'ApplyExceptionRoots:"))
+                .unwrap()
+                .to_string();
+            match mutate {
+                "missing" => script = script.replace(&format!("{summary_line}\n"), "  :\n"),
+                "duplicate" => {
+                    script = script.replace(
+                        &format!("{summary_line}\n"),
+                        &format!("{summary_line}\n{summary_line}\n"),
+                    )
+                }
+                "malformed" => script = script.replace("\"tables\":1", "\"tables\":\"bad\""),
+                "wrong_summary_identity" => {
+                    script = script.replace(
+                        "\"$label\" \"$exception_identity\"",
+                        "\"$label\" \"v1:wrong\"",
+                    )
+                }
+                "wrong_marker_identity" => {
+                    script = script.replace(
+                        "\"exception_roots=$exception_identity\"",
+                        "\"exception_roots=v1:wrong\"",
+                    )
+                }
+                _ => unreachable!(),
+            }
+            write_executable(&headless, &script);
+
+            let out = dir.path().join(format!("out-{case}"));
+            let mut opts = generation_opts(None);
+            opts.run = true;
+            opts.ghidra_home = Some(ghidra_home);
+            opts.no_skip_opaque = true;
+            let tools = crate::thumb_analysis::ThumbTools {
+                radare2: test_identity(
+                    crate::thumb_analysis::ThumbProducer::Radare2,
+                    "/tools/r2",
+                    "radare2 exception fixture",
+                ),
+                rizin: None,
+            };
+            let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools).unwrap();
+            let image = &report.images[0];
+            assert!(
+                matches!(image.outcome, ImageOutcome::TerminalInvalid),
+                "{case}: {:?}",
+                image.outcome
+            );
+            assert_eq!(image.exception_roots_applied, None, "{case}");
+            assert!(
+                image
+                    .exception_error
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{case}: {:?}",
+                image.exception_error
+            );
+            assert!(!out.join("export/00_BOOT.complete").exists(), "{case}");
+            for name in GHIDRA_EXPORT_FILES {
+                assert!(
+                    !out.join("export/00_BOOT").join(name).exists(),
+                    "{case}: {name}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opaque_skip_retains_present_exception_generation_state_without_application() {
+        fn copy_raw_storage(value: &serde_json::Value, fixture: &[u8], image: &mut [u8]) {
+            match value {
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        copy_raw_storage(value, fixture, image);
+                    }
+                }
+                serde_json::Value::Object(object) => {
+                    if object.get("kind").and_then(serde_json::Value::as_str) == Some("raw")
+                        && let (Some(address), Some(size)) = (
+                            object.get("address").and_then(serde_json::Value::as_str),
+                            object.get("size").and_then(serde_json::Value::as_u64),
+                        )
+                    {
+                        let start = usize::from_str_radix(address.trim_start_matches("0x"), 16)
+                            .unwrap()
+                            - 0x4001_0000;
+                        let end = start + size as usize;
+                        image[start..end].copy_from_slice(&fixture[start..end]);
+                    }
+                    for value in object.values() {
+                        copy_raw_storage(value, fixture, image);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/exception_roots/roots.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut image = vec![0u8; 1024 * 1024];
+        let mut state = 0x41c6_ce57u32;
+        for byte in &mut image {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        copy_raw_storage(&manifest, &fixture, &mut image);
+        assert!(
+            opaque_skip(&image).is_some(),
+            "the fixture must hit the opaque gate"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(&modem, craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &image)])).unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_recording_headless(&ghidra_home);
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/tools/r2",
+                "radare2 opaque fixture",
+            ),
+            rizin: None,
+        };
+        let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools).unwrap();
+        let image = &report.images[0];
+        assert!(matches!(
+            image.exception_state,
+            RuntimeExceptionState::Present(_)
+        ));
+        assert!(matches!(image.outcome, ImageOutcome::SkippedOpaque(_)));
+        assert_eq!(image.exception_roots_applied, None);
+        assert_eq!(image.exception_error, None);
+        assert!(!out.join("export/00_BOOT/argv.txt").exists());
+        assert!(!out.join("export/00_BOOT.complete").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tighten_fallback_reapplies_the_same_exception_state_in_datamark_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let modem = dir.path().join("modem.bin");
+        std::fs::write(
+            &modem,
+            craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &fixture)]),
+        )
+        .unwrap();
+        let ghidra_home = dir.path().join("fake-ghidra");
+        write_recording_headless(&ghidra_home);
+        let out = dir.path().join("out");
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+        opts.no_skip_opaque = true;
+        opts.tighten_wall_clock_budget_override = Some(std::time::Duration::ZERO);
+        let tools = crate::thumb_analysis::ThumbTools {
+            radare2: test_identity(
+                crate::thumb_analysis::ThumbProducer::Radare2,
+                "/tools/r2",
+                "radare2 fallback fixture",
+            ),
+            rizin: None,
+        };
+
+        let report = run_report_with_thumb_tools(&modem, &opts, &out, &tools).unwrap();
+        let image = &report.images[0];
+        assert!(matches!(image.outcome, ImageOutcome::Analyzed(_)));
+        assert!(
+            image
+                .thumb_tighten_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("retrying as datamark"))
+        );
+        assert_eq!(image.thumb_decompiled, Some(0));
+        assert!(image.exception_roots_applied.is_some());
+        assert_eq!(image.exception_error, None);
+        let RuntimeExceptionState::Present(map) = &image.exception_state else {
+            panic!("fallback lost present exception state");
+        };
+        let argv = std::fs::read_to_string(out.join("export/00_BOOT/argv.txt")).unwrap();
+        let argv = argv.lines().collect::<Vec<_>>();
+        let tame = argv
+            .iter()
+            .position(|argument| *argument == "TameAnalysis.java")
+            .unwrap();
+        assert_eq!(
+            &argv[tame + 1..=tame + 3],
+            ["datamark", &map.identity, "none"]
+        );
+        assert_eq!(
+            std::fs::read(out.join("export/00_BOOT.complete")).unwrap(),
+            export_completion_marker(&map.identity, "none", "none")
+        );
+    }
+
     /// A fake `analyzeHeadless` that additionally records its full argv
     /// (one argument per line, under the image's export directory) and
-    /// prints the strict `ApplyPalTasks` success summary with the
-    /// identity ExportDecomp was given — so the in-process route's exact
-    /// spawn argv, marker identity, and summary parsing are observable.
+    /// prints strict exception-root and PAL success summaries with the
+    /// identities ExportDecomp was given — so the in-process route's exact
+    /// spawn argv, marker identities, and summary parsing are observable.
     #[cfg(unix)]
     fn write_recording_headless(home: &Path) {
         let headless = home.join("support/analyzeHeadless");
@@ -4887,11 +5604,14 @@ printf '%s
             r#"#!/bin/sh
 set -eu
 export_dir=
+exception_identity=none
 pal_identity=none
 map_hash=none
+exception_applied=0
 applied=0
 state=0
 for arg in "$@"; do
+  [ "$arg" = "ApplyExceptionRoots.java" ] && exception_applied=1
   [ "$arg" = "ApplyPalTasks.java" ] && applied=1
   if [ "$arg" = "ExportDecomp.java" ]; then
     state=1
@@ -4901,11 +5621,13 @@ for arg in "$@"; do
     1) export_dir=$arg; state=2 ;;
     2) state=3 ;;
     3) state=4 ;;
-    4) pal_identity=$arg; state=5 ;;
+    4) exception_identity=$arg; state=5 ;;
     5) state=6 ;;
-    6) state=7 ;;
+    6) pal_identity=$arg; state=7 ;;
     7) state=8 ;;
-    8) map_hash=$arg; state=0 ;;
+    8) state=9 ;;
+    9) state=10 ;;
+    10) map_hash=$arg; state=0 ;;
     *) : ;;
   esac
 done
@@ -4918,11 +5640,14 @@ printf '%s
 : > "$export_dir/decompiled.c"
 export_root=$(dirname "$export_dir")
 label=$(basename "$export_dir")
+if [ "$exception_applied" = 1 ]; then
+  printf 'ApplyExceptionRoots: {"image":"%s","status":"ok","identity":"%s","tables":1,"roles":8,"entries":7,"functions_created":7,"functions_reapplied":0,"functions_existing":0,"names_applied":6,"names_reapplied":0,"names_preserved":0,"names_not_requested":1,"shared_entries":1}\n' "$label" "$exception_identity"
+fi
 if [ "$applied" = 1 ]; then
   printf 'ApplyPalTasks: {"image":"%s","status":"ok","identity":"%s","tasks":2,"entries":2,"functions_created":2,"functions_existing":0,"names_applied":2,"names_preserved":0,"shared_entries":0}\n' "$label" "$pal_identity"
 fi
 printf '%s
-' 'pixel-modem-extractor-ghidra-export-v3' "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
+' 'pixel-modem-extractor-ghidra-export-v4' "exception_roots=$exception_identity" "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
 "#,
         );
     }
@@ -4948,6 +5673,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             0x4001_0000,
             None,
             None,
+            None,
             &[(0x4109_0000, 0x288_0000)],
             "datamark",
         );
@@ -4965,14 +5691,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let ps = args.iter().position(|a| a == "-postScript").unwrap();
         assert_eq!(args[ps + 1], "ExportDecomp.java");
         assert_eq!(args[ps + 2], "/out/export/02_MAIN");
-        // pre-script wires TameAnalysis.java, then mode, then the expected PAL
-        // identity (none), then the data-region args (only in datamark mode),
-        // before the post-script
+        // pre-script wires TameAnalysis.java, then mode, expected exception
+        // identity, expected PAL identity, and the data-region args (only in
+        // datamark mode), before the post-script.
         let pre = args.iter().position(|a| a == "-preScript").unwrap();
         assert_eq!(args[pre + 1], "TameAnalysis.java");
         assert_eq!(args[pre + 2], "datamark");
-        assert_eq!(args[pre + 3], "none"); // expected PAL identity
-        assert_eq!(args[pre + 4], "41090000:2880000"); // addrHex:lenHex
+        assert_eq!(args[pre + 3], "none"); // expected exception identity
+        assert_eq!(args[pre + 4], "none"); // expected PAL identity
+        assert_eq!(args[pre + 5], "41090000:2880000"); // addrHex:lenHex
         assert!(pre < ps, "pre-script must precede post-script");
         assert!(args.iter().any(|a| a == "-overwrite"));
         // base 0 -> zero-padded "00000000"; no data regions -> -postScript
@@ -4984,6 +5711,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             0,
             None,
             None,
+            None,
             &[],
             "datamark",
         );
@@ -4991,7 +5719,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(z[zpre + 1], "TameAnalysis.java");
         assert_eq!(z[zpre + 2], "datamark");
         assert_eq!(z[zpre + 3], "none");
-        assert_eq!(z[zpre + 4], "-postScript");
+        assert_eq!(z[zpre + 4], "none");
+        assert_eq!(z[zpre + 5], "-postScript");
         let bz = z.iter().position(|a| a == "-loader-baseAddr").unwrap();
         assert_eq!(z[bz + 1], "00000000");
     }
@@ -5005,17 +5734,18 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             0x40e00000,
             None,
             None,
+            None,
             &[(0x40e12000, 0x100000)],
             "tighten",
         );
         let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
-        // The next two args after the script name are the mode and the
-        // expected PAL identity.
+        // The next three args are mode, exception identity, and PAL identity.
         assert_eq!(args[pre_idx + 1], "tighten");
         assert_eq!(args[pre_idx + 2], "none");
+        assert_eq!(args[pre_idx + 3], "none");
         // No addrHex:lenHex follows (tighten mode does not data-mark).
         assert!(
-            !args[pre_idx + 3..].iter().any(|a| a.contains(':')),
+            !args[pre_idx + 4..].iter().any(|a| a.contains(':')),
             "tighten mode must not pass region args: {:?}",
             &args[pre_idx + 3..]
         );
@@ -5030,27 +5760,27 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             0x40e00000,
             None,
             None,
+            None,
             &[(0x40e12000, 0x100000)],
             "datamark",
         );
         let pre_idx = args.iter().position(|a| a == "TameAnalysis.java").unwrap();
         assert_eq!(args[pre_idx + 1], "datamark");
         assert_eq!(args[pre_idx + 2], "none");
-        assert!(args[pre_idx + 3..].iter().any(|a| a == "40e12000:100000"));
+        assert_eq!(args[pre_idx + 3], "none");
+        assert!(args[pre_idx + 4..].iter().any(|a| a == "40e12000:100000"));
     }
 
     #[test]
-    fn tame_analysis_args_pass_none_identity_after_mode() {
-        // The strict TameAnalysis contract consumes mode then the expected PAL
-        // identity. Every current generated/in-process source passes `none`
-        // (the PAL task-inventory task is the only future supplier of a
-        // present identity); the identity must sit between the mode and any
-        // region arguments in both modes.
+    fn tame_analysis_args_pass_none_identities_after_mode() {
+        // The strict contract consumes mode, exception identity, then PAL
+        // identity. Both identities sit before any datamark region.
         let datamark = headless_args(
             "$HERE",
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
+            None,
             None,
             None,
             &[(0x40e12000, 0x100000)],
@@ -5061,14 +5791,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .position(|arg| arg == "TameAnalysis.java")
             .unwrap();
         assert_eq!(
-            &datamark[tame_at + 1..=tame_at + 3],
-            ["datamark", "none", "40e12000:100000"]
+            &datamark[tame_at + 1..=tame_at + 4],
+            ["datamark", "none", "none", "40e12000:100000"]
         );
         let tighten = headless_args(
             "$HERE",
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
+            None,
             None,
             None,
             &[(0x40e12000, 0x100000)],
@@ -5078,7 +5809,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .iter()
             .position(|arg| arg == "TameAnalysis.java")
             .unwrap();
-        assert_eq!(&tighten[tame_at + 1..=tame_at + 2], ["tighten", "none"]);
+        assert_eq!(
+            &tighten[tame_at + 1..=tame_at + 3],
+            ["tighten", "none", "none"]
+        );
 
         // The generated turnkey script (the other argument source) carries
         // the same identity spelling for every image invocation.
@@ -5092,8 +5826,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         run(&modem, &generation_opts(None), &out).unwrap();
         let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
         assert!(
-            script.contains("'TameAnalysis.java' 'tighten' 'none'"),
-            "run_ghidra.sh must pass the none identity after the mode:\n{script}"
+            script.contains("'TameAnalysis.java' 'tighten' 'none' 'none'"),
+            "run_ghidra.sh must pass both none identities after the mode:\n{script}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5111,6 +5845,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "PalTasksSupport.codeUnitsDigestHex",
             "PalTasksSupport.functionBodiesDigestHex",
             "PalTasksSupport.memoryDigestHex",
+            "ExceptionRootsSupport.validateAbsent",
+            "ExceptionRootsSupport.validateAppliedIdentity",
         ] {
             assert!(
                 TAME_ANALYSIS_JAVA.contains(required),
@@ -5159,6 +5895,23 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn export_source_contract_reauthenticates_exception_roots_and_emits_v4() {
+        for required in [
+            "ExceptionRootsSupport.preflight",
+            "ExceptionRootsSupport.validateApplied",
+            "ExceptionRootsSupport.validateAbsent",
+            "pixel-modem-extractor-ghidra-export-v4",
+            "exception_roots=",
+        ] {
+            assert!(
+                EXPORT_DECOMP_JAVA.contains(required),
+                "ExportDecomp.java must contain {required:?}"
+            );
+        }
+        assert!(!EXPORT_DECOMP_JAVA.contains("pixel-modem-extractor-ghidra-export-v3"));
+    }
+
+    #[test]
     fn headless_args_applies_scatter_before_tame_analysis() {
         let args = headless_args(
             "/out",
@@ -5166,6 +5919,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             SCATTER_BASE,
             Some("scatter/02_MAIN/load_map.json"),
+            None,
             None,
             &[],
             "tighten",
@@ -5197,6 +5951,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             0,
             None,
             None,
+            None,
             &[],
             "tighten",
         );
@@ -5211,13 +5966,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         };
         // Present PAL map plus a scatter map: the pre-script order is
         // ApplyScatterLoad, ApplyPalTasks, TameAnalysis, and ApplyPalTasks
-        // consumes the four canonical arguments verbatim.
+        // consumes the four canonical arguments verbatim. The exception-root
+        // slot is independently absent in this PAL-specific test.
         let both = headless_args(
             "/out",
             "02_MAIN",
             "ARM:LE:32:v7",
             SCATTER_BASE,
             Some("scatter/02_MAIN/load_map.json"),
+            None,
             Some(pal_plan),
             &[],
             "tighten",
@@ -5255,6 +6012,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             SCATTER_BASE,
             None,
+            None,
             Some(pal_plan),
             &[],
             "tighten",
@@ -5270,7 +6028,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(pal_only_at < tame_only_at);
         assert!(!pal_only.iter().any(|arg| arg == "ApplyScatterLoad.java"));
         assert_eq!(
-            pal_only[tame_only_at + 2],
+            pal_only[tame_only_at + 3],
             "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
         );
         assert_eq!(pal_only[pal_only_at + 4], "-");
@@ -5283,6 +6041,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             SCATTER_BASE,
             Some("scatter/02_MAIN/load_map.json"),
             None,
+            None,
             &[],
             "tighten",
         );
@@ -5290,10 +6049,139 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn headless_args_order_exception_roots_before_pal() {
+        let exception = ExceptionRootScriptPlan {
+            manifest: "exception_roots/02_MAIN/roots.json",
+            identity: "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:7",
+        };
+        let pal = PalScriptPlan {
+            manifest: "pal_tasks/02_MAIN/tasks.json",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+        };
+        let args = headless_args(
+            "/out",
+            "02_MAIN",
+            "ARM:LE:32:v7",
+            SCATTER_BASE,
+            Some("scatter/02_MAIN/load_map.json"),
+            Some(exception),
+            Some(pal),
+            &[],
+            "tighten",
+        );
+
+        let scatter_at = args
+            .iter()
+            .position(|arg| arg == "ApplyScatterLoad.java")
+            .unwrap();
+        let exception_at = args
+            .iter()
+            .position(|arg| arg == "ApplyExceptionRoots.java")
+            .unwrap();
+        let pal_at = args
+            .iter()
+            .position(|arg| arg == "ApplyPalTasks.java")
+            .unwrap();
+        let tame_at = args
+            .iter()
+            .position(|arg| arg == "TameAnalysis.java")
+            .unwrap();
+        assert!(scatter_at < exception_at && exception_at < pal_at && pal_at < tame_at);
+        assert_eq!(
+            &args[exception_at - 1..=exception_at + 5],
+            [
+                "-preScript",
+                "ApplyExceptionRoots.java",
+                "/out",
+                "02_MAIN",
+                "/out/exception_roots/02_MAIN/roots.json",
+                "/out/scatter/02_MAIN/load_map.json",
+                exception.identity,
+            ]
+        );
+        assert_eq!(
+            &args[tame_at + 1..=tame_at + 3],
+            ["tighten", exception.identity, pal.identity]
+        );
+    }
+
+    #[test]
+    fn headless_args_cover_exception_scatter_pal_presence_matrix() {
+        let exception = ExceptionRootScriptPlan {
+            manifest: "exception_roots/02_MAIN/roots.json",
+            identity: "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:7",
+        };
+        let pal = PalScriptPlan {
+            manifest: "pal_tasks/02_MAIN/tasks.json",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+        };
+        for scatter_present in [false, true] {
+            for exception_present in [false, true] {
+                for pal_present in [false, true] {
+                    let scatter = scatter_present.then_some("scatter/02_MAIN/load_map.json");
+                    let args = headless_args(
+                        "/out",
+                        "02_MAIN",
+                        "ARM:LE:32:v7",
+                        SCATTER_BASE,
+                        scatter,
+                        exception_present.then_some(exception),
+                        pal_present.then_some(pal),
+                        &[],
+                        "tighten",
+                    );
+                    let position = |name: &str| args.iter().position(|argument| argument == name);
+                    assert_eq!(position("ApplyScatterLoad.java").is_some(), scatter_present);
+                    assert_eq!(
+                        position("ApplyExceptionRoots.java").is_some(),
+                        exception_present
+                    );
+                    assert_eq!(position("ApplyPalTasks.java").is_some(), pal_present);
+                    let tame = position("TameAnalysis.java").unwrap();
+                    if let Some(exception_at) = position("ApplyExceptionRoots.java") {
+                        assert!(exception_at < tame);
+                        assert_eq!(
+                            args[exception_at + 4],
+                            scatter.map_or("-", |_| { "/out/scatter/02_MAIN/load_map.json" })
+                        );
+                    }
+                    if let Some(pal_at) = position("ApplyPalTasks.java") {
+                        assert!(pal_at < tame);
+                        assert_eq!(
+                            args[pal_at + 4],
+                            scatter.map_or("-", |_| { "/out/scatter/02_MAIN/load_map.json" })
+                        );
+                    }
+                    assert_eq!(
+                        args[tame + 2],
+                        if exception_present {
+                            exception.identity
+                        } else {
+                            "none"
+                        }
+                    );
+                    assert_eq!(
+                        args[tame + 3],
+                        if pal_present { pal.identity } else { "none" }
+                    );
+                    let export = position("ExportDecomp.java").unwrap();
+                    assert_eq!(args[export + 4], args[tame + 2]);
+                    assert_eq!(args[export + 6], args[tame + 3]);
+                    assert_eq!(
+                        args[export + 8],
+                        scatter.map_or("-", |_| "/out/scatter/02_MAIN/load_map.json")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pal_pre_script_remains_under_no_thumb_decompile() {
         // --no-thumb-decompile suppresses dense-Thumb discovery, not
         // firmware-authoritative task entries: datamark mode still schedules
-        // ApplyPalTasks ahead of TameAnalysis, with `-` when scatter is absent.
+        // ApplyPalTasks ahead of TameAnalysis, with `-` when scatter is absent;
+        // the independently absent exception identity remains explicit.
         // The mode routes through the option plumbing (mode_from_opts), not a
         // literal, so an Opts-to-mode regression fails here.
         let mut opts = generation_opts(Some("02_MAIN"));
@@ -5308,6 +6196,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "02_MAIN",
             "ARM:LE:32:v7",
             0x40e00000,
+            None,
             None,
             Some(plan),
             &[(0x40e12000, 0x100000)],
@@ -5328,11 +6217,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert_eq!(args[pal_at + 4], "-");
         assert_eq!(args[tame_at + 1], "datamark");
+        assert_eq!(args[tame_at + 2], "none");
         assert_eq!(
-            args[tame_at + 2],
+            args[tame_at + 3],
             "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
         );
-        assert!(args[tame_at + 3..].iter().any(|a| a == "40e12000:100000"));
+        assert!(args[tame_at + 4..].iter().any(|a| a == "40e12000:100000"));
     }
 
     #[test]
@@ -5607,6 +6497,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             global_types_apply_error: None,
             globals_provisional: None,
             globals_provisional_suppressed: None,
+            exception_state: RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         };
         reset_pass2_runtime_results(&mut image);
@@ -5688,7 +6581,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
-    fn pass2_args_wire_ten_apply_symbols_and_eight_export_arguments() {
+    fn pass2_args_wire_ten_apply_symbols_and_ten_export_arguments() {
         let symbol_map = pass2_symbol_test_map("wired", "02_MAIN");
         let input = Pass2Input {
             function_map: Some(symbol_map.clone()),
@@ -5735,14 +6628,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "02_MAIN",
             "none",
             "-",
+            "none",
+            "-",
             "-",
             &map_path,
             symbol_map.map_blake3(),
         ];
         assert_eq!(
-            &args[export_at + 1..=export_at + 8],
+            &args[export_at + 1..=export_at + 10],
             expected_export,
-            "ExportDecomp must consume exactly its eight arguments"
+            "ExportDecomp must consume exactly its ten arguments"
         );
         let apply_position = apply_at;
         let thumb_position = args
@@ -5773,6 +6668,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 0,
                 scatter,
                 None,
+                None,
                 &[],
                 mode,
             );
@@ -5781,11 +6677,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .position(|arg| arg == "ExportDecomp.java")
                 .unwrap();
             assert_eq!(
-                &args[export_at + 1..=export_at + 8],
+                &args[export_at + 1..=export_at + 10],
                 [
                     "/out/export/00_BOOT",
                     "/out",
                     "00_BOOT",
+                    "none",
+                    "-",
                     "none",
                     "-",
                     "-",
@@ -5802,6 +6700,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             SCATTER_BASE,
             Some("scatter/02_MAIN/load_map.json"),
             None,
+            None,
             &[],
             "tighten",
         );
@@ -5809,28 +6708,28 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .iter()
             .position(|arg| arg == "ExportDecomp.java")
             .unwrap();
-        assert_eq!(args[export_at + 6], "/out/scatter/02_MAIN/load_map.json");
+        assert_eq!(args[export_at + 8], "/out/scatter/02_MAIN/load_map.json");
     }
 
     #[test]
-    fn completion_marker_v3_binds_pal_and_symbol_map() {
+    fn completion_marker_v4_binds_exception_pal_and_symbol_map() {
         assert_eq!(
-            export_completion_marker("none", "none"),
-            b"pixel-modem-extractor-ghidra-export-v3\npal_tasks=none\nsymbol_map=none\n",
+            export_completion_marker("none", "none", "none"),
+            b"pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=none\nsymbol_map=none\n",
         );
         let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:1";
         assert_eq!(
-            export_completion_marker(identity, "none"),
+            export_completion_marker("none", identity, "none"),
             format!(
-                "pixel-modem-extractor-ghidra-export-v3\npal_tasks={identity}\nsymbol_map=none\n"
+                "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks={identity}\nsymbol_map=none\n"
             )
             .as_bytes(),
         );
         let hash = "b".repeat(64);
         assert_eq!(
-            export_completion_marker(identity, &hash),
+            export_completion_marker("none", identity, &hash),
             format!(
-                "pixel-modem-extractor-ghidra-export-v3\npal_tasks={identity}\nsymbol_map={hash}\n"
+                "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks={identity}\nsymbol_map={hash}\n"
             )
             .as_bytes(),
         );
@@ -5838,7 +6737,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // The generated turnkey script constructs the same expected bytes for
         // its PAL-none single-pass invocations.
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0u8; 4])]);
-        let dir = std::env::temp_dir().join(format!("pme_marker_v3_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pme_marker_v4_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let modem = dir.join("modem.bin");
@@ -5848,11 +6747,19 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
         assert!(
             script.contains(
-                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v3' 'pal_tasks=none' 'symbol_map=none'"
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v4' 'exception_roots=none' 'pal_tasks=none' 'symbol_map=none'"
             ),
-            "run_ghidra.sh must compare the exact v3 marker:\n{script}"
+            "run_ghidra.sh must compare the exact v4 marker:\n{script}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_completion_marker_binds_exception_roots() {
+        assert_eq!(
+            export_completion_marker("v1:roots", "v1:pal", "maphash"),
+            b"pixel-modem-extractor-ghidra-export-v4\nexception_roots=v1:roots\npal_tasks=v1:pal\nsymbol_map=maphash\n"
+        );
     }
 
     #[test]
@@ -5867,16 +6774,21 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let hash = "c".repeat(64);
 
         // A stale PAL identity under a marker that binds a map hash.
-        std::fs::write(&run.completion, export_completion_marker(identity, &hash)).unwrap();
-        assert!(run.validate_current(identity, &hash).is_ok());
-        assert!(run.validate_current("none", &hash).is_err());
-        assert!(run.validate_current(identity, "none").is_err());
+        std::fs::write(
+            &run.completion,
+            export_completion_marker("none", identity, &hash),
+        )
+        .unwrap();
+        assert!(run.validate_current("none", identity, &hash).is_ok());
+        assert!(run.validate_current("v1:stale", identity, &hash).is_err());
+        assert!(run.validate_current("none", "none", &hash).is_err());
+        assert!(run.validate_current("none", identity, "none").is_err());
         // A truncated or extended marker never normalizes through.
-        let exact = export_completion_marker("none", "none");
+        let exact = export_completion_marker("none", "none", "none");
         std::fs::write(&run.completion, &exact[..exact.len() - 1]).unwrap();
-        assert!(run.validate_current("none", "none").is_err());
+        assert!(run.validate_current("none", "none", "none").is_err());
         std::fs::write(&run.completion, [exact.as_slice(), b"trailing\n"].concat()).unwrap();
-        assert!(run.validate_current("none", "none").is_err());
+        assert!(run.validate_current("none", "none", "none").is_err());
     }
 
     #[test]
@@ -5938,7 +6850,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .position(|arg| arg == "ExportDecomp.java")
             .unwrap();
         assert_eq!(
-            &args[export_at + 4..=export_at + 6],
+            &args[export_at + 6..=export_at + 8],
             [identity, manifest_arg.as_str(), scatter_arg.as_str()]
         );
         std::fs::remove_dir_all(&root).ok();
@@ -5970,6 +6882,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 "/out/export/02_MAIN",
                 "/out",
                 "02_MAIN",
+                "none",
+                "-",
                 "none",
                 "-",
                 "-",
@@ -6052,6 +6966,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             spec_path: out.join("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
         };
         let mut opts = generation_opts(None);
@@ -6145,6 +7060,97 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .unwrap_err()
                 .contains("tasks")
         );
+    }
+
+    fn exception_summary(identity: &str) -> String {
+        format!(
+            "ApplyExceptionRoots: {{\"image\":\"00_BOOT\",\"status\":\"ok\",\"identity\":\"{identity}\",\"tables\":1,\"roles\":8,\"entries\":7,\"functions_created\":5,\"functions_reapplied\":0,\"functions_existing\":2,\"names_applied\":5,\"names_reapplied\":0,\"names_preserved\":1,\"names_not_requested\":1,\"shared_entries\":1}}"
+        )
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_accepts_exact_conserving_payload() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        assert_eq!(
+            parse_apply_exception_roots_summary(&exception_summary(identity), "00_BOOT", identity)
+                .unwrap(),
+            AppliedExceptionRoots {
+                tables: 1,
+                roles: 8,
+                entries: 7,
+                functions_created: 5,
+                functions_reapplied: 0,
+                functions_existing: 2,
+                names_applied: 5,
+                names_reapplied: 0,
+                names_preserved: 1,
+                names_not_requested: 1,
+                shared_entries: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_requires_one_matching_interface_line() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        let valid = exception_summary(identity);
+        for stdout in ["ordinary output".to_string(), format!("{valid}\n{valid}")] {
+            assert!(parse_apply_exception_roots_summary(&stdout, "00_BOOT", identity).is_err());
+        }
+        assert!(
+            parse_apply_exception_roots_summary(&valid, "01_PSP", identity)
+                .unwrap_err()
+                .contains("image")
+        );
+        assert!(
+            parse_apply_exception_roots_summary(&valid, "00_BOOT", "v1:stale")
+                .unwrap_err()
+                .contains("identity")
+        );
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_rejects_malformed_noninteger_and_overflow() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        for stdout in [
+            "ApplyExceptionRoots: {".to_string(),
+            exception_summary(identity).replacen("\"tables\":1", "\"tables\":\"1\"", 1),
+            exception_summary(identity).replacen(
+                "\"tables\":1",
+                "\"tables\":18446744073709551616",
+                1,
+            ),
+            exception_summary(identity).replacen(
+                "\"shared_entries\":1",
+                "\"shared_entries\":1,\"unexpected\":0",
+                1,
+            ),
+        ] {
+            assert!(
+                parse_apply_exception_roots_summary(&stdout, "00_BOOT", identity).is_err(),
+                "accepted malformed summary: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_rejects_status_and_nonconservation() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        for stdout in [
+            exception_summary(identity).replacen("\"status\":\"ok\"", "\"status\":\"error\"", 1),
+            exception_summary(identity).replacen(
+                "\"functions_created\":5",
+                "\"functions_created\":4",
+                1,
+            ),
+            exception_summary(identity).replacen("\"names_applied\":5", "\"names_applied\":4", 1),
+            exception_summary(identity).replacen("\"shared_entries\":1", "\"shared_entries\":2", 1),
+        ] {
+            assert!(
+                parse_apply_exception_roots_summary(&stdout, "00_BOOT", identity).is_err(),
+                "accepted nonconserving summary: {stdout}"
+            );
+        }
     }
 
     fn ok_globals_summary(
@@ -7741,6 +8747,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             PAL_BASE,
             None,
+            None,
             Some(PalScriptPlan {
                 manifest: &map.relative_path,
                 identity: &map.identity,
@@ -7765,10 +8772,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert!(
             script.contains(&format!(
-                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v3' 'pal_tasks={}' 'symbol_map=none'",
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v4' 'exception_roots=none' 'pal_tasks={}' 'symbol_map=none'",
                 map.identity
             )),
-            "run_ghidra.sh must compare the exact present-PAL v3 marker:\n{script}"
+            "run_ghidra.sh must compare the exact present-PAL v4 marker:\n{script}"
         );
 
         // Malformed: an ambiguous MAIN is the typed BadPalTasks error and
@@ -7821,6 +8828,113 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn generation_discovers_exception_roots_for_every_embedded_image() {
+        let buf = craft_modem_bin(&[
+            ("BOOT", 0, 1, &[0u8; 64]),
+            ("MAIN", 0x4001_0000, 3, &[0u8; 64]),
+            ("VSS", 0x5000_0000, 4, &[0u8; 64]),
+        ]);
+        let toc = Toc::parse(&buf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let scatter_calls = std::cell::Cell::new(0);
+        let pal_calls = std::cell::Cell::new(0);
+        let exception_calls = std::cell::RefCell::new(Vec::new());
+
+        let analysis = generate_runtime_analysis_with(
+            &toc,
+            &buf,
+            dir.path(),
+            |_image, _base| {
+                scatter_calls.set(scatter_calls.get() + 1);
+                Ok(None)
+            },
+            |_runtime, label, toc_name| {
+                exception_calls
+                    .borrow_mut()
+                    .push((label.to_string(), toc_name.to_string()));
+                Ok(None)
+            },
+            |_runtime, _label| {
+                pal_calls.set(pal_calls.get() + 1);
+                Ok(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(scatter_calls.get(), 1, "scatter remains MAIN-only");
+        assert_eq!(pal_calls.get(), 1, "PAL remains MAIN-only");
+        assert_eq!(
+            exception_calls.into_inner(),
+            [
+                ("00_BOOT".to_string(), "BOOT".to_string()),
+                ("02_MAIN".to_string(), "MAIN".to_string()),
+                ("03_VSS".to_string(), "VSS".to_string()),
+            ],
+            "every embedded image must be offered to exception discovery in TOC order"
+        );
+        for label in ["00_BOOT", "02_MAIN", "03_VSS"] {
+            assert_eq!(
+                analysis.exception_roots.get(label),
+                Some(&RuntimeExceptionState::Absent),
+                "successful no-candidate discovery must be explicit for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_exception_state_is_explicit_filter_independent_and_clears_stale_manifest() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let buf = craft_modem_bin(&[
+            ("BOOT", 0x4001_0000, 1, &fixture),
+            ("VSS", 0x5000_0000, 4, &[0u8; 64]),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let stale = out.join("exception_roots/03_VSS/roots.json");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"stale").unwrap();
+
+        let report = run_report(&modem, &generation_opts(Some("VSS")), &out).unwrap();
+
+        let RuntimeExceptionState::Present(map) = report.runtime_exception_state("00_BOOT") else {
+            panic!("the structurally valid BOOT fixture must publish exception roots");
+        };
+        assert_eq!(map.relative_path, "exception_roots/00_BOOT/roots.json");
+        assert_eq!(map.tables, 1);
+        assert_eq!(map.roots, 7);
+        assert!(out.join(&map.relative_path).is_file());
+        assert_eq!(
+            report.runtime_exception_state("03_VSS"),
+            RuntimeExceptionState::Absent
+        );
+        assert_eq!(
+            report.runtime_exception_state("missing"),
+            RuntimeExceptionState::Unmanaged
+        );
+        assert!(
+            !stale.exists(),
+            "successful absence clears the owned manifest even when its directory remains"
+        );
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report.spec_path).unwrap()).unwrap();
+        assert_eq!(
+            spec["images"][0]["exception_root_map"],
+            "exception_roots/00_BOOT/roots.json"
+        );
+        assert!(spec["images"][1].get("exception_root_map").is_none());
+        assert!(
+            report.images.is_empty(),
+            "the image filter selects only later runs"
+        );
+    }
+
+    #[test]
     fn pal_generation_reuses_scatter_discovery() {
         // One MAIN generation loop: the single scatter discovery result
         // feeds both the scatter artifact and the RuntimeImage PAL
@@ -7842,6 +8956,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter_calls.set(scatter_calls.get() + 1);
                 scatter::discover(image, base).map_err(|error| error.to_string())
             },
+            exception_roots::discover,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
                 crate::pal_tasks::discover(runtime, label)
@@ -7870,6 +8985,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter_calls.set(scatter_calls.get() + 1);
                 scatter::discover(image, base).map_err(|error| error.to_string())
             },
+            exception_roots::discover,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
                 crate::pal_tasks::discover(runtime, label)
@@ -7905,6 +9021,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter_calls.set(scatter_calls.get() + 1);
                 scatter::discover(image, base).map_err(|error| error.to_string())
             },
+            exception_roots::discover,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
                 crate::pal_tasks::discover(runtime, label)
@@ -8019,11 +9136,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                exception_state: RuntimeExceptionState::Unmanaged,
+                exception_roots_applied: None,
+                exception_error: None,
                 pal_applied: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
         };
 
@@ -8031,6 +9152,107 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(
             err.to_string(),
             "decompose incomplete: Thumb analysis failed on 02_MAIN: radare2 parser rejected empty stdout"
+        );
+    }
+
+    fn exception_report(
+        outcome: ImageOutcome,
+        exception_state: RuntimeExceptionState,
+        runtime_exception_state: Option<RuntimeExceptionState>,
+        exception_error: Option<&str>,
+        terminal_error: Option<&str>,
+    ) -> DecompileReport {
+        let mut runtime_exception_roots = HashMap::new();
+        if let Some(state) = runtime_exception_state {
+            runtime_exception_roots.insert("02_MAIN".to_string(), state);
+        }
+        DecompileReport {
+            images: vec![ImageResult {
+                label: "02_MAIN".into(),
+                outcome,
+                classification: Some("not_opaque"),
+                thumb_functions: None,
+                thumb_regions_requested: None,
+                thumb_regions_succeeded: None,
+                thumb_regions_failed: None,
+                thumb_radare2_runs: None,
+                thumb_rizin_runs: None,
+                ghidra_execution_accepted: None,
+                ghidra_execution_quarantined: None,
+                thumb_execution_accepted: None,
+                thumb_execution_quarantined: None,
+                image_start: 0,
+                image_len: 0,
+                thumb_error: None,
+                terminal_error: terminal_error.map(str::to_string),
+                pass2_applied: None,
+                pass2_creation_plan: None,
+                pass2_thumb_names: None,
+                pass2_error: None,
+                thumb_decompiled: None,
+                thumb_tighten_error: None,
+                thumb_enrich_error: None,
+                globals_error: None,
+                globals_recovered: None,
+                globals_applied: None,
+                globals_apply_skipped: None,
+                globals_apply_error: None,
+                global_types_applied: None,
+                global_types_apply_skipped: None,
+                global_types_apply_error: None,
+                globals_provisional: None,
+                globals_provisional_suppressed: None,
+                exception_state,
+                exception_roots_applied: None,
+                exception_error: exception_error.map(str::to_string),
+                pal_applied: None,
+            }],
+            spec_path: PathBuf::from("ghidra_load.json"),
+            current_exports: BTreeSet::new(),
+            runtime_scatter: HashMap::new(),
+            runtime_exception_roots,
+            runtime_tasks: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn report_failure_surfaces_exception_error_before_generic_terminal_error() {
+        let state = RuntimeExceptionState::Present(MaterializedExceptionRoots {
+            relative_path: "exception_roots/02_MAIN/roots.json".into(),
+            blake3: "b".repeat(64),
+            identity: format!("v1:{}:1:7", "b".repeat(64)),
+            tables: 1,
+            roots: 7,
+        });
+        let report = exception_report(
+            ImageOutcome::TerminalInvalid,
+            state.clone(),
+            Some(state),
+            Some("missing ApplyExceptionRoots summary"),
+            Some("invalid terminal output"),
+        );
+
+        let error = report_failure(&report).expect("exception application must fail");
+        assert_eq!(
+            error.to_string(),
+            "decompose incomplete: exception-root application failed on 02_MAIN: missing ApplyExceptionRoots summary"
+        );
+    }
+
+    #[test]
+    fn report_failure_rejects_exception_generation_state_drift() {
+        let report = exception_report(
+            ImageOutcome::Analyzed(1),
+            RuntimeExceptionState::Absent,
+            None,
+            None,
+            None,
+        );
+
+        let error = report_failure(&report).expect("state drift must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "decompose incomplete: exception-root state drifted for 02_MAIN"
         );
     }
 
@@ -8483,11 +9705,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                exception_state: RuntimeExceptionState::Unmanaged,
+                exception_roots_applied: None,
+                exception_error: None,
                 pal_applied: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
         };
         assert!(report_failure(&report).is_none());
@@ -8534,11 +9760,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 global_types_apply_error: None,
                 globals_provisional: None,
                 globals_provisional_suppressed: None,
+                exception_state: RuntimeExceptionState::Unmanaged,
+                exception_roots_applied: None,
+                exception_error: None,
                 pal_applied: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
             runtime_scatter: HashMap::new(),
+            runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
         };
 
@@ -8586,6 +9816,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             global_types_apply_error: None,
             globals_provisional: Some(42),
             globals_provisional_suppressed: Some(7),
+            exception_state: RuntimeExceptionState::Unmanaged,
+            exception_roots_applied: None,
+            exception_error: None,
             pal_applied: None,
         };
         assert_eq!(r.globals_provisional, Some(42));
@@ -8841,12 +10074,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .map(|path| path.to_string_lossy())
                 .collect::<Vec<_>>(),
             vec![
+                out.join("scripts/ApplyExceptionRoots.java")
+                    .to_string_lossy(),
                 out.join("scripts/ApplyGlobalTypes.java").to_string_lossy(),
                 out.join("scripts/ApplyGlobals.java").to_string_lossy(),
                 out.join("scripts/ApplyPalTasks.java").to_string_lossy(),
                 out.join("scripts/ApplyScatterLoad.java").to_string_lossy(),
                 out.join("scripts/ApplySymbols.java").to_string_lossy(),
                 out.join("scripts/ApplyThumbNames.java").to_string_lossy(),
+                out.join("scripts/ExceptionRootsSupport.java")
+                    .to_string_lossy(),
                 out.join("scripts/ExportDecomp.java").to_string_lossy(),
                 out.join("scripts/PalTasksSupport.java").to_string_lossy(),
                 out.join("scripts/PmeScriptSupport.java").to_string_lossy(),
@@ -9147,7 +10384,11 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         for name in GHIDRA_EXPORT_FILES {
             std::fs::write(run.directory.join(name), format!("stale {name}\n")).unwrap();
         }
-        std::fs::write(&run.completion, export_completion_marker("none", "none")).unwrap();
+        std::fs::write(
+            &run.completion,
+            export_completion_marker("none", "none", "none"),
+        )
+        .unwrap();
 
         run.invalidate().unwrap();
 
@@ -9155,28 +10396,38 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         for name in GHIDRA_EXPORT_FILES {
             assert!(!run.directory.join(name).exists());
         }
-        assert!(run.validate_current("none", "none").is_err());
+        assert!(run.validate_current("none", "none", "none").is_err());
 
         for name in GHIDRA_EXPORT_FILES {
             std::fs::write(run.directory.join(name), b"current\n").unwrap();
         }
         std::fs::write(&run.completion, b"wrong generation\n").unwrap();
-        assert!(run.validate_current("none", "none").is_err());
-        // A v1-shaped marker is stale, not normalized.
-        std::fs::write(&run.completion, b"pixel-modem-extractor-ghidra-export-v1\n").unwrap();
-        assert!(run.validate_current("none", "none").is_err());
-        std::fs::write(&run.completion, export_completion_marker("none", "none")).unwrap();
-        run.validate_current("none", "none").unwrap();
+        assert!(run.validate_current("none", "none", "none").is_err());
+        // A complete old v3 marker is stale, not normalized.
+        std::fs::write(
+            &run.completion,
+            b"pixel-modem-extractor-ghidra-export-v3\npal_tasks=none\nsymbol_map=none\n",
+        )
+        .unwrap();
+        assert!(run.validate_current("none", "none", "none").is_err());
+        std::fs::write(
+            &run.completion,
+            export_completion_marker("none", "none", "none"),
+        )
+        .unwrap();
+        run.validate_current("none", "none", "none").unwrap();
         // Stale identity or map binding values are rejected exactly.
         let bound = export_completion_marker(
             "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
             "none",
+            "none",
         );
         std::fs::write(&run.completion, &bound).unwrap();
-        assert!(run.validate_current("none", "none").is_err());
+        assert!(run.validate_current("none", "none", "none").is_err());
         assert!(
             run.validate_current(
                 "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+                "none",
                 "none"
             )
             .is_ok()
@@ -9190,7 +10441,11 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::create_dir_all(run.directory.join("functions.json")).unwrap();
         std::fs::write(run.directory.join("disasm.lst"), b"stale\n").unwrap();
         std::fs::write(run.directory.join("decompiled.c"), b"stale\n").unwrap();
-        std::fs::write(&run.completion, export_completion_marker("none", "none")).unwrap();
+        std::fs::write(
+            &run.completion,
+            export_completion_marker("none", "none", "none"),
+        )
+        .unwrap();
 
         run.invalidate().unwrap_err();
 
@@ -9232,6 +10487,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "ARM:LE:32:v7",
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
@@ -9268,7 +10524,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0xaa, 0xbb])]);
         let toc = Toc::parse(&buf).unwrap();
         let evil = "a';rm -rf $HOME;echo'";
-        write_run_script(&base, &toc, evil, &HashMap::new(), &HashMap::new()).unwrap();
+        write_run_script(
+            &base,
+            &toc,
+            evil,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         let sh = std::fs::read_to_string(base.join("run_ghidra.sh")).unwrap();
         // The processor appears only inside the single-quoted, escaped form — never
         // raw. The dangerous chars (`;`, `$`, ` `, `'`) are inert inside the quotes.

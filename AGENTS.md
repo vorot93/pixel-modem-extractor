@@ -315,7 +315,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyPalTasks` + `PalTasksSupport`, `ApplyExceptionRoots` + `ExceptionRootsSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyExceptionRoots` + `ExceptionRootsSupport`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -374,6 +374,17 @@ module; when a file outgrows that, split it.
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
   discovery does not reject overlapping roots: producer evidence may describe them, while Ghidra's
   single instruction/listing model cannot apply them simultaneously.
+- **Generation and pass-1 currentness are explicit.** After splitting every TOC image, `decompile`
+  discovers MAIN scatter once, builds one `RuntimeImage` per embedded image, discovers exception
+  roots for every image, then discovers MAIN PAL against the shared runtime. Every label records
+  `RuntimeExceptionState::{Present, Absent, Unmanaged}`; filters, opaque skips, and stale files never
+  fabricate currentness. Present pass-1 order is `ApplyScatterLoad` → `ApplyExceptionRoots` →
+  `ApplyPalTasks` → `TameAnalysis`; generated and in-process routes pass the same identities and
+  parse exactly one conserving exception summary. `TameAnalysis` validates root ownership before
+  and after both modes, so datamark treats root instructions as protected code. `ExportDecomp`
+  reauthenticates the manifest and program state before and after export and writes the exact
+  four-line `pixel-modem-extractor-ghidra-export-v4` marker last; old v3 bytes are stale. An opaque
+  skip retains generation state but has no application summary.
 - **Real-Ghidra fixtures have one production oracle.** Everything under
   `tests/fixtures/exception_roots/` is wholly synthetic. The private
   `committed_ghidra_fixture_matches_production_discovery_and_serialization` test regenerates the
@@ -768,7 +779,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   stride, 128-byte names, and 2000-byte symbol leaves (Ghidra's own bound). Exceeding any limit
   is a typed resource error, never a silent miss.
 - **Ghidra seeding is transactional and ordered.** Script order is `ApplyScatterLoad` →
-  `ApplyPalTasks` → `TameAnalysis` → analysis → export; a PAL map without a scatter map passes
+  `ApplyExceptionRoots` → `ApplyPalTasks` → `TameAnalysis` → analysis → export, with each optional
+  application script present only for its explicit current state; a PAL map without a scatter map passes
   `-` as the scatter argument. `ApplyPalTasks.java` strictly revalidates the manifest (image
   identity, scatter dependency, hashes, label policy recomputation) before any mutation, seeds
   one function per entry inside one transaction, records ownership in the
@@ -2184,7 +2196,7 @@ hardcoded. Two reference images exercise both models end-to-end:
     is load-bearing: Ghidra 12's completed `TimeoutTaskMonitor`s retain their
     scheduled timer, while cancelling one also cancels its parent. The exporter
     checks each long operation on return and gates every temporary-to-terminal
-    move, including the v3 completion marker. Deadline expiry can therefore
+    move, including the v4 completion marker. Deadline expiry can therefore
     leave no current marker without accumulating one pending timer per function.
   - **Pass-2 manifest arguments must sit inside the Ghidra kit root.**
     `readPal` authenticates the task manifest, the scatter load map, *and*

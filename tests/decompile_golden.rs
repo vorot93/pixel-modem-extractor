@@ -450,6 +450,8 @@ fn run_saved_project_export(
         .arg(label)
         .arg("none")
         .arg("-")
+        .arg("none")
+        .arg("-")
         .arg("-")
         .arg("-")
         .arg("none")
@@ -698,7 +700,7 @@ fn generated_only_pal_seeding_is_default_on() {
 /// Task 12: the immediate `--run` route discovers, materializes, applies,
 /// and certifies PAL task seeding under real Ghidra with no flag — the
 /// tighten default. The strict `ApplyPalTasks` summary is parsed into the
-/// report and the identity-bound v3 marker is validated.
+/// report and the identity-bound v4 marker is validated.
 #[test]
 fn immediate_run_applies_pal_tasks_by_default() {
     let Some(home) = find_ghidra_home() else {
@@ -760,7 +762,9 @@ fn immediate_run_applies_pal_tasks_by_default() {
     assert!(out.join("pal_tasks/02_MAIN/tasks.json").is_file());
     let marker = std::fs::read_to_string(out.join("export/02_MAIN.complete")).unwrap_or_default();
     assert!(
-        marker.starts_with("pixel-modem-extractor-ghidra-export-v3\npal_tasks=v1:"),
+        marker.starts_with(
+            "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=v1:"
+        ),
         "the current marker must bind the applied PAL identity: {marker:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -827,7 +831,9 @@ fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
     );
     let marker = std::fs::read_to_string(out.join("export/02_MAIN.complete")).unwrap_or_default();
     assert!(
-        marker.starts_with("pixel-modem-extractor-ghidra-export-v3\npal_tasks=v1:"),
+        marker.starts_with(
+            "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=v1:"
+        ),
         "the datamark marker must bind the applied PAL identity: {marker:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -1349,7 +1355,7 @@ printf 'pixel-modem-extractor-ghidra-export-v1\n\n' > "$export_dir.complete"
 
 /// Task 14: the generated shell runs the complete PAL-seeded pass from a
 /// kit root whose path contains spaces and parentheses — the quoted
-/// `$HERE` rooting, the PAL-aware argv, and the exact v3 marker
+/// `$HERE` rooting, the PAL-aware argv, and the exact v4 marker
 /// comparison must all survive them. The remaining shell-active
 /// characters (quotes, `&`, `;`, backtick, `!`, `$`) are mangled by
 /// upstream `analyzeHeadless`'s own launcher before our quoting can
@@ -1417,8 +1423,8 @@ fn generated_shell_completes_pal_run_from_root_with_spaces_and_metacharacters() 
     let marker = std::fs::read(out.join("export/02_MAIN.complete")).unwrap();
     assert_eq!(
         marker,
-        pixel_modem_extractor::decompile::export_completion_marker(&identity, "none"),
-        "the shell must compare the exact PAL-aware v3 marker"
+        pixel_modem_extractor::decompile::export_completion_marker("none", &identity, "none"),
+        "the shell must compare the exact PAL-aware v4 marker"
     );
     let functions: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("export/02_MAIN/functions.json")).unwrap())
@@ -1663,6 +1669,8 @@ public class SeedMixedGap extends GhidraScript {
     .arg("00_BOOT")
     .arg("none")
     .arg("-")
+    .arg("none")
+    .arg("-")
     .arg("-")
     .arg("-")
     .arg("none")
@@ -1876,12 +1884,12 @@ public class SeedSavedProgram extends GhidraScript {
         "a function entry outside the u32 domain must fail the strict exporter:\n{diagnostics}"
     );
     // The pass-1 export (from the direct run, not invalidated by a
-    // `run_two_pass` wrapper) keeps its v3 marker; the failed re-export
+    // `run_two_pass` wrapper) keeps its v4 marker; the failed re-export
     // published nothing new.
     let marker_after = std::fs::read(out.join("export/00_BOOT.complete")).unwrap();
     assert_eq!(
         marker_after,
-        pixel_modem_extractor::decompile::export_completion_marker("none", "none")
+        pixel_modem_extractor::decompile::export_completion_marker("none", "none", "none")
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -2443,6 +2451,8 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     .arg("00_BOOT")
     .arg("none")
     .arg("-")
+    .arg("none")
+    .arg("-")
     .arg("-")
     .arg(creation_only_symbol_map.path())
     .arg(creation_only_symbol_map.map_blake3())
@@ -2481,6 +2491,7 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     assert_eq!(
         std::fs::read(creation_only_out.join("export/00_BOOT.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
             "none",
             creation_only_symbol_map.map_blake3(),
         ),
@@ -2843,7 +2854,11 @@ public class ProbeThumbCreationRollback extends GhidraScript {
     // The completion marker binds identity none and the exact map hash.
     assert_eq!(
         std::fs::read(exp.join("..").join("00_BOOT.complete")).unwrap(),
-        pixel_modem_extractor::decompile::export_completion_marker("none", symbol_map.map_blake3()),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
+            "none",
+            symbol_map.map_blake3(),
+        ),
     );
 
     // The strict pass-2 property survived in the saved program.
@@ -6093,7 +6108,8 @@ fn tame_import(home: &std::path::Path, kit: &TameKit, seed: bool) -> String {
 }
 
 /// A `-process` run driving TameAnalysis with the given script arguments
-/// (mode, identity, regions), optionally followed by one post-script. A
+/// (mode, exception identity, PAL identity, regions), optionally followed by
+/// one post-script. A
 /// pre-script failure makes Ghidra print `REPORT SCRIPT ERROR`, abort the
 /// rest of the run, and skip the post-script — while still exiting zero, so
 /// callers assert on the report text rather than the exit status.
@@ -6189,7 +6205,7 @@ fn datamark_preserves_code_functions_and_partitions_gaps() {
     let run = tame_datamark(
         &home,
         &kit,
-        &["datamark", "none", "40010000:40"],
+        &["datamark", "none", "none", "40010000:40"],
         Some("InspectDatamark.java"),
     );
     assert!(
@@ -6289,7 +6305,7 @@ fn datamark_partitions_large_gaps_into_chunks_and_caps_digest_listing() {
     let run = tame_datamark(
         &home,
         &kit,
-        &["datamark", "none", "40010000:40"],
+        &["datamark", "none", "none", "40010000:40"],
         Some("InspectDatamarkChunks.java"),
     );
     assert!(
@@ -6340,7 +6356,7 @@ fn datamark_rejects_strict_argument_contract_before_mutation() {
     );
 
     let present_identity = format!("v1:{}:1:1", "a".repeat(64));
-    let mut regions_4097: Vec<&str> = vec!["datamark", "none"];
+    let mut regions_4097: Vec<&str> = vec!["datamark", "none", "none"];
     regions_4097.extend(
         (0..4097).map(|index| {
             Box::leak(format!("{:08x}:1", 0x4001_0000 + index).into_boxed_str()) as &str
@@ -6348,56 +6364,76 @@ fn datamark_rejects_strict_argument_contract_before_mutation() {
     );
     let over_aggregate = ["00000100:10000001", "10000200:10000001"];
     let cases: Vec<(Vec<&str>, &str)> = vec![
-        (vec!["explode", "none"], "unknown mode"),
-        (vec!["tighten"], "PAL identity"),
-        (vec!["datamark"], "PAL identity"),
+        (vec!["explode", "none", "none"], "unknown mode"),
+        (vec!["tighten"], "exception-root identity"),
+        (vec!["datamark", "none"], "PAL identity"),
         (
-            vec!["tighten", "none", "40010000:4"],
+            vec!["tighten", "none", "none", "40010000:4"],
             "tighten mode accepts no region arguments",
         ),
         (
-            vec!["datamark", "bogus"],
+            vec!["datamark", "bogus", "none"],
+            "exception-root identity is not the v1 grammar",
+        ),
+        (
+            vec!["datamark", &present_identity, "none"],
+            "exception-root terminal ownership state is incomplete",
+        ),
+        (
+            vec!["datamark", "none", "bogus"],
             "PAL identity is not the v1 grammar",
         ),
         (
-            vec!["datamark", &present_identity, "40010000:4"],
+            vec!["datamark", "none", &present_identity],
             "stale PAL property",
         ),
-        (vec!["datamark", "none", "40010000"], "malformed region"),
-        (vec!["datamark", "none", "4001000g:4"], "malformed region"),
         (
-            vec!["datamark", "none", "40010000:0"],
+            vec!["datamark", "none", "none", "40010000"],
+            "malformed region",
+        ),
+        (
+            vec!["datamark", "none", "none", "4001000g:4"],
+            "malformed region",
+        ),
+        (
+            vec!["datamark", "none", "none", "40010000:0"],
             "the region length is zero",
         ),
         (
-            vec!["datamark", "none", "ffffffff:2"],
+            vec!["datamark", "none", "none", "ffffffff:2"],
             "wraps the 32-bit address space",
         ),
         // 16-hex-digit fields parse to negative longs; they must hit the
         // wrap rejection, never a silent no-op or an obscure address error.
         (
-            vec!["datamark", "none", "40010000:ffffffffffffffff"],
+            vec!["datamark", "none", "none", "40010000:ffffffffffffffff"],
             "wraps the 32-bit address space",
         ),
         (
-            vec!["datamark", "none", "ffffffffffffffff:1"],
+            vec!["datamark", "none", "none", "ffffffffffffffff:1"],
             "wraps the 32-bit address space",
         ),
         (
-            vec!["datamark", "none", "40010020:4", "40010010:4"],
+            vec!["datamark", "none", "none", "40010020:4", "40010010:4"],
             "not sorted",
         ),
         (
-            vec!["datamark", "none", "40010000:20", "40010010:8"],
+            vec!["datamark", "none", "none", "40010000:20", "40010010:8"],
             "overlap",
         ),
         (
-            vec!["datamark", "none", "50010000:4"],
+            vec!["datamark", "none", "none", "50010000:4"],
             "not fully inside initialized memory",
         ),
         (regions_4097, "region count exceeds"),
         (
-            vec!["datamark", "none", over_aggregate[0], over_aggregate[1]],
+            vec![
+                "datamark",
+                "none",
+                "none",
+                over_aggregate[0],
+                over_aggregate[1],
+            ],
             "aggregate region bytes exceed",
         ),
     ];
@@ -6439,7 +6475,12 @@ fn assert_datamark_fails_pristine(
         "seed run failed for {case}:\n{seeded}"
     );
     patch_tame_script(&kit.out, patches);
-    let failed = tame_datamark(home, &kit, &["datamark", "none", "40010000:40"], None);
+    let failed = tame_datamark(
+        home,
+        &kit,
+        &["datamark", "none", "none", "40010000:40"],
+        None,
+    );
     assert!(
         failed.contains("REPORT SCRIPT ERROR"),
         "patched datamark run for {case} did not fail the headless run:\n{failed}"
@@ -6573,6 +6614,8 @@ fn export_rejects_deadline_expiry_after_final_decompile_operation() {
         "00_BOOT".to_string(),
         "none".to_string(),
         "-".to_string(),
+        "none".to_string(),
+        "-".to_string(),
         "-".to_string(),
         "-".to_string(),
         "none".to_string(),
@@ -6650,7 +6693,7 @@ fn build_pal_pass2_kit(
     }
     if export_pass1 {
         // One -process run applies PAL transactionally and exports pass 1
-        // under the strict eight-argument contract.
+        // under the strict ten-argument contract.
         // The seed (pre-existing meaningful/coincident primaries) ran at
         // import time; this run only applies PAL and exports pass 1.
         let args: Vec<String> = [
@@ -6673,6 +6716,8 @@ fn build_pal_pass2_kit(
                 .into_owned(),
             kit.kit_root.to_string_lossy().into_owned(),
             "02_MAIN".to_string(),
+            "none".to_string(),
+            "-".to_string(),
             kit.identity.clone(),
             kit.manifest_path.to_string_lossy().into_owned(),
             kit.scatter_path.to_string_lossy().into_owned(),
@@ -6700,7 +6745,11 @@ fn build_pal_pass2_kit(
         );
         assert_eq!(
             std::fs::read(kit.out.join("export/02_MAIN.complete")).unwrap(),
-            pixel_modem_extractor::decompile::export_completion_marker(&kit.identity, "none"),
+            pixel_modem_extractor::decompile::export_completion_marker(
+                "none",
+                &kit.identity,
+                "none",
+            ),
             "the pass-1 marker must bind the PAL identity and no symbol map"
         );
     }
@@ -6855,6 +6904,8 @@ fn pal_apply_symbols(
                 .into_owned(),
             kit.kit_root.to_string_lossy().into_owned(),
             "02_MAIN".to_string(),
+            "none".to_string(),
+            "-".to_string(),
             kit.identity.clone(),
             kit.manifest_path.to_string_lossy().into_owned(),
             kit.scatter_path.to_string_lossy().into_owned(),
@@ -6886,6 +6937,8 @@ fn pal_export_only(home: &std::path::Path, state: &Pass2Kit, map: Option<(&str, 
             .into_owned(),
         kit.kit_root.to_string_lossy().into_owned(),
         "02_MAIN".to_string(),
+        "none".to_string(),
+        "-".to_string(),
         kit.identity.clone(),
         kit.manifest_path.to_string_lossy().into_owned(),
         kit.scatter_path.to_string_lossy().into_owned(),
@@ -7392,10 +7445,11 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
         first.contains("ApplySymbols: image=02_MAIN applied 1 names"),
         "unexpected pass-2 summary:\n{first}"
     );
-    // The pass-2 export published under the v3 marker binding PAL and map.
+    // The pass-2 export published under the v4 marker binding PAL and map.
     assert_eq!(
         std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
             &state.kit.identity,
             &state.map_hash
         )
@@ -7911,12 +7965,13 @@ public class ProbeProperty extends GhidraScript {
     let _ = std::fs::remove_dir_all(&script_staging);
 }
 
-/// The v3 marker binds PAL and map exactly: pass 1 writes
-/// `pal_tasks=<identity>`/`symbol_map=none`, pass 2 the exact map BLAKE3, and
-/// the stale-input rejections (wrong map hash, map-less run under a set
-/// property, identity none under an applied state) never publish.
+/// The v4 marker binds exception roots, PAL, and map exactly: pass 1 writes
+/// `exception_roots=none`/`pal_tasks=<identity>`/`symbol_map=none`, pass 2 the
+/// exact map BLAKE3, and the stale-input rejections (wrong map hash, map-less
+/// run under a set property, identity none under an applied state) never
+/// publish.
 #[test]
-fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
+fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
     let Some(home) = find_ghidra_home() else {
         eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
         return;
@@ -7934,7 +7989,11 @@ fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
     // Pass 1 marker: identity bound, no symbol map.
     assert_eq!(
         std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
-        pixel_modem_extractor::decompile::export_completion_marker(&state.kit.identity, "none")
+        pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
+            &state.kit.identity,
+            "none",
+        )
     );
 
     // Pass 2: ApplySymbols then the map-bound export; the marker now carries
@@ -7948,6 +8007,7 @@ fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
     assert_eq!(
         std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
             &state.kit.identity,
             &state.map_hash
         )
@@ -7992,6 +8052,8 @@ fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
             "02_MAIN".to_string(),
             "none".to_string(),
             "-".to_string(),
+            "none".to_string(),
+            "-".to_string(),
             "-".to_string(),
             "-".to_string(),
             "none".to_string(),
@@ -8009,6 +8071,7 @@ fn export_pal_postflight_writes_v3_marker_and_rejects_stale_inputs() {
     assert_eq!(
         std::fs::read(state.kit.out.join("export/02_MAIN.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
             &state.kit.identity,
             &state.map_hash
         )
@@ -8110,6 +8173,8 @@ fn export_pal_postflight_rejects_program_drift() {
                     .into_owned(),
                 kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".to_string(),
+                "none".to_string(),
+                "-".to_string(),
                 kit.identity.clone(),
                 kit.manifest_path.to_string_lossy().into_owned(),
                 kit.scatter_path.to_string_lossy().into_owned(),
@@ -8265,6 +8330,8 @@ public class SeedExtraFunction extends GhidraScript {
                     .into_owned(),
                 kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".to_string(),
+                "none".to_string(),
+                "-".to_string(),
                 kit.identity.clone(),
                 kit.manifest_path.to_string_lossy().into_owned(),
                 kit.scatter_path.to_string_lossy().into_owned(),
@@ -8683,6 +8750,59 @@ public class ExceptionTamperNotRequestedPrimary extends GhidraScript {
 }
 "#;
 
+const EXCEPTION_CORRUPT_TERMINAL_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
+import java.math.BigInteger;
+
+public class ExceptionCorruptTerminal extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1) throw new AssertionError("expected one corruption mode");
+        Address first = toAddr(0x40010200L);
+        Address second = toAddr(0x40010220L);
+        switch (args[0]) {
+            case "removed":
+                if (!currentProgram.getFunctionManager().removeFunction(second)) {
+                    throw new AssertionError("root function removal failed");
+                }
+                break;
+            case "merged":
+                Function owner = currentProgram.getFunctionManager().getFunctionAt(first);
+                if (owner == null
+                        || !currentProgram.getFunctionManager().removeFunction(second)) {
+                    throw new AssertionError("merge fixture functions are missing");
+                }
+                AddressSet merged = new AddressSet(owner.getBody());
+                merged.addRange(second, second.add(3));
+                owner.setBody(merged);
+                break;
+            case "retagged":
+                currentProgram.getListing().clearCodeUnits(second, second.add(3), false);
+                Register tMode = currentProgram.getLanguage().getRegister("TMode");
+                currentProgram.getProgramContext().setValue(
+                        tMode, second, second.add(3), BigInteger.ZERO);
+                AddressSet range = new AddressSet(second, second.add(3));
+                DisassembleCommand disassemble = new DisassembleCommand(second, range, false);
+                disassemble.enableCodeAnalysis(false);
+                if (!disassemble.applyTo(currentProgram, monitor)) {
+                    throw new AssertionError("retagged disassembly failed: "
+                            + disassemble.getStatusMsg());
+                }
+                break;
+            default:
+                throw new AssertionError("unknown corruption mode " + args[0]);
+        }
+        System.out.println("ExceptionCorruptTerminal: ready " + args[0]);
+    }
+}
+"#;
+
 const EXCEPTION_SENTINEL_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 
@@ -9016,6 +9136,10 @@ fn generate_exception_apply_kit_inner(
             "ExceptionTamperNotRequestedPrimary.java",
             EXCEPTION_TAMPER_NOT_REQUESTED_PRIMARY_JAVA,
         ),
+        (
+            "ExceptionCorruptTerminal.java",
+            EXCEPTION_CORRUPT_TERMINAL_JAVA,
+        ),
         ("ExceptionSentinel.java", EXCEPTION_SENTINEL_JAVA),
         ("ExceptionSupportProbe.java", EXCEPTION_SUPPORT_PROBE_JAVA),
         (
@@ -9051,7 +9175,20 @@ fn generate_exception_scatter_apply_kit(
     let plan = pixel_modem_extractor::scatter::discover(&fixture.raw, EXCEPTION_BASE)
         .expect("synthetic exception scatter discovery")
         .expect("synthetic exception scatter loader was not structurally discoverable");
-    let mut kit = generate_exception_apply_kit(home, case, &fixture);
+    // Production scatter discovery is intentionally MAIN-only. This Java
+    // boundary fixture instead exercises an explicit test-only BOOT scatter
+    // map, so stage the generic kit from a same-sized no-candidate image before
+    // installing the intended raw bytes and materialized map.
+    let staging_raw = vec![0; fixture.raw.len()];
+    let mut kit = generate_exception_apply_kit_inner(
+        home,
+        case,
+        &staging_raw,
+        &fixture.manifest,
+        &fixture.identity,
+    );
+    std::fs::write(kit.out.join("images/00_BOOT"), &fixture.raw)
+        .expect("install synthetic exception scatter image");
     if kit.scatter_path.is_none() {
         pixel_modem_extractor::scatter::materialize(&plan, &fixture.raw, "00_BOOT", &kit.out)
             .expect("materialize synthetic exception scatter map");
@@ -9157,6 +9294,47 @@ fn exception_apply_with(
             identity.to_string(),
             "-postScript".to_string(),
             post_script.to_string(),
+        ],
+    )
+}
+
+fn exception_corrupt_and_export(
+    home: &std::path::Path,
+    kit: &ExceptionApplyKit,
+    mode: &str,
+) -> std::process::Output {
+    let export = kit.out.join("export/00_BOOT");
+    let _ = std::fs::remove_file(kit.out.join("export/00_BOOT.complete"));
+    for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+        let _ = std::fs::remove_file(export.join(name));
+    }
+    exception_headless(
+        home,
+        kit,
+        &[
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ExceptionCorruptTerminal.java".to_string(),
+            mode.to_string(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+            export.to_string_lossy().into_owned(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            kit.identity.clone(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            "none".to_string(),
+            "-".to_string(),
+            kit.scatter_path.as_ref().map_or_else(
+                || "-".to_string(),
+                |path| path.to_string_lossy().into_owned(),
+            ),
+            "-".to_string(),
+            "none".to_string(),
         ],
     )
 }
@@ -9324,6 +9502,121 @@ fn pass1_applies_exception_roots_transactionally() {
         panic!("configured real-Ghidra exception test requires /opt/ghidra");
     };
     let fixture = exception_fixture();
+
+    // Drive the shipping pass-1 route, including generated discovery state,
+    // ApplyExceptionRoots -> TameAnalysis(datamark) -> auto-analysis ->
+    // ExportDecomp, before the focused transaction/replay checks below.
+    let production_dir = std::env::temp_dir().join(format!(
+        "pme_exception_production_pass1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&production_dir);
+    std::fs::create_dir_all(&production_dir).unwrap();
+    let production_modem = production_dir.join("modem.bin");
+    std::fs::write(
+        &production_modem,
+        craft_single_image_modem_bin("BOOT", EXCEPTION_BASE, 1, &fixture.raw),
+    )
+    .unwrap();
+    let production_out = production_dir.join("out");
+    let production = pixel_modem_extractor::decompile::run_report(
+        &production_modem,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home.clone()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: true,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &production_out,
+    )
+    .unwrap();
+    let image = &production.images[0];
+    assert!(matches!(
+        image.outcome,
+        pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
+    ));
+    assert_eq!(
+        image.exception_roots_applied,
+        Some(pixel_modem_extractor::decompile::AppliedExceptionRoots {
+            tables: 1,
+            roles: 8,
+            entries: 7,
+            functions_created: 7,
+            functions_reapplied: 0,
+            functions_existing: 0,
+            names_applied: 6,
+            names_reapplied: 0,
+            names_preserved: 0,
+            names_not_requested: 1,
+            shared_entries: 1,
+        })
+    );
+    assert_eq!(image.exception_error, None);
+    let production_manifest =
+        std::fs::read_to_string(production_out.join("exception_roots/00_BOOT/roots.json")).unwrap();
+    let production_identity = exception_manifest_identity(&production_manifest);
+    assert_eq!(production_identity, fixture.identity);
+    assert_eq!(
+        std::fs::read(production_out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &production_identity,
+            "none",
+            "none",
+        )
+    );
+    let exported: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(production_out.join("export/00_BOOT/functions.json")).unwrap(),
+    )
+    .unwrap();
+    let entries = exported
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|function| function["entry"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for entry in [
+        "0x40010200",
+        "0x40010220",
+        "0x40010240",
+        "0x40010260",
+        "0x40010280",
+        "0x400102a0",
+        "0x400102c0",
+    ] {
+        assert!(
+            entries.contains(entry),
+            "datamark lost exception root {entry}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&production_dir);
+
+    let generated_kit = generate_exception_apply_kit(&home, "generated_script", &fixture);
+    let generated = std::process::Command::new(generated_kit.out.join("run_ghidra.sh"))
+        .env("GHIDRA_INSTALL_DIR", &home)
+        .output()
+        .unwrap();
+    let generated_diagnostics = process_diagnostics(&generated);
+    assert!(
+        generated.status.success()
+            && String::from_utf8_lossy(&generated.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplyExceptionRoots: ")),
+        "generated run_ghidra.sh failed:\n{generated_diagnostics}"
+    );
+    assert_eq!(
+        std::fs::read(generated_kit.out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &fixture.identity,
+            "none",
+            "none",
+        )
+    );
+    let _ = std::fs::remove_dir_all(&generated_kit.dir);
+
     let kit = generate_exception_apply_kit(&home, "ok", &fixture);
     let imported = exception_import(&home, &kit);
     let import_diagnostics = process_diagnostics(&imported);
@@ -9434,6 +9727,50 @@ fn pass1_applies_exception_roots_transactionally() {
     assert!(after_stale.status.success());
     assert_eq!(exception_state(&after_stale), partial);
     let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn export_v4_rejects_removed_merged_and_retagged_exception_roots() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception test requires /opt/ghidra");
+    };
+    let fixture = exception_fixture();
+    for (mode, expected) in [
+        ("removed", "registry function binding is stale"),
+        ("merged", "foreign function overlaps exception root"),
+        ("retagged", "exception-root instruction"),
+    ] {
+        let kit = generate_exception_apply_kit(&home, &format!("export_{mode}"), &fixture);
+        let imported = exception_import(&home, &kit);
+        assert!(
+            imported.status.success(),
+            "{mode} import failed:\n{}",
+            process_diagnostics(&imported)
+        );
+        let applied = exception_apply(&home, &kit);
+        assert!(
+            applied.status.success(),
+            "{mode} application failed:\n{}",
+            process_diagnostics(&applied)
+        );
+
+        let rejected = exception_corrupt_and_export(&home, &kit, mode);
+        let diagnostics = process_diagnostics(&rejected);
+        assert!(
+            diagnostics.contains(&format!("ExceptionCorruptTerminal: ready {mode}"))
+                && diagnostics.contains("REPORT SCRIPT ERROR")
+                && diagnostics.contains(expected),
+            "ExportDecomp accepted {mode} root state:\n{diagnostics}"
+        );
+        assert!(!kit.out.join("export/00_BOOT.complete").exists(), "{mode}");
+        for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+            assert!(
+                !kit.out.join("export/00_BOOT").join(name).exists(),
+                "{mode}: {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&kit.dir);
+    }
 }
 
 #[test]

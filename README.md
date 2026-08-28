@@ -92,8 +92,22 @@ analyze/export phase; the Rust process peaks near ~2.5 GB, mostly owned function
 
 `--no-thumb-decompile` changes only Ghidra to `datamark` mode and skips `body_c` enrichment. The
 streaming host Thumb analyzer, including opt-in failure-only Rizin fallback, still runs. In datamark
-mode every authoritative PAL task function (see below) is still disassembled as code — only
-undefined regions that no task owns are marked as data.
+mode every architectural exception-root instruction and authoritative PAL task function (see below)
+stays code — only undefined regions that neither subsystem owns are marked as data.
+
+**Architectural exception-root seeding (default on).** Generation probes every embedded TOC image,
+before image filtering or the opaque skip, for a complete A32 exception-vector table and an optional
+semantically proven VBAR relocation. A validated plan publishes
+`exception_roots/<label>/roots.json`; clean absence clears stale owned output, while malformed,
+ambiguous, or resource-exhausted evidence fails closed. With Ghidra enabled, the strict
+`ApplyExceptionRoots.java` transaction runs after scatter application and before PAL seeding,
+`TameAnalysis`, and auto-analysis. It creates or reuses exact-entry ARM/Thumb functions, assigns
+conventional primaries only when safe, retains role labels and concrete ownership, and never replaces
+a meaningful foreign primary. Generated and immediate runs bind the exact root identity through
+TameAnalysis and the four-line `pixel-modem-extractor-ghidra-export-v4` completion marker; missing,
+duplicate, malformed, stale, removed, merged, or retagged root state publishes no current export. An
+opaque-skipped image can still retain a current generation manifest, but has no Ghidra application
+counts because no process ran.
 
 **PAL task seeding (default on).** Every recognized MAIN image is probed, at generation time and on
 every run, for a PAL task initializer: a semantic proof (anchor materialization of `PALTskTm\0`,
@@ -177,14 +191,16 @@ its full set of flags.
     └── manifest.json            # input/output sizes, blake3 digests, and the TOC image table
                                  #   (each TOC image row carries its opaque battery)
 
-`decompile` writes a standalone Ghidra import kit. A MAIN with one validated runtime map adds:
+`decompile` writes a standalone Ghidra import kit. Any image with validated architectural roots adds
+`exception_roots/<label>/roots.json`. A MAIN with one validated runtime map adds:
 
     scatter/<label>/load_map.json
     scatter/<label>/blocks/<entry>-<operation>.bin
 
-and a MAIN with a validated PAL task plan adds `pal_tasks/<label>/tasks.json` (see Formats). Both
-are wired into `ghidra_load.json`: a recognized MAIN gains optional `runtime_load_map` and optional
-`pal_task_map` with import-kit-relative paths; images without them omit the fields.
+and a MAIN with a validated PAL task plan adds `pal_tasks/<label>/tasks.json` (see Formats). These
+are wired into `ghidra_load.json`: each image can gain optional `exception_root_map`; a recognized
+MAIN can additionally gain optional `runtime_load_map` and `pal_task_map`. Images without a given
+artifact omit its field.
 
 The manifest is the auditable map; payload files exist only for materialized copy or nonzero
 `decompress1` outputs. Zero-filled outputs and self-copies remain compact manifest entries.
@@ -280,6 +296,15 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   writable, non-executable, non-volatile runtime blocks because the table carries no trustworthy MPU
   permissions. No candidate remains raw-only; a candidate that reaches the structural threshold but is
   malformed or ambiguous fails closed.
+- **Architectural exception-root manifest** — `pixel-modem-extractor-exception-roots-v1`: the
+  authenticated canonical manifest for one image's complete initial exception-vector table and any
+  semantically proven VBAR relocation, written at `exception_roots/<label>/roots.json`. It binds the
+  raw image, optional scatter load map, supported slot instructions and literal targets, root entry
+  bytes/ISA/storage, role relationships, and deterministic Ghidra application groups. Its external
+  identity is `v1:<manifest-blake3>:<tables>:<roots>`. Ghidra applies it transactionally before
+  auto-analysis and records concrete function, primary-symbol, and role-label ownership; the v4
+  export marker binds the same identity as `exception_roots=<identity>`. Strict readers and Ghidra
+  postflight rederive all identities and reject stale or partial state.
 - **PAL task manifest** — `pixel-modem-extractor-pal-tasks-v1`: the authenticated canonical
   manifest of one validated PAL task plan, written at `pal_tasks/<label>/tasks.json`
   (`images/<MAIN>/pal_tasks/tasks.json` under `decompose`). It binds the image identity (BLAKE3),
