@@ -24,7 +24,6 @@ import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
-import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Data;
@@ -43,15 +42,10 @@ import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
-import ghidra.program.model.symbol.SymbolUtilities;
 import ghidra.program.model.util.StringPropertyMap;
 import ghidra.util.task.TaskMonitor;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.Reader;
 import java.io.StringReader;
 import java.math.BigInteger;
@@ -560,7 +554,7 @@ final class PalTasksSupport {
     }
 
     private static byte[] ascii(String text) {
-        return text.getBytes(StandardCharsets.US_ASCII);
+        return PmeScriptSupport.ascii(text);
     }
 
     // -------------------------------------------------------------------------
@@ -885,10 +879,7 @@ final class PalTasksSupport {
     // -------------------------------------------------------------------------
 
     static String blake3Hex(byte[] domain, byte[] payload) {
-        Blake3Digest digest = new Blake3Digest();
-        digest.update(domain, 0, domain.length);
-        digest.update(payload, 0, payload.length);
-        return finishHash(digest);
+        return PmeScriptSupport.blake3Hex(domain, payload);
     }
 
     static String executionDigestHex(long entry, List<ExecutionRangeWire> ranges) {
@@ -1190,12 +1181,13 @@ final class PalTasksSupport {
     }
 
     private static byte[] utf8NoSurrogates(String value) {
-        for (int index = 0; index < value.length(); index++) {
-            if (Character.isSurrogate(value.charAt(index))) {
-                fail("string contains an unpaired surrogate");
-            }
+        try {
+            return PmeScriptSupport.boundedUtf8(value, Integer.MAX_VALUE, "string");
         }
-        return value.getBytes(StandardCharsets.UTF_8);
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
+            return null;
+        }
     }
 
     private static void updateLeU32(Blake3Digest digest, long value) {
@@ -1211,29 +1203,17 @@ final class PalTasksSupport {
     }
 
     private static String finishHash(Blake3Digest digest) {
-        byte[] output = new byte[digest.getDigestSize()];
-        digest.doFinal(output, 0);
-        StringBuilder text = new StringBuilder(output.length * 2);
-        for (byte value : output) {
-            text.append(String.format(Locale.ROOT, "%02x", value & 0xff));
-        }
-        return text.toString();
+        return PmeScriptSupport.finishHash(digest);
     }
 
     private static byte[] hexToBytes(String text) {
-        if (text.length() % 2 != 0) {
-            fail("hex string has an odd length");
+        try {
+            return PmeScriptSupport.hexToBytes(text, "hex string");
         }
-        ByteArrayOutputStream output = new ByteArrayOutputStream(text.length() / 2);
-        for (int index = 0; index < text.length(); index += 2) {
-            int high = Character.digit(text.charAt(index), 16);
-            int low = Character.digit(text.charAt(index + 1), 16);
-            if (high < 0 || low < 0) {
-                fail("hex string contains a non-hex character");
-            }
-            output.write((high << 4) | low);
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
+            return null;
         }
-        return output.toByteArray();
     }
 
     // -------------------------------------------------------------------------
@@ -1280,18 +1260,13 @@ final class PalTasksSupport {
         if (!isSafeLabel(label)) {
             fail("expected image label is not a safe path component");
         }
-        File manifestFile = requireCanonicalContainedFile(root, palFile, "task manifest");
-
         byte[] bytes;
         String manifestBlake3;
-        try (FileInputStream input = new FileInputStream(manifestFile)) {
-            long size = input.getChannel().size();
-            if (size > MAX_PAL_MANIFEST_BYTES) {
-                fail("task manifest exceeds the 4 MiB ceiling");
-            }
-            manifestBlake3 = hashExact(input, size, "task manifest");
-            input.getChannel().position(0);
-            bytes = readExact(input, size, "task manifest");
+        try (PmeScriptSupport.TrustedFile retained =
+                PmeScriptSupport.openCanonicalContainedFile(root, palFile, "task manifest")) {
+            bytes = retained.readAll(MAX_PAL_MANIFEST_BYTES, "task manifest");
+            manifestBlake3 = PmeScriptSupport.blake3Hex(bytes);
+            retained.verifyPathIdentity("task manifest");
         }
         catch (IOException error) {
             throw new Exception("task manifest could not be read: " + error.getMessage(), error);
@@ -1306,27 +1281,25 @@ final class PalTasksSupport {
             if (scatterFile == null) {
                 fail("scatter dependency nullability does not match the supplied load map");
             }
-            File scatter = requireCanonicalContainedFile(root, scatterFile, "scatter load map");
-            if (!manifest.scatterLoadMapBlake3.equals(hashFile(scatter, "scatter load map"))) {
-                fail("scatter load-map BLAKE3 does not match the manifest dependency");
+            try (PmeScriptSupport.TrustedFile scatter =
+                    PmeScriptSupport.openCanonicalContainedFile(
+                            root, scatterFile, "scatter load map")) {
+                if (!manifest.scatterLoadMapBlake3.equals(scatter.blake3("scatter load map"))) {
+                    fail("scatter load-map BLAKE3 does not match the manifest dependency");
+                }
+                scatter.verifyPathIdentity("scatter load map");
             }
         }
 
-        File rawImage;
-        try {
-            rawImage = new File(new File(root, "images"), label).getCanonicalFile();
-        }
-        catch (IOException error) {
-            throw new Exception("raw image path cannot be canonicalized", error);
-        }
-        if (!isStrictlyContained(root, rawImage) || !rawImage.isFile() || !rawImage.canRead()) {
-            fail("raw image is not a contained readable regular file");
-        }
-        if (rawImage.length() != manifest.imageSize) {
-            fail("raw image size does not match the manifest");
-        }
-        if (!manifest.imageBlake3.equals(hashFile(rawImage, "raw image"))) {
-            fail("image BLAKE3 does not match the raw image file");
+        try (PmeScriptSupport.TrustedFile rawImage = PmeScriptSupport.openContainedChild(
+                root, "images/" + label, "raw image")) {
+            if (rawImage.size() != manifest.imageSize) {
+                fail("raw image size does not match the manifest");
+            }
+            if (!manifest.imageBlake3.equals(rawImage.blake3("raw image"))) {
+                fail("image BLAKE3 does not match the raw image file");
+            }
+            rawImage.verifyPathIdentity("raw image");
         }
         return manifest;
     }
@@ -1392,12 +1365,15 @@ final class PalTasksSupport {
     }
 
     static String primarySource(SourceType source) {
-        switch (source) {
-            case DEFAULT: return "default";
-            case ANALYSIS: return "analysis";
-            case IMPORTED: return "imported";
-            case USER_DEFINED: return "user_defined";
-            default: fail("unknown primary source " + source); return null;
+        if (source == SourceType.AI) {
+            fail("unknown primary source " + source);
+        }
+        try {
+            return PmeScriptSupport.primarySource(source);
+        }
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
+            return null;
         }
     }
 
@@ -1447,29 +1423,13 @@ final class PalTasksSupport {
     }
 
     private static String jsonString(String value) {
-        StringBuilder out = new StringBuilder(value.length() + 2);
-        out.append('"');
-        for (int index = 0; index < value.length(); index++) {
-            char character = value.charAt(index);
-            switch (character) {
-                case '\\': out.append("\\\\"); break;
-                case '"': out.append("\\\""); break;
-                case '\b': out.append("\\b"); break;
-                case '\f': out.append("\\f"); break;
-                case '\n': out.append("\\n"); break;
-                case '\r': out.append("\\r"); break;
-                case '\t': out.append("\\t"); break;
-                default:
-                    if (character < 0x20) {
-                        out.append(String.format(Locale.ROOT, "\\u%04x", (int) character));
-                    }
-                    else {
-                        out.append(character);
-                    }
-            }
+        try {
+            return PmeScriptSupport.jsonString(value);
         }
-        out.append('"');
-        return out.toString();
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1808,15 +1768,11 @@ final class PalTasksSupport {
     }
 
     static Address programAddress(Program program, long value) {
-        if (value < 0 || value > UINT32_MAX) {
-            fail("address is outside the u32 domain");
-        }
-        AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
         try {
-            return space.getAddress(value);
+            return PmeScriptSupport.programAddress(program, value);
         }
-        catch (AddressOutOfBoundsException error) {
-            fail("address is outside the default address space");
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
             return null;
         }
     }
@@ -1830,30 +1786,29 @@ final class PalTasksSupport {
         assertGhidraSymbolLimit();
         requireHashText(functionsHash, "expected functions.json BLAKE3");
         requireHashText(mapHash, "expected symbol map BLAKE3");
-        File functionsFile =
-                requireCanonicalFileArgument(retainedFunctions, "retained pass-1 functions.json");
-        File mapFile = requireCanonicalFileArgument(map, "symbol map");
-
         SymbolMap parsed;
-        try (FileInputStream input = new FileInputStream(mapFile)) {
-            long mapSize = input.getChannel().size();
-            if (mapSize > MAX_SYMBOL_MAP_BYTES) {
+        try (PmeScriptSupport.TrustedFile mapFile =
+                        PmeScriptSupport.openCanonicalFile(map, "symbol map");
+                PmeScriptSupport.TrustedFile functionsFile =
+                        PmeScriptSupport.openCanonicalFile(
+                                retainedFunctions, "retained pass-1 functions.json")) {
+            if (mapFile.size() > MAX_SYMBOL_MAP_BYTES) {
                 fail("symbol map exceeds the 256 MiB ceiling");
             }
-            String actualMapHash = hashExact(input, mapSize, "symbol map");
+            String actualMapHash = mapFile.blake3("symbol map");
             if (!actualMapHash.equals(mapHash)) {
                 fail("symbol map BLAKE3 does not match the expected value");
             }
-            input.getChannel().position(0);
-            parsed = parseSymbolMap(new InputStreamReader(input, StandardCharsets.UTF_8
-                    .newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)), actualMapHash);
+            parsed = parseSymbolMap(mapFile.utf8Reader(), actualMapHash);
+            if (!functionsHash.equals(functionsFile.blake3(
+                    "retained pass-1 functions.json"))) {
+                fail("functions.json BLAKE3 does not match the retained file");
+            }
+            mapFile.verifyPathIdentity("symbol map");
+            functionsFile.verifyPathIdentity("retained pass-1 functions.json");
         }
         catch (IOException error) {
             throw new Exception("symbol map could not be read: " + error.getMessage(), error);
-        }
-        if (!functionsHash.equals(hashFile(functionsFile, "retained pass-1 functions.json"))) {
-            fail("functions.json BLAKE3 does not match the retained file");
         }
         if (!parsed.functionsBlake3.equals(functionsHash)) {
             fail("functions.json BLAKE3 does not match the map dependency");
@@ -1871,20 +1826,18 @@ final class PalTasksSupport {
     static SymbolMap readSymbolMapForExport(File map, String mapHash) throws Exception {
         assertGhidraSymbolLimit();
         requireHashText(mapHash, "expected symbol map BLAKE3");
-        File mapFile = requireCanonicalFileArgument(map, "symbol map");
-        try (FileInputStream input = new FileInputStream(mapFile)) {
-            long mapSize = input.getChannel().size();
-            if (mapSize > MAX_SYMBOL_MAP_BYTES) {
+        try (PmeScriptSupport.TrustedFile mapFile =
+                PmeScriptSupport.openCanonicalFile(map, "symbol map")) {
+            if (mapFile.size() > MAX_SYMBOL_MAP_BYTES) {
                 fail("symbol map exceeds the 256 MiB ceiling");
             }
-            String actualMapHash = hashExact(input, mapSize, "symbol map");
+            String actualMapHash = mapFile.blake3("symbol map");
             if (!actualMapHash.equals(mapHash)) {
                 fail("symbol map BLAKE3 does not match the expected value");
             }
-            input.getChannel().position(0);
-            return parseSymbolMap(new InputStreamReader(input, StandardCharsets.UTF_8
-                    .newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)), actualMapHash);
+            SymbolMap parsed = parseSymbolMap(mapFile.utf8Reader(), actualMapHash);
+            mapFile.verifyPathIdentity("symbol map");
+            return parsed;
         }
         catch (IOException error) {
             throw new Exception("symbol map could not be read: " + error.getMessage(), error);
@@ -3169,10 +3122,11 @@ final class PalTasksSupport {
             if (value.indexOf('\0') >= 0) {
                 fail(what + " contains a NUL byte");
             }
-            for (int index = 0; index < value.length(); index++) {
-                if (Character.isSurrogate(value.charAt(index))) {
-                    fail(what + " contains an unpaired surrogate");
-                }
+            try {
+                PmeScriptSupport.boundedUtf8(value, Integer.MAX_VALUE, what);
+            }
+            catch (PmeScriptSupport.SupportError error) {
+                fail(error.getMessage());
             }
             return value;
         }
@@ -3187,103 +3141,22 @@ final class PalTasksSupport {
     // -------------------------------------------------------------------------
 
     private static void assertGhidraSymbolLimit() {
-        if (SymbolUtilities.MAX_SYMBOL_NAME_LENGTH != 2000) {
-            fail("SymbolUtilities.MAX_SYMBOL_NAME_LENGTH != 2000 is not supported");
+        try {
+            PmeScriptSupport.assertGhidraSymbolLimit();
+        }
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
         }
     }
 
     private static File requireCanonicalDirectory(File file, String description) {
-        File canonical = requireCanonicalArgument(file, description);
-        if (!canonical.isDirectory()) {
-            fail(description + " is not a directory");
-        }
-        return canonical;
-    }
-
-    private static File requireCanonicalFileArgument(File file, String description) {
-        File canonical = requireCanonicalArgument(file, description);
-        if (!canonical.isFile() || !canonical.canRead()) {
-            fail(description + " is not a readable regular file");
-        }
-        return canonical;
-    }
-
-    private static File requireCanonicalContainedFile(File root, File file, String description) {
-        File canonical = requireCanonicalFileArgument(file, description);
-        if (!isStrictlyContained(root, canonical)) {
-            fail(description + " escapes the import-kit root");
-        }
-        return canonical;
-    }
-
-    private static File requireCanonicalArgument(File file, String description) {
-        if (file == null || !file.isAbsolute()) {
-            fail(description + " is not absolute");
-        }
         try {
-            File canonical = file.getCanonicalFile();
-            if (!canonical.getPath().equals(file.getPath())) {
-                fail(description + " is not in canonical form");
-            }
-            return canonical;
+            return PmeScriptSupport.requireCanonicalDirectory(file, description);
         }
-        catch (IOException error) {
-            fail(description + " cannot be canonicalized");
+        catch (PmeScriptSupport.SupportError error) {
+            fail(error.getMessage());
             return null;
         }
-    }
-
-    private static boolean isStrictlyContained(File root, File child) {
-        return !root.toPath().equals(child.toPath()) && child.toPath().startsWith(root.toPath());
-    }
-
-    private static String hashFile(File file, String what) {
-        try (FileInputStream input = new FileInputStream(file)) {
-            return hashExact(input, input.getChannel().size(), what);
-        }
-        catch (IOException error) {
-            fail(what + " could not be hashed");
-            return null;
-        }
-    }
-
-    private static String hashExact(InputStream input, long size, String what) throws IOException {
-        Blake3Digest digest = new Blake3Digest();
-        byte[] buffer = new byte[HASH_BUFFER_SIZE];
-        long offset = 0;
-        while (offset < size) {
-            int wanted = (int) Math.min(buffer.length, size - offset);
-            int read = readFully(input, buffer, wanted);
-            if (read != wanted) {
-                fail(what + " ended before its declared size");
-            }
-            digest.update(buffer, 0, read);
-            offset += read;
-        }
-        if (input.read() != -1) {
-            fail(what + " grew while it was being authenticated");
-        }
-        return finishHash(digest);
-    }
-
-    private static byte[] readExact(InputStream input, long size, String what) throws IOException {
-        byte[] bytes = new byte[(int) size];
-        if (readFully(input, bytes, bytes.length) != bytes.length) {
-            fail(what + " ended before its declared size");
-        }
-        return bytes;
-    }
-
-    private static int readFully(InputStream input, byte[] output, int length) throws IOException {
-        int offset = 0;
-        while (offset < length) {
-            int read = input.read(output, offset, length - offset);
-            if (read < 0) {
-                break;
-            }
-            offset += read;
-        }
-        return offset;
     }
 
     // -------------------------------------------------------------------------

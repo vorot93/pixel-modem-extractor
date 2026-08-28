@@ -1605,6 +1605,8 @@ fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
 import java.math.BigInteger;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
@@ -4115,6 +4117,10 @@ fn pal_support_strict_parsers_registry_and_digests() {
         &out,
     )
     .unwrap();
+    assert!(
+        out.join("scripts/PmeScriptSupport.java").is_file(),
+        "generated PAL kit is missing its shared script support"
+    );
 
     let scatter_path = out.join("scatter/02_MAIN/load_map.json");
     assert!(
@@ -8120,6 +8126,7 @@ public class SeedExtraFunction extends GhidraScript {
         System.out.println("SeedExtraFunction: ok");
     }
 }
+
 "#,
     )
     .unwrap();
@@ -8244,4 +8251,1967 @@ public class SeedExtraFunction extends GhidraScript {
         let _ = std::fs::remove_dir_all(&state.kit.dir);
     }
     let _ = std::fs::remove_dir_all(&corrupt_dir);
+}
+
+// -----------------------------------------------------------------------------
+// Exception-root transactional applicator
+// -----------------------------------------------------------------------------
+
+const EXCEPTION_BASE: u32 = 0x4001_0000;
+const EXCEPTION_IMAGE_LEN: usize = 0x1000;
+const EXCEPTION_RESET: u32 = EXCEPTION_BASE + 0x200;
+const EXCEPTION_UNDEFINED: u32 = EXCEPTION_BASE + 0x220;
+const EXCEPTION_SUPERVISOR: u32 = EXCEPTION_BASE + 0x240;
+const EXCEPTION_PREFETCH: u32 = EXCEPTION_BASE + 0x260;
+const EXCEPTION_SHARED: u32 = EXCEPTION_BASE + 0x280;
+const EXCEPTION_IRQ: u32 = EXCEPTION_BASE + 0x2a0;
+const EXCEPTION_FIQ: u32 = EXCEPTION_BASE + 0x2c0;
+const EXCEPTION_SCATTER_DIRECT: u32 = SCATTER_COPY_DESTINATION + 8;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireManifest {
+    format: String,
+    schema_version: u32,
+    tool_version: String,
+    image: ExceptionWireImage,
+    runtime: ExceptionWireRuntime,
+    decoder: ExceptionWireDecoder,
+    initial_table: ExceptionWireTable,
+    relocation: ExceptionWireRelocation,
+    tables: Vec<ExceptionWireTable>,
+    roots: Vec<ExceptionWireRoot>,
+    applications: Vec<ExceptionWireApplication>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireImage {
+    label: String,
+    toc_name: String,
+    base_addr: String,
+    size: u32,
+    blake3: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireRuntime {
+    scatter_load_map_blake3: Option<String>,
+    scatter_entries_used: Vec<usize>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireDecoder {
+    semantic_adapter: String,
+    #[serde(rename = "crate")]
+    crate_name: String,
+    version: String,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireSpan {
+    kind: String,
+    address: String,
+    size: u32,
+    scatter_entry: Option<usize>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireTable {
+    kind: String,
+    address: String,
+    blake3: String,
+    storage: Vec<ExceptionWireSpan>,
+    slots: Vec<ExceptionWireSlot>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireSlot {
+    index: usize,
+    role: String,
+    address: String,
+    form: String,
+    slot_blake3: String,
+    slot_storage: Vec<ExceptionWireSpan>,
+    literal: Option<ExceptionWireLiteral>,
+    entry: String,
+    isa: String,
+    instruction_size: u8,
+    instruction_blake3: String,
+    instruction_storage: Vec<ExceptionWireSpan>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireLiteral {
+    address: String,
+    blake3: String,
+    storage: Vec<ExceptionWireSpan>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireRelocation {
+    status: String,
+    selected: Option<ExceptionWireVbar>,
+    table_address: Option<String>,
+    observations: Vec<ExceptionWireVbar>,
+    handoffs: Vec<ExceptionWireHandoff>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireVbar {
+    pc: String,
+    isa: String,
+    source_register: u8,
+    conditional: bool,
+    exact_value: Option<String>,
+    definitions: Vec<String>,
+    dominates_handoffs: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireHandoff {
+    pc: String,
+    kind: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireRoot {
+    entry: String,
+    isa: String,
+    instruction_size: u8,
+    instruction_blake3: String,
+    storage: Vec<ExceptionWireSpan>,
+    claims: Vec<ExceptionWireClaim>,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireClaim {
+    table_kind: String,
+    table_address: String,
+    slot_address: String,
+    role: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ExceptionWireApplication {
+    entry: String,
+    isa: String,
+    desired_primary: Option<String>,
+    claims: Vec<ExceptionWireClaim>,
+    role_labels: Vec<String>,
+}
+
+struct ExceptionFixture {
+    raw: Vec<u8>,
+    manifest: String,
+    identity: String,
+}
+
+#[derive(Clone, Copy)]
+struct ExceptionSlotSpec {
+    role: &'static str,
+    primary: &'static str,
+    entry: u32,
+    isa: &'static str,
+    direct: bool,
+}
+
+fn exception_address(value: u32) -> String {
+    format!("{value:#010x}")
+}
+
+fn exception_raw_span(address: u32, size: u32) -> ExceptionWireSpan {
+    ExceptionWireSpan {
+        kind: "raw".to_string(),
+        address: exception_address(address),
+        size,
+        scatter_entry: None,
+    }
+}
+
+fn exception_write_u32(raw: &mut [u8], address: u32, value: u32) {
+    let offset = usize::try_from(address - EXCEPTION_BASE).unwrap();
+    raw[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn exception_region_hash(raw: &[u8], address: u32, size: usize) -> String {
+    let offset = usize::try_from(address - EXCEPTION_BASE).unwrap();
+    blake3::hash(&raw[offset..offset + size])
+        .to_hex()
+        .to_string()
+}
+
+fn exception_branch(slot: u32, target: u32) -> u32 {
+    let displacement = i64::from(target) - (i64::from(slot) + 8);
+    assert_eq!(displacement % 4, 0);
+    let words = displacement / 4;
+    assert!((-0x80_0000..=0x7f_ffff).contains(&words));
+    0xea00_0000 | (u32::try_from(words & 0x00ff_ffff).unwrap())
+}
+
+fn exception_literal_load(slot: u32, literal: u32) -> u32 {
+    let displacement = i64::from(literal) - (i64::from(slot) + 8);
+    assert!((-0xfff..=0xfff).contains(&displacement));
+    let base = if displacement >= 0 {
+        0xe59f_f000
+    } else {
+        0xe51f_f000
+    };
+    base | u32::try_from(displacement.unsigned_abs()).unwrap()
+}
+
+fn exception_mov_half(register: u8, immediate: u16, high: bool) -> u32 {
+    let opcode = if high { 0xe340_0000 } else { 0xe300_0000 };
+    opcode
+        | ((u32::from(immediate) & 0xf000) << 4)
+        | (u32::from(register) << 12)
+        | (u32::from(immediate) & 0x0fff)
+}
+
+fn exception_slot_specs() -> [ExceptionSlotSpec; 8] {
+    [
+        ExceptionSlotSpec {
+            role: "reset",
+            primary: "Reset",
+            entry: EXCEPTION_RESET,
+            isa: "arm",
+            direct: true,
+        },
+        ExceptionSlotSpec {
+            role: "undefined_instruction",
+            primary: "UndefinedInstruction",
+            entry: EXCEPTION_UNDEFINED,
+            isa: "thumb",
+            direct: false,
+        },
+        ExceptionSlotSpec {
+            role: "supervisor_call",
+            primary: "SupervisorCall",
+            entry: EXCEPTION_SUPERVISOR,
+            isa: "arm",
+            direct: false,
+        },
+        ExceptionSlotSpec {
+            role: "prefetch_abort",
+            primary: "PrefetchAbort",
+            entry: EXCEPTION_PREFETCH,
+            isa: "thumb",
+            direct: false,
+        },
+        ExceptionSlotSpec {
+            role: "data_abort",
+            primary: "DataAbort",
+            entry: EXCEPTION_SHARED,
+            isa: "arm",
+            direct: false,
+        },
+        ExceptionSlotSpec {
+            role: "reserved",
+            primary: "Reserved",
+            entry: EXCEPTION_SHARED,
+            isa: "arm",
+            direct: false,
+        },
+        ExceptionSlotSpec {
+            role: "irq",
+            primary: "IRQ",
+            entry: EXCEPTION_IRQ,
+            isa: "arm",
+            direct: false,
+        },
+        ExceptionSlotSpec {
+            role: "fiq",
+            primary: "FIQ",
+            entry: EXCEPTION_FIQ,
+            isa: "thumb",
+            direct: false,
+        },
+    ]
+}
+
+fn exception_fixture() -> ExceptionFixture {
+    let specs = exception_slot_specs();
+    let mut raw = vec![0u8; EXCEPTION_IMAGE_LEN];
+    for spec in specs {
+        let bytes: &[u8] = if spec.entry == EXCEPTION_UNDEFINED {
+            &[0x41, 0xf2, 0x34, 0x20]
+        } else if spec.isa == "arm" {
+            &[0x1e, 0xff, 0x2f, 0xe1]
+        } else {
+            &[0x70, 0x47]
+        };
+        let offset = usize::try_from(spec.entry - EXCEPTION_BASE).unwrap();
+        raw[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+    for (index, spec) in specs.into_iter().enumerate() {
+        let slot = EXCEPTION_BASE + u32::try_from(index).unwrap() * 4;
+        if spec.direct {
+            exception_write_u32(&mut raw, slot, exception_branch(slot, spec.entry));
+        } else {
+            let literal = EXCEPTION_BASE + 0x40 + u32::try_from(index).unwrap() * 4;
+            exception_write_u32(&mut raw, slot, exception_literal_load(slot, literal));
+            let pointer = if spec.isa == "thumb" {
+                spec.entry | 1
+            } else {
+                spec.entry
+            };
+            exception_write_u32(&mut raw, literal, pointer);
+        }
+    }
+
+    let mut slots = Vec::new();
+    let mut roots: std::collections::BTreeMap<(u32, &'static str), ExceptionWireRoot> =
+        std::collections::BTreeMap::new();
+    for (index, spec) in specs.into_iter().enumerate() {
+        let slot = EXCEPTION_BASE + u32::try_from(index).unwrap() * 4;
+        let instruction_size = if spec.isa == "arm" || spec.entry == EXCEPTION_UNDEFINED {
+            4
+        } else {
+            2
+        };
+        let instruction_blake3 =
+            exception_region_hash(&raw, spec.entry, usize::from(instruction_size));
+        let literal = (!spec.direct).then(|| {
+            let address = EXCEPTION_BASE + 0x40 + u32::try_from(index).unwrap() * 4;
+            ExceptionWireLiteral {
+                address: exception_address(address),
+                blake3: exception_region_hash(&raw, address, 4),
+                storage: vec![exception_raw_span(address, 4)],
+            }
+        });
+        let claim = ExceptionWireClaim {
+            table_kind: "initial".to_string(),
+            table_address: exception_address(EXCEPTION_BASE),
+            slot_address: exception_address(slot),
+            role: spec.role.to_string(),
+        };
+        slots.push(ExceptionWireSlot {
+            index,
+            role: spec.role.to_string(),
+            address: exception_address(slot),
+            form: if spec.direct {
+                "direct_branch".to_string()
+            } else {
+                "literal_load".to_string()
+            },
+            slot_blake3: exception_region_hash(&raw, slot, 4),
+            slot_storage: vec![exception_raw_span(slot, 4)],
+            literal,
+            entry: exception_address(spec.entry),
+            isa: spec.isa.to_string(),
+            instruction_size,
+            instruction_blake3: instruction_blake3.clone(),
+            instruction_storage: vec![exception_raw_span(spec.entry, u32::from(instruction_size))],
+        });
+        roots
+            .entry((spec.entry, spec.isa))
+            .and_modify(|root| root.claims.push(claim.clone()))
+            .or_insert_with(|| ExceptionWireRoot {
+                entry: exception_address(spec.entry),
+                isa: spec.isa.to_string(),
+                instruction_size,
+                instruction_blake3,
+                storage: vec![exception_raw_span(spec.entry, u32::from(instruction_size))],
+                claims: vec![claim],
+            });
+    }
+
+    let table = ExceptionWireTable {
+        kind: "initial".to_string(),
+        address: exception_address(EXCEPTION_BASE),
+        blake3: exception_region_hash(&raw, EXCEPTION_BASE, 32),
+        storage: vec![exception_raw_span(EXCEPTION_BASE, 32)],
+        slots,
+    };
+    let roots: Vec<_> = roots.into_values().collect();
+    let mut applications = Vec::new();
+    for root in &roots {
+        let desired_primary = if root.claims.len() == 1 {
+            let role = &root.claims[0].role;
+            Some(
+                specs
+                    .iter()
+                    .find(|spec| spec.role == role)
+                    .unwrap()
+                    .primary
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        let role_labels = root
+            .claims
+            .iter()
+            .map(|claim| format!("exception_{}_40010000", claim.role))
+            .collect();
+        applications.push(ExceptionWireApplication {
+            entry: root.entry.clone(),
+            isa: root.isa.clone(),
+            desired_primary,
+            claims: root.claims.clone(),
+            role_labels,
+        });
+    }
+    let wire = ExceptionWireManifest {
+        format: "pixel-modem-extractor-exception-roots-v1".to_string(),
+        schema_version: 1,
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        image: ExceptionWireImage {
+            label: "00_BOOT".to_string(),
+            toc_name: "BOOT".to_string(),
+            base_addr: exception_address(EXCEPTION_BASE),
+            size: u32::try_from(raw.len()).unwrap(),
+            blake3: blake3::hash(&raw).to_hex().to_string(),
+        },
+        runtime: ExceptionWireRuntime {
+            scatter_load_map_blake3: None,
+            scatter_entries_used: Vec::new(),
+        },
+        decoder: ExceptionWireDecoder {
+            semantic_adapter: "pixel-modem-extractor-arm32-v1".to_string(),
+            crate_name: "scaleservers-arm32-assembly".to_string(),
+            version: "1.0.0".to_string(),
+        },
+        initial_table: table.clone(),
+        relocation: ExceptionWireRelocation {
+            status: "not_observed".to_string(),
+            selected: None,
+            table_address: None,
+            observations: Vec::new(),
+            handoffs: Vec::new(),
+            reason: None,
+        },
+        tables: vec![table],
+        roots,
+        applications,
+    };
+    let manifest = serde_json::to_string_pretty(&wire).unwrap();
+    let identity = format!("v1:{}:1:7", blake3::hash(manifest.as_bytes()).to_hex());
+    ExceptionFixture {
+        raw,
+        manifest,
+        identity,
+    }
+}
+
+fn exception_nonlexical_shared_fixture() -> ExceptionFixture {
+    let fixture = exception_fixture();
+    let mut raw = fixture.raw;
+    let mut wire: ExceptionWireManifest = serde_json::from_str(&fixture.manifest).unwrap();
+    let literal_address = EXCEPTION_BASE + 0x40 + 3 * 4;
+    exception_write_u32(&mut raw, literal_address, EXCEPTION_SUPERVISOR);
+    let literal_blake3 = exception_region_hash(&raw, literal_address, 4);
+    for table in [&mut wire.initial_table, &mut wire.tables[0]] {
+        let supervisor = table.slots[2].clone();
+        let prefetch = &mut table.slots[3];
+        prefetch.literal.as_mut().unwrap().blake3 = literal_blake3.clone();
+        prefetch.entry = supervisor.entry;
+        prefetch.isa = supervisor.isa;
+        prefetch.instruction_size = supervisor.instruction_size;
+        prefetch.instruction_blake3 = supervisor.instruction_blake3;
+        prefetch.instruction_storage = supervisor.instruction_storage;
+    }
+    wire.image.blake3 = blake3::hash(&raw).to_hex().to_string();
+
+    let prefetch_root_index = wire
+        .roots
+        .iter()
+        .position(|root| root.entry == exception_address(EXCEPTION_PREFETCH))
+        .unwrap();
+    let prefetch_claim = wire.roots[prefetch_root_index].claims[0].clone();
+    wire.roots.remove(prefetch_root_index);
+    wire.roots
+        .iter_mut()
+        .find(|root| root.entry == exception_address(EXCEPTION_SUPERVISOR))
+        .unwrap()
+        .claims
+        .push(prefetch_claim.clone());
+
+    let prefetch_application_index = wire
+        .applications
+        .iter()
+        .position(|application| application.entry == exception_address(EXCEPTION_PREFETCH))
+        .unwrap();
+    wire.applications.remove(prefetch_application_index);
+    let supervisor = wire
+        .applications
+        .iter_mut()
+        .find(|application| application.entry == exception_address(EXCEPTION_SUPERVISOR))
+        .unwrap();
+    supervisor.desired_primary = None;
+    supervisor.claims.push(prefetch_claim);
+    supervisor
+        .role_labels
+        .push("exception_prefetch_abort_40010000".to_string());
+
+    let manifest = serde_json::to_string_pretty(&wire).unwrap();
+    ExceptionFixture {
+        raw,
+        identity: format!("v1:{}:1:6", blake3::hash(manifest.as_bytes()).to_hex()),
+        manifest,
+    }
+}
+
+fn exception_relocated_same_targets_fixture() -> ExceptionFixture {
+    let fixture = exception_fixture();
+    let mut raw = fixture.raw;
+    let mut wire: ExceptionWireManifest = serde_json::from_str(&fixture.manifest).unwrap();
+    let relocated_address = EXCEPTION_BASE + 0x100;
+    let literal_base = EXCEPTION_BASE + 0x140;
+    exception_write_u32(
+        &mut raw,
+        EXCEPTION_RESET,
+        exception_mov_half(0, relocated_address as u16, false),
+    );
+    exception_write_u32(
+        &mut raw,
+        EXCEPTION_RESET + 4,
+        exception_mov_half(0, (relocated_address >> 16) as u16, true),
+    );
+    exception_write_u32(&mut raw, EXCEPTION_RESET + 8, 0xee0c_0f10);
+    exception_write_u32(&mut raw, EXCEPTION_RESET + 12, 0xe12f_ff1e);
+    let reset_blake3 = exception_region_hash(&raw, EXCEPTION_RESET, 4);
+    for table in [&mut wire.initial_table, &mut wire.tables[0]] {
+        table.slots[0].instruction_blake3 = reset_blake3.clone();
+    }
+    wire.roots
+        .iter_mut()
+        .find(|root| root.entry == exception_address(EXCEPTION_RESET))
+        .unwrap()
+        .instruction_blake3 = reset_blake3;
+    let mut relocated = wire.initial_table.clone();
+    relocated.kind = "relocated".to_string();
+    relocated.address = exception_address(relocated_address);
+    relocated.storage = vec![exception_raw_span(relocated_address, 32)];
+    for (index, slot) in relocated.slots.iter_mut().enumerate() {
+        let address = relocated_address + u32::try_from(index).unwrap() * 4;
+        let literal = literal_base + u32::try_from(index).unwrap() * 4;
+        exception_write_u32(&mut raw, address, exception_literal_load(address, literal));
+        let pointer = if slot.isa == "thumb" {
+            u32::from_str_radix(slot.entry.trim_start_matches("0x"), 16).unwrap() | 1
+        } else {
+            u32::from_str_radix(slot.entry.trim_start_matches("0x"), 16).unwrap()
+        };
+        exception_write_u32(&mut raw, literal, pointer);
+        slot.address = exception_address(address);
+        slot.form = "literal_load".to_string();
+        slot.slot_blake3 = exception_region_hash(&raw, address, 4);
+        slot.slot_storage = vec![exception_raw_span(address, 4)];
+        slot.literal = Some(ExceptionWireLiteral {
+            address: exception_address(literal),
+            blake3: exception_region_hash(&raw, literal, 4),
+            storage: vec![exception_raw_span(literal, 4)],
+        });
+    }
+    relocated.blake3 = exception_region_hash(&raw, relocated_address, 32);
+    for slot in &relocated.slots {
+        let claim = ExceptionWireClaim {
+            table_kind: "relocated".to_string(),
+            table_address: relocated.address.clone(),
+            slot_address: slot.address.clone(),
+            role: slot.role.clone(),
+        };
+        wire.roots
+            .iter_mut()
+            .find(|root| root.entry == slot.entry && root.isa == slot.isa)
+            .unwrap()
+            .claims
+            .push(claim.clone());
+        let application = wire
+            .applications
+            .iter_mut()
+            .find(|application| application.entry == slot.entry && application.isa == slot.isa)
+            .unwrap();
+        application.claims.push(claim);
+        application
+            .role_labels
+            .push(format!("exception_{}_{relocated_address:08x}", slot.role));
+    }
+    wire.tables.push(relocated);
+    let selected = ExceptionWireVbar {
+        pc: exception_address(EXCEPTION_RESET + 8),
+        isa: "arm".to_string(),
+        source_register: 0,
+        conditional: false,
+        exact_value: Some(exception_address(relocated_address)),
+        definitions: vec![
+            exception_address(EXCEPTION_RESET),
+            exception_address(EXCEPTION_RESET + 4),
+        ],
+        dominates_handoffs: true,
+    };
+    wire.relocation = ExceptionWireRelocation {
+        status: "relocated".to_string(),
+        selected: Some(selected.clone()),
+        table_address: Some(exception_address(relocated_address)),
+        observations: vec![selected],
+        handoffs: Vec::new(),
+        reason: None,
+    };
+    wire.image.blake3 = blake3::hash(&raw).to_hex().to_string();
+
+    let manifest = serde_json::to_string_pretty(&wire).unwrap();
+    ExceptionFixture {
+        raw,
+        identity: format!("v1:{}:2:7", blake3::hash(manifest.as_bytes()).to_hex()),
+        manifest,
+    }
+}
+
+fn exception_scatter_raw() -> Vec<u8> {
+    const LOADER_OFFSET: usize = 0x300;
+    const LOADER_IMMEDIATE: u32 = 0x78;
+    const LITERAL_OFFSET: usize = LOADER_OFFSET + 8 + LOADER_IMMEDIATE as usize;
+    const TABLE_OFFSET: usize = 0x400;
+    const TABLE_LEN: u32 = 7 * 16;
+    const NULL_HANDLER: u32 = EXCEPTION_BASE + 0x600;
+    const COPY_HANDLER: u32 = EXCEPTION_BASE + 0x601;
+    const DECOMPRESS1_HANDLER: u32 = EXCEPTION_BASE + 0x604;
+    const ZERO_HANDLER: u32 = EXCEPTION_BASE + 0x609;
+    const SENTINEL_SOURCE: u32 = EXCEPTION_BASE + 0x680;
+    const SELF_COPY_SOURCE: u32 = EXCEPTION_BASE + 0x700;
+    const DECOMPRESS1_SOURCE: u32 = EXCEPTION_BASE + 0x720;
+    const ZERO_SOURCE: u32 = EXCEPTION_BASE + 0x730;
+
+    let mut raw = exception_fixture().raw;
+    for (offset, instruction) in [0xe28f_0078, 0xe890_0c00, 0xe08a_a000, 0xe08b_b000]
+        .into_iter()
+        .enumerate()
+    {
+        write_scatter_u32(&mut raw, LOADER_OFFSET + offset * 4, instruction);
+    }
+    let literal_address = EXCEPTION_BASE + u32::try_from(LITERAL_OFFSET).unwrap();
+    let table_address = EXCEPTION_BASE + u32::try_from(TABLE_OFFSET).unwrap();
+    write_scatter_u32(
+        &mut raw,
+        LITERAL_OFFSET,
+        table_address.wrapping_sub(literal_address),
+    );
+    write_scatter_u32(
+        &mut raw,
+        LITERAL_OFFSET + 4,
+        (table_address + TABLE_LEN).wrapping_sub(literal_address),
+    );
+    raw[0x700..0x704].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+    raw[0x720..0x722].copy_from_slice(&[0x22, 0xaa]);
+    for (index, source, destination, size, handler) in [
+        (0, SENTINEL_SOURCE, 0, 0, NULL_HANDLER),
+        (1, 0, SENTINEL_SOURCE, 0, NULL_HANDLER),
+        (2, SELF_COPY_SOURCE, SELF_COPY_SOURCE, 4, COPY_HANDLER),
+        (3, EXCEPTION_FIQ, SCATTER_COPY_DESTINATION, 2, COPY_HANDLER),
+        (
+            4,
+            EXCEPTION_RESET,
+            EXCEPTION_SCATTER_DIRECT,
+            4,
+            COPY_HANDLER,
+        ),
+        (
+            5,
+            DECOMPRESS1_SOURCE,
+            SCATTER_DECOMPRESS1_DESTINATION,
+            3,
+            DECOMPRESS1_HANDLER,
+        ),
+        (6, ZERO_SOURCE, SCATTER_ZERO_DESTINATION, 5, ZERO_HANDLER),
+    ] {
+        write_scatter_descriptor(
+            &mut raw,
+            TABLE_OFFSET,
+            index,
+            source,
+            destination,
+            size,
+            handler,
+        );
+    }
+    // The FIQ vector now names the Thumb copy at the scatter destination.
+    exception_write_u32(
+        &mut raw,
+        EXCEPTION_BASE + 0x40 + 7 * 4,
+        SCATTER_COPY_DESTINATION | 1,
+    );
+    exception_write_u32(
+        &mut raw,
+        EXCEPTION_BASE,
+        exception_branch(EXCEPTION_BASE, EXCEPTION_SCATTER_DIRECT),
+    );
+    raw
+}
+
+fn exception_scatter_fixture(raw: Vec<u8>, scatter_blake3: &str) -> ExceptionFixture {
+    let fixture = exception_fixture();
+    let mut wire: ExceptionWireManifest = serde_json::from_str(&fixture.manifest).unwrap();
+    wire.image.blake3 = blake3::hash(&raw).to_hex().to_string();
+    wire.runtime.scatter_load_map_blake3 = Some(scatter_blake3.to_string());
+    wire.runtime.scatter_entries_used = vec![3, 4];
+    let literal_address = EXCEPTION_BASE + 0x40 + 7 * 4;
+    let literal_blake3 = exception_region_hash(&raw, literal_address, 4);
+    let scatter_storage = vec![ExceptionWireSpan {
+        kind: "scatter_bytes".to_string(),
+        address: exception_address(SCATTER_COPY_DESTINATION),
+        size: 2,
+        scatter_entry: Some(3),
+    }];
+    let direct_storage = vec![ExceptionWireSpan {
+        kind: "scatter_bytes".to_string(),
+        address: exception_address(EXCEPTION_SCATTER_DIRECT),
+        size: 4,
+        scatter_entry: Some(4),
+    }];
+    for table in [&mut wire.initial_table, &mut wire.tables[0]] {
+        table.blake3 = exception_region_hash(&raw, EXCEPTION_BASE, 32);
+        let reset = &mut table.slots[0];
+        reset.slot_blake3 = exception_region_hash(&raw, EXCEPTION_BASE, 4);
+        reset.entry = exception_address(EXCEPTION_SCATTER_DIRECT);
+        reset.instruction_storage = direct_storage.clone();
+        let slot = &mut table.slots[7];
+        slot.literal.as_mut().unwrap().blake3 = literal_blake3.clone();
+        slot.entry = exception_address(SCATTER_COPY_DESTINATION);
+        slot.instruction_storage = scatter_storage.clone();
+    }
+    let root = wire
+        .roots
+        .iter_mut()
+        .find(|root| root.entry == exception_address(EXCEPTION_FIQ))
+        .unwrap();
+    root.entry = exception_address(SCATTER_COPY_DESTINATION);
+    root.storage = scatter_storage;
+    let root = wire
+        .roots
+        .iter_mut()
+        .find(|root| root.entry == exception_address(EXCEPTION_RESET))
+        .unwrap();
+    root.entry = exception_address(EXCEPTION_SCATTER_DIRECT);
+    root.storage = direct_storage;
+    let application = wire
+        .applications
+        .iter_mut()
+        .find(|application| application.entry == exception_address(EXCEPTION_FIQ))
+        .unwrap();
+    application.entry = exception_address(SCATTER_COPY_DESTINATION);
+    let application = wire
+        .applications
+        .iter_mut()
+        .find(|application| application.entry == exception_address(EXCEPTION_RESET))
+        .unwrap();
+    application.entry = exception_address(EXCEPTION_SCATTER_DIRECT);
+    wire.roots.sort_by(|left, right| {
+        (left.entry.as_str(), left.isa.as_str()).cmp(&(right.entry.as_str(), right.isa.as_str()))
+    });
+    wire.applications.sort_by(|left, right| {
+        (left.entry.as_str(), left.isa.as_str()).cmp(&(right.entry.as_str(), right.isa.as_str()))
+    });
+    let manifest = serde_json::to_string_pretty(&wire).unwrap();
+    ExceptionFixture {
+        raw,
+        identity: format!("v1:{}:1:7", blake3::hash(manifest.as_bytes()).to_hex()),
+        manifest,
+    }
+}
+
+const EXCEPTION_SEED_FOREIGN_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+import java.math.BigInteger;
+
+public class ExceptionSeedForeign extends GhidraScript {
+    private void seed(long raw, String name, boolean createFunction) throws Exception {
+        Address entry = toAddr(raw);
+        Address end = entry.add(3);
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        currentProgram.getProgramContext().setValue(tMode, entry, end, BigInteger.ZERO);
+        AddressSet one = new AddressSet(entry, end);
+        DisassembleCommand disassemble = new DisassembleCommand(entry, one, false);
+        disassemble.enableCodeAnalysis(false);
+        if (!disassemble.applyTo(currentProgram, monitor)) {
+            throw new AssertionError("foreign fixture disassembly failed at " + entry);
+        }
+        if (!createFunction) {
+            return;
+        }
+        CreateFunctionCmd create =
+                new CreateFunctionCmd(null, entry, one, SourceType.ANALYSIS);
+        if (!create.applyTo(currentProgram, monitor)) {
+            throw new AssertionError("foreign fixture function failed at " + entry);
+        }
+        Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+        if (function == null) {
+            throw new AssertionError("foreign fixture function is missing at " + entry);
+        }
+        if (name != null) {
+            function.setName(name, SourceType.USER_DEFINED);
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        seed(0x40010200L, null, true);
+        seed(0x40010240L, "firmwareSupervisor", true);
+        seed(0x400102a0L, null, false);
+        System.out.println("ExceptionSeedForeign: ready");
+    }
+}
+"#;
+
+const EXCEPTION_INSPECT_APPLIED_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public class ExceptionInspectApplied extends GhidraScript {
+    private static final long[] ENTRIES = {
+        0x40010200L, 0x40010220L, 0x40010240L, 0x40010260L,
+        0x40010280L, 0x400102a0L, 0x400102c0L
+    };
+    private static final boolean[] THUMB = {
+        false, true, false, true, false, false, true
+    };
+    private static final int[] LENGTHS = {
+        4, 4, 4, 2, 4, 4, 2
+    };
+
+    @Override
+    public void run() throws Exception {
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ExceptionRoots.v1.Ownership");
+        if (registry == null || registry.getSize() != ENTRIES.length) {
+            throw new AssertionError("exception ownership registry is not complete");
+        }
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                "PixelModemExtractor_ExceptionRoots_v1",
+                currentProgram.getGlobalNamespace());
+        if (namespace == null) {
+            throw new AssertionError("exception namespace is missing");
+        }
+        Map<Long, Set<String>> expected = new HashMap<Long, Set<String>>();
+        expected.put(0x40010200L, Set.of("exception_reset_40010000"));
+        expected.put(0x40010220L, Set.of("exception_undefined_instruction_40010000"));
+        expected.put(0x40010240L, Set.of("exception_supervisor_call_40010000"));
+        expected.put(0x40010260L, Set.of("exception_prefetch_abort_40010000"));
+        expected.put(0x40010280L, Set.of(
+                "exception_data_abort_40010000", "exception_reserved_40010000"));
+        expected.put(0x400102a0L, Set.of("exception_irq_40010000"));
+        expected.put(0x400102c0L, Set.of("exception_fiq_40010000"));
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        List<String> fingerprint = new ArrayList<String>();
+        for (int index = 0; index < ENTRIES.length; index++) {
+            Address entry = toAddr(ENTRIES[index]);
+            Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+            if (function == null || !function.getEntryPoint().equals(entry)) {
+                throw new AssertionError("exception function is missing at " + entry);
+            }
+            Instruction instruction = currentProgram.getListing().getInstructionAt(entry);
+            if (instruction == null || instruction.getLength() != LENGTHS[index]) {
+                throw new AssertionError("exception first instruction changed at " + entry);
+            }
+            RegisterValue mode = instruction.getRegisterValue(tMode);
+            BigInteger wanted = THUMB[index] ? BigInteger.ONE : BigInteger.ZERO;
+            if (mode == null || !mode.hasValue() || !wanted.equals(mode.getUnsignedValue())) {
+                throw new AssertionError("exception ISA changed at " + entry);
+            }
+            Set<String> labels = new HashSet<String>();
+            SymbolIterator symbols = currentProgram.getSymbolTable().getSymbolsAsIterator(entry);
+            while (symbols.hasNext()) {
+                Symbol symbol = symbols.next();
+                if (namespace.equals(symbol.getParentNamespace())) {
+                    if (symbol.getID() == function.getID()) {
+                        throw new AssertionError(
+                                "exception role label absorbed the function primary at " + entry);
+                    }
+                    labels.add(symbol.getName());
+                    fingerprint.add(entry + ":" + symbol.getName() + ":" + symbol.getID());
+                }
+            }
+            if (!labels.equals(expected.get(ENTRIES[index]))) {
+                throw new AssertionError("exception labels changed at " + entry + ": " + labels);
+            }
+            String ownership = registry.getString(entry);
+            if (ownership == null || !ownership.contains(":" + function.getID() + ":")) {
+                throw new AssertionError("ownership does not bind the function at " + entry);
+            }
+            fingerprint.add(entry + ":registry:" + ownership);
+        }
+        if (!"Reset".equals(currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(0x40010200L)).getName())) {
+            throw new AssertionError("default Reset primary was not applied");
+        }
+        if (!"firmwareSupervisor".equals(currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(0x40010240L)).getName())) {
+            throw new AssertionError("meaningful foreign primary was overwritten");
+        }
+        Function shared = currentProgram.getFunctionManager()
+                .getFunctionAt(toAddr(0x40010280L));
+        if (!"FUN_40010280".equals(shared.getName())
+                || shared.getSymbol().getSource() != SourceType.DEFAULT
+                || !currentProgram.getGlobalNamespace().equals(
+                        shared.getSymbol().getParentNamespace())) {
+            throw new AssertionError("shared handler did not preserve its default primary");
+        }
+        Collections.sort(fingerprint);
+        System.out.println("ExceptionInspectApplied: fingerprint " + fingerprint);
+        System.out.println("ExceptionInspectApplied: ok");
+    }
+}
+"#;
+
+const EXCEPTION_INSPECT_STATE_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.listing.CodeUnit;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class ExceptionInspectState extends GhidraScript {
+    private static final long[] ENTRIES = {
+        0x40010200L, 0x40010220L, 0x40010222L, 0x40010240L, 0x40010260L,
+        0x40010280L, 0x400102a0L, 0x400102c0L
+    };
+
+    @Override
+    public void run() throws Exception {
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ExceptionRoots.v1.Ownership");
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                "PixelModemExtractor_ExceptionRoots_v1",
+                currentProgram.getGlobalNamespace());
+        List<String> state = new ArrayList<String>();
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        state.add("registry=" + (registry == null ? "none" : registry.getSize()));
+        state.add("namespace=" + (namespace == null ? "none" : namespace.getID()));
+        for (long raw : ENTRIES) {
+            Address entry = toAddr(raw);
+            Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+            state.add(entry + ":fn=" + (function == null ? "none"
+                    : function.getID() + "/" + function.getName() + "/"
+                            + function.getSymbol().getSource()));
+            CodeUnit unit = currentProgram.getListing().getCodeUnitContaining(entry);
+            state.add(entry + ":unit=" + (unit == null ? "none"
+                    : unit.getClass().getSimpleName() + "/" + unit.getMinAddress()
+                            + "/" + unit.getLength()));
+            RegisterValue mode = currentProgram.getProgramContext()
+                    .getRegisterValue(tMode, entry);
+            state.add(entry + ":tmode=" + (mode == null || !mode.hasValue()
+                    ? "none" : mode.getUnsignedValue().toString()));
+            List<String> labels = new ArrayList<String>();
+            if (namespace != null) {
+                SymbolIterator symbols = currentProgram.getSymbolTable()
+                        .getSymbolsAsIterator(entry);
+                while (symbols.hasNext()) {
+                    Symbol symbol = symbols.next();
+                    if (namespace.equals(symbol.getParentNamespace())) {
+                        labels.add(symbol.getName() + "/" + symbol.getID() + "/"
+                                + symbol.getSource());
+                    }
+                }
+            }
+            Collections.sort(labels);
+            state.add(entry + ":labels=" + labels);
+            state.add(entry + ":ownership="
+                    + (registry == null ? "none" : registry.getString(entry)));
+        }
+        System.out.println("ExceptionInspectState: " + state);
+    }
+}
+"#;
+
+const EXCEPTION_SEED_LATE_COLLISION_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.data.ByteDataType;
+
+public class ExceptionSeedLateCollision extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        createData(toAddr(0x40010222L), ByteDataType.dataType);
+        System.out.println("ExceptionSeedLateCollision: ready");
+    }
+}
+"#;
+
+const EXCEPTION_TAMPER_REGISTRY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class ExceptionTamperRegistry extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ExceptionRoots.v1.Ownership");
+        if (registry == null || registry.getSize() != 7) {
+            throw new AssertionError("complete exception registry is unavailable");
+        }
+        registry.remove(toAddr(0x400102c0L));
+        if (registry.getSize() != 6) {
+            throw new AssertionError("exception registry tamper did not persist");
+        }
+        System.out.println("ExceptionTamperRegistry: ready");
+    }
+}
+"#;
+
+const EXCEPTION_INSPECT_SCATTER_APPLIED_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+import java.math.BigInteger;
+
+public class ExceptionInspectScatterApplied extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Address entry = toAddr(0x40011000L);
+        Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+        if (function == null || !"FIQ".equals(function.getName())) {
+            throw new AssertionError("scatter-backed FIQ function is missing");
+        }
+        Register tMode = currentProgram.getLanguage().getRegister("TMode");
+        RegisterValue mode = currentProgram.getListing().getInstructionAt(entry)
+                .getRegisterValue(tMode);
+        if (mode == null || !mode.hasValue()
+                || !BigInteger.ONE.equals(mode.getUnsignedValue())) {
+            throw new AssertionError("scatter-backed FIQ function is not Thumb");
+        }
+        Address directEntry = toAddr(0x40011008L);
+        Function direct = currentProgram.getFunctionManager().getFunctionAt(directEntry);
+        if (direct == null || !"Reset".equals(direct.getName())) {
+            throw new AssertionError("scatter-backed direct Reset function is missing");
+        }
+        RegisterValue directMode = currentProgram.getListing().getInstructionAt(directEntry)
+                .getRegisterValue(tMode);
+        if (directMode == null || !directMode.hasValue()
+                || !BigInteger.ZERO.equals(directMode.getUnsignedValue())) {
+            throw new AssertionError("scatter-backed direct Reset function is not A32");
+        }
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                "PixelModemExtractor_ExceptionRoots_v1",
+                currentProgram.getGlobalNamespace());
+        boolean role = false;
+        SymbolIterator symbols = currentProgram.getSymbolTable().getSymbolsAsIterator(entry);
+        while (symbols.hasNext()) {
+            Symbol symbol = symbols.next();
+            if (namespace.equals(symbol.getParentNamespace())
+                    && "exception_fiq_40010000".equals(symbol.getName())) {
+                role = true;
+            }
+        }
+        boolean directRole = false;
+        symbols = currentProgram.getSymbolTable().getSymbolsAsIterator(directEntry);
+        while (symbols.hasNext()) {
+            Symbol symbol = symbols.next();
+            if (namespace.equals(symbol.getParentNamespace())
+                    && "exception_reset_40010000".equals(symbol.getName())) {
+                directRole = true;
+            }
+        }
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ExceptionRoots.v1.Ownership");
+        if (!role || !directRole || registry == null || registry.getSize() != 7
+                || registry.getString(entry) == null
+                || registry.getString(directEntry) == null) {
+            throw new AssertionError("scatter-backed exception ownership is incomplete");
+        }
+        System.out.println("ExceptionInspectScatterApplied: ok");
+    }
+}
+"#;
+
+struct ExceptionApplyKit {
+    dir: PathBuf,
+    out: PathBuf,
+    kit_root: PathBuf,
+    manifest_path: PathBuf,
+    scatter_path: Option<PathBuf>,
+    identity: String,
+}
+
+fn generate_exception_apply_kit(
+    home: &std::path::Path,
+    case: &str,
+    fixture: &ExceptionFixture,
+) -> ExceptionApplyKit {
+    let dir =
+        std::env::temp_dir().join(format!("pme_exception_apply_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        craft_single_image_modem_bin("BOOT", EXCEPTION_BASE, 1, &fixture.raw),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        },
+        &out,
+    )
+    .unwrap();
+    let manifest_dir = out.join("exception_roots/00_BOOT");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    let manifest_path = manifest_dir.join("roots.json");
+    std::fs::write(&manifest_path, &fixture.manifest).unwrap();
+    let scatter_path = out.join("scatter/00_BOOT/load_map.json");
+    let scatter_path = scatter_path
+        .is_file()
+        .then(|| std::fs::canonicalize(scatter_path).unwrap());
+    for script in [
+        "PmeScriptSupport.java",
+        "ExceptionRootsSupport.java",
+        "ApplyExceptionRoots.java",
+    ] {
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/ghidra")
+                .join(script),
+            out.join("scripts").join(script),
+        )
+        .unwrap_or_else(|error| panic!("could not stage {script}: {error}"));
+    }
+    for (name, source) in [
+        ("ExceptionSeedForeign.java", EXCEPTION_SEED_FOREIGN_JAVA),
+        (
+            "ExceptionInspectApplied.java",
+            EXCEPTION_INSPECT_APPLIED_JAVA,
+        ),
+        ("ExceptionInspectState.java", EXCEPTION_INSPECT_STATE_JAVA),
+        (
+            "ExceptionSeedLateCollision.java",
+            EXCEPTION_SEED_LATE_COLLISION_JAVA,
+        ),
+        (
+            "ExceptionTamperRegistry.java",
+            EXCEPTION_TAMPER_REGISTRY_JAVA,
+        ),
+        (
+            "ExceptionInspectScatterApplied.java",
+            EXCEPTION_INSPECT_SCATTER_APPLIED_JAVA,
+        ),
+    ] {
+        std::fs::write(out.join("scripts").join(name), source).unwrap();
+    }
+    std::fs::create_dir_all(out.join("ghidra_project")).unwrap();
+    for directory in ["ghidra_config", "ghidra_cache", "ghidra_tmp"] {
+        std::fs::create_dir_all(out.join(directory)).unwrap();
+    }
+    ExceptionApplyKit {
+        kit_root: std::fs::canonicalize(&out).unwrap(),
+        manifest_path: std::fs::canonicalize(&manifest_path).unwrap(),
+        scatter_path,
+        identity: fixture.identity.clone(),
+        dir,
+        out,
+    }
+}
+
+fn generate_exception_scatter_apply_kit(
+    home: &std::path::Path,
+    case: &str,
+) -> (ExceptionApplyKit, ExceptionFixture) {
+    let raw = exception_scatter_raw();
+    let plan = pixel_modem_extractor::scatter::discover(&raw, EXCEPTION_BASE)
+        .expect("synthetic exception scatter discovery")
+        .expect("synthetic exception scatter loader was not structurally discoverable");
+    let mut placeholder = exception_fixture();
+    placeholder.raw = raw.clone();
+    let mut kit = generate_exception_apply_kit(home, case, &placeholder);
+    if kit.scatter_path.is_none() {
+        pixel_modem_extractor::scatter::materialize(&plan, &raw, "00_BOOT", &kit.out)
+            .expect("materialize synthetic exception scatter map");
+        kit.scatter_path =
+            Some(std::fs::canonicalize(kit.out.join("scatter/00_BOOT/load_map.json")).unwrap());
+    }
+    let scatter_path = kit
+        .scatter_path
+        .as_ref()
+        .expect("synthetic exception scatter map was discovered");
+    let scatter_blake3 = blake3_of(scatter_path);
+    let fixture = exception_scatter_fixture(raw, &scatter_blake3);
+    std::fs::write(&kit.manifest_path, &fixture.manifest).unwrap();
+    kit.identity = fixture.identity.clone();
+    (kit, fixture)
+}
+
+fn exception_headless(
+    home: &std::path::Path,
+    kit: &ExceptionApplyKit,
+    args: &[String],
+) -> std::process::Output {
+    let config = kit.out.join("ghidra_config");
+    let cache = kit.out.join("ghidra_cache");
+    let temp = kit.out.join("ghidra_tmp");
+    let java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        config.display(),
+        cache.display(),
+        temp.display(),
+        temp.display()
+    );
+    std::process::Command::new(
+        analyze_headless_in_home(home).expect("located Ghidra home still has analyzeHeadless"),
+    )
+    .arg(kit.out.join("ghidra_project"))
+    .arg("pixel-modem")
+    .args(args)
+    .env("XDG_CONFIG_HOME", &config)
+    .env("XDG_CACHE_HOME", &cache)
+    .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+    .output()
+    .unwrap()
+}
+
+fn exception_import(home: &std::path::Path, kit: &ExceptionApplyKit) -> std::process::Output {
+    let mut args = vec![
+        "-import".to_string(),
+        kit.out
+            .join("images/00_BOOT")
+            .to_string_lossy()
+            .into_owned(),
+        "-processor".to_string(),
+        "ARM:LE:32:v7".to_string(),
+        "-loader".to_string(),
+        "BinaryLoader".to_string(),
+        "-loader-baseAddr".to_string(),
+        "40010000".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+    ];
+    if let Some(scatter) = &kit.scatter_path {
+        args.extend([
+            "-preScript".to_string(),
+            "ApplyScatterLoad.java".to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            scatter.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend([
+        "-postScript".to_string(),
+        "ExceptionSeedForeign.java".to_string(),
+    ]);
+    exception_headless(home, kit, &args)
+}
+
+fn exception_apply(home: &std::path::Path, kit: &ExceptionApplyKit) -> std::process::Output {
+    exception_apply_with(home, kit, &kit.identity, "ExceptionInspectApplied.java")
+}
+
+fn exception_apply_with(
+    home: &std::path::Path,
+    kit: &ExceptionApplyKit,
+    identity: &str,
+    post_script: &str,
+) -> std::process::Output {
+    exception_headless(
+        home,
+        kit,
+        &[
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-preScript".to_string(),
+            "ApplyExceptionRoots.java".to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            kit.scatter_path.as_ref().map_or_else(
+                || "-".to_string(),
+                |path| path.to_string_lossy().into_owned(),
+            ),
+            identity.to_string(),
+            "-postScript".to_string(),
+            post_script.to_string(),
+        ],
+    )
+}
+
+fn exception_run_script(
+    home: &std::path::Path,
+    kit: &ExceptionApplyKit,
+    script: &str,
+) -> std::process::Output {
+    exception_headless(
+        home,
+        kit,
+        &[
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            script.to_string(),
+        ],
+    )
+}
+
+fn exception_state(output: &std::process::Output) -> String {
+    let diagnostics = process_diagnostics(output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let states = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ExceptionInspectState: "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states.len(),
+        1,
+        "expected one exception state fingerprint:\n{diagnostics}"
+    );
+    states[0].to_string()
+}
+
+fn exception_fixture_mutated(mutate: impl FnOnce(&mut ExceptionWireManifest)) -> ExceptionFixture {
+    let fixture = exception_fixture();
+    let mut value: ExceptionWireManifest = serde_json::from_str(&fixture.manifest).unwrap();
+    mutate(&mut value);
+    let tables = value.tables.len();
+    let roots = value.roots.len();
+    let manifest = serde_json::to_string_pretty(&value).unwrap();
+    ExceptionFixture {
+        raw: fixture.raw,
+        identity: format!(
+            "v1:{}:{tables}:{roots}",
+            blake3::hash(manifest.as_bytes()).to_hex()
+        ),
+        manifest,
+    }
+}
+
+fn exception_fixture_with_manifest(
+    fixture: ExceptionFixture,
+    manifest: String,
+) -> ExceptionFixture {
+    ExceptionFixture {
+        raw: fixture.raw,
+        identity: format!("v1:{}:1:7", blake3::hash(manifest.as_bytes()).to_hex()),
+        manifest,
+    }
+}
+
+fn exception_summary(output: &std::process::Output) -> serde_json::Value {
+    let diagnostics = process_diagnostics(output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let summaries = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyExceptionRoots: "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "expected exactly one unwrapped exception summary:\n{diagnostics}"
+    );
+    serde_json::from_str(summaries[0])
+        .unwrap_or_else(|error| panic!("malformed exception summary ({error}):\n{diagnostics}"))
+}
+
+fn assert_exception_conservation(summary: &serde_json::Value) {
+    let count = |field: &str| summary[field].as_u64().unwrap();
+    assert_eq!(
+        count("entries"),
+        count("functions_created") + count("functions_reapplied") + count("functions_existing")
+    );
+    assert_eq!(
+        count("entries"),
+        count("names_applied")
+            + count("names_reapplied")
+            + count("names_preserved")
+            + count("names_not_requested")
+    );
+    assert!(count("shared_entries") <= count("names_not_requested"));
+}
+
+fn assert_exception_rejected_unchanged(
+    home: &std::path::Path,
+    case: &str,
+    fixture: &ExceptionFixture,
+    identity: &str,
+    seed_script: Option<&str>,
+    expected_error: &str,
+) {
+    let kit = generate_exception_apply_kit(home, case, fixture);
+    let imported = exception_import(home, &kit);
+    assert!(
+        imported.status.success(),
+        "exception rejection fixture import failed:\n{}",
+        process_diagnostics(&imported)
+    );
+    if let Some(script) = seed_script {
+        let seeded = exception_run_script(home, &kit, script);
+        assert!(
+            seeded.status.success(),
+            "exception rejection fixture seeding failed:\n{}",
+            process_diagnostics(&seeded)
+        );
+    }
+    let before = exception_run_script(home, &kit, "ExceptionInspectState.java");
+    assert!(
+        before.status.success(),
+        "exception baseline inspection failed:\n{}",
+        process_diagnostics(&before)
+    );
+    let before = exception_state(&before);
+    let rejected = exception_apply_with(home, &kit, identity, "ExceptionInspectState.java");
+    let diagnostics = process_diagnostics(&rejected);
+    assert!(
+        diagnostics.contains(expected_error),
+        "exception case {case} missed {expected_error:?}:\n{diagnostics}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&rejected.stdout)
+            .lines()
+            .any(|line| line.starts_with("ApplyExceptionRoots: ")),
+        "exception case {case} emitted a success summary:\n{diagnostics}"
+    );
+    assert_eq!(
+        exception_state(&rejected),
+        before,
+        "exception case {case} changed the saved program"
+    );
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn pass1_applies_exception_roots_transactionally() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception test requires /opt/ghidra");
+    };
+    let fixture = exception_fixture();
+    let kit = generate_exception_apply_kit(&home, "ok", &fixture);
+    let imported = exception_import(&home, &kit);
+    let import_diagnostics = process_diagnostics(&imported);
+    assert!(
+        imported.status.success()
+            && String::from_utf8_lossy(&imported.stdout)
+                .lines()
+                .any(|line| line == "ExceptionSeedForeign: ready"),
+        "exception fixture import failed:\n{import_diagnostics}"
+    );
+
+    let first = exception_apply(&home, &kit);
+    let first_diagnostics = process_diagnostics(&first);
+    assert!(
+        first.status.success()
+            && String::from_utf8_lossy(&first.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectApplied: ok"),
+        "first exception application failed:\n{first_diagnostics}"
+    );
+    let first_summary = exception_summary(&first);
+    assert_eq!(
+        first_summary,
+        serde_json::json!({
+            "image": "00_BOOT",
+            "status": "ok",
+            "identity": fixture.identity,
+            "tables": 1,
+            "roles": 8,
+            "entries": 7,
+            "functions_created": 5,
+            "functions_reapplied": 0,
+            "functions_existing": 2,
+            "names_applied": 5,
+            "names_reapplied": 0,
+            "names_preserved": 1,
+            "names_not_requested": 1,
+            "shared_entries": 1,
+        })
+    );
+    assert_exception_conservation(&first_summary);
+
+    let replay = exception_apply(&home, &kit);
+    let replay_diagnostics = process_diagnostics(&replay);
+    assert!(
+        replay.status.success()
+            && String::from_utf8_lossy(&replay.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectApplied: ok"),
+        "exception replay failed:\n{replay_diagnostics}"
+    );
+    let replay_summary = exception_summary(&replay);
+    assert_eq!(
+        replay_summary,
+        serde_json::json!({
+            "image": "00_BOOT",
+            "status": "ok",
+            "identity": fixture.identity,
+            "tables": 1,
+            "roles": 8,
+            "entries": 7,
+            "functions_created": 0,
+            "functions_reapplied": 5,
+            "functions_existing": 2,
+            "names_applied": 0,
+            "names_reapplied": 5,
+            "names_preserved": 1,
+            "names_not_requested": 1,
+            "shared_entries": 1,
+        })
+    );
+    assert_exception_conservation(&replay_summary);
+    let fingerprint = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| line.starts_with("ExceptionInspectApplied: fingerprint "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(fingerprint(&first), fingerprint(&replay));
+
+    let tampered = exception_run_script(&home, &kit, "ExceptionTamperRegistry.java");
+    assert!(
+        tampered.status.success()
+            && String::from_utf8_lossy(&tampered.stdout)
+                .lines()
+                .any(|line| line == "ExceptionTamperRegistry: ready"),
+        "exception registry tamper failed:\n{}",
+        process_diagnostics(&tampered)
+    );
+    let partial = exception_run_script(&home, &kit, "ExceptionInspectState.java");
+    assert!(partial.status.success());
+    let partial = exception_state(&partial);
+    let stale = exception_apply_with(&home, &kit, &kit.identity, "ExceptionInspectState.java");
+    let stale_diagnostics = process_diagnostics(&stale);
+    assert!(
+        stale_diagnostics.contains("ownership registry has a stale or partial size"),
+        "partial exception registry was not rejected:\n{stale_diagnostics}"
+    );
+    assert_eq!(exception_state(&stale), partial);
+    assert!(
+        !String::from_utf8_lossy(&stale.stdout)
+            .lines()
+            .any(|line| line.starts_with("ApplyExceptionRoots: ")),
+        "stale exception replay emitted a success summary"
+    );
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn pass1_applies_shared_exception_roles_with_nonlexical_label_order() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception test requires /opt/ghidra");
+    };
+    let fixture = exception_nonlexical_shared_fixture();
+    let kit = generate_exception_apply_kit(&home, "nonlexical_shared", &fixture);
+    let imported = exception_import(&home, &kit);
+    assert!(
+        imported.status.success(),
+        "shared-role exception fixture import failed:\n{}",
+        process_diagnostics(&imported)
+    );
+
+    let applied =
+        exception_apply_with(&home, &kit, &fixture.identity, "ExceptionInspectState.java");
+    let diagnostics = process_diagnostics(&applied);
+    assert!(
+        applied.status.success(),
+        "nonlexical shared-role application failed:\n{diagnostics}"
+    );
+    let summary = exception_summary(&applied);
+    assert_eq!(summary["entries"], 6);
+    assert_eq!(summary["shared_entries"], 2);
+    assert_eq!(summary["names_not_requested"], 2);
+    assert_exception_conservation(&summary);
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn pass1_relocated_same_role_claims_keep_unique_primaries() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception test requires /opt/ghidra");
+    };
+    let fixture = exception_relocated_same_targets_fixture();
+    let kit = generate_exception_apply_kit(&home, "relocated_same_targets", &fixture);
+    let imported = exception_import(&home, &kit);
+    assert!(
+        imported.status.success(),
+        "relocated exception fixture import failed:\n{}",
+        process_diagnostics(&imported)
+    );
+
+    let applied =
+        exception_apply_with(&home, &kit, &fixture.identity, "ExceptionInspectState.java");
+    let diagnostics = process_diagnostics(&applied);
+    assert!(
+        applied.status.success(),
+        "relocated same-target exception application failed:\n{diagnostics}"
+    );
+    let summary = exception_summary(&applied);
+    assert_eq!(summary["tables"], 2);
+    assert_eq!(summary["roles"], 16);
+    assert_eq!(summary["entries"], 7);
+    assert_eq!(summary["shared_entries"], 1);
+    assert_eq!(summary["names_not_requested"], 1);
+    assert_exception_conservation(&summary);
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn pass1_applies_scatter_backed_exception_root() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception test requires /opt/ghidra");
+    };
+    let (kit, fixture) = generate_exception_scatter_apply_kit(&home, "scatter");
+    let imported = exception_import(&home, &kit);
+    assert!(
+        imported.status.success(),
+        "scatter exception fixture import failed:\n{}",
+        process_diagnostics(&imported)
+    );
+    let first = exception_apply_with(
+        &home,
+        &kit,
+        &fixture.identity,
+        "ExceptionInspectScatterApplied.java",
+    );
+    let diagnostics = process_diagnostics(&first);
+    assert!(
+        first.status.success()
+            && String::from_utf8_lossy(&first.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectScatterApplied: ok"),
+        "scatter-backed exception application failed:\n{diagnostics}"
+    );
+    let summary = exception_summary(&first);
+    assert_eq!(summary["entries"], 7);
+    assert_eq!(summary["functions_created"], 6);
+    assert_eq!(summary["functions_existing"], 1);
+    assert_eq!(summary["names_applied"], 5);
+    assert_exception_conservation(&summary);
+
+    let replay = exception_apply_with(
+        &home,
+        &kit,
+        &fixture.identity,
+        "ExceptionInspectScatterApplied.java",
+    );
+    assert!(
+        replay.status.success(),
+        "scatter-backed exception replay failed:\n{}",
+        process_diagnostics(&replay)
+    );
+    let replay_summary = exception_summary(&replay);
+    assert_eq!(replay_summary["functions_reapplied"], 6);
+    assert_eq!(replay_summary["functions_existing"], 1);
+    assert_exception_conservation(&replay_summary);
+
+    let scatter: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(kit.scatter_path.as_ref().unwrap()).unwrap())
+            .unwrap();
+    let payload_relative = scatter["entries"][3]["materialization"]["path"]
+        .as_str()
+        .unwrap();
+    let payload = kit
+        .scatter_path
+        .as_ref()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(payload_relative);
+    let original = std::fs::read(&payload).unwrap();
+    let mut corrupted = original.clone();
+    corrupted[0] ^= 0x80;
+    std::fs::write(&payload, corrupted).unwrap();
+    let rejected = exception_apply_with(
+        &home,
+        &kit,
+        &fixture.identity,
+        "ExceptionInspectScatterApplied.java",
+    );
+    let rejected_diagnostics = process_diagnostics(&rejected);
+    assert!(
+        rejected_diagnostics.contains("scatter payload identity does not match"),
+        "corrupt scatter payload was accepted:\n{rejected_diagnostics}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&rejected.stdout)
+            .lines()
+            .any(|line| line.starts_with("ApplyExceptionRoots: ")),
+        "corrupt scatter payload emitted a success summary"
+    );
+    std::fs::write(payload, original).unwrap();
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn pass1_exception_roots_fail_closed_without_residue() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception test requires /opt/ghidra");
+    };
+
+    let unknown_base = exception_fixture();
+    let mut unknown_manifest = unknown_base.manifest.strip_suffix('}').unwrap().to_string();
+    unknown_manifest.push_str(",\n  \"unexpected\": true\n}");
+    let unknown_schema = exception_fixture_with_manifest(unknown_base, unknown_manifest);
+    assert_exception_rejected_unchanged(
+        &home,
+        "unknown_schema",
+        &unknown_schema,
+        &unknown_schema.identity,
+        None,
+        "malformed exception-root manifest",
+    );
+
+    let trailing_base = exception_fixture();
+    let trailing_manifest = format!("{}\n", trailing_base.manifest);
+    let trailing = exception_fixture_with_manifest(trailing_base, trailing_manifest);
+    assert_exception_rejected_unchanged(
+        &home,
+        "trailing_whitespace",
+        &trailing,
+        &trailing.identity,
+        None,
+        "exception-root manifest does not have canonical JSON framing",
+    );
+
+    let scalar_base = exception_fixture();
+    let scalar_manifest = replace_once(
+        &scalar_base.manifest,
+        "\"schema_version\": 1",
+        "\"schema_version\": \"1\"",
+    );
+    let scalar_type = exception_fixture_with_manifest(scalar_base, scalar_manifest);
+    assert_exception_rejected_unchanged(
+        &home,
+        "scalar_type",
+        &scalar_type,
+        &scalar_type.identity,
+        None,
+        "schema_version is not a canonical unsigned decimal",
+    );
+
+    let too_many_observations = exception_fixture_mutated(|value| {
+        value.relocation.status = "unresolved".to_string();
+        value.relocation.observations = (0..65)
+            .map(|index| ExceptionWireVbar {
+                pc: exception_address(EXCEPTION_BASE + 0x800 + index * 4),
+                isa: "arm".to_string(),
+                source_register: 0,
+                conditional: false,
+                exact_value: None,
+                definitions: Vec::new(),
+                dominates_handoffs: false,
+            })
+            .collect();
+    });
+    assert_exception_rejected_unchanged(
+        &home,
+        "vbar_limit",
+        &too_many_observations,
+        &too_many_observations.identity,
+        None,
+        "relocation.observations exceeds its element ceiling",
+    );
+
+    let valid = exception_fixture();
+    assert_exception_rejected_unchanged(
+        &home,
+        "wrong_identity",
+        &valid,
+        "v1:0000000000000000000000000000000000000000000000000000000000000000:1:7",
+        None,
+        "identity does not match",
+    );
+
+    let vector = exception_fixture_mutated(|value| {
+        value.initial_table.slots[0].form = "literal_load".to_string();
+        value.tables[0].slots[0].form = "literal_load".to_string();
+    });
+    assert_exception_rejected_unchanged(
+        &home,
+        "vector_form",
+        &vector,
+        &vector.identity,
+        None,
+        "does not decode to its declared root",
+    );
+
+    let cross_isa = exception_fixture_mutated(|value| {
+        let thumb = value.roots[1].clone();
+        for table in [&mut value.initial_table, &mut value.tables[0]] {
+            let reset = &mut table.slots[0];
+            reset.entry = thumb.entry.clone();
+            reset.instruction_size = thumb.instruction_size;
+            reset.instruction_blake3 = thumb.instruction_blake3.clone();
+            reset.instruction_storage = thumb.storage.clone();
+        }
+        value.roots[0].entry = thumb.entry.clone();
+        value.roots[0].instruction_size = thumb.instruction_size;
+        value.roots[0].instruction_blake3 = thumb.instruction_blake3;
+        value.roots[0].storage = thumb.storage;
+        value.applications[0].entry = thumb.entry;
+    });
+    assert_exception_rejected_unchanged(
+        &home,
+        "cross_isa",
+        &cross_isa,
+        &cross_isa.identity,
+        None,
+        "cross-ISA aliases",
+    );
+
+    let duplicate_table = exception_fixture_mutated(|value| {
+        let mut duplicate = value.initial_table.clone();
+        duplicate.kind = "relocated".to_string();
+        value.tables.push(duplicate);
+    });
+    assert_exception_rejected_unchanged(
+        &home,
+        "duplicate_table",
+        &duplicate_table,
+        &duplicate_table.identity,
+        None,
+        "duplicate addresses",
+    );
+
+    let unbound_relocated = exception_fixture_mutated(|value| {
+        let relocated_address = EXCEPTION_BASE + 0x100;
+        let mut relocated = value.initial_table.clone();
+        relocated.kind = "relocated".to_string();
+        relocated.address = exception_address(relocated_address);
+        for (index, slot) in relocated.slots.iter_mut().enumerate() {
+            slot.address = exception_address(relocated_address + u32::try_from(index).unwrap() * 4);
+        }
+        for slot in &relocated.slots {
+            let claim = ExceptionWireClaim {
+                table_kind: "relocated".to_string(),
+                table_address: relocated.address.clone(),
+                slot_address: slot.address.clone(),
+                role: slot.role.clone(),
+            };
+            let root = value
+                .roots
+                .iter_mut()
+                .find(|root| root.entry == slot.entry && root.isa == slot.isa)
+                .unwrap();
+            root.claims.push(claim.clone());
+            let application = value
+                .applications
+                .iter_mut()
+                .find(|application| application.entry == slot.entry && application.isa == slot.isa)
+                .unwrap();
+            application.claims.push(claim);
+            application
+                .role_labels
+                .push(format!("exception_{}_{relocated_address:08x}", slot.role));
+        }
+        value.tables.push(relocated);
+    });
+    assert_exception_rejected_unchanged(
+        &home,
+        "unbound_relocated",
+        &unbound_relocated,
+        &unbound_relocated.identity,
+        None,
+        "non-relocated evidence published a relocated table",
+    );
+
+    let root_bytes = exception_fixture_mutated(|value| {
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        value.initial_table.slots[0].instruction_blake3 = wrong.clone();
+        value.tables[0].slots[0].instruction_blake3 = wrong.clone();
+        value.roots[0].instruction_blake3 = wrong;
+    });
+    assert_exception_rejected_unchanged(
+        &home,
+        "root_bytes",
+        &root_bytes,
+        &root_bytes.identity,
+        None,
+        "root instruction hash does not match runtime bytes",
+    );
+
+    assert_exception_rejected_unchanged(
+        &home,
+        "late_collision",
+        &valid,
+        &valid.identity,
+        Some("ExceptionSeedLateCollision.java"),
+        "instruction/data collision exists within exception root 40010220",
+    );
+
+    let rollback_kit = generate_exception_apply_kit(&home, "rollback", &valid);
+    let imported = exception_import(&home, &rollback_kit);
+    assert!(imported.status.success());
+    let before = exception_run_script(&home, &rollback_kit, "ExceptionInspectState.java");
+    assert!(before.status.success());
+    let before = exception_state(&before);
+    let script_path = rollback_kit.out.join("scripts/ApplyExceptionRoots.java");
+    let source = std::fs::read_to_string(&script_path).unwrap();
+    let application_site = "            applyOne(validated, plan, counts);\n";
+    let injected = concat!(
+        "            applyOne(validated, plan, counts);\n",
+        "            if (counts.functionsCreated == 3) {\n",
+        "                throw new ExceptionRootsSupport.RootError(\n",
+        "                        \"injected exception-root rollback failure\");\n",
+        "            }\n",
+    );
+    std::fs::write(
+        &script_path,
+        replace_once(&source, application_site, injected),
+    )
+    .unwrap();
+    let rejected = exception_apply_with(
+        &home,
+        &rollback_kit,
+        &rollback_kit.identity,
+        "ExceptionInspectState.java",
+    );
+    let diagnostics = process_diagnostics(&rejected);
+    assert!(
+        diagnostics.contains("injected exception-root rollback failure"),
+        "injected exception rollback did not fire:\n{diagnostics}"
+    );
+    assert_eq!(exception_state(&rejected), before);
+    assert!(
+        !String::from_utf8_lossy(&rejected.stdout)
+            .lines()
+            .any(|line| line.starts_with("ApplyExceptionRoots: ")),
+        "rolled-back exception run emitted a success summary"
+    );
+    let _ = std::fs::remove_dir_all(&rollback_kit.dir);
 }

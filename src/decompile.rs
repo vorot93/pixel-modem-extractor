@@ -33,6 +33,7 @@ const APPLY_GLOBAL_TYPES_JAVA: &str = include_str!("ghidra/ApplyGlobalTypes.java
 const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java");
 const APPLY_THUMB_NAMES_JAVA: &str = include_str!("ghidra/ApplyThumbNames.java");
 const APPLY_PAL_TASKS_JAVA: &str = include_str!("ghidra/ApplyPalTasks.java");
+const PME_SCRIPT_SUPPORT_JAVA: &str = include_str!("ghidra/PmeScriptSupport.java");
 const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
@@ -2047,14 +2048,14 @@ fn run_report_impl(
     let runtime_analysis = generate_runtime_analysis(&toc, &data, out)?;
 
     // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,ApplyPalTasks,
-    //    PalTasksSupport,TameAnalysis,ApplyThumbNames,ApplySymbols,ApplyGlobals,
-    //    ApplyGlobalTypes,ExportDecomp}.java
+    //    PmeScriptSupport,PalTasksSupport,TameAnalysis,ApplyThumbNames,
+    //    ApplySymbols,ApplyGlobals,ApplyGlobalTypes,ExportDecomp}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplyThumbNames,
     //    ApplySymbols, ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
     //    ApplyPalTasks transactionally seeds PAL task functions before analysis;
-    //    PalTasksSupport is the package-private strict PAL support class every
-    //    PAL-aware script shares - no script may grow a second parser.)
+    //    PmeScriptSupport owns generic script utilities and PalTasksSupport owns
+    //    the strict PAL schema - no script may grow a second parser.)
     let scripts = out.join("scripts");
     std::fs::create_dir_all(&scripts)?;
     std::fs::write(
@@ -2062,6 +2063,10 @@ fn run_report_impl(
         APPLY_SCATTER_LOAD_JAVA,
     )?;
     std::fs::write(scripts.join("ApplyPalTasks.java"), APPLY_PAL_TASKS_JAVA)?;
+    std::fs::write(
+        scripts.join("PmeScriptSupport.java"),
+        PME_SCRIPT_SUPPORT_JAVA,
+    )?;
     std::fs::write(scripts.join("PalTasksSupport.java"), PAL_TASKS_SUPPORT_JAVA)?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
@@ -8790,12 +8795,17 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             PAL_TASKS_SUPPORT_JAVA.as_bytes(),
             "generated kits must stage the exact PalTasksSupport source"
         );
+        let shared_staged =
+            std::fs::read(out.join("scripts/PmeScriptSupport.java")).unwrap_or_default();
+        assert_eq!(
+            shared_staged,
+            PME_SCRIPT_SUPPORT_JAVA.as_bytes(),
+            "generated kits must stage the exact shared script support source"
+        );
 
-        // Source contract: the support class owns the one copy of every
-        // PAL parser/digest/registry constant. Each literal below must
-        // appear in PalTasksSupport.java (and pin the Java-side
-        // SymbolUtilities.MAX_SYMBOL_NAME_LENGTH == 2000 assertion), and
-        // must not be redefined by any other staged script.
+        // Source contract: PalTasksSupport owns the one copy of every PAL
+        // parser/digest/registry constant; generic symbol policy is shared.
+        // No other staged script may redefine the PAL constants below.
         let source = PAL_TASKS_SUPPORT_JAVA;
         for owned in [
             "pixel-modem-extractor-pal-tasks-v1",
@@ -8809,7 +8819,6 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "pixel-modem-extractor-pal-labels-v1",
             "pixel-modem-extractor-pal-primary-v1",
             "pixel-modem-extractor-pal-comment-v1",
-            "MAX_SYMBOL_NAME_LENGTH != 2000",
         ] {
             assert!(
                 source.contains(owned),
@@ -8840,6 +8849,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 out.join("scripts/ApplyThumbNames.java").to_string_lossy(),
                 out.join("scripts/ExportDecomp.java").to_string_lossy(),
                 out.join("scripts/PalTasksSupport.java").to_string_lossy(),
+                out.join("scripts/PmeScriptSupport.java").to_string_lossy(),
                 out.join("scripts/TameAnalysis.java").to_string_lossy(),
             ]
         );
