@@ -459,6 +459,7 @@ dependencies = [
  "crc32fast",
  "ext4-view",
  "flate2",
+ "getrandom",
  "libc",
  "paq",
  "regex",

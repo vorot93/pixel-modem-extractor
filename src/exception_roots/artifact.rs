@@ -758,7 +758,7 @@ mod tests {
         );
         std::fs::remove_file(root.path().join("exception_roots/01_MAIN/foreign.bin")).unwrap();
         super::clear_materialized(root.path(), "01_MAIN").unwrap();
-        assert!(!root.path().join("exception_roots/01_MAIN").exists());
+        assert!(root.path().join("exception_roots/01_MAIN").is_dir());
     }
 
     #[cfg(unix)]
@@ -815,7 +815,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clear_parent_swap_never_unlinks_the_replacement_tree() {
+    fn clear_parent_swap_after_manifest_unlink_preserves_both_directories() {
         use std::os::unix::fs::symlink;
 
         let raw = canonical_raw_fixture();
@@ -839,7 +839,7 @@ mod tests {
         let label_for_hook = label.clone();
         let retained_for_hook = retained.clone();
         let replacement_for_hook = replacement.clone();
-        super::set_before_clear_unlink(move || {
+        super::set_after_clear_manifest_unlink(move || {
             std::fs::rename(&label_for_hook, &retained_for_hook).unwrap();
             symlink(&replacement_for_hook, &label_for_hook).unwrap();
         });
@@ -850,6 +850,7 @@ mod tests {
             std::fs::read(&replacement_manifest).unwrap(),
             b"replacement must survive"
         );
+        assert!(retained.is_dir());
         assert!(!retained.join("roots.json").exists());
     }
 
@@ -900,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn post_unlink_cleanup_failure_returns_success_and_manifest_stays_absent() {
+    fn clear_leaves_empty_label_directory_as_allowed_residue() {
         let raw = canonical_raw_fixture();
         let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
         let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
@@ -913,8 +914,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let materialized = materialize(&plan, context, root.path()).unwrap();
         let manifest = root.path().join(materialized.relative_path);
-        super::set_label_cleanup_failure(std::io::ErrorKind::PermissionDenied);
-
         super::clear_materialized(root.path(), "01_MAIN").unwrap();
 
         assert!(!manifest.exists());
@@ -1469,14 +1468,13 @@ pub(crate) fn clear_materialized(root: &Path, label: &str) -> Result<()> {
         return Ok(());
     };
 
-    run_before_clear_unlink();
+    // Manifest unlink or confirmed absence is the complete clear operation. The label directory
+    // intentionally remains because post-unlink name cleanup cannot be object-bound on POSIX.
     label_dir
         .unlink_regular_file_if_exists(ARTIFACT_FILE_NAME, "owned manifest")
         .map_err(|error| invalid(error.to_string()))?;
+    run_after_clear_manifest_unlink();
 
-    // Manifest unlink or confirmed absence is the clear commit. Directory cleanup is optional
-    // ownership hygiene and cannot retroactively turn that committed result into failure.
-    let _ = remove_label_directory(&exception_dir, label, &label_dir);
     Ok(())
 }
 
@@ -1805,7 +1803,7 @@ fn run_before_commit() -> Result<()> {
 thread_local! {
     static BEFORE_MATERIALIZE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
-    static BEFORE_CLEAR_UNLINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static AFTER_CLEAR_MANIFEST_UNLINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static BEFORE_READER_SETUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
@@ -1819,8 +1817,8 @@ fn set_before_materialize_publication(hook: impl FnOnce() + 'static) {
 }
 
 #[cfg(all(test, unix))]
-fn set_before_clear_unlink(hook: impl FnOnce() + 'static) {
-    BEFORE_CLEAR_UNLINK.with(|slot| {
+fn set_after_clear_manifest_unlink(hook: impl FnOnce() + 'static) {
+    AFTER_CLEAR_MANIFEST_UNLINK.with(|slot| {
         assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
     });
 }
@@ -1841,9 +1839,9 @@ fn run_before_materialize_publication() {
     });
 }
 
-fn run_before_clear_unlink() {
+fn run_after_clear_manifest_unlink() {
     #[cfg(all(test, unix))]
-    BEFORE_CLEAR_UNLINK.with(|slot| {
+    AFTER_CLEAR_MANIFEST_UNLINK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
         }
@@ -1857,36 +1855,6 @@ fn run_before_reader_setup() {
             hook();
         }
     });
-}
-
-#[cfg(test)]
-thread_local! {
-    static LABEL_CLEANUP_FAILURE: std::cell::RefCell<Option<std::io::ErrorKind>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn set_label_cleanup_failure(kind: std::io::ErrorKind) {
-    LABEL_CLEANUP_FAILURE.with(|slot| {
-        assert!(slot.borrow_mut().replace(kind).is_none());
-    });
-}
-
-fn remove_label_directory(
-    parent: &TrustedDirectory,
-    label: &str,
-    child: &TrustedDirectory,
-) -> Result<()> {
-    #[cfg(test)]
-    if let Some(kind) = LABEL_CLEANUP_FAILURE.with(|slot| slot.borrow_mut().take()) {
-        return Err(invalid(format!(
-            "injected label cleanup failure: {}",
-            std::io::Error::from(kind)
-        )));
-    }
-    parent
-        .remove_child_directory_if_empty(label, child, "owned label directory")
-        .map_err(|error| invalid(error.to_string()))
 }
 
 fn open_manifest_file(path: &Path, expected_label: &str) -> Result<File> {

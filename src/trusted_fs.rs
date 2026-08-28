@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt as _;
 #[cfg(windows)]
@@ -17,6 +17,7 @@ use std::os::windows::fs::OpenOptionsExt as _;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -43,6 +44,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 const MAX_TEMP_ATTEMPTS: usize = 128;
+#[cfg(windows)]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const WINDOWS_DIRECTORY_ACCESS: FILE_ACCESS_RIGHTS =
@@ -203,54 +205,19 @@ impl TrustedDirectory {
         }
     }
 
-    pub(crate) fn remove_child_directory_if_empty(
-        &self,
-        name: &str,
-        child: &Self,
-        context: &str,
-    ) -> Result<()> {
-        let Some(current) = self.open_directory_child(name, context)? else {
-            return Ok(());
-        };
-        let current_metadata = current
-            .file
-            .metadata()
-            .map_err(|error| bad(format!("{context} metadata is unavailable: {error}")))?;
-        let child_metadata = child.file.metadata().map_err(|error| {
-            bad(format!(
-                "{context} retained metadata is unavailable: {error}"
-            ))
-        })?;
-        if (current_metadata.dev(), current_metadata.ino())
-            != (child_metadata.dev(), child_metadata.ino())
-        {
-            return Ok(());
-        }
-        let component = unix_component(name, context)?;
-        // The identity check prevents an already-replaced name from being removed. This cleanup
-        // is non-authoritative and callers must ignore a concurrent rename or non-empty result.
-        // SAFETY: `self.file` is a live directory and `component` is one NUL-terminated name.
-        let result = unsafe {
-            libc::unlinkat(
-                self.file.as_raw_fd(),
-                component.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(bad(format!(
-                "{context} cannot be removed: {}",
-                io::Error::last_os_error()
-            )))
-        }
-    }
-
     pub(crate) fn atomic_write_file(
         &self,
         target: &str,
         context: &str,
+    ) -> Result<TrustedAtomicFile> {
+        self.atomic_write_file_with_name_source(target, context, random_temporary_name)
+    }
+
+    fn atomic_write_file_with_name_source(
+        &self,
+        target: &str,
+        context: &str,
+        mut name_source: impl FnMut(&str) -> Result<String>,
     ) -> Result<TrustedAtomicFile> {
         self.require_regular_file_or_absent(target, context)?;
         let destination_metadata = unix_entry_metadata(&self.file, target, context)?;
@@ -266,7 +233,7 @@ impl TrustedDirectory {
             ))
         })?;
         for _ in 0..MAX_TEMP_ATTEMPTS {
-            let temporary_name = temporary_name(target.to_string_lossy().as_ref());
+            let temporary_name = name_source(target.to_string_lossy().as_ref())?;
             let temporary = unix_component(&temporary_name, context)?;
             let descriptor = unsafe {
                 libc::openat(
@@ -288,7 +255,6 @@ impl TrustedDirectory {
                     parent,
                     target,
                     temporary,
-                    finalized: false,
                 };
                 if let Some(metadata) = destination_metadata.as_ref() {
                     atomic.preserve_metadata(metadata).map_err(|error| {
@@ -335,8 +301,9 @@ pub(crate) struct TrustedAtomicFile {
     file: File,
     parent: File,
     target: CString,
+    // POSIX cannot unlink this entry by open-file identity. Failure leaves it as residue;
+    // successful rename is the only operation that consumes the staging name.
     temporary: CString,
-    finalized: bool,
 }
 
 #[cfg(unix)]
@@ -359,8 +326,10 @@ impl TrustedAtomicFile {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self) -> io::Result<()> {
+    pub(crate) fn commit(self) -> io::Result<()> {
         self.file.sync_all()?;
+        // POSIX resolves the source leaf at rename time. The retained parent protects ancestor
+        // replacement, while malicious mutation inside this directory is outside the contract.
         // SAFETY: both names are NUL-terminated components and `parent` is a live directory.
         let result = unsafe {
             libc::renameat(
@@ -373,7 +342,6 @@ impl TrustedAtomicFile {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
-        self.finalized = true;
         self.parent.sync_all()
     }
 }
@@ -386,19 +354,6 @@ impl Write for TrustedAtomicFile {
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
-    }
-}
-
-#[cfg(unix)]
-impl Drop for TrustedAtomicFile {
-    fn drop(&mut self) {
-        if !self.finalized {
-            // SAFETY: `parent` remains live and `temporary` is a NUL-terminated component.
-            unsafe {
-                libc::unlinkat(self.parent.as_raw_fd(), self.temporary.as_ptr(), 0);
-            }
-            let _ = self.parent.sync_all();
-        }
     }
 }
 
@@ -746,28 +701,6 @@ impl TrustedDirectory {
             .map_err(|error| bad(format!("{context} cannot be removed: {error}")))?;
         drop(file);
         Ok(true)
-    }
-
-    pub(crate) fn remove_child_directory_if_empty(
-        &self,
-        name: &str,
-        child: &Self,
-        context: &str,
-    ) -> Result<()> {
-        let Some(current) = self.directory.open_optional_directory_with_access(
-            OsStr::new(name),
-            WINDOWS_DIRECTORY_ACCESS | DELETE,
-            FILE_OPEN,
-            context,
-        )?
-        else {
-            return Ok(());
-        };
-        if current.identity != child.directory.identity {
-            return Ok(());
-        }
-        windows_set_delete(&current.file)
-            .map_err(|error| bad(format!("{context} cannot be removed: {error}")))
     }
 
     pub(crate) fn atomic_write_file(
@@ -1232,15 +1165,6 @@ impl TrustedDirectory {
         Err(unsupported(context))
     }
 
-    pub(crate) fn remove_child_directory_if_empty(
-        &self,
-        _name: &str,
-        _child: &Self,
-        context: &str,
-    ) -> Result<()> {
-        Err(unsupported(context))
-    }
-
     pub(crate) fn atomic_write_file(
         &self,
         _target: &str,
@@ -1281,6 +1205,21 @@ impl Write for TrustedAtomicFile {
     }
 }
 
+#[cfg(unix)]
+fn random_temporary_name(target: &str) -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| bad(format!("OS random staging name generation failed: {error}")))?;
+    let mut suffix = String::with_capacity(random.len() * 2);
+    for byte in random {
+        suffix.push(HEX[usize::from(byte >> 4)] as char);
+        suffix.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    Ok(format!(".{target}.tmp-{suffix}"))
+}
+
+#[cfg(windows)]
 fn temporary_name(target: &str) -> String {
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(".{target}.tmp-{}-{counter:016x}", std::process::id())
@@ -1325,6 +1264,8 @@ fn bad(reason: impl Into<String>) -> Error {
 mod tests {
     use super::FileIdentity;
     use crate::error::{Error, Result};
+    #[cfg(unix)]
+    use std::io::Write as _;
     #[cfg(unix)]
     use std::path::Path;
     #[cfg(unix)]
@@ -1375,6 +1316,103 @@ mod tests {
             super::TrustedDirectory::new(&with_separator, "test root"),
             "without following its final component",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_writer_never_unlinks_a_replaced_staging_leaf() {
+        let root = tempdir().unwrap();
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
+        let mut writer = trusted
+            .atomic_write_file("roots.json", "test manifest")
+            .unwrap();
+        writer.write_all(b"owned temporary bytes").unwrap();
+        let staging = root
+            .path()
+            .join(writer.temporary.to_str().expect("ASCII staging name"));
+        let retained = root.path().join("retained-temporary");
+        std::fs::rename(&staging, &retained).unwrap();
+        std::fs::write(&staging, b"replacement bytes").unwrap();
+
+        drop(writer);
+
+        assert_eq!(std::fs::read(&staging).unwrap(), b"replacement bytes");
+        assert_eq!(std::fs::read(&retained).unwrap(), b"owned temporary bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_name_collision_retries_to_a_fresh_leaf() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("roots.json");
+        let collision = root.path().join("occupied-staging");
+        std::fs::write(&target, b"old target").unwrap();
+        std::fs::write(&collision, b"foreign collision").unwrap();
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
+        let mut names = ["occupied-staging", "available-staging"].into_iter();
+
+        let mut writer = trusted
+            .atomic_write_file_with_name_source("roots.json", "test manifest", |_| {
+                Ok(names.next().expect("bounded name attempts").to_owned())
+            })
+            .unwrap();
+        writer.write_all(b"new target").unwrap();
+        writer.commit().unwrap();
+
+        assert_eq!(std::fs::read(target).unwrap(), b"new target");
+        assert_eq!(std::fs::read(collision).unwrap(), b"foreign collision");
+        assert!(!root.path().join("available-staging").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_name_allocation_stops_after_bounded_collisions() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("roots.json");
+        std::fs::write(&target, b"old target").unwrap();
+        let names = (0..128)
+            .map(|index| format!("occupied-staging-{index:03}"))
+            .collect::<Vec<_>>();
+        for name in &names {
+            std::fs::write(root.path().join(name), b"foreign collision").unwrap();
+        }
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
+        let mut names_for_source = names.iter();
+
+        let result =
+            trusted.atomic_write_file_with_name_source("roots.json", "test manifest", |_| {
+                Ok(names_for_source
+                    .next()
+                    .expect("allocator exceeded its collision bound")
+                    .clone())
+            });
+
+        assert_bad(result, "temporary name allocation exhausted");
+        assert_eq!(std::fs::read(target).unwrap(), b"old target");
+        for name in names {
+            assert_eq!(
+                std::fs::read(root.path().join(name)).unwrap(),
+                b"foreign collision"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_name_source_error_precedes_staging_mutation() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("roots.json");
+        std::fs::write(&target, b"old target").unwrap();
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
+
+        let result =
+            trusted.atomic_write_file_with_name_source("roots.json", "test manifest", |_| {
+                Err(super::bad("injected OS random failure"))
+            });
+
+        assert_bad(result, "injected OS random failure");
+        assert_eq!(std::fs::read(target).unwrap(), b"old target");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]

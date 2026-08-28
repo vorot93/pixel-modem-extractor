@@ -308,7 +308,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `blake3` helpers |
 | `tree_hash.rs` | `pme-paq-v1` whole-tree hash behind the `tree-hash` subcommand (fail-closed tree validation) |
-| `trusted_fs.rs` | Retained directory capabilities, no-follow traversal, and handle-relative atomic leaf mutation |
+| `trusted_fs.rs` | Retained directory capabilities, no-follow traversal, and platform-specific atomic leaf mutation |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
@@ -323,14 +323,20 @@ module; when a file outgrows that, split it.
   final-component no-follow/reparse-point open and uses that same object for every descendant
   operation. Never reintroduce a metadata/canonicalize check followed by a path reopen: a rename
   between those calls can redirect a reader, publication, or clear into a replacement tree.
-- **Mutation is handle-relative on both platform families.** Unix uses `mkdirat`/`openat`/
-  `renameat`/`unlinkat`; Windows uses `NtCreateFile` plus `NtSetInformationFile` rename and
-  disposition requests rooted at retained handles. Atomic replacement syncs complete temporary
-  bytes first, preserves an existing Unix leaf's mode/owner, and keeps pre-commit failures from
-  changing the old complete leaf.
-- **Clear commits at the owned leaf.** Once the regular leaf was unlinked or confirmed absent,
-  removing an empty owned directory is best-effort hygiene. A cleanup failure must not turn the
-  committed clear into an error, and an identity mismatch must not remove a replacement directory.
+- **Publication guarantees are platform-specific.** Unix creates a 128-bit OS-random staging leaf
+  with `openat(O_EXCL)` relative to the retained parent, retries at most 128 collisions, syncs the
+  complete file, and atomically replaces the target with parent-relative `renameat` before syncing
+  the directory. Existing mode/owner preservation remains. POSIX has no operation that renames an
+  open source descriptor over an existing name: the Unix threat model covers ancestor/directory
+  replacement, symlink escape, crash-safe replacement, and cooperative concurrency, but excludes a
+  malicious writer changing children inside the already-retained directory. Never describe the
+  Unix source rename as object-bound. Once a Unix staging leaf exists, a failed or abandoned write
+  deliberately leaves it because pathname cleanup could remove a replacement. Windows instead uses
+  `NtCreateFile` plus handle-bound `NtSetInformationFile` rename/disposition and may clean the exact
+  open object.
+- **Clear commits at the owned leaf and stops there.** Once the regular manifest was unlinked or
+  confirmed absent through the retained label handle, clear succeeds and performs no label-directory
+  removal. Empty label directories are allowed noncanonical residue.
 
 ### Dense Thumb analyzer invariants
 
