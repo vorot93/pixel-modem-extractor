@@ -3,6 +3,9 @@
 // their dedicated support classes; this class owns only canonical containment,
 // retained regular-file identity, BLAKE3, bounded Unicode, and symbol helpers.
 //@category PixelModem
+import com.google.gson.Strictness;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressSpace;
@@ -16,6 +19,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.io.StringReader;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
@@ -32,6 +36,7 @@ final class PmeScriptSupport {
     static final long UINT32_END = 0x1_0000_0000L;
     static final int GHIDRA_SYMBOL_LEAF_LIMIT = 2000;
     private static final int HASH_BUFFER_SIZE = 64 * 1024;
+    private static final int MAX_JSON_DEPTH = 64;
 
     private PmeScriptSupport() {}
 
@@ -232,13 +237,15 @@ final class PmeScriptSupport {
             }
             return new TrustedFile(path, input, after);
         }
-        catch (IOException error) {
+        catch (Throwable error) {
             try {
                 input.close();
             }
-            catch (IOException closeFailure) {
-                error.addSuppressed(closeFailure);
+            catch (Throwable closeFailure) {
+                suppress(error, closeFailure);
             }
+            if (error instanceof Error) throw (Error) error;
+            if (error instanceof RuntimeException) throw (RuntimeException) error;
             throw new SupportError(what + " identity could not be retained", error);
         }
     }
@@ -393,6 +400,86 @@ final class PmeScriptSupport {
         return out.toString();
     }
 
+    static byte[] canonicalJsonBytes(String text, String what) {
+        StringBuilder output = new StringBuilder(text.length());
+        try (JsonReader reader = new JsonReader(new StringReader(text))) {
+            reader.setStrictness(Strictness.STRICT);
+            writeCanonicalJson(reader, output, 0, what);
+            if (reader.peek() != JsonToken.END_DOCUMENT) {
+                fail(what + " has trailing JSON");
+            }
+        }
+        catch (IOException | IllegalStateException error) {
+            throw new SupportError(what + " cannot be canonicalized", error);
+        }
+        return boundedUtf8(output.toString(), Integer.MAX_VALUE, what + " canonical JSON");
+    }
+
+    private static void writeCanonicalJson(JsonReader reader, StringBuilder output, int depth,
+            String what) throws IOException {
+        if (depth > MAX_JSON_DEPTH) {
+            fail(what + " exceeds the JSON nesting limit");
+        }
+        switch (reader.peek()) {
+            case BEGIN_OBJECT:
+                reader.beginObject();
+                output.append('{');
+                boolean firstMember = true;
+                while (reader.hasNext()) {
+                    output.append(firstMember ? "\n" : ",\n");
+                    appendIndent(output, depth + 1);
+                    output.append(jsonString(reader.nextName())).append(": ");
+                    writeCanonicalJson(reader, output, depth + 1, what);
+                    firstMember = false;
+                }
+                reader.endObject();
+                if (!firstMember) {
+                    output.append('\n');
+                    appendIndent(output, depth);
+                }
+                output.append('}');
+                break;
+            case BEGIN_ARRAY:
+                reader.beginArray();
+                output.append('[');
+                boolean firstElement = true;
+                while (reader.hasNext()) {
+                    output.append(firstElement ? "\n" : ",\n");
+                    appendIndent(output, depth + 1);
+                    writeCanonicalJson(reader, output, depth + 1, what);
+                    firstElement = false;
+                }
+                reader.endArray();
+                if (!firstElement) {
+                    output.append('\n');
+                    appendIndent(output, depth);
+                }
+                output.append(']');
+                break;
+            case STRING:
+                output.append(jsonString(reader.nextString()));
+                break;
+            case NUMBER:
+                output.append(reader.nextString());
+                break;
+            case BOOLEAN:
+                output.append(reader.nextBoolean());
+                break;
+            case NULL:
+                reader.nextNull();
+                output.append("null");
+                break;
+            default:
+                fail(what + " contains an invalid JSON value");
+        }
+    }
+
+    private static void appendIndent(StringBuilder output, int depth) {
+        for (int index = 0; index < depth; index++) {
+            output.append("  ");
+        }
+    }
+
     static void assertGhidraSymbolLimit() {
         if (SymbolUtilities.MAX_SYMBOL_NAME_LENGTH != GHIDRA_SYMBOL_LEAF_LIMIT) {
             fail("SymbolUtilities.MAX_SYMBOL_NAME_LENGTH != 2000 is not supported");
@@ -457,6 +544,16 @@ final class PmeScriptSupport {
             offset += read;
         }
         return offset;
+    }
+
+    private static void suppress(Throwable primary, Throwable cleanupFailure) {
+        if (primary == cleanupFailure) return;
+        try {
+            primary.addSuppressed(cleanupFailure);
+        }
+        catch (Throwable ignored) {
+            // Preserve the original terminal failure.
+        }
     }
 
     private static void fail(String message) {

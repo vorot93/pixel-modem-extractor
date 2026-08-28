@@ -1,0 +1,921 @@
+{
+  "format": "pixel-modem-extractor-exception-roots-v1",
+  "schema_version": 1,
+  "tool_version": "2.0.0",
+  "image": {
+    "label": "00_BOOT",
+    "toc_name": "BOOT",
+    "base_addr": "0x40010000",
+    "size": 4096,
+    "blake3": "ecac537943ddbd367b403fff221bf07d2ff13fc9aa44a091608acbaff89abcf1"
+  },
+  "runtime": {
+    "scatter_load_map_blake3": null,
+    "scatter_entries_used": []
+  },
+  "decoder": {
+    "semantic_adapter": "pixel-modem-extractor-arm32-v1",
+    "crate": "scaleservers-arm32-assembly",
+    "version": "1.0.0"
+  },
+  "initial_table": {
+    "kind": "initial",
+    "address": "0x40010000",
+    "blake3": "afdbea7e57b10f86acb455e0c14ff6b8b5fb93c7dcf4c7de50e26b5cc8d184d0",
+    "storage": [
+      {
+        "kind": "raw",
+        "address": "0x40010000",
+        "size": 32,
+        "scatter_entry": null
+      }
+    ],
+    "slots": [
+      {
+        "index": 0,
+        "role": "reset",
+        "address": "0x40010000",
+        "form": "direct_branch",
+        "slot_blake3": "b9b888c4c454e13e714b58cde5616ee7e6b275a3b229cc2269664662e27b3252",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010000",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": null,
+        "entry": "0x40010200",
+        "isa": "arm",
+        "instruction_size": 4,
+        "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010200",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 1,
+        "role": "undefined_instruction",
+        "address": "0x40010004",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010004",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x40010044",
+          "blake3": "583622a9eb7dbe7c8c2be6dbd3b6d17962b6913e014cedcc2a8fce2c55b68641",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010044",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x40010220",
+        "isa": "thumb",
+        "instruction_size": 4,
+        "instruction_blake3": "1cfbcf27261950280385ff2e7043a518683f55a02909f46977a084b568b5097f",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010220",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 2,
+        "role": "supervisor_call",
+        "address": "0x40010008",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010008",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x40010048",
+          "blake3": "d0cb1eae15fe73a08a8a8369771b0bd574d8afa1f3d02bb905dd7100487be966",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010048",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x40010240",
+        "isa": "arm",
+        "instruction_size": 4,
+        "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010240",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 3,
+        "role": "prefetch_abort",
+        "address": "0x4001000c",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x4001000c",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x4001004c",
+          "blake3": "d0cb1eae15fe73a08a8a8369771b0bd574d8afa1f3d02bb905dd7100487be966",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x4001004c",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x40010240",
+        "isa": "arm",
+        "instruction_size": 4,
+        "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010240",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 4,
+        "role": "data_abort",
+        "address": "0x40010010",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010010",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x40010050",
+          "blake3": "1b2bfb243e32baf1a4b4055870c810302d86fda87f4c9fa185fffe7c2d7edb5d",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010050",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x40010280",
+        "isa": "arm",
+        "instruction_size": 4,
+        "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010280",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 5,
+        "role": "reserved",
+        "address": "0x40010014",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010014",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x40010054",
+          "blake3": "1b2bfb243e32baf1a4b4055870c810302d86fda87f4c9fa185fffe7c2d7edb5d",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010054",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x40010280",
+        "isa": "arm",
+        "instruction_size": 4,
+        "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010280",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 6,
+        "role": "irq",
+        "address": "0x40010018",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x40010018",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x40010058",
+          "blake3": "36eb7ab970d744d7571db1531f886bc8aadc96bcaca8decd1a9633d2439600c1",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010058",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x400102a0",
+        "isa": "arm",
+        "instruction_size": 4,
+        "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x400102a0",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ]
+      },
+      {
+        "index": 7,
+        "role": "fiq",
+        "address": "0x4001001c",
+        "form": "literal_load",
+        "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+        "slot_storage": [
+          {
+            "kind": "raw",
+            "address": "0x4001001c",
+            "size": 4,
+            "scatter_entry": null
+          }
+        ],
+        "literal": {
+          "address": "0x4001005c",
+          "blake3": "6dfa6b49292a99c456483e089664455e13821b8b755d2657d428d9b788c02da4",
+          "storage": [
+            {
+              "kind": "raw",
+              "address": "0x4001005c",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        "entry": "0x400102c0",
+        "isa": "thumb",
+        "instruction_size": 2,
+        "instruction_blake3": "8a09f486717eda865dd286162039792980cf32f77517e0c4fb472529f72e5e8c",
+        "instruction_storage": [
+          {
+            "kind": "raw",
+            "address": "0x400102c0",
+            "size": 2,
+            "scatter_entry": null
+          }
+        ]
+      }
+    ]
+  },
+  "relocation": {
+    "status": "not_observed",
+    "selected": null,
+    "table_address": null,
+    "observations": [],
+    "handoffs": [],
+    "reason": null
+  },
+  "tables": [
+    {
+      "kind": "initial",
+      "address": "0x40010000",
+      "blake3": "afdbea7e57b10f86acb455e0c14ff6b8b5fb93c7dcf4c7de50e26b5cc8d184d0",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x40010000",
+          "size": 32,
+          "scatter_entry": null
+        }
+      ],
+      "slots": [
+        {
+          "index": 0,
+          "role": "reset",
+          "address": "0x40010000",
+          "form": "direct_branch",
+          "slot_blake3": "b9b888c4c454e13e714b58cde5616ee7e6b275a3b229cc2269664662e27b3252",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010000",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": null,
+          "entry": "0x40010200",
+          "isa": "arm",
+          "instruction_size": 4,
+          "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010200",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 1,
+          "role": "undefined_instruction",
+          "address": "0x40010004",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010004",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x40010044",
+            "blake3": "583622a9eb7dbe7c8c2be6dbd3b6d17962b6913e014cedcc2a8fce2c55b68641",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x40010044",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x40010220",
+          "isa": "thumb",
+          "instruction_size": 4,
+          "instruction_blake3": "1cfbcf27261950280385ff2e7043a518683f55a02909f46977a084b568b5097f",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010220",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 2,
+          "role": "supervisor_call",
+          "address": "0x40010008",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010008",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x40010048",
+            "blake3": "d0cb1eae15fe73a08a8a8369771b0bd574d8afa1f3d02bb905dd7100487be966",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x40010048",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x40010240",
+          "isa": "arm",
+          "instruction_size": 4,
+          "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010240",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 3,
+          "role": "prefetch_abort",
+          "address": "0x4001000c",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x4001000c",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x4001004c",
+            "blake3": "d0cb1eae15fe73a08a8a8369771b0bd574d8afa1f3d02bb905dd7100487be966",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x4001004c",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x40010240",
+          "isa": "arm",
+          "instruction_size": 4,
+          "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010240",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 4,
+          "role": "data_abort",
+          "address": "0x40010010",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010010",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x40010050",
+            "blake3": "1b2bfb243e32baf1a4b4055870c810302d86fda87f4c9fa185fffe7c2d7edb5d",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x40010050",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x40010280",
+          "isa": "arm",
+          "instruction_size": 4,
+          "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010280",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 5,
+          "role": "reserved",
+          "address": "0x40010014",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010014",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x40010054",
+            "blake3": "1b2bfb243e32baf1a4b4055870c810302d86fda87f4c9fa185fffe7c2d7edb5d",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x40010054",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x40010280",
+          "isa": "arm",
+          "instruction_size": 4,
+          "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010280",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 6,
+          "role": "irq",
+          "address": "0x40010018",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x40010018",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x40010058",
+            "blake3": "36eb7ab970d744d7571db1531f886bc8aadc96bcaca8decd1a9633d2439600c1",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x40010058",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x400102a0",
+          "isa": "arm",
+          "instruction_size": 4,
+          "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x400102a0",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "role": "fiq",
+          "address": "0x4001001c",
+          "form": "literal_load",
+          "slot_blake3": "46a559b555bd76b0121a5e0131db93adb459f890614a245e4fc00f25cdd7787e",
+          "slot_storage": [
+            {
+              "kind": "raw",
+              "address": "0x4001001c",
+              "size": 4,
+              "scatter_entry": null
+            }
+          ],
+          "literal": {
+            "address": "0x4001005c",
+            "blake3": "6dfa6b49292a99c456483e089664455e13821b8b755d2657d428d9b788c02da4",
+            "storage": [
+              {
+                "kind": "raw",
+                "address": "0x4001005c",
+                "size": 4,
+                "scatter_entry": null
+              }
+            ]
+          },
+          "entry": "0x400102c0",
+          "isa": "thumb",
+          "instruction_size": 2,
+          "instruction_blake3": "8a09f486717eda865dd286162039792980cf32f77517e0c4fb472529f72e5e8c",
+          "instruction_storage": [
+            {
+              "kind": "raw",
+              "address": "0x400102c0",
+              "size": 2,
+              "scatter_entry": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "roots": [
+    {
+      "entry": "0x40010200",
+      "isa": "arm",
+      "instruction_size": 4,
+      "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x40010200",
+          "size": 4,
+          "scatter_entry": null
+        }
+      ],
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010000",
+          "role": "reset"
+        }
+      ]
+    },
+    {
+      "entry": "0x40010220",
+      "isa": "thumb",
+      "instruction_size": 4,
+      "instruction_blake3": "1cfbcf27261950280385ff2e7043a518683f55a02909f46977a084b568b5097f",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x40010220",
+          "size": 4,
+          "scatter_entry": null
+        }
+      ],
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010004",
+          "role": "undefined_instruction"
+        }
+      ]
+    },
+    {
+      "entry": "0x40010240",
+      "isa": "arm",
+      "instruction_size": 4,
+      "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x40010240",
+          "size": 4,
+          "scatter_entry": null
+        }
+      ],
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010008",
+          "role": "supervisor_call"
+        },
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x4001000c",
+          "role": "prefetch_abort"
+        }
+      ]
+    },
+    {
+      "entry": "0x40010280",
+      "isa": "arm",
+      "instruction_size": 4,
+      "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x40010280",
+          "size": 4,
+          "scatter_entry": null
+        }
+      ],
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010010",
+          "role": "data_abort"
+        },
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010014",
+          "role": "reserved"
+        }
+      ]
+    },
+    {
+      "entry": "0x400102a0",
+      "isa": "arm",
+      "instruction_size": 4,
+      "instruction_blake3": "bb05c128192d9feb3efd889a7572f5283753e943d3dfb9da55d02f2fe9e6dee2",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x400102a0",
+          "size": 4,
+          "scatter_entry": null
+        }
+      ],
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010018",
+          "role": "irq"
+        }
+      ]
+    },
+    {
+      "entry": "0x400102c0",
+      "isa": "thumb",
+      "instruction_size": 2,
+      "instruction_blake3": "8a09f486717eda865dd286162039792980cf32f77517e0c4fb472529f72e5e8c",
+      "storage": [
+        {
+          "kind": "raw",
+          "address": "0x400102c0",
+          "size": 2,
+          "scatter_entry": null
+        }
+      ],
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x4001001c",
+          "role": "fiq"
+        }
+      ]
+    }
+  ],
+  "applications": [
+    {
+      "entry": "0x40010200",
+      "isa": "arm",
+      "desired_primary": "Reset",
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010000",
+          "role": "reset"
+        }
+      ],
+      "role_labels": [
+        "exception_reset_40010000"
+      ]
+    },
+    {
+      "entry": "0x40010220",
+      "isa": "thumb",
+      "desired_primary": "UndefinedInstruction",
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010004",
+          "role": "undefined_instruction"
+        }
+      ],
+      "role_labels": [
+        "exception_undefined_instruction_40010000"
+      ]
+    },
+    {
+      "entry": "0x40010240",
+      "isa": "arm",
+      "desired_primary": null,
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010008",
+          "role": "supervisor_call"
+        },
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x4001000c",
+          "role": "prefetch_abort"
+        }
+      ],
+      "role_labels": [
+        "exception_supervisor_call_40010000",
+        "exception_prefetch_abort_40010000"
+      ]
+    },
+    {
+      "entry": "0x40010280",
+      "isa": "arm",
+      "desired_primary": null,
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010010",
+          "role": "data_abort"
+        },
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010014",
+          "role": "reserved"
+        }
+      ],
+      "role_labels": [
+        "exception_data_abort_40010000",
+        "exception_reserved_40010000"
+      ]
+    },
+    {
+      "entry": "0x400102a0",
+      "isa": "arm",
+      "desired_primary": "IRQ",
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x40010018",
+          "role": "irq"
+        }
+      ],
+      "role_labels": [
+        "exception_irq_40010000"
+      ]
+    },
+    {
+      "entry": "0x400102c0",
+      "isa": "thumb",
+      "desired_primary": "FIQ",
+      "claims": [
+        {
+          "table_kind": "initial",
+          "table_address": "0x40010000",
+          "slot_address": "0x4001001c",
+          "role": "fiq"
+        }
+      ],
+      "role_labels": [
+        "exception_fiq_40010000"
+      ]
+    }
+  ]
+}

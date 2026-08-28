@@ -1181,8 +1181,20 @@ final class PalTasksSupport {
     }
 
     private static byte[] utf8NoSurrogates(String value) {
+        return utf8NoSurrogates(value, "string");
+    }
+
+    private static byte[] utf8NoSurrogates(String value, String what) {
+        if (value == null) {
+            fail(what + " is missing");
+        }
+        for (int index = 0; index < value.length(); index++) {
+            if (Character.isSurrogate(value.charAt(index))) {
+                fail(what + " contains a surrogate code unit");
+            }
+        }
         try {
-            return PmeScriptSupport.boundedUtf8(value, Integer.MAX_VALUE, "string");
+            return PmeScriptSupport.boundedUtf8(value, Integer.MAX_VALUE, what);
         }
         catch (PmeScriptSupport.SupportError error) {
             fail(error.getMessage());
@@ -3123,7 +3135,7 @@ final class PalTasksSupport {
                 fail(what + " contains a NUL byte");
             }
             try {
-                PmeScriptSupport.boundedUtf8(value, Integer.MAX_VALUE, what);
+                utf8NoSurrogates(value, what);
             }
             catch (PmeScriptSupport.SupportError error) {
                 fail(error.getMessage());

@@ -1,11 +1,11 @@
 // ApplyExceptionRoots.java - strict pass-1 architectural exception-root
 // seeding. The complete manifest and current program are classified before
-// one explicit transaction. Any failure runs the reverse journal and aborts
-// the transaction; no partial prefix is authoritative.
+// the script-owned transaction. Any failure runs the reverse journal and
+// aborts that transaction; no partial prefix is authoritative.
 //@category PixelModem
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
-import ghidra.app.script.GhidraScript;
+import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
@@ -26,7 +26,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-public class ApplyExceptionRoots extends GhidraScript {
+public class ApplyExceptionRoots extends HeadlessScript {
     @FunctionalInterface
     private interface Undo {
         void run() throws Exception;
@@ -40,6 +40,18 @@ public class ApplyExceptionRoots extends GhidraScript {
         int namesReapplied;
         int namesPreserved;
         int namesNotRequested;
+    }
+
+    private static final class ContextRun {
+        final Address start;
+        Address end;
+        final RegisterValue value;
+
+        ContextRun(Address start, Address end, RegisterValue value) {
+            this.start = start;
+            this.end = end;
+            this.value = value;
+        }
     }
 
     private final List<Undo> undo = new ArrayList<Undo>();
@@ -58,39 +70,38 @@ public class ApplyExceptionRoots extends GhidraScript {
         String scatter = args[3];
         String expectedIdentity = args[4];
 
-        String summary;
-        try (ExceptionRootsSupport.Validated validated = ExceptionRootsSupport.preflight(
-                currentProgram, monitor, kitRoot, image, manifest, scatter,
-                expectedIdentity)) {
+        ExceptionRootsSupport.Validated validated = null;
+        boolean transactionEnded = false;
+        try {
+            validated = ExceptionRootsSupport.preflight(currentProgram, monitor, kitRoot, image,
+                    manifest, scatter, expectedIdentity);
             Counts counts = new Counts();
-            int transaction = currentProgram.startTransaction("Apply exception roots");
-            boolean commit = false;
-            Throwable failure = null;
-            try {
-                applyAll(validated, counts);
-                validated.verifyRetainedFiles();
-                ExceptionRootsSupport.AppliedState state =
-                        ExceptionRootsSupport.validateApplied(
-                                currentProgram, validated.manifest, validated.identity);
-                requireConservation(validated, counts, state);
-                validated.close();
-                commit = true;
-            }
-            catch (Throwable error) {
-                failure = error;
-                rollback(error);
-            }
-            finally {
-                currentProgram.endTransaction(transaction, commit);
-            }
-            if (failure != null) {
-                if (failure instanceof Exception) throw (Exception) failure;
-                if (failure instanceof Error) throw (Error) failure;
-                throw new Exception(failure);
-            }
-            summary = summary(validated, counts);
+            applyAll(validated, counts);
+            ExceptionRootsSupport.AppliedState state = ExceptionRootsSupport.validateApplied(
+                    currentProgram, validated.manifest, validated.identity);
+            validated.verifyRetainedFiles();
+            requireConservation(validated, counts, state);
+            String summary = summary(validated, counts);
+
+            end(true);
+            transactionEnded = true;
+            validated.close();
+            validated = null;
+            System.out.println("ApplyExceptionRoots: " + summary);
         }
-        System.out.println("ApplyExceptionRoots: " + summary);
+        catch (Throwable error) {
+            if (!transactionEnded) {
+                rollback(error);
+                try {
+                    end(false);
+                }
+                catch (Throwable abortFailure) {
+                    suppress(error, abortFailure);
+                }
+            }
+            close(validated, error);
+            rethrow(error);
+        }
     }
 
     private void applyAll(ExceptionRootsSupport.Validated validated, Counts counts)
@@ -116,12 +127,12 @@ public class ApplyExceptionRoots extends GhidraScript {
                 DisassembleCommand disassemble =
                         new DisassembleCommand(entry, instructionRange, false);
                 disassemble.enableCodeAnalysis(false);
+                journal(() -> clear(instructionRange));
                 if (!disassemble.applyTo(currentProgram, monitor)) {
                     fail("exception-root disassembly failed at " + entry + ": "
                             + disassemble.getStatusMsg());
                 }
                 AddressSetView disassembled = disassemble.getDisassembledAddressSet();
-                if (!disassembled.isEmpty()) journal(() -> clear(disassembled));
                 if (!disassembled.contains(instructionRange)
                         || disassembled.getNumAddresses() != instructionRange.getNumAddresses()) {
                     fail("exception-root disassembly did not define exactly one instruction at "
@@ -130,6 +141,13 @@ public class ApplyExceptionRoots extends GhidraScript {
             }
             CreateFunctionCmd create = new CreateFunctionCmd(
                     null, entry, instructionRange, SourceType.ANALYSIS);
+            journal(() -> {
+                Function partial = currentProgram.getFunctionManager().getFunctionAt(entry);
+                if (partial != null
+                        && !currentProgram.getFunctionManager().removeFunction(entry)) {
+                    fail("exception-root partial function could not be rolled back at " + entry);
+                }
+            });
             if (!create.applyTo(currentProgram, monitor)) {
                 fail("exception-root function creation failed at " + entry + ": "
                         + create.getStatusMsg());
@@ -139,11 +157,6 @@ public class ApplyExceptionRoots extends GhidraScript {
                 fail("exception-root function was not created with the exact entry body at "
                         + entry);
             }
-            journal(() -> {
-                if (!currentProgram.getFunctionManager().removeFunction(entry)) {
-                    fail("exception-root function could not be rolled back at " + entry);
-                }
-            });
             created = true;
         }
         if (function == null) fail("exception-root function is missing at " + entry);
@@ -173,6 +186,7 @@ public class ApplyExceptionRoots extends GhidraScript {
                 String priorName = prior.getName();
                 SourceType priorSource = prior.getSource();
                 Function applied = function;
+                journal(() -> applied.setName(priorName, priorSource));
                 try {
                     function.setName(plan.application.desiredPrimary, SourceType.ANALYSIS);
                 }
@@ -180,7 +194,6 @@ public class ApplyExceptionRoots extends GhidraScript {
                         | ghidra.util.exception.InvalidInputException error) {
                     fail("exception primary could not be applied at " + entry);
                 }
-                journal(() -> applied.setName(priorName, priorSource));
                 counts.namesApplied++;
             }
             else if ("preserved".equals(primaryDisposition)) {
@@ -200,21 +213,23 @@ public class ApplyExceptionRoots extends GhidraScript {
             deferredDefaultName = function.getName();
             Function guarded = function;
             String priorName = deferredDefaultName;
+            journal(() -> guarded.setName(priorName, SourceType.DEFAULT));
             function.setName(ExceptionRootsSupport.primaryGuardName(
                     plan.application.entry), SourceType.ANALYSIS);
-            journal(() -> guarded.setName(priorName, SourceType.DEFAULT));
         }
         ensureNamespace();
         if (plan.prior == null) {
             for (String leaf : plan.application.roleLabels) {
-                Symbol symbol = currentProgram.getSymbolTable().createLabel(
-                        entry, leaf, reservedNamespace, SourceType.ANALYSIS);
-                if (symbol == null) fail("exception role label was not created: " + leaf);
                 journal(() -> {
-                    if (!symbol.delete()) {
+                    Symbol partial = currentProgram.getSymbolTable().getSymbol(
+                            leaf, entry, reservedNamespace);
+                    if (partial != null && !partial.delete()) {
                         fail("exception role label could not be rolled back: " + leaf);
                     }
                 });
+                Symbol symbol = currentProgram.getSymbolTable().createLabel(
+                        entry, leaf, reservedNamespace, SourceType.ANALYSIS);
+                if (symbol == null) fail("exception role label was not created: " + leaf);
             }
         }
         if (deferredDefaultName != null) {
@@ -229,16 +244,11 @@ public class ApplyExceptionRoots extends GhidraScript {
         List<Long> labelIds = new ArrayList<Long>();
         for (ExceptionRootsSupport.LabelEntry label : labels) labelIds.add(label.id);
         Symbol primary = function.getSymbol();
-        Long primaryId = null;
-        String primarySource = null;
-        String primaryHash = null;
-        if (!"not_requested".equals(primaryDisposition)) {
-            primaryId = primary.getID();
-            primarySource = PmeScriptSupport.primarySource(primary.getSource());
-            primaryHash = PmeScriptSupport.blake3Hex(PmeScriptSupport.boundedUtf8(
-                    primary.getName(), ExceptionRootsSupport.MAX_SYMBOL_UTF8_BYTES,
-                    "exception primary"));
-        }
+        Long primaryId = primary.getID();
+        String primarySource = PmeScriptSupport.primarySource(primary.getSource());
+        String primaryHash = PmeScriptSupport.blake3Hex(PmeScriptSupport.boundedUtf8(
+                primary.getName(), ExceptionRootsSupport.MAX_SYMBOL_UTF8_BYTES,
+                "exception primary"));
         ExceptionRootsSupport.RegistryEntry ownership =
                 new ExceptionRootsSupport.RegistryEntry(
                         validated.manifest.manifestBlake3, plan.application.entry,
@@ -249,8 +259,8 @@ public class ApplyExceptionRoots extends GhidraScript {
         String priorValue = registry.getString(entry);
         String value = ExceptionRootsSupport.registryValue(ownership);
         if (plan.prior == null) {
-            registry.add(entry, value);
             journal(() -> registry.remove(entry));
+            registry.add(entry, value);
         }
         else if (!value.equals(priorValue)) {
             fail("exception-root replay would change ownership at " + entry);
@@ -262,14 +272,41 @@ public class ApplyExceptionRoots extends GhidraScript {
         ProgramContext context = currentProgram.getProgramContext();
         Address end = toAddr(Math.addExact(root.entry, root.instructionSize) - 1);
         BigInteger wanted = "thumb".equals(root.isa) ? BigInteger.ONE : BigInteger.ZERO;
-        RegisterValue prior = context.getRegisterValue(validated.tMode, entry);
-        context.setValue(validated.tMode, entry, end, wanted);
-        journal(() -> {
-            context.remove(entry, end, validated.tMode);
-            if (prior != null && prior.hasValue()) {
-                context.setValue(validated.tMode, entry, end, prior.getUnsignedValue());
+        List<ContextRun> prior = snapshotContext(context, validated.tMode, entry, end);
+        journal(() -> restoreContext(context, validated.tMode, entry, end, prior));
+        context.setRegisterValue(entry, end, new RegisterValue(validated.tMode, wanted));
+    }
+
+    private List<ContextRun> snapshotContext(ProgramContext context,
+            ghidra.program.model.lang.Register register, Address start, Address end) {
+        List<ContextRun> runs = new ArrayList<ContextRun>();
+        Address cursor = start;
+        while (true) {
+            RegisterValue value = context.getNonDefaultValue(register, cursor);
+            if (value != null) {
+                ContextRun prior = runs.isEmpty() ? null : runs.get(runs.size() - 1);
+                if (prior != null && prior.end.next().equals(cursor)
+                        && prior.value.equals(value)) {
+                    prior.end = cursor;
+                }
+                else {
+                    runs.add(new ContextRun(cursor, cursor, value));
+                }
             }
-        });
+            if (cursor.equals(end)) break;
+            cursor = cursor.next();
+            if (cursor == null) fail("exception-root context snapshot wrapped the address space");
+        }
+        return Collections.unmodifiableList(runs);
+    }
+
+    private void restoreContext(ProgramContext context,
+            ghidra.program.model.lang.Register register, Address start, Address end,
+            List<ContextRun> runs) throws Exception {
+        context.remove(start, end, register);
+        for (ContextRun run : runs) {
+            context.setRegisterValue(run.start, run.end, run.value);
+        }
     }
 
     private StringPropertyMap findOrCreateRegistry() throws Exception {
@@ -277,13 +314,14 @@ public class ApplyExceptionRoots extends GhidraScript {
         if (existing != null) return existing;
         PropertyMapManager manager = currentProgram.getUsrPropertyManager();
         try {
-            StringPropertyMap created =
-                    manager.createStringPropertyMap(ExceptionRootsSupport.OWNERSHIP_MAP);
             journal(() -> {
-                if (!manager.removePropertyMap(ExceptionRootsSupport.OWNERSHIP_MAP)) {
+                if (ExceptionRootsSupport.currentRegistry(currentProgram) != null
+                        && !manager.removePropertyMap(ExceptionRootsSupport.OWNERSHIP_MAP)) {
                     fail("exception-root ownership registry could not be rolled back");
                 }
             });
+            StringPropertyMap created =
+                    manager.createStringPropertyMap(ExceptionRootsSupport.OWNERSHIP_MAP);
             return created;
         }
         catch (Exception error) {
@@ -300,6 +338,15 @@ public class ApplyExceptionRoots extends GhidraScript {
             return;
         }
         SymbolTable symbols = currentProgram.getSymbolTable();
+        journal(() -> {
+            Namespace partial = ExceptionRootsSupport.currentNamespace(currentProgram);
+            if (partial != null) {
+                Symbol symbol = partial.getSymbol();
+                if (symbol != null && !symbol.delete()) {
+                    fail("exception-root namespace could not be rolled back");
+                }
+            }
+        });
         try {
             reservedNamespace = symbols.createNameSpace(
                     currentProgram.getGlobalNamespace(),
@@ -309,13 +356,6 @@ public class ApplyExceptionRoots extends GhidraScript {
                 | ghidra.util.exception.InvalidInputException error) {
             fail("exception-root reserved namespace could not be created");
         }
-        Namespace created = reservedNamespace;
-        journal(() -> {
-            Symbol symbol = created.getSymbol();
-            if (symbol != null && !symbol.delete()) {
-                fail("exception-root namespace could not be rolled back");
-            }
-        });
     }
 
     private void clear(AddressSetView addresses) throws Exception {
@@ -335,9 +375,35 @@ public class ApplyExceptionRoots extends GhidraScript {
                 undo.get(index).run();
             }
             catch (Throwable rollbackFailure) {
-                primary.addSuppressed(rollbackFailure);
+                suppress(primary, rollbackFailure);
             }
         }
+    }
+
+    private void close(AutoCloseable closeable, Throwable primary) {
+        if (closeable == null) return;
+        try {
+            closeable.close();
+        }
+        catch (Throwable closeFailure) {
+            suppress(primary, closeFailure);
+        }
+    }
+
+    private void suppress(Throwable primary, Throwable cleanupFailure) {
+        if (primary == cleanupFailure) return;
+        try {
+            primary.addSuppressed(cleanupFailure);
+        }
+        catch (Throwable ignored) {
+            // Preserve the original terminal failure.
+        }
+    }
+
+    private void rethrow(Throwable failure) throws Exception {
+        if (failure instanceof Exception) throw (Exception) failure;
+        if (failure instanceof Error) throw (Error) failure;
+        throw new Exception(failure);
     }
 
     private void requireConservation(ExceptionRootsSupport.Validated validated,

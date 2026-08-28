@@ -438,29 +438,29 @@ final class ExceptionRootsSupport {
         }
 
         @Override
-        public void close() throws IOException {
+        public void close() throws Exception {
             if (closed) return;
             closed = true;
-            IOException failure = null;
+            Throwable failure = null;
             for (int index = entries.size() - 1; index >= 0; index--) {
                 PmeScriptSupport.TrustedFile payload = entries.get(index).payload;
                 if (payload == null) continue;
                 try {
                     payload.close();
                 }
-                catch (IOException error) {
+                catch (Throwable error) {
                     if (failure == null) failure = error;
-                    else failure.addSuppressed(error);
+                    else suppress(failure, error);
                 }
             }
             try {
                 manifestFile.close();
             }
-            catch (IOException error) {
+            catch (Throwable error) {
                 if (failure == null) failure = error;
-                else failure.addSuppressed(error);
+                else suppress(failure, error);
             }
-            if (failure != null) throw failure;
+            if (failure != null) rethrow(failure);
         }
     }
 
@@ -501,33 +501,33 @@ final class ExceptionRootsSupport {
         }
 
         @Override
-        public void close() throws IOException {
+        public void close() throws Exception {
             if (closed) return;
             closed = true;
-            IOException failure = null;
+            Throwable failure = null;
             if (scatterMap != null) {
                 try {
                     scatterMap.close();
                 }
-                catch (IOException error) {
+                catch (Throwable error) {
                     failure = error;
                 }
             }
             try {
                 rawFile.close();
             }
-            catch (IOException error) {
+            catch (Throwable error) {
                 if (failure == null) failure = error;
-                else failure.addSuppressed(error);
+                else suppress(failure, error);
             }
             try {
                 manifestFile.close();
             }
-            catch (IOException error) {
+            catch (Throwable error) {
                 if (failure == null) failure = error;
-                else failure.addSuppressed(error);
+                else suppress(failure, error);
             }
-            if (failure != null) throw failure;
+            if (failure != null) rethrow(failure);
         }
     }
 
@@ -557,13 +557,14 @@ final class ExceptionRootsSupport {
                     kitRoot, manifestArgument, "exception-root manifest");
             byte[] manifestBytes = manifestFile.readAll(
                     MAX_MANIFEST_BYTES, "exception-root manifest");
-            if (manifestBytes.length < 2 || manifestBytes[0] != '{'
-                    || manifestBytes[manifestBytes.length - 1] != '}') {
-                fail("exception-root manifest does not have canonical JSON framing");
-            }
-            String manifestHash = PmeScriptSupport.blake3Hex(manifestBytes);
             String text = PmeScriptSupport.decodeUtf8(manifestBytes, "exception-root manifest");
             Manifest manifest = parseManifest(text);
+            byte[] canonical = PmeScriptSupport.canonicalJsonBytes(
+                    text, "exception-root manifest");
+            if (!Arrays.equals(canonical, manifestBytes)) {
+                fail("exception-root manifest bytes are not in canonical field order or JSON spelling");
+            }
+            String manifestHash = PmeScriptSupport.blake3Hex(manifestBytes);
             manifest.manifestBlake3 = manifestHash;
             validateManifestSemantics(manifest);
 
@@ -611,11 +612,12 @@ final class ExceptionRootsSupport {
             return new Validated(manifest, identity, tMode, plans,
                     manifestFile, rawFile, scatterMap);
         }
-        catch (Exception error) {
+        catch (Throwable error) {
             closeQuietly(scatterMap, error);
             closeQuietly(rawFile, error);
             closeQuietly(manifestFile, error);
-            throw error;
+            rethrow(error);
+            return null;
         }
     }
 
@@ -921,12 +923,13 @@ final class ExceptionRootsSupport {
             }
             return new ScatterMap(mapFile, Collections.unmodifiableList(entries));
         }
-        catch (Exception error) {
+        catch (Throwable error) {
             for (int index = openedPayloads.size() - 1; index >= 0; index--) {
                 closeQuietly(openedPayloads.get(index), error);
             }
             closeQuietly(mapFile, error);
-            throw error;
+            rethrow(error);
+            return null;
         }
     }
 
@@ -1440,6 +1443,7 @@ final class ExceptionRootsSupport {
         }
         List<Root> expectedRoots = new ArrayList<Root>(derived.values());
         expectedRoots.sort(rootComparator());
+        validateRequestedInstructionSpans(expectedRoots);
         if (expectedRoots.size() != manifest.roots.size()) {
             fail("exception roots do not equal the unique table targets");
         }
@@ -1820,24 +1824,47 @@ final class ExceptionRootsSupport {
         }
     }
 
+    static long checkedPcRelative(long address, long displacement, String what) {
+        if (address < 0 || address > PmeScriptSupport.UINT32_MAX - 8) {
+            fail(what + " architectural PC leaves the u32 address domain");
+        }
+        long visiblePc = address + 8;
+        if ((displacement >= 0 && displacement > PmeScriptSupport.UINT32_MAX - visiblePc)
+                || (displacement < 0 && displacement < -visiblePc)) {
+            fail(what + " displacement leaves the u32 address domain");
+        }
+        return visiblePc + displacement;
+    }
+
+    static void validateRequestedInstructionSpans(List<Root> roots) {
+        List<Root> ordered = new ArrayList<Root>(roots);
+        ordered.sort(rootComparator());
+        long priorEnd = -1;
+        for (Root root : ordered) {
+            long end = root.entry + root.instructionSize;
+            if (end <= root.entry || end > PmeScriptSupport.UINT32_END) {
+                fail("exception-root requested instruction span leaves the u32 address domain");
+            }
+            if (root.entry < priorEnd) {
+                fail("exception-root requested instruction spans intersect at "
+                        + canonicalAddress(root.entry));
+            }
+            priorEnd = end;
+        }
+    }
+
     private static DecodedSlot decodeSlot(long address, long word) {
         if ((word & 0xff00_0000L) == 0xea00_0000L) {
             long immediate = word & 0x00ff_ffffL;
             if ((immediate & 0x0080_0000L) != 0) immediate |= ~0x00ff_ffffL;
-            long target = address + 8 + (immediate << 2);
-            if (target < 0 || target > PmeScriptSupport.UINT32_MAX) {
-                fail("direct vector target leaves the u32 address domain");
-            }
+            long target = checkedPcRelative(address, immediate << 2, "direct vector target");
             return new DecodedSlot("direct_branch", target, "arm", null);
         }
         if ((word & 0xffff_f000L) == 0xe59f_f000L
                 || (word & 0xffff_f000L) == 0xe51f_f000L) {
             long offset = word & 0xfffL;
-            long literal = (word & 0x0080_0000L) != 0
-                    ? address + 8 + offset : address + 8 - offset;
-            if (literal < 0 || literal > PmeScriptSupport.UINT32_MAX) {
-                fail("vector literal leaves the u32 address domain");
-            }
+            long displacement = (word & 0x0080_0000L) != 0 ? offset : -offset;
+            long literal = checkedPcRelative(address, displacement, "vector literal");
             // Runtime evidence validation independently reads and hashes the
             // literal; this decoder only returns its address. The target is
             // recovered by the caller from the authenticated raw bytes below.
@@ -1887,7 +1914,7 @@ final class ExceptionRootsSupport {
                 if (stored == null) fail("exception-root registry is missing " + entry);
                 prior = parseRegistry(stored);
                 validateOwnedState(program, namespace, application, root, existing, prior,
-                        manifest.manifestBlake3);
+                        manifest.manifestBlake3, tMode, "owned");
                 freshDisposition = prior.primaryDisposition;
             }
             else {
@@ -1968,13 +1995,14 @@ final class ExceptionRootsSupport {
     private static String classifyFreshPrimary(Program program, Application application,
             Function existing) {
         if (application.desiredPrimary == null) return "not_requested";
-        if (existing != null && existing.getSymbol().getSource() != SourceType.DEFAULT) {
+        Address entry = PmeScriptSupport.programAddress(program, application.entry);
+        Symbol primary = program.getSymbolTable().getPrimarySymbol(entry);
+        if (primary != null && primary.getSource() != SourceType.DEFAULT) {
             return "preserved";
         }
         // Ghidra permits duplicate global leaves at different addresses (the
         // binary loader itself may import Reset at zero), so only a meaningful
         // same-address symbol changes this root's primary disposition.
-        Address entry = PmeScriptSupport.programAddress(program, application.entry);
         Symbol sameName = program.getSymbolTable().getSymbol(application.desiredPrimary,
                 entry, program.getGlobalNamespace());
         return sameName != null && sameName.getSource() != SourceType.DEFAULT
@@ -1983,7 +2011,7 @@ final class ExceptionRootsSupport {
 
     private static void validateOwnedState(Program program, Namespace namespace,
             Application application, Root root, Function function, RegistryEntry prior,
-            String expectedManifestBlake3) {
+            String expectedManifestBlake3, Register tMode, String stage) {
         Address entry = PmeScriptSupport.programAddress(program, application.entry);
         if (!prior.manifestBlake3.equals(expectedManifestBlake3)
                 || prior.entry != application.entry || !prior.isa.equals(application.isa)
@@ -1994,6 +2022,7 @@ final class ExceptionRootsSupport {
                 || !function.getEntryPoint().equals(entry)) {
             fail("exception-root registry function binding is stale at " + entry);
         }
+        requireAppliedRoot(program, function, root, tMode, stage);
         if (!"created".equals(prior.functionDisposition)
                 && !"foreign".equals(prior.functionDisposition)) {
             fail("exception-root function disposition is invalid at " + entry);
@@ -2046,9 +2075,11 @@ final class ExceptionRootsSupport {
             }
         }
         else if ("not_requested".equals(prior.primaryDisposition)) {
-            if (application.desiredPrimary != null || prior.primaryId != null
-                    || prior.primarySource != null || prior.primaryNameBlake3 != null) {
-                fail("not-requested exception primary binding is malformed at " + entry);
+            if (application.desiredPrimary != null || prior.primaryId == null
+                    || prior.primaryId.longValue() != primary.getID()
+                    || !source.equals(prior.primarySource)
+                    || !digest.equals(prior.primaryNameBlake3)) {
+                fail("not-requested exception primary is stale at " + entry);
             }
         }
         else {
@@ -2066,6 +2097,8 @@ final class ExceptionRootsSupport {
         }
         Map<String, Root> roots = new HashMap<String, Root>();
         for (Root root : manifest.roots) roots.put(rootKey(root.entry, root.isa), root);
+        Register tMode = program.getLanguage().getRegister("TMode");
+        if (tMode == null) fail("the current language has no TMode register");
         int shared = 0;
         for (Application application : manifest.applications) {
             Root root = roots.get(rootKey(application.entry, application.isa));
@@ -2076,7 +2109,7 @@ final class ExceptionRootsSupport {
                 fail("postflight registry does not bind the manifest");
             }
             validateOwnedState(program, namespace, application, root, function, prior,
-                    manifest.manifestBlake3);
+                    manifest.manifestBlake3, tMode, "postflight");
             if (isSharedEntry(application)) shared++;
         }
         validateNamespaceInventory(program, namespace, manifest);
@@ -2165,6 +2198,9 @@ final class ExceptionRootsSupport {
             }
         }
         String labelsHash = hash(fields[13], "registry labels hash");
+        if (primaryId == null || source == null || primaryHash == null) {
+            fail("exception-root registry does not bind a resulting primary identity");
+        }
         return new RegistryEntry(manifest, entry, isa, instruction, functionId,
                 functionDisposition, primaryDisposition, primaryId, source, primaryHash,
                 Collections.unmodifiableList(labelIds), labelsHash);
@@ -2227,24 +2263,53 @@ final class ExceptionRootsSupport {
     }
 
     static void requireInstruction(Instruction instruction, Root root, Register tMode) {
+        requireInstruction(instruction, root, tMode, "existing");
+    }
+
+    private static void requireAppliedRoot(Program program, Function function, Root root,
+            Register tMode, String stage) {
+        Address entry = PmeScriptSupport.programAddress(program, root.entry);
+        Instruction instruction = program.getListing().getInstructionAt(entry);
+        if (instruction == null) {
+            fail(stage + " exception-root instruction is missing");
+        }
+        requireInstruction(instruction, root, tMode, stage);
+        BigInteger expected = "thumb".equals(root.isa) ? BigInteger.ONE : BigInteger.ZERO;
+        for (long offset = 0; offset < root.instructionSize; offset++) {
+            Address address = PmeScriptSupport.programAddress(program, root.entry + offset);
+            RegisterValue value = program.getProgramContext().getRegisterValue(tMode, address);
+            if (value == null || !value.hasValue()
+                    || !expected.equals(value.getUnsignedValue())) {
+                fail(stage + " exception-root instruction ISA is stale");
+            }
+        }
+        Address end = PmeScriptSupport.programAddress(program,
+                root.entry + root.instructionSize - 1L);
+        if (!function.getBody().contains(entry, end)) {
+            fail(stage + " exception-root function body does not contain its instruction");
+        }
+    }
+
+    private static void requireInstruction(Instruction instruction, Root root, Register tMode,
+            String stage) {
         if (instruction.getLength() != root.instructionSize
                 || instruction.isLengthOverridden()) {
-            fail("existing exception-root instruction length is stale");
+            fail(stage + " exception-root instruction length is stale");
         }
         RegisterValue value = instruction.getRegisterValue(tMode);
         BigInteger expected = "thumb".equals(root.isa) ? BigInteger.ONE : BigInteger.ZERO;
         if (value == null || !value.hasValue()
                 || !expected.equals(value.getUnsignedValue())) {
-            fail("existing exception-root instruction ISA is stale");
+            fail(stage + " exception-root instruction ISA is stale");
         }
         try {
             if (!PmeScriptSupport.blake3Hex(instruction.getBytes())
                     .equals(root.instructionBlake3)) {
-                fail("existing exception-root instruction bytes are stale");
+                fail(stage + " exception-root instruction bytes are stale");
             }
         }
         catch (MemoryAccessException error) {
-            throw new RootError("existing exception-root instruction is unreadable", error);
+            throw new RootError(stage + " exception-root instruction is unreadable", error);
         }
     }
 
@@ -2440,7 +2505,9 @@ final class ExceptionRootsSupport {
     }
 
     private static long unsigned(String value, long maximum, String what) {
-        if (!DECIMAL.matcher(value).matches()) fail(what + " is not a canonical integer");
+        if (!DECIMAL.matcher(value).matches()) {
+            fail(what + " is not a canonical unsigned decimal");
+        }
         try {
             long parsed = Long.parseLong(value);
             if (parsed < 0 || parsed > maximum) fail(what + " exceeds its bound");
@@ -2522,9 +2589,25 @@ final class ExceptionRootsSupport {
         try {
             closeable.close();
         }
-        catch (Exception closeFailure) {
-            primary.addSuppressed(closeFailure);
+        catch (Throwable closeFailure) {
+            suppress(primary, closeFailure);
         }
+    }
+
+    private static void suppress(Throwable primary, Throwable cleanupFailure) {
+        if (primary == cleanupFailure) return;
+        try {
+            primary.addSuppressed(cleanupFailure);
+        }
+        catch (Throwable ignored) {
+            // Preserve the original terminal failure.
+        }
+    }
+
+    private static void rethrow(Throwable failure) throws Exception {
+        if (failure instanceof Exception) throw (Exception) failure;
+        if (failure instanceof Error) throw (Error) failure;
+        throw new Exception(failure);
     }
 
     private static void fail(String message) {

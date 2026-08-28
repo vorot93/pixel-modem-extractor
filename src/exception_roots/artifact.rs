@@ -36,6 +36,14 @@ mod tests {
         base | u32::try_from(displacement.unsigned_abs()).unwrap()
     }
 
+    fn a32_branch(slot: u32, target: u32) -> u32 {
+        let displacement = i64::from(target) - (i64::from(slot) + 8);
+        assert_eq!(displacement % 4, 0);
+        let words = displacement / 4;
+        assert!((-0x80_0000..=0x7f_ffff).contains(&words));
+        0xea00_0000 | u32::try_from(words & 0x00ff_ffff).unwrap()
+    }
+
     fn a32_mov_half(register: u8, immediate: u16, high: bool) -> u32 {
         let opcode = if high { 0xe340_0000 } else { 0xe300_0000 };
         opcode
@@ -72,6 +80,166 @@ mod tests {
         );
         write_u32(&mut raw, RESET_ENTRY + 8, 0xee0c_0f10);
         write_u32(&mut raw, RESET_ENTRY + 12, 0xe12f_ff1e);
+        raw
+    }
+
+    fn ghidra_raw_fixture() -> Vec<u8> {
+        const IMAGE_SIZE: usize = 0x1000;
+        const TARGETS: [u32; 8] = [
+            BASE + 0x200,
+            BASE + 0x220,
+            BASE + 0x240,
+            BASE + 0x260,
+            BASE + 0x280,
+            BASE + 0x280,
+            BASE + 0x2a0,
+            BASE + 0x2c0,
+        ];
+        const THUMB: [bool; 8] = [false, true, false, true, false, false, false, true];
+
+        let mut raw = vec![0; IMAGE_SIZE];
+        for (index, target) in TARGETS.into_iter().enumerate() {
+            let instruction: &[u8] = if target == BASE + 0x220 {
+                &[0x41, 0xf2, 0x34, 0x20]
+            } else if THUMB[index] {
+                &[0x70, 0x47]
+            } else {
+                &[0x1e, 0xff, 0x2f, 0xe1]
+            };
+            let offset = usize::try_from(target - BASE).unwrap();
+            raw[offset..offset + instruction.len()].copy_from_slice(instruction);
+
+            let slot = BASE + u32::try_from(index).unwrap() * 4;
+            if index == 0 {
+                write_u32(&mut raw, slot, a32_branch(slot, target));
+            } else {
+                let literal = BASE + 0x40 + u32::try_from(index).unwrap() * 4;
+                write_u32(&mut raw, slot, a32_ldr_pc(slot, literal));
+                write_u32(
+                    &mut raw,
+                    literal,
+                    if THUMB[index] { target | 1 } else { target },
+                );
+            }
+        }
+        raw
+    }
+
+    fn ghidra_nonlexical_shared_fixture() -> Vec<u8> {
+        let mut raw = ghidra_raw_fixture();
+        write_u32(&mut raw, BASE + 0x4c, BASE + 0x240);
+        raw
+    }
+
+    fn ghidra_relocated_same_targets_fixture() -> Vec<u8> {
+        let mut raw = ghidra_raw_fixture();
+        let relocated = BASE + 0x100;
+        let literals = BASE + 0x140;
+        write_u32(
+            &mut raw,
+            BASE + 0x200,
+            a32_mov_half(0, relocated as u16, false),
+        );
+        write_u32(
+            &mut raw,
+            BASE + 0x204,
+            a32_mov_half(0, (relocated >> 16) as u16, true),
+        );
+        write_u32(&mut raw, BASE + 0x208, 0xee0c_0f10);
+        write_u32(&mut raw, BASE + 0x20c, 0xe12f_ff1e);
+        let targets = [
+            (BASE + 0x200, false),
+            (BASE + 0x220, true),
+            (BASE + 0x240, false),
+            (BASE + 0x260, true),
+            (BASE + 0x280, false),
+            (BASE + 0x280, false),
+            (BASE + 0x2a0, false),
+            (BASE + 0x2c0, true),
+        ];
+        for (index, (target, thumb)) in targets.into_iter().enumerate() {
+            let slot = relocated + u32::try_from(index).unwrap() * 4;
+            let literal = literals + u32::try_from(index).unwrap() * 4;
+            write_u32(&mut raw, slot, a32_ldr_pc(slot, literal));
+            write_u32(&mut raw, literal, if thumb { target | 1 } else { target });
+        }
+        raw
+    }
+
+    fn write_scatter_descriptor(
+        raw: &mut [u8],
+        index: u32,
+        source: u32,
+        destination: u32,
+        size: u32,
+        handler: u32,
+    ) {
+        let address = BASE + 0x400 + index * 16;
+        for (offset, value) in [source, destination, size, handler].into_iter().enumerate() {
+            write_u32(raw, address + u32::try_from(offset).unwrap() * 4, value);
+        }
+    }
+
+    fn ghidra_scatter_fixture() -> Vec<u8> {
+        const COPY_DESTINATION: u32 = BASE + 0x1000;
+        const DECOMPRESS_DESTINATION: u32 = COPY_DESTINATION + 0x10;
+        const ZERO_DESTINATION: u32 = COPY_DESTINATION + 0x20;
+        const NULL_HANDLER: u32 = BASE + 0x600;
+        const COPY_HANDLER: u32 = BASE + 0x601;
+        const DECOMPRESS_HANDLER: u32 = BASE + 0x604;
+        const ZERO_HANDLER: u32 = BASE + 0x609;
+        const SENTINEL_SOURCE: u32 = BASE + 0x680;
+        const SELF_COPY_SOURCE: u32 = BASE + 0x700;
+        const DECOMPRESS_SOURCE: u32 = BASE + 0x720;
+        const ZERO_SOURCE: u32 = BASE + 0x730;
+
+        let mut raw = ghidra_raw_fixture();
+        for (offset, instruction) in [0xe28f_0078, 0xe890_0c00, 0xe08a_a000, 0xe08b_b000]
+            .into_iter()
+            .enumerate()
+        {
+            write_u32(
+                &mut raw,
+                BASE + 0x300 + u32::try_from(offset).unwrap() * 4,
+                instruction,
+            );
+        }
+        let literal_pair = BASE + 0x380;
+        let table = BASE + 0x400;
+        write_u32(&mut raw, literal_pair, table.wrapping_sub(literal_pair));
+        write_u32(
+            &mut raw,
+            literal_pair + 4,
+            (table + 7 * 16).wrapping_sub(literal_pair),
+        );
+        raw[0x700..0x704].copy_from_slice(&[0xff; 4]);
+        raw[0x720..0x722].copy_from_slice(&[0x22, 0xaa]);
+        for (index, source, destination, size, handler) in [
+            (0, SENTINEL_SOURCE, 0, 0, NULL_HANDLER),
+            (1, 0, SENTINEL_SOURCE, 0, NULL_HANDLER),
+            (2, SELF_COPY_SOURCE, SELF_COPY_SOURCE, 4, COPY_HANDLER),
+            (3, BASE + 0x2c0, COPY_DESTINATION, 2, COPY_HANDLER),
+            (4, BASE + 0x200, COPY_DESTINATION + 8, 4, COPY_HANDLER),
+            (
+                5,
+                DECOMPRESS_SOURCE,
+                DECOMPRESS_DESTINATION,
+                3,
+                DECOMPRESS_HANDLER,
+            ),
+            (6, ZERO_SOURCE, ZERO_DESTINATION, 5, ZERO_HANDLER),
+        ] {
+            write_scatter_descriptor(
+                raw.as_mut_slice(),
+                index,
+                source,
+                destination,
+                size,
+                handler,
+            );
+        }
+        write_u32(&mut raw, BASE + 0x5c, COPY_DESTINATION | 1);
+        write_u32(&mut raw, BASE, a32_branch(BASE, COPY_DESTINATION + 8));
         raw
     }
 
@@ -219,6 +387,110 @@ mod tests {
         let validated = read(&root.path().join(&map.relative_path), &runtime, context).unwrap();
         assert_eq!(validated.identity, map.identity);
         assert_eq!(validated.plan, plan);
+    }
+
+    #[test]
+    fn committed_ghidra_fixture_matches_production_discovery_and_serialization() {
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots");
+        let update = std::env::var_os("PME_UPDATE_EXCEPTION_ROOT_FIXTURE").is_some();
+        let mut canonical = None;
+        for (name, expected_raw) in [
+            (None, ghidra_raw_fixture()),
+            (
+                Some("nonlexical_shared"),
+                ghidra_nonlexical_shared_fixture(),
+            ),
+            (
+                Some("relocated_same_targets"),
+                ghidra_relocated_same_targets_fixture(),
+            ),
+        ] {
+            let case_dir = name.map_or_else(|| fixture_dir.clone(), |name| fixture_dir.join(name));
+            let runtime = RuntimeImage::from_plan(&expected_raw, BASE, None).unwrap();
+            let plan = discover(&runtime, "00_BOOT", "BOOT").unwrap().unwrap();
+            let context = ExceptionArtifactContext {
+                label: "00_BOOT",
+                toc_name: "BOOT",
+                image_blake3: *blake3::hash(&expected_raw).as_bytes(),
+                scatter_load_map_blake3: None,
+            };
+            let serialized = super::serialize(&plan, &context).unwrap();
+            if update {
+                std::fs::create_dir_all(&case_dir).unwrap();
+                std::fs::write(case_dir.join("synthetic.bin"), &expected_raw).unwrap();
+                std::fs::write(case_dir.join("roots.json"), &serialized).unwrap();
+            }
+            assert_eq!(
+                std::fs::read(case_dir.join("synthetic.bin"))
+                    .expect("committed synthetic exception-root raw fixture"),
+                expected_raw
+            );
+            assert_eq!(
+                std::fs::read(case_dir.join("roots.json"))
+                    .expect("committed canonical exception-root manifest fixture"),
+                serialized
+            );
+            if name.is_none() {
+                canonical = Some((serialized, plan.tables.len(), plan.roots.len()));
+            }
+        }
+
+        let scatter_raw = ghidra_scatter_fixture();
+        let scatter_plan = crate::scatter::discover(&scatter_raw, BASE)
+            .unwrap()
+            .expect("synthetic scatter fixture");
+        let scatter_root = tempfile::tempdir().unwrap();
+        let scatter_map = crate::scatter::materialize(
+            &scatter_plan,
+            &scatter_raw,
+            "00_BOOT",
+            scatter_root.path(),
+        )
+        .unwrap();
+        let scatter_bytes =
+            std::fs::read(scatter_root.path().join(&scatter_map.relative_path)).unwrap();
+        let scatter_blake3 = *blake3::hash(&scatter_bytes).as_bytes();
+        assert_eq!(
+            scatter_map.blake3,
+            blake3::hash(&scatter_bytes).to_hex().to_string()
+        );
+        let runtime = RuntimeImage::from_plan(&scatter_raw, BASE, Some(&scatter_plan)).unwrap();
+        let scatter_exception_plan = discover(&runtime, "00_BOOT", "BOOT").unwrap().unwrap();
+        let scatter_context = ExceptionArtifactContext {
+            label: "00_BOOT",
+            toc_name: "BOOT",
+            image_blake3: *blake3::hash(&scatter_raw).as_bytes(),
+            scatter_load_map_blake3: Some(scatter_blake3),
+        };
+        let scatter_serialized =
+            super::serialize(&scatter_exception_plan, &scatter_context).unwrap();
+        let scatter_fixture_dir = fixture_dir.join("scatter");
+        if update {
+            std::fs::create_dir_all(&scatter_fixture_dir).unwrap();
+            std::fs::write(scatter_fixture_dir.join("synthetic.bin"), &scatter_raw).unwrap();
+            std::fs::write(scatter_fixture_dir.join("roots.json"), &scatter_serialized).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(scatter_fixture_dir.join("synthetic.bin"))
+                .expect("committed synthetic scatter exception-root raw fixture"),
+            scatter_raw
+        );
+        assert_eq!(
+            std::fs::read(scatter_fixture_dir.join("roots.json"))
+                .expect("committed canonical scatter exception-root manifest fixture"),
+            scatter_serialized
+        );
+
+        let (committed, tables, roots) = canonical.unwrap();
+        assert_eq!(
+            blake3::hash(&committed).to_hex().as_str(),
+            "078cc132cc0c351f6bbf7dba7ce29e53cbd94c730962800b467753395ba3b203"
+        );
+        assert_eq!(
+            super::identity(*blake3::hash(&committed).as_bytes(), tables, roots),
+            "v1:078cc132cc0c351f6bbf7dba7ce29e53cbd94c730962800b467753395ba3b203:1:7"
+        );
     }
 
     #[cfg(unix)]

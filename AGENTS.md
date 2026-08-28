@@ -269,6 +269,9 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `scatter/mod.rs` | Semantic A32 scatter discovery, exact bounded-table classification, and checked runtime planning |
 | `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
 | `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
+| `exception_roots/mod.rs` | Architectural exception-root types, strict limits, and subsystem boundary |
+| `exception_roots/discover.rs` | A32 vector-table classification plus reset-side VBAR relocation proof |
+| `exception_roots/artifact.rs` | Canonical authenticated root manifest materialization, reading, and fixture provenance |
 | `pal_tasks/mod.rs` | PAL shared types, named resource limits, the structured domain error, and the `discover` plan boundary |
 | `pal_tasks/cfg.rs` | Entry-rooted local CFG decode and its definition-aware dataflow/graph queries |
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
@@ -312,7 +315,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyPalTasks` + `PalTasksSupport`, `ApplyExceptionRoots` + `ExceptionRootsSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -337,6 +340,48 @@ module; when a file outgrows that, split it.
 - **Clear commits at the owned leaf and stops there.** Once the regular manifest was unlinked or
   confirmed absent through the retained label handle, clear succeeds and performs no label-directory
   removal. Empty label directories are allowed noncanonical residue.
+
+### Architectural exception roots
+
+- **Canonical means exact production bytes.** `ExceptionRootsSupport` first applies its ordered,
+  typed v1 grammar, then rewrites the same JSON generically to Rust `serde_json`'s two-space pretty
+  spelling and compares exact UTF-8 bytes. This rejects changed key/string escaping, minification,
+  internal whitespace, noncanonical numeric tokens, and any trailing byte; canonical output has no
+  trailing newline. All manifest/raw/scatter/payload handles remain open from preflight through
+  commit or abort. Every partially completed acquisition and close path catches `Throwable`, closes
+  the remaining handles, and preserves cleanup failures as suppressed diagnostics.
+- **The script-owned transaction is the authority.** `ApplyExceptionRoots` is a `HeadlessScript` and
+  must not open a nested program transaction: Ghidra already starts its outer transaction before
+  `run()`. Success is apply → complete postflight → retained-file recheck → conservation/summary
+  construction → `end(true)` → close retained handles → print one summary. Failure runs the
+  pre-registered reverse journal, calls `end(false)` as the authoritative exact rollback, closes
+  handles, and rethrows so no later headless script runs. A close failure after `end(true)` leaves
+  valid committed/replayable state but emits no success summary and still stops continuation.
+- **Mutation cleanup is registered before mutation.** Context, disassembly, function, primary,
+  namespace, role-label, registry-map, and registry-record undo actions all exist before their
+  Ghidra command runs, because commands may mutate and then fail. TMode snapshots preserve exact
+  non-default `RegisterValue` runs and gaps rather than flattening one value across the instruction.
+  The journal is defensive cleanup and diagnostics only; transaction abort remains authoritative.
+- **One ownership validator serves replay and terminal postflight.** Every resulting primary,
+  including `not_requested`, is bound by symbol ID, source, and name BLAKE3. Validation rechecks the
+  exact function entry, instruction length/override/bytes/ISA, complete instruction-span body
+  containment, primary disposition, role-label IDs/source/type/namespace, registry bijection, and
+  manifest identity. Fresh classification consults the actual primary symbol even when no function
+  exists, so a meaningful pre-existing label is preserved. Unshipped old registry records without
+  primary identity fields are invalid; there is no compatibility grammar.
+- **Ghidra-only constraints stay Ghidra-only.** Java preflight rejects intersections among the
+  complete derived instruction spans before mutation and computes A32 architectural `PC + 8` before
+  applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
+  discovery does not reject overlapping roots: producer evidence may describe them, while Ghidra's
+  single instruction/listing model cannot apply them simultaneously.
+- **Real-Ghidra fixtures have one production oracle.** Everything under
+  `tests/fixtures/exception_roots/` is wholly synthetic. The private
+  `committed_ghidra_fixture_matches_production_discovery_and_serialization` test regenerates the
+  canonical, shared-role, relocated, and scatter-backed raw/manifests through production Rust
+  discovery and serialization and compares every committed byte. Set
+  `PME_UPDATE_EXCEPTION_ROOT_FIXTURE=1` only when intentionally regenerating those fixtures. The
+  integration suite loads them directly; malformed cases are focused text/byte mutations, never a
+  parallel test-owned wire schema.
 
 ### Dense Thumb analyzer invariants
 
