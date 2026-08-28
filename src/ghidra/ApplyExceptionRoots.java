@@ -13,6 +13,7 @@ import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.lang.RegisterValue;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.listing.ProgramContext;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.SourceType;
@@ -22,11 +23,13 @@ import ghidra.program.model.util.PropertyMapManager;
 import ghidra.program.model.util.StringPropertyMap;
 import java.io.File;
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 public class ApplyExceptionRoots extends HeadlessScript {
+    private static final int MAX_SUMMARY_BYTES = 256 * 1024;
     @FunctionalInterface
     private interface Undo {
         void run() throws Exception;
@@ -79,6 +82,7 @@ public class ApplyExceptionRoots extends HeadlessScript {
             applyAll(validated, counts);
             ExceptionRootsSupport.AppliedState state = ExceptionRootsSupport.validateApplied(
                     currentProgram, validated.manifest, validated.identity);
+            ExceptionRootsSupport.validatePass2Lineage(currentProgram);
             validated.verifyRetainedFiles();
             requireConservation(validated, counts, state);
             String summary = summary(validated, counts);
@@ -255,7 +259,10 @@ public class ApplyExceptionRoots extends HeadlessScript {
                         validated.manifest.manifestBlake3, plan.application.entry,
                         plan.application.isa, plan.root.instructionBlake3, function.getID(),
                         functionDisposition, primaryDisposition, primaryId, primarySource,
-                        primaryHash, null, null, Collections.unmodifiableList(labelIds),
+                        primaryHash,
+                        plan.prior == null ? null : plan.prior.transitionAuthority,
+                        plan.prior == null ? null : plan.prior.transitionOriginalPrimaryBlake3,
+                        Collections.unmodifiableList(labelIds),
                         ExceptionRootsSupport.labelsDigest(labels));
         String priorValue = registry.getString(entry);
         String value = ExceptionRootsSupport.registryValue(ownership);
@@ -429,10 +436,138 @@ public class ApplyExceptionRoots extends HeadlessScript {
                 validated.manifest.applications) {
             if (ExceptionRootsSupport.isSharedEntry(application)) shared++;
         }
-        return "{\"image\":" + PmeScriptSupport.jsonString(
+        String symbolPass2 = currentProgram.getOptions(Program.PROGRAM_INFO)
+                .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+        PalTasksSupport.validateSymbolPass2Property(symbolPass2);
+        int functionsCreated = 0;
+        int functionsReapplied = 0;
+        int functionsExisting = 0;
+        int namesApplied = 0;
+        int namesReapplied = 0;
+        int namesPreserved = 0;
+        int namesNotRequested = 0;
+        StringBuilder applications = new StringBuilder("[");
+        long previousEntry = -1;
+        String previousIsa = null;
+        for (int index = 0; index < validated.plans.size(); index++) {
+            ExceptionRootsSupport.Plan plan = validated.plans.get(index);
+            if (previousEntry > plan.application.entry
+                    || (previousEntry == plan.application.entry
+                            && previousIsa.compareTo(plan.application.isa) >= 0)) {
+                fail("exception application summary order is not strict");
+            }
+            previousEntry = plan.application.entry;
+            previousIsa = plan.application.isa;
+            Address entry = toAddr(plan.application.entry);
+            Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+            if (function == null) fail("exception summary function is missing at " + entry);
+            ExceptionRootsSupport.RegistryEntry retained = ExceptionRootsSupport.parseRegistry(
+                    registry.getString(entry));
+            String functionResult;
+            if (plan.prior == null && "created".equals(retained.functionDisposition)) {
+                functionResult = "created";
+                functionsCreated++;
+            }
+            else if (plan.prior != null && "created".equals(retained.functionDisposition)) {
+                functionResult = "reapplied";
+                functionsReapplied++;
+            }
+            else {
+                functionResult = "existing";
+                functionsExisting++;
+            }
+            String nameResult;
+            switch (retained.primaryDisposition) {
+                case "exception_owned":
+                    if (plan.prior == null) {
+                        nameResult = "applied";
+                        namesApplied++;
+                    }
+                    else {
+                        nameResult = "reapplied";
+                        namesReapplied++;
+                    }
+                    break;
+                case "pass2_owned":
+                    nameResult = "reapplied";
+                    namesReapplied++;
+                    break;
+                case "preserved":
+                    nameResult = "preserved";
+                    namesPreserved++;
+                    break;
+                case "not_requested":
+                    nameResult = "not_requested";
+                    namesNotRequested++;
+                    break;
+                default:
+                    fail("exception summary carries an unknown primary disposition");
+                    return null;
+            }
+            Symbol current = function.getSymbol();
+            String currentName = current.getName();
+            String currentSource = PmeScriptSupport.primarySource(current.getSource());
+            String currentDigest = ExceptionRootsSupport.primaryNameDigest(currentName);
+            if (retained.primaryId == null || retained.primaryId.longValue() != current.getID()
+                    || !retained.primarySource.equals(currentSource)
+                    || !retained.primaryNameBlake3.equals(currentDigest)) {
+                fail("exception summary primary identity is stale at " + entry);
+            }
+            if (index != 0) applications.append(',');
+            applications.append("{\"entry\":")
+                    .append(PmeScriptSupport.jsonString(
+                            ExceptionRootsSupport.canonicalAddress(plan.application.entry)))
+                    .append(",\"isa\":")
+                    .append(PmeScriptSupport.jsonString(plan.application.isa))
+                    .append(",\"function_result\":")
+                    .append(PmeScriptSupport.jsonString(functionResult))
+                    .append(",\"name_result\":")
+                    .append(PmeScriptSupport.jsonString(nameResult))
+                    .append(",\"shared\":")
+                    .append(ExceptionRootsSupport.isSharedEntry(plan.application))
+                    .append(",\"primary_disposition\":")
+                    .append(PmeScriptSupport.jsonString(retained.primaryDisposition))
+                    .append(",\"current_primary\":")
+                    .append(primaryIdentity(current.getID(), currentSource, currentName,
+                            currentDigest))
+                    .append(",\"transition\":");
+            if ("pass2_owned".equals(retained.primaryDisposition)) {
+                if (plan.application.desiredPrimary == null
+                        || retained.transitionAuthority == null
+                        || !ExceptionRootsSupport.primaryNameDigest(
+                                plan.application.desiredPrimary).equals(
+                                        retained.transitionOriginalPrimaryBlake3)) {
+                    fail("exception summary transition is incomplete at " + entry);
+                }
+                applications.append("{\"authority\":")
+                        .append(PmeScriptSupport.jsonString(retained.transitionAuthority))
+                        .append(",\"original_primary\":")
+                        .append(primaryIdentity(current.getID(), "analysis",
+                                plan.application.desiredPrimary,
+                                retained.transitionOriginalPrimaryBlake3))
+                        .append('}');
+            }
+            else {
+                applications.append("null");
+            }
+            applications.append('}');
+        }
+        applications.append(']');
+        if (functionsCreated != counts.functionsCreated
+                || functionsReapplied != counts.functionsReapplied
+                || functionsExisting != counts.functionsExisting
+                || namesApplied != counts.namesApplied
+                || namesReapplied != counts.namesReapplied
+                || namesPreserved != counts.namesPreserved
+                || namesNotRequested != counts.namesNotRequested) {
+            fail("exception summary rows do not rederive the aggregate counts");
+        }
+        String summary = "{\"image\":" + PmeScriptSupport.jsonString(
                 validated.manifest.image.label)
                 + ",\"status\":\"ok\",\"identity\":"
                 + PmeScriptSupport.jsonString(validated.identity)
+                + ",\"symbol_pass2\":"
+                + (symbolPass2 == null ? "null" : PmeScriptSupport.jsonString(symbolPass2))
                 + ",\"tables\":" + validated.manifest.tables.size()
                 + ",\"roles\":" + roles
                 + ",\"entries\":" + validated.manifest.applications.size()
@@ -443,7 +578,21 @@ public class ApplyExceptionRoots extends HeadlessScript {
                 + ",\"names_reapplied\":" + counts.namesReapplied
                 + ",\"names_preserved\":" + counts.namesPreserved
                 + ",\"names_not_requested\":" + counts.namesNotRequested
-                + ",\"shared_entries\":" + shared + "}";
+                + ",\"shared_entries\":" + shared
+                + ",\"applications\":" + applications + "}";
+        if (summary.getBytes(StandardCharsets.UTF_8).length > MAX_SUMMARY_BYTES) {
+            fail("ApplyExceptionRoots summary exceeds the 256 KiB limit");
+        }
+        return summary;
+    }
+
+    private String primaryIdentity(long symbolId, String source, String name, String digest) {
+        PmeScriptSupport.boundedUtf8(name, ExceptionRootsSupport.MAX_SYMBOL_UTF8_BYTES,
+                "exception summary primary");
+        return "{\"symbol_id\":" + symbolId
+                + ",\"source\":" + PmeScriptSupport.jsonString(source)
+                + ",\"name\":" + PmeScriptSupport.jsonString(name)
+                + ",\"name_blake3\":" + PmeScriptSupport.jsonString(digest) + "}";
     }
 
     private void fail(String message) {

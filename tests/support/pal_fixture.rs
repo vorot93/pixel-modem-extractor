@@ -1120,6 +1120,8 @@ pub(super) fn canonical_symbol_map(
     json.string_field(false, "scatter_load_map_blake3", scatter_blake3_hex);
     json.close_object();
     json.string_field(false, "functions_blake3", functions_blake3_hex);
+    json.key(false, "predecessor_symbol_pass2");
+    json.out.push_str("null");
     json.key(false, "executions");
     json.open_array();
     for (first, entry, execution, start, end, blake3) in [

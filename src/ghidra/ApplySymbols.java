@@ -23,7 +23,7 @@
 // ownership registry), reserved labels, the owned repeatable comment, and the
 // core registry fields are verified unchanged after mutation, and
 // PixelModemExtractor.SymbolPass2 is set to
-// "v2:<map-blake3>:<pass1-functions-blake3>:<execution-count>" only after the
+// "v3:<map-blake3>:<pass1-functions-blake3>:<execution-count>" only after the
 // full postflight. Every pre-existing skip case (missing function, invalid
 // name, collision, unauthorized disposition) now throws; there is no
 // print-and-continue path. On any throwable the mutation is undone in reverse
@@ -243,13 +243,12 @@ public class ApplySymbols extends HeadlessScript {
         String property = currentProgram.getOptions(Program.PROGRAM_INFO)
                 .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
         String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
-        // The property must be absent (first application) or exactly the
-        // expected identity (an idempotent replay); a different prior map is
-        // stale. Which case holds is re-derived per decision below from the
-        // current primary, so no replay flag is retained.
-        if (property != null && !property.equals(expectedProperty)) {
-            fail("stale SymbolPass2 property: expected " + expectedProperty + " or absence "
-                    + "but found " + property);
+        PalTasksSupport.validateSymbolPass2Property(property);
+        if (!java.util.Objects.equals(property, map.predecessorSymbolPass2)
+                && !expectedProperty.equals(property)) {
+            fail("stale SymbolPass2 property: expected predecessor "
+                    + map.predecessorSymbolPass2 + " or current " + expectedProperty
+                    + " but found " + property);
         }
 
         StringPropertyMap palRegistry = currentProgram.getUsrPropertyManager()
@@ -261,6 +260,9 @@ public class ApplySymbols extends HeadlessScript {
                 .getStringPropertyMap(ExceptionRootsSupport.OWNERSHIP_MAP);
         if (exceptionPresent && exceptionRegistry == null) {
             fail("the exception ownership registry is missing under a present identity");
+        }
+        if (exceptionPresent) {
+            ExceptionRootsSupport.validatePass2TransitionPreflight(currentProgram, map);
         }
 
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -280,7 +282,7 @@ public class ApplySymbols extends HeadlessScript {
                 fail("no function exists at the map execution entry " + entry);
             }
             verifyCurrentBody(execution, function);
-            verifyAndAuthorize(decision, function, exceptionRegistry, palRegistry);
+            verifyAndAuthorize(execution, decision, function, exceptionRegistry, palRegistry);
             boolean rename = "rename".equals(decision.action)
                     && !function.getName().equals(decision.finalPrimary);
             planned.add(new Planned(execution, decision, function, rename));
@@ -349,7 +351,8 @@ public class ApplySymbols extends HeadlessScript {
      * primary, a non-registry analysis-sourced primary, or an exact
      * registry-bound exception_owned/pal_owned transition may be displaced.
      */
-    private void verifyAndAuthorize(PalTasksSupport.MapDecision decision, Function function,
+    private void verifyAndAuthorize(PalTasksSupport.MapExecution execution,
+            PalTasksSupport.MapDecision decision, Function function,
             StringPropertyMap exceptionRegistry, StringPropertyMap palRegistry) {
         Address entry = function.getEntryPoint();
         String currentName = function.getName();
@@ -364,7 +367,8 @@ public class ApplySymbols extends HeadlessScript {
                         ExceptionRootsSupport.parseRegistry(
                                 exceptionRegistry == null ? null
                                         : exceptionRegistry.getString(entry));
-                ExceptionRootsSupport.validatePass2Transition(retained, decision, entry);
+                ExceptionRootsSupport.validatePass2Transition(
+                        currentProgram, retained, execution, decision, entry);
             }
             if (decision.palTransition) {
                 requirePalRegistryDisposition(palRegistry, entry, "pass2_owned");
@@ -393,6 +397,8 @@ public class ApplySymbols extends HeadlessScript {
                         fail("an exception transition must produce a user_defined primary at "
                                 + entry);
                     }
+                    validateFreshExceptionTransition(
+                            execution, decision, function, exceptionRegistry);
                     return;
                 case "preserved":
                 case "not_requested":
@@ -457,6 +463,34 @@ public class ApplySymbols extends HeadlessScript {
             return null;
         }
         return PalTasksSupport.parseRegistry(value).primaryDisposition;
+    }
+
+    private void validateFreshExceptionTransition(PalTasksSupport.MapExecution execution,
+            PalTasksSupport.MapDecision decision, Function function,
+            StringPropertyMap registry) {
+        Address entry = function.getEntryPoint();
+        ExceptionRootsSupport.RegistryEntry retained = ExceptionRootsSupport.parseRegistry(
+                registry == null ? null : registry.getString(entry));
+        PalTasksSupport.MapPrimaryIdentity original =
+                decision.exceptionTransitionOriginal;
+        PalTasksSupport.MapPrimaryIdentity target = decision.exceptionTransitionFinal;
+        if (original == null || target == null
+                || !"exception_owned".equals(retained.primaryDisposition)
+                || retained.entry != execution.entry
+                || !retained.isa.equals(execution.decodeRanges.get(0).isa)
+                || retained.primaryId == null
+                || retained.primaryId.longValue() != original.symbolId
+                || retained.primaryId.longValue() != target.symbolId
+                || !retained.primarySource.equals(original.source)
+                || !retained.primaryNameBlake3.equals(original.nameBlake3)
+                || function.getSymbol().getID() != original.symbolId
+                || !function.getName().equals(original.name)
+                || !PalTasksSupport.primarySource(function.getSymbol().getSource()).equals(
+                        original.source)
+                || !decision.finalPrimary.equals(target.name)
+                || !decision.finalSource.equals(target.source)) {
+            fail("fresh exception transition does not exactly bind the registry at " + entry);
+        }
     }
 
     private static String exceptionRegistryDisposition(
@@ -530,7 +564,6 @@ public class ApplySymbols extends HeadlessScript {
                         preflight.exceptionRoots.manifest, preflight.exceptionIdentity);
                 ExceptionRootsSupport.validatePass2Transitions(
                         currentProgram, preflight.map);
-                preflight.exceptionRoots.verifyRetainedFiles();
             }
             else {
                 ExceptionRootsSupport.validateAbsent(currentProgram);
@@ -560,7 +593,10 @@ public class ApplySymbols extends HeadlessScript {
                             + plan.function.getEntryPoint());
                 }
             }
+            PalTasksSupport.validateThumbCreationState(
+                    currentProgram, monitor, preflight.map);
             if (preflight.exceptionRoots != null) {
+                preflight.exceptionRoots.verifyRetainedFiles();
                 preflight.exceptionRoots.close();
             }
             currentProgram.getOptions(Program.PROGRAM_INFO)
@@ -672,7 +708,22 @@ public class ApplySymbols extends HeadlessScript {
                         + prior.primaryDisposition + ", not exception_owned");
             }
             Symbol symbol = plan.function.getSymbol();
-            if (prior.primaryId == null || prior.primaryId.longValue() != symbol.getID()) {
+            PalTasksSupport.MapPrimaryIdentity original =
+                    plan.decision.exceptionTransitionOriginal;
+            PalTasksSupport.MapPrimaryIdentity target =
+                    plan.decision.exceptionTransitionFinal;
+            if (original == null || target == null
+                    || prior.primaryId == null
+                    || prior.primaryId.longValue() != symbol.getID()
+                    || prior.primaryId.longValue() != original.symbolId
+                    || prior.primaryId.longValue() != target.symbolId
+                    || !prior.primarySource.equals(original.source)
+                    || !prior.primaryNameBlake3.equals(original.nameBlake3)
+                    || symbol.getID() != target.symbolId
+                    || !plan.function.getName().equals(target.name)
+                    || !PalTasksSupport.primarySource(symbol.getSource()).equals(target.source)
+                    || !ExceptionRootsSupport.primaryNameDigest(target.name).equals(
+                            target.nameBlake3)) {
                 fail("the exception primary symbol ID changed during the rename at " + entry);
             }
             String updated = ExceptionRootsSupport.registryValue(
@@ -680,11 +731,9 @@ public class ApplySymbols extends HeadlessScript {
                             prior.manifestBlake3, prior.entry, prior.isa,
                             prior.instructionBlake3, prior.functionId,
                             prior.functionDisposition, "pass2_owned", prior.primaryId,
-                            plan.decision.finalSource,
-                            ExceptionRootsSupport.primaryNameDigest(
-                                    plan.decision.finalPrimary),
+                            target.source, target.nameBlake3,
                             plan.decision.exceptionTransitionAuthority,
-                            prior.primaryNameBlake3, prior.labelIds,
+                            original.nameBlake3, prior.labelIds,
                             prior.labelsBlake3));
             final StringPropertyMap registry = preflight.exceptionRegistry;
             final String priorValue = value;

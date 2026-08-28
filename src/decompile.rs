@@ -12,7 +12,7 @@
 use crate::{
     error::{Error, Result},
     exception_roots::{self, ExceptionArtifactContext, MaterializedExceptionRoots},
-    execution_ranges::{OwnedExecutionIdentity, TaggedExecutionRecord, parse_blake3},
+    execution_ranges::{DecodeIsa, OwnedExecutionIdentity, TaggedExecutionRecord, parse_blake3},
     pal_tasks::{self, TaskArtifactContext},
     runtime_image::RuntimeImage,
     scatter,
@@ -20,7 +20,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::{OsStr, OsString},
     io::BufRead,
     num::NonZeroUsize,
@@ -682,19 +682,181 @@ pub struct AppliedPalTasks {
     pub shared_entries: usize,
 }
 
+const APPLY_EXCEPTION_ROOTS_SUMMARY_MAX_BYTES: usize = 256 * 1024;
+const EXCEPTION_PRIMARY_MAX_UTF8_BYTES: usize = 2000;
+const SYMBOL_PASS2_MAX_BYTES: usize = 192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionFunctionResult {
+    Created,
+    Reapplied,
+    Existing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionNameResult {
+    Applied,
+    Reapplied,
+    Preserved,
+    NotRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionPrimarySource {
+    Default,
+    Analysis,
+    Ai,
+    Imported,
+    UserDefined,
+}
+
+impl ExceptionPrimarySource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Analysis => "analysis",
+            Self::Ai => "ai",
+            Self::Imported => "imported",
+            Self::UserDefined => "user_defined",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionTransitionAuthority {
+    Func,
+    Registration,
+}
+
+impl ExceptionTransitionAuthority {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Func => "func",
+            Self::Registration => "registration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExceptionPrimaryIdentity {
+    pub(crate) symbol_id: u64,
+    pub(crate) source: ExceptionPrimarySource,
+    pub(crate) name: String,
+    pub(crate) name_blake3: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExceptionPrimaryDisposition {
+    ExceptionOwned {
+        current: ExceptionPrimaryIdentity,
+    },
+    Preserved {
+        current: ExceptionPrimaryIdentity,
+    },
+    NotRequested {
+        current: ExceptionPrimaryIdentity,
+    },
+    Pass2Owned {
+        authority: ExceptionTransitionAuthority,
+        original: ExceptionPrimaryIdentity,
+        final_primary: ExceptionPrimaryIdentity,
+    },
+}
+
+impl ExceptionPrimaryDisposition {
+    pub(crate) fn current(&self) -> &ExceptionPrimaryIdentity {
+        match self {
+            Self::ExceptionOwned { current }
+            | Self::Preserved { current }
+            | Self::NotRequested { current } => current,
+            Self::Pass2Owned { final_primary, .. } => final_primary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedExceptionApplication {
+    pub(crate) function_result: ExceptionFunctionResult,
+    pub(crate) name_result: ExceptionNameResult,
+    pub(crate) shared: bool,
+    pub(crate) disposition: ExceptionPrimaryDisposition,
+}
+
+/// Strict current-run `ApplyExceptionRoots` result. Its semantic application
+/// state can only be obtained from the bounded summary parser below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedExceptionRoots {
-    pub tables: usize,
-    pub roles: usize,
-    pub entries: usize,
-    pub functions_created: usize,
-    pub functions_reapplied: usize,
-    pub functions_existing: usize,
-    pub names_applied: usize,
-    pub names_reapplied: usize,
-    pub names_preserved: usize,
-    pub names_not_requested: usize,
-    pub shared_entries: usize,
+    pub(crate) image: String,
+    pub(crate) identity: String,
+    pub(crate) tables: usize,
+    pub(crate) roles: usize,
+    pub(crate) entries: usize,
+    pub(crate) functions_created: usize,
+    pub(crate) functions_reapplied: usize,
+    pub(crate) functions_existing: usize,
+    pub(crate) names_applied: usize,
+    pub(crate) names_reapplied: usize,
+    pub(crate) names_preserved: usize,
+    pub(crate) names_not_requested: usize,
+    pub(crate) shared_entries: usize,
+    pub(crate) symbol_pass2: Option<String>,
+    pub(crate) applications: BTreeMap<(u32, DecodeIsa), AppliedExceptionApplication>,
+}
+
+impl AppliedExceptionRoots {
+    /// Parse exactly one bounded current-run interface line. Callers cannot
+    /// manufacture the semantic state accepted by `ExceptionPass2Context`.
+    pub fn parse_current(
+        stdout: &str,
+        expected_image: &str,
+        expected_identity: &str,
+    ) -> Result<Self> {
+        parse_apply_exception_roots_summary(stdout, expected_image, expected_identity)
+            .map_err(Error::Serialize)
+    }
+
+    pub(crate) fn symbol_pass2(&self) -> Option<&str> {
+        self.symbol_pass2.as_deref()
+    }
+
+    pub(crate) fn applications(&self) -> &BTreeMap<(u32, DecodeIsa), AppliedExceptionApplication> {
+        &self.applications
+    }
+}
+
+/// Explicit inputs for constructing authenticated exception state at the
+/// decompile boundary. Every path and identity is supplied by the caller;
+/// currentness is never inferred from artifact existence.
+pub struct ExceptionPass2ContextInput<'a> {
+    pub manifest_path: &'a Path,
+    pub image_dir: &'a Path,
+    pub image_label: &'a str,
+    pub toc_name: &'a str,
+    pub image_base: u32,
+    pub expected_identity: &'a str,
+    pub expected_scatter_load_map_blake3: Option<[u8; 32]>,
+    pub applied: &'a AppliedExceptionRoots,
+}
+
+/// Authenticate the runtime image and exception manifest, then bind the
+/// strict current-run application summary into an opaque pass-2 context.
+pub fn read_exception_pass2_context(
+    input: ExceptionPass2ContextInput<'_>,
+) -> Result<crate::symbolicate::ExceptionPass2Context> {
+    let raw = std::fs::read(input.image_dir.join(format!("{}.bin", input.image_label)))?;
+    let runtime = RuntimeImage::for_image_dir(&raw, input.image_base, input.image_dir)?;
+    let validated = exception_roots::read_with_identity(
+        input.manifest_path,
+        &runtime,
+        ExceptionArtifactContext {
+            label: input.image_label,
+            toc_name: input.toc_name,
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: input.expected_scatter_load_map_blake3,
+        },
+        input.expected_identity,
+    )?;
+    crate::symbolicate::ExceptionPass2Context::from_validated(&validated, input.applied)
 }
 
 /// The parsed `ApplyThumbNames: {json}` current-run summary for one scheduled
@@ -3241,10 +3403,10 @@ impl PreparedSymbolPass2Map {
 
     /// The exact `PixelModemExtractor.SymbolPass2` property value
     /// `ApplySymbols` sets on success:
-    /// `v2:<symbol-map-blake3>:<pass1-functions-blake3>:<execution-count>`.
+    /// `v3:<symbol-map-blake3>:<pass1-functions-blake3>:<execution-count>`.
     pub fn pass2_property(&self) -> String {
         format!(
-            "v2:{}:{}:{}",
+            "v3:{}:{}:{}",
             self.map.blake3(),
             self.functions.blake3(),
             self.execution_count
@@ -3640,6 +3802,7 @@ struct ApplyExceptionRootsWire {
     image: String,
     status: String,
     identity: String,
+    symbol_pass2: NullableStringWire,
     tables: usize,
     roles: usize,
     entries: usize,
@@ -3651,6 +3814,44 @@ struct ApplyExceptionRootsWire {
     names_preserved: usize,
     names_not_requested: usize,
     shared_entries: usize,
+    applications: Vec<ApplyExceptionApplicationWire>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct NullableStringWire(Option<String>);
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyExceptionApplicationWire {
+    entry: String,
+    isa: String,
+    function_result: String,
+    name_result: String,
+    shared: bool,
+    primary_disposition: String,
+    current_primary: ExceptionPrimaryIdentityWire,
+    transition: NullableExceptionTransitionWire,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExceptionPrimaryIdentityWire {
+    symbol_id: u64,
+    source: String,
+    name: String,
+    name_blake3: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct NullableExceptionTransitionWire(Option<ExceptionTransitionWire>);
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExceptionTransitionWire {
+    authority: String,
+    original_primary: ExceptionPrimaryIdentityWire,
 }
 
 #[derive(Default)]
@@ -3708,6 +3909,11 @@ fn parse_apply_exception_roots_summary(
     if payloads.next().is_some() {
         return Err("duplicate ApplyExceptionRoots summaries".to_string());
     }
+    if payload.len() > APPLY_EXCEPTION_ROOTS_SUMMARY_MAX_BYTES {
+        return Err(format!(
+            "ApplyExceptionRoots summary exceeds the {APPLY_EXCEPTION_ROOTS_SUMMARY_MAX_BYTES}-byte limit"
+        ));
+    }
     let wire: ApplyExceptionRootsWire = serde_json::from_str(payload)
         .map_err(|error| format!("malformed ApplyExceptionRoots summary: {error}"))?;
     if wire.image != expected_image {
@@ -3727,30 +3933,235 @@ fn parse_apply_exception_roots_summary(
             "ApplyExceptionRoots summary identity does not match this run's root map".to_string(),
         );
     }
-    let functions = wire
-        .functions_created
-        .checked_add(wire.functions_reapplied)
-        .and_then(|count| count.checked_add(wire.functions_existing))
-        .ok_or_else(|| "ApplyExceptionRoots function counts overflow".to_string())?;
-    let names = wire
-        .names_applied
-        .checked_add(wire.names_reapplied)
-        .and_then(|count| count.checked_add(wire.names_preserved))
-        .and_then(|count| count.checked_add(wire.names_not_requested))
-        .ok_or_else(|| "ApplyExceptionRoots name counts overflow".to_string())?;
-    if functions != wire.entries || names != wire.entries {
+    if !(1..=exception_roots::MAX_TABLES).contains(&wire.tables) {
         return Err(format!(
-            "non-conserving ApplyExceptionRoots summary: entries {}, functions {functions}, names {names}",
-            wire.entries
+            "ApplyExceptionRoots summary table count is outside 1..={}",
+            exception_roots::MAX_TABLES
         ));
     }
-    if wire.shared_entries > wire.names_not_requested {
+    let expected_roles = wire
+        .tables
+        .checked_mul(exception_roots::VECTOR_SLOTS)
+        .ok_or_else(|| "ApplyExceptionRoots summary role count overflows".to_string())?;
+    if wire.roles != expected_roles {
+        return Err(format!(
+            "ApplyExceptionRoots summary roles {} do not match {} tables",
+            wire.roles, wire.tables
+        ));
+    }
+    let symbol_pass2 = wire.symbol_pass2.0.map(validate_symbol_pass2).transpose()?;
+    if wire.applications.is_empty() || wire.applications.len() > crate::exception_roots::MAX_ROOTS {
+        return Err(format!(
+            "ApplyExceptionRoots summary carries {} applications outside 1..={}",
+            wire.applications.len(),
+            crate::exception_roots::MAX_ROOTS
+        ));
+    }
+
+    let mut applications = BTreeMap::new();
+    let mut functions_created = 0usize;
+    let mut functions_reapplied = 0usize;
+    let mut functions_existing = 0usize;
+    let mut names_applied = 0usize;
+    let mut names_reapplied = 0usize;
+    let mut names_preserved = 0usize;
+    let mut names_not_requested = 0usize;
+    let mut shared_entries = 0usize;
+    let mut previous_key = None;
+    let mut pass2_owned = 0usize;
+    for application in wire.applications {
+        let entry = parse_exception_summary_address(&application.entry)?;
+        let isa = parse_exception_summary_isa(&application.isa)?;
+        let key = (entry, isa);
+        if previous_key.is_some_and(|previous| previous >= key) {
+            return Err(
+                "ApplyExceptionRoots applications are not strictly sorted by (entry, ISA)"
+                    .to_string(),
+            );
+        }
+        previous_key = Some(key);
+        let function_result = match application.function_result.as_str() {
+            "created" => {
+                functions_created += 1;
+                ExceptionFunctionResult::Created
+            }
+            "reapplied" => {
+                functions_reapplied += 1;
+                ExceptionFunctionResult::Reapplied
+            }
+            "existing" => {
+                functions_existing += 1;
+                ExceptionFunctionResult::Existing
+            }
+            _ => {
+                return Err(format!(
+                    "ApplyExceptionRoots application at 0x{entry:08x} carries an unknown function_result"
+                ));
+            }
+        };
+        let name_result = match application.name_result.as_str() {
+            "applied" => {
+                names_applied += 1;
+                ExceptionNameResult::Applied
+            }
+            "reapplied" => {
+                names_reapplied += 1;
+                ExceptionNameResult::Reapplied
+            }
+            "preserved" => {
+                names_preserved += 1;
+                ExceptionNameResult::Preserved
+            }
+            "not_requested" => {
+                names_not_requested += 1;
+                ExceptionNameResult::NotRequested
+            }
+            _ => {
+                return Err(format!(
+                    "ApplyExceptionRoots application at 0x{entry:08x} carries an unknown name_result"
+                ));
+            }
+        };
+        if matches!(
+            (function_result, name_result),
+            (
+                ExceptionFunctionResult::Reapplied,
+                ExceptionNameResult::Applied
+            ) | (
+                ExceptionFunctionResult::Created,
+                ExceptionNameResult::Reapplied
+            )
+        ) {
+            return Err(format!(
+                "ApplyExceptionRoots application at 0x{entry:08x} carries inconsistent function_result and name_result replay state"
+            ));
+        }
+        if application.shared {
+            shared_entries += 1;
+        }
+        let current = parse_exception_primary(application.current_primary, entry, "current")?;
+        let disposition = match application.primary_disposition.as_str() {
+            "exception_owned" => {
+                if application.transition.0.is_some()
+                    || current.source != ExceptionPrimarySource::Analysis
+                    || !matches!(
+                        name_result,
+                        ExceptionNameResult::Applied | ExceptionNameResult::Reapplied
+                    )
+                {
+                    return Err(format!(
+                        "exception_owned application at 0x{entry:08x} has inconsistent state"
+                    ));
+                }
+                ExceptionPrimaryDisposition::ExceptionOwned { current }
+            }
+            "preserved" => {
+                if application.transition.0.is_some()
+                    || current.source == ExceptionPrimarySource::Default
+                    || name_result != ExceptionNameResult::Preserved
+                {
+                    return Err(format!(
+                        "preserved application at 0x{entry:08x} has inconsistent state"
+                    ));
+                }
+                ExceptionPrimaryDisposition::Preserved { current }
+            }
+            "not_requested" => {
+                if application.transition.0.is_some()
+                    || name_result != ExceptionNameResult::NotRequested
+                    || !application.shared
+                {
+                    return Err(format!(
+                        "not_requested application at 0x{entry:08x} is not a shared entry or has inconsistent state"
+                    ));
+                }
+                ExceptionPrimaryDisposition::NotRequested { current }
+            }
+            "pass2_owned" => {
+                let transition = application.transition.0.ok_or_else(|| {
+                    format!("pass2_owned application at 0x{entry:08x} lacks its transition")
+                })?;
+                let authority = match transition.authority.as_str() {
+                    "func" => ExceptionTransitionAuthority::Func,
+                    "registration" => ExceptionTransitionAuthority::Registration,
+                    _ => {
+                        return Err(format!(
+                            "pass2_owned application at 0x{entry:08x} has an unknown transition authority"
+                        ));
+                    }
+                };
+                let original =
+                    parse_exception_primary(transition.original_primary, entry, "original")?;
+                if name_result != ExceptionNameResult::Reapplied
+                    || original.source != ExceptionPrimarySource::Analysis
+                    || current.source != ExceptionPrimarySource::UserDefined
+                    || original.symbol_id != current.symbol_id
+                    || original.name == current.name
+                {
+                    return Err(format!(
+                        "pass2_owned application at 0x{entry:08x} has inconsistent transition state"
+                    ));
+                }
+                pass2_owned += 1;
+                ExceptionPrimaryDisposition::Pass2Owned {
+                    authority,
+                    original,
+                    final_primary: current,
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "ApplyExceptionRoots application at 0x{entry:08x} carries an unknown primary_disposition"
+                ));
+            }
+        };
+        if application.shared && name_result != ExceptionNameResult::NotRequested {
+            return Err(format!(
+                "shared exception application at 0x{entry:08x} is not name_result not_requested"
+            ));
+        }
+        if applications
+            .insert(
+                key,
+                AppliedExceptionApplication {
+                    function_result,
+                    name_result,
+                    shared: application.shared,
+                    disposition,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "ApplyExceptionRoots summary duplicates application 0x{entry:08x}/{}",
+                application.isa
+            ));
+        }
+    }
+    if pass2_owned != 0 && symbol_pass2.is_none() {
         return Err(
-            "non-conserving ApplyExceptionRoots summary: shared entries exceed names not requested"
+            "ApplyExceptionRoots pass2_owned state lacks the SymbolPass2 property".to_string(),
+        );
+    }
+
+    if wire.entries != applications.len()
+        || wire.functions_created != functions_created
+        || wire.functions_reapplied != functions_reapplied
+        || wire.functions_existing != functions_existing
+        || wire.names_applied != names_applied
+        || wire.names_reapplied != names_reapplied
+        || wire.names_preserved != names_preserved
+        || wire.names_not_requested != names_not_requested
+        || wire.shared_entries != shared_entries
+    {
+        return Err(
+            "non-conserving ApplyExceptionRoots summary: aggregate counters do not match application rows"
                 .to_string(),
         );
     }
     Ok(AppliedExceptionRoots {
+        image: wire.image,
+        identity: wire.identity,
         tables: wire.tables,
         roles: wire.roles,
         entries: wire.entries,
@@ -3762,7 +4173,116 @@ fn parse_apply_exception_roots_summary(
         names_preserved: wire.names_preserved,
         names_not_requested: wire.names_not_requested,
         shared_entries: wire.shared_entries,
+        symbol_pass2,
+        applications,
     })
+}
+
+fn parse_exception_summary_address(value: &str) -> std::result::Result<u32, String> {
+    if value.len() != 10
+        || !value.starts_with("0x")
+        || !value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "ApplyExceptionRoots application address {value:?} is not canonical"
+        ));
+    }
+    u32::from_str_radix(&value[2..], 16)
+        .map_err(|_| format!("ApplyExceptionRoots application address {value:?} is invalid"))
+}
+
+fn parse_exception_summary_isa(value: &str) -> std::result::Result<DecodeIsa, String> {
+    match value {
+        "arm" => Ok(DecodeIsa::Arm),
+        "thumb" => Ok(DecodeIsa::Thumb),
+        _ => Err(format!(
+            "ApplyExceptionRoots application ISA {value:?} is not arm or thumb"
+        )),
+    }
+}
+
+fn parse_exception_primary(
+    wire: ExceptionPrimaryIdentityWire,
+    entry: u32,
+    kind: &str,
+) -> std::result::Result<ExceptionPrimaryIdentity, String> {
+    if wire.symbol_id > i64::MAX as u64 {
+        return Err(format!(
+            "exception {kind} primary symbol ID exceeds Long.MAX_VALUE at 0x{entry:08x}"
+        ));
+    }
+    let source = match wire.source.as_str() {
+        "default" => ExceptionPrimarySource::Default,
+        "analysis" => ExceptionPrimarySource::Analysis,
+        "ai" => ExceptionPrimarySource::Ai,
+        "imported" => ExceptionPrimarySource::Imported,
+        "user_defined" => ExceptionPrimarySource::UserDefined,
+        _ => {
+            return Err(format!(
+                "exception {kind} primary source is unknown at 0x{entry:08x}"
+            ));
+        }
+    };
+    if wire.name.len() > EXCEPTION_PRIMARY_MAX_UTF8_BYTES
+        || wire.name.contains('\0')
+        || wire.name.contains('\u{fffd}')
+    {
+        return Err(format!(
+            "exception {kind} primary name is invalid at 0x{entry:08x}"
+        ));
+    }
+    validate_lower_blake3(&wire.name_blake3, "exception primary name")?;
+    if crate::manifest::blake3_bytes(wire.name.as_bytes()) != wire.name_blake3 {
+        return Err(format!(
+            "exception {kind} primary name digest does not match at 0x{entry:08x}"
+        ));
+    }
+    Ok(ExceptionPrimaryIdentity {
+        symbol_id: wire.symbol_id,
+        source,
+        name: wire.name,
+        name_blake3: wire.name_blake3,
+    })
+}
+
+fn validate_lower_blake3(value: &str, what: &str) -> std::result::Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{what} is not 64 lowercase hexadecimal characters"));
+    }
+    Ok(())
+}
+
+fn validate_symbol_pass2(value: String) -> std::result::Result<String, String> {
+    if value.len() > SYMBOL_PASS2_MAX_BYTES || !value.is_ascii() {
+        return Err(format!(
+            "SymbolPass2 property exceeds the {SYMBOL_PASS2_MAX_BYTES}-byte ASCII limit"
+        ));
+    }
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "v3" {
+        return Err("SymbolPass2 property is not the strict v3 grammar".to_string());
+    }
+    validate_lower_blake3(parts[1], "SymbolPass2 map BLAKE3")?;
+    validate_lower_blake3(parts[2], "SymbolPass2 functions BLAKE3")?;
+    let execution_count = parts[3]
+        .parse::<usize>()
+        .map_err(|_| "SymbolPass2 execution count is not canonical unsigned decimal".to_string())?;
+    if parts[3].starts_with('0') && parts[3] != "0" {
+        return Err("SymbolPass2 execution count is not canonical unsigned decimal".to_string());
+    }
+    if execution_count > crate::execution_ranges::MAX_EXECUTION_FUNCTIONS {
+        return Err(format!(
+            "SymbolPass2 execution count exceeds the {}-execution limit",
+            crate::execution_ranges::MAX_EXECUTION_FUNCTIONS
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_applied_exception_roots(
@@ -5373,22 +5893,18 @@ printf '%s
         let RuntimeExceptionState::Present(map) = &image.exception_state else {
             panic!("the selected image must retain its present generation state");
         };
-        assert_eq!(
-            image.exception_roots_applied,
-            Some(AppliedExceptionRoots {
-                tables: 1,
-                roles: 8,
-                entries: 7,
-                functions_created: 7,
-                functions_reapplied: 0,
-                functions_existing: 0,
-                names_applied: 6,
-                names_reapplied: 0,
-                names_preserved: 0,
-                names_not_requested: 1,
-                shared_entries: 1,
-            })
-        );
+        let applied = image.exception_roots_applied.as_ref().unwrap();
+        assert_eq!(applied.tables, 1);
+        assert_eq!(applied.roles, 8);
+        assert_eq!(applied.entries, 7);
+        assert_eq!(applied.functions_created, 7);
+        assert_eq!(applied.functions_reapplied, 0);
+        assert_eq!(applied.functions_existing, 0);
+        assert_eq!(applied.names_applied, 6);
+        assert_eq!(applied.names_reapplied, 0);
+        assert_eq!(applied.names_preserved, 0);
+        assert_eq!(applied.names_not_requested, 1);
+        assert_eq!(applied.shared_entries, 1);
         assert_eq!(image.exception_error, None);
         assert!(matches!(image.outcome, ImageOutcome::Analyzed(_)));
         assert_eq!(
@@ -5743,7 +6259,7 @@ printf '%s
 export_root=$(dirname "$export_dir")
 label=$(basename "$export_dir")
 if [ "$exception_applied" = 1 ]; then
-  printf 'ApplyExceptionRoots: {"image":"%s","status":"ok","identity":"%s","tables":1,"roles":8,"entries":7,"functions_created":7,"functions_reapplied":0,"functions_existing":0,"names_applied":6,"names_reapplied":0,"names_preserved":0,"names_not_requested":1,"shared_entries":1}\n' "$label" "$exception_identity"
+  printf 'ApplyExceptionRoots: {"image":"%s","status":"ok","identity":"%s","symbol_pass2":null,"tables":1,"roles":8,"entries":7,"functions_created":7,"functions_reapplied":0,"functions_existing":0,"names_applied":6,"names_reapplied":0,"names_preserved":0,"names_not_requested":1,"shared_entries":1,"applications":[{"entry":"0x40010200","isa":"arm","function_result":"created","name_result":"applied","shared":false,"primary_disposition":"exception_owned","current_primary":{"symbol_id":10,"source":"analysis","name":"Reset","name_blake3":"0d1d0ead7580ab6516b3a9d29c2e4f2deb32e1c89b4df2430e1032abed999a2b"},"transition":null},{"entry":"0x40010220","isa":"thumb","function_result":"created","name_result":"applied","shared":false,"primary_disposition":"exception_owned","current_primary":{"symbol_id":11,"source":"analysis","name":"UndefinedInstruction","name_blake3":"715fe00f95685fc6af937f3a3079d0adc2bbb17b414183d0f627dbaf1c854d44"},"transition":null},{"entry":"0x40010240","isa":"arm","function_result":"created","name_result":"applied","shared":false,"primary_disposition":"exception_owned","current_primary":{"symbol_id":12,"source":"analysis","name":"SupervisorCall","name_blake3":"65141a0d03c5f9e990718f5d96455fac812883d8c1ebebe6aff6c075696a0b3f"},"transition":null},{"entry":"0x40010260","isa":"thumb","function_result":"created","name_result":"applied","shared":false,"primary_disposition":"exception_owned","current_primary":{"symbol_id":13,"source":"analysis","name":"PrefetchAbort","name_blake3":"2284c4117b9106b82fd8829c308230541944069ef71de3c0ab6048e766facb56"},"transition":null},{"entry":"0x40010280","isa":"arm","function_result":"created","name_result":"not_requested","shared":true,"primary_disposition":"not_requested","current_primary":{"symbol_id":14,"source":"default","name":"FUN_400102c0","name_blake3":"540e5a978812bce06f547b4c4d75b5817b3a6371b207ee5102361da0263bced4"},"transition":null},{"entry":"0x400102a0","isa":"arm","function_result":"created","name_result":"applied","shared":false,"primary_disposition":"exception_owned","current_primary":{"symbol_id":15,"source":"analysis","name":"ExistingIrq","name_blake3":"3950983f0d306d9cca4541556cff660fc2094dc5476df3f36bfa6e35afb8e20e"},"transition":null},{"entry":"0x400102c0","isa":"thumb","function_result":"created","name_result":"applied","shared":false,"primary_disposition":"exception_owned","current_primary":{"symbol_id":16,"source":"analysis","name":"DataAbort","name_blake3":"3fc2b1d7338304093e20b37543550aca715e6bd9e6475512c1e068425b615358"},"transition":null}]}\n' "$label" "$exception_identity"
 fi
 if [ "$applied" = 1 ]; then
   printf 'ApplyPalTasks: {"image":"%s","status":"ok","identity":"%s","tasks":2,"entries":2,"functions_created":2,"functions_existing":0,"names_applied":2,"names_preserved":0,"shared_entries":0}\n' "$label" "$pal_identity"
@@ -6901,7 +7417,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(
             symbol_map.pass2_property(),
             format!(
-                "v2:{}:{}:3",
+                "v3:{}:{}:3",
                 symbol_map.map_blake3(),
                 symbol_map.functions_blake3()
             )
@@ -7205,32 +7721,373 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
     }
 
-    fn exception_summary(identity: &str) -> String {
+    fn aggregate_only_exception_summary(identity: &str) -> String {
         format!(
             "ApplyExceptionRoots: {{\"image\":\"00_BOOT\",\"status\":\"ok\",\"identity\":\"{identity}\",\"tables\":1,\"roles\":8,\"entries\":7,\"functions_created\":5,\"functions_reapplied\":0,\"functions_existing\":2,\"names_applied\":5,\"names_reapplied\":0,\"names_preserved\":1,\"names_not_requested\":1,\"shared_entries\":1}}"
         )
     }
 
+    fn summary_primary(symbol_id: u64, source: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "symbol_id": symbol_id,
+            "source": source,
+            "name": name,
+            "name_blake3": crate::manifest::blake3_bytes(name.as_bytes()),
+        })
+    }
+
+    fn exception_summary_for(image: &str, identity: &str) -> String {
+        let applications = vec![
+            serde_json::json!({
+                "entry": "0x40010200", "isa": "arm", "function_result": "created",
+                "name_result": "applied", "shared": false,
+                "primary_disposition": "exception_owned",
+                "current_primary": summary_primary(10, "analysis", "Reset"),
+                "transition": null,
+            }),
+            serde_json::json!({
+                "entry": "0x40010220", "isa": "arm", "function_result": "created",
+                "name_result": "applied", "shared": false,
+                "primary_disposition": "exception_owned",
+                "current_primary": summary_primary(11, "analysis", "UndefinedInstruction"),
+                "transition": null,
+            }),
+            serde_json::json!({
+                "entry": "0x40010240", "isa": "arm", "function_result": "created",
+                "name_result": "applied", "shared": false,
+                "primary_disposition": "exception_owned",
+                "current_primary": summary_primary(12, "analysis", "SupervisorCall"),
+                "transition": null,
+            }),
+            serde_json::json!({
+                "entry": "0x40010260", "isa": "arm", "function_result": "created",
+                "name_result": "applied", "shared": false,
+                "primary_disposition": "exception_owned",
+                "current_primary": summary_primary(13, "analysis", "PrefetchAbort"),
+                "transition": null,
+            }),
+            serde_json::json!({
+                "entry": "0x40010280", "isa": "arm", "function_result": "created",
+                "name_result": "applied", "shared": false,
+                "primary_disposition": "exception_owned",
+                "current_primary": summary_primary(14, "analysis", "DataAbort"),
+                "transition": null,
+            }),
+            serde_json::json!({
+                "entry": "0x400102a0", "isa": "arm", "function_result": "existing",
+                "name_result": "preserved", "shared": false,
+                "primary_disposition": "preserved",
+                "current_primary": summary_primary(15, "imported", "ExistingIrq"),
+                "transition": null,
+            }),
+            serde_json::json!({
+                "entry": "0x400102c0", "isa": "arm", "function_result": "existing",
+                "name_result": "not_requested", "shared": true,
+                "primary_disposition": "not_requested",
+                "current_primary": summary_primary(16, "default", "FUN_400102c0"),
+                "transition": null,
+            }),
+        ];
+        format!(
+            "ApplyExceptionRoots: {}",
+            serde_json::json!({
+                "image": image,
+                "status": "ok",
+                "identity": identity,
+                "symbol_pass2": null,
+                "tables": 1,
+                "roles": 8,
+                "entries": 7,
+                "functions_created": 5,
+                "functions_reapplied": 0,
+                "functions_existing": 2,
+                "names_applied": 5,
+                "names_reapplied": 0,
+                "names_preserved": 1,
+                "names_not_requested": 1,
+                "shared_entries": 1,
+                "applications": applications,
+            })
+        )
+    }
+
+    fn exception_summary(identity: &str) -> String {
+        exception_summary_for("00_BOOT", identity)
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_rejects_aggregate_only_payload() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+
+        let error = parse_apply_exception_roots_summary(
+            &aggregate_only_exception_summary(identity),
+            "00_BOOT",
+            identity,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("symbol_pass2") || error.contains("applications"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn parse_apply_exception_roots_summary_accepts_exact_conserving_payload() {
         let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
-        assert_eq!(
+        let parsed =
             parse_apply_exception_roots_summary(&exception_summary(identity), "00_BOOT", identity)
-                .unwrap(),
-            AppliedExceptionRoots {
-                tables: 1,
-                roles: 8,
-                entries: 7,
-                functions_created: 5,
-                functions_reapplied: 0,
-                functions_existing: 2,
-                names_applied: 5,
-                names_reapplied: 0,
-                names_preserved: 1,
-                names_not_requested: 1,
-                shared_entries: 1,
-            }
+                .unwrap();
+        assert_eq!(parsed.image, "00_BOOT");
+        assert_eq!(parsed.identity, identity);
+        assert_eq!(parsed.tables, 1);
+        assert_eq!(parsed.roles, 8);
+        assert_eq!(parsed.entries, 7);
+        assert_eq!(parsed.functions_created, 5);
+        assert_eq!(parsed.functions_reapplied, 0);
+        assert_eq!(parsed.functions_existing, 2);
+        assert_eq!(parsed.names_applied, 5);
+        assert_eq!(parsed.names_reapplied, 0);
+        assert_eq!(parsed.names_preserved, 1);
+        assert_eq!(parsed.names_not_requested, 1);
+        assert_eq!(parsed.shared_entries, 1);
+        assert_eq!(parsed.applications.len(), 7);
+    }
+
+    fn fixture_exception_summary(identity: &str) -> String {
+        let rows = [
+            ("0x40010200", "arm", Some("Reset"), false),
+            ("0x40010220", "thumb", Some("UndefinedInstruction"), false),
+            ("0x40010240", "arm", Some("SupervisorCall"), false),
+            ("0x40010260", "thumb", Some("PrefetchAbort"), false),
+            ("0x40010280", "arm", None, true),
+            ("0x400102a0", "arm", Some("IRQ"), false),
+            ("0x400102c0", "thumb", Some("FIQ"), false),
+        ];
+        let applications = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (entry, isa, desired, shared))| {
+                let (name_result, disposition, source, name) = match desired {
+                    Some(name) => ("applied", "exception_owned", "analysis", name),
+                    None => ("not_requested", "not_requested", "default", "FUN_40010280"),
+                };
+                serde_json::json!({
+                    "entry": entry,
+                    "isa": isa,
+                    "function_result": "created",
+                    "name_result": name_result,
+                    "shared": shared,
+                    "primary_disposition": disposition,
+                    "current_primary": summary_primary(100 + index as u64, source, name),
+                    "transition": null,
+                })
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "ApplyExceptionRoots: {}",
+            serde_json::json!({
+                "image": "00_BOOT",
+                "status": "ok",
+                "identity": identity,
+                "symbol_pass2": null,
+                "tables": 1,
+                "roles": 8,
+                "entries": 7,
+                "functions_created": 7,
+                "functions_reapplied": 0,
+                "functions_existing": 0,
+                "names_applied": 6,
+                "names_reapplied": 0,
+                "names_preserved": 0,
+                "names_not_requested": 1,
+                "shared_entries": 1,
+                "applications": applications,
+            })
+        )
+    }
+
+    #[test]
+    fn exception_context_constructor_authenticates_artifact_and_rejects_state_key_drift() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots");
+        let raw = std::fs::read(fixture.join("synthetic.bin")).unwrap();
+        let retained = tempfile::tempdir().unwrap();
+        let image_dir = retained.path().join("images/00_BOOT");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::write(image_dir.join("00_BOOT.bin"), &raw).unwrap();
+        let manifest = retained.path().join("exception_roots/00_BOOT/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(fixture.join("roots.json"), &manifest).unwrap();
+        let manifest_blake3 = crate::manifest::blake3_file(&manifest).unwrap();
+        let identity = format!("v1:{manifest_blake3}:1:7");
+        let applied = AppliedExceptionRoots::parse_current(
+            &fixture_exception_summary(&identity),
+            "00_BOOT",
+            &identity,
+        )
+        .unwrap();
+
+        let context = read_exception_pass2_context(ExceptionPass2ContextInput {
+            manifest_path: &manifest,
+            image_dir: &image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            expected_identity: &identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &applied,
+        })
+        .unwrap();
+        assert_eq!(context.identity(), identity);
+
+        let mut aggregate_drifted = applied.clone();
+        aggregate_drifted.tables += 1;
+        let error = read_exception_pass2_context(ExceptionPass2ContextInput {
+            manifest_path: &manifest,
+            image_dir: &image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            expected_identity: &identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &aggregate_drifted,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("aggregate counts"), "{error}");
+
+        let mut provenance_drifted = applied.clone();
+        provenance_drifted.identity =
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7".into();
+        let error = read_exception_pass2_context(ExceptionPass2ContextInput {
+            manifest_path: &manifest,
+            image_dir: &image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            expected_identity: &identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &provenance_drifted,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("identity"), "{error}");
+
+        let mut provenance_drifted = applied.clone();
+        provenance_drifted.image = "01_MAIN".into();
+        let error = read_exception_pass2_context(ExceptionPass2ContextInput {
+            manifest_path: &manifest,
+            image_dir: &image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            expected_identity: &identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &provenance_drifted,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("image"), "{error}");
+
+        let mut drifted = applied.clone();
+        let first = *drifted.applications.keys().next().unwrap();
+        let state = drifted.applications.remove(&first).unwrap();
+        drifted.applications.insert((first.0 + 4, first.1), state);
+        let error = read_exception_pass2_context(ExceptionPass2ContextInput {
+            manifest_path: &manifest,
+            image_dir: &image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            expected_identity: &identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &drifted,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exact application state"), "{error}");
+    }
+
+    #[test]
+    fn exception_context_accepts_repeated_same_role_claims_as_nonshared() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/exception_roots/relocated_same_targets");
+        let retained = tempfile::tempdir().unwrap();
+        let image_dir = retained.path().join("images/00_BOOT");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::copy(fixture.join("synthetic.bin"), image_dir.join("00_BOOT.bin")).unwrap();
+        let manifest = retained.path().join("exception_roots/00_BOOT/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(fixture.join("roots.json"), &manifest).unwrap();
+        let manifest_blake3 = crate::manifest::blake3_file(&manifest).unwrap();
+        let identity = format!("v1:{manifest_blake3}:2:7");
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let applications = wire["applications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, application)| {
+                let desired = application["desired_primary"].as_str();
+                let (name_result, disposition, source, name, shared) = match desired {
+                    Some(name) => ("applied", "exception_owned", "analysis", name, false),
+                    None => (
+                        "not_requested",
+                        "not_requested",
+                        "default",
+                        "FUN_40010280",
+                        true,
+                    ),
+                };
+                serde_json::json!({
+                    "entry": application["entry"],
+                    "isa": application["isa"],
+                    "function_result": "created",
+                    "name_result": name_result,
+                    "shared": shared,
+                    "primary_disposition": disposition,
+                    "current_primary": summary_primary(100 + index as u64, source, name),
+                    "transition": null,
+                })
+            })
+            .collect::<Vec<_>>();
+        let summary = format!(
+            "ApplyExceptionRoots: {}",
+            serde_json::json!({
+                "image": "00_BOOT",
+                "status": "ok",
+                "identity": identity,
+                "symbol_pass2": null,
+                "tables": 2,
+                "roles": 16,
+                "entries": 7,
+                "functions_created": 7,
+                "functions_reapplied": 0,
+                "functions_existing": 0,
+                "names_applied": 6,
+                "names_reapplied": 0,
+                "names_preserved": 0,
+                "names_not_requested": 1,
+                "shared_entries": 1,
+                "applications": applications,
+            })
         );
+        let applied = AppliedExceptionRoots::parse_current(&summary, "00_BOOT", &identity).unwrap();
+
+        let context = read_exception_pass2_context(ExceptionPass2ContextInput {
+            manifest_path: &manifest,
+            image_dir: &image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            expected_identity: &identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &applied,
+        })
+        .unwrap();
+
+        assert_eq!(context.identity(), identity);
     }
 
     #[test]
@@ -7277,6 +8134,40 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn parse_apply_exception_roots_summary_rejects_values_outside_named_bounds() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        for stdout in [
+            exception_summary(identity).replacen("\"tables\":1", "\"tables\":3", 1),
+            exception_summary(identity).replacen("\"roles\":8", "\"roles\":17", 1),
+            exception_summary(identity).replacen(
+                "\"symbol_pass2\":null",
+                &format!(
+                    "\"symbol_pass2\":\"v3:{}:{}:262145\"",
+                    "b".repeat(64),
+                    "c".repeat(64)
+                ),
+                1,
+            ),
+        ] {
+            assert!(
+                parse_apply_exception_roots_summary(&stdout, "00_BOOT", identity).is_err(),
+                "accepted out-of-bounds summary: {stdout}"
+            );
+        }
+
+        let oversized = format!(
+            "{}{}",
+            exception_summary(identity),
+            " ".repeat(APPLY_EXCEPTION_ROOTS_SUMMARY_MAX_BYTES)
+        );
+        assert!(
+            parse_apply_exception_roots_summary(&oversized, "00_BOOT", identity)
+                .unwrap_err()
+                .contains("byte limit")
+        );
+    }
+
+    #[test]
     fn parse_apply_exception_roots_summary_rejects_status_and_nonconservation() {
         let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
         for stdout in [
@@ -7297,6 +8188,74 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn parse_apply_exception_roots_summary_rejects_impossible_replay_results() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        let summary = exception_summary(identity)
+            .replacen(
+                "\"function_result\":\"created\"",
+                "\"function_result\":\"reapplied\"",
+                1,
+            )
+            .replacen("\"functions_created\":5", "\"functions_created\":4", 1)
+            .replacen("\"functions_reapplied\":0", "\"functions_reapplied\":1", 1);
+
+        let error = parse_apply_exception_roots_summary(&summary, "00_BOOT", identity).unwrap_err();
+
+        assert!(
+            error.contains("function_result") && error.contains("name_result"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_accepts_owned_primary_on_existing_function_replay() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        let mut value: serde_json::Value = serde_json::from_str(
+            exception_summary(identity)
+                .strip_prefix("ApplyExceptionRoots: ")
+                .expect("summary prefix"),
+        )
+        .unwrap();
+        value["applications"][5]["name_result"] = serde_json::json!("reapplied");
+        value["applications"][5]["primary_disposition"] = serde_json::json!("exception_owned");
+        value["applications"][5]["current_primary"] = summary_primary(15, "analysis", "IRQ");
+        value["names_reapplied"] = serde_json::json!(1);
+        value["names_preserved"] = serde_json::json!(0);
+        let summary = format!("ApplyExceptionRoots: {value}");
+
+        let parsed = parse_apply_exception_roots_summary(&summary, "00_BOOT", identity).unwrap();
+
+        let application = &parsed.applications[&(0x4001_02a0, DecodeIsa::Arm)];
+        assert_eq!(
+            application.function_result,
+            ExceptionFunctionResult::Existing
+        );
+        assert_eq!(application.name_result, ExceptionNameResult::Reapplied);
+    }
+
+    #[test]
+    fn parse_apply_exception_roots_summary_rejects_nonshared_not_requested_state() {
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:7";
+        let valid = exception_summary(identity);
+        let mut value: serde_json::Value = serde_json::from_str(
+            valid
+                .strip_prefix("ApplyExceptionRoots: ")
+                .expect("summary prefix"),
+        )
+        .unwrap();
+        value["applications"][6]["shared"] = serde_json::json!(false);
+        value["shared_entries"] = serde_json::json!(0);
+        let summary = format!("ApplyExceptionRoots: {value}");
+
+        let error = parse_apply_exception_roots_summary(&summary, "00_BOOT", identity).unwrap_err();
+
+        assert!(
+            error.contains("not_requested") && error.contains("shared"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn valid_exception_summary_survives_pal_summary_failure() {
         let manifest_blake3 = "a".repeat(64);
         let roots_identity = format!("v1:{manifest_blake3}:1:7");
@@ -7309,7 +8268,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         };
         let pal_identity = format!("v1:{}:2:2", "b".repeat(64));
         let stdout = format!(
-            "ApplyExceptionRoots: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{roots_identity}\",\"tables\":1,\"roles\":8,\"entries\":7,\"functions_created\":5,\"functions_reapplied\":0,\"functions_existing\":2,\"names_applied\":5,\"names_reapplied\":0,\"names_preserved\":1,\"names_not_requested\":1,\"shared_entries\":1}}\nApplyPalTasks: {{not json}}"
+            "{}\nApplyPalTasks: {{not json}}",
+            exception_summary_for("02_MAIN", &roots_identity)
         );
 
         let coordinated = coordinate_application_summaries(
@@ -7322,22 +8282,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             }),
         );
 
-        assert_eq!(
-            coordinated.exception_roots_applied,
-            Some(AppliedExceptionRoots {
-                tables: 1,
-                roles: 8,
-                entries: 7,
-                functions_created: 5,
-                functions_reapplied: 0,
-                functions_existing: 2,
-                names_applied: 5,
-                names_reapplied: 0,
-                names_preserved: 1,
-                names_not_requested: 1,
-                shared_entries: 1,
-            })
-        );
+        let applied = coordinated.exception_roots_applied.as_ref().unwrap();
+        assert_eq!(applied.entries, 7);
+        assert_eq!(applied.functions_created, 5);
+        assert_eq!(applied.functions_existing, 2);
+        assert_eq!(applied.names_applied, 5);
+        assert_eq!(applied.names_preserved, 1);
+        assert_eq!(applied.names_not_requested, 1);
         assert_eq!(coordinated.exception_error, None);
         assert_eq!(coordinated.pal_applied, None);
         assert!(

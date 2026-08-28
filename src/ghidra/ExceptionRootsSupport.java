@@ -2392,8 +2392,9 @@ final class ExceptionRootsSupport {
                 name, MAX_SYMBOL_UTF8_BYTES, "exception-root primary"));
     }
 
-    static void validatePass2Transition(RegistryEntry registry,
-            PalTasksSupport.MapDecision decision, Address entry) {
+    static void validatePass2Transition(Program program, RegistryEntry registry,
+            PalTasksSupport.MapExecution execution, PalTasksSupport.MapDecision decision,
+            Address entry) {
         if (!"pass2_owned".equals(registry.primaryDisposition)) {
             fail("the exception registry disposition at " + entry
                     + " is not pass2_owned");
@@ -2401,34 +2402,135 @@ final class ExceptionRootsSupport {
         if (!decision.exceptionTransitionAuthority.equals(registry.transitionAuthority)) {
             fail("exception transition authority does not match the symbol map at " + entry);
         }
-        if (!primaryNameDigest(decision.originalPrimary).equals(
-                registry.transitionOriginalPrimaryBlake3)) {
+        if (decision.exceptionTransitionOriginal == null
+                || decision.exceptionTransitionFinal == null) {
+            fail("exception transition identities are missing at " + entry);
+        }
+        String executionIsa = execution.decodeRanges.get(0).isa;
+        if (registry.entry != execution.entry || !registry.isa.equals(executionIsa)) {
+            fail("exception transition key does not match the registry at " + entry);
+        }
+        if (registry.primaryId == null
+                || registry.primaryId.longValue()
+                        != decision.exceptionTransitionOriginal.symbolId
+                || registry.primaryId.longValue()
+                        != decision.exceptionTransitionFinal.symbolId) {
+            fail("exception transition symbol ID does not match the registry at " + entry);
+        }
+        if (!decision.exceptionTransitionOriginal.nameBlake3.equals(
+                    registry.transitionOriginalPrimaryBlake3)
+                || !primaryNameDigest(decision.originalPrimary).equals(
+                        registry.transitionOriginalPrimaryBlake3)
+                || !"analysis".equals(decision.exceptionTransitionOriginal.source)) {
             fail("exception transition original primary does not match the symbol map at "
                     + entry);
         }
-        if (!decision.finalSource.equals(registry.primarySource)
-                || !primaryNameDigest(decision.finalPrimary).equals(
-                        registry.primaryNameBlake3)) {
+        if (!decision.exceptionTransitionFinal.source.equals(registry.primarySource)
+                || !decision.exceptionTransitionFinal.nameBlake3.equals(
+                        registry.primaryNameBlake3)
+                || !decision.finalSource.equals(registry.primarySource)
+                || !primaryNameDigest(decision.finalPrimary).equals(registry.primaryNameBlake3)) {
             fail("exception transition final primary does not match the symbol map at "
                     + entry);
+        }
+        Function function = program.getFunctionManager().getFunctionAt(entry);
+        if (function == null || function.getID() != registry.functionId) {
+            fail("exception transition function binding is stale at " + entry);
+        }
+        Symbol current = function.getSymbol();
+        if (current.getID() != decision.exceptionTransitionFinal.symbolId
+                || !PmeScriptSupport.primarySource(current.getSource()).equals(
+                        decision.exceptionTransitionFinal.source)
+                || !current.getName().equals(decision.exceptionTransitionFinal.name)
+                || !primaryNameDigest(current.getName()).equals(
+                        decision.exceptionTransitionFinal.nameBlake3)) {
+            fail("exception transition current primary does not match the symbol map at " + entry);
         }
     }
 
     static void validatePass2Transitions(Program program, PalTasksSupport.SymbolMap map) {
-        StringPropertyMap registry = currentRegistry(program);
-        Set<Address> expected = new HashSet<Address>();
+        Set<String> expected = pass2TransitionKeys(program, map);
+        validateCurrentPass2Transitions(program, map);
+        Set<String> actual = pass2OwnedRegistryKeys(program);
+        if (!actual.equals(expected)) {
+            fail("the pass2_owned exception registry and symbol-map transitions are not bijective");
+        }
+    }
+
+    /**
+     * Before mutation, every already-transitioned registry row must still be
+     * represented by the successor map. Map rows that remain exception_owned
+     * are validated individually by ApplySymbols and become pass2_owned only
+     * after mutation; postflight then requires exact set equality.
+     */
+    static void validatePass2TransitionPreflight(
+            Program program, PalTasksSupport.SymbolMap map) {
+        Set<String> expected = pass2TransitionKeys(program, map);
+        Set<String> actual = pass2OwnedRegistryKeys(program);
+        validatePass2Lineage(program, actual);
+        if (!expected.containsAll(actual)) {
+            fail("the pass2_owned exception registry and symbol-map transitions are not bijective");
+        }
+    }
+
+    static void validatePass2Lineage(Program program) {
+        validatePass2Lineage(program, pass2OwnedRegistryKeys(program));
+    }
+
+    private static void validatePass2Lineage(Program program, Set<String> transitions) {
+        if (!transitions.isEmpty() && program.getOptions(Program.PROGRAM_INFO)
+                .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null) == null) {
+            fail("pass2_owned exception registry lacks SymbolPass2 lineage");
+        }
+    }
+
+    private static Set<String> pass2TransitionKeys(
+            Program program, PalTasksSupport.SymbolMap map) {
+        Set<String> expected = new HashSet<String>();
         for (int index = 0; index < map.decisions.size(); index++) {
             PalTasksSupport.MapDecision decision = map.decisions.get(index);
             if (decision.exceptionTransitionAuthority == null) continue;
+            PalTasksSupport.MapExecution execution = map.executions.get(index);
             Address entry = PmeScriptSupport.programAddress(
-                    program, map.executions.get(index).entry);
-            if (!expected.add(entry)) {
+                    program, execution.entry);
+            String key = rootKey(execution.entry, execution.decodeRanges.get(0).isa);
+            if (!expected.add(key)) {
                 fail("the symbol map carries duplicate exception transitions at " + entry);
             }
+        }
+        return expected;
+    }
+
+    private static void validateCurrentPass2Transitions(
+            Program program, PalTasksSupport.SymbolMap map) {
+        StringPropertyMap registry = currentRegistry(program);
+        for (int index = 0; index < map.decisions.size(); index++) {
+            PalTasksSupport.MapDecision decision = map.decisions.get(index);
+            if (decision.exceptionTransitionAuthority == null) continue;
+            PalTasksSupport.MapExecution execution = map.executions.get(index);
+            Address entry = PmeScriptSupport.programAddress(program, execution.entry);
             RegistryEntry retained = parseRegistry(
                     registry == null ? null : registry.getString(entry));
-            validatePass2Transition(retained, decision, entry);
+            validatePass2Transition(program, retained, execution, decision, entry);
         }
+    }
+
+    private static Set<String> pass2OwnedRegistryKeys(Program program) {
+        StringPropertyMap registry = currentRegistry(program);
+        Set<String> actual = new HashSet<String>();
+        if (registry != null) {
+            AddressIterator entries = registry.getPropertyIterator();
+            while (entries.hasNext()) {
+                Address entry = entries.next();
+                RegistryEntry retained = parseRegistry(registry.getString(entry));
+                if (!"pass2_owned".equals(retained.primaryDisposition)) continue;
+                String key = rootKey(retained.entry, retained.isa);
+                if (!actual.add(key)) {
+                    fail("the exception registry carries a duplicate pass2_owned key at " + entry);
+                }
+            }
+        }
+        return actual;
     }
 
     static String registryValue(RegistryEntry entry) {

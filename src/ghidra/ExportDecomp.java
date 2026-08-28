@@ -169,6 +169,9 @@ public class ExportDecomp extends HeadlessScript {
                     if (property != null) {
                         fail("a pass-1/single-pass export requires the SymbolPass2 property absent");
                     }
+                    if (roots != null) {
+                        ExceptionRootsSupport.validatePass2Lineage(currentProgram);
+                    }
                 }
                 else {
                     if ("none".equals(mapHash)) {
@@ -196,6 +199,7 @@ public class ExportDecomp extends HeadlessScript {
                     String property = currentProgram.getOptions(
                             ghidra.program.model.listing.Program.PROGRAM_INFO)
                             .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+                    PalTasksSupport.validateSymbolPass2Property(property);
                     if (!expectedProperty.equals(property)) {
                         fail("stale SymbolPass2 property: expected " + expectedProperty
                                 + " but found " + property);

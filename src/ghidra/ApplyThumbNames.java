@@ -205,7 +205,9 @@ public class ApplyThumbNames extends HeadlessScript {
         String expectedPass2Property = PalTasksSupport.expectedSymbolPass2Property(map);
         String priorPass2Property = currentProgram.getOptions(Program.PROGRAM_INFO)
                 .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-        if (priorPass2Property != null && !expectedPass2Property.equals(priorPass2Property)) {
+        PalTasksSupport.validateSymbolPass2Property(priorPass2Property);
+        if (!java.util.Objects.equals(priorPass2Property, map.predecessorSymbolPass2)
+                && !expectedPass2Property.equals(priorPass2Property)) {
             fail("the saved program belongs to a different symbol-map application");
         }
         Register tMode = currentProgram.getLanguage().getRegister("TMode");

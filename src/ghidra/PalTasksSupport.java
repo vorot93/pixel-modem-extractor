@@ -1,7 +1,7 @@
 // PalTasksSupport.java - the one shared strict PAL support class for
 // pixel-modem-extractor Ghidra scripts. Package-private on purpose: every
 // PAL-aware script in the generated kit (ApplyPalTasks, TameAnalysis,
-// ApplySymbols, ExportDecomp) parses PAL manifests, the v3 symbol map,
+// ApplySymbols, ExportDecomp) parses PAL manifests, the v4 symbol map,
 // the ownership registry, and the domain-separated digest grammars through
 // this single copy; no script may grow a second permissive parser or trust
 // a summary/property in place of inspecting the concrete program state.
@@ -77,6 +77,7 @@ final class PalTasksSupport {
             "PixelModemExtractor.ThumbNames.v1.Ownership";
     static final String PAL_PROPERTY = "PixelModemExtractor.PalTasks";
     static final String SYMBOL_PASS2_PROPERTY = "PixelModemExtractor.SymbolPass2";
+    static final int MAX_SYMBOL_PASS2_BYTES = 192;
     static final String NONE_IDENTITY = "none";
     static final String IDENTITY_VERSION = "v1";
     static final String SEMANTIC_ADAPTER = "pixel-modem-extractor-arm32-v1";
@@ -407,8 +408,35 @@ final class PalTasksSupport {
     }
 
     static String expectedSymbolPass2Property(SymbolMap map) {
-        return "v2:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":"
+        return "v3:" + map.mapBlake3 + ":" + map.functionsBlake3 + ":"
                 + map.executions.size();
+    }
+
+    static void validateSymbolPass2Property(String value) {
+        if (value == null) return;
+        byte[] bytes = value.getBytes(StandardCharsets.US_ASCII);
+        if (bytes.length > MAX_SYMBOL_PASS2_BYTES
+                || !value.equals(new String(bytes, StandardCharsets.US_ASCII))) {
+            fail("SymbolPass2 property exceeds the bounded ASCII grammar");
+        }
+        String[] parts = value.split(":", -1);
+        if (parts.length != 4 || !"v3".equals(parts[0])) {
+            fail("SymbolPass2 property does not have the exact v3 grammar");
+        }
+        requireHashText(parts[1], "SymbolPass2 map BLAKE3");
+        requireHashText(parts[2], "SymbolPass2 functions BLAKE3");
+        if (!parts[3].matches("0|[1-9][0-9]*")) {
+            fail("SymbolPass2 execution count is not canonical unsigned decimal");
+        }
+        try {
+            long count = Long.parseLong(parts[3]);
+            if (count > MAX_EXECUTIONS) {
+                fail("SymbolPass2 execution count exceeds the map limit");
+            }
+        }
+        catch (NumberFormatException error) {
+            fail("SymbolPass2 execution count overflows the signed 64-bit domain");
+        }
     }
 
     static String thumbCreationOwnershipValue(SymbolMap map, MapCreation creation,
@@ -508,6 +536,54 @@ final class PalTasksSupport {
         String currentDigest = currentExecutionDigest(program, monitor, function);
         if (!parsed.ghidraExecutionBlake3.equals(currentDigest)) {
             fail("the owned Thumb creation body changed at " + entry);
+        }
+    }
+
+    /**
+     * Validate the complete map-owned creation state before SymbolPass2 can
+     * advance. Unowned skipped requests are allowed, but an exact current
+     * requested primary without ownership and every registry key absent from
+     * the map fail closed.
+     */
+    static void validateThumbCreationState(
+            Program program, TaskMonitor monitor, SymbolMap map) throws Exception {
+        FunctionManager functions = program.getFunctionManager();
+        StringPropertyMap ownership = program.getUsrPropertyManager()
+                .getStringPropertyMap(THUMB_CREATION_OWNERSHIP_MAP);
+        Set<Long> requested = new HashSet<Long>();
+        for (MapCreation creation : map.creations) {
+            monitor.checkCancelled();
+            validateThumbCreationExecution(program, monitor, creation);
+            Address entry = programAddress(program, creation.entry);
+            String owned = ownership == null ? null : ownership.getString(entry);
+            if (owned != null) {
+                validateOwnedThumbCreation(program, monitor, ownership, map, creation);
+            }
+            else {
+                Function function = functions.getFunctionAt(entry);
+                if (function != null && creation.finalPrimary.equals(function.getName())
+                        && creation.finalSource.equals(primarySource(
+                                function.getSymbol().getSource()))) {
+                    fail("an exact Thumb creation lacks ownership at " + entry);
+                }
+            }
+            requested.add(creation.entry);
+        }
+        if (ownership != null) {
+            AddressIterator entries = ownership.getPropertyIterator();
+            while (entries.hasNext()) {
+                monitor.checkCancelled();
+                Address entry = entries.next();
+                if (!entry.getAddressSpace().equals(
+                        program.getAddressFactory().getDefaultAddressSpace())) {
+                    fail("the Thumb creation registry uses a non-default address space at "
+                            + entry);
+                }
+                if (!requested.contains(entry.getOffset())) {
+                    fail("the Thumb creation registry has an entry absent from the map at "
+                            + entry);
+                }
+            }
         }
     }
 
@@ -766,11 +842,15 @@ final class PalTasksSupport {
         final String action;
         final List<String> annotations;
         final String exceptionTransitionAuthority;
+        final MapPrimaryIdentity exceptionTransitionOriginal;
+        final MapPrimaryIdentity exceptionTransitionFinal;
         final boolean palTransition;
 
         MapDecision(long execution, String originalPrimary, String originalSource,
                 String finalPrimary, String finalSource, String action, List<String> annotations,
-                String exceptionTransitionAuthority, boolean palTransition) {
+                String exceptionTransitionAuthority,
+                MapPrimaryIdentity exceptionTransitionOriginal,
+                MapPrimaryIdentity exceptionTransitionFinal, boolean palTransition) {
             this.execution = execution;
             this.originalPrimary = originalPrimary;
             this.originalSource = originalSource;
@@ -779,7 +859,23 @@ final class PalTasksSupport {
             this.action = action;
             this.annotations = annotations;
             this.exceptionTransitionAuthority = exceptionTransitionAuthority;
+            this.exceptionTransitionOriginal = exceptionTransitionOriginal;
+            this.exceptionTransitionFinal = exceptionTransitionFinal;
             this.palTransition = palTransition;
+        }
+    }
+
+    static final class MapPrimaryIdentity {
+        final long symbolId;
+        final String source;
+        final String name;
+        final String nameBlake3;
+
+        MapPrimaryIdentity(long symbolId, String source, String name, String nameBlake3) {
+            this.symbolId = symbolId;
+            this.source = source;
+            this.name = name;
+            this.nameBlake3 = nameBlake3;
         }
     }
 
@@ -830,6 +926,7 @@ final class PalTasksSupport {
         final String manifestBlake3;
         final String scatterLoadMapBlake3;
         final String functionsBlake3;
+        final String predecessorSymbolPass2;
         final List<MapExecution> executions;
         final List<MapDecision> decisions;
         final List<MapCreation> creations;
@@ -838,7 +935,8 @@ final class PalTasksSupport {
         SymbolMap(String imageLabel, long imageBase, long imageSize, String imageBlake3,
                 String exceptionIdentity, String exceptionManifestBlake3,
                 String palIdentity, String manifestBlake3, String scatterLoadMapBlake3,
-                String functionsBlake3, List<MapExecution> executions,
+                String functionsBlake3, String predecessorSymbolPass2,
+                List<MapExecution> executions,
                 List<MapDecision> decisions, List<MapCreation> creations, String mapBlake3) {
             this.imageLabel = imageLabel;
             this.imageBase = imageBase;
@@ -850,6 +948,7 @@ final class PalTasksSupport {
             this.manifestBlake3 = manifestBlake3;
             this.scatterLoadMapBlake3 = scatterLoadMapBlake3;
             this.functionsBlake3 = functionsBlake3;
+            this.predecessorSymbolPass2 = predecessorSymbolPass2;
             this.executions = executions;
             this.decisions = decisions;
             this.creations = creations;
@@ -2854,7 +2953,8 @@ final class PalTasksSupport {
             return new SymbolMap(wire.imageLabel, wire.imageBase, wire.imageSize,
                     wire.imageBlake3, wire.exceptionIdentity, wire.exceptionManifestBlake3,
                     wire.palIdentity, wire.manifestBlake3,
-                    wire.scatterLoadMapBlake3, wire.functionsBlake3, wire.executions,
+                    wire.scatterLoadMapBlake3, wire.functionsBlake3,
+                    wire.predecessorSymbolPass2, wire.executions,
                     wire.decisions, wire.creations, mapBlake3);
         }
         catch (PalError error) {
@@ -2876,6 +2976,7 @@ final class PalTasksSupport {
         String manifestBlake3;
         String scatterLoadMapBlake3;
         String functionsBlake3;
+        String predecessorSymbolPass2;
         List<MapExecution> executions = new ArrayList<>();
         List<MapDecision> decisions = new ArrayList<>();
         List<MapCreation> creations = new ArrayList<>();
@@ -2964,6 +3065,13 @@ final class PalTasksSupport {
 
         name(reader, "functions_blake3");
         wire.functionsBlake3 = hashValue(reader, "functions_blake3");
+
+        name(reader, "predecessor_symbol_pass2");
+        if (!nullValue(reader, "predecessor_symbol_pass2")) {
+            wire.predecessorSymbolPass2 = stringValue(
+                    reader, "predecessor_symbol_pass2");
+            validateSymbolPass2Property(wire.predecessorSymbolPass2);
+        }
 
         name(reader, "executions");
         beginArray(reader, "executions");
@@ -3086,6 +3194,8 @@ final class PalTasksSupport {
             }
             endArray(reader, "annotations");
             String exceptionTransitionAuthority = null;
+            MapPrimaryIdentity exceptionTransitionOriginal = null;
+            MapPrimaryIdentity exceptionTransitionFinal = null;
             name(reader, "exception_transition");
             if (!nullValue(reader, "exception_transition")) {
                 reader.beginObject();
@@ -3105,7 +3215,13 @@ final class PalTasksSupport {
                         && !"registration".equals(exceptionTransitionAuthority)) {
                     fail("exception_transition authority is not func or registration");
                 }
-                endObject(reader, "authority");
+                name(reader, "original_primary");
+                exceptionTransitionOriginal = readMapPrimaryIdentity(
+                        reader, "exception_transition original_primary");
+                name(reader, "final_primary");
+                exceptionTransitionFinal = readMapPrimaryIdentity(
+                        reader, "exception_transition final_primary");
+                endObject(reader, "final_primary");
             }
             boolean palTransition = false;
             name(reader, "pal_transition");
@@ -3157,9 +3273,24 @@ final class PalTasksSupport {
             if (exceptionTransitionAuthority != null && !"user_defined".equals(finalSource)) {
                 fail("an exception transition does not produce a user_defined primary");
             }
+            if (exceptionTransitionAuthority != null) {
+                if (!originalPrimary.equals(exceptionTransitionOriginal.name)
+                        || !originalSource.equals(exceptionTransitionOriginal.source)
+                        || !finalPrimary.equals(exceptionTransitionFinal.name)
+                        || !finalSource.equals(exceptionTransitionFinal.source)
+                        || exceptionTransitionOriginal.symbolId
+                                != exceptionTransitionFinal.symbolId
+                        || !"analysis".equals(exceptionTransitionOriginal.source)
+                        || !"user_defined".equals(exceptionTransitionFinal.source)
+                        || exceptionTransitionOriginal.name.equals(
+                                exceptionTransitionFinal.name)) {
+                    fail("exception transition primary identities do not match the decision");
+                }
+            }
             wire.decisions.add(new MapDecision(execution, originalPrimary, originalSource,
                     finalPrimary, finalSource, action, annotations,
-                    exceptionTransitionAuthority, palTransition));
+                    exceptionTransitionAuthority, exceptionTransitionOriginal,
+                    exceptionTransitionFinal, palTransition));
         }
          endArray(reader, "symbols");
          if (wire.decisions.size() != wire.executions.size()) {
@@ -3258,9 +3389,31 @@ final class PalTasksSupport {
          return wire;
     }
 
+    private static MapPrimaryIdentity readMapPrimaryIdentity(JsonReader reader, String what)
+            throws IOException {
+        reader.beginObject();
+        name(reader, "symbol_id");
+        long symbolId = unsignedValue(reader, Long.MAX_VALUE, what + " symbol_id");
+        name(reader, "source");
+        String source = requireSourceName(stringValue(reader, what + " source"));
+        name(reader, "name");
+        String primary = mapString(reader, what + " name");
+        if (primary.length() > MAX_SYMBOL_LEAF_CHARS) {
+            fail(what + " name exceeds the Ghidra symbol leaf limit");
+        }
+        name(reader, "name_blake3");
+        String nameBlake3 = hashValue(reader, what + " name_blake3");
+        endObject(reader, "name_blake3");
+        if (!ExceptionRootsSupport.primaryNameDigest(primary).equals(nameBlake3)) {
+            fail(what + " name digest does not match its exact UTF-8 bytes");
+        }
+        return new MapPrimaryIdentity(symbolId, source, primary, nameBlake3);
+    }
+
     private static String requireSourceName(String source) {
         if (!"default".equals(source) && !"analysis".equals(source)
-                && !"imported".equals(source) && !"user_defined".equals(source)) {
+                && !"ai".equals(source) && !"imported".equals(source)
+                && !"user_defined".equals(source)) {
             fail("unknown symbol source " + source);
         }
         return source;

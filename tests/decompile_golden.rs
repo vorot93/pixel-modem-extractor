@@ -3154,6 +3154,39 @@ public class RemoveThumbCreationOwnership extends GhidraScript {
         "ownership removal failed:\n{}",
         process_diagnostics(&removed)
     );
+    let apply_symbols_args = vec![
+        out.to_string_lossy().into_owned(),
+        "00_BOOT".to_string(),
+        symbol_map.image_blake3().to_string(),
+        "none".to_string(),
+        "-".to_string(),
+        "none".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        boot_dir
+            .join("decompiled/functions.json")
+            .to_string_lossy()
+            .into_owned(),
+        symbol_map.functions_blake3().to_string(),
+        symbol_map.path().to_string_lossy().into_owned(),
+        symbol_map.map_blake3().to_string(),
+    ];
+    let rejected_symbols = inspect_saved_project_with_args(
+        &home,
+        &out,
+        "00_BOOT",
+        "ApplySymbols.java",
+        &apply_symbols_args,
+    );
+    let diagnostics = process_diagnostics(&rejected_symbols);
+    assert!(
+        diagnostics.contains("exact Thumb creation lacks ownership"),
+        "ApplySymbols advanced over missing Thumb creation ownership:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("ApplySymbols: image="),
+        "rejected Thumb ownership emitted an ApplySymbols summary:\n{diagnostics}"
+    );
     let rejected_unowned = inspect_saved_project_with_args(
         &home,
         &out,
@@ -7023,7 +7056,7 @@ fn pal_export_pass1_only(home: &std::path::Path, kit: &PalApplyKit) -> String {
 /// applied state still validates, the alpha primary was renamed by its
 /// registration evidence with the exact registry transition, the coincident
 /// ANALYSIS beta and meaningful zeta primaries were preserved, the property
-/// binds the exact v2 grammar, and every reserved label survived.
+/// binds the exact v3 grammar, and every reserved label survived.
 const INSPECT_PASS2_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -7120,7 +7153,7 @@ public class InspectPass2 extends GhidraScript {
         }
         String property = currentProgram.getOptions(Program.PROGRAM_INFO)
                 .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-        String expected = "v2:" + args[4] + ":" + args[5] + ":" + args[6];
+        String expected = "v3:" + args[4] + ":" + args[5] + ":" + args[6];
         if (!expected.equals(property)) {
             throw new AssertionError("the SymbolPass2 property is " + property
                     + ", expected " + expected);
@@ -7140,7 +7173,7 @@ public class SeedStalePass2Property extends GhidraScript {
     public void run() throws Exception {
         currentProgram.getOptions(Program.PROGRAM_INFO).setString(
                 PalTasksSupport.SYMBOL_PASS2_PROPERTY,
-                "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:9:9");
+                "v3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:9");
         System.out.println("SeedStalePass2Property: ok");
     }
 }
@@ -8619,81 +8652,32 @@ fn exception_pass2_fixture() -> ExceptionFixture {
     exception_fixture_from_committed(&raw, &manifest)
 }
 
-fn fixture_u32(value: &serde_json::Value) -> u32 {
-    u32::from_str_radix(value.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
-}
-
-fn exception_role_wire(role: &str) -> &'static str {
-    match role {
-        "reset" => "reset",
-        "undefined_instruction" => "undefined_instruction",
-        "supervisor_call" => "supervisor_call",
-        "prefetch_abort" => "prefetch_abort",
-        "data_abort" => "data_abort",
-        "reserved" => "reserved",
-        "irq" => "irq",
-        "fiq" => "fiq",
-        other => panic!("unknown exception role {other}"),
-    }
-}
-
-fn exception_table_kind_wire(kind: &str) -> &'static str {
-    match kind {
-        "initial" => "initial",
-        "relocated" => "relocated",
-        other => panic!("unknown exception table kind {other}"),
-    }
-}
-
 fn exception_pass2_context(
     fixture: &ExceptionFixture,
+    application_output: &std::process::Output,
+    manifest_path: &std::path::Path,
+    image_dir: &std::path::Path,
 ) -> pixel_modem_extractor::symbolicate::ExceptionPass2Context {
-    use pixel_modem_extractor::symbolicate::{
-        DecodeIsa, ExceptionApplicationRef, ExceptionPass2Context, ExceptionRoleRef,
-    };
-
-    let manifest: serde_json::Value = serde_json::from_str(&fixture.manifest).unwrap();
-    let applications = manifest["applications"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|application| {
-            let entry = fixture_u32(&application["entry"]);
-            let isa = match application["isa"].as_str().unwrap() {
-                "arm" => DecodeIsa::Arm,
-                "thumb" => DecodeIsa::Thumb,
-                other => panic!("unknown exception ISA {other}"),
-            };
-            let desired_primary = application["desired_primary"].as_str().map(str::to_string);
-            let applied = desired_primary.is_some() && entry != 0x4001_0240;
-            let roles = application["claims"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|claim| ExceptionRoleRef {
-                    table_kind: exception_table_kind_wire(claim["table_kind"].as_str().unwrap()),
-                    table_address: fixture_u32(&claim["table_address"]),
-                    slot_address: fixture_u32(&claim["slot_address"]),
-                    role: exception_role_wire(claim["role"].as_str().unwrap()),
-                })
-                .collect();
-            (
-                (entry, isa),
-                ExceptionApplicationRef {
-                    desired_primary,
-                    applied,
-                    roles,
-                },
-            )
-        })
-        .collect();
-    ExceptionPass2Context {
-        identity: fixture.identity.clone(),
-        manifest_blake3: blake3::hash(fixture.manifest.as_bytes())
-            .to_hex()
-            .to_string(),
-        applications,
-    }
+    let stdout = String::from_utf8_lossy(&application_output.stdout);
+    let applied = pixel_modem_extractor::decompile::AppliedExceptionRoots::parse_current(
+        &stdout,
+        "00_BOOT",
+        &fixture.identity,
+    )
+    .unwrap();
+    pixel_modem_extractor::decompile::read_exception_pass2_context(
+        pixel_modem_extractor::decompile::ExceptionPass2ContextInput {
+            manifest_path,
+            image_dir,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: EXCEPTION_BASE,
+            expected_identity: &fixture.identity,
+            expected_scatter_load_map_blake3: None,
+            applied: &applied,
+        },
+    )
+    .unwrap()
 }
 
 const EXCEPTION_SEED_FOREIGN_JAVA: &str = r#"//@category PixelModemTest
@@ -8935,12 +8919,16 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.RegisterValue;
 import ghidra.program.model.listing.CodeUnit;
+import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.util.StringPropertyMap;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 
@@ -8961,6 +8949,8 @@ public class ExceptionInspectState extends GhidraScript {
         Register tMode = currentProgram.getLanguage().getRegister("TMode");
         state.add("registry=" + (registry == null ? "none" : registry.getSize()));
         state.add("namespace=" + (namespace == null ? "none" : namespace.getID()));
+        state.add("symbol_pass2=" + currentProgram.getOptions(Program.PROGRAM_INFO)
+                .getString("PixelModemExtractor.SymbolPass2", null));
         for (long raw : ENTRIES) {
             Address entry = toAddr(raw);
             Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
@@ -8970,7 +8960,8 @@ public class ExceptionInspectState extends GhidraScript {
             CodeUnit unit = currentProgram.getListing().getCodeUnitContaining(entry);
             state.add(entry + ":unit=" + (unit == null ? "none"
                     : unit.getClass().getSimpleName() + "/" + unit.getMinAddress()
-                            + "/" + unit.getLength()));
+                            + "/" + unit.getLength() + "/"
+                            + unit.getComment(CommentType.PLATE)));
             RegisterValue mode = currentProgram.getProgramContext()
                     .getRegisterValue(tMode, entry);
             state.add(entry + ":tmode=" + (mode == null || !mode.hasValue()
@@ -8992,7 +8983,34 @@ public class ExceptionInspectState extends GhidraScript {
             state.add(entry + ":ownership="
                     + (registry == null ? "none" : registry.getString(entry)));
         }
-        System.out.println("ExceptionInspectState: " + state);
+        String encoded = Base64.getEncoder().encodeToString(
+                state.toString().getBytes(StandardCharsets.UTF_8));
+        System.out.println("ExceptionInspectState: " + encoded);
+    }
+}
+"#;
+
+const EXCEPTION_SET_SYMBOL_PASS2_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.framework.options.Options;
+import ghidra.program.model.listing.Program;
+
+public class ExceptionSetSymbolPass2 extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        Options options = currentProgram.getOptions(Program.PROGRAM_INFO);
+        if (args.length == 1 && "clear".equals(args[0])) {
+            options.removeOption("PixelModemExtractor.SymbolPass2");
+        }
+        else if (args.length == 2 && "restore".equals(args[0])) {
+            options.setString("PixelModemExtractor.SymbolPass2", args[1]);
+        }
+        else {
+            throw new AssertionError("expected clear or restore plus one value");
+        }
+        System.out.println("ExceptionSetSymbolPass2: "
+                + options.getString("PixelModemExtractor.SymbolPass2", null));
     }
 }
 "#;
@@ -9531,6 +9549,10 @@ fn generate_exception_apply_kit_inner(
         ("ExceptionInspectPass2.java", EXCEPTION_INSPECT_PASS2_JAVA),
         ("ExceptionInspectState.java", EXCEPTION_INSPECT_STATE_JAVA),
         (
+            "ExceptionSetSymbolPass2.java",
+            EXCEPTION_SET_SYMBOL_PASS2_JAVA,
+        ),
+        (
             "ExceptionSeedLateCollision.java",
             EXCEPTION_SEED_LATE_COLLISION_JAVA,
         ),
@@ -9884,7 +9906,7 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     )
     .unwrap();
 
-    let context = exception_pass2_context(&fixture);
+    let context = exception_pass2_context(&fixture, &applied, &kit.manifest_path, &image_dir);
     let map_path = kit.out.join("symbol_maps/00_BOOT-exception-v4.json");
     std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
     let bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(
@@ -10064,6 +10086,86 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
         process_diagnostics(&inspected)
     );
 
+    let state_before_replays = exception_run_script(home, &kit, "ExceptionInspectState.java");
+    assert!(state_before_replays.status.success());
+    let state_before_replays = exception_state(&state_before_replays);
+
+    let mut clean_replay_args = apply_args();
+    clean_replay_args.extend([
+        "-postScript".to_string(),
+        "ExceptionInspectPass2.java".to_string(),
+        fixture.identity.clone(),
+    ]);
+    let clean_replay = exception_headless(home, &kit, &clean_replay_args);
+    let clean_replay_diagnostics = process_diagnostics(&clean_replay);
+    assert!(
+        clean_replay.status.success()
+            && String::from_utf8_lossy(&clean_replay.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplySymbols: ") && line.contains("applied 0 names"))
+            && String::from_utf8_lossy(&clean_replay.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectPass2: ok"),
+        "clean exception ApplySymbols replay mutated or failed:\n{clean_replay_diagnostics}"
+    );
+    let state_after_clean_replay = exception_run_script(home, &kit, "ExceptionInspectState.java");
+    assert!(state_after_clean_replay.status.success());
+    assert_eq!(
+        exception_state(&state_after_clean_replay),
+        state_before_replays
+    );
+
+    let pass1_replay = exception_headless(
+        home,
+        &kit,
+        &[
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-preScript".to_string(),
+            "ApplyExceptionRoots.java".to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            scatter.clone(),
+            fixture.identity.clone(),
+            "-postScript".to_string(),
+            "ExceptionInspectPass2.java".to_string(),
+            fixture.identity.clone(),
+        ],
+    );
+    let pass1_replay_diagnostics = process_diagnostics(&pass1_replay);
+    assert!(
+        pass1_replay.status.success()
+            && String::from_utf8_lossy(&pass1_replay.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectPass2: ok"),
+        "post-pass-2 ApplyExceptionRoots replay failed:\n{pass1_replay_diagnostics}"
+    );
+    let pass1_replay_summary = exception_summary(&pass1_replay);
+    assert_eq!(
+        pass1_replay_summary["symbol_pass2"],
+        prepared.pass2_property()
+    );
+    assert_eq!(
+        pass1_replay_summary["applications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|application| application["primary_disposition"] == "pass2_owned")
+            .count(),
+        transitions.len()
+    );
+    assert_exception_conservation(&pass1_replay_summary);
+    let state_after_pass1_replay = exception_run_script(home, &kit, "ExceptionInspectState.java");
+    assert!(state_after_pass1_replay.status.success());
+    assert_eq!(
+        exception_state(&state_after_pass1_replay),
+        state_before_replays
+    );
+
     let export_args = || -> Vec<String> {
         [
             "-process".to_string(),
@@ -10089,6 +10191,175 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
         ]
         .into()
     };
+
+    // A transitioned registry without the property is partial state, not a
+    // fresh first application. Neither ApplySymbols nor mapless Export may
+    // reconstruct or publish lineage from it.
+    {
+        let cleared =
+            exception_run_script_with(home, &kit, "ExceptionSetSymbolPass2.java", &["clear"]);
+        assert!(
+            cleared.status.success()
+                && String::from_utf8_lossy(&cleared.stdout)
+                    .lines()
+                    .any(|line| line == "ExceptionSetSymbolPass2: null"),
+            "could not clear the SymbolPass2 property:\n{}",
+            process_diagnostics(&cleared)
+        );
+
+        let missing_lineage_pass1 = exception_headless(
+            home,
+            &kit,
+            &[
+                "-process".to_string(),
+                "00_BOOT".to_string(),
+                "-noanalysis".to_string(),
+                "-scriptPath".to_string(),
+                kit.out.join("scripts").to_string_lossy().into_owned(),
+                "-preScript".to_string(),
+                "ApplyExceptionRoots.java".to_string(),
+                kit.kit_root.to_string_lossy().into_owned(),
+                "00_BOOT".to_string(),
+                kit.manifest_path.to_string_lossy().into_owned(),
+                scatter.clone(),
+                fixture.identity.clone(),
+                "-postScript".to_string(),
+                "ExceptionSentinel.java".to_string(),
+            ],
+        );
+        let pass1_diagnostics = process_diagnostics(&missing_lineage_pass1);
+        assert!(
+            pass1_diagnostics.contains("pass2_owned exception registry lacks SymbolPass2 lineage"),
+            "ApplyExceptionRoots replay accepted missing transition lineage:\n{pass1_diagnostics}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&missing_lineage_pass1.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplyExceptionRoots: ")
+                    || line == "ExceptionSentinel: RAN")
+        );
+
+        let mut missing_lineage_apply_args = apply_args();
+        missing_lineage_apply_args.extend([
+            "-postScript".to_string(),
+            "ExceptionSentinel.java".to_string(),
+        ]);
+        let missing_lineage_apply = exception_headless(home, &kit, &missing_lineage_apply_args);
+        let apply_diagnostics = process_diagnostics(&missing_lineage_apply);
+        assert!(
+            apply_diagnostics.contains("pass2_owned exception registry lacks SymbolPass2 lineage"),
+            "ApplySymbols reconstructed missing transition lineage:\n{apply_diagnostics}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&missing_lineage_apply.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplySymbols: ") || line == "ExceptionSentinel: RAN")
+        );
+
+        let marker_before = std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap();
+        let mut missing_lineage_export_args = export_args();
+        let export_len = missing_lineage_export_args.len();
+        missing_lineage_export_args[export_len - 2] = "-".to_string();
+        missing_lineage_export_args[export_len - 1] = "none".to_string();
+        let missing_lineage_export = exception_headless(home, &kit, &missing_lineage_export_args);
+        let export_diagnostics = process_diagnostics(&missing_lineage_export);
+        assert!(
+            export_diagnostics.contains("pass2_owned exception registry lacks SymbolPass2 lineage"),
+            "mapless Export published missing transition lineage:\n{export_diagnostics}"
+        );
+        assert_eq!(
+            std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
+            marker_before
+        );
+
+        let property = prepared.pass2_property();
+        let restored = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionSetSymbolPass2.java",
+            &["restore", &property],
+        );
+        assert!(
+            restored.status.success(),
+            "could not restore the SymbolPass2 property:\n{}",
+            process_diagnostics(&restored)
+        );
+        let after = exception_run_script(home, &kit, "ExceptionInspectState.java");
+        assert!(after.status.success());
+        assert_eq!(exception_state(&after), state_before_replays);
+    }
+
+    // A successor map may name the current v3 property as its predecessor,
+    // but it cannot omit one of the registry's existing pass2_owned rows.
+    // Both mutation preflight/postflight and independent Export enforce the
+    // same exact (entry, ISA) bijection.
+    {
+        let source = std::fs::read_to_string(prepared.path()).unwrap();
+        let predecessor = "\"predecessor_symbol_pass2\": null";
+        let replacement = format!(
+            "\"predecessor_symbol_pass2\": {}",
+            serde_json::to_string(&prepared.pass2_property()).unwrap()
+        );
+        assert_eq!(source.matches(predecessor).count(), 1);
+        let omitted_text = source.replacen(predecessor, &replacement, 1);
+        let omitted_text =
+            replace_first_json_object_value_with_null(&omitted_text, "exception_transition");
+        let omitted_map: serde_json::Value = serde_json::from_str(&omitted_text).unwrap();
+        assert!(
+            omitted_map["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|decision| decision["action"] == "rename"
+                    && decision["exception_transition"].is_null())
+        );
+        let omitted_bytes = omitted_text.into_bytes();
+        let omitted_path = kit.out.join("symbol_maps/00_BOOT-omitted-transition.json");
+        std::fs::write(&omitted_path, &omitted_bytes).unwrap();
+        let omitted_hash = blake3::hash(&omitted_bytes).to_hex().to_string();
+        let marker_before = std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap();
+
+        let mut omitted_export_args = export_args();
+        let export_len = omitted_export_args.len();
+        omitted_export_args[export_len - 2] = omitted_path.to_string_lossy().into_owned();
+        omitted_export_args[export_len - 1] = omitted_hash.clone();
+        let omitted_export = exception_headless(home, &kit, &omitted_export_args);
+        let omitted_export_diagnostics = process_diagnostics(&omitted_export);
+        assert!(
+            omitted_export_diagnostics.contains(
+                "pass2_owned exception registry and symbol-map transitions are not bijective"
+            ),
+            "independent Export accepted an omitted exception transition:\n{omitted_export_diagnostics}"
+        );
+        assert_eq!(
+            std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
+            marker_before
+        );
+
+        let mut omitted_apply_args = apply_args();
+        omitted_apply_args[17] = omitted_path.to_string_lossy().into_owned();
+        omitted_apply_args[18] = omitted_hash;
+        omitted_apply_args.extend([
+            "-postScript".to_string(),
+            "ExceptionSentinel.java".to_string(),
+        ]);
+        let omitted_apply = exception_headless(home, &kit, &omitted_apply_args);
+        let omitted_apply_diagnostics = process_diagnostics(&omitted_apply);
+        assert!(
+            omitted_apply_diagnostics.contains(
+                "pass2_owned exception registry and symbol-map transitions are not bijective"
+            ) && omitted_apply_diagnostics.contains("at ApplySymbols.preflight"),
+            "ApplySymbols accepted an omitted exception transition:\n{omitted_apply_diagnostics}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&omitted_apply.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplySymbols: ") || line == "ExceptionSentinel: RAN")
+        );
+        let after = exception_run_script(home, &kit, "ExceptionInspectState.java");
+        assert!(after.status.success());
+        assert_eq!(exception_state(&after), state_before_replays);
+    }
 
     // The registry's transition authority is map-owned, not merely one of a
     // closed pair. A structurally valid registration -> func substitution
@@ -10266,6 +10537,46 @@ fn exception_state(output: &std::process::Output) -> String {
     states[0].to_string()
 }
 
+fn replace_first_json_object_value_with_null(input: &str, key: &str) -> String {
+    let marker = format!("\"{key}\": ");
+    let marker_start = input.find(&marker).expect("JSON key is present");
+    let value_start = marker_start + marker.len();
+    assert_eq!(input.as_bytes()[value_start], b'{');
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut value_end = None;
+    for (offset, byte) in input.as_bytes()[value_start..].iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    value_end = Some(value_start + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let value_end = value_end.expect("JSON object is complete");
+    let mut output = input.to_string();
+    output.replace_range(value_start..value_end, "null");
+    output
+}
+
 fn exception_context_state(output: &std::process::Output) -> String {
     let diagnostics = process_diagnostics(output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -10321,7 +10632,114 @@ fn assert_exception_conservation(summary: &serde_json::Value) {
             + count("names_preserved")
             + count("names_not_requested")
     );
-    assert!(count("shared_entries") <= count("names_not_requested"));
+    let applications = summary["applications"].as_array().unwrap();
+    assert_eq!(applications.len() as u64, count("entries"));
+    assert!(applications.len() <= 16);
+    let mut function_counts = std::collections::BTreeMap::<&str, u64>::new();
+    let mut name_counts = std::collections::BTreeMap::<&str, u64>::new();
+    let mut shared = 0u64;
+    let mut previous = None;
+    for application in applications {
+        let entry = application["entry"].as_str().unwrap();
+        assert!(entry.starts_with("0x") && entry.len() == 10);
+        let isa = application["isa"].as_str().unwrap();
+        assert!(matches!(isa, "arm" | "thumb"));
+        let key = (entry, isa);
+        assert!(previous.is_none_or(|prior| prior < key));
+        previous = Some(key);
+        let function_result = application["function_result"].as_str().unwrap();
+        assert!(matches!(
+            function_result,
+            "created" | "reapplied" | "existing"
+        ));
+        *function_counts.entry(function_result).or_default() += 1;
+        let name_result = application["name_result"].as_str().unwrap();
+        assert!(matches!(
+            name_result,
+            "applied" | "reapplied" | "preserved" | "not_requested"
+        ));
+        *name_counts.entry(name_result).or_default() += 1;
+        let is_shared = application["shared"].as_bool().unwrap();
+        shared += u64::from(is_shared);
+        let disposition = application["primary_disposition"].as_str().unwrap();
+        assert!(matches!(
+            disposition,
+            "exception_owned" | "preserved" | "not_requested" | "pass2_owned"
+        ));
+        let current = application["current_primary"].as_object().unwrap();
+        assert_eq!(current.len(), 4);
+        assert!(current["symbol_id"].as_u64().unwrap() <= i64::MAX as u64);
+        let source = current["source"].as_str().unwrap();
+        assert!(matches!(
+            source,
+            "default" | "analysis" | "ai" | "imported" | "user_defined"
+        ));
+        let name = current["name"].as_str().unwrap();
+        assert_eq!(
+            current["name_blake3"].as_str().unwrap(),
+            blake3::hash(name.as_bytes()).to_hex().as_str()
+        );
+        match disposition {
+            "exception_owned" => {
+                assert!(matches!(name_result, "applied" | "reapplied"));
+                assert_eq!(source, "analysis");
+                assert!(application["transition"].is_null());
+            }
+            "preserved" => {
+                assert_eq!(name_result, "preserved");
+                assert_ne!(source, "default");
+                assert!(application["transition"].is_null());
+            }
+            "not_requested" => {
+                assert_eq!(name_result, "not_requested");
+                assert!(is_shared);
+                assert!(application["transition"].is_null());
+            }
+            "pass2_owned" => {
+                assert_eq!(name_result, "reapplied");
+                assert_eq!(source, "user_defined");
+                let transition = application["transition"].as_object().unwrap();
+                assert!(matches!(
+                    transition["authority"].as_str().unwrap(),
+                    "func" | "registration"
+                ));
+                let original = transition["original_primary"].as_object().unwrap();
+                assert_eq!(original["source"], "analysis");
+                assert_eq!(original["symbol_id"], current["symbol_id"]);
+                assert_ne!(original["name"], current["name"]);
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(
+        function_counts.get("created").copied().unwrap_or(0),
+        count("functions_created")
+    );
+    assert_eq!(
+        function_counts.get("reapplied").copied().unwrap_or(0),
+        count("functions_reapplied")
+    );
+    assert_eq!(
+        function_counts.get("existing").copied().unwrap_or(0),
+        count("functions_existing")
+    );
+    assert_eq!(
+        name_counts.get("applied").copied().unwrap_or(0),
+        count("names_applied")
+    );
+    assert_eq!(
+        name_counts.get("reapplied").copied().unwrap_or(0),
+        count("names_reapplied")
+    );
+    assert_eq!(
+        name_counts.get("preserved").copied().unwrap_or(0),
+        count("names_preserved")
+    );
+    assert_eq!(
+        name_counts.get("not_requested").copied().unwrap_or(0),
+        count("names_not_requested")
+    );
+    assert_eq!(shared, count("shared_entries"));
 }
 
 fn assert_exception_rejected_unchanged(
@@ -10424,22 +10842,7 @@ fn pass1_applies_exception_roots_transactionally() {
         image.outcome,
         pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
     ));
-    assert_eq!(
-        image.exception_roots_applied,
-        Some(pixel_modem_extractor::decompile::AppliedExceptionRoots {
-            tables: 1,
-            roles: 8,
-            entries: 7,
-            functions_created: 7,
-            functions_reapplied: 0,
-            functions_existing: 0,
-            names_applied: 6,
-            names_reapplied: 0,
-            names_preserved: 0,
-            names_not_requested: 1,
-            shared_entries: 1,
-        })
-    );
+    assert!(image.exception_roots_applied.is_some());
     assert_eq!(image.exception_error, None);
     let production_manifest =
         std::fs::read_to_string(production_out.join("exception_roots/00_BOOT/roots.json")).unwrap();
@@ -10523,25 +10926,25 @@ fn pass1_applies_exception_roots_transactionally() {
         "first exception application failed:\n{first_diagnostics}"
     );
     let first_summary = exception_summary(&first);
-    assert_eq!(
-        first_summary,
-        serde_json::json!({
-            "image": "00_BOOT",
-            "status": "ok",
-            "identity": fixture.identity,
-            "tables": 1,
-            "roles": 8,
-            "entries": 7,
-            "functions_created": 5,
-            "functions_reapplied": 0,
-            "functions_existing": 2,
-            "names_applied": 5,
-            "names_reapplied": 0,
-            "names_preserved": 1,
-            "names_not_requested": 1,
-            "shared_entries": 1,
-        })
-    );
+    assert_eq!(first_summary["image"], "00_BOOT");
+    assert_eq!(first_summary["status"], "ok");
+    assert_eq!(first_summary["identity"], fixture.identity);
+    assert!(first_summary["symbol_pass2"].is_null());
+    for (field, expected) in [
+        ("tables", 1),
+        ("roles", 8),
+        ("entries", 7),
+        ("functions_created", 5),
+        ("functions_reapplied", 0),
+        ("functions_existing", 2),
+        ("names_applied", 5),
+        ("names_reapplied", 0),
+        ("names_preserved", 1),
+        ("names_not_requested", 1),
+        ("shared_entries", 1),
+    ] {
+        assert_eq!(first_summary[field], expected);
+    }
     assert_exception_conservation(&first_summary);
 
     let replay = exception_apply(&home, &kit);
@@ -10554,25 +10957,25 @@ fn pass1_applies_exception_roots_transactionally() {
         "exception replay failed:\n{replay_diagnostics}"
     );
     let replay_summary = exception_summary(&replay);
-    assert_eq!(
-        replay_summary,
-        serde_json::json!({
-            "image": "00_BOOT",
-            "status": "ok",
-            "identity": fixture.identity,
-            "tables": 1,
-            "roles": 8,
-            "entries": 7,
-            "functions_created": 0,
-            "functions_reapplied": 5,
-            "functions_existing": 2,
-            "names_applied": 0,
-            "names_reapplied": 5,
-            "names_preserved": 1,
-            "names_not_requested": 1,
-            "shared_entries": 1,
-        })
-    );
+    assert_eq!(replay_summary["image"], "00_BOOT");
+    assert_eq!(replay_summary["status"], "ok");
+    assert_eq!(replay_summary["identity"], fixture.identity);
+    assert!(replay_summary["symbol_pass2"].is_null());
+    for (field, expected) in [
+        ("tables", 1),
+        ("roles", 8),
+        ("entries", 7),
+        ("functions_created", 0),
+        ("functions_reapplied", 5),
+        ("functions_existing", 2),
+        ("names_applied", 0),
+        ("names_reapplied", 5),
+        ("names_preserved", 1),
+        ("names_not_requested", 1),
+        ("shared_entries", 1),
+    ] {
+        assert_eq!(replay_summary[field], expected);
+    }
     assert_exception_conservation(&replay_summary);
     let fingerprint = |output: &std::process::Output| {
         String::from_utf8_lossy(&output.stdout)

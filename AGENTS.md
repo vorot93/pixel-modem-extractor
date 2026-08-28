@@ -369,17 +369,43 @@ module; when a file outgrows that, split it.
   manifest identity. Fresh classification consults the actual primary symbol even when no function
   exists, so a meaningful pre-existing label is preserved. Unshipped old registry records without
   primary identity fields are invalid; there is no compatibility grammar.
-- **Exception naming survives pass 2 through explicit authenticated context.** Symbolication
-  attaches `exception_root` evidence only on exact normalized `(entry, decode ISA)` keys and ranks
-  names as `__func__ > registration > exception_root > pal_task > token > string_ref`. Fresh
-  `symbols.json` / symbol maps are v4; the map binds the exception manifest identity and BLAKE3.
-  `ApplySymbols` revalidates the complete exception manifest, registry, functions, instructions,
-  and role-label inventory before mutation. Only an `exception_owned` primary may transition, only
-  for map-authenticated `func` or `registration` authority; the registry retains the original-name
-  digest and exact authority while binding the new symbol ID/source/name digest. Preserved foreign
-  primaries and shared label-only handlers never transition. Final `ExportDecomp` revalidates the
-  transitioned registry and unchanged role labels against the same manifest and map; stale or
-  partial registry state stops before another mutation.
+- **Exception pass-2 context is opaque and currentness-explicit.** The public
+  `read_exception_pass2_context(ExceptionPass2ContextInput)` constructor receives the exact manifest,
+  image directory/label/TOC/base, expected identity/scatter digest, and parsed current-run summary;
+  it rebuilds `RuntimeImage`, calls the strict artifact reader, and compares manifest-derived table,
+  role, application, shared-entry, and `(entry, DecodeIsa)` state before returning the opaque
+  `ExceptionPass2Context`. The context has no public fields, `Default`, deserializer, literal, or
+  path-existence fallback. `ApplyExceptionRoots` summaries are closed typed state, not aggregate
+  hints: at most 256 KiB and 16 strictly ordered rows, with bounded IDs/names, exact name BLAKE3,
+  closed source/result/disposition enums, row-derived counters, and first-apply/replay conservation.
+  The parsed state retains its image and manifest identity privately; context construction requires
+  both to equal the independently authenticated artifact, so same-shaped summaries cannot be mixed
+  across images or manifests. `function_result: existing` plus `name_result: reapplied` is valid:
+  pass 1 may adopt a pre-existing foreign function while owning and later replaying only its primary.
+  Shared means exactly `desired_primary == null` with multiple claims; repeated initial/relocated
+  claims for one role remain non-shared and keep their unique primary.
+- **Exception naming survives pass 2 through closed primary dispositions.** Symbolication attaches
+  `exception_root` evidence only on exact normalized `(entry, decode ISA)` keys and ranks names as
+  `__func__ > registration > exception_root > pal_task > token > string_ref`. The summary supplies
+  exactly `exception_owned`, `preserved`, `not_requested`, or `pass2_owned` state. Only
+  `exception_owned` may create a `func`/`registration` transition; preserved and shared label-only
+  applications force exact preservation and cannot acquire generic, PAL, or thunk-mirror renames.
+  A replayed `pass2_owned` row reproduces its exact authority plus original/final symbol ID, source,
+  name, and digest. Current-primary equality applies only to the Ghidra-owned execution at that key;
+  radare2/Rizin records may retain the role evidence without becoming program-state authority.
+- **Pass-2 lineage is strict v3 and transition-complete.** Fresh symbol maps are v4 and require the
+  nullable `predecessor_symbol_pass2` field. `PixelModemExtractor.SymbolPass2` has only
+  `v3:<map-blake3>:<functions-blake3>:<execution-count>` grammar; there is no v2 reader. The current
+  property must equal the map's explicit predecessor or its exact current token. Any existing
+  `pass2_owned` exception registry row requires a non-null property — missing lineage is partial
+  state, never a fresh application, and mapless Export rejects it. ApplySymbols rejects any
+  already-`pass2_owned` exception registry key omitted by a successor map before mutation, then
+  requires exact bidirectional `(entry, first decode-range ISA)` transition equality postflight;
+  independent Export repeats the exact check. Immediately before publishing the token,
+  ApplySymbols revalidates the complete exception state, PAL state, every map-owned Thumb creation,
+  and every final decision primary, then rechecks and successfully closes the retained exception
+  files as the last fallible step before the property write. A clean replay performs zero renames;
+  stale/partial ownership emits no success summary and leaves prior program/export state intact.
 - **Ghidra-only constraints stay Ghidra-only.** Java preflight rejects intersections among the
   complete derived instruction spans before mutation and computes A32 architectural `PC + 8` before
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
