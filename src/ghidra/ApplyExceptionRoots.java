@@ -172,7 +172,8 @@ public class ApplyExceptionRoots extends HeadlessScript {
             primaryDisposition = plan.prior.primaryDisposition;
             if ("created".equals(functionDisposition)) counts.functionsReapplied++;
             else counts.functionsExisting++;
-            if ("exception_owned".equals(primaryDisposition)) counts.namesReapplied++;
+            if ("exception_owned".equals(primaryDisposition)
+                    || "pass2_owned".equals(primaryDisposition)) counts.namesReapplied++;
             else if ("preserved".equals(primaryDisposition)) counts.namesPreserved++;
             else counts.namesNotRequested++;
         }
@@ -254,7 +255,7 @@ public class ApplyExceptionRoots extends HeadlessScript {
                         validated.manifest.manifestBlake3, plan.application.entry,
                         plan.application.isa, plan.root.instructionBlake3, function.getID(),
                         functionDisposition, primaryDisposition, primaryId, primarySource,
-                        primaryHash, Collections.unmodifiableList(labelIds),
+                        primaryHash, null, null, Collections.unmodifiableList(labelIds),
                         ExceptionRootsSupport.labelsDigest(labels));
         String priorValue = registry.getString(entry);
         String value = ExceptionRootsSupport.registryValue(ownership);

@@ -353,13 +353,17 @@ final class ExceptionRootsSupport {
         final Long primaryId;
         final String primarySource;
         final String primaryNameBlake3;
+        final String transitionAuthority;
+        final String transitionOriginalPrimaryBlake3;
         final List<Long> labelIds;
         final String labelsBlake3;
 
         RegistryEntry(String manifestBlake3, long entry, String isa,
                 String instructionBlake3, long functionId, String functionDisposition,
                 String primaryDisposition, Long primaryId, String primarySource,
-                String primaryNameBlake3, List<Long> labelIds, String labelsBlake3) {
+                String primaryNameBlake3, String transitionAuthority,
+                String transitionOriginalPrimaryBlake3, List<Long> labelIds,
+                String labelsBlake3) {
             this.manifestBlake3 = manifestBlake3;
             this.entry = entry;
             this.isa = isa;
@@ -370,6 +374,8 @@ final class ExceptionRootsSupport {
             this.primaryId = primaryId;
             this.primarySource = primarySource;
             this.primaryNameBlake3 = primaryNameBlake3;
+            this.transitionAuthority = transitionAuthority;
+            this.transitionOriginalPrimaryBlake3 = transitionOriginalPrimaryBlake3;
             this.labelIds = labelIds;
             this.labelsBlake3 = labelsBlake3;
         }
@@ -2067,6 +2073,20 @@ final class ExceptionRootsSupport {
                 fail("owned exception primary is stale at " + entry);
             }
         }
+        else if ("pass2_owned".equals(prior.primaryDisposition)) {
+            String original = application.desiredPrimary == null ? null
+                    : primaryNameDigest(application.desiredPrimary);
+            if (application.desiredPrimary == null
+                    || prior.primaryId == null || prior.primaryId.longValue() != primary.getID()
+                    || primary.getSource() != SourceType.USER_DEFINED
+                    || !source.equals(prior.primarySource)
+                    || !digest.equals(prior.primaryNameBlake3)
+                    || !("func".equals(prior.transitionAuthority)
+                            || "registration".equals(prior.transitionAuthority))
+                    || !original.equals(prior.transitionOriginalPrimaryBlake3)) {
+                fail("pass-2-owned exception primary is stale at " + entry);
+            }
+        }
         else if ("preserved".equals(prior.primaryDisposition)) {
             if (application.desiredPrimary == null || prior.primaryId == null
                     || prior.primaryId.longValue() != primary.getID()
@@ -2288,6 +2308,14 @@ final class ExceptionRootsSupport {
                 fail("owned exception primary is stale at " + entry);
             }
         }
+        else if ("pass2_owned".equals(prior.primaryDisposition)) {
+            if (entryRoles.size() != 1 || primary.getSource() != SourceType.USER_DEFINED
+                    || !("func".equals(prior.transitionAuthority)
+                            || "registration".equals(prior.transitionAuthority))
+                    || prior.transitionOriginalPrimaryBlake3 == null) {
+                fail("pass-2-owned exception primary is stale at " + entry);
+            }
+        }
         else if ("preserved".equals(prior.primaryDisposition)) {
             if (entryRoles.size() != 1 || primary.getSource() == SourceType.DEFAULT) {
                 fail("preserved exception primary is stale at " + entry);
@@ -2359,11 +2387,59 @@ final class ExceptionRootsSupport {
     // Registry and label ownership grammar
     // ---------------------------------------------------------------------
 
+    static String primaryNameDigest(String name) {
+        return PmeScriptSupport.blake3Hex(PmeScriptSupport.boundedUtf8(
+                name, MAX_SYMBOL_UTF8_BYTES, "exception-root primary"));
+    }
+
+    static void validatePass2Transition(RegistryEntry registry,
+            PalTasksSupport.MapDecision decision, Address entry) {
+        if (!"pass2_owned".equals(registry.primaryDisposition)) {
+            fail("the exception registry disposition at " + entry
+                    + " is not pass2_owned");
+        }
+        if (!decision.exceptionTransitionAuthority.equals(registry.transitionAuthority)) {
+            fail("exception transition authority does not match the symbol map at " + entry);
+        }
+        if (!primaryNameDigest(decision.originalPrimary).equals(
+                registry.transitionOriginalPrimaryBlake3)) {
+            fail("exception transition original primary does not match the symbol map at "
+                    + entry);
+        }
+        if (!decision.finalSource.equals(registry.primarySource)
+                || !primaryNameDigest(decision.finalPrimary).equals(
+                        registry.primaryNameBlake3)) {
+            fail("exception transition final primary does not match the symbol map at "
+                    + entry);
+        }
+    }
+
+    static void validatePass2Transitions(Program program, PalTasksSupport.SymbolMap map) {
+        StringPropertyMap registry = currentRegistry(program);
+        Set<Address> expected = new HashSet<Address>();
+        for (int index = 0; index < map.decisions.size(); index++) {
+            PalTasksSupport.MapDecision decision = map.decisions.get(index);
+            if (decision.exceptionTransitionAuthority == null) continue;
+            Address entry = PmeScriptSupport.programAddress(
+                    program, map.executions.get(index).entry);
+            if (!expected.add(entry)) {
+                fail("the symbol map carries duplicate exception transitions at " + entry);
+            }
+            RegistryEntry retained = parseRegistry(
+                    registry == null ? null : registry.getString(entry));
+            validatePass2Transition(retained, decision, entry);
+        }
+    }
+
     static String registryValue(RegistryEntry entry) {
         String primaryId = entry.primaryId == null ? "none" : Long.toString(entry.primaryId);
         String source = entry.primarySource == null ? "none" : entry.primarySource;
         String primaryHash = entry.primaryNameBlake3 == null
                 ? "none" : entry.primaryNameBlake3;
+        String transitionAuthority = entry.transitionAuthority == null
+                ? "none" : entry.transitionAuthority;
+        String transitionOriginal = entry.transitionOriginalPrimaryBlake3 == null
+                ? "none" : entry.transitionOriginalPrimaryBlake3;
         StringBuilder ids = new StringBuilder();
         for (int index = 0; index < entry.labelIds.size(); index++) {
             if (index != 0) ids.append(',');
@@ -2373,14 +2449,15 @@ final class ExceptionRootsSupport {
                 String.format(Locale.ROOT, "%08x", entry.entry), entry.isa,
                 entry.instructionBlake3, Long.toString(entry.functionId),
                 entry.functionDisposition, entry.primaryDisposition, primaryId, source,
-                primaryHash, Integer.toString(entry.labelIds.size()), ids.toString(),
+                primaryHash, transitionAuthority, transitionOriginal,
+                Integer.toString(entry.labelIds.size()), ids.toString(),
                 entry.labelsBlake3);
     }
 
     static RegistryEntry parseRegistry(String value) {
         if (value == null) fail("exception-root registry value is missing");
         String[] fields = value.split(":", -1);
-        if (fields.length != 14 || !IDENTITY_VERSION.equals(fields[0])) {
+        if (fields.length != 16 || !IDENTITY_VERSION.equals(fields[0])) {
             fail("exception-root registry grammar is invalid");
         }
         String manifest = hash(fields[1], "registry manifest hash");
@@ -2392,7 +2469,7 @@ final class ExceptionRootsSupport {
         String functionDisposition = oneOf(fields[6], "registry function disposition",
                 "created", "foreign");
         String primaryDisposition = oneOf(fields[7], "registry primary disposition",
-                "exception_owned", "preserved", "not_requested");
+                "exception_owned", "preserved", "not_requested", "pass2_owned");
         Long primaryId = "none".equals(fields[8]) ? null
                 : unsigned(fields[8], Long.MAX_VALUE, "registry primary ID");
         String source = "none".equals(fields[9]) ? null
@@ -2400,24 +2477,38 @@ final class ExceptionRootsSupport {
                         "ai", "imported", "user_defined");
         String primaryHash = "none".equals(fields[10]) ? null
                 : hash(fields[10], "registry primary hash");
-        int labelCount = (int) unsigned(fields[11], 16, "registry label count");
+        String transitionAuthority = "none".equals(fields[11]) ? null
+                : oneOf(fields[11], "registry transition authority", "func", "registration");
+        String transitionOriginal = "none".equals(fields[12]) ? null
+                : hash(fields[12], "registry transition original primary hash");
+        int labelCount = (int) unsigned(fields[13], 16, "registry label count");
         List<Long> labelIds = new ArrayList<Long>();
         if (labelCount == 0) {
-            if (!fields[12].isEmpty()) fail("zero-label registry carries label IDs");
+            if (!fields[14].isEmpty()) fail("zero-label registry carries label IDs");
         }
         else {
-            String[] ids = fields[12].split(",", -1);
+            String[] ids = fields[14].split(",", -1);
             if (ids.length != labelCount) fail("registry label IDs do not conserve");
             for (String id : ids) {
                 labelIds.add(unsigned(id, Long.MAX_VALUE, "registry label ID"));
             }
         }
-        String labelsHash = hash(fields[13], "registry labels hash");
+        String labelsHash = hash(fields[15], "registry labels hash");
         if (primaryId == null || source == null || primaryHash == null) {
             fail("exception-root registry does not bind a resulting primary identity");
         }
+        if ("pass2_owned".equals(primaryDisposition)) {
+            if (transitionAuthority == null || transitionOriginal == null
+                    || !"user_defined".equals(source)) {
+                fail("pass-2-owned exception registry lacks its exact transition");
+            }
+        }
+        else if (transitionAuthority != null || transitionOriginal != null) {
+            fail("an untransitioned exception registry carries transition state");
+        }
         return new RegistryEntry(manifest, entry, isa, instruction, functionId,
                 functionDisposition, primaryDisposition, primaryId, source, primaryHash,
+                transitionAuthority, transitionOriginal,
                 Collections.unmodifiableList(labelIds), labelsHash);
     }
 

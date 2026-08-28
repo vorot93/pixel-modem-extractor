@@ -3126,9 +3126,9 @@ impl RetainedPass2File {
     }
 }
 
-/// The authenticated function-map input for pass 2: the strict v3 symbol map
+/// The authenticated function-map input for pass 2: the strict v4 symbol map
 /// and the retained pass-1 files it binds, plus the image identity the
-/// ten-argument `ApplySymbols` and eight-argument `ExportDecomp` contracts
+/// twelve-argument `ApplySymbols` and ten-argument `ExportDecomp` contracts
 /// consume. The PAL identity and its manifest paths live on
 /// [`Pass2Input`] — a pass-2 run may carry PAL state without a function map.
 /// The driver computes every expected hash from retained current inputs
@@ -3316,6 +3316,10 @@ pub struct Pass2Input {
     pub function_map: Option<PreparedSymbolPass2Map>,
     pub global_map: Option<PreparedPass2Map>,
     pub global_types_map: Option<PreparedPass2Map>,
+    /// Explicit current exception-root state. Task 9 constructs this pair from
+    /// the terminal validated artifact; pass 2 never probes for one.
+    pub exception_identity: String,
+    pub exception_manifest: Option<PathBuf>,
     /// The PAL identity the pass-2 scripts must agree on (`none` when the
     /// orchestrator drives no PAL state) plus the canonical task/scatter
     /// manifest paths when a PAL state is present.
@@ -3336,6 +3340,64 @@ impl Pass2Input {
             &self.pal_identity
         }
     }
+
+    fn exception_args(&self) -> Result<(String, String)> {
+        let identity = if self.exception_identity.is_empty() {
+            "none"
+        } else {
+            self.exception_identity.as_str()
+        };
+        if identity == "none" {
+            if self.exception_manifest.is_some() {
+                return Err(Error::DecomposeIncomplete(
+                    "pass-2 exception identity none carries a manifest".into(),
+                ));
+            }
+            return Ok(("none".to_string(), "-".to_string()));
+        }
+
+        let parts = identity.split(':').collect::<Vec<_>>();
+        if parts.len() != 4
+            || parts[0] != "v1"
+            || parts[1].len() != 64
+            || !parts[1]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || parts[2]
+                .parse::<usize>()
+                .ok()
+                .is_none_or(|count| !(1..=crate::exception_roots::MAX_TABLES).contains(&count))
+            || parts[3]
+                .parse::<usize>()
+                .ok()
+                .is_none_or(|count| !(1..=crate::exception_roots::MAX_ROOTS).contains(&count))
+        {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 exception identity is not the strict v1 grammar".into(),
+            ));
+        }
+        let manifest = self.exception_manifest.as_ref().ok_or_else(|| {
+            Error::DecomposeIncomplete(
+                "a present pass-2 exception identity requires its manifest".into(),
+            )
+        })?;
+        let canonical = std::fs::canonicalize(manifest)?;
+        if canonical != *manifest || !canonical.is_file() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 exception manifest is not a canonical regular file: {}",
+                manifest.display()
+            )));
+        }
+        if crate::manifest::blake3_file(&canonical)? != parts[1] {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 exception manifest does not match its identity BLAKE3".into(),
+            ));
+        }
+        Ok((
+            identity.to_string(),
+            canonical.to_string_lossy().into_owned(),
+        ))
+    }
 }
 
 /// The `analyzeHeadless` argument vector for pass 2 of `run_two_pass`. Runs in
@@ -3346,13 +3408,12 @@ impl Pass2Input {
 /// `ApplyGlobalTypes.java` scripts run in that order, followed by
 /// `ExportDecomp.java`.
 ///
-/// `ApplySymbols` consumes exactly ten arguments (kit root, image label,
-/// image BLAKE3, PAL identity, task manifest, scatter manifest, retained
-/// pass-1 functions.json, its BLAKE3, symbol map, its BLAKE3) and
+/// `ApplySymbols` consumes exactly twelve arguments (kit root, image label,
+/// image BLAKE3, exception identity/manifest, PAL identity, task/scatter
+/// manifests, retained pass-1 functions.json, its BLAKE3, symbol map, its BLAKE3) and
 /// `ExportDecomp` exactly ten (output directory, kit root, image label,
 /// exception identity/manifest, PAL identity/manifest, scatter manifest,
-/// pass-1 symbol map, expected map BLAKE3). Task 8 supplies present pass-2
-/// exception context; until then pass 2 states explicit absence.
+/// pass-1 symbol map, expected map BLAKE3).
 fn headless_process_args(
     root: &str,
     label: &str,
@@ -3375,6 +3436,7 @@ fn headless_process_args(
         map.validate_for_spawn()?;
     }
 
+    let (exception_identity, exception_manifest) = input.exception_args()?;
     let pal_identity = input.pal_identity_or_none().to_string();
     let pal_manifest = input
         .pal_manifest
@@ -3422,6 +3484,8 @@ fn headless_process_args(
             root.to_string(),
             map.image_label().to_string(),
             map.image_blake3().to_string(),
+            exception_identity.clone(),
+            exception_manifest.clone(),
             pal_identity.clone(),
             pal_manifest.clone(),
             scatter_manifest.clone(),
@@ -3457,8 +3521,8 @@ fn headless_process_args(
         format!("{root}/export/{label}"),
         root.to_string(),
         label.to_string(),
-        "none".to_string(),
-        "-".to_string(),
+        exception_identity,
+        exception_manifest,
         pal_identity,
         pal_manifest,
         scatter_manifest,
@@ -6326,14 +6390,14 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let args = headless_process_args("/out", "02_MAIN", &input)
             .unwrap()
             .expect("typed maps schedule pass two");
-        // ApplySymbols' seventh argument is the retained functions.json; the
-        // map itself is the ninth.
+        // ApplySymbols' ninth argument is the retained functions.json; the
+        // map itself is the eleventh.
         let apply_at = args
             .iter()
             .position(|arg| arg == "ApplySymbols.java")
             .unwrap();
-        let function_argument = &args[apply_at + 7];
-        let map_argument = &args[apply_at + 9];
+        let function_argument = &args[apply_at + 9];
+        let map_argument = &args[apply_at + 11];
         let global_argument = &args[args
             .iter()
             .position(|arg| arg == "ApplyGlobals.java")
@@ -6619,7 +6683,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
-    fn pass2_args_wire_ten_apply_symbols_and_ten_export_arguments() {
+    fn pass2_args_wire_twelve_apply_symbols_and_ten_export_arguments() {
         let symbol_map = pass2_symbol_test_map("wired", "02_MAIN");
         let input = Pass2Input {
             function_map: Some(symbol_map.clone()),
@@ -6643,6 +6707,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             symbol_map.image_blake3(),
             "none",
             "-",
+            "none",
+            "-",
             "-",
             &functions_path,
             symbol_map.functions_blake3(),
@@ -6650,11 +6716,11 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             symbol_map.map_blake3(),
         ];
         assert_eq!(
-            &args[apply_at + 1..=apply_at + 10],
+            &args[apply_at + 1..=apply_at + 12],
             expected_apply,
-            "ApplySymbols must consume exactly its ten arguments"
+            "ApplySymbols must consume exactly its twelve arguments"
         );
-        assert_eq!(args[apply_at + 11], "-postScript");
+        assert_eq!(args[apply_at + 13], "-postScript");
 
         let export_at = args
             .iter()
@@ -6880,7 +6946,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .position(|arg| arg == "ApplySymbols.java")
             .unwrap();
         assert_eq!(
-            &args[apply_at + 4..=apply_at + 6],
+            &args[apply_at + 6..=apply_at + 8],
             [identity, manifest_arg.as_str(), scatter_arg.as_str()]
         );
         let export_at = args
@@ -6890,6 +6956,45 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(
             &args[export_at + 6..=export_at + 8],
             [identity, manifest_arg.as_str(), scatter_arg.as_str()]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pass2_args_pass_exception_identity_and_manifest_through() {
+        let root = pass2_test_root("exception_args");
+        let manifest = root.join("roots.json");
+        std::fs::write(&manifest, b"manifest").unwrap();
+        let identity = format!(
+            "v1:{}:1:1",
+            crate::manifest::blake3_file(&manifest).unwrap()
+        );
+        let manifest_arg = manifest.to_string_lossy().into_owned();
+        let input = Pass2Input {
+            function_map: Some(pass2_symbol_test_map("exception_wired", "02_MAIN")),
+            exception_identity: identity.clone(),
+            exception_manifest: Some(manifest.clone()),
+            ..Pass2Input::default()
+        };
+
+        let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
+            .unwrap()
+            .unwrap();
+        let apply_at = args
+            .iter()
+            .position(|arg| arg == "ApplySymbols.java")
+            .unwrap();
+        assert_eq!(
+            &args[apply_at + 4..=apply_at + 5],
+            [identity.as_str(), manifest_arg.as_str()]
+        );
+        let export_at = args
+            .iter()
+            .position(|arg| arg == "ExportDecomp.java")
+            .unwrap();
+        assert_eq!(
+            &args[export_at + 4..=export_at + 5],
+            [identity.as_str(), manifest_arg.as_str()]
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -10300,7 +10405,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let source = PAL_TASKS_SUPPORT_JAVA;
         for owned in [
             "pixel-modem-extractor-pal-tasks-v1",
-            "pixel-modem-extractor-symbol-map-v3",
+            "pixel-modem-extractor-symbol-map-v4",
             "PixelModemExtractor_PalTasks_v1",
             "PixelModemExtractor.PalTasks.v1.Ownership",
             "PixelModemExtractor.ThumbNames.v1.Ownership",

@@ -179,6 +179,16 @@ public class ExportDecomp extends HeadlessScript {
                     if (!map.imageLabel.equals(label)) {
                         fail("the symbol map was built for image " + map.imageLabel);
                     }
+                    if (!exceptionIdentity.equals(map.exceptionIdentity)) {
+                        fail("the symbol map exception identity does not match the invocation");
+                    }
+                    if (roots != null && !roots.manifest.manifestBlake3.equals(
+                            map.exceptionManifestBlake3)) {
+                        fail("the symbol map exception manifest BLAKE3 does not match the manifest");
+                    }
+                    if (roots != null) {
+                        ExceptionRootsSupport.validatePass2Transitions(currentProgram, map);
+                    }
                     if (!palIdentity.equals(map.palIdentity)) {
                         fail("the symbol map PAL identity does not match the invocation");
                     }

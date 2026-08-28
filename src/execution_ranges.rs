@@ -14,7 +14,7 @@ pub(crate) const MAX_EXECUTION_CHARGED_BYTES: u64 = 512 * 1024 * 1024;
 const EXECUTION_DIGEST_DOMAIN: &[u8] = b"pixel-modem-extractor-execution-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum DecodeIsa {
+pub enum DecodeIsa {
     Arm,
     Thumb,
 }

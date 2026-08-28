@@ -369,6 +369,17 @@ module; when a file outgrows that, split it.
   manifest identity. Fresh classification consults the actual primary symbol even when no function
   exists, so a meaningful pre-existing label is preserved. Unshipped old registry records without
   primary identity fields are invalid; there is no compatibility grammar.
+- **Exception naming survives pass 2 through explicit authenticated context.** Symbolication
+  attaches `exception_root` evidence only on exact normalized `(entry, decode ISA)` keys and ranks
+  names as `__func__ > registration > exception_root > pal_task > token > string_ref`. Fresh
+  `symbols.json` / symbol maps are v4; the map binds the exception manifest identity and BLAKE3.
+  `ApplySymbols` revalidates the complete exception manifest, registry, functions, instructions,
+  and role-label inventory before mutation. Only an `exception_owned` primary may transition, only
+  for map-authenticated `func` or `registration` authority; the registry retains the original-name
+  digest and exact authority while binding the new symbol ID/source/name digest. Preserved foreign
+  primaries and shared label-only handlers never transition. Final `ExportDecomp` revalidates the
+  transitioned registry and unchanged role labels against the same manifest and map; stale or
+  partial registry state stops before another mutation.
 - **Ghidra-only constraints stay Ghidra-only.** Java preflight rejects intersections among the
   complete derived instruction spans before mutation and computes A32 architectural `PC + 8` before
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
@@ -1068,7 +1079,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   argument-construction details and the all-three example.
 
   **Pass-2 creation of named producer-owned Thumb functions.** The symbol map
-  is `pixel-modem-extractor-symbol-map-v3` with a `creations` section: named
+  is `pixel-modem-extractor-symbol-map-v4` with a `creations` section: named
   (`Recovered` or provisional) Thumb executions authenticated by a validated
   producer inventory (radare2/Rizin strict v3) whose entry Ghidra's own
   inventory never discovered. Readable v1/v2 legacy records remain valid

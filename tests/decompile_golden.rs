@@ -2185,7 +2185,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     )
     .unwrap();
 
-    // Build the strict v3 symbol map from the retained pass-1 tree. Token
+    // Build the strict v4 symbol map from the retained pass-1 tree. Token
     // 0x20 (a genuine LDR data reference) drives one provisional rename; the
     // retained file is hashed verbatim through the same builder the decompose
     // pipeline uses.
@@ -2225,6 +2225,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
         "00_BOOT",
         &tokens,
         &tree_manifest,
+        None,
         None,
     )
     .unwrap();
@@ -2441,6 +2442,8 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     .arg(&creation_only_root)
     .arg("00_BOOT")
     .arg(creation_only_symbol_map.image_blake3())
+    .arg("none")
+    .arg("-")
     .arg("none")
     .arg("-")
     .arg("-")
@@ -3345,6 +3348,8 @@ public class ReplaceThumbCreation extends GhidraScript {
     let c = std::fs::read_to_string(out2.join("export/00_BOOT/decompiled.c")).unwrap();
     assert!(c.contains("recovered_global_word"));
     assert!(!c.contains("invalid_map_must_apply_zero"));
+
+    assert_exception_pass2_survival(&home);
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
@@ -4298,7 +4303,7 @@ fn pal_support_strict_parsers_registry_and_digests() {
         std::fs::write(case_dir.join("expected.txt"), "escapes the import-kit root").unwrap();
     }
 
-    // The strict v3 symbol-map fixtures.
+    // The strict v4 symbol-map fixtures.
     let functions_bytes = b"[{\"name\": \"FUN_40010400\"}]\n".as_slice();
     let functions_hash = pal_fixture::blake3_hex(functions_bytes);
     std::fs::write(case_root.join("functions.json"), functions_bytes).unwrap();
@@ -4312,8 +4317,8 @@ fn pal_support_strict_parsers_registry_and_digests() {
     std::fs::write(case_root.join("symbol_map.json"), &symbol_map).unwrap();
     let bad_symbol_map = replace_once(
         &symbol_map,
-        "\"format\": \"pixel-modem-extractor-symbol-map-v3\",",
-        "\"format\": \"pixel-modem-extractor-symbol-map-v3\",\n  \"unexpected\": true,",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v4\",",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v4\",\n  \"unexpected\": true,",
     );
     std::fs::write(case_root.join("symbol_map_bad.json"), &bad_symbol_map).unwrap();
 
@@ -6701,7 +6706,7 @@ fn blake3_of(path: &std::path::Path) -> String {
     blake3::hash(&std::fs::read(path).unwrap()).to_string()
 }
 
-/// Builds the retained images tree and derives the strict v3 symbol map with
+/// Builds the retained images tree and derives the strict v4 symbol map with
 /// the PAL context from the fixture manifest geometry.
 fn build_pal_pass2_kit(
     home: &std::path::Path,
@@ -6864,6 +6869,7 @@ fn build_pal_pass2_kit(
         "02_MAIN",
         &tokens,
         &tree.join("manifest.json"),
+        None,
         Some(&pal),
     )
     .unwrap();
@@ -6894,7 +6900,7 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
-/// A `-process` run driving ApplySymbols with its ten canonical arguments,
+/// A `-process` run driving ApplySymbols with its twelve canonical arguments,
 /// optionally followed by one extra post-script (with its own arguments) and
 /// the pass-2 ExportDecomp.
 fn pal_apply_symbols(
@@ -6915,6 +6921,8 @@ fn pal_apply_symbols(
         kit.kit_root.to_string_lossy().into_owned(),
         "02_MAIN".to_string(),
         state.image_hash.clone(),
+        "none".to_string(),
+        "-".to_string(),
         kit.identity.clone(),
         kit.manifest_path.to_string_lossy().into_owned(),
         kit.scatter_path.to_string_lossy().into_owned(),
@@ -7477,7 +7485,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     // The map itself carries the exact PAL binding and the authorized
     // transition on the registration rename.
     let map_text = std::fs::read_to_string(&state.map_path).unwrap();
-    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v3\""));
+    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v4\""));
     assert!(map_text.contains(&format!("\"identity\": \"{}\"", state.kit.identity)));
     assert!(map_text.contains("\"from\": \"pal_owned\""));
     assert!(map_text.contains("\"to\": \"pass2_owned\""));
@@ -7571,7 +7579,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     let functions_arg = state.functions_path.to_string_lossy().into_owned();
     let map_arg = state.map_path.to_string_lossy().into_owned();
     let cases: Vec<(Vec<String>, &str)> = vec![
-        // Malformed ten-arg input: nine arguments.
+        // Malformed twelve-arg input: eleven arguments.
         (
             vec![
                 "-postScript".into(),
@@ -7579,6 +7587,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".into(),
                 state.image_hash.clone(),
+                "none".into(),
+                "-".into(),
                 state.kit.identity.clone(),
                 state.kit.manifest_path.to_string_lossy().into_owned(),
                 state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -7586,7 +7596,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.functions_hash.clone(),
                 map_arg.clone(),
             ],
-            "expected exactly ten arguments",
+            "expected exactly twelve arguments",
         ),
         // Stale image BLAKE3.
         (
@@ -7596,6 +7606,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".into(),
                 "0".repeat(64),
+                "none".into(),
+                "-".into(),
                 state.kit.identity.clone(),
                 state.kit.manifest_path.to_string_lossy().into_owned(),
                 state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -7616,6 +7628,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".into(),
                 state.image_hash.clone(),
+                "none".into(),
+                "-".into(),
                 format!("v1:{}:9:9", "b".repeat(64)),
                 state.kit.manifest_path.to_string_lossy().into_owned(),
                 state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -7634,6 +7648,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".into(),
                 state.image_hash.clone(),
+                "none".into(),
+                "-".into(),
                 state.kit.identity.clone(),
                 state.kit.manifest_path.to_string_lossy().into_owned(),
                 state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -7652,6 +7668,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
                 state.kit.kit_root.to_string_lossy().into_owned(),
                 "02_MAIN".into(),
                 state.image_hash.clone(),
+                "none".into(),
+                "-".into(),
                 state.kit.identity.clone(),
                 state.kit.manifest_path.to_string_lossy().into_owned(),
                 state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -7705,6 +7723,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
             state.kit.kit_root.to_string_lossy().into_owned(),
             "02_MAIN".into(),
             state.image_hash.clone(),
+            "none".into(),
+            "-".into(),
             state.kit.identity.clone(),
             state.kit.manifest_path.to_string_lossy().into_owned(),
             state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -7740,6 +7760,8 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
             state.kit.kit_root.to_string_lossy().into_owned(),
             "02_MAIN".into(),
             state.image_hash.clone(),
+            "none".into(),
+            "-".into(),
             state.kit.identity.clone(),
             state.kit.manifest_path.to_string_lossy().into_owned(),
             state.kit.scatter_path.to_string_lossy().into_owned(),
@@ -8547,6 +8569,133 @@ fn exception_fixture_from_committed(raw: &[u8], manifest: &str) -> ExceptionFixt
     }
 }
 
+const EXCEPTION_REG_RESET_OFF: usize = 0x600;
+const EXCEPTION_REG_IRQ_OFF: usize = 0x620;
+const EXCEPTION_REG_FIQ_OFF: usize = 0x640;
+const EXCEPTION_FILE_OFF: usize = 0x680;
+const EXCEPTION_FUNC_OFF: usize = 0x6a0;
+const EXCEPTION_REG_TABLE_OFF: usize = 0x700;
+
+fn exception_pass2_fixture() -> ExceptionFixture {
+    let fixture = exception_fixture();
+    let mut raw = fixture.raw;
+    let put_string = |raw: &mut [u8], offset: usize, value: &str| {
+        let end = offset + value.len() + 1;
+        assert!(raw[offset..end].iter().all(|byte| *byte == 0));
+        raw[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+    };
+    put_string(&mut raw, EXCEPTION_REG_RESET_OFF, "registered_reset");
+    put_string(&mut raw, EXCEPTION_REG_IRQ_OFF, "registered_irq");
+    put_string(&mut raw, EXCEPTION_REG_FIQ_OFF, "registered_fiq");
+    put_string(&mut raw, EXCEPTION_FILE_OFF, "src/exception.c");
+    put_string(&mut raw, EXCEPTION_FUNC_OFF, "undefined_handler");
+
+    assert!(
+        raw[EXCEPTION_REG_TABLE_OFF..EXCEPTION_REG_TABLE_OFF + 24]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    for (index, (name_offset, function)) in [
+        (EXCEPTION_REG_RESET_OFF, 0x4001_0200u32),
+        (EXCEPTION_REG_IRQ_OFF, 0x4001_02a0u32),
+        (EXCEPTION_REG_FIQ_OFF, 0x4001_02c1u32),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = EXCEPTION_REG_TABLE_OFF + index * 8;
+        raw[offset..offset + 4]
+            .copy_from_slice(&(EXCEPTION_BASE + name_offset as u32).to_le_bytes());
+        raw[offset + 4..offset + 8].copy_from_slice(&function.to_le_bytes());
+    }
+
+    let manifest_value: serde_json::Value = serde_json::from_str(&fixture.manifest).unwrap();
+    let old_image_blake3 = manifest_value["image"]["blake3"].as_str().unwrap();
+    let new_image_blake3 = blake3::hash(&raw).to_hex().to_string();
+    let manifest = fixture
+        .manifest
+        .replacen(old_image_blake3, &new_image_blake3, 1);
+    assert_ne!(manifest, fixture.manifest);
+    exception_fixture_from_committed(&raw, &manifest)
+}
+
+fn fixture_u32(value: &serde_json::Value) -> u32 {
+    u32::from_str_radix(value.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+}
+
+fn exception_role_wire(role: &str) -> &'static str {
+    match role {
+        "reset" => "reset",
+        "undefined_instruction" => "undefined_instruction",
+        "supervisor_call" => "supervisor_call",
+        "prefetch_abort" => "prefetch_abort",
+        "data_abort" => "data_abort",
+        "reserved" => "reserved",
+        "irq" => "irq",
+        "fiq" => "fiq",
+        other => panic!("unknown exception role {other}"),
+    }
+}
+
+fn exception_table_kind_wire(kind: &str) -> &'static str {
+    match kind {
+        "initial" => "initial",
+        "relocated" => "relocated",
+        other => panic!("unknown exception table kind {other}"),
+    }
+}
+
+fn exception_pass2_context(
+    fixture: &ExceptionFixture,
+) -> pixel_modem_extractor::symbolicate::ExceptionPass2Context {
+    use pixel_modem_extractor::symbolicate::{
+        DecodeIsa, ExceptionApplicationRef, ExceptionPass2Context, ExceptionRoleRef,
+    };
+
+    let manifest: serde_json::Value = serde_json::from_str(&fixture.manifest).unwrap();
+    let applications = manifest["applications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|application| {
+            let entry = fixture_u32(&application["entry"]);
+            let isa = match application["isa"].as_str().unwrap() {
+                "arm" => DecodeIsa::Arm,
+                "thumb" => DecodeIsa::Thumb,
+                other => panic!("unknown exception ISA {other}"),
+            };
+            let desired_primary = application["desired_primary"].as_str().map(str::to_string);
+            let applied = desired_primary.is_some() && entry != 0x4001_0240;
+            let roles = application["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|claim| ExceptionRoleRef {
+                    table_kind: exception_table_kind_wire(claim["table_kind"].as_str().unwrap()),
+                    table_address: fixture_u32(&claim["table_address"]),
+                    slot_address: fixture_u32(&claim["slot_address"]),
+                    role: exception_role_wire(claim["role"].as_str().unwrap()),
+                })
+                .collect();
+            (
+                (entry, isa),
+                ExceptionApplicationRef {
+                    desired_primary,
+                    applied,
+                    roles,
+                },
+            )
+        })
+        .collect();
+    ExceptionPass2Context {
+        identity: fixture.identity.clone(),
+        manifest_blake3: blake3::hash(fixture.manifest.as_bytes())
+            .to_hex()
+            .to_string(),
+        applications,
+    }
+}
+
 const EXCEPTION_SEED_FOREIGN_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
@@ -8714,6 +8863,72 @@ public class ExceptionInspectApplied extends GhidraScript {
 }
 "#;
 
+const EXCEPTION_INSPECT_PASS2_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class ExceptionInspectPass2 extends GhidraScript {
+    private void requireName(long raw, String name, SourceType source) {
+        Function function = currentProgram.getFunctionManager().getFunctionAt(toAddr(raw));
+        if (function == null || !name.equals(function.getName())
+                || function.getSymbol().getSource() != source) {
+            throw new AssertionError("unexpected pass-2 primary at " + toAddr(raw));
+        }
+    }
+
+    private void requireTransition(StringPropertyMap registry, long raw, String authority) {
+        Address entry = toAddr(raw);
+        ExceptionRootsSupport.RegistryEntry value =
+                ExceptionRootsSupport.parseRegistry(registry.getString(entry));
+        if (!"pass2_owned".equals(value.primaryDisposition)
+                || !authority.equals(value.transitionAuthority)
+                || value.transitionOriginalPrimaryBlake3 == null) {
+            throw new AssertionError("missing exception transition at " + entry);
+        }
+    }
+
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1) throw new AssertionError("expected exception identity");
+        ExceptionRootsSupport.validateAppliedIdentity(currentProgram, args[0]);
+        requireName(0x40010200L, "registered_reset", SourceType.USER_DEFINED);
+        requireName(0x40010220L, "undefined_handler", SourceType.USER_DEFINED);
+        requireName(0x40010240L, "firmwareSupervisor", SourceType.USER_DEFINED);
+        requireName(0x40010260L, "PrefetchAbort", SourceType.ANALYSIS);
+        Function shared = currentProgram.getFunctionManager().getFunctionAt(toAddr(0x40010280L));
+        if (shared == null || !"FUN_40010280".equals(shared.getName())
+                || shared.getSymbol().getSource() != SourceType.DEFAULT) {
+            throw new AssertionError("shared exception handler primary changed");
+        }
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap(ExceptionRootsSupport.OWNERSHIP_MAP);
+        requireTransition(registry, 0x40010200L, "registration");
+        requireTransition(registry, 0x40010220L, "func");
+        Namespace namespace = currentProgram.getSymbolTable().getNamespace(
+                ExceptionRootsSupport.RESERVED_NAMESPACE,
+                currentProgram.getGlobalNamespace());
+        int labels = 0;
+        SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(namespace);
+        while (symbols.hasNext()) {
+            Symbol symbol = symbols.next();
+            if (symbol.getSource() != SourceType.ANALYSIS) {
+                throw new AssertionError("exception role label source changed");
+            }
+            labels++;
+        }
+        if (labels != 8) throw new AssertionError("exception role-label count changed: " + labels);
+        System.out.println("ExceptionInspectPass2: ok");
+    }
+}
+"#;
+
 const EXCEPTION_INSPECT_STATE_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -8812,6 +9027,70 @@ public class ExceptionTamperRegistry extends GhidraScript {
             throw new AssertionError("exception registry tamper did not persist");
         }
         System.out.println("ExceptionTamperRegistry: ready");
+    }
+}
+"#;
+
+const EXCEPTION_TAMPER_TRANSITION_AUTHORITY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class ExceptionTamperTransitionAuthority extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1 || !("tamper".equals(args[0]) || "restore".equals(args[0]))) {
+            throw new AssertionError("expected tamper or restore");
+        }
+        Address entry = toAddr(0x40010200L);
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ExceptionRoots.v1.Ownership");
+        String value = registry == null ? null : registry.getString(entry);
+        String[] fields = value == null ? new String[0] : value.split(":", -1);
+        String expected = "tamper".equals(args[0]) ? "registration" : "func";
+        String replacement = "tamper".equals(args[0]) ? "func" : "registration";
+        if (fields.length != 16 || !"pass2_owned".equals(fields[7])
+                || !expected.equals(fields[11])) {
+            throw new AssertionError("transition authority fixture state changed");
+        }
+        fields[11] = replacement;
+        registry.add(entry, String.join(":", fields));
+        System.out.println("ExceptionTamperTransitionAuthority: " + args[0]);
+    }
+}
+"#;
+
+const EXCEPTION_TAMPER_TRANSITION_PRIMARY_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class ExceptionTamperTransitionPrimary extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1 || !("tamper".equals(args[0]) || "restore".equals(args[0]))) {
+            throw new AssertionError("expected tamper or restore");
+        }
+        Address entry = toAddr(0x40010200L);
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ExceptionRoots.v1.Ownership");
+        String value = registry == null ? null : registry.getString(entry);
+        String[] fields = value == null ? new String[0] : value.split(":", -1);
+        String expected = "tamper".equals(args[0]) ? "registered_reset" : "tampered_reset";
+        String replacement = "tamper".equals(args[0]) ? "tampered_reset" : "registered_reset";
+        Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+        if (fields.length != 16 || !"pass2_owned".equals(fields[7])
+                || function == null || !expected.equals(function.getName())) {
+            throw new AssertionError("transition primary fixture state changed");
+        }
+        function.setName(replacement, SourceType.USER_DEFINED);
+        fields[10] = ExceptionRootsSupport.primaryNameDigest(replacement);
+        registry.add(entry, String.join(":", fields));
+        System.out.println("ExceptionTamperTransitionPrimary: " + args[0]);
     }
 }
 "#;
@@ -9249,6 +9528,7 @@ fn generate_exception_apply_kit_inner(
             "ExceptionInspectApplied.java",
             EXCEPTION_INSPECT_APPLIED_JAVA,
         ),
+        ("ExceptionInspectPass2.java", EXCEPTION_INSPECT_PASS2_JAVA),
         ("ExceptionInspectState.java", EXCEPTION_INSPECT_STATE_JAVA),
         (
             "ExceptionSeedLateCollision.java",
@@ -9257,6 +9537,14 @@ fn generate_exception_apply_kit_inner(
         (
             "ExceptionTamperRegistry.java",
             EXCEPTION_TAMPER_REGISTRY_JAVA,
+        ),
+        (
+            "ExceptionTamperTransitionAuthority.java",
+            EXCEPTION_TAMPER_TRANSITION_AUTHORITY_JAVA,
+        ),
+        (
+            "ExceptionTamperTransitionPrimary.java",
+            EXCEPTION_TAMPER_TRANSITION_PRIMARY_JAVA,
         ),
         (
             "ExceptionInspectScatterApplied.java",
@@ -9507,6 +9795,433 @@ fn exception_export_only(home: &std::path::Path, kit: &ExceptionApplyKit) -> std
             "none".to_string(),
         ],
     )
+}
+
+fn assert_exception_pass2_survival(home: &std::path::Path) {
+    use pixel_modem_extractor::symbolicate::TaggedEvidence;
+
+    let fixture = exception_pass2_fixture();
+    let kit = generate_exception_apply_kit(home, "pass2_survival", &fixture);
+    let imported = exception_import(home, &kit);
+    assert!(
+        imported.status.success(),
+        "exception pass-2 import failed:\n{}",
+        process_diagnostics(&imported)
+    );
+    let applied = exception_apply(home, &kit);
+    assert!(
+        applied.status.success(),
+        "exception pass-1 application failed:\n{}",
+        process_diagnostics(&applied)
+    );
+    let exported = exception_export_only(home, &kit);
+    assert!(
+        exported.status.success(),
+        "exception pass-1 export failed:\n{}",
+        process_diagnostics(&exported)
+    );
+
+    let tree = kit.dir.join("pass2-tree");
+    let image_dir = tree.join("images/00_BOOT");
+    let decompiled = image_dir.join("decompiled");
+    std::fs::create_dir_all(&decompiled).unwrap();
+    let image_path = image_dir.join("00_BOOT.bin");
+    std::fs::write(&image_path, &fixture.raw).unwrap();
+    std::fs::copy(
+        kit.out.join("export/00_BOOT/disasm.lst"),
+        decompiled.join("disasm.lst"),
+    )
+    .unwrap();
+
+    let functions_path = decompiled.join("functions.json");
+    let mut functions: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(kit.out.join("export/00_BOOT/functions.json")).unwrap(),
+    )
+    .unwrap();
+    let undefined = functions
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|function| function["entry"] == "0x40010220")
+        .expect("undefined-instruction root is absent from the pass-1 inventory");
+    undefined["data_refs"] = serde_json::json!([
+        format!("0x{:08x}", EXCEPTION_BASE + EXCEPTION_FILE_OFF as u32),
+        format!("0x{:08x}", EXCEPTION_BASE + EXCEPTION_FUNC_OFF as u32),
+    ]);
+    std::fs::write(
+        &functions_path,
+        serde_json::to_vec_pretty(&functions).unwrap(),
+    )
+    .unwrap();
+
+    let source_tree = image_dir.join("source_tree");
+    std::fs::create_dir_all(&source_tree).unwrap();
+    std::fs::write(
+        source_tree.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "files": {
+                "src/exception.c": {
+                    "occurrences": [{
+                        "vaddr": format!(
+                            "0x{:08x}",
+                            EXCEPTION_BASE + EXCEPTION_FILE_OFF as u32
+                        ),
+                    }],
+                    "attributed_strings": [],
+                },
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let tree_manifest = tree.join("manifest.json");
+    std::fs::write(
+        &tree_manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "toc": [{"name": "BOOT", "load_addr": EXCEPTION_BASE}],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let context = exception_pass2_context(&fixture);
+    let map_path = kit.out.join("symbol_maps/00_BOOT-exception-v4.json");
+    std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
+    let bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(
+        &map_path,
+        &image_dir,
+        "00_BOOT",
+        &HashMap::new(),
+        &tree_manifest,
+        Some(&context),
+        None,
+    )
+    .unwrap();
+    assert_eq!(bundle.map.creation_count, 0);
+    let symbol_at = |entry: u32| {
+        bundle
+            .symbols
+            .iter()
+            .find(|symbol| {
+                u32::from_str_radix(symbol.address.trim_start_matches("0x"), 16).unwrap() == entry
+            })
+            .unwrap_or_else(|| panic!("no symbol at 0x{entry:08x}"))
+    };
+    let reset = symbol_at(0x4001_0200);
+    assert_eq!(reset.name.as_deref(), Some("registered_reset"));
+    assert!(
+        reset
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, TaggedEvidence::Registration { .. }))
+    );
+    assert!(
+        reset
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, TaggedEvidence::ExceptionRoot { .. }))
+    );
+    let undefined = symbol_at(0x4001_0220);
+    assert_eq!(undefined.name.as_deref(), Some("undefined_handler"));
+    assert!(
+        undefined
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, TaggedEvidence::Func { .. }))
+    );
+    let supervisor = symbol_at(0x4001_0240);
+    assert!(supervisor.name.is_none());
+    assert!(
+        supervisor
+            .evidence
+            .iter()
+            .any(|evidence| matches!(evidence, TaggedEvidence::ExceptionRoot { .. }))
+    );
+    let shared = symbol_at(0x4001_0280);
+    assert!(shared.name.is_none());
+    assert_eq!(
+        shared
+            .evidence
+            .iter()
+            .filter(|evidence| matches!(evidence, TaggedEvidence::ExceptionRoot { .. }))
+            .count(),
+        2
+    );
+
+    let map: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+    assert_eq!(map["exception_roots"]["identity"], fixture.identity);
+    let transitions = map["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|decision| decision["exception_transition"]["authority"].as_str())
+        .collect::<Vec<_>>();
+    assert!(transitions.contains(&"registration"));
+    assert!(transitions.contains(&"func"));
+
+    let prepared = pixel_modem_extractor::decompile::PreparedSymbolPass2Map::new(
+        &map_path,
+        &functions_path,
+        &image_path,
+        "00_BOOT",
+        bundle.map.execution_count,
+        bundle.map.applied_decision_count,
+        bundle.map.creation_requests.clone(),
+    )
+    .unwrap();
+    let scatter = kit.scatter_path.as_ref().map_or_else(
+        || "-".to_string(),
+        |path| path.to_string_lossy().into_owned(),
+    );
+    let apply_args = || {
+        vec![
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ApplySymbols.java".to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            prepared.image_blake3().to_string(),
+            fixture.identity.clone(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            "none".to_string(),
+            "-".to_string(),
+            scatter.clone(),
+            functions_path.to_string_lossy().into_owned(),
+            prepared.functions_blake3().to_string(),
+            prepared.path().to_string_lossy().into_owned(),
+            prepared.map_blake3().to_string(),
+        ]
+    };
+
+    let _ = std::fs::remove_dir_all(kit.out.join("export/00_BOOT"));
+    let _ = std::fs::remove_file(kit.out.join("export/00_BOOT.complete"));
+    let mut args = apply_args();
+    args.extend([
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+        kit.out
+            .join("export/00_BOOT")
+            .to_string_lossy()
+            .into_owned(),
+        kit.kit_root.to_string_lossy().into_owned(),
+        "00_BOOT".to_string(),
+        fixture.identity.clone(),
+        kit.manifest_path.to_string_lossy().into_owned(),
+        "none".to_string(),
+        "-".to_string(),
+        scatter.clone(),
+        prepared.path().to_string_lossy().into_owned(),
+        prepared.map_blake3().to_string(),
+    ]);
+    let pass2 = exception_headless(home, &kit, &args);
+    let diagnostics = process_diagnostics(&pass2);
+    assert!(
+        pass2.status.success()
+            && String::from_utf8_lossy(&pass2.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplySymbols: ")),
+        "exception pass 2 failed:\n{diagnostics}"
+    );
+    assert_eq!(
+        std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &fixture.identity,
+            "none",
+            prepared.map_blake3(),
+        )
+    );
+    let exported: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(kit.out.join("export/00_BOOT/functions.json")).unwrap(),
+    )
+    .unwrap();
+    let final_names = exported
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|function| function["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(final_names.contains("registered_reset"));
+    assert!(final_names.contains("undefined_handler"));
+    assert!(final_names.contains("firmwareSupervisor"));
+
+    let inspected = exception_run_script_with(
+        home,
+        &kit,
+        "ExceptionInspectPass2.java",
+        &[fixture.identity.as_str()],
+    );
+    assert!(
+        inspected.status.success()
+            && String::from_utf8_lossy(&inspected.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectPass2: ok"),
+        "exception pass-2 inspection failed:\n{}",
+        process_diagnostics(&inspected)
+    );
+
+    let export_args = || -> Vec<String> {
+        [
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+            kit.out
+                .join("export/00_BOOT")
+                .to_string_lossy()
+                .into_owned(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            fixture.identity.clone(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            "none".to_string(),
+            "-".to_string(),
+            scatter.clone(),
+            prepared.path().to_string_lossy().into_owned(),
+            prepared.map_blake3().to_string(),
+        ]
+        .into()
+    };
+
+    // The registry's transition authority is map-owned, not merely one of a
+    // closed pair. A structurally valid registration -> func substitution
+    // must fail both independent final export and idempotent replay.
+    {
+        let tampered = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionTamperTransitionAuthority.java",
+            &["tamper"],
+        );
+        assert!(
+            tampered.status.success(),
+            "exception transition-authority tamper failed:\n{}",
+            process_diagnostics(&tampered)
+        );
+        let before = exception_run_script(home, &kit, "ExceptionInspectState.java");
+        let before = exception_state(&before);
+        let marker_before = std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap();
+        let rejected_export = exception_headless(home, &kit, &export_args());
+        let export_diagnostics = process_diagnostics(&rejected_export);
+        assert!(
+            export_diagnostics
+                .contains("exception transition authority does not match the symbol map"),
+            "export accepted a stale exception transition authority:\n{export_diagnostics}"
+        );
+        assert_eq!(
+            std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
+            marker_before
+        );
+
+        let mut retry_args = apply_args();
+        retry_args.extend([
+            "-postScript".to_string(),
+            "ExceptionSentinel.java".to_string(),
+        ]);
+        let rejected = exception_headless(home, &kit, &retry_args);
+        let rejected_diagnostics = process_diagnostics(&rejected);
+        assert!(
+            rejected_diagnostics
+                .contains("exception transition authority does not match the symbol map"),
+            "replay accepted a stale exception transition authority:\n{rejected_diagnostics}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&rejected.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplySymbols: ") || line == "ExceptionSentinel: RAN"),
+            "stale transition authority continued after preflight:\n{rejected_diagnostics}"
+        );
+        let after = exception_run_script(home, &kit, "ExceptionInspectState.java");
+        assert_eq!(exception_state(&after), before);
+
+        let restored = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionTamperTransitionAuthority.java",
+            &["restore"],
+        );
+        assert!(
+            restored.status.success(),
+            "exception transition-authority restore failed:\n{}",
+            process_diagnostics(&restored)
+        );
+    }
+
+    // Updating both the current name and its registry digest still cannot
+    // substitute a different final primary for the one authorized by the map.
+    {
+        let tampered = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionTamperTransitionPrimary.java",
+            &["tamper"],
+        );
+        assert!(
+            tampered.status.success(),
+            "exception transition-primary tamper failed:\n{}",
+            process_diagnostics(&tampered)
+        );
+        let marker_before = std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap();
+        let rejected_export = exception_headless(home, &kit, &export_args());
+        let export_diagnostics = process_diagnostics(&rejected_export);
+        assert!(
+            export_diagnostics
+                .contains("exception transition final primary does not match the symbol map"),
+            "export accepted a substituted exception transition primary:\n{export_diagnostics}"
+        );
+        assert_eq!(
+            std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
+            marker_before
+        );
+        let restored = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionTamperTransitionPrimary.java",
+            &["restore"],
+        );
+        assert!(
+            restored.status.success(),
+            "exception transition-primary restore failed:\n{}",
+            process_diagnostics(&restored)
+        );
+    }
+
+    let tampered = exception_run_script(home, &kit, "ExceptionTamperRegistry.java");
+    assert!(
+        tampered.status.success(),
+        "exception registry tamper failed:\n{}",
+        process_diagnostics(&tampered)
+    );
+    let before = exception_run_script(home, &kit, "ExceptionInspectState.java");
+    let before = exception_state(&before);
+    let mut retry_args = apply_args();
+    retry_args.extend([
+        "-postScript".to_string(),
+        "ExceptionSentinel.java".to_string(),
+    ]);
+    let rejected = exception_headless(home, &kit, &retry_args);
+    let rejected_diagnostics = process_diagnostics(&rejected);
+    assert!(
+        rejected_diagnostics.contains("exception-root registry value is missing"),
+        "stale exception registry was not rejected:\n{rejected_diagnostics}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&rejected.stdout)
+            .lines()
+            .any(|line| line.starts_with("ApplySymbols: ") || line == "ExceptionSentinel: RAN"),
+        "stale exception registry continued after preflight:\n{rejected_diagnostics}"
+    );
+    let after = exception_run_script(home, &kit, "ExceptionInspectState.java");
+    assert_eq!(exception_state(&after), before);
+
+    let _ = std::fs::remove_dir_all(&kit.dir);
 }
 
 fn exception_run_script(

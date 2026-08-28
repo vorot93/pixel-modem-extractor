@@ -3,19 +3,22 @@
 //! (the pw_tokenizer DB, `__func__` strings, attributed strings, existing
 //! attribution), then rewrite the artifacts in place + emit `symbols.json`.
 //! Pure-Rust; ARM and Thumb. Fail-closed and tiered. Two evidence sources yield
-//! a real (`Recovered`) rename: `__func__`, and a `{name, fn}` registration
-//! table whose pointer resolves to a known function entry (see
-//! `symbolicate/reg_table.rs`). A token or a uniquely-referenced identifier
-//! string yields a marked `guess_…` name (`Provisional`). Provisional names are
-//! never applied to Ghidra as an authoritative (`USER_DEFINED`) symbol;
+//! a real (`Recovered`) name: `__func__`, a `{name, fn}` registration table
+//! whose pointer resolves to a known function entry (see
+//! `symbolicate/reg_table.rs`), an authenticated exception root, or a PAL task.
+//! A token or a uniquely-referenced identifier string yields a marked
+//! `guess_…` name (`Provisional`). Provisional names are never applied to
+//! Ghidra as an authoritative (`USER_DEFINED`) symbol;
 //! string-ref guesses specifically are computed only by the post-globals
 //! finalize rewrite, so they never even appear in Ghidra's pass-2 input.
 //! Registration names, being `Recovered`, are computed at the symbol_map stage
 //! and therefore *do* reach Ghidra pass 2. Everything else is a comment.
-//! Precedence: `__func__` > registration > token > string-ref.
+//! Precedence from strongest to weakest: `__func__`, registration,
+//! exception_root, pal_task, token, string-ref.
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::disasm_index::DisasmIndex;
 use crate::error::{Error, Result};
+pub use crate::execution_ranges::DecodeIsa;
 use crate::execution_ranges::{ExecutionIdentity, FunctionEvidenceKey, FunctionOwner};
 use crate::recover_source::{Confidence, Tool};
 use serde::{Deserialize, Serialize};
@@ -51,12 +54,11 @@ pub enum Tier {
     None,
 }
 
-/// `symbols.json` format tag (v2 introduced the tagged evidence model and
-/// `name_conflicts`; v3 adds `dbt_source` evidence and its annotations).
-pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v3";
+/// `symbols.json` format tag (v4 adds authenticated exception-root evidence).
+pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v4";
 
 /// Strict pass-2 map format name shared with the Java reader.
-pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v3";
+pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v4";
 
 /// Interface limits for the strict map (mirrored by `PalTasksSupport.java`).
 pub const MAX_MAP_ANNOTATIONS_PER_DECISION: usize = 256;
@@ -70,14 +72,14 @@ pub const MAX_MAP_ANNOTATION_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_PRIMARY_CHARS: usize = 2000;
 
 /// Explicit naming authority. Lower rank (ordinal) is stronger; the order is
-/// the pinned precedence `__func__ > registration > pal_task > token >
-/// string_ref`. `file` and `dbt_source` evidence carry no authority
-/// (annotation-only).
+/// the pinned precedence: `__func__`, registration, exception_root, pal_task,
+/// token, string_ref. `file` and `dbt_source` evidence are annotation-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Authority {
     Func,
     Registration,
+    ExceptionRoot,
     PalTask,
     Token,
     StringRef,
@@ -88,10 +90,101 @@ impl Authority {
         match self {
             Self::Func => "func",
             Self::Registration => "registration",
+            Self::ExceptionRoot => "exception_root",
             Self::PalTask => "pal_task",
             Self::Token => "token",
             Self::StringRef => "string_ref",
         }
+    }
+}
+
+/// One ordered architectural role claim attached to a normalized exception
+/// application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionRoleRef {
+    pub table_kind: &'static str,
+    pub table_address: u32,
+    pub slot_address: u32,
+    pub role: &'static str,
+}
+
+/// One exception-root application at an exact normalized entry and decode ISA.
+/// `applied` means the desired project-owned exception primary is the retained
+/// primary; a preserved meaningful primary leaves the rank proposal-less.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionApplicationRef {
+    pub desired_primary: Option<String>,
+    pub applied: bool,
+    pub roles: Vec<ExceptionRoleRef>,
+}
+
+/// The authenticated exception state bound into symbolication and pass 2.
+/// Production construction accepts only a strict reader result plus the
+/// caller's explicit per-application current state; it never probes a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionPass2Context {
+    pub identity: String,
+    pub manifest_blake3: String,
+    pub applications: BTreeMap<(u32, DecodeIsa), ExceptionApplicationRef>,
+}
+
+impl ExceptionPass2Context {
+    #[allow(dead_code)] // Task 9 constructs this at the explicit terminal-state boundary.
+    pub(crate) fn from_validated(
+        validated: &crate::exception_roots::ValidatedExceptionRoots,
+        current: &BTreeMap<(u32, DecodeIsa), bool>,
+    ) -> Result<Self> {
+        let expected = validated
+            .plan
+            .applications
+            .iter()
+            .map(|application| (application.entry, application.isa.decode_isa()))
+            .collect::<BTreeSet<_>>();
+        let supplied = current.keys().copied().collect::<BTreeSet<_>>();
+        if supplied != expected {
+            return Err(Error::Serialize(
+                "exception pass-2 context does not carry the exact application state".into(),
+            ));
+        }
+
+        let mut applications = BTreeMap::new();
+        for application in &validated.plan.applications {
+            let key = (application.entry, application.isa.decode_isa());
+            let applied = current[&key];
+            if applied && application.desired_primary.is_none() {
+                return Err(Error::Serialize(format!(
+                    "exception application at 0x{:08x} has no desired primary to mark applied",
+                    application.entry
+                )));
+            }
+            let roles = application
+                .claims
+                .iter()
+                .map(|claim| ExceptionRoleRef {
+                    table_kind: match claim.table_kind {
+                        crate::exception_roots::VectorTableKind::Initial => "initial",
+                        crate::exception_roots::VectorTableKind::Relocated => "relocated",
+                    },
+                    table_address: claim.table_address,
+                    slot_address: claim.slot_address,
+                    role: claim.role.as_wire(),
+                })
+                .collect();
+            applications.insert(
+                key,
+                ExceptionApplicationRef {
+                    desired_primary: application.desired_primary.clone(),
+                    applied,
+                    roles,
+                },
+            );
+        }
+
+        Ok(Self {
+            identity: validated.identity.clone(),
+            manifest_blake3: crate::manifest::blake3_fixed(validated.manifest_blake3),
+            applications,
+        })
     }
 }
 
@@ -142,6 +235,13 @@ pub enum TaggedEvidence {
     Registration {
         value: String,
     },
+    ExceptionRoot {
+        manifest_blake3: String,
+        table_kind: &'static str,
+        table_address: u32,
+        slot_address: u32,
+        role: &'static str,
+    },
     PalTask {
         #[serde(flatten)]
         task: PalTaskRef,
@@ -171,6 +271,7 @@ impl TaggedEvidence {
         match self {
             Self::Func { .. } => "func",
             Self::Registration { .. } => "registration",
+            Self::ExceptionRoot { .. } => "exception_root",
             Self::PalTask { .. } => "pal_task",
             Self::Token { .. } => "token",
             Self::File { .. } => "file",
@@ -278,9 +379,15 @@ pub struct RawEvidence {
     pub dbt_sources: Vec<String>,
     pub ident_guess: Option<(String, name_guess::Class)>, // string_ref_guess output
     /// Authoritative name recovered from a `{name, fn}` registration table
-    /// (`reg_table::scan`). Outranks pal_task, token, and string-ref; only
-    /// `__func__` wins.
+    /// (`reg_table::scan`). Outranks exception_root, pal_task, token, and
+    /// string-ref; only `__func__` wins.
     pub registration: Option<String>,
+    /// Manifest identity attached separately so `ExceptionApplicationRef`
+    /// remains the exact application model shared by the pass-2 context.
+    pub exception_manifest_blake3: Option<String>,
+    /// The authenticated exception application at this exact entry and decode
+    /// ISA. Occupies the `exception_root` authority rank.
+    pub exception: Option<ExceptionApplicationRef>,
     /// The PAL application at this entry, when the PAL task manifest claims
     /// it. Occupies the `pal_task` authority rank.
     pub pal: Option<PalApplicationRef>,
@@ -494,14 +601,14 @@ struct NameCandidate {
 }
 
 /// Apply the ranked, fail-closed naming policy for one function. Ranks are
-/// the pinned precedence `__func__ > registration > pal_task > token >
-/// string_ref`; the strongest rank with a proposal wins and every weaker
+/// the pinned precedence: `__func__`, registration, exception_root, pal_task,
+/// token, string_ref. The strongest rank with a proposal wins and every weaker
 /// candidate is retained as evidence. Two distinct names at the winning rank
 /// apply neither: the sorted candidates are serialized as `name_conflicts`.
-/// Shared task roles (multiple tasks at one entry) block every weaker rank
-/// while proposing no name of their own. Returns
-/// `(name, tier, evidence, annotations, conflicts)`. `addr_hex` is bare
-/// (e.g. "40e1bff4").
+/// Shared exception/task roles and preserved role primaries block every weaker
+/// rank while proposing no name of their own. Returns
+/// `(name, tier, evidence, annotations, conflicts)`. `addr_hex` is bare, for
+/// example `"40e1bff4"`.
 #[allow(clippy::type_complexity)]
 pub fn decide(
     addr_hex: &str,
@@ -567,6 +674,37 @@ pub fn decide(
     if let Some(reg) = &raw.registration {
         ev.push(TaggedEvidence::Registration { value: reg.clone() });
         ann.push(format!("registration: {reg:?}"));
+    }
+
+    // Exception role evidence is retained in manifest table/slot order. An
+    // applied preferred primary re-proposes its architectural name; a shared
+    // or preserved application contributes a blocking rank with no proposal.
+    // Missing manifest identity makes the whole source ineligible rather than
+    // producing unauthenticated evidence.
+    if let (Some(manifest_blake3), Some(app)) = (&raw.exception_manifest_blake3, &raw.exception) {
+        for role in &app.roles {
+            ev.push(TaggedEvidence::ExceptionRoot {
+                manifest_blake3: manifest_blake3.clone(),
+                table_kind: role.table_kind,
+                table_address: role.table_address,
+                slot_address: role.slot_address,
+                role: role.role,
+            });
+            ann.push(format!(
+                "exception root: {} table={}@{:#010x} slot={:#010x}",
+                role.role, role.table_kind, role.table_address, role.slot_address
+            ));
+        }
+        candidates.push(NameCandidate {
+            authority: Authority::ExceptionRoot,
+            kind: "exception_root",
+            proposed_name: app
+                .desired_primary
+                .as_ref()
+                .filter(|_| app.applied)
+                .cloned()
+                .unwrap_or_default(),
+        });
     }
 
     // PAL task evidence: one variant plus one annotation line per attached
@@ -683,7 +821,7 @@ pub fn decide(
         return (None, Tier::None, ev, ann, Vec::new());
     };
     if group.is_empty() {
-        // A blocking rank with no proposal (shared task roles): no name.
+        // A blocking role rank with no proposal: no name.
         return (None, Tier::None, ev, ann, Vec::new());
     }
     if group.len() > 1 {
@@ -703,7 +841,10 @@ pub fn decide(
     let winner = &group[0];
     let name = winner.proposed_name.clone();
     let tier = match winner.authority {
-        Authority::Func | Authority::Registration | Authority::PalTask => Tier::Recovered,
+        Authority::Func
+        | Authority::Registration
+        | Authority::ExceptionRoot
+        | Authority::PalTask => Tier::Recovered,
         Authority::Token | Authority::StringRef => Tier::Provisional,
     };
     (Some(name), tier, ev, ann, Vec::new())
@@ -1100,7 +1241,7 @@ fn write_symbols_json(
 }
 
 /// Serializable shape of the strict pass-2 symbol map
-/// (`pixel-modem-extractor-symbol-map-v3`), consumed first by
+/// (`pixel-modem-extractor-symbol-map-v4`), consumed first by
 /// `ApplyThumbNames.java` (creation of named functions Ghidra never discovered),
 /// then by `ApplySymbols.java` (application), and finally by
 /// `ExportDecomp.java` (postflight identity comparison) through the shared
@@ -1110,11 +1251,18 @@ fn write_symbols_json(
 struct SymbolMapFile<'a> {
     format: &'static str,
     image: ImageBlock<'a>,
+    exception_roots: ExceptionBlock<'a>,
     pal: PalBlock<'a>,
     functions_blake3: &'a str,
     executions: Vec<ExecutionBlock<'a>>,
     symbols: Vec<DecisionBlock<'a>>,
     creations: Vec<CreationBlock<'a>>,
+}
+
+#[derive(Serialize)]
+struct ExceptionBlock<'a> {
+    identity: &'a str,
+    manifest_blake3: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1149,6 +1297,7 @@ struct DecisionBlock<'a> {
     final_source: &'a str,
     action: &'static str,
     annotations: &'a [String],
+    exception_transition: Option<ExceptionTransition>,
     pal_transition: Option<PalTransition>,
 }
 
@@ -1172,6 +1321,75 @@ struct CreationBlock<'a> {
 struct PalTransition {
     from: &'static str,
     to: &'static str,
+}
+
+#[derive(Serialize)]
+struct ExceptionTransition {
+    from: &'static str,
+    to: &'static str,
+    authority: &'static str,
+}
+
+fn stronger_exception_authority(symbol: &Symbol) -> Option<&'static str> {
+    if symbol
+        .evidence
+        .iter()
+        .any(|evidence| matches!(evidence, TaggedEvidence::Func { .. }))
+    {
+        Some("func")
+    } else if symbol
+        .evidence
+        .iter()
+        .any(|evidence| matches!(evidence, TaggedEvidence::Registration { .. }))
+    {
+        Some("registration")
+    } else {
+        None
+    }
+}
+
+fn validate_exception_context(context: &ExceptionPass2Context) -> Result<()> {
+    let parts = context.identity.split(':').collect::<Vec<_>>();
+    if parts.len() != 4
+        || parts[0] != "v1"
+        || parts[1] != context.manifest_blake3
+        || parts[1].len() != 64
+        || !parts[1]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Serialize(
+            "exception pass-2 context identity does not bind its manifest BLAKE3".into(),
+        ));
+    }
+    let tables = parts[2]
+        .parse::<usize>()
+        .map_err(|_| Error::Serialize("exception context table count is invalid".into()))?;
+    let roots = parts[3]
+        .parse::<usize>()
+        .map_err(|_| Error::Serialize("exception context root count is invalid".into()))?;
+    if !(1..=crate::exception_roots::MAX_TABLES).contains(&tables)
+        || roots != context.applications.len()
+        || roots == 0
+        || roots > crate::exception_roots::MAX_ROOTS
+    {
+        return Err(Error::Serialize(
+            "exception pass-2 context identity counts do not match its applications".into(),
+        ));
+    }
+    for ((entry, _), application) in &context.applications {
+        if application.roles.is_empty() {
+            return Err(Error::Serialize(format!(
+                "exception application at 0x{entry:08x} has no role evidence"
+            )));
+        }
+        if application.applied && application.desired_primary.is_none() {
+            return Err(Error::Serialize(format!(
+                "exception application at 0x{entry:08x} has no desired primary to mark applied"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One authenticated Ghidra execution plus its retained record identity (the
@@ -1301,10 +1519,14 @@ pub(crate) fn write_pass2_symbol_map(
     load_addr: u64,
     image_bytes: &[u8],
     symbols: &[Symbol],
+    exception: Option<&ExceptionPass2Context>,
     pal: Option<&PalPass2Context>,
     runtime: &crate::runtime_image::RuntimeImage<'_>,
 ) -> Result<WrittenSymbolMap> {
     check_map_limits(symbols)?;
+    if let Some(context) = exception {
+        validate_exception_context(context)?;
+    }
 
     let functions_path = image_dir.join("decompiled").join("functions.json");
     let functions_bytes = std::fs::read(&functions_path)?;
@@ -1389,6 +1611,35 @@ pub(crate) fn write_pass2_symbol_map(
                 symbol.original_name, execution.original_primary, execution.entry
             )));
         }
+        let execution_isa = match execution.first_isa {
+            "arm" => DecodeIsa::Arm,
+            "thumb" => DecodeIsa::Thumb,
+            _ => unreachable!("validated execution ISA"),
+        };
+        let exception_application = exception
+            .and_then(|context| context.applications.get(&(execution.entry, execution_isa)))
+            .filter(|application| application.applied);
+        if let Some(application) = exception_application
+            && application.desired_primary.as_deref() != Some(execution.original_primary.as_str())
+        {
+            return Err(Error::Serialize(format!(
+                "exception application current primary does not match the retained record at 0x{:08x}",
+                execution.entry
+            )));
+        }
+        let exception_transition = exception_application.and_then(|_| {
+            let authority = stronger_exception_authority(symbol)?;
+            (symbol.tier == Tier::Recovered
+                && symbol
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name != execution.original_primary))
+            .then_some(ExceptionTransition {
+                from: "exception_owned",
+                to: "pass2_owned",
+                authority,
+            })
+        });
         let pal_transition = match pal
             .and_then(|ctx| ctx.applications.get(&execution.entry))
             .filter(|app| app.desired_primary == execution.original_primary)
@@ -1398,10 +1649,11 @@ pub(crate) fn write_pass2_symbol_map(
             // from the original) may transition; a pal-rank preserve never
             // does.
             Some(app)
-                if symbol
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name != execution.original_primary)
+                if exception_application.is_none()
+                    && symbol
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name != execution.original_primary)
                     && symbol.tier == Tier::Recovered =>
             {
                 if app.isa != symbol.decode_isa() {
@@ -1422,8 +1674,10 @@ pub(crate) fn write_pass2_symbol_map(
         // Genuine imported and user-defined names stay protected — their
         // decisions downgrade to preserve (the evidence survives in
         // symbols.json).
-        let rename_authorized = pal_transition.is_some()
-            || matches!(execution.original_source.as_str(), "default" | "analysis");
+        let rename_authorized = exception_transition.is_some()
+            || pal_transition.is_some()
+            || (exception_application.is_none()
+                && matches!(execution.original_source.as_str(), "default" | "analysis"));
         let (final_primary, final_source, action) = match &symbol.name {
             Some(name) if name != &execution.original_primary && rename_authorized => {
                 let source = match symbol.tier {
@@ -1450,6 +1704,7 @@ pub(crate) fn write_pass2_symbol_map(
             final_source,
             action,
             annotations: &symbol.annotations,
+            exception_transition,
             pal_transition,
         });
     }
@@ -1598,6 +1853,13 @@ pub(crate) fn write_pass2_symbol_map(
         });
     }
 
+    let (exception_identity, exception_manifest_blake3) = match exception {
+        None => ("none", None),
+        Some(context) => (
+            context.identity.as_str(),
+            Some(context.manifest_blake3.as_str()),
+        ),
+    };
     let (pal_identity, manifest_blake3, scatter_blake3) = match pal {
         None => ("none", None, None),
         Some(ctx) => (
@@ -1616,6 +1878,10 @@ pub(crate) fn write_pass2_symbol_map(
             base_addr: format!("0x{load_addr:08x}"),
             size: image_size,
             blake3: &crate::manifest::blake3_bytes(image_bytes),
+        },
+        exception_roots: ExceptionBlock {
+            identity: exception_identity,
+            manifest_blake3: exception_manifest_blake3,
         },
         pal: PalBlock {
             identity: pal_identity,
@@ -1694,19 +1960,20 @@ pub struct Pass2MapBundle {
 /// Build the ranked symbol set for one image and write its strict pass-2 map
 /// to `map_out_path`. One call covers: `build_map` (ranked decisions), the
 /// exact retained-file hash, the runtime-recomputed execution inventory, the
-/// decision cross-checks, and the atomic v3 write.
+/// decision cross-checks, and the atomic v4 write.
 pub fn prepare_pass2_symbol_map(
     map_out_path: &Path,
     image_dir: &Path,
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
+    exception: Option<&ExceptionPass2Context>,
     pal: Option<&PalPass2Context>,
 ) -> Result<Pass2MapBundle> {
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
     let image_bytes = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
-    let symbols = build_map(image_dir, image_label, tokens, manifest, pal)?;
+    let symbols = build_map(image_dir, image_label, tokens, manifest, exception, pal)?;
     let runtime = thumb_runtime(image_dir, &image_bytes, load_addr)?;
     let map = write_pass2_symbol_map(
         map_out_path,
@@ -1715,6 +1982,7 @@ pub fn prepare_pass2_symbol_map(
         load_addr,
         &image_bytes,
         &symbols,
+        exception,
         pal,
         &runtime,
     )?;
@@ -2123,8 +2391,12 @@ pub(crate) fn build_map(
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
+    exception: Option<&ExceptionPass2Context>,
     pal: Option<&PalPass2Context>,
 ) -> Result<Vec<Symbol>> {
+    if let Some(context) = exception {
+        validate_exception_context(context)?;
+    }
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
     let index = crate::disasm_index::DisasmIndex::new(&disasm);
@@ -2259,6 +2531,31 @@ pub(crate) fn build_map(
                 crate::execution_ranges::DecodeIsa::Arm => "arm",
                 crate::execution_ranges::DecodeIsa::Thumb => "thumb",
             });
+        let record_decode_isa = match record_isa {
+            "arm" => DecodeIsa::Arm,
+            "thumb" => DecodeIsa::Thumb,
+            _ => {
+                return Err(Error::Serialize(format!(
+                    "symbolicate: unsupported record decode ISA {record_isa:?}"
+                )));
+            }
+        };
+        let exception_app = exception
+            .and_then(|context| {
+                context
+                    .applications
+                    .get(&(u32::try_from(f.entry).ok()?, record_decode_isa))
+            })
+            .cloned();
+        if let Some(application) = &exception_app
+            && application.applied
+            && application.desired_primary.as_deref() != Some(f.name.as_str())
+        {
+            return Err(Error::Serialize(format!(
+                "exception application current primary does not match the retained record at 0x{:08x}",
+                f.entry
+            )));
+        }
         let pal_app = pal
             .and_then(|ctx| ctx.applications.get(&u32::try_from(f.entry).ok()?))
             .filter(|app| app.isa == record_isa)
@@ -2305,7 +2602,10 @@ pub(crate) fn build_map(
 
         // A PAL-applied primary is a real name every weaker rank defers to —
         // but registration (rank above pal_task) may still displace it.
-        let pal_applied = pal_app.is_some();
+        let role_primary = exception_app
+            .as_ref()
+            .is_some_and(|application| application.applied)
+            || pal_app.is_some();
         let raw = RawEvidence {
             func_name,
             tokens: hits,
@@ -2313,11 +2613,15 @@ pub(crate) fn build_map(
             file_strings: fstrings,
             dbt_sources,
             ident_guess,
-            registration: if is_real_name(&f.name) && !pal_applied {
+            registration: if is_real_name(&f.name) && !role_primary {
                 None
             } else {
                 reg_names.get(&f.entry).cloned()
             },
+            exception_manifest_blake3: exception
+                .filter(|_| exception_app.is_some())
+                .map(|context| context.manifest_blake3.clone()),
+            exception: exception_app,
             pal: pal_app,
         };
         let (name, tier, evidence, annotations, name_conflicts) = decide(&addr_hex, &raw);
@@ -2386,7 +2690,7 @@ fn symbolicate_image(
     tokens: &HashMap<u32, String>,
     manifest: &Path,
 ) -> Result<PathBuf> {
-    let symbols = build_map(image_dir, image_label, tokens, manifest, None)?;
+    let symbols = build_map(image_dir, image_label, tokens, manifest, None, None)?;
     let image = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
@@ -2426,7 +2730,7 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
         if !dir.join("decompiled").join("functions.json").exists() {
             continue;
         }
-        let symbols = build_map(&dir, &label, &tokens, &manifest, None)?;
+        let symbols = build_map(&dir, &label, &tokens, &manifest, None, None)?;
         let image = std::fs::read(dir.join(format!("{label}.bin")))?;
         let load_addr = crate::manifest::load_addr_for_image(&manifest, &label)?
             .ok_or_else(|| Error::Serialize(format!("load_addr missing for {label}")))?;
@@ -2696,6 +3000,8 @@ mod tests {
             dbt_sources: vec![],
             ident_guess: None,
             registration: None,
+            exception_manifest_blake3: None,
+            exception: None,
             pal: None,
         }
     }
@@ -3763,7 +4069,7 @@ mod tests {
 
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dec.join("symbols.json")).unwrap()).unwrap();
-        assert_eq!(v["format"], "pixel-modem-extractor-symbols-v3");
+        assert_eq!(v["format"], "pixel-modem-extractor-symbols-v4");
         assert_eq!(v["symbols"].as_array().unwrap().len(), 1);
         let symbol = &v["symbols"][0];
         let evidence = symbol["evidence"].as_array().unwrap();
@@ -3824,6 +4130,7 @@ mod tests {
             &tokmap,
             &manifest,
             None,
+            None,
         )
         .unwrap();
 
@@ -3869,6 +4176,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
             None,
         )
         .unwrap();
@@ -3952,6 +4260,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
             None,
         )
         .unwrap();
@@ -4038,6 +4347,7 @@ mod tests {
             &HashMap::new(),
             &manifest,
             None,
+            None,
         )
         .unwrap();
 
@@ -4089,6 +4399,7 @@ mod tests {
             &HashMap::new(),
             &manifest,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(symbols.len(), 1);
@@ -4134,6 +4445,7 @@ mod tests {
             "02_MAIN",
             &HashMap::new(),
             &manifest,
+            None,
             None,
         )
         .unwrap();
@@ -4422,7 +4734,15 @@ mod tests {
         let image_dir = dir.join("images/02_MAIN");
         // Empty token map isolates the string-ref tier from token guesses.
         // build_map does not write, so the retained tree is not mutated.
-        let symbols = build_map(&image_dir, "02_MAIN", &HashMap::new(), &manifest, None).unwrap();
+        let symbols = build_map(
+            &image_dir,
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+            None,
+            None,
+        )
+        .unwrap();
         let string_ref = symbols
             .iter()
             .filter(|s| s.evidence.iter().any(|e| e.kind() == "string_ref"))
@@ -4442,7 +4762,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Task 11: ranked authority + strict symbol-map v3
+    // Task 11+: ranked authority + strict symbol-map v4
     // ------------------------------------------------------------------
 
     fn pal_ref(name: &str, index: u32) -> PalTaskRef {
@@ -4475,8 +4795,272 @@ mod tests {
         }
     }
 
+    fn exception_role(
+        table_kind: &'static str,
+        table_address: u32,
+        slot_address: u32,
+        role: &'static str,
+    ) -> ExceptionRoleRef {
+        ExceptionRoleRef {
+            table_kind,
+            table_address,
+            slot_address,
+            role,
+        }
+    }
+
+    fn exception_app(
+        desired_primary: Option<&str>,
+        applied: bool,
+        roles: Vec<ExceptionRoleRef>,
+    ) -> ExceptionApplicationRef {
+        ExceptionApplicationRef {
+            desired_primary: desired_primary.map(str::to_owned),
+            applied,
+            roles,
+        }
+    }
+
     fn raw_with_pal(pal: Option<PalApplicationRef>) -> RawEvidence {
         RawEvidence { pal, ..raw() }
+    }
+
+    #[test]
+    fn exception_authority_orders_func_registration_exception_pal_token_string_ref() {
+        let exception = Some(exception_app(
+            Some("Reset"),
+            true,
+            vec![exception_role("initial", 0x4001_0000, 0x4001_0000, "reset")],
+        ));
+        let pal = Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]));
+        let token = vec![(0x3c2a, "■format♦tok■domain♦D".into())];
+        let ident = Some(("StringRef_Guess".to_string(), name_guess::Class::FnName));
+
+        let decide_name = |func_name: Option<&str>,
+                           registration: Option<&str>,
+                           exception: Option<ExceptionApplicationRef>,
+                           pal: Option<PalApplicationRef>| {
+            decide(
+                "40e1bff4",
+                &RawEvidence {
+                    func_name: func_name.map(str::to_owned),
+                    registration: registration.map(str::to_owned),
+                    exception_manifest_blake3: Some("a".repeat(64)),
+                    exception,
+                    pal,
+                    tokens: token.clone(),
+                    ident_guess: ident.clone(),
+                    ..raw()
+                },
+            )
+            .0
+        };
+
+        assert_eq!(
+            decide_name(
+                Some("func_name"),
+                Some("registration_name"),
+                exception.clone(),
+                pal.clone(),
+            )
+            .as_deref(),
+            Some("func_name")
+        );
+        assert_eq!(
+            decide_name(
+                None,
+                Some("registration_name"),
+                exception.clone(),
+                pal.clone(),
+            )
+            .as_deref(),
+            Some("registration_name")
+        );
+        assert_eq!(
+            decide_name(None, None, exception, pal).as_deref(),
+            Some("Reset")
+        );
+        assert!(Authority::Registration < Authority::ExceptionRoot);
+        assert!(Authority::ExceptionRoot < Authority::PalTask);
+    }
+
+    #[test]
+    fn exception_same_rank_conflict_retains_every_role_evidence_and_blocks_weaker_names() {
+        let roles = vec![
+            exception_role("initial", 0x4001_0000, 0x4001_0010, "data_abort"),
+            exception_role("initial", 0x4001_0000, 0x4001_0014, "reserved"),
+        ];
+        let raw = RawEvidence {
+            exception_manifest_blake3: Some("a".repeat(64)),
+            exception: Some(exception_app(None, false, roles.clone())),
+            pal: Some(pal_app("pal_TaskEntry_shared", &[("shared", 0)])),
+            tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+            ..raw()
+        };
+
+        let (name, tier, evidence, _, conflicts) = decide("40010280", &raw);
+
+        assert_eq!(name, None);
+        assert_eq!(tier, Tier::None);
+        assert!(conflicts.is_empty());
+        let exception_evidence = evidence
+            .iter()
+            .filter_map(|evidence| match evidence {
+                TaggedEvidence::ExceptionRoot {
+                    manifest_blake3,
+                    table_kind,
+                    table_address,
+                    slot_address,
+                    role,
+                } => Some((
+                    manifest_blake3.as_str(),
+                    *table_kind,
+                    *table_address,
+                    *slot_address,
+                    *role,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exception_evidence,
+            vec![
+                (
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "initial",
+                    0x4001_0000,
+                    0x4001_0010,
+                    "data_abort",
+                ),
+                (
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "initial",
+                    0x4001_0000,
+                    0x4001_0014,
+                    "reserved",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn exception_preserved_foreign_primary_is_evidence_only() {
+        let raw = RawEvidence {
+            exception_manifest_blake3: Some("d".repeat(64)),
+            exception: Some(exception_app(
+                Some("SupervisorCall"),
+                false,
+                vec![exception_role(
+                    "initial",
+                    0x4001_0000,
+                    0x4001_0008,
+                    "supervisor_call",
+                )],
+            )),
+            ..raw()
+        };
+
+        let (name, tier, evidence, _, _) = decide("40010240", &raw);
+        assert!(name.is_none());
+        assert_eq!(tier, Tier::None);
+        assert!(matches!(
+            evidence.as_slice(),
+            [TaggedEvidence::ExceptionRoot {
+                role: "supervisor_call",
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn exception_fresh_symbol_wires_are_v4() {
+        assert_eq!(SYMBOLS_FORMAT, "pixel-modem-extractor-symbols-v4");
+        assert_eq!(SYMBOL_MAP_FORMAT, "pixel-modem-extractor-symbol-map-v4");
+    }
+
+    #[test]
+    fn exception_context_requires_strict_artifact_and_exact_explicit_application_state() {
+        let raw = include_bytes!("../tests/fixtures/exception_roots/synthetic.bin");
+        let runtime =
+            crate::runtime_image::RuntimeImage::from_plan(raw, 0x4001_0000, None).unwrap();
+        let source_manifest =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json");
+        let retained = tempfile::tempdir().unwrap();
+        let manifest = retained.path().join("exception_roots/00_BOOT/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(source_manifest, &manifest).unwrap();
+        let validated = crate::exception_roots::read(
+            &manifest,
+            &runtime,
+            crate::exception_roots::ExceptionArtifactContext {
+                label: "00_BOOT",
+                toc_name: "BOOT",
+                image_blake3: *blake3::hash(raw).as_bytes(),
+                scatter_load_map_blake3: None,
+            },
+        )
+        .unwrap();
+        let mut current = validated
+            .plan
+            .applications
+            .iter()
+            .map(|application| {
+                (
+                    (application.entry, application.isa.decode_isa()),
+                    application.desired_primary.is_some() && application.entry != 0x4001_0240,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let context = ExceptionPass2Context::from_validated(&validated, &current).unwrap();
+
+        assert_eq!(context.identity, validated.identity);
+        assert_eq!(
+            context.manifest_blake3,
+            crate::manifest::blake3_fixed(validated.manifest_blake3)
+        );
+        assert_eq!(context.applications.len(), 7);
+        let reset = &context.applications[&(0x4001_0200, DecodeIsa::Arm)];
+        assert_eq!(reset.desired_primary.as_deref(), Some("Reset"));
+        assert!(reset.applied);
+        assert_eq!(
+            reset.roles,
+            vec![exception_role("initial", 0x4001_0000, 0x4001_0000, "reset")]
+        );
+        let preserved = &context.applications[&(0x4001_0240, DecodeIsa::Arm)];
+        assert_eq!(preserved.desired_primary.as_deref(), Some("SupervisorCall"));
+        assert!(!preserved.applied);
+        let shared = &context.applications[&(0x4001_0280, DecodeIsa::Arm)];
+        assert_eq!(shared.desired_primary, None);
+        assert_eq!(
+            shared
+                .roles
+                .iter()
+                .map(|role| role.role)
+                .collect::<Vec<_>>(),
+            ["data_abort", "reserved"]
+        );
+
+        let removed = current.keys().next().copied().unwrap();
+        current.remove(&removed);
+        let error = ExceptionPass2Context::from_validated(&validated, &current)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact application state"), "{error}");
+
+        current.insert(removed, false);
+        current.insert((0x4001_03f0, DecodeIsa::Thumb), false);
+        let error = ExceptionPass2Context::from_validated(&validated, &current)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact application state"), "{error}");
+
+        current.remove(&(0x4001_03f0, DecodeIsa::Thumb));
+        current.insert((0x4001_0280, DecodeIsa::Arm), true);
+        let error = ExceptionPass2Context::from_validated(&validated, &current)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no desired primary"), "{error}");
     }
 
     #[test]
@@ -4857,6 +5441,7 @@ mod tests {
             &image,
             &[ghidra_symbol, legacy_symbol, strict_v3_symbol],
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
@@ -4913,6 +5498,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &[symbol],
+            None,
             None,
             &runtime_for(&image, load_addr),
         )
@@ -5000,6 +5586,7 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
@@ -5083,6 +5670,7 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
@@ -5146,6 +5734,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &symbols,
+            None,
             None,
             &runtime_for(&image, load_addr),
         )
@@ -5215,6 +5804,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &symbols,
+            None,
             None,
             &runtime_for(&image, load_addr),
         )
@@ -5303,6 +5893,7 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
@@ -5380,6 +5971,7 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
@@ -5414,7 +6006,7 @@ mod tests {
     }
 
     #[test]
-    fn map_v2_field_order_is_exact_and_functions_blake3_covers_retained_bytes() {
+    fn map_v4_field_order_is_exact_and_functions_blake3_covers_retained_bytes() {
         let dir = map_fixture_tree("order");
         let image = vec![0u8; 0x400];
         let load_addr = 0x4000_0000u32;
@@ -5428,15 +6020,17 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
 
         let text = std::fs::read_to_string(&map_path).unwrap();
-        // Top-level order: format,image,pal,functions_blake3,executions,symbols.
+        // Top-level order is part of the canonical v4 map contract.
         let top: Vec<&str> = [
             "format",
             "image",
+            "exception_roots",
             "pal",
             "functions_blake3",
             "executions",
@@ -5473,7 +6067,16 @@ mod tests {
             positions.push(image_block.find(&format!("\"{key}\":")).unwrap());
         }
         assert!(positions.windows(2).all(|w| w[0] < w[1]));
-        // pal block for none: identity + null hashes.
+        let exception_block = text
+            .split("\"exception_roots\": {")
+            .nth(1)
+            .unwrap()
+            .split("},")
+            .next()
+            .unwrap();
+        assert!(exception_block.contains("\"identity\": \"none\""));
+        assert!(exception_block.contains("\"manifest_blake3\": null"));
+        // PAL block for none: identity + null hashes.
         let pal_block = text
             .split("\"pal\": {")
             .nth(1)
@@ -5495,7 +6098,7 @@ mod tests {
         for key in ["producer", "entry", "execution_blake3", "decode_ranges"] {
             assert!(execution_block.contains(&format!("\"{key}\":")));
         }
-        // Decisions: execution,original_primary,original_source,final_primary,final_source,action,annotations,pal_transition.
+        // Decision authorization fields follow the evidence-independent fields.
         let symbols_block = text.split("\"symbols\": [").nth(1).unwrap();
         let mut positions: Vec<usize> = Vec::new();
         for key in [
@@ -5506,6 +6109,7 @@ mod tests {
             "final_source",
             "action",
             "annotations",
+            "exception_transition",
             "pal_transition",
         ] {
             positions.push(symbols_block.find(&format!("\"{key}\":")).unwrap());
@@ -5587,6 +6191,7 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap();
@@ -5644,6 +6249,7 @@ mod tests {
                 &image,
                 &symbols,
                 None,
+                None,
                 &runtime_for(&image, load_addr),
             )
             .unwrap();
@@ -5685,6 +6291,17 @@ mod tests {
             identity: identity.to_string(),
             manifest_blake3: "b".repeat(64),
             scatter_load_map_blake3: Some("c".repeat(64)),
+            applications: applications.into_iter().collect(),
+        }
+    }
+
+    fn exception_ctx(
+        identity: &str,
+        applications: Vec<((u32, DecodeIsa), ExceptionApplicationRef)>,
+    ) -> ExceptionPass2Context {
+        ExceptionPass2Context {
+            identity: identity.to_string(),
+            manifest_blake3: "d".repeat(64),
             applications: applications.into_iter().collect(),
         }
     }
@@ -5734,6 +6351,9 @@ mod tests {
         symbols[0].original_name = "pal_TaskEntry_alpha".into();
         symbols[0].name = Some("Func_Winner".into());
         symbols[0].tier = Tier::Recovered;
+        symbols[0].evidence = vec![TaggedEvidence::Registration {
+            value: "Func_Winner".into(),
+        }];
         symbols[1].name = Some("guess_tok_00000200".into());
         symbols[1].tier = Tier::Provisional;
 
@@ -5752,6 +6372,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &symbols,
+            None,
             Some(&pal),
             &runtime_for(&image, load_addr),
         )
@@ -5781,6 +6402,9 @@ mod tests {
         symbols2[0].original_name = "unrelated_existing".into();
         symbols2[0].name = Some("Func_Winner".into());
         symbols2[0].tier = Tier::Recovered;
+        symbols2[0].evidence = vec![TaggedEvidence::Registration {
+            value: "Func_Winner".into(),
+        }];
         let map_path2 = dir2.join("map.json");
         write_pass2_symbol_map(
             &map_path2,
@@ -5789,6 +6413,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &symbols2,
+            None,
             Some(&pal),
             &runtime_for(&image, load_addr),
         )
@@ -5800,6 +6425,132 @@ mod tests {
             serde_json::Value::Null
         );
         let _ = executions;
+    }
+
+    #[test]
+    fn map_v4_binds_exception_context_and_authorizes_only_stronger_transition() {
+        let dir = map_fixture_tree("exception_transition");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["analysis", "default"]);
+        retitle_first_record(&dir, "Reset");
+        symbols[0].original_name = "Reset".into();
+        symbols[0].name = Some("registered_reset".into());
+        symbols[0].tier = Tier::Recovered;
+        symbols[0].evidence = vec![TaggedEvidence::Registration {
+            value: "registered_reset".into(),
+        }];
+        let exception = exception_ctx(
+            &format!("v1:{}:1:1", "d".repeat(64)),
+            vec![(
+                (load_addr + 0x100, DecodeIsa::Arm),
+                exception_app(
+                    Some("Reset"),
+                    true,
+                    vec![exception_role("initial", load_addr, load_addr, "reset")],
+                ),
+            )],
+        );
+        let map_path = dir.join("map.json");
+
+        write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            Some(&exception),
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
+        assert_eq!(parsed["format"], "pixel-modem-extractor-symbol-map-v4");
+        assert_eq!(parsed["exception_roots"]["identity"], exception.identity);
+        assert_eq!(
+            parsed["exception_roots"]["manifest_blake3"],
+            exception.manifest_blake3
+        );
+        assert_eq!(
+            parsed["symbols"][0]["exception_transition"],
+            serde_json::json!({
+                "from": "exception_owned",
+                "to": "pass2_owned",
+                "authority": "registration",
+            })
+        );
+        assert_eq!(
+            parsed["symbols"][0]["pal_transition"],
+            serde_json::Value::Null
+        );
+
+        symbols[0].evidence.clear();
+        let unproven_path = dir.join("unproven-map.json");
+        write_pass2_symbol_map(
+            &unproven_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            Some(&exception),
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        let unproven: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&unproven_path).unwrap()).unwrap();
+        assert_eq!(unproven["symbols"][0]["action"], "preserve");
+        assert_eq!(
+            unproven["symbols"][0]["exception_transition"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn map_rejects_applied_exception_primary_mismatch() {
+        let dir = map_fixture_tree("exception_primary_mismatch");
+        let image = vec![0u8; 0x400];
+        let load_addr = 0x4000_0000u32;
+        let (mut symbols, _) =
+            two_execution_fixture(&dir, &image, load_addr, ["analysis", "default"]);
+        retitle_first_record(&dir, "Reset");
+        symbols[0].original_name = "Reset".into();
+        symbols[0].name = Some("registered_reset".into());
+        symbols[0].tier = Tier::Recovered;
+        symbols[0].evidence = vec![TaggedEvidence::Registration {
+            value: "registered_reset".into(),
+        }];
+        let exception = exception_ctx(
+            &format!("v1:{}:1:1", "d".repeat(64)),
+            vec![(
+                (load_addr + 0x100, DecodeIsa::Arm),
+                exception_app(
+                    Some("NotReset"),
+                    true,
+                    vec![exception_role("initial", load_addr, load_addr, "reset")],
+                ),
+            )],
+        );
+
+        let error = write_pass2_symbol_map(
+            &dir.join("map.json"),
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &symbols,
+            Some(&exception),
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("current primary"), "{error}");
     }
 
     #[test]
@@ -5817,6 +6568,7 @@ mod tests {
                 u64::from(load_addr),
                 &image,
                 &symbols,
+                None,
                 None,
                 &runtime_for(&image, load_addr),
             )
@@ -5857,6 +6609,7 @@ mod tests {
             &image,
             &symbols,
             None,
+            None,
             &runtime_for(&image, load_addr),
         )
         .unwrap_err()
@@ -5879,6 +6632,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &symbols,
+            None,
             None,
             &runtime_for(&image, load_addr),
         )
@@ -5916,7 +6670,15 @@ mod tests {
             "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:0",
             vec![(0x100, pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]))],
         );
-        let symbols = build_map(&root, "02_MAIN", &HashMap::new(), &manifest, Some(&pal)).unwrap();
+        let symbols = build_map(
+            &root,
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+            None,
+            Some(&pal),
+        )
+        .unwrap();
 
         // The Ghidra record at the application entry carries pal_task evidence
         // and the recovered task primary; the Thumb records (same tree, other
@@ -6008,7 +6770,7 @@ mod tests {
                 pal_app_isa("thumb", "pal_TaskEntry_gamma", &[("gamma", 2)]),
             )],
         );
-        let symbols = build_map(&root, "02_MAIN", &tokens, &manifest, Some(&pal)).unwrap();
+        let symbols = build_map(&root, "02_MAIN", &tokens, &manifest, None, Some(&pal)).unwrap();
 
         let gamma = symbols
             .iter()
@@ -6040,7 +6802,15 @@ mod tests {
             "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:0",
             vec![(0x100, pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]))],
         );
-        let symbols = build_map(&root, "02_MAIN", &HashMap::new(), &manifest, Some(&pal)).unwrap();
+        let symbols = build_map(
+            &root,
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+            None,
+            Some(&pal),
+        )
+        .unwrap();
         let record = symbols
             .iter()
             .find(|s| s.owner == FunctionOwner::Ghidra && s.address == "0x00000100")
@@ -6054,6 +6824,58 @@ mod tests {
             record.evidence
         );
         assert!(record.name.is_none());
+    }
+
+    #[test]
+    fn exception_build_map_attaches_by_exact_entry_and_decode_isa() {
+        let root = thumb_ghidra_record_tree("exception_attach", "Reset", &[0x20]);
+        let tokens = HashMap::from([(0x20u32, "■format♦token name■domain♦D".to_string())]);
+        let manifest = root.join("manifest.json");
+        let application = exception_app(
+            Some("Reset"),
+            true,
+            vec![exception_role("initial", 0, 0, "reset")],
+        );
+        let exception = exception_ctx(
+            &format!("v1:{}:1:1", "d".repeat(64)),
+            vec![((0x100, DecodeIsa::Thumb), application.clone())],
+        );
+
+        let symbols =
+            build_map(&root, "02_MAIN", &tokens, &manifest, Some(&exception), None).unwrap();
+        let attached = symbols
+            .iter()
+            .find(|symbol| symbol.owner == FunctionOwner::Ghidra)
+            .unwrap();
+        assert_eq!(attached.name.as_deref(), Some("Reset"));
+        assert_eq!(attached.tier, Tier::Recovered);
+        assert!(attached.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaggedEvidence::ExceptionRoot { role: "reset", .. }
+        )));
+
+        let wrong_isa = exception_ctx(
+            &format!("v1:{}:1:1", "d".repeat(64)),
+            vec![((0x100, DecodeIsa::Arm), application)],
+        );
+        let symbols =
+            build_map(&root, "02_MAIN", &tokens, &manifest, Some(&wrong_isa), None).unwrap();
+        let unattached = symbols
+            .iter()
+            .find(|symbol| symbol.owner == FunctionOwner::Ghidra)
+            .unwrap();
+        assert!(
+            !unattached
+                .evidence
+                .iter()
+                .any(|evidence| matches!(evidence, TaggedEvidence::ExceptionRoot { .. }))
+        );
+        assert!(
+            unattached
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with(GUESS_PREFIX))
+        );
     }
 
     #[test]
@@ -6081,7 +6903,9 @@ mod tests {
             original_name: "pal_TaskEntry_gamma".into(),
             name: Some("gamma_task_fn".into()), // registration-rank rename
             tier: Tier::Recovered,
-            evidence: Vec::new(),
+            evidence: vec![TaggedEvidence::Registration {
+                value: "gamma_task_fn".into(),
+            }],
             annotations: vec!["pal task: gamma slot=0x40010180 priority=7 stack=1024".into()],
             name_conflicts: Vec::new(),
         }];
@@ -6100,6 +6924,7 @@ mod tests {
             u64::from(load_addr),
             &image,
             &symbols,
+            None,
             Some(&pal),
             &runtime_for(&image, load_addr),
         )
@@ -6140,6 +6965,7 @@ mod tests {
             &main,
             &HashMap::new(),
             &dir.join("manifest.json"),
+            None,
             None,
         )
         .unwrap();

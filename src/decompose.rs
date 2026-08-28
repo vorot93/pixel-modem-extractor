@@ -3175,6 +3175,7 @@ fn build_and_write_symbol_maps(
             &label,
             &tokens,
             manifest,
+            None,
             pal.get(&label).map(|terminal| &terminal.context),
         );
         match bundle {

@@ -70,7 +70,7 @@ import org.bouncycastle.crypto.digests.Blake3Digest;
 
 final class PalTasksSupport {
     static final String PAL_FORMAT = "pixel-modem-extractor-pal-tasks-v1";
-    static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v3";
+    static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v4";
     static final String RESERVED_NAMESPACE = "PixelModemExtractor_PalTasks_v1";
     static final String OWNERSHIP_MAP = "PixelModemExtractor.PalTasks.v1.Ownership";
     static final String THUMB_CREATION_OWNERSHIP_MAP =
@@ -765,11 +765,12 @@ final class PalTasksSupport {
         final String finalSource;
         final String action;
         final List<String> annotations;
+        final String exceptionTransitionAuthority;
         final boolean palTransition;
 
         MapDecision(long execution, String originalPrimary, String originalSource,
                 String finalPrimary, String finalSource, String action, List<String> annotations,
-                boolean palTransition) {
+                String exceptionTransitionAuthority, boolean palTransition) {
             this.execution = execution;
             this.originalPrimary = originalPrimary;
             this.originalSource = originalSource;
@@ -777,6 +778,7 @@ final class PalTasksSupport {
             this.finalSource = finalSource;
             this.action = action;
             this.annotations = annotations;
+            this.exceptionTransitionAuthority = exceptionTransitionAuthority;
             this.palTransition = palTransition;
         }
     }
@@ -822,6 +824,8 @@ final class PalTasksSupport {
         final long imageBase;
         final long imageSize;
         final String imageBlake3;
+        final String exceptionIdentity;
+        final String exceptionManifestBlake3;
         final String palIdentity;
         final String manifestBlake3;
         final String scatterLoadMapBlake3;
@@ -832,6 +836,7 @@ final class PalTasksSupport {
         final String mapBlake3;
 
         SymbolMap(String imageLabel, long imageBase, long imageSize, String imageBlake3,
+                String exceptionIdentity, String exceptionManifestBlake3,
                 String palIdentity, String manifestBlake3, String scatterLoadMapBlake3,
                 String functionsBlake3, List<MapExecution> executions,
                 List<MapDecision> decisions, List<MapCreation> creations, String mapBlake3) {
@@ -839,6 +844,8 @@ final class PalTasksSupport {
             this.imageBase = imageBase;
             this.imageSize = imageSize;
             this.imageBlake3 = imageBlake3;
+            this.exceptionIdentity = exceptionIdentity;
+            this.exceptionManifestBlake3 = exceptionManifestBlake3;
             this.palIdentity = palIdentity;
             this.manifestBlake3 = manifestBlake3;
             this.scatterLoadMapBlake3 = scatterLoadMapBlake3;
@@ -1776,6 +1783,23 @@ final class PalTasksSupport {
         return parts;
     }
 
+    private static String[] parseExceptionIdentity(String identity) {
+        if (identity == null) {
+            fail("exception identity is missing");
+        }
+        String[] parts = identity.split(":", -1);
+        if (parts.length != 4 || !IDENTITY_VERSION.equals(parts[0])) {
+            fail("exception identity is not the v1 grammar");
+        }
+        requireHashText(parts[1], "exception identity manifest BLAKE3");
+        long tables = requireNonNegative(parts[2], "exception identity table count");
+        long roots = requireNonNegative(parts[3], "exception identity root count");
+        if (tables < 1 || tables > 2 || roots < 1 || roots > 16) {
+            fail("exception identity counts leave the closed bounds");
+        }
+        return parts;
+    }
+
     private static StringPropertyMap ownershipMap(Program program) {
         StringPropertyMap map =
                 program.getUsrPropertyManager().getStringPropertyMap(OWNERSHIP_MAP);
@@ -1852,7 +1876,7 @@ final class PalTasksSupport {
     }
 
     // -------------------------------------------------------------------------
-    // Strict symbol-map v3 reader
+    // Strict symbol-map v4 reader
     // -------------------------------------------------------------------------
 
     static SymbolMap readSymbolMap(File retainedFunctions, String functionsHash, File map,
@@ -2817,7 +2841,7 @@ final class PalTasksSupport {
     }
 
     // -------------------------------------------------------------------------
-    // Symbol-map v3 parsing
+    // Symbol-map v4 parsing
     // -------------------------------------------------------------------------
 
     private static SymbolMap parseSymbolMap(Reader reader, String mapBlake3) throws Exception {
@@ -2828,7 +2852,8 @@ final class PalTasksSupport {
                 fail("symbol map has trailing non-whitespace content");
             }
             return new SymbolMap(wire.imageLabel, wire.imageBase, wire.imageSize,
-                    wire.imageBlake3, wire.palIdentity, wire.manifestBlake3,
+                    wire.imageBlake3, wire.exceptionIdentity, wire.exceptionManifestBlake3,
+                    wire.palIdentity, wire.manifestBlake3,
                     wire.scatterLoadMapBlake3, wire.functionsBlake3, wire.executions,
                     wire.decisions, wire.creations, mapBlake3);
         }
@@ -2845,6 +2870,8 @@ final class PalTasksSupport {
         long imageBase;
         long imageSize;
         String imageBlake3;
+        String exceptionIdentity;
+        String exceptionManifestBlake3;
         String palIdentity;
         String manifestBlake3;
         String scatterLoadMapBlake3;
@@ -2883,6 +2910,29 @@ final class PalTasksSupport {
         name(reader, "blake3");
         wire.imageBlake3 = hashValue(reader, "symbol map image blake3");
         endObject(reader, "blake3");
+
+        name(reader, "exception_roots");
+        reader.beginObject();
+        name(reader, "identity");
+        String exceptionIdentity = stringValue(reader, "symbol map exception identity");
+        if (NONE_IDENTITY.equals(exceptionIdentity)) {
+            wire.exceptionIdentity = NONE_IDENTITY;
+            name(reader, "manifest_blake3");
+            if (!nullValue(reader, "manifest_blake3")) {
+                fail("a none exception identity carries a manifest BLAKE3");
+            }
+        }
+        else {
+            String[] parts = parseExceptionIdentity(exceptionIdentity);
+            wire.exceptionIdentity = exceptionIdentity;
+            name(reader, "manifest_blake3");
+            wire.exceptionManifestBlake3 = hashValue(
+                    reader, "exception manifest_blake3");
+            if (!wire.exceptionManifestBlake3.equals(parts[1])) {
+                fail("exception identity does not bind its manifest BLAKE3");
+            }
+        }
+        endObject(reader, "manifest_blake3");
 
         name(reader, "pal");
         reader.beginObject();
@@ -3035,6 +3085,28 @@ final class PalTasksSupport {
                 annotations.add(annotation);
             }
             endArray(reader, "annotations");
+            String exceptionTransitionAuthority = null;
+            name(reader, "exception_transition");
+            if (!nullValue(reader, "exception_transition")) {
+                reader.beginObject();
+                name(reader, "from");
+                if (!"exception_owned".equals(
+                        stringValue(reader, "exception_transition from"))) {
+                    fail("exception_transition from is not exception_owned");
+                }
+                name(reader, "to");
+                if (!"pass2_owned".equals(stringValue(reader, "exception_transition to"))) {
+                    fail("exception_transition to is not pass2_owned");
+                }
+                name(reader, "authority");
+                exceptionTransitionAuthority = stringValue(
+                        reader, "exception_transition authority");
+                if (!"func".equals(exceptionTransitionAuthority)
+                        && !"registration".equals(exceptionTransitionAuthority)) {
+                    fail("exception_transition authority is not func or registration");
+                }
+                endObject(reader, "authority");
+            }
             boolean palTransition = false;
             name(reader, "pal_transition");
             if (!nullValue(reader, "pal_transition")) {
@@ -3051,6 +3123,9 @@ final class PalTasksSupport {
                 palTransition = true;
             }
             endObject(reader, "pal_transition");
+            if (exceptionTransitionAuthority != null && palTransition) {
+                fail("a decision carries both exception and PAL transitions");
+            }
             if (originalPrimary.length() > MAX_SYMBOL_LEAF_CHARS
                     || finalPrimary.length() > MAX_SYMBOL_LEAF_CHARS) {
                 fail("a decision primary exceeds the Ghidra symbol leaf limit");
@@ -3060,8 +3135,8 @@ final class PalTasksSupport {
                         || !originalSource.equals(finalSource)) {
                     fail("a preserve decision changes the primary");
                 }
-                if (palTransition) {
-                    fail("a preserve decision carries a PAL transition");
+                if (exceptionTransitionAuthority != null || palTransition) {
+                    fail("a preserve decision carries an ownership transition");
                 }
             }
             else if ("mirror".equals(action)) {
@@ -3072,15 +3147,19 @@ final class PalTasksSupport {
                 if (!originalSource.equals(finalSource)) {
                     fail("a mirror decision changes the primary source");
                 }
-                if (palTransition) {
-                    fail("a mirror decision carries a PAL transition");
+                if (exceptionTransitionAuthority != null || palTransition) {
+                    fail("a mirror decision carries an ownership transition");
                 }
             }
             else if ("default".equals(finalSource)) {
                 fail("a rename decision produces a default source");
             }
+            if (exceptionTransitionAuthority != null && !"user_defined".equals(finalSource)) {
+                fail("an exception transition does not produce a user_defined primary");
+            }
             wire.decisions.add(new MapDecision(execution, originalPrimary, originalSource,
-                    finalPrimary, finalSource, action, annotations, palTransition));
+                    finalPrimary, finalSource, action, annotations,
+                    exceptionTransitionAuthority, palTransition));
         }
          endArray(reader, "symbols");
          if (wire.decisions.size() != wire.executions.size()) {

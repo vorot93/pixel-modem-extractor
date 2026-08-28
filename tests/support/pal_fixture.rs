@@ -1076,7 +1076,7 @@ pub(super) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A minimal canonical `pixel-modem-extractor-symbol-map-v3` covering the
+/// A minimal canonical `pixel-modem-extractor-symbol-map-v4` covering the
 /// two fixture executions (one PAL rename decision, one preserve), with
 /// the exact ordered fields the strict reader enforces.
 pub(super) fn canonical_symbol_map(
@@ -1099,13 +1099,19 @@ pub(super) fn canonical_symbol_map(
 
     let mut json = Json::new();
     json.open_object();
-    json.string_field(true, "format", "pixel-modem-extractor-symbol-map-v3");
+    json.string_field(true, "format", "pixel-modem-extractor-symbol-map-v4");
     json.key(false, "image");
     json.open_object();
     json.string_field(true, "label", LABEL);
     json.string_field(false, "base_addr", &address(BASE));
     json.number_field(false, "size", IMAGE_LEN as u64);
     json.string_field(false, "blake3", &blake3_hex(image));
+    json.close_object();
+    json.key(false, "exception_roots");
+    json.open_object();
+    json.string_field(true, "identity", "none");
+    json.key(false, "manifest_blake3");
+    json.out.push_str("null");
     json.close_object();
     json.key(false, "pal");
     json.open_object();
@@ -1167,6 +1173,8 @@ pub(super) fn canonical_symbol_map(
     json.element(true);
     json.string_value("pal task alpha");
     json.close_array();
+    json.key(false, "exception_transition");
+    json.out.push_str("null");
     json.key(false, "pal_transition");
     json.open_object();
     json.string_field(true, "from", "pal_owned");
@@ -1184,6 +1192,8 @@ pub(super) fn canonical_symbol_map(
     json.key(false, "annotations");
     json.open_array();
     json.close_array();
+    json.key(false, "exception_transition");
+    json.out.push_str("null");
     json.key(false, "pal_transition");
     json.out.push_str("null");
     json.close_object();
