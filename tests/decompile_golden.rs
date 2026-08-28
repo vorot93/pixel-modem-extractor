@@ -1143,16 +1143,20 @@ fn generated_shell_rejects_partial_export_after_functions_json() {
 
     let script_path = out.join("scripts/ExportDecomp.java");
     let script = std::fs::read_to_string(&script_path).unwrap();
-    let mutation_point = "            publish(outDir, \"functions.json\", temporaries,\n";
+    let mutation_point = concat!(
+        "            Files.move(output.temporary.toPath(), output.destination.toPath(),\n",
+        "                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);\n"
+    );
     assert_eq!(script.matches(mutation_point).count(), 1);
     let injected = script.replacen(
         mutation_point,
         concat!(
-            "            if (true) {\n",
+            "            Files.move(output.temporary.toPath(), output.destination.toPath(),\n",
+            "                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);\n",
+            "            if (output.destination.getName().equals(\"functions.json\")) {\n",
             "                throw new RuntimeException(\n",
-            "                        \"deterministic partial export fault before functions.json\");\n",
-            "            }\n",
-            "            publish(outDir, \"functions.json\", temporaries,\n"
+            "                        \"deterministic partial export fault after functions.json\");\n",
+            "            }\n"
         ),
         1,
     );
@@ -1165,7 +1169,7 @@ fn generated_shell_rejects_partial_export_after_functions_json() {
         "generated shell accepted a partial current export:\n{diagnostics}"
     );
     assert!(
-        diagnostics.contains("deterministic partial export fault before functions.json"),
+        diagnostics.contains("deterministic partial export fault after functions.json"),
         "missing injected ExportDecomp failure:\n{diagnostics}"
     );
     assert!(!export.join("functions.json").exists());
@@ -4104,6 +4108,37 @@ fn replace_once(text: &str, from: &str, to: &str) -> String {
     text.replacen(from, to, 1)
 }
 
+fn inject_before_final_export_postflight(out: &std::path::Path, injection: &str) {
+    let path = out.join("scripts/ExportDecomp.java");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let anchors = [
+        "                validateExceptionState(roots);\n",
+        "            validateExceptionState(roots);\n",
+        "            if (roots == null) {\n",
+    ];
+    let (offset, anchor) = anchors
+        .iter()
+        .find_map(|anchor| source.rfind(anchor).map(|offset| (offset, *anchor)))
+        .expect("ExportDecomp final postflight anchor");
+    let mut patched = String::with_capacity(source.len() + injection.len());
+    patched.push_str(&source[..offset]);
+    patched.push_str(injection);
+    patched.push_str(&source[offset..]);
+    assert!(
+        patched[offset + injection.len()..].starts_with(anchor),
+        "injection did not preserve the final postflight anchor"
+    );
+    std::fs::write(path, patched).unwrap();
+}
+
+fn clear_owned_export(out: &std::path::Path, label: &str) {
+    let export = out.join("export").join(label);
+    let _ = std::fs::remove_file(out.join("export").join(format!("{label}.complete")));
+    for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+        let _ = std::fs::remove_file(export.join(name));
+    }
+}
+
 fn minify_json_whitespace(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut in_string = false;
@@ -6949,6 +6984,33 @@ fn pal_export_only(home: &std::path::Path, state: &Pass2Kit, map: Option<(&str, 
     pal_headless(home, kit, &args)
 }
 
+fn pal_export_pass1_only(home: &std::path::Path, kit: &PalApplyKit) -> String {
+    let args: Vec<String> = [
+        "-process".to_string(),
+        "02_MAIN".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+        kit.out
+            .join("export/02_MAIN")
+            .to_string_lossy()
+            .into_owned(),
+        kit.kit_root.to_string_lossy().into_owned(),
+        "02_MAIN".to_string(),
+        "none".to_string(),
+        "-".to_string(),
+        kit.identity.clone(),
+        kit.manifest_path.to_string_lossy().into_owned(),
+        kit.scatter_path.to_string_lossy().into_owned(),
+        "-".to_string(),
+        "none".to_string(),
+    ]
+    .into();
+    pal_headless(home, kit, &args)
+}
+
 /// Postflight inspector after a successful PAL-aware pass 2: the complete
 /// applied state still validates, the alpha primary was renamed by its
 /// registration evidence with the exact registry transition, the coincident
@@ -8348,6 +8410,82 @@ public class SeedExtraFunction extends GhidraScript {
     let _ = std::fs::remove_dir_all(&corrupt_dir);
 }
 
+#[test]
+fn export_revalidates_pal_after_output_generation_before_publication() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra PAL final-postflight test requires /opt/ghidra");
+    };
+    let image = pal_fixture::craft_main_image();
+    for (case, injection, expected) in [
+        (
+            "label_drift",
+            concat!(
+                "            ghidra.program.model.symbol.Namespace driftNamespace =\n",
+                "                    currentProgram.getSymbolTable().getNamespace(\n",
+                "                            PalTasksSupport.RESERVED_NAMESPACE,\n",
+                "                            currentProgram.getGlobalNamespace());\n",
+                "            ghidra.program.model.symbol.Symbol driftLabel =\n",
+                "                    currentProgram.getSymbolTable().getSymbol(\n",
+                "                            \"pal_TaskEntry_alpha\", toAddr(0x40010400L),\n",
+                "                            driftNamespace);\n",
+                "            if (driftLabel == null || !driftLabel.delete()) {\n",
+                "                throw new AssertionError(\"PAL final label drift injection failed\");\n",
+                "            }\n",
+                "            System.out.println(\"ExportFinalPalDrift: label\");\n",
+            ),
+            "the reserved label set does not match the registry",
+        ),
+        (
+            "file_identity_drift",
+            concat!(
+                "            java.nio.file.attribute.FileTime driftTime =\n",
+                "                    java.nio.file.Files.getLastModifiedTime(taskManifest.toPath());\n",
+                "            java.nio.file.Files.setLastModifiedTime(taskManifest.toPath(),\n",
+                "                    java.nio.file.attribute.FileTime.fromMillis(\n",
+                "                            Math.addExact(driftTime.toMillis(), 120000L)));\n",
+                "            System.out.println(\"ExportFinalPalDrift: file\");\n",
+            ),
+            "task manifest no longer names the retained regular file",
+        ),
+    ] {
+        let kit = generate_pal_apply_kit_manifests(&home, case, &image, |scatter_hash| {
+            pal_fixture::extended_manifest(&image, scatter_hash)
+        });
+        let imported = pal_import(&home, &kit, None);
+        assert!(
+            !imported.contains("REPORT SCRIPT ERROR"),
+            "PAL final-postflight import failed for {case}:\n{imported}"
+        );
+        let applied = pal_apply(&home, &kit, None);
+        assert!(
+            applied.contains("ApplyPalTasks:") && !applied.contains("REPORT SCRIPT ERROR"),
+            "PAL final-postflight application failed for {case}:\n{applied}"
+        );
+        clear_owned_export(&kit.out, "02_MAIN");
+        inject_before_final_export_postflight(&kit.out, injection);
+
+        let rejected = pal_export_pass1_only(&home, &kit);
+
+        assert!(
+            rejected.contains("ExportFinalPalDrift:")
+                && rejected.contains("REPORT SCRIPT ERROR")
+                && rejected.contains(expected),
+            "ExportDecomp accepted PAL {case} after output generation:\n{rejected}"
+        );
+        assert!(
+            !kit.out.join("export/02_MAIN.complete").exists(),
+            "PAL {case} published a v4 marker"
+        );
+        for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+            assert!(
+                !kit.out.join("export/02_MAIN").join(name).exists(),
+                "PAL {case} published {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&kit.dir);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Exception-root transactional applicator
 // -----------------------------------------------------------------------------
@@ -9339,6 +9477,38 @@ fn exception_corrupt_and_export(
     )
 }
 
+fn exception_export_only(home: &std::path::Path, kit: &ExceptionApplyKit) -> std::process::Output {
+    exception_headless(
+        home,
+        kit,
+        &[
+            "-process".to_string(),
+            "00_BOOT".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+            kit.out
+                .join("export/00_BOOT")
+                .to_string_lossy()
+                .into_owned(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            kit.identity.clone(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            "none".to_string(),
+            "-".to_string(),
+            kit.scatter_path.as_ref().map_or_else(
+                || "-".to_string(),
+                |path| path.to_string_lossy().into_owned(),
+            ),
+            "-".to_string(),
+            "none".to_string(),
+        ],
+    )
+}
+
 fn exception_run_script(
     home: &std::path::Path,
     kit: &ExceptionApplyKit,
@@ -9771,6 +9941,76 @@ fn export_v4_rejects_removed_merged_and_retagged_exception_roots() {
         }
         let _ = std::fs::remove_dir_all(&kit.dir);
     }
+}
+
+#[test]
+fn export_rejects_root_byte_drift_after_output_generation_without_publication() {
+    let Some(home) = find_ghidra_home() else {
+        panic!("configured real-Ghidra exception final-postflight test requires /opt/ghidra");
+    };
+    let fixture = exception_fixture();
+    let kit = generate_exception_apply_kit(&home, "export_final_byte_drift", &fixture);
+    let imported = exception_import(&home, &kit);
+    assert!(
+        imported.status.success(),
+        "exception final-byte import failed:\n{}",
+        process_diagnostics(&imported)
+    );
+    let applied = exception_apply(&home, &kit);
+    assert!(
+        applied.status.success(),
+        "exception final-byte application failed:\n{}",
+        process_diagnostics(&applied)
+    );
+    clear_owned_export(&kit.out, "00_BOOT");
+    inject_before_final_export_postflight(
+        &kit.out,
+        concat!(
+            "            ghidra.program.model.address.Address driftEntry =\n",
+            "                    toAddr(0x40010220L);\n",
+            "            currentProgram.getListing().clearCodeUnits(\n",
+            "                    driftEntry, driftEntry.add(3), false);\n",
+            "            currentProgram.getMemory().setByte(driftEntry, (byte) 0x40);\n",
+            "            ghidra.program.model.lang.Register driftTMode =\n",
+            "                    currentProgram.getLanguage().getRegister(\"TMode\");\n",
+            "            currentProgram.getProgramContext().setValue(\n",
+            "                    driftTMode, driftEntry, driftEntry.add(3), java.math.BigInteger.ONE);\n",
+            "            ghidra.program.model.address.AddressSet driftRange =\n",
+            "                    new ghidra.program.model.address.AddressSet(\n",
+            "                            driftEntry, driftEntry.add(3));\n",
+            "            ghidra.app.cmd.disassemble.DisassembleCommand drift =\n",
+            "                    new ghidra.app.cmd.disassemble.DisassembleCommand(\n",
+            "                            driftEntry, driftRange, false);\n",
+            "            drift.enableCodeAnalysis(false);\n",
+            "            if (!drift.applyTo(currentProgram, monitor)) {\n",
+            "                throw new AssertionError(\n",
+            "                        \"exception final-byte disassembly failed: \"\n",
+            "                        + drift.getStatusMsg());\n",
+            "            }\n",
+            "            System.out.println(\"ExportFinalExceptionByteDrift: ready\");\n",
+        ),
+    );
+
+    let rejected = exception_export_only(&home, &kit);
+    let diagnostics = process_diagnostics(&rejected);
+
+    assert!(
+        diagnostics.contains("ExportFinalExceptionByteDrift: ready")
+            && diagnostics.contains("REPORT SCRIPT ERROR")
+            && diagnostics.contains("postflight exception-root instruction bytes are stale"),
+        "ExportDecomp accepted final exception-byte drift:\n{diagnostics}"
+    );
+    assert!(
+        !kit.out.join("export/00_BOOT.complete").exists(),
+        "final exception-byte drift published a v4 marker"
+    );
+    for name in ["functions.json", "disasm.lst", "decompiled.c"] {
+        assert!(
+            !kit.out.join("export/00_BOOT").join(name).exists(),
+            "final exception-byte drift published {name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&kit.dir);
 }
 
 #[test]

@@ -687,6 +687,47 @@ final class PalTasksSupport {
         }
     }
 
+    /** A completely authenticated PAL input set whose exact files remain
+     * open until the caller finishes its terminal validation. */
+    static final class ValidatedPal implements AutoCloseable {
+        final PalManifest manifest;
+        final String identity;
+        private final PmeScriptSupport.TrustedFile manifestFile;
+        private final PmeScriptSupport.TrustedFile scatterFile;
+        private final PmeScriptSupport.TrustedFile rawFile;
+        private boolean closed;
+
+        ValidatedPal(PalManifest manifest, String identity,
+                PmeScriptSupport.TrustedFile manifestFile,
+                PmeScriptSupport.TrustedFile scatterFile,
+                PmeScriptSupport.TrustedFile rawFile) {
+            this.manifest = manifest;
+            this.identity = identity;
+            this.manifestFile = manifestFile;
+            this.scatterFile = scatterFile;
+            this.rawFile = rawFile;
+        }
+
+        void verifyRetainedFiles() {
+            manifestFile.verifyPathIdentity("task manifest");
+            if (scatterFile != null) {
+                scatterFile.verifyPathIdentity("scatter load map");
+            }
+            rawFile.verifyPathIdentity("raw image");
+        }
+
+        @Override
+        public void close() throws Exception {
+            if (closed) return;
+            closed = true;
+            Throwable failure = null;
+            failure = closeRetained(rawFile, failure);
+            failure = closeRetained(scatterFile, failure);
+            failure = closeRetained(manifestFile, failure);
+            if (failure != null) rethrow(failure);
+        }
+    }
+
     static final class ExecutionRangeWire {
         final String isa;
         final long start;
@@ -1265,55 +1306,76 @@ final class PalTasksSupport {
     // PAL manifest reader
     // -------------------------------------------------------------------------
 
-    static PalManifest readPal(File kitRoot, String label, File palFile, File scatterFile)
+    static ValidatedPal retainPal(File kitRoot, String label, File palFile, File scatterFile)
             throws Exception {
         assertGhidraSymbolLimit();
         File root = requireCanonicalDirectory(kitRoot, "import-kit root");
         if (!isSafeLabel(label)) {
             fail("expected image label is not a safe path component");
         }
-        byte[] bytes;
-        String manifestBlake3;
-        try (PmeScriptSupport.TrustedFile retained =
-                PmeScriptSupport.openCanonicalContainedFile(root, palFile, "task manifest")) {
-            bytes = retained.readAll(MAX_PAL_MANIFEST_BYTES, "task manifest");
-            manifestBlake3 = PmeScriptSupport.blake3Hex(bytes);
-            retained.verifyPathIdentity("task manifest");
-        }
-        catch (IOException error) {
-            throw new Exception("task manifest could not be read: " + error.getMessage(), error);
-        }
+        PmeScriptSupport.TrustedFile retainedManifest = null;
+        PmeScriptSupport.TrustedFile retainedScatter = null;
+        PmeScriptSupport.TrustedFile retainedRaw = null;
+        try {
+            byte[] bytes;
+            String manifestBlake3;
+            try {
+                retainedManifest = PmeScriptSupport.openCanonicalContainedFile(
+                        root, palFile, "task manifest");
+                bytes = retainedManifest.readAll(MAX_PAL_MANIFEST_BYTES, "task manifest");
+                manifestBlake3 = PmeScriptSupport.blake3Hex(bytes);
+            }
+            catch (IOException error) {
+                throw new Exception(
+                        "task manifest could not be read: " + error.getMessage(), error);
+            }
 
-        PalManifest manifest = parsePalManifest(bytes, label, manifestBlake3);
-
-        if (manifest.scatterLoadMapBlake3 == null && scatterFile != null) {
-            fail("scatter dependency nullability does not match the supplied load map");
-        }
-        if (manifest.scatterLoadMapBlake3 != null) {
-            if (scatterFile == null) {
+            PalManifest manifest = parsePalManifest(bytes, label, manifestBlake3);
+            if (manifest.scatterLoadMapBlake3 == null && scatterFile != null) {
                 fail("scatter dependency nullability does not match the supplied load map");
             }
-            try (PmeScriptSupport.TrustedFile scatter =
-                    PmeScriptSupport.openCanonicalContainedFile(
-                            root, scatterFile, "scatter load map")) {
-                if (!manifest.scatterLoadMapBlake3.equals(scatter.blake3("scatter load map"))) {
+            if (manifest.scatterLoadMapBlake3 != null) {
+                if (scatterFile == null) {
+                    fail("scatter dependency nullability does not match the supplied load map");
+                }
+                retainedScatter = PmeScriptSupport.openCanonicalContainedFile(
+                        root, scatterFile, "scatter load map");
+                if (!manifest.scatterLoadMapBlake3.equals(
+                        retainedScatter.blake3("scatter load map"))) {
                     fail("scatter load-map BLAKE3 does not match the manifest dependency");
                 }
-                scatter.verifyPathIdentity("scatter load map");
             }
-        }
 
-        try (PmeScriptSupport.TrustedFile rawImage = PmeScriptSupport.openContainedChild(
-                root, "images/" + label, "raw image")) {
-            if (rawImage.size() != manifest.imageSize) {
+            retainedRaw = PmeScriptSupport.openContainedChild(
+                    root, "images/" + label, "raw image");
+            if (retainedRaw.size() != manifest.imageSize) {
                 fail("raw image size does not match the manifest");
             }
-            if (!manifest.imageBlake3.equals(rawImage.blake3("raw image"))) {
+            if (!manifest.imageBlake3.equals(retainedRaw.blake3("raw image"))) {
                 fail("image BLAKE3 does not match the raw image file");
             }
-            rawImage.verifyPathIdentity("raw image");
+            ValidatedPal validated = new ValidatedPal(manifest, expectedPalIdentity(manifest),
+                    retainedManifest, retainedScatter, retainedRaw);
+            validated.verifyRetainedFiles();
+            retainedManifest = null;
+            retainedScatter = null;
+            retainedRaw = null;
+            return validated;
         }
-        return manifest;
+        catch (Throwable error) {
+            closeQuietly(retainedRaw, error);
+            closeQuietly(retainedScatter, error);
+            closeQuietly(retainedManifest, error);
+            rethrow(error);
+            return null;
+        }
+    }
+
+    static PalManifest readPal(File kitRoot, String label, File palFile, File scatterFile)
+            throws Exception {
+        try (ValidatedPal retained = retainPal(kitRoot, label, palFile, scatterFile)) {
+            return retained.manifest;
+        }
     }
 
     static String expectedPalIdentity(PalManifest manifest) {
@@ -3169,6 +3231,44 @@ final class PalTasksSupport {
             fail(error.getMessage());
             return null;
         }
+    }
+
+    private static Throwable closeRetained(AutoCloseable closeable, Throwable failure) {
+        if (closeable == null) return failure;
+        try {
+            closeable.close();
+        }
+        catch (Throwable closeFailure) {
+            if (failure == null) return closeFailure;
+            suppress(failure, closeFailure);
+        }
+        return failure;
+    }
+
+    private static void closeQuietly(AutoCloseable closeable, Throwable primary) {
+        if (closeable == null) return;
+        try {
+            closeable.close();
+        }
+        catch (Throwable closeFailure) {
+            suppress(primary, closeFailure);
+        }
+    }
+
+    private static void suppress(Throwable primary, Throwable cleanupFailure) {
+        if (primary == cleanupFailure) return;
+        try {
+            primary.addSuppressed(cleanupFailure);
+        }
+        catch (Throwable ignored) {
+            // Preserve the original terminal failure.
+        }
+    }
+
+    private static void rethrow(Throwable failure) throws Exception {
+        if (failure instanceof Exception) throw (Exception) failure;
+        if (failure instanceof Error) throw (Error) failure;
+        throw new Exception(failure);
     }
 
     // -------------------------------------------------------------------------

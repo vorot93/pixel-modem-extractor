@@ -378,12 +378,18 @@ module; when a file outgrows that, split it.
   discovers MAIN scatter once, builds one `RuntimeImage` per embedded image, discovers exception
   roots for every image, then discovers MAIN PAL against the shared runtime. Every label records
   `RuntimeExceptionState::{Present, Absent, Unmanaged}`; filters, opaque skips, and stale files never
-  fabricate currentness. Present pass-1 order is `ApplyScatterLoad` → `ApplyExceptionRoots` →
-  `ApplyPalTasks` → `TameAnalysis`; generated and in-process routes pass the same identities and
-  parse exactly one conserving exception summary. `TameAnalysis` validates root ownership before
-  and after both modes, so datamark treats root instructions as protected code. `ExportDecomp`
-  reauthenticates the manifest and program state before and after export and writes the exact
-  four-line `pixel-modem-extractor-ghidra-export-v4` marker last; old v3 bytes are stale. An opaque
+  fabricate currentness. Exception discovery, materialization, and clear must each finish before
+  state insertion; any failure returns no `RuntimeAnalysis` and preserves an earlier complete
+  manifest rather than reporting it current. Present pass-1 order is `ApplyScatterLoad` →
+  `ApplyExceptionRoots` → `ApplyPalTasks` → `TameAnalysis`; generated and in-process routes pass the same identities and
+  parse exactly one conserving exception summary. Host summary coordination commits a valid
+  exception result before parsing PAL: a later PAL-summary failure preserves the exception counts
+  but leaves the image terminal-invalid and the export non-current. `TameAnalysis` validates root
+  ownership before and after both modes, so datamark treats root instructions as protected code. `ExportDecomp`
+  retains both exception and PAL inputs, reauthenticates both manifest/program states before and
+  after generating sibling staging files, closes both retained states successfully, then moves the
+  three outputs and writes the exact four-line `pixel-modem-extractor-ghidra-export-v4` marker last;
+  old v3 bytes are stale. An opaque
   skip retains generation state but has no application summary.
 - **Real-Ghidra fixtures have one production oracle.** Everything under
   `tests/fixtures/exception_roots/` is wholly synthetic. The private
@@ -797,7 +803,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   retagged task function, or identity mismatch is a hard failure — never a silent overwrite.
   The export completion marker binds the exact PAL identity
   (`pal_tasks=v1:<manifest-blake3>:<tasks>:<distinct-entries>`); the postflight re-reads the
-  program state and rejects drift.
+  program state and rejects drift. `PalTasksSupport.ValidatedPal` retains the exact task-manifest,
+  optional scatter-map, and raw-image handles through final export postflight, rechecks those same
+  path identities without reopening them, and closes every partial or complete acquisition in
+  reverse order with suppressed cleanup diagnostics.
 - **Terminal state is ownership-explicit.** `decompose` marshals the validated manifest to
   `images/<MAIN>/pal_tasks/tasks.json` after authenticating it against the terminal
   raw/scatter bytes (validation precedes any terminal byte change; `rename` is the commit).
@@ -2160,9 +2169,12 @@ hardcoded. Two reference images exercise both models end-to-end:
     — plus the sibling `export/<label>.complete` marker; opaque skips invalidate too,
     and any invalidation failure prevents launch. Unsuccessful, aborted, missing-marker,
     and invalid-output attempts scrub every removable owned path before marshalling.
-    `ExportDecomp.java` checks each `PrintWriter` after its write/flush/close path, writes
-    the marker only after all three checked files, and atomically renames a sibling temp
-    marker into place. Direct and generated validation require the exact marker bytes,
+    `ExportDecomp.java` checks each `PrintWriter` after its write/flush/close path while all three
+    outputs remain sibling staging files. It repeats exception and PAL postflight, closes retained
+    inputs, atomically moves the three destinations, then atomically renames a sibling temp marker
+    into place. A pre-move validation or close failure removes only staging and leaves prior
+    destinations untouched; a later partial move or marker failure remains non-current for host
+    cleanup. Direct and generated validation require the exact marker bytes,
     including its one trailing newline. Keep the marker outside `export/<label>/` so
     ownership-aware refresh still consumes exactly the three exports, and marshal only
     exports explicitly marked current by the producing report.

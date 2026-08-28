@@ -1933,6 +1933,8 @@ fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<Runti
         out,
         |image, base| scatter::discover(image, base).map_err(|error| error.to_string()),
         exception_roots::discover,
+        exception_roots::materialize,
+        exception_roots::clear_materialized,
         pal_tasks::discover,
     )
 }
@@ -1941,8 +1943,10 @@ fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<Runti
 /// once, one runtime view per embedded image, exception roots for every image,
 /// then MAIN PAL against the already-built view. Publication is atomic
 /// replacement; an owned artifact is cleared only after successful absence.
-/// Any discovery or publication error returns no consumable current state.
-#[allow(clippy::type_complexity)]
+/// Any discovery, publication, or clear error returns no consumable current state.
+// Keep discovery, publication, and clear independently injectable so each
+// currentness boundary has deterministic failure coverage.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn generate_runtime_analysis_with(
     toc: &Toc,
     data: &[u8],
@@ -1957,6 +1961,21 @@ fn generate_runtime_analysis_with(
         &str,
     ) -> std::result::Result<
         Option<exception_roots::ExceptionRootPlan>,
+        exception_roots::ExceptionRootError,
+    >,
+    mut materialize_exception_roots: impl FnMut(
+        &exception_roots::ExceptionRootPlan,
+        ExceptionArtifactContext<'_>,
+        &Path,
+    ) -> std::result::Result<
+        MaterializedExceptionRoots,
+        exception_roots::ExceptionRootError,
+    >,
+    mut clear_exception_roots: impl FnMut(
+        &Path,
+        &str,
+    ) -> std::result::Result<
+        (),
         exception_roots::ExceptionRootError,
     >,
     mut discover_tasks: impl FnMut(
@@ -2037,7 +2056,7 @@ fn generate_runtime_analysis_with(
         };
         match discover_exception_roots(runtime, label, &entry.name)? {
             Some(plan) => {
-                let materialized = exception_roots::materialize(&plan, context, out)?;
+                let materialized = materialize_exception_roots(&plan, context, out)?;
                 tracing::info!(
                     "exception roots: {label} -> {} ({})",
                     materialized.relative_path,
@@ -2047,7 +2066,7 @@ fn generate_runtime_analysis_with(
                     .insert(label.clone(), RuntimeExceptionState::Present(materialized));
             }
             None => {
-                exception_roots::clear_materialized(out, label)?;
+                clear_exception_roots(out, label)?;
                 tracing::info!("exception roots: {label} has no vector-table candidate");
                 exception_states.insert(label.clone(), RuntimeExceptionState::Absent);
             }
@@ -2655,63 +2674,41 @@ fn run_report_impl(
                     // Currentness is explicit and conserving: exact v4 marker,
                     // one strict exception summary when present, then the PAL
                     // summary under its independent present-state rule.
-                    let mut exception_currentness_error = None;
-                    let validated = (|| {
-                        if let Err(reason) = export_attempt.validate_current(
-                            &exception_identity,
-                            &pal_identity,
-                            "none",
-                        ) {
-                            if matches!(exception_state, RuntimeExceptionState::Present(_)) {
-                                exception_currentness_error = Some(reason.clone());
-                            }
-                            return Err(reason);
+                    if let Err(reason) =
+                        export_attempt.validate_current(&exception_identity, &pal_identity, "none")
+                    {
+                        tracing::warn!(
+                            "ghidra: {label} current export is not this run's: {reason}"
+                        );
+                        if matches!(exception_state, RuntimeExceptionState::Present(_)) {
+                            exception_error = Some(reason.clone());
                         }
-                        let roots = match &exception_state {
-                            RuntimeExceptionState::Present(map) => {
-                                match parse_apply_exception_roots_summary(
-                                    &captured_stdout,
-                                    &label,
-                                    &map.identity,
-                                )
-                                .and_then(|summary| {
-                                    validate_applied_exception_roots(&summary, map)?;
-                                    Ok(summary)
-                                }) {
-                                    Ok(summary) => Some(summary),
-                                    Err(reason) => {
-                                        exception_currentness_error = Some(reason.clone());
-                                        return Err(reason);
-                                    }
-                                }
-                            }
+                        terminal_error = Some(reason);
+                        ImageOutcome::TerminalInvalid
+                    } else {
+                        let expected_exception_roots = match &exception_state {
+                            RuntimeExceptionState::Present(map) => Some(map),
                             RuntimeExceptionState::Unmanaged | RuntimeExceptionState::Absent => {
                                 None
                             }
                         };
-                        let pal = match &pal_plan {
-                            Some(plan) => Some(parse_apply_pal_tasks_summary(
-                                &captured_stdout,
-                                &label,
-                                plan.identity,
-                            )?),
-                            None => None,
-                        };
-                        Ok((roots, pal))
-                    })();
-                    match validated {
-                        Ok((roots, pal)) => {
-                            exception_roots_applied = roots;
-                            pal_applied = pal;
-                            ImageOutcome::Analyzed(count_functions(&export_attempt.directory))
-                        }
-                        Err(reason) => {
+                        let coordinated = coordinate_application_summaries(
+                            &captured_stdout,
+                            &label,
+                            expected_exception_roots,
+                            pal_plan,
+                        );
+                        exception_roots_applied = coordinated.exception_roots_applied;
+                        exception_error = coordinated.exception_error;
+                        pal_applied = coordinated.pal_applied;
+                        terminal_error = coordinated.terminal_error;
+                        if let Some(reason) = &terminal_error {
                             tracing::warn!(
                                 "ghidra: {label} current export is not this run's: {reason}"
                             );
-                            exception_error = exception_currentness_error;
-                            terminal_error = Some(reason);
                             ImageOutcome::TerminalInvalid
+                        } else {
+                            ImageOutcome::Analyzed(count_functions(&export_attempt.directory))
                         }
                     }
                 }
@@ -3590,6 +3587,47 @@ struct ApplyExceptionRootsWire {
     names_preserved: usize,
     names_not_requested: usize,
     shared_entries: usize,
+}
+
+#[derive(Default)]
+struct CoordinatedApplicationSummaries {
+    exception_roots_applied: Option<AppliedExceptionRoots>,
+    exception_error: Option<String>,
+    pal_applied: Option<AppliedPalTasks>,
+    terminal_error: Option<String>,
+}
+
+fn coordinate_application_summaries(
+    stdout: &str,
+    expected_image: &str,
+    expected_exception_roots: Option<&MaterializedExceptionRoots>,
+    pal_plan: Option<PalScriptPlan<'_>>,
+) -> CoordinatedApplicationSummaries {
+    let mut coordinated = CoordinatedApplicationSummaries::default();
+    if let Some(expected) = expected_exception_roots {
+        match parse_apply_exception_roots_summary(stdout, expected_image, &expected.identity)
+            .and_then(|summary| {
+                validate_applied_exception_roots(&summary, expected)?;
+                Ok(summary)
+            }) {
+            Ok(summary) => coordinated.exception_roots_applied = Some(summary),
+            Err(reason) => {
+                coordinated.exception_error = Some(reason.clone());
+                coordinated.terminal_error = Some(reason);
+            }
+        }
+    }
+    if let Some(plan) = pal_plan {
+        match parse_apply_pal_tasks_summary(stdout, expected_image, plan.identity) {
+            Ok(summary) => coordinated.pal_applied = Some(summary),
+            Err(reason) => {
+                if coordinated.terminal_error.is_none() {
+                    coordinated.terminal_error = Some(reason);
+                }
+            }
+        }
+    }
+    coordinated
 }
 
 fn parse_apply_exception_roots_summary(
@@ -7153,6 +7191,110 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         }
     }
 
+    #[test]
+    fn valid_exception_summary_survives_pal_summary_failure() {
+        let manifest_blake3 = "a".repeat(64);
+        let roots_identity = format!("v1:{manifest_blake3}:1:7");
+        let roots = MaterializedExceptionRoots {
+            relative_path: "exception_roots/02_MAIN/roots.json".into(),
+            blake3: manifest_blake3,
+            identity: roots_identity.clone(),
+            tables: 1,
+            roots: 7,
+        };
+        let pal_identity = format!("v1:{}:2:2", "b".repeat(64));
+        let stdout = format!(
+            "ApplyExceptionRoots: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{roots_identity}\",\"tables\":1,\"roles\":8,\"entries\":7,\"functions_created\":5,\"functions_reapplied\":0,\"functions_existing\":2,\"names_applied\":5,\"names_reapplied\":0,\"names_preserved\":1,\"names_not_requested\":1,\"shared_entries\":1}}\nApplyPalTasks: {{not json}}"
+        );
+
+        let coordinated = coordinate_application_summaries(
+            &stdout,
+            "02_MAIN",
+            Some(&roots),
+            Some(PalScriptPlan {
+                manifest: "pal_tasks/02_MAIN/tasks.json",
+                identity: &pal_identity,
+            }),
+        );
+
+        assert_eq!(
+            coordinated.exception_roots_applied,
+            Some(AppliedExceptionRoots {
+                tables: 1,
+                roles: 8,
+                entries: 7,
+                functions_created: 5,
+                functions_reapplied: 0,
+                functions_existing: 2,
+                names_applied: 5,
+                names_reapplied: 0,
+                names_preserved: 1,
+                names_not_requested: 1,
+                shared_entries: 1,
+            })
+        );
+        assert_eq!(coordinated.exception_error, None);
+        assert_eq!(coordinated.pal_applied, None);
+        assert!(
+            coordinated
+                .terminal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("malformed ApplyPalTasks summary"))
+        );
+    }
+
+    #[test]
+    fn valid_pal_summary_survives_exception_summary_failure() {
+        let manifest_blake3 = "a".repeat(64);
+        let roots = MaterializedExceptionRoots {
+            relative_path: "exception_roots/02_MAIN/roots.json".into(),
+            blake3: manifest_blake3.clone(),
+            identity: format!("v1:{manifest_blake3}:1:7"),
+            tables: 1,
+            roots: 7,
+        };
+        let pal_identity = format!("v1:{}:2:2", "b".repeat(64));
+        let stdout = format!(
+            "ApplyExceptionRoots: {{not json}}\nApplyPalTasks: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{pal_identity}\",\"tasks\":2,\"entries\":2,\"functions_created\":2,\"functions_existing\":0,\"names_applied\":2,\"names_preserved\":0,\"shared_entries\":0}}"
+        );
+
+        let coordinated = coordinate_application_summaries(
+            &stdout,
+            "02_MAIN",
+            Some(&roots),
+            Some(PalScriptPlan {
+                manifest: "pal_tasks/02_MAIN/tasks.json",
+                identity: &pal_identity,
+            }),
+        );
+
+        assert_eq!(coordinated.exception_roots_applied, None);
+        assert!(
+            coordinated
+                .exception_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("malformed ApplyExceptionRoots summary"))
+        );
+        assert_eq!(
+            coordinated.pal_applied,
+            Some(AppliedPalTasks {
+                tasks: 2,
+                entries: 2,
+                functions_created: 2,
+                functions_existing: 0,
+                names_applied: 2,
+                names_preserved: 0,
+                shared_entries: 0,
+            })
+        );
+        assert!(
+            coordinated
+                .terminal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("malformed ApplyExceptionRoots summary"))
+        );
+    }
+
     fn ok_globals_summary(
         candidates: usize,
         applied: usize,
@@ -8854,6 +8996,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     .push((label.to_string(), toc_name.to_string()));
                 Ok(None)
             },
+            exception_roots::materialize,
+            exception_roots::clear_materialized,
             |_runtime, _label| {
                 pal_calls.set(pal_calls.get() + 1);
                 Ok(None)
@@ -8934,6 +9078,114 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
     }
 
+    fn write_prior_exception_manifest(root: &Path, label: &str) -> (PathBuf, Vec<u8>) {
+        let bytes = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
+        )
+        .unwrap();
+        let path = root.join(format!("exception_roots/{label}/roots.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    }
+
+    #[test]
+    fn generation_exception_discovery_failure_preserves_stale_manifest_without_current_state() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let data = craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &fixture)]);
+        let toc = Toc::parse(&data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (stale, prior_bytes) = write_prior_exception_manifest(dir.path(), "00_BOOT");
+
+        let result = generate_runtime_analysis_with(
+            &toc,
+            &data,
+            dir.path(),
+            |_image, _base| Ok(None),
+            |_runtime, _label, _toc_name| {
+                Err(exception_roots::ExceptionRootError::Artifact(
+                    "injected discovery failure".into(),
+                ))
+            },
+            |_plan, _context, _root| panic!("discovery failure must not publish"),
+            |_root, _label| panic!("discovery failure must not clear"),
+            |_runtime, _label| panic!("a BOOT-only fixture must not discover PAL"),
+        );
+
+        let Err(error) = result else {
+            panic!("discovery failure returned consumable current state");
+        };
+        assert!(error.to_string().contains("injected discovery failure"));
+        assert_eq!(std::fs::read(stale).unwrap(), prior_bytes);
+    }
+
+    #[test]
+    fn generation_exception_publication_failure_preserves_stale_manifest_without_current_state() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let data = craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &fixture)]);
+        let toc = Toc::parse(&data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (stale, prior_bytes) = write_prior_exception_manifest(dir.path(), "00_BOOT");
+
+        let result = generate_runtime_analysis_with(
+            &toc,
+            &data,
+            dir.path(),
+            |_image, _base| Ok(None),
+            exception_roots::discover,
+            |_plan, _context, _root| {
+                Err(exception_roots::ExceptionRootError::Artifact(
+                    "injected publication failure".into(),
+                ))
+            },
+            |_root, _label| panic!("present discovery must not clear"),
+            |_runtime, _label| panic!("a BOOT-only fixture must not discover PAL"),
+        );
+
+        let Err(error) = result else {
+            panic!("publication failure returned consumable current state");
+        };
+        assert!(error.to_string().contains("injected publication failure"));
+        assert_eq!(std::fs::read(stale).unwrap(), prior_bytes);
+    }
+
+    #[test]
+    fn generation_exception_clear_failure_preserves_stale_manifest_without_current_state() {
+        let data = craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &[0u8; 64])]);
+        let toc = Toc::parse(&data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (stale, prior_bytes) = write_prior_exception_manifest(dir.path(), "00_BOOT");
+
+        let result = generate_runtime_analysis_with(
+            &toc,
+            &data,
+            dir.path(),
+            |_image, _base| Ok(None),
+            |_runtime, _label, _toc_name| Ok(None),
+            |_plan, _context, _root| panic!("absent discovery must not publish"),
+            |_root, _label| {
+                Err(exception_roots::ExceptionRootError::Artifact(
+                    "injected clear failure".into(),
+                ))
+            },
+            |_runtime, _label| panic!("a BOOT-only fixture must not discover PAL"),
+        );
+
+        let Err(error) = result else {
+            panic!("clear failure returned consumable current state");
+        };
+        assert!(error.to_string().contains("injected clear failure"));
+        assert_eq!(std::fs::read(stale).unwrap(), prior_bytes);
+    }
+
     #[test]
     fn pal_generation_reuses_scatter_discovery() {
         // One MAIN generation loop: the single scatter discovery result
@@ -8957,6 +9209,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter::discover(image, base).map_err(|error| error.to_string())
             },
             exception_roots::discover,
+            exception_roots::materialize,
+            exception_roots::clear_materialized,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
                 crate::pal_tasks::discover(runtime, label)
@@ -8986,6 +9240,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter::discover(image, base).map_err(|error| error.to_string())
             },
             exception_roots::discover,
+            exception_roots::materialize,
+            exception_roots::clear_materialized,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
                 crate::pal_tasks::discover(runtime, label)
@@ -9022,6 +9278,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter::discover(image, base).map_err(|error| error.to_string())
             },
             exception_roots::discover,
+            exception_roots::materialize,
+            exception_roots::clear_materialized,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
                 crate::pal_tasks::discover(runtime, label)

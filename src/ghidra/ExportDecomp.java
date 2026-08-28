@@ -13,10 +13,10 @@
 // Arg[9] = expected lowercase symbol-map BLAKE3, or literal "none" with "-".
 //
 // A strict HeadlessScript: before any export output or marker is written it
-// validates exception roots through ExceptionRootsSupport and PAL
-// map/properties through PalTasksSupport (a present
-// PAL manifest re-authenticates the manifest, raw/scatter memory, and the
-// complete applied state; identity none requires every PAL surface absent),
+// retains and validates exception roots through ExceptionRootsSupport and PAL
+// map/properties through PalTasksSupport (a present PAL manifest keeps its
+// manifest/raw/scatter handles open while re-authenticating the complete
+// applied state; identity none requires every PAL surface absent),
 // derives the current execution identities from the current function bodies
 // with per-range BLAKE3 over current program memory, and — in pass 2 —
 // compares every current body to the retained pass-1 map exactly (a changed
@@ -24,9 +24,10 @@
 // one 15-minute deadline and, for a present manifest, a 64-MiB aggregate
 // task-function-body ceiling. Monitor-aware operations inherit headless
 // cancellation and receive only the remaining deadline; every long operation
-// is checked on return. Outputs are published atomically (temporary files moved
-// into place) only after a direct deadline gate, and the exact four-line v4
-// marker is replaced LAST under the same gate:
+// is checked on return. All three outputs remain sibling staging files until
+// both states pass final postflight and their retained handles close. They are
+// then moved into place, and the exact four-line v4 marker is replaced LAST
+// under the same gate:
 //
 // pixel-modem-extractor-ghidra-export-v4
 // exception_roots=<identity-or-none>
@@ -131,135 +132,120 @@ public class ExportDecomp extends HeadlessScript {
         if (!exceptionPresent && exceptionManifest != null) {
             fail("exception identity none requires the literal '-' manifest");
         }
-        String symbolMapArgument = "none";
-        try (ExceptionRootsSupport.Validated roots = exceptionPresent
-                ? ExceptionRootsSupport.preflight(currentProgram, monitor, canonicalRoot, label,
-                        exceptionManifest, scatterArgument, exceptionIdentity)
-                : null) {
-            if (roots == null) {
-                ExceptionRootsSupport.validateAbsent(currentProgram);
-            }
-            else {
-                ExceptionRootsSupport.validateApplied(
-                        currentProgram, roots.manifest, roots.identity);
-                roots.verifyRetainedFiles();
-            }
-            checkDeadline();
-
-            // PAL state: a present manifest is fully re-authenticated after
-            // analysis; identity none requires every PAL surface absent.
-            boolean palPresent = !PalTasksSupport.NONE_IDENTITY.equals(palIdentity);
-            if (palPresent) {
-                if (taskManifest == null) {
-                    fail("a present PAL identity requires the task manifest argument");
-                }
-                PalTasksSupport.PalManifest manifest = PalTasksSupport.readPal(
-                        canonicalRoot, label, taskManifest, scatterManifest);
-                checkDeadline();
-                String identity = PalTasksSupport.expectedPalIdentity(manifest);
-                if (!identity.equals(palIdentity)) {
-                    fail("the expected PAL identity does not match the manifest");
-                }
-                PalTasksSupport.validateApplied(currentProgram, manifest, identity);
-                checkDeadline();
-                chargeTaskBodies(manifest);
-                checkDeadline();
-            }
-            else {
-                if (taskManifest != null) {
-                    fail("identity none requires the literal '-' task manifest");
-                }
-                PalTasksSupport.validateAbsent(currentProgram);
-                checkDeadline();
-            }
-
-            // Symbol map / pass-2 property contract.
-            PalTasksSupport.SymbolMap map = null;
-            if (mapFile == null) {
-                if (!"none".equals(mapHash)) {
-                    fail("an absent symbol map requires the literal 'none' hash");
-                }
-                String property = currentProgram.getOptions(
-                        ghidra.program.model.listing.Program.PROGRAM_INFO)
-                        .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-                if (property != null) {
-                    fail("a pass-1/single-pass export requires the SymbolPass2 property absent");
-                }
-            }
-            else {
-                if ("none".equals(mapHash)) {
-                    fail("a present symbol map requires its expected BLAKE3");
-                }
-                map = PalTasksSupport.readSymbolMapForExport(mapFile, mapHash);
-                checkDeadline();
-                if (!map.imageLabel.equals(label)) {
-                    fail("the symbol map was built for image " + map.imageLabel);
-                }
-                if (!palIdentity.equals(map.palIdentity)) {
-                    fail("the symbol map PAL identity does not match the invocation");
-                }
-                String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
-                String property = currentProgram.getOptions(
-                        ghidra.program.model.listing.Program.PROGRAM_INFO)
-                        .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-                if (!expectedProperty.equals(property)) {
-                    fail("stale SymbolPass2 property: expected " + expectedProperty
-                            + " but found " + property);
-                }
-                verifyBodiesAgainstMap(map);
-                checkDeadline();
-                symbolMapArgument = map.mapBlake3;
-            }
-
-            FunctionManager fm = currentProgram.getFunctionManager();
-            Listing listing = currentProgram.getListing();
-
-            // Pass-1/single-pass entry fallback: a tiny anchorless blob may yield
-            // no functions. A present map has already authenticated the exact
-            // pass-2 function set, which this fallback must never mutate.
-            if (map == null && fm.getFunctionCount() == 0) {
-                Address base = currentProgram.getImageBase();
-                try {
-                    disassemble(base);
-                    createFunction(base, null);
-                }
-                catch (Exception e) {
-                    fail("the entry-function fallback failed: " + e.getMessage());
-                }
-                checkDeadline();
-            }
-
-            outDir.mkdirs();
-            List<File> temporaries = new ArrayList<File>();
-            try {
-                publish(outDir, "functions.json", temporaries,
-                        (w) -> writeFunctionsJson(w, fm, listing));
-                publish(outDir, "disasm.lst", temporaries,
-                        (w) -> writeDisassembly(w, listing));
-                publish(outDir, "decompiled.c", temporaries, (w) -> writeDecompiledC(w, fm));
-            }
-            finally {
-                for (File temporary : temporaries) {
-                    Files.deleteIfExists(temporary.toPath());
-                }
-            }
-            if (roots == null) {
-                ExceptionRootsSupport.validateAbsent(currentProgram);
-            }
-            else {
-                ExceptionRootsSupport.validateApplied(
-                        currentProgram, roots.manifest, roots.identity);
-                roots.verifyRetainedFiles();
-            }
-            checkDeadline();
+        boolean palPresent = !PalTasksSupport.NONE_IDENTITY.equals(palIdentity);
+        if (palPresent && taskManifest == null) {
+            fail("a present PAL identity requires the task manifest argument");
         }
-        writeCompletionMarker(outDir, exceptionIdentity, palIdentity, symbolMapArgument);
+        if (!palPresent && taskManifest != null) {
+            fail("identity none requires the literal '-' task manifest");
+        }
+        String symbolMapArgument = "none";
+        List<StagedOutput> staged = new ArrayList<StagedOutput>();
+        try {
+            try (ExceptionRootsSupport.Validated roots = exceptionPresent
+                    ? ExceptionRootsSupport.preflight(currentProgram, monitor, canonicalRoot,
+                            label, exceptionManifest, scatterArgument, exceptionIdentity)
+                    : null;
+                    PalTasksSupport.ValidatedPal pal = palPresent
+                            ? PalTasksSupport.retainPal(
+                                    canonicalRoot, label, taskManifest, scatterManifest)
+                            : null) {
+                validateExceptionState(roots);
+                validatePalState(pal, palIdentity);
+                if (pal != null) {
+                    chargeTaskBodies(pal.manifest);
+                    checkDeadline();
+                }
+
+                // Symbol map / pass-2 property contract.
+                PalTasksSupport.SymbolMap map = null;
+                if (mapFile == null) {
+                    if (!"none".equals(mapHash)) {
+                        fail("an absent symbol map requires the literal 'none' hash");
+                    }
+                    String property = currentProgram.getOptions(
+                            ghidra.program.model.listing.Program.PROGRAM_INFO)
+                            .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+                    if (property != null) {
+                        fail("a pass-1/single-pass export requires the SymbolPass2 property absent");
+                    }
+                }
+                else {
+                    if ("none".equals(mapHash)) {
+                        fail("a present symbol map requires its expected BLAKE3");
+                    }
+                    map = PalTasksSupport.readSymbolMapForExport(mapFile, mapHash);
+                    checkDeadline();
+                    if (!map.imageLabel.equals(label)) {
+                        fail("the symbol map was built for image " + map.imageLabel);
+                    }
+                    if (!palIdentity.equals(map.palIdentity)) {
+                        fail("the symbol map PAL identity does not match the invocation");
+                    }
+                    String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
+                    String property = currentProgram.getOptions(
+                            ghidra.program.model.listing.Program.PROGRAM_INFO)
+                            .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+                    if (!expectedProperty.equals(property)) {
+                        fail("stale SymbolPass2 property: expected " + expectedProperty
+                                + " but found " + property);
+                    }
+                    verifyBodiesAgainstMap(map);
+                    checkDeadline();
+                    symbolMapArgument = map.mapBlake3;
+                }
+
+                FunctionManager fm = currentProgram.getFunctionManager();
+                Listing listing = currentProgram.getListing();
+
+                // Pass-1/single-pass entry fallback: a tiny anchorless blob may yield
+                // no functions. A present map has already authenticated the exact
+                // pass-2 function set, which this fallback must never mutate.
+                if (map == null && fm.getFunctionCount() == 0) {
+                    Address base = currentProgram.getImageBase();
+                    try {
+                        disassemble(base);
+                        createFunction(base, null);
+                    }
+                    catch (Exception e) {
+                        fail("the entry-function fallback failed: " + e.getMessage());
+                    }
+                    checkDeadline();
+                }
+
+                outDir.mkdirs();
+                stage(outDir, "functions.json", staged,
+                        (w) -> writeFunctionsJson(w, fm, listing));
+                stage(outDir, "disasm.lst", staged,
+                        (w) -> writeDisassembly(w, listing));
+                stage(outDir, "decompiled.c", staged, (w) -> writeDecompiledC(w, fm));
+                validateExceptionState(roots);
+                validatePalState(pal, palIdentity);
+            }
+            publishStaged(staged);
+            writeCompletionMarker(outDir, exceptionIdentity, palIdentity, symbolMapArgument);
+        }
+        finally {
+            for (StagedOutput output : staged) {
+                Files.deleteIfExists(output.temporary.toPath());
+            }
+        }
 
         println("ExportDecomp: wrote export to " + outDir.getAbsolutePath());
     }
 
     private interface Writer {
         void write(PrintWriter writer) throws Exception;
+    }
+
+    private static final class StagedOutput {
+        final File temporary;
+        final File destination;
+
+        StagedOutput(File temporary, File destination) {
+            this.temporary = temporary;
+            this.destination = destination;
+        }
     }
 
     private static File requireCanonicalDirectory(File file) throws IOException {
@@ -269,6 +255,32 @@ public class ExportDecomp extends HeadlessScript {
             fail("the import-kit root is not a canonical directory");
         }
         return canonical;
+    }
+
+    private void validateExceptionState(ExceptionRootsSupport.Validated roots) throws Exception {
+        if (roots == null) {
+            ExceptionRootsSupport.validateAbsent(currentProgram);
+        }
+        else {
+            ExceptionRootsSupport.validateApplied(currentProgram, roots.manifest, roots.identity);
+            roots.verifyRetainedFiles();
+        }
+        checkDeadline();
+    }
+
+    private void validatePalState(PalTasksSupport.ValidatedPal pal, String expectedIdentity)
+            throws Exception {
+        if (pal == null) {
+            PalTasksSupport.validateAbsent(currentProgram);
+        }
+        else {
+            if (!pal.identity.equals(expectedIdentity)) {
+                fail("the expected PAL identity does not match the manifest");
+            }
+            PalTasksSupport.validateApplied(currentProgram, pal.manifest, pal.identity);
+            pal.verifyRetainedFiles();
+        }
+        checkDeadline();
     }
 
     /** Charge each task function's current body bytes once against the cap. */
@@ -453,21 +465,28 @@ public class ExportDecomp extends HeadlessScript {
     // Atomic publication
     // ---------------------------------------------------------------------
 
-    /** Writes one output through a sibling temporary and moves it into place. */
-    private void publish(File outDir, String name, List<File> temporaries, Writer writer)
+    /** Writes and validates one sibling temporary without changing its destination. */
+    private void stage(File outDir, String name, List<StagedOutput> staged, Writer writer)
             throws Exception {
         File temporary = File.createTempFile(name + ".", ".tmp", outDir);
-        temporaries.add(temporary);
+        StagedOutput output = new StagedOutput(temporary, new File(outDir, name));
+        staged.add(output);
         PrintWriter w = new PrintWriter(new FileWriter(temporary));
         try (w) {
             writer.write(w);
         }
         checkWriter(w, temporary);
-        File destination = new File(outDir, name);
         checkDeadline();
-        Files.move(temporary.toPath(), destination.toPath(),
-                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        temporaries.remove(temporary);
+    }
+
+    /** Publishes every fully generated output only after final state validation and close. */
+    private void publishStaged(List<StagedOutput> staged) throws Exception {
+        for (StagedOutput output : staged) {
+            checkDeadline();
+            Files.move(output.temporary.toPath(), output.destination.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        }
+        checkDeadline();
     }
 
     private void writeCompletionMarker(File outDir, String exceptionIdentity,
