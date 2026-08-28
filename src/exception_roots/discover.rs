@@ -1455,6 +1455,33 @@ mod tests {
     }
 
     #[test]
+    fn conditional_return_not_taken_path_prevents_stale_initial_confirmation() {
+        let [initial_movw, initial_movt] = materialize(0, BASE);
+        let [relocated_movw, relocated_movt] = materialize(1, RELOCATED_TABLE);
+        let fixture = reset_fixture_with_program(&[
+            initial_movw,
+            initial_movt,
+            a32_vbar_write(0),
+            0x112f_ff1e, // bxne lr
+            relocated_movw,
+            relocated_movt,
+            a32_vbar_write(1),
+            0xe12f_ff1e, // bx lr
+        ]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::Unresolved { observations } = plan.relocation else {
+            panic!("the conditional return's not-taken write must block stale confirmation");
+        };
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].exact_value, Some(BASE));
+        assert_eq!(observations[1].exact_value, Some(RELOCATED_TABLE));
+        assert_eq!(plan.tables.len(), 1);
+    }
+
+    #[test]
     fn outside_zero_fill_and_mapped_non_table_values_are_unresolved() {
         let cases = [0x5000_0000, BASE + 0x3000, BASE + 0x1c00];
         for (index, value) in cases.into_iter().enumerate() {

@@ -822,7 +822,7 @@ impl<'runtime, 'data> CfgBuilder<'runtime, 'data> {
                     pc,
                     kind: BoundaryKind::ExceptionCall,
                 });
-                if self.calls == CallPolicy::Fallthrough {
+                if instruction.conditional || self.calls == CallPolicy::Fallthrough {
                     self.schedule(pc, next, true)
                 } else {
                     Ok(())
@@ -833,14 +833,20 @@ impl<'runtime, 'data> CfgBuilder<'runtime, 'data> {
                     pc,
                     kind: BoundaryKind::Return,
                 });
-                Ok(())
+                if instruction.conditional {
+                    self.schedule(pc, next, true)
+                } else {
+                    Ok(())
+                }
             }
             ControlFlow::Barrier => {
                 self.handoffs.insert(Handoff {
                     pc,
                     kind: BoundaryKind::Indirect,
                 });
-                if instruction.links_lr && self.calls == CallPolicy::Fallthrough {
+                if instruction.conditional
+                    || (instruction.links_lr && self.calls == CallPolicy::Fallthrough)
+                {
                     self.schedule(pc, next, true)
                 } else {
                     Ok(())
@@ -1478,15 +1484,13 @@ mod tests {
         bytes
     }
 
+    fn decode_with_policy(bytes: &[u8], isa: DecodeIsa, calls: CallPolicy) -> SemanticCfg {
+        SemanticCfg::decode(&runtime(bytes), 0, isa, CfgLimits::exception_roots(), calls)
+            .expect("fixture CFG decodes")
+    }
+
     fn decode(bytes: &[u8], isa: DecodeIsa) -> SemanticCfg {
-        SemanticCfg::decode(
-            &runtime(bytes),
-            0,
-            isa,
-            CfgLimits::exception_roots(),
-            CallPolicy::FallthroughAndHandoff,
-        )
-        .expect("fixture CFG decodes")
+        decode_with_policy(bytes, isa, CallPolicy::FallthroughAndHandoff)
     }
 
     #[derive(Clone, Default, PartialEq, Eq)]
@@ -1637,6 +1641,82 @@ mod tests {
     }
 
     #[test]
+    fn conditional_return_retains_taken_handoff_and_not_taken_edge_under_both_policies() {
+        let mut bytes = Vec::new();
+        // bxne lr: cond=NE and the canonical return register.
+        bytes.extend_from_slice(&0x112f_ff1eu32.to_le_bytes());
+        bytes.extend_from_slice(&0xeaff_fffeu32.to_le_bytes());
+
+        for policy in [CallPolicy::Fallthrough, CallPolicy::FallthroughAndHandoff] {
+            let cfg = decode_with_policy(&bytes, DecodeIsa::Arm, policy);
+            let instruction = &cfg.instructions()[&0];
+            assert!(instruction.conditional);
+            assert!(matches!(
+                instruction.flow,
+                crate::arm32::ControlFlow::Return
+            ));
+            assert!(
+                cfg.handoffs()
+                    .iter()
+                    .any(|edge| edge.pc == 0 && edge.kind == BoundaryKind::Return)
+            );
+            assert_eq!(cfg.successors(0), Some(&BTreeSet::from([4])));
+            assert!(cfg.instructions().contains_key(&4));
+        }
+    }
+
+    #[test]
+    fn conditional_exception_retains_taken_handoff_and_not_taken_edge_under_both_policies() {
+        let mut bytes = Vec::new();
+        // svcne #0: cond=NE, SVC immediate zero.
+        bytes.extend_from_slice(&0x1f00_0000u32.to_le_bytes());
+        bytes.extend_from_slice(&0xeaff_fffeu32.to_le_bytes());
+
+        for policy in [CallPolicy::Fallthrough, CallPolicy::FallthroughAndHandoff] {
+            let cfg = decode_with_policy(&bytes, DecodeIsa::Arm, policy);
+            let instruction = &cfg.instructions()[&0];
+            assert!(instruction.conditional);
+            assert!(matches!(
+                instruction.flow,
+                crate::arm32::ControlFlow::ExceptionCall
+            ));
+            assert!(
+                cfg.handoffs()
+                    .iter()
+                    .any(|edge| { edge.pc == 0 && edge.kind == BoundaryKind::ExceptionCall })
+            );
+            assert_eq!(cfg.successors(0), Some(&BTreeSet::from([4])));
+            assert!(cfg.instructions().contains_key(&4));
+        }
+    }
+
+    #[test]
+    fn conditional_indirect_retains_taken_handoff_and_not_taken_edge_under_both_policies() {
+        let mut bytes = Vec::new();
+        // bxne r1: cond=NE and an unresolved, non-linking register target.
+        bytes.extend_from_slice(&0x112f_ff11u32.to_le_bytes());
+        bytes.extend_from_slice(&0xeaff_fffeu32.to_le_bytes());
+
+        for policy in [CallPolicy::Fallthrough, CallPolicy::FallthroughAndHandoff] {
+            let cfg = decode_with_policy(&bytes, DecodeIsa::Arm, policy);
+            let instruction = &cfg.instructions()[&0];
+            assert!(instruction.conditional);
+            assert!(matches!(
+                instruction.flow,
+                crate::arm32::ControlFlow::Barrier
+            ));
+            assert!(!instruction.links_lr);
+            assert!(
+                cfg.handoffs()
+                    .iter()
+                    .any(|edge| edge.pc == 0 && edge.kind == BoundaryKind::Indirect)
+            );
+            assert_eq!(cfg.successors(0), Some(&BTreeSet::from([4])));
+            assert!(cfg.instructions().contains_key(&4));
+        }
+    }
+
+    #[test]
     fn shared_dataflow_overlay_runs_after_call_clobber() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&arm_mov_immediate(0, 0x12));
@@ -1708,14 +1788,17 @@ mod tests {
     }
 
     #[test]
-    fn return_boundary_is_typed() {
-        let returned = decode(&0xe12f_ff1eu32.to_le_bytes(), DecodeIsa::Arm);
-        assert_eq!(returned.handoffs()[0].kind, BoundaryKind::Return);
-        assert_eq!(returned.successors(0), None);
-        assert_eq!(
-            returned.instructions().keys().copied().collect::<Vec<_>>(),
-            [0]
-        );
+    fn unconditional_return_stops_under_both_policies() {
+        let bytes = 0xe12f_ff1eu32.to_le_bytes();
+        for policy in [CallPolicy::Fallthrough, CallPolicy::FallthroughAndHandoff] {
+            let returned = decode_with_policy(&bytes, DecodeIsa::Arm, policy);
+            assert_eq!(returned.handoffs()[0].kind, BoundaryKind::Return);
+            assert_eq!(returned.successors(0), None);
+            assert_eq!(
+                returned.instructions().keys().copied().collect::<Vec<_>>(),
+                [0]
+            );
+        }
     }
 
     #[test]
@@ -1744,9 +1827,17 @@ mod tests {
     }
 
     #[test]
-    fn indirect_boundary_is_typed() {
-        let indirect = decode(&0xe12f_ff10u32.to_le_bytes(), DecodeIsa::Arm);
-        assert_eq!(indirect.handoffs()[0].kind, BoundaryKind::Indirect);
+    fn unconditional_non_linking_indirect_stops_under_both_policies() {
+        let bytes = 0xe12f_ff10u32.to_le_bytes();
+        for policy in [CallPolicy::Fallthrough, CallPolicy::FallthroughAndHandoff] {
+            let indirect = decode_with_policy(&bytes, DecodeIsa::Arm, policy);
+            assert_eq!(indirect.handoffs()[0].kind, BoundaryKind::Indirect);
+            assert_eq!(indirect.successors(0), None);
+            assert_eq!(
+                indirect.instructions().keys().copied().collect::<Vec<_>>(),
+                [0]
+            );
+        }
     }
 
     #[test]
