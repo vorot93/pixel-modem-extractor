@@ -34,6 +34,15 @@ pub(crate) struct AuthenticatedDecodeRange {
     pub blake3: [u8; 32],
 }
 
+/// Aggregate execution-range work shared by adjacent symbol-map sections.
+/// Function counts stay section-local, matching the independent Java row
+/// limits; range count and exclusive `end - start` bytes are map-wide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ExecutionRangeUsage {
+    pub range_count: usize,
+    pub charged_bytes: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ExecutionBudget {
     functions: usize,
@@ -252,11 +261,38 @@ pub(crate) fn canonicalize_instruction_extents(
 }
 
 impl ExecutionBudget {
+    pub(crate) fn from_range_usage(usage: ExecutionRangeUsage) -> Result<Self> {
+        if usage.range_count > MAX_EXECUTION_RANGES {
+            return Err(invalid("execution range count exceeds the supported limit"));
+        }
+        if usage.charged_bytes > MAX_EXECUTION_CHARGED_BYTES {
+            return Err(invalid(
+                "execution charged bytes exceed the supported limit",
+            ));
+        }
+        Ok(Self {
+            functions: 0,
+            ranges: usage.range_count,
+            charged_bytes: usage.charged_bytes,
+        })
+    }
+
+    pub(crate) fn range_usage(&self) -> ExecutionRangeUsage {
+        ExecutionRangeUsage {
+            range_count: self.ranges,
+            charged_bytes: self.charged_bytes,
+        }
+    }
+
     pub(crate) fn charge_function(&mut self) -> Result<()> {
         self.charge(0, 0)
     }
 
-    fn charge(&mut self, ranges: usize, bytes: u64) -> Result<()> {
+    pub(crate) fn check_execution(&self, ranges: usize, bytes: u64) -> Result<()> {
+        self.checked_charge(ranges, bytes).map(|_| ())
+    }
+
+    fn checked_charge(&self, ranges: usize, bytes: u64) -> Result<(usize, usize, u64)> {
         if ranges > MAX_EXECUTION_RANGES_PER_FUNCTION {
             return Err(invalid(
                 "execution range count exceeds the per-function limit",
@@ -287,6 +323,11 @@ impl ExecutionBudget {
                 "execution charged bytes exceed the supported limit",
             ));
         }
+        Ok((functions, total_ranges, charged_bytes))
+    }
+
+    fn charge(&mut self, ranges: usize, bytes: u64) -> Result<()> {
+        let (functions, total_ranges, charged_bytes) = self.checked_charge(ranges, bytes)?;
         self.functions = functions;
         self.ranges = total_ranges;
         self.charged_bytes = charged_bytes;
@@ -720,6 +761,7 @@ pub(crate) struct StreamedGhidraInventory {
     pub inventory: ValidatedInventory,
     pub functions: Vec<GhidraFunctionFields>,
     pub thumb_creation_nominations: Vec<ThumbCreationNomination>,
+    pub range_usage: ExecutionRangeUsage,
 }
 
 const GHIDRA_REQUIRED_KEYS: [&str; 8] = [
@@ -948,6 +990,7 @@ impl GhidraInventoryScan<'_, '_> {
                 "raw inventory count does not equal accepted plus quarantined",
             ));
         }
+        let range_usage = self.budget.range_usage();
         Ok(StreamedGhidraInventory {
             inventory: ValidatedInventory {
                 raw_count,
@@ -958,6 +1001,7 @@ impl GhidraInventoryScan<'_, '_> {
             },
             functions: self.functions,
             thumb_creation_nominations: self.thumb_creation_nominations,
+            range_usage,
         })
     }
 }
@@ -1816,6 +1860,29 @@ mod tests {
         assert_eq!(streamed.functions[1].name, "FUN_0008");
         assert_eq!(streamed.functions[0].entry, 0);
         assert_eq!(streamed.functions[1].entry, 8);
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_exposes_exact_aggregate_range_usage() {
+        let image = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let records = vec![
+            ghidra_record("FUN_0000", 0, 4, &image),
+            ghidra_record("FUN_0008", 8, 12, &image),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+
+        let streamed = read_ghidra_inventory_streaming(&path, &runtime).unwrap();
+
+        assert_eq!(
+            streamed.range_usage,
+            ExecutionRangeUsage {
+                range_count: 2,
+                charged_bytes: 8,
+            }
+        );
     }
 
     #[test]

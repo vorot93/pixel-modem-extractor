@@ -437,6 +437,10 @@ module; when a file outgrows that, split it.
   Thumb ranges beginning at the entry. Java requires an exact lineage/registry bijection, rehashes
   those producer ranges and digest, proves the current Ghidra body is contained by them, and then
   independently recomputes the Ghidra execution digest; the two digests may and normally do differ.
+  Rust's streamed Ghidra inventory carries its exact aggregate range count and charged bytes into
+  lineage validation: both sides share the 1,048,576-range and 512 MiB sum-of-exclusive-extent-byte
+  limits across those two map sections. Function/lineage row limits remain independent, matching
+  Java; never restart the aggregate range/byte budget at the lineage boundary.
   This owned-only surface is materially bounded: 165 Mustang and 64 Cheetah rows, versus conservative
   all-overlap projections of 88,349 and 72,893 rows. The sparse choice does not change execution,
   creation, report, or SymbolPass2 counts and does not relax the Task 9 boundary: no predecessor map

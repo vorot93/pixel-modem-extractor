@@ -1348,6 +1348,25 @@ fn authenticate_nominated_thumb_execution(
             "nominated producer execution has no decode ranges".into(),
         ));
     }
+    let charged_bytes = symbol.decode_ranges.iter().try_fold(0u64, |total, range| {
+        if range.isa != "thumb" {
+            return Err(Error::Serialize(
+                "nominated producer execution is not Thumb-only".into(),
+            ));
+        }
+        let start = u32::try_from(parse_hex(&range.start)?)
+            .map_err(|_| Error::Serialize("nominated producer range start exceeds u32".into()))?;
+        let end = u32::try_from(parse_hex(&range.end)?)
+            .map_err(|_| Error::Serialize("nominated producer range end exceeds u32".into()))?;
+        let length = end
+            .checked_sub(start)
+            .filter(|length| *length > 0)
+            .ok_or_else(|| Error::Serialize("nominated producer range is empty or wraps".into()))?;
+        total
+            .checked_add(u64::from(length))
+            .ok_or_else(|| Error::Serialize("nominated producer charged-byte overflow".into()))
+    })?;
+    budget.check_execution(symbol.decode_ranges.len(), charged_bytes)?;
     let mut extents = Vec::new();
     let mut expected_hashes = Vec::new();
     extents
@@ -1416,9 +1435,11 @@ fn build_thumb_creation_lineage(
     executions: &[GhidraExecutionRecord],
     symbols: &[Symbol],
     runtime: &crate::runtime_image::RuntimeImage<'_>,
+    range_usage: crate::execution_ranges::ExecutionRangeUsage,
 ) -> Result<Vec<ThumbCreationLineageBlock>> {
     type NominationKey = (u32, [u8; 32]);
 
+    let mut budget = crate::execution_ranges::ExecutionBudget::from_range_usage(range_usage)?;
     let producer_keys = nominations
         .iter()
         .map(|nomination| (nomination.entry, nomination.producer_execution_blake3))
@@ -1475,11 +1496,7 @@ fn build_thumb_creation_lineage(
         }
     }
 
-    let mut budget = crate::execution_ranges::ExecutionBudget::default();
     let mut lineage = Vec::new();
-    lineage
-        .try_reserve_exact(nominations.len())
-        .map_err(|_| Error::Serialize("Thumb creation lineage allocation failed".into()))?;
     let mut linked_executions = BTreeSet::new();
     let mut linked_producers = BTreeSet::new();
     for nomination in nominations {
@@ -1725,6 +1742,7 @@ pub(crate) fn write_pass2_symbol_map(
         &executions,
         symbols,
         runtime,
+        streamed.range_usage,
     )?;
 
     // One decision per execution, cross-checked against the Ghidra-owned
@@ -5437,6 +5455,90 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    fn build_lineage_with_prior_usage(
+        fixture: &ThumbLineageFixture,
+        range_usage: crate::execution_ranges::ExecutionRangeUsage,
+    ) -> Result<Vec<ThumbCreationLineageBlock>> {
+        let (ghidra, _) = identity_for(
+            &fixture.dir,
+            fixture.owned_entry,
+            &fixture.image,
+            fixture.load_addr,
+        );
+        let executions = vec![GhidraExecutionRecord {
+            entry: fixture.owned_entry,
+            entry_text: format!("0x{:08x}", fixture.owned_entry),
+            execution_blake3: crate::manifest::blake3_fixed(ghidra.execution_blake3),
+            decode_ranges: ghidra
+                .decode_ranges
+                .iter()
+                .map(DecodeRangeWire::from_authenticated)
+                .collect(),
+            original_primary: "FUN_owned".into(),
+            original_source: "default".into(),
+            first_isa: "thumb",
+            thunk_of: None,
+            execution_digest: ghidra.execution_blake3,
+        }];
+        let nominations = [crate::execution_ranges::ThumbCreationNomination {
+            entry: fixture.owned_entry,
+            producer_execution_blake3: fixture.owned_producer.execution_blake3,
+            ghidra_execution_blake3: ghidra.execution_blake3,
+        }];
+
+        build_thumb_creation_lineage(
+            &nominations,
+            &executions,
+            &fixture.symbols,
+            &runtime_for(&fixture.image, fixture.load_addr),
+            range_usage,
+        )
+    }
+
+    #[test]
+    fn map_lineage_accepts_the_exact_combined_range_and_byte_boundary() {
+        let fixture = thumb_lineage_fixture("combined_lineage_boundary");
+        let lineage = build_lineage_with_prior_usage(
+            &fixture,
+            crate::execution_ranges::ExecutionRangeUsage {
+                range_count: crate::execution_ranges::MAX_EXECUTION_RANGES - 1,
+                charged_bytes: crate::execution_ranges::MAX_EXECUTION_CHARGED_BYTES - 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(lineage.len(), 1);
+    }
+
+    #[test]
+    fn map_lineage_rejects_combined_range_or_byte_usage_one_over_the_limit() {
+        let fixture = thumb_lineage_fixture("combined_lineage_over_limit");
+        let cases = [
+            (
+                crate::execution_ranges::ExecutionRangeUsage {
+                    range_count: crate::execution_ranges::MAX_EXECUTION_RANGES,
+                    charged_bytes: crate::execution_ranges::MAX_EXECUTION_CHARGED_BYTES - 8,
+                },
+                "execution range count exceeds the supported limit",
+            ),
+            (
+                crate::execution_ranges::ExecutionRangeUsage {
+                    range_count: crate::execution_ranges::MAX_EXECUTION_RANGES - 1,
+                    charged_bytes: crate::execution_ranges::MAX_EXECUTION_CHARGED_BYTES - 7,
+                },
+                "execution charged bytes exceed the supported limit",
+            ),
+        ];
+
+        for (range_usage, expected) in cases {
+            let error = build_lineage_with_prior_usage(&fixture, range_usage)
+                .err()
+                .expect("combined usage above a map limit must fail")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]
