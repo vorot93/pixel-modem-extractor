@@ -282,6 +282,44 @@ fn inspect_saved_project_with_args_and_env(
     .unwrap()
 }
 
+fn inspect_saved_project_with_post_scripts(
+    home: &std::path::Path,
+    out: &std::path::Path,
+    label: &str,
+    scripts: &[(String, Vec<String>)],
+) -> std::process::Output {
+    let config = out.join("ghidra_config");
+    let cache = out.join("ghidra_cache");
+    let temp = out.join("ghidra_tmp");
+    let java_options = format!(
+        "-Dapplication.settingsdir={} -Dapplication.cachedir={} -Dapplication.tempdir={} -Djava.io.tmpdir={}",
+        config.display(),
+        cache.display(),
+        temp.display(),
+        temp.display()
+    );
+    let mut command = std::process::Command::new(
+        analyze_headless_in_home(home).expect("located Ghidra home still has analyzeHeadless"),
+    );
+    command
+        .arg(out.join("ghidra_project"))
+        .arg("pixel-modem")
+        .arg("-process")
+        .arg(label)
+        .arg("-noanalysis")
+        .arg("-scriptPath")
+        .arg(out.join("scripts"));
+    for (script, arguments) in scripts {
+        command.arg("-postScript").arg(script).args(arguments);
+    }
+    command
+        .env("XDG_CONFIG_HOME", config)
+        .env("XDG_CACHE_HOME", cache)
+        .env("GHIDRA_HEADLESS_JAVA_OPTIONS", java_options)
+        .output()
+        .unwrap()
+}
+
 fn process_diagnostics(output: &std::process::Output) -> String {
     format!(
         "status: {}\nstdout:\n{}\nstderr:\n{}",
@@ -2433,8 +2471,14 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     .arg(creation_only_out.join("scripts"))
     .arg("-postScript")
     .arg("ApplyThumbNames.java")
+    .arg(&creation_only_root)
     .arg("00_BOOT")
     .arg(creation_only_symbol_map.image_blake3())
+    .arg("none")
+    .arg("-")
+    .arg("-")
+    .arg(&creation_only_functions_path)
+    .arg(creation_only_symbol_map.functions_blake3())
     .arg(creation_only_symbol_map.path())
     .arg(creation_only_symbol_map.map_blake3())
     .arg("-postScript")
@@ -2560,8 +2604,20 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     let apply_thumb_path = out.join("scripts/ApplyThumbNames.java");
     let apply_thumb_source = std::fs::read_to_string(&apply_thumb_path).unwrap();
     let thumb_apply_args = vec![
+        std::fs::canonicalize(&out)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
         "00_BOOT".to_string(),
         symbol_map.image_blake3().to_string(),
+        "none".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        boot_dir
+            .join("decompiled/functions.json")
+            .to_string_lossy()
+            .into_owned(),
+        symbol_map.functions_blake3().to_string(),
         symbol_map.path().to_string_lossy().into_owned(),
         symbol_map.map_blake3().to_string(),
     ];
@@ -3075,6 +3131,214 @@ public class ProbeThumbCreationSkips extends GhidraScript {
     assert!(boot.pass2_error.is_none());
     let c = std::fs::read_to_string(exp.join("decompiled.c")).unwrap();
     assert!(c.contains("Reset"));
+
+    // A successor rebuild represents the previously-created Thumb function
+    // through the current Ghidra execution inventory. ApplyThumbNames must
+    // migrate its ownership without opening the deleted predecessor map,
+    // leave the predecessor property staged across a separately committed
+    // run, and allow an identical current-map retry to complete through
+    // ExportDecomp. One headless invocation would roll all earlier scripts
+    // back when a later script fails, so the deliberate failure runs next.
+    {
+        let successor_dir =
+            std::env::temp_dir().join(format!("pme_decompile_p2_successor_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&successor_dir);
+        std::fs::create_dir_all(&successor_dir).unwrap();
+        copy_dir(&dir, &successor_dir);
+        let successor_out = successor_dir.join("out");
+        let successor_image_dir = successor_dir.join("images/00_BOOT");
+        let successor_decompiled = successor_image_dir.join("decompiled");
+        std::fs::copy(
+            successor_out.join("export/00_BOOT/functions.json"),
+            successor_decompiled.join("functions.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            successor_out.join("export/00_BOOT/disasm.lst"),
+            successor_decompiled.join("disasm.lst"),
+        )
+        .unwrap();
+
+        let successor_base_path = successor_out.join("symbol_maps/00_BOOT-successor-base.json");
+        let successor_bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(
+            &successor_base_path,
+            &successor_image_dir,
+            "00_BOOT",
+            &tokens,
+            &successor_dir.join("manifest.json"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            successor_bundle
+                .map
+                .creation_requests
+                .iter()
+                .all(|request| request.entry != 0x24),
+            "the final Ghidra inventory must represent the owned function as an execution"
+        );
+        let predecessor_field = "\"predecessor_symbol_pass2\": null";
+        let predecessor_replacement = format!(
+            "\"predecessor_symbol_pass2\": {}",
+            serde_json::to_string(&symbol_map.pass2_property()).unwrap()
+        );
+        let successor_source = std::fs::read_to_string(&successor_base_path).unwrap();
+        assert_eq!(successor_source.matches(predecessor_field).count(), 1);
+        let successor_bytes = successor_source
+            .replacen(predecessor_field, &predecessor_replacement, 1)
+            .into_bytes();
+        let successor_map_path = successor_out.join("symbol_maps/00_BOOT-successor.json");
+        std::fs::write(&successor_map_path, &successor_bytes).unwrap();
+        let _ = std::fs::remove_file(&successor_base_path);
+        let successor_functions_path = successor_decompiled.join("functions.json");
+        let successor_prepared = pixel_modem_extractor::decompile::PreparedSymbolPass2Map::new(
+            &successor_map_path,
+            &successor_functions_path,
+            &successor_image_dir.join("00_BOOT.bin"),
+            "00_BOOT",
+            successor_bundle.map.execution_count,
+            successor_bundle.map.applied_decision_count,
+            successor_bundle.map.creation_requests,
+        )
+        .unwrap();
+        let predecessor_map_path = successor_out.join("symbol_maps/00_BOOT.json");
+        std::fs::remove_file(&predecessor_map_path).unwrap();
+        assert!(!predecessor_map_path.exists());
+
+        let successor_root = std::fs::canonicalize(&successor_out).unwrap();
+        let successor_thumb_args = vec![
+            successor_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            successor_prepared.image_blake3().to_string(),
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            successor_functions_path.to_string_lossy().into_owned(),
+            successor_prepared.functions_blake3().to_string(),
+            successor_prepared.path().to_string_lossy().into_owned(),
+            successor_prepared.map_blake3().to_string(),
+        ];
+        let successor_symbol_args = vec![
+            successor_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            successor_prepared.image_blake3().to_string(),
+            "none".to_string(),
+            "-".to_string(),
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            successor_functions_path.to_string_lossy().into_owned(),
+            successor_prepared.functions_blake3().to_string(),
+            successor_prepared.path().to_string_lossy().into_owned(),
+            successor_prepared.map_blake3().to_string(),
+        ];
+        let successor_export_args = vec![
+            successor_out
+                .join("export/00_BOOT")
+                .to_string_lossy()
+                .into_owned(),
+            successor_root.to_string_lossy().into_owned(),
+            "00_BOOT".to_string(),
+            "none".to_string(),
+            "-".to_string(),
+            "none".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            successor_prepared.path().to_string_lossy().into_owned(),
+            successor_prepared.map_blake3().to_string(),
+        ];
+        std::fs::write(
+            successor_out.join("scripts/FailAfterThumb.java"),
+            r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+
+public class FailAfterThumb extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        throw new AssertionError("intentional failure after Thumb ownership migration");
+    }
+}
+"#,
+        )
+        .unwrap();
+        let migrated = inspect_saved_project_with_args(
+            &home,
+            &successor_out,
+            "00_BOOT",
+            "ApplyThumbNames.java",
+            &successor_thumb_args,
+        );
+        let migration_diagnostics = process_diagnostics(&migrated);
+        assert!(
+            migrated.status.success() && migration_diagnostics.contains("ApplyThumbNames: {"),
+            "the successor ownership migration failed:\n{migration_diagnostics}"
+        );
+        let failed_later =
+            inspect_saved_project(&home, &successor_out, "00_BOOT", "FailAfterThumb.java");
+        let failure_diagnostics = process_diagnostics(&failed_later);
+        assert!(
+            failure_diagnostics.contains("intentional failure after Thumb ownership migration"),
+            "the intentional post-migration failure did not run:\n{failure_diagnostics}"
+        );
+        let staged_probe =
+            inspect_saved_project(&home, &successor_out, "00_BOOT", "ProbeProperty.java");
+        let staged_probe_stdout = String::from_utf8_lossy(&staged_probe.stdout);
+        let staged_property = staged_probe_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ProbeProperty: "))
+            .unwrap_or_else(|| panic!("no staged property line:\n{staged_probe_stdout}"))
+            .trim_end_matches(" (GhidraScript)");
+        assert_eq!(staged_property, symbol_map.pass2_property());
+        let staged_ownership = staged_probe_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ProbeThumbOwnership: "))
+            .unwrap_or_else(|| panic!("no staged ownership line:\n{staged_probe_stdout}"))
+            .trim_end_matches(" (GhidraScript)");
+        assert_eq!(
+            staged_ownership.split(':').nth(1),
+            Some(successor_prepared.map_blake3()),
+            "staged ownership must bind the current map before ApplySymbols publishes it"
+        );
+
+        let retry = inspect_saved_project_with_post_scripts(
+            &home,
+            &successor_out,
+            "00_BOOT",
+            &[
+                ("ApplyThumbNames.java".to_string(), successor_thumb_args),
+                ("ApplySymbols.java".to_string(), successor_symbol_args),
+                ("ExportDecomp.java".to_string(), successor_export_args),
+            ],
+        );
+        let retry_diagnostics = process_diagnostics(&retry);
+        assert!(
+            retry.status.success()
+                && retry_diagnostics.contains("ApplyThumbNames: {")
+                && retry_diagnostics.contains("ApplySymbols: ")
+                && retry_diagnostics.contains("ExportDecomp: wrote export"),
+            "the identical staged successor retry failed:\n{retry_diagnostics}"
+        );
+        let final_probe =
+            inspect_saved_project(&home, &successor_out, "00_BOOT", "ProbeProperty.java");
+        let final_stdout = String::from_utf8_lossy(&final_probe.stdout);
+        let final_property = final_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ProbeProperty: "))
+            .unwrap_or_else(|| panic!("no final property line:\n{final_stdout}"))
+            .trim_end_matches(" (GhidraScript)");
+        assert_eq!(final_property, successor_prepared.pass2_property());
+        let final_ownership = final_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("ProbeThumbOwnership: "))
+            .unwrap_or_else(|| panic!("no final ownership line:\n{final_stdout}"))
+            .trim_end_matches(" (GhidraScript)");
+        assert_eq!(
+            final_ownership.split(':').nth(1),
+            Some(successor_prepared.map_blake3())
+        );
+        let _ = std::fs::remove_dir_all(&successor_dir);
+    }
 
     // Current program bytes, not map text alone, authenticate a creation.
     let mutate_creation = r#"//@category PixelModemTest
@@ -8608,6 +8872,7 @@ const EXCEPTION_REG_FIQ_OFF: usize = 0x640;
 const EXCEPTION_FILE_OFF: usize = 0x680;
 const EXCEPTION_FUNC_OFF: usize = 0x6a0;
 const EXCEPTION_REG_TABLE_OFF: usize = 0x700;
+const EXCEPTION_PENDING_THUMB_OFF: usize = 0x300;
 
 fn exception_pass2_fixture() -> ExceptionFixture {
     let fixture = exception_fixture();
@@ -8622,6 +8887,12 @@ fn exception_pass2_fixture() -> ExceptionFixture {
     put_string(&mut raw, EXCEPTION_REG_FIQ_OFF, "registered_fiq");
     put_string(&mut raw, EXCEPTION_FILE_OFF, "src/exception.c");
     put_string(&mut raw, EXCEPTION_FUNC_OFF, "undefined_handler");
+    assert_eq!(
+        raw[EXCEPTION_PENDING_THUMB_OFF..EXCEPTION_PENDING_THUMB_OFF + 2],
+        [0, 0]
+    );
+    raw[EXCEPTION_PENDING_THUMB_OFF..EXCEPTION_PENDING_THUMB_OFF + 2]
+        .copy_from_slice(&[0x70, 0x47]); // Thumb `bx lr`, intentionally unreferenced.
 
     assert!(
         raw[EXCEPTION_REG_TABLE_OFF..EXCEPTION_REG_TABLE_OFF + 24]
@@ -8654,17 +8925,10 @@ fn exception_pass2_fixture() -> ExceptionFixture {
 
 fn exception_pass2_context(
     fixture: &ExceptionFixture,
-    application_output: &std::process::Output,
+    applied: &pixel_modem_extractor::decompile::AppliedExceptionRoots,
     manifest_path: &std::path::Path,
     image_dir: &std::path::Path,
 ) -> pixel_modem_extractor::symbolicate::ExceptionPass2Context {
-    let stdout = String::from_utf8_lossy(&application_output.stdout);
-    let applied = pixel_modem_extractor::decompile::AppliedExceptionRoots::parse_current(
-        &stdout,
-        "00_BOOT",
-        &fixture.identity,
-    )
-    .unwrap();
     pixel_modem_extractor::decompile::read_exception_pass2_context(
         pixel_modem_extractor::decompile::ExceptionPass2ContextInput {
             manifest_path,
@@ -8674,7 +8938,7 @@ fn exception_pass2_context(
             image_base: EXCEPTION_BASE,
             expected_identity: &fixture.identity,
             expected_scatter_load_map_blake3: None,
-            applied: &applied,
+            applied,
         },
     )
     .unwrap()
@@ -8884,7 +9148,7 @@ public class ExceptionInspectPass2 extends GhidraScript {
         ExceptionRootsSupport.validateAppliedIdentity(currentProgram, args[0]);
         requireName(0x40010200L, "registered_reset", SourceType.USER_DEFINED);
         requireName(0x40010220L, "undefined_handler", SourceType.USER_DEFINED);
-        requireName(0x40010240L, "firmwareSupervisor", SourceType.USER_DEFINED);
+        requireName(0x40010240L, "SupervisorCall", SourceType.ANALYSIS);
         requireName(0x40010260L, "PrefetchAbort", SourceType.ANALYSIS);
         Function shared = currentProgram.getFunctionManager().getFunctionAt(toAddr(0x40010280L));
         if (shared == null || !"FUN_40010280".equals(shared.getName())
@@ -8935,7 +9199,7 @@ import java.util.List;
 public class ExceptionInspectState extends GhidraScript {
     private static final long[] ENTRIES = {
         0x40010200L, 0x40010220L, 0x40010222L, 0x40010240L, 0x40010260L,
-        0x40010280L, 0x400102a0L, 0x400102c0L
+        0x40010280L, 0x400102a0L, 0x400102c0L, 0x40010300L
     };
 
     @Override
@@ -9471,61 +9735,7 @@ struct ExceptionApplyKit {
     identity: String,
 }
 
-fn generate_exception_apply_kit(
-    home: &std::path::Path,
-    case: &str,
-    fixture: &ExceptionFixture,
-) -> ExceptionApplyKit {
-    generate_exception_apply_kit_inner(
-        home,
-        case,
-        &fixture.raw,
-        &fixture.manifest,
-        &fixture.identity,
-    )
-}
-
-fn generate_exception_apply_kit_inner(
-    home: &std::path::Path,
-    case: &str,
-    raw: &[u8],
-    manifest: &str,
-    identity: &str,
-) -> ExceptionApplyKit {
-    let dir =
-        std::env::temp_dir().join(format!("pme_exception_apply_{case}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let modem_path = dir.join("modem.bin");
-    std::fs::write(
-        &modem_path,
-        craft_single_image_modem_bin("BOOT", EXCEPTION_BASE, 1, raw),
-    )
-    .unwrap();
-    let out = dir.join("out");
-    pixel_modem_extractor::decompile::run_report(
-        &modem_path,
-        &pixel_modem_extractor::decompile::Opts {
-            run: false,
-            image: None,
-            ghidra_home: Some(home.to_path_buf()),
-            processor: "ARM:LE:32:v7".to_string(),
-            no_thumb_decompile: false,
-            rizin_fallback: false,
-            tighten_wall_clock_budget_override: None,
-            no_skip_opaque: false,
-        },
-        &out,
-    )
-    .unwrap();
-    let manifest_dir = out.join("exception_roots/00_BOOT");
-    std::fs::create_dir_all(&manifest_dir).unwrap();
-    let manifest_path = manifest_dir.join("roots.json");
-    std::fs::write(&manifest_path, manifest).unwrap();
-    let scatter_path = out.join("scatter/00_BOOT/load_map.json");
-    let scatter_path = scatter_path
-        .is_file()
-        .then(|| std::fs::canonicalize(scatter_path).unwrap());
+fn stage_exception_test_scripts(out: &std::path::Path) {
     for script in [
         "PmeScriptSupport.java",
         "PalTasksSupport.java",
@@ -9601,6 +9811,64 @@ fn generate_exception_apply_kit_inner(
     ] {
         std::fs::write(out.join("scripts").join(name), source).unwrap();
     }
+}
+
+fn generate_exception_apply_kit(
+    home: &std::path::Path,
+    case: &str,
+    fixture: &ExceptionFixture,
+) -> ExceptionApplyKit {
+    generate_exception_apply_kit_inner(
+        home,
+        case,
+        &fixture.raw,
+        &fixture.manifest,
+        &fixture.identity,
+    )
+}
+
+fn generate_exception_apply_kit_inner(
+    home: &std::path::Path,
+    case: &str,
+    raw: &[u8],
+    manifest: &str,
+    identity: &str,
+) -> ExceptionApplyKit {
+    let dir =
+        std::env::temp_dir().join(format!("pme_exception_apply_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        craft_single_image_modem_bin("BOOT", EXCEPTION_BASE, 1, raw),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: false,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: false,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: false,
+        },
+        &out,
+    )
+    .unwrap();
+    let manifest_dir = out.join("exception_roots/00_BOOT");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    let manifest_path = manifest_dir.join("roots.json");
+    std::fs::write(&manifest_path, manifest).unwrap();
+    let scatter_path = out.join("scatter/00_BOOT/load_map.json");
+    let scatter_path = scatter_path
+        .is_file()
+        .then(|| std::fs::canonicalize(scatter_path).unwrap());
+    stage_exception_test_scripts(&out);
     std::fs::create_dir_all(out.join("ghidra_project")).unwrap();
     for directory in ["ghidra_config", "ghidra_cache", "ghidra_tmp"] {
         std::fs::create_dir_all(out.join(directory)).unwrap();
@@ -9823,25 +10091,54 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     use pixel_modem_extractor::symbolicate::TaggedEvidence;
 
     let fixture = exception_pass2_fixture();
-    let kit = generate_exception_apply_kit(home, "pass2_survival", &fixture);
-    let imported = exception_import(home, &kit);
-    assert!(
-        imported.status.success(),
-        "exception pass-2 import failed:\n{}",
-        process_diagnostics(&imported)
-    );
-    let applied = exception_apply(home, &kit);
-    assert!(
-        applied.status.success(),
-        "exception pass-1 application failed:\n{}",
-        process_diagnostics(&applied)
-    );
-    let exported = exception_export_only(home, &kit);
-    assert!(
-        exported.status.success(),
-        "exception pass-1 export failed:\n{}",
-        process_diagnostics(&exported)
-    );
+    let production_dir = std::env::temp_dir().join(format!(
+        "pme_exception_apply_pass2_survival_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&production_dir);
+    std::fs::create_dir_all(&production_dir).unwrap();
+    let production_modem = production_dir.join("modem.bin");
+    std::fs::write(
+        &production_modem,
+        craft_single_image_modem_bin("BOOT", EXCEPTION_BASE, 1, &fixture.raw),
+    )
+    .unwrap();
+    let production_out = production_dir.join("out");
+    let production = pixel_modem_extractor::decompile::run_report(
+        &production_modem,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile: true,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &production_out,
+    )
+    .unwrap();
+    let authority = production.images[0]
+        .exception_roots_applied
+        .as_ref()
+        .expect("production pass 1 must produce exception authority");
+    assert_eq!(authority.identity(), fixture.identity);
+    stage_exception_test_scripts(&production_out);
+    let manifest_path =
+        std::fs::canonicalize(production_out.join("exception_roots/00_BOOT/roots.json")).unwrap();
+    let scatter_path = production_out.join("scatter/00_BOOT/load_map.json");
+    let scatter_path = scatter_path
+        .is_file()
+        .then(|| std::fs::canonicalize(scatter_path).unwrap());
+    let kit = ExceptionApplyKit {
+        dir: production_dir,
+        out: production_out.clone(),
+        kit_root: std::fs::canonicalize(&production_out).unwrap(),
+        manifest_path,
+        scatter_path,
+        identity: fixture.identity.clone(),
+    };
 
     let tree = kit.dir.join("pass2-tree");
     let image_dir = tree.join("images/00_BOOT");
@@ -9906,7 +10203,7 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     )
     .unwrap();
 
-    let context = exception_pass2_context(&fixture, &applied, &kit.manifest_path, &image_dir);
+    let context = exception_pass2_context(&fixture, authority, &kit.manifest_path, &image_dir);
     let map_path = kit.out.join("symbol_maps/00_BOOT-exception-v4.json");
     std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
     let bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(
@@ -9952,7 +10249,7 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
             .any(|evidence| matches!(evidence, TaggedEvidence::Func { .. }))
     );
     let supervisor = symbol_at(0x4001_0240);
-    assert!(supervisor.name.is_none());
+    assert_eq!(supervisor.name.as_deref(), Some("SupervisorCall"));
     assert!(
         supervisor
             .evidence
@@ -10069,7 +10366,7 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
         .collect::<std::collections::HashSet<_>>();
     assert!(final_names.contains("registered_reset"));
     assert!(final_names.contains("undefined_handler"));
-    assert!(final_names.contains("firmwareSupervisor"));
+    assert!(final_names.contains("SupervisorCall"));
 
     let inspected = exception_run_script_with(
         home,
@@ -10304,6 +10601,47 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
         let omitted_text = source.replacen(predecessor, &replacement, 1);
         let omitted_text =
             replace_first_json_object_value_with_null(&omitted_text, "exception_transition");
+        let pending_entry = EXCEPTION_BASE + EXCEPTION_PENDING_THUMB_OFF as u32;
+        let pending_end = pending_entry + 2;
+        let pending_range_blake3 = blake3::hash(
+            &fixture.raw[EXCEPTION_PENDING_THUMB_OFF..EXCEPTION_PENDING_THUMB_OFF + 2],
+        );
+        let mut execution_hasher = blake3::Hasher::new();
+        execution_hasher.update(b"pixel-modem-extractor-execution-v1\0");
+        execution_hasher.update(&pending_entry.to_le_bytes());
+        execution_hasher.update(&1u32.to_le_bytes());
+        execution_hasher.update(&[1]);
+        execution_hasher.update(&pending_entry.to_le_bytes());
+        execution_hasher.update(&pending_end.to_le_bytes());
+        execution_hasher.update(pending_range_blake3.as_bytes());
+        let pending_execution_blake3 = execution_hasher.finalize();
+        let empty_creations = "  \"creations\": []";
+        assert_eq!(omitted_text.matches(empty_creations).count(), 1);
+        let pending_creation = format!(
+            concat!(
+                "  \"creations\": [\n",
+                "    {{\n",
+                "      \"entry\": \"0x{pending_entry:08x}\",\n",
+                "      \"execution_blake3\": \"{pending_execution_blake3}\",\n",
+                "      \"decode_ranges\": [\n",
+                "        {{\n",
+                "          \"isa\": \"thumb\",\n",
+                "          \"start\": \"0x{pending_entry:08x}\",\n",
+                "          \"end\": \"0x{pending_end:08x}\",\n",
+                "          \"blake3\": \"{pending_range_blake3}\"\n",
+                "        }}\n",
+                "      ],\n",
+                "      \"final_primary\": \"pending_thumb_handler\",\n",
+                "      \"final_source\": \"analysis\"\n",
+                "    }}\n",
+                "  ]"
+            ),
+            pending_entry = pending_entry,
+            pending_execution_blake3 = pending_execution_blake3,
+            pending_end = pending_end,
+            pending_range_blake3 = pending_range_blake3,
+        );
+        let omitted_text = omitted_text.replacen(empty_creations, &pending_creation, 1);
         let omitted_map: serde_json::Value = serde_json::from_str(&omitted_text).unwrap();
         assert!(
             omitted_map["symbols"]
@@ -10313,11 +10651,75 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
                 .any(|decision| decision["action"] == "rename"
                     && decision["exception_transition"].is_null())
         );
+        assert_eq!(omitted_map["creations"].as_array().unwrap().len(), 1);
         let omitted_bytes = omitted_text.into_bytes();
         let omitted_path = kit.out.join("symbol_maps/00_BOOT-omitted-transition.json");
         std::fs::write(&omitted_path, &omitted_bytes).unwrap();
         let omitted_hash = blake3::hash(&omitted_bytes).to_hex().to_string();
         let marker_before = std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap();
+
+        let ordered_before = exception_run_script(home, &kit, "ExceptionInspectState.java");
+        assert!(ordered_before.status.success());
+        let ordered_before = exception_state(&ordered_before);
+        let ordered_apply = exception_headless(
+            home,
+            &kit,
+            &[
+                "-process".to_string(),
+                "00_BOOT".to_string(),
+                "-noanalysis".to_string(),
+                "-scriptPath".to_string(),
+                kit.out.join("scripts").to_string_lossy().into_owned(),
+                "-postScript".to_string(),
+                "ApplyThumbNames.java".to_string(),
+                kit.kit_root.to_string_lossy().into_owned(),
+                "00_BOOT".to_string(),
+                prepared.image_blake3().to_string(),
+                fixture.identity.clone(),
+                kit.manifest_path.to_string_lossy().into_owned(),
+                scatter.clone(),
+                functions_path.to_string_lossy().into_owned(),
+                prepared.functions_blake3().to_string(),
+                omitted_path.to_string_lossy().into_owned(),
+                omitted_hash.clone(),
+                "-postScript".to_string(),
+                "ExceptionSentinel.java".to_string(),
+            ],
+        );
+        let ordered_diagnostics = process_diagnostics(&ordered_apply);
+        assert!(
+            ordered_diagnostics.contains(
+                "pass2_owned exception registry and symbol-map transitions are not bijective"
+            ) && ordered_diagnostics.contains("at ApplyThumbNames.run"),
+            "ApplyThumbNames did not reject invalid exception transitions before creation:\n{ordered_diagnostics}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&ordered_apply.stdout)
+                .lines()
+                .any(|line| line.starts_with("ApplyThumbNames: ")
+                    || line == "ExceptionSentinel: RAN"),
+            "invalid transition preflight mutated or continued:\n{ordered_diagnostics}"
+        );
+        let ordered_after = exception_run_script(home, &kit, "ExceptionInspectState.java");
+        assert!(ordered_after.status.success());
+        assert_eq!(exception_state(&ordered_after), ordered_before);
+
+        let omitted_property = format!(
+            "v3:{omitted_hash}:{}:{}",
+            prepared.functions_blake3(),
+            prepared.execution_count()
+        );
+        let staged = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionSetSymbolPass2.java",
+            &["restore", &omitted_property],
+        );
+        assert!(
+            staged.status.success(),
+            "could not stage the omitted-transition property:\n{}",
+            process_diagnostics(&staged)
+        );
 
         let mut omitted_export_args = export_args();
         let export_len = omitted_export_args.len();
@@ -10334,6 +10736,17 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
         assert_eq!(
             std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
             marker_before
+        );
+        let restored = exception_run_script_with(
+            home,
+            &kit,
+            "ExceptionSetSymbolPass2.java",
+            &["restore", &prepared.pass2_property()],
+        );
+        assert!(
+            restored.status.success(),
+            "could not restore the current SymbolPass2 property:\n{}",
+            process_diagnostics(&restored)
         );
 
         let mut omitted_apply_args = apply_args();
@@ -10480,7 +10893,8 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     let rejected = exception_headless(home, &kit, &retry_args);
     let rejected_diagnostics = process_diagnostics(&rejected);
     assert!(
-        rejected_diagnostics.contains("exception-root registry value is missing"),
+        rejected_diagnostics
+            .contains("exception-root ownership registry has a stale or partial size"),
         "stale exception registry was not rejected:\n{rejected_diagnostics}"
     );
     assert!(
@@ -11302,7 +11716,7 @@ fn post_commit_close_failure_is_replayable_without_success_summary() {
         "        }\n",
         "    }\n",
         "\n",
-        "    static final class AppliedState",
+        "    enum Pass2MapPhase",
     );
     let injected_tail = concat!(
         "            if (failure != null) rethrow(failure);\n",
@@ -11310,7 +11724,7 @@ fn post_commit_close_failure_is_replayable_without_success_summary() {
         "        }\n",
         "    }\n",
         "\n",
-        "    static final class AppliedState",
+        "    enum Pass2MapPhase",
     );
     std::fs::write(
         &support_path,

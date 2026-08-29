@@ -471,6 +471,21 @@ final class PalTasksSupport {
         }
     }
 
+    private static String symbolPass2MapHash(String property) {
+        if (property == null) return null;
+        validateSymbolPass2Property(property);
+        return property.split(":", -1)[1];
+    }
+
+    private static String migrateThumbOwnershipValue(String value, String currentMapHash) {
+        int hashStart = "v1:".length();
+        int hashEnd = value.indexOf(':', hashStart);
+        if (hashEnd < 0) {
+            fail("Thumb creation ownership does not have a replaceable map hash");
+        }
+        return value.substring(0, hashStart) + currentMapHash + value.substring(hashEnd);
+    }
+
     /** Re-authenticate the producer execution against current program memory. */
     static void validateThumbCreationExecution(Program program, TaskMonitor monitor,
             MapCreation creation) throws Exception {
@@ -504,6 +519,16 @@ final class PalTasksSupport {
         if (!map.mapBlake3.equals(parsed.mapBlake3)
                 || !creation.executionBlake3.equals(parsed.producerExecutionBlake3)) {
             fail("the Thumb creation ownership changed at " + entry);
+        }
+        validateOwnedThumbCreation(program, monitor, parsed, creation);
+    }
+
+    static void validateOwnedThumbCreation(Program program, TaskMonitor monitor,
+            ThumbCreationOwnership parsed, MapCreation creation) throws Exception {
+        Address entry = programAddress(program, creation.entry);
+        validateThumbCreationExecution(program, monitor, creation);
+        if (!creation.executionBlake3.equals(parsed.producerExecutionBlake3)) {
+            fail("the Thumb creation producer identity changed at " + entry);
         }
         Function function = program.getFunctionManager().getFunctionAt(entry);
         if (function == null || !creation.finalPrimary.equals(function.getName())
@@ -539,6 +564,122 @@ final class PalTasksSupport {
         }
     }
 
+    private static void validateOwnedThumbExecution(Program program, TaskMonitor monitor,
+            ThumbCreationOwnership parsed, ExecutionDecision represented,
+            boolean currentProperty) throws Exception {
+        MapExecution execution = represented.execution;
+        MapDecision decision = represented.decision;
+        Address entry = programAddress(program, execution.entry);
+        Function function = program.getFunctionManager().getFunctionAt(entry);
+        if (function == null || function.getID() != parsed.functionId
+                || function.getSymbol().getID() != parsed.primarySymbolId) {
+            fail("the owned Thumb execution identity changed at " + entry);
+        }
+        String expectedName = currentProperty ? decision.finalPrimary : decision.originalPrimary;
+        String expectedSource = currentProperty ? decision.finalSource : decision.originalSource;
+        boolean mirrorOriginal = currentProperty && "mirror".equals(decision.action)
+                && function.getName().equals(decision.originalPrimary);
+        if ((!function.getName().equals(expectedName) && !mirrorOriginal)
+                || !primarySource(function.getSymbol().getSource()).equals(expectedSource)) {
+            fail("the owned Thumb execution primary changed at " + entry);
+        }
+        if (!parsed.producerExecutionBlake3.equals(execution.executionBlake3)) {
+            fail("the owned Thumb producer execution changed at " + entry);
+        }
+        String currentDigest = currentExecutionDigest(program, monitor, function);
+        if (!parsed.ghidraExecutionBlake3.equals(currentDigest)
+                || !execution.executionBlake3.equals(currentDigest)) {
+            fail("the owned Thumb execution body changed at " + entry);
+        }
+    }
+
+    static ThumbOwnershipState preflightThumbOwnershipState(
+            Program program, TaskMonitor monitor, SymbolMap map, String property,
+            boolean decisionsApplied)
+            throws Exception {
+        String expectedProperty = expectedSymbolPass2Property(map);
+        validateSymbolPass2Property(property);
+        if (!java.util.Objects.equals(property, map.predecessorSymbolPass2)
+                && !expectedProperty.equals(property)) {
+            fail("the saved program belongs to a different symbol-map application");
+        }
+        boolean currentProperty = expectedProperty.equals(property);
+        String predecessorHash = symbolPass2MapHash(map.predecessorSymbolPass2);
+
+        Map<Long, MapCreation> creations = new HashMap<Long, MapCreation>();
+        for (MapCreation creation : map.creations) {
+            if (creations.put(creation.entry, creation) != null) {
+                fail("the symbol map carries duplicate Thumb creations");
+            }
+        }
+        Map<Long, ExecutionDecision> executions = new HashMap<Long, ExecutionDecision>();
+        for (int index = 0; index < map.executions.size(); index++) {
+            MapExecution execution = map.executions.get(index);
+            if (executions.put(execution.entry,
+                    new ExecutionDecision(execution, map.decisions.get(index))) != null) {
+                fail("the symbol map carries duplicate execution entries");
+            }
+            if (creations.containsKey(execution.entry)) {
+                fail("the symbol map represents one Thumb-owned entry twice");
+            }
+        }
+
+        StringPropertyMap registry = program.getUsrPropertyManager()
+                .getStringPropertyMap(THUMB_CREATION_OWNERSHIP_MAP);
+        Map<Long, ThumbCreationOwnership> rows =
+                new HashMap<Long, ThumbCreationOwnership>();
+        List<ThumbOwnershipMigration> migrations =
+                new ArrayList<ThumbOwnershipMigration>();
+        String rowMapHash = null;
+        if (registry != null) {
+            AddressIterator entries = registry.getPropertyIterator();
+            while (entries.hasNext()) {
+                monitor.checkCancelled();
+                Address entry = entries.next();
+                if (!entry.getAddressSpace().equals(
+                        program.getAddressFactory().getDefaultAddressSpace())) {
+                    fail("the Thumb creation registry uses a non-default address space at "
+                            + entry);
+                }
+                String value = registry.getString(entry);
+                ThumbCreationOwnership parsed = parseThumbCreationOwnership(value);
+                if (rowMapHash == null) rowMapHash = parsed.mapBlake3;
+                else if (!rowMapHash.equals(parsed.mapBlake3)) {
+                    fail("the Thumb creation registry mixes predecessor and current map hashes");
+                }
+                boolean predecessorRow = predecessorHash != null
+                        && predecessorHash.equals(parsed.mapBlake3);
+                boolean currentRow = map.mapBlake3.equals(parsed.mapBlake3);
+                if ((!predecessorRow && !currentRow) || (currentProperty && !currentRow)) {
+                    fail("the Thumb creation ownership belongs to a foreign map at " + entry);
+                }
+
+                long offset = entry.getOffset();
+                MapCreation creation = creations.get(offset);
+                ExecutionDecision execution = executions.get(offset);
+                if ((creation == null) == (execution == null)) {
+                    fail("the Thumb creation registry entry is not represented exactly once at "
+                            + entry);
+                }
+                if (creation != null) {
+                    validateOwnedThumbCreation(program, monitor, parsed, creation);
+                }
+                else {
+                    validateOwnedThumbExecution(
+                            program, monitor, parsed, execution, decisionsApplied);
+                }
+                if (rows.put(offset, parsed) != null) {
+                    fail("the Thumb creation registry carries duplicate entries at " + entry);
+                }
+                if (predecessorRow) {
+                    migrations.add(new ThumbOwnershipMigration(entry, value,
+                            migrateThumbOwnershipValue(value, map.mapBlake3)));
+                }
+            }
+        }
+        return new ThumbOwnershipState(registry, rows, migrations);
+    }
+
     /**
      * Validate the complete map-owned creation state before SymbolPass2 can
      * advance. Unowned skipped requests are allowed, but an exact current
@@ -548,16 +689,20 @@ final class PalTasksSupport {
     static void validateThumbCreationState(
             Program program, TaskMonitor monitor, SymbolMap map) throws Exception {
         FunctionManager functions = program.getFunctionManager();
-        StringPropertyMap ownership = program.getUsrPropertyManager()
-                .getStringPropertyMap(THUMB_CREATION_OWNERSHIP_MAP);
-        Set<Long> requested = new HashSet<Long>();
+        String property = program.getOptions(Program.PROGRAM_INFO)
+                .getString(SYMBOL_PASS2_PROPERTY, null);
+        ThumbOwnershipState state = preflightThumbOwnershipState(
+                program, monitor, map, property, true);
+        if (!state.migrations.isEmpty()) {
+            fail("terminal Thumb ownership still belongs to the predecessor map");
+        }
         for (MapCreation creation : map.creations) {
             monitor.checkCancelled();
             validateThumbCreationExecution(program, monitor, creation);
             Address entry = programAddress(program, creation.entry);
-            String owned = ownership == null ? null : ownership.getString(entry);
+            ThumbCreationOwnership owned = state.at(creation.entry);
             if (owned != null) {
-                validateOwnedThumbCreation(program, monitor, ownership, map, creation);
+                validateOwnedThumbCreation(program, monitor, owned, creation);
             }
             else {
                 Function function = functions.getFunctionAt(entry);
@@ -565,23 +710,6 @@ final class PalTasksSupport {
                         && creation.finalSource.equals(primarySource(
                                 function.getSymbol().getSource()))) {
                     fail("an exact Thumb creation lacks ownership at " + entry);
-                }
-            }
-            requested.add(creation.entry);
-        }
-        if (ownership != null) {
-            AddressIterator entries = ownership.getPropertyIterator();
-            while (entries.hasNext()) {
-                monitor.checkCancelled();
-                Address entry = entries.next();
-                if (!entry.getAddressSpace().equals(
-                        program.getAddressFactory().getDefaultAddressSpace())) {
-                    fail("the Thumb creation registry uses a non-default address space at "
-                            + entry);
-                }
-                if (!requested.contains(entry.getOffset())) {
-                    fail("the Thumb creation registry has an entry absent from the map at "
-                            + entry);
                 }
             }
         }
@@ -915,6 +1043,46 @@ final class PalTasksSupport {
         }
     }
 
+    static final class ThumbOwnershipMigration {
+        final Address entry;
+        final String priorValue;
+        final String currentValue;
+
+        ThumbOwnershipMigration(Address entry, String priorValue, String currentValue) {
+            this.entry = entry;
+            this.priorValue = priorValue;
+            this.currentValue = currentValue;
+        }
+    }
+
+    static final class ThumbOwnershipState {
+        final StringPropertyMap registry;
+        final Map<Long, ThumbCreationOwnership> rows;
+        final List<ThumbOwnershipMigration> migrations;
+
+        ThumbOwnershipState(StringPropertyMap registry,
+                Map<Long, ThumbCreationOwnership> rows,
+                List<ThumbOwnershipMigration> migrations) {
+            this.registry = registry;
+            this.rows = rows;
+            this.migrations = migrations;
+        }
+
+        ThumbCreationOwnership at(long entry) {
+            return rows.get(entry);
+        }
+    }
+
+    private static final class ExecutionDecision {
+        final MapExecution execution;
+        final MapDecision decision;
+
+        ExecutionDecision(MapExecution execution, MapDecision decision) {
+            this.execution = execution;
+            this.decision = decision;
+        }
+    }
+
     static final class SymbolMap {
         final String imageLabel;
         final long imageBase;
@@ -953,6 +1121,50 @@ final class PalTasksSupport {
             this.decisions = decisions;
             this.creations = creations;
             this.mapBlake3 = mapBlake3;
+        }
+    }
+
+    static final class RetainedSymbolMap implements AutoCloseable {
+        final SymbolMap map;
+        private final PmeScriptSupport.TrustedFile mapFile;
+        private final PmeScriptSupport.TrustedFile functionsFile;
+        private boolean closed;
+
+        RetainedSymbolMap(SymbolMap map, PmeScriptSupport.TrustedFile mapFile,
+                PmeScriptSupport.TrustedFile functionsFile) {
+            this.map = map;
+            this.mapFile = mapFile;
+            this.functionsFile = functionsFile;
+        }
+
+        void verifyRetainedFiles() {
+            mapFile.verifyPathIdentity("symbol map");
+            if (functionsFile != null) {
+                functionsFile.verifyPathIdentity("retained pass-1 functions.json");
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            if (closed) return;
+            closed = true;
+            Throwable failure = null;
+            if (functionsFile != null) {
+                try {
+                    functionsFile.close();
+                }
+                catch (Throwable error) {
+                    failure = error;
+                }
+            }
+            try {
+                mapFile.close();
+            }
+            catch (Throwable error) {
+                if (failure == null) failure = error;
+                else suppress(failure, error);
+            }
+            if (failure != null) rethrow(failure);
         }
     }
 
@@ -1978,17 +2190,17 @@ final class PalTasksSupport {
     // Strict symbol-map v4 reader
     // -------------------------------------------------------------------------
 
-    static SymbolMap readSymbolMap(File retainedFunctions, String functionsHash, File map,
-            String mapHash) throws Exception {
+    static RetainedSymbolMap retainSymbolMap(File retainedFunctions, String functionsHash,
+            File map, String mapHash) throws Exception {
         assertGhidraSymbolLimit();
         requireHashText(functionsHash, "expected functions.json BLAKE3");
         requireHashText(mapHash, "expected symbol map BLAKE3");
-        SymbolMap parsed;
-        try (PmeScriptSupport.TrustedFile mapFile =
-                        PmeScriptSupport.openCanonicalFile(map, "symbol map");
-                PmeScriptSupport.TrustedFile functionsFile =
-                        PmeScriptSupport.openCanonicalFile(
-                                retainedFunctions, "retained pass-1 functions.json")) {
+        PmeScriptSupport.TrustedFile mapFile = null;
+        PmeScriptSupport.TrustedFile functionsFile = null;
+        try {
+            mapFile = PmeScriptSupport.openCanonicalFile(map, "symbol map");
+            functionsFile = PmeScriptSupport.openCanonicalFile(
+                    retainedFunctions, "retained pass-1 functions.json");
             if (mapFile.size() > MAX_SYMBOL_MAP_BYTES) {
                 fail("symbol map exceeds the 256 MiB ceiling");
             }
@@ -1996,35 +2208,44 @@ final class PalTasksSupport {
             if (!actualMapHash.equals(mapHash)) {
                 fail("symbol map BLAKE3 does not match the expected value");
             }
-            parsed = parseSymbolMap(mapFile.utf8Reader(), actualMapHash);
+            SymbolMap parsed = parseSymbolMap(mapFile.utf8Reader(), actualMapHash);
             if (!functionsHash.equals(functionsFile.blake3(
                     "retained pass-1 functions.json"))) {
                 fail("functions.json BLAKE3 does not match the retained file");
             }
             mapFile.verifyPathIdentity("symbol map");
             functionsFile.verifyPathIdentity("retained pass-1 functions.json");
+            if (!parsed.functionsBlake3.equals(functionsHash)) {
+                fail("functions.json BLAKE3 does not match the map dependency");
+            }
+            return new RetainedSymbolMap(parsed, mapFile, functionsFile);
         }
-        catch (IOException error) {
-            throw new Exception("symbol map could not be read: " + error.getMessage(), error);
+        catch (Throwable error) {
+            closeQuietly(functionsFile, error);
+            closeQuietly(mapFile, error);
+            if (error instanceof IOException) {
+                throw new Exception("symbol map could not be read: " + error.getMessage(), error);
+            }
+            rethrow(error);
+            return null;
         }
-        if (!parsed.functionsBlake3.equals(functionsHash)) {
-            fail("functions.json BLAKE3 does not match the map dependency");
-        }
-        return parsed;
     }
 
-    /**
-     * The export-side map read: the map file itself is hashed from one
-     * retained handle and strictly parsed. The retained pass-1
-     * functions.json binding is not re-read here — ApplySymbols owns that
-     * check, and the pass-2 export pins the map's own functions digest
-     * through the exact SymbolPass2 property instead.
-     */
-    static SymbolMap readSymbolMapForExport(File map, String mapHash) throws Exception {
+    static SymbolMap readSymbolMap(File retainedFunctions, String functionsHash, File map,
+            String mapHash) throws Exception {
+        try (RetainedSymbolMap retained = retainSymbolMap(
+                retainedFunctions, functionsHash, map, mapHash)) {
+            return retained.map;
+        }
+    }
+
+    /** Retain the export-side map handle through terminal validation. */
+    static RetainedSymbolMap retainSymbolMapForExport(File map, String mapHash) throws Exception {
         assertGhidraSymbolLimit();
         requireHashText(mapHash, "expected symbol map BLAKE3");
-        try (PmeScriptSupport.TrustedFile mapFile =
-                PmeScriptSupport.openCanonicalFile(map, "symbol map")) {
+        PmeScriptSupport.TrustedFile mapFile = null;
+        try {
+            mapFile = PmeScriptSupport.openCanonicalFile(map, "symbol map");
             if (mapFile.size() > MAX_SYMBOL_MAP_BYTES) {
                 fail("symbol map exceeds the 256 MiB ceiling");
             }
@@ -2034,10 +2255,15 @@ final class PalTasksSupport {
             }
             SymbolMap parsed = parseSymbolMap(mapFile.utf8Reader(), actualMapHash);
             mapFile.verifyPathIdentity("symbol map");
-            return parsed;
+            return new RetainedSymbolMap(parsed, mapFile, null);
         }
-        catch (IOException error) {
-            throw new Exception("symbol map could not be read: " + error.getMessage(), error);
+        catch (Throwable error) {
+            closeQuietly(mapFile, error);
+            if (error instanceof IOException) {
+                throw new Exception("symbol map could not be read: " + error.getMessage(), error);
+            }
+            rethrow(error);
+            return null;
         }
     }
 

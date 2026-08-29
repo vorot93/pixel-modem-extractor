@@ -150,91 +150,78 @@ public class ExportDecomp extends HeadlessScript {
                             ? PalTasksSupport.retainPal(
                                     canonicalRoot, label, taskManifest, scatterManifest)
                             : null) {
-                validateExceptionState(roots);
-                validatePalState(pal, palIdentity);
-                if (pal != null) {
-                    chargeTaskBodies(pal.manifest);
-                    checkDeadline();
+                if (mapFile == null && !"none".equals(mapHash)) {
+                    fail("an absent symbol map requires the literal 'none' hash");
                 }
+                if (mapFile != null && "none".equals(mapHash)) {
+                    fail("a present symbol map requires its expected BLAKE3");
+                }
+                try (ExceptionRootsSupport.Pass2MapState pass2State = mapFile == null
+                        ? null
+                        : ExceptionRootsSupport.retainTerminalPass2MapState(
+                                currentProgram, deadlineMonitor(), label, exceptionIdentity,
+                                roots, mapFile, mapHash)) {
+                    validateExceptionState(roots);
+                    validatePalState(pal, palIdentity);
+                    if (pal != null) {
+                        chargeTaskBodies(pal.manifest);
+                        checkDeadline();
+                    }
 
-                // Symbol map / pass-2 property contract.
-                PalTasksSupport.SymbolMap map = null;
-                if (mapFile == null) {
-                    if (!"none".equals(mapHash)) {
-                        fail("an absent symbol map requires the literal 'none' hash");
+                    // Symbol map / pass-2 property contract.
+                    PalTasksSupport.SymbolMap map = null;
+                    if (mapFile == null) {
+                        String property = currentProgram.getOptions(
+                                ghidra.program.model.listing.Program.PROGRAM_INFO)
+                                .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+                        if (property != null) {
+                            fail("a pass-1/single-pass export requires the SymbolPass2 property absent");
+                        }
+                        if (roots != null) {
+                            ExceptionRootsSupport.validatePass2Lineage(currentProgram);
+                        }
                     }
-                    String property = currentProgram.getOptions(
-                            ghidra.program.model.listing.Program.PROGRAM_INFO)
-                            .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-                    if (property != null) {
-                        fail("a pass-1/single-pass export requires the SymbolPass2 property absent");
+                    else {
+                        map = pass2State.map;
+                        checkDeadline();
+                        if (!palIdentity.equals(map.palIdentity)) {
+                            fail("the symbol map PAL identity does not match the invocation");
+                        }
+                        verifyBodiesAgainstMap(map);
+                        checkDeadline();
+                        symbolMapArgument = map.mapBlake3;
                     }
-                    if (roots != null) {
-                        ExceptionRootsSupport.validatePass2Lineage(currentProgram);
+
+                    FunctionManager fm = currentProgram.getFunctionManager();
+                    Listing listing = currentProgram.getListing();
+
+                    // Pass-1/single-pass entry fallback: a tiny anchorless blob may yield
+                    // no functions. A present map has already authenticated the exact
+                    // pass-2 function set, which this fallback must never mutate.
+                    if (map == null && fm.getFunctionCount() == 0) {
+                        Address base = currentProgram.getImageBase();
+                        try {
+                            disassemble(base);
+                            createFunction(base, null);
+                        }
+                        catch (Exception e) {
+                            fail("the entry-function fallback failed: " + e.getMessage());
+                        }
+                        checkDeadline();
+                    }
+
+                    outDir.mkdirs();
+                    stage(outDir, "functions.json", staged,
+                            (w) -> writeFunctionsJson(w, fm, listing));
+                    stage(outDir, "disasm.lst", staged,
+                            (w) -> writeDisassembly(w, listing));
+                    stage(outDir, "decompiled.c", staged, (w) -> writeDecompiledC(w, fm));
+                    validateExceptionState(roots);
+                    validatePalState(pal, palIdentity);
+                    if (pass2State != null) {
+                        pass2State.validate(ExceptionRootsSupport.Pass2MapPhase.TERMINAL);
                     }
                 }
-                else {
-                    if ("none".equals(mapHash)) {
-                        fail("a present symbol map requires its expected BLAKE3");
-                    }
-                    map = PalTasksSupport.readSymbolMapForExport(mapFile, mapHash);
-                    checkDeadline();
-                    if (!map.imageLabel.equals(label)) {
-                        fail("the symbol map was built for image " + map.imageLabel);
-                    }
-                    if (!exceptionIdentity.equals(map.exceptionIdentity)) {
-                        fail("the symbol map exception identity does not match the invocation");
-                    }
-                    if (roots != null && !roots.manifest.manifestBlake3.equals(
-                            map.exceptionManifestBlake3)) {
-                        fail("the symbol map exception manifest BLAKE3 does not match the manifest");
-                    }
-                    if (roots != null) {
-                        ExceptionRootsSupport.validatePass2Transitions(currentProgram, map);
-                    }
-                    if (!palIdentity.equals(map.palIdentity)) {
-                        fail("the symbol map PAL identity does not match the invocation");
-                    }
-                    String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
-                    String property = currentProgram.getOptions(
-                            ghidra.program.model.listing.Program.PROGRAM_INFO)
-                            .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-                    PalTasksSupport.validateSymbolPass2Property(property);
-                    if (!expectedProperty.equals(property)) {
-                        fail("stale SymbolPass2 property: expected " + expectedProperty
-                                + " but found " + property);
-                    }
-                    verifyBodiesAgainstMap(map);
-                    checkDeadline();
-                    symbolMapArgument = map.mapBlake3;
-                }
-
-                FunctionManager fm = currentProgram.getFunctionManager();
-                Listing listing = currentProgram.getListing();
-
-                // Pass-1/single-pass entry fallback: a tiny anchorless blob may yield
-                // no functions. A present map has already authenticated the exact
-                // pass-2 function set, which this fallback must never mutate.
-                if (map == null && fm.getFunctionCount() == 0) {
-                    Address base = currentProgram.getImageBase();
-                    try {
-                        disassemble(base);
-                        createFunction(base, null);
-                    }
-                    catch (Exception e) {
-                        fail("the entry-function fallback failed: " + e.getMessage());
-                    }
-                    checkDeadline();
-                }
-
-                outDir.mkdirs();
-                stage(outDir, "functions.json", staged,
-                        (w) -> writeFunctionsJson(w, fm, listing));
-                stage(outDir, "disasm.lst", staged,
-                        (w) -> writeDisassembly(w, listing));
-                stage(outDir, "decompiled.c", staged, (w) -> writeDecompiledC(w, fm));
-                validateExceptionState(roots);
-                validatePalState(pal, palIdentity);
             }
             publishStaged(staged);
             writeCompletionMarker(outDir, exceptionIdentity, palIdentity, symbolMapArgument);
@@ -326,13 +313,11 @@ public class ExportDecomp extends HeadlessScript {
      * execution must appear in the retained map with the exact digest, and
      * every map execution must still exist — program drift fails closed.
      * Entries from the map's `creations` section have a separate identity:
-     * current memory must still authenticate the producer ranges, and every
-     * project-owned creation must retain its map/execution registry binding,
-     * concrete function/symbol IDs, Ghidra execution digest, and accepted
-     * Thumb projection. ApplyThumbNames passes the explicit returned
-     * disassembly set to CreateFunctionCmd, and the final body must remain
-     * wholly inside the authenticated producer ranges rather than expand
-     * through open-ended flow.
+     * current memory must still authenticate the producer ranges. The shared
+     * terminal validator has already required every Thumb ownership row to be
+     * represented exactly once by either a current creation or an authenticated
+     * execution; an execution-represented successor row continues through the
+     * ordinary exact function-set comparison below.
      */
     private void verifyBodiesAgainstMap(PalTasksSupport.SymbolMap map) throws Exception {
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -371,22 +356,6 @@ public class ExportDecomp extends HeadlessScript {
                 }
             }
             created.add(creation.entry);
-        }
-        if (creationOwnership != null) {
-            AddressIterator owned = creationOwnership.getPropertyIterator();
-            while (owned.hasNext()) {
-                checkDeadline();
-                Address address = owned.next();
-                if (!address.getAddressSpace().equals(
-                        currentProgram.getAddressFactory().getDefaultAddressSpace())) {
-                    fail("the Thumb creation registry uses a non-default address space at "
-                            + address);
-                }
-                if (!created.contains(address.getOffset())) {
-                    fail("the Thumb creation registry has an entry absent from the map at "
-                            + address);
-                }
-            }
         }
         FunctionIterator iterator = functions.getFunctions(true);
         int compared = 0;

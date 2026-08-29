@@ -99,27 +99,20 @@ public class ApplySymbols extends HeadlessScript {
     private final class Preflight {
         final PalTasksSupport.SymbolMap map;
         final String label;
-        final String imageBlake3;
-        final String exceptionIdentity;
-        final boolean exceptionPresent;
-        final ExceptionRootsSupport.Validated exceptionRoots;
+        final ExceptionRootsSupport.Pass2MapState pass2State;
         final String palIdentity;
         final boolean palPresent;
         final List<Planned> planned;
         final StringPropertyMap exceptionRegistry;
         final StringPropertyMap palRegistry;
 
-        Preflight(PalTasksSupport.SymbolMap map, String label, String imageBlake3,
-                String exceptionIdentity, boolean exceptionPresent,
-                ExceptionRootsSupport.Validated exceptionRoots,
+        Preflight(PalTasksSupport.SymbolMap map, String label,
+                ExceptionRootsSupport.Pass2MapState pass2State,
                 String palIdentity, boolean palPresent, List<Planned> planned,
                 StringPropertyMap exceptionRegistry, StringPropertyMap palRegistry) {
             this.map = map;
             this.label = label;
-            this.imageBlake3 = imageBlake3;
-            this.exceptionIdentity = exceptionIdentity;
-            this.exceptionPresent = exceptionPresent;
-            this.exceptionRoots = exceptionRoots;
+            this.pass2State = pass2State;
             this.palIdentity = palIdentity;
             this.palPresent = palPresent;
             this.planned = planned;
@@ -171,41 +164,18 @@ public class ApplySymbols extends HeadlessScript {
         File mapFile = new File(args[10]);
         String mapHash = args[11];
 
-        PalTasksSupport.SymbolMap map =
-                PalTasksSupport.readSymbolMap(functionsFile, functionsHash, mapFile, mapHash);
-        if (!label.equals(currentProgram.getName())) {
-            fail("the expected image label does not match the current program name");
-        }
-        if (!map.imageLabel.equals(label)) {
-            fail("the symbol map was built for image " + map.imageLabel);
-        }
-        if (!imageBlake3.equals(map.imageBlake3)) {
-            fail("the expected image BLAKE3 does not match the symbol map");
-        }
-        verifyImageBlock(map);
+        ExceptionRootsSupport.Pass2MapState pass2State =
+                ExceptionRootsSupport.retainPass2MapState(
+                        currentProgram, monitor, kitRoot, label, imageBlake3,
+                        exceptionIdentity, exceptionManifest,
+                        scatterManifest == null ? "-" : scatterManifest.getPath(),
+                        functionsFile, functionsHash, mapFile, mapHash,
+                        ExceptionRootsSupport.Pass2MapPhase.BEFORE_MUTATION);
+        PalTasksSupport.SymbolMap map = pass2State.map;
+        try {
+            verifyImageBlock(map);
 
         boolean exceptionPresent = !PalTasksSupport.NONE_IDENTITY.equals(exceptionIdentity);
-        if (exceptionPresent) {
-            if (exceptionManifest == null) {
-                fail("a present exception identity requires the roots manifest argument");
-            }
-            if (!exceptionIdentity.equals(map.exceptionIdentity)) {
-                fail("the symbol map exception identity does not match the expected identity");
-            }
-            if (!exceptionIdentity.split(":", -1)[1].equals(
-                    map.exceptionManifestBlake3)) {
-                fail("the symbol map exception manifest BLAKE3 does not match the identity");
-            }
-        }
-        else {
-            if (exceptionManifest != null) {
-                fail("exception identity none requires the literal '-' manifest");
-            }
-            if (!PalTasksSupport.NONE_IDENTITY.equals(map.exceptionIdentity)) {
-                fail("the symbol map binds an exception identity the invocation does not declare");
-            }
-            ExceptionRootsSupport.validateAbsent(currentProgram);
-        }
 
         boolean palPresent = !PalTasksSupport.NONE_IDENTITY.equals(palIdentity);
         if (palPresent) {
@@ -240,17 +210,6 @@ public class ApplySymbols extends HeadlessScript {
             PalTasksSupport.validateAbsent(currentProgram);
         }
 
-        String property = currentProgram.getOptions(Program.PROGRAM_INFO)
-                .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-        String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
-        PalTasksSupport.validateSymbolPass2Property(property);
-        if (!java.util.Objects.equals(property, map.predecessorSymbolPass2)
-                && !expectedProperty.equals(property)) {
-            fail("stale SymbolPass2 property: expected predecessor "
-                    + map.predecessorSymbolPass2 + " or current " + expectedProperty
-                    + " but found " + property);
-        }
-
         StringPropertyMap palRegistry = currentProgram.getUsrPropertyManager()
                 .getStringPropertyMap(PalTasksSupport.OWNERSHIP_MAP);
         if (palPresent && palRegistry == null) {
@@ -261,8 +220,8 @@ public class ApplySymbols extends HeadlessScript {
         if (exceptionPresent && exceptionRegistry == null) {
             fail("the exception ownership registry is missing under a present identity");
         }
-        if (exceptionPresent) {
-            ExceptionRootsSupport.validatePass2TransitionPreflight(currentProgram, map);
+        if (!pass2State.thumbOwnership().migrations.isEmpty()) {
+            fail("ApplyThumbNames did not migrate predecessor Thumb ownership");
         }
 
         FunctionManager functions = currentProgram.getFunctionManager();
@@ -287,15 +246,19 @@ public class ApplySymbols extends HeadlessScript {
                     && !function.getName().equals(decision.finalPrimary);
             planned.add(new Planned(execution, decision, function, rename));
         }
-        ExceptionRootsSupport.Validated roots = null;
-        if (exceptionPresent) {
-            roots = ExceptionRootsSupport.preflight(currentProgram, monitor, kitRoot, label,
-                    exceptionManifest,
-                    scatterManifest == null ? "-" : scatterManifest.getPath(),
-                    exceptionIdentity);
+        return new Preflight(map, label, pass2State, palIdentity, palPresent,
+                planned, exceptionRegistry, palRegistry);
         }
-        return new Preflight(map, label, imageBlake3, exceptionIdentity, exceptionPresent,
-                roots, palIdentity, palPresent, planned, exceptionRegistry, palRegistry);
+        catch (Throwable error) {
+            try {
+                pass2State.close();
+            }
+            catch (Throwable closeFailure) {
+                suppress(error, closeFailure);
+            }
+            rethrow(error);
+            return null;
+        }
     }
 
     /**
@@ -559,15 +522,8 @@ public class ApplySymbols extends HeadlessScript {
             // decision's final primary is current, reserved labels, the owned
             // comment, and the core registry fields are unchanged (the shared
             // validator re-derives them), and only then is the property set.
-            if (preflight.exceptionPresent) {
-                ExceptionRootsSupport.validateApplied(currentProgram,
-                        preflight.exceptionRoots.manifest, preflight.exceptionIdentity);
-                ExceptionRootsSupport.validatePass2Transitions(
-                        currentProgram, preflight.map);
-            }
-            else {
-                ExceptionRootsSupport.validateAbsent(currentProgram);
-            }
+            preflight.pass2State.validate(
+                    ExceptionRootsSupport.Pass2MapPhase.AFTER_MUTATION);
             if (preflight.palPresent) {
                 PalTasksSupport.validateAppliedIdentity(currentProgram, preflight.palIdentity);
             }
@@ -593,12 +549,8 @@ public class ApplySymbols extends HeadlessScript {
                             + plan.function.getEntryPoint());
                 }
             }
-            PalTasksSupport.validateThumbCreationState(
-                    currentProgram, monitor, preflight.map);
-            if (preflight.exceptionRoots != null) {
-                preflight.exceptionRoots.verifyRetainedFiles();
-                preflight.exceptionRoots.close();
-            }
+            preflight.pass2State.verifyRetainedFiles();
+            preflight.pass2State.close();
             currentProgram.getOptions(Program.PROGRAM_INFO)
                     .setString(PalTasksSupport.SYMBOL_PASS2_PROPERTY,
                             PalTasksSupport.expectedSymbolPass2Property(preflight.map));
@@ -758,13 +710,11 @@ public class ApplySymbols extends HeadlessScript {
             catch (Throwable abortFailure) {
                 suppress(original, abortFailure);
             }
-            if (preflight.exceptionRoots != null) {
-                try {
-                    preflight.exceptionRoots.close();
-                }
-                catch (Throwable closeFailure) {
-                    suppress(original, closeFailure);
-                }
+            try {
+                preflight.pass2State.close();
+            }
+            catch (Throwable closeFailure) {
+                suppress(original, closeFailure);
             }
         }
     }

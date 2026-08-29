@@ -251,9 +251,10 @@ explicit returned set to `CreateFunctionCmd`, and rejects a final body outside t
 Persistent ownership is stored in
 `PixelModemExtractor.ThumbNames.v1.Ownership` as
 `v1:<map_blake3>:<producer_execution_blake3>:<function_id>:<primary_symbol_id>:<ghidra_execution_blake3>`.
-A later script failure may leave that owned saved-project creation; an identical retry must fully
-revalidate it before reporting `reapplied`. A missing, malformed, wrong-image, or non-conserving
-summary fails `decompile_pass2` and publishes no replacement export. Rust terminal validation
+Ghidra rolls back earlier post-scripts when a later script fails in the same headless invocation.
+A separately committed `ApplyThumbNames`-only staged state is accepted only by an identical retry,
+which must fully revalidate it before reporting `reapplied`. A missing, malformed, wrong-image, or
+non-conserving summary fails `decompile_pass2` and publishes no replacement export. Rust terminal validation
 accounts for newly created and owned-replayed functions against the pass-1 producer baseline,
 publishes exactly `decompiled.c`, `disasm.lst`, and `functions.json` while preserving sidecars, and
 refreshes current inventory/report counters from the committed summary.

@@ -538,6 +538,131 @@ final class ExceptionRootsSupport {
         }
     }
 
+    enum Pass2MapPhase {
+        BEFORE_MUTATION,
+        AFTER_MUTATION,
+        TERMINAL
+    }
+
+    static final class Pass2MapState implements AutoCloseable {
+        final PalTasksSupport.SymbolMap map;
+        final Validated roots;
+        private final Program program;
+        private final TaskMonitor monitor;
+        private final String exceptionIdentity;
+        private final PalTasksSupport.RetainedSymbolMap retainedMap;
+        private final boolean closeRoots;
+        private PalTasksSupport.ThumbOwnershipState thumbOwnership;
+        private boolean closed;
+
+        Pass2MapState(Program program, TaskMonitor monitor, String exceptionIdentity,
+                PalTasksSupport.RetainedSymbolMap retainedMap, Validated roots,
+                boolean closeRoots) {
+            this.program = program;
+            this.monitor = monitor;
+            this.exceptionIdentity = exceptionIdentity;
+            this.retainedMap = retainedMap;
+            this.map = retainedMap.map;
+            this.roots = roots;
+            this.closeRoots = closeRoots;
+        }
+
+        void validate(Pass2MapPhase phase) throws Exception {
+            if (closed) fail("the retained pass-2 map state is closed");
+            thumbOwnership = validateState(
+                    program, monitor, map, roots, exceptionIdentity, phase);
+            retainedMap.verifyRetainedFiles();
+            if (roots != null) roots.verifyRetainedFiles();
+        }
+
+        private static PalTasksSupport.ThumbOwnershipState validateState(
+                Program program, TaskMonitor monitor, PalTasksSupport.SymbolMap map,
+                Validated roots, String exceptionIdentity, Pass2MapPhase phase)
+                throws Exception {
+            boolean exceptionPresent =
+                    !PalTasksSupport.NONE_IDENTITY.equals(exceptionIdentity);
+            String property = program.getOptions(Program.PROGRAM_INFO)
+                    .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
+            String expectedProperty = PalTasksSupport.expectedSymbolPass2Property(map);
+            PalTasksSupport.validateSymbolPass2Property(property);
+            boolean currentProperty = expectedProperty.equals(property);
+            if (phase == Pass2MapPhase.TERMINAL) {
+                if (!currentProperty) {
+                    fail("stale SymbolPass2 property: expected " + expectedProperty
+                            + " but found " + property);
+                }
+            }
+            else if (!java.util.Objects.equals(property, map.predecessorSymbolPass2)
+                    && !currentProperty) {
+                fail("stale SymbolPass2 property: expected predecessor "
+                        + map.predecessorSymbolPass2 + " or current " + expectedProperty
+                        + " but found " + property);
+            }
+
+            if (exceptionPresent) {
+                validateApplied(program, roots.manifest, exceptionIdentity);
+                if (phase == Pass2MapPhase.BEFORE_MUTATION && !currentProperty) {
+                    validatePass2TransitionPreflight(program, map);
+                }
+                else {
+                    validatePass2Transitions(program, map);
+                }
+            }
+            else {
+                validateAbsent(program);
+            }
+
+            boolean decisionsApplied = phase != Pass2MapPhase.BEFORE_MUTATION
+                    || currentProperty;
+            PalTasksSupport.ThumbOwnershipState thumbOwnership =
+                    PalTasksSupport.preflightThumbOwnershipState(
+                    program, monitor, map, property, decisionsApplied);
+            if (phase != Pass2MapPhase.BEFORE_MUTATION
+                    && !thumbOwnership.migrations.isEmpty()) {
+                fail("post-mutation Thumb ownership still belongs to the predecessor map");
+            }
+            if (phase != Pass2MapPhase.BEFORE_MUTATION) {
+                PalTasksSupport.validateThumbCreationState(program, monitor, map);
+            }
+            return thumbOwnership;
+        }
+
+        PalTasksSupport.ThumbOwnershipState thumbOwnership() {
+            if (thumbOwnership == null) {
+                fail("the retained pass-2 map state has not been validated");
+            }
+            return thumbOwnership;
+        }
+
+        void verifyRetainedFiles() {
+            retainedMap.verifyRetainedFiles();
+            if (roots != null) roots.verifyRetainedFiles();
+        }
+
+        @Override
+        public void close() throws Exception {
+            if (closed) return;
+            closed = true;
+            Throwable failure = null;
+            if (closeRoots && roots != null) {
+                try {
+                    roots.close();
+                }
+                catch (Throwable error) {
+                    failure = error;
+                }
+            }
+            try {
+                retainedMap.close();
+            }
+            catch (Throwable error) {
+                if (failure == null) failure = error;
+                else suppress(failure, error);
+            }
+            if (failure != null) rethrow(failure);
+        }
+    }
+
     static final class AppliedState {
         final int sharedEntries;
 
@@ -623,6 +748,100 @@ final class ExceptionRootsSupport {
             closeQuietly(scatterMap, error);
             closeQuietly(rawFile, error);
             closeQuietly(manifestFile, error);
+            rethrow(error);
+            return null;
+        }
+    }
+
+    static Pass2MapState retainPass2MapState(Program program, TaskMonitor monitor,
+            File kitRoot, String label, String imageBlake3, String exceptionIdentity,
+            File exceptionManifest, String scatterArgument, File functionsFile,
+            String functionsHash, File mapFile, String mapHash, Pass2MapPhase phase)
+            throws Exception {
+        PalTasksSupport.RetainedSymbolMap retainedMap = null;
+        Validated roots = null;
+        try {
+            retainedMap = PalTasksSupport.retainSymbolMap(
+                    functionsFile, functionsHash, mapFile, mapHash);
+            PalTasksSupport.SymbolMap map = retainedMap.map;
+            if (!label.equals(program.getName()) || !label.equals(map.imageLabel)) {
+                fail("the symbol map image label does not match the current program");
+            }
+            if (!imageBlake3.equals(map.imageBlake3)) {
+                fail("the expected image BLAKE3 does not match the symbol map");
+            }
+            boolean exceptionPresent =
+                    !PalTasksSupport.NONE_IDENTITY.equals(exceptionIdentity);
+            if (!exceptionIdentity.equals(map.exceptionIdentity)) {
+                fail("the symbol map exception identity does not match the invocation");
+            }
+            if (exceptionPresent) {
+                if (exceptionManifest == null) {
+                    fail("a present exception identity requires the roots manifest argument");
+                }
+                String[] identity = parseIdentity(exceptionIdentity);
+                if (!identity[1].equals(map.exceptionManifestBlake3)) {
+                    fail("the symbol map exception manifest BLAKE3 does not match the identity");
+                }
+                roots = preflight(program, monitor, kitRoot, label, exceptionManifest,
+                        scatterArgument, exceptionIdentity);
+                if (!roots.manifest.manifestBlake3.equals(map.exceptionManifestBlake3)) {
+                    fail("the symbol map exception manifest BLAKE3 does not match the manifest");
+                }
+            }
+            else {
+                if (exceptionManifest != null) {
+                    fail("exception identity none requires the literal '-' manifest");
+                }
+                if (map.exceptionManifestBlake3 != null) {
+                    fail("an exception-absent map carries a manifest BLAKE3");
+                }
+            }
+            Pass2MapState state = new Pass2MapState(
+                    program, monitor, exceptionIdentity, retainedMap, roots, true);
+            state.validate(phase);
+            return state;
+        }
+        catch (Throwable error) {
+            closeQuietly(roots, error);
+            closeQuietly(retainedMap, error);
+            rethrow(error);
+            return null;
+        }
+    }
+
+    static Pass2MapState retainTerminalPass2MapState(Program program, TaskMonitor monitor,
+            String label, String exceptionIdentity, Validated roots,
+            File mapFile, String mapHash) throws Exception {
+        PalTasksSupport.RetainedSymbolMap retainedMap = null;
+        try {
+            retainedMap = PalTasksSupport.retainSymbolMapForExport(mapFile, mapHash);
+            PalTasksSupport.SymbolMap map = retainedMap.map;
+            if (!label.equals(program.getName()) || !label.equals(map.imageLabel)) {
+                fail("the symbol map image label does not match the current program");
+            }
+            if (!exceptionIdentity.equals(map.exceptionIdentity)) {
+                fail("the symbol map exception identity does not match the invocation");
+            }
+            boolean exceptionPresent =
+                    !PalTasksSupport.NONE_IDENTITY.equals(exceptionIdentity);
+            if (exceptionPresent) {
+                if (roots == null || !exceptionIdentity.equals(roots.identity)
+                        || !roots.manifest.manifestBlake3.equals(
+                                map.exceptionManifestBlake3)) {
+                    fail("the terminal exception state does not match the symbol map");
+                }
+            }
+            else if (roots != null || map.exceptionManifestBlake3 != null) {
+                fail("an exception-absent terminal map carries exception state");
+            }
+            Pass2MapState state = new Pass2MapState(
+                    program, monitor, exceptionIdentity, retainedMap, roots, false);
+            state.validate(Pass2MapPhase.TERMINAL);
+            return state;
+        }
+        catch (Throwable error) {
+            closeQuietly(retainedMap, error);
             rethrow(error);
             return null;
         }

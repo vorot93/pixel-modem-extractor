@@ -1,7 +1,7 @@
 // ApplyThumbNames.java — pass-2 creation of named producer-authenticated
 // Thumb functions the Ghidra analyzer never discovered.
 //
-// A pass-2 symbol map (v3) carries a `creations` section: named Thumb
+// A pass-2 symbol map (v4) carries a `creations` section: named Thumb
 // executions whose identity a validated producer inventory (radare2/Rizin
 // strict v3) authenticated over exact decode ranges, but whose entry is
 // absent from the Ghidra function inventory. For every creation this script
@@ -13,11 +13,20 @@
 // authenticated ranges.
 //
 // This script runs before every other pass-2 mutator so malformed producer or
-// ownership state cannot follow another mutation. A later script failure may
-// leave an owned creation in the saved project; an identical retry revalidates
-// it as reapplied before Rust publishes an export. Persistent ownership lives
-// in PixelModemExtractor.ThumbNames.v1.Ownership with value:
+// ownership state cannot follow another mutation. Ghidra rolls it back when a
+// later post-script fails in the same headless invocation. A separately
+// committed staged run is still valid only for an identical retry, which
+// revalidates it as reapplied before Rust publishes an export. Persistent
+// ownership lives in PixelModemExtractor.ThumbNames.v1.Ownership with value:
 // v1:<map_blake3>:<producer_execution_blake3>:<function_id>:<primary_symbol_id>:<ghidra_execution_blake3>.
+// A successor map may represent an old creation through either its current
+// creation request or authenticated execution. Preflight validates every row,
+// then transactionally rewrites only predecessor map hashes; SymbolPass2 stays
+// at the predecessor value until ApplySymbols completes the current map.
+//
+// Arguments: canonical kit root, label, image BLAKE3, exception identity,
+// exception manifest or '-', scatter map or '-', retained functions.json and
+// its BLAKE3, then the symbol map and its BLAKE3.
 //
 // Fail-closed rules mirrored from ApplySymbols/ApplyPalTasks:
 // - existing-entry handling is exhaustive and ordered: an owned matching
@@ -39,14 +48,12 @@ import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.CodeUnitIterator;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
-import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolUtilities;
@@ -60,9 +67,7 @@ import com.google.gson.JsonObject;
 import java.io.File;
 import java.math.BigInteger;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 public class ApplyThumbNames extends HeadlessScript {
@@ -182,81 +187,54 @@ public class ApplyThumbNames extends HeadlessScript {
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length != 4) {
-            fail("expected exactly four arguments: image label, image BLAKE3, "
-                    + "symbol map, its BLAKE3");
+        if (args.length != 10) {
+            fail("expected exactly ten arguments: kit root, image label, image BLAKE3, "
+                    + "exception identity, exception manifest, scatter manifest, retained "
+                    + "functions.json, its BLAKE3, symbol map, its BLAKE3");
         }
-        String label = args[0];
-        String imageBlake3 = args[1];
-        File mapFile = new File(args[2]);
-        String mapHash = args[3];
+        File kitRoot = new File(args[0]);
+        String label = args[1];
+        String imageBlake3 = args[2];
+        String exceptionIdentity = args[3];
+        File exceptionManifest = "-".equals(args[4]) ? null : new File(args[4]);
+        String scatterArgument = args[5];
+        File functionsFile = new File(args[6]);
+        String functionsHash = args[7];
+        File mapFile = new File(args[8]);
+        String mapHash = args[9];
 
-        // The map is authenticated through the shared reader. ApplySymbols
-        // verifies its retained functions.json binding later in this process;
-        // creation preflight intentionally runs first so malformed producer
-        // state cannot follow any other pass-2 mutation.
-        PalTasksSupport.SymbolMap map = PalTasksSupport.readSymbolMapForExport(mapFile, mapHash);
-        if (!label.equals(currentProgram.getName())) {
-            fail("the expected image label does not match the current program name");
-        }
-        if (!imageBlake3.equals(map.imageBlake3)) {
-            fail("the expected image BLAKE3 does not match the symbol map");
-        }
-        String expectedPass2Property = PalTasksSupport.expectedSymbolPass2Property(map);
-        String priorPass2Property = currentProgram.getOptions(Program.PROGRAM_INFO)
-                .getString(PalTasksSupport.SYMBOL_PASS2_PROPERTY, null);
-        PalTasksSupport.validateSymbolPass2Property(priorPass2Property);
-        if (!java.util.Objects.equals(priorPass2Property, map.predecessorSymbolPass2)
-                && !expectedPass2Property.equals(priorPass2Property)) {
-            fail("the saved program belongs to a different symbol-map application");
-        }
-        Register tMode = currentProgram.getLanguage().getRegister("TMode");
-        if (tMode == null) {
-            fail("the language lacks the TMode context register");
-        }
+        ExceptionRootsSupport.Pass2MapState pass2State =
+                ExceptionRootsSupport.retainPass2MapState(
+                        currentProgram, monitor, kitRoot, label, imageBlake3,
+                        exceptionIdentity, exceptionManifest, scatterArgument,
+                        functionsFile, functionsHash, mapFile, mapHash,
+                        ExceptionRootsSupport.Pass2MapPhase.BEFORE_MUTATION);
+        PalTasksSupport.SymbolMap map = pass2State.map;
 
         List<Undo> undoJournal = new ArrayList<>();
-        long createdBytes = 0;
-        int created = 0;
-        int reapplied = 0;
-        int skippedExisting = 0;
-        int skippedCollision = 0;
-        long phaseDeadline = Math.addExact(System.currentTimeMillis(), PHASE_BUDGET_MS);
-        FunctionManager functions = currentProgram.getFunctionManager();
-        PropertyMapManager properties = currentProgram.getUsrPropertyManager();
-        StringPropertyMap ownership =
-                properties.getStringPropertyMap(PalTasksSupport.THUMB_CREATION_OWNERSHIP_MAP);
-        List<PalTasksSupport.MapCreation> verified = new ArrayList<>();
-        List<Planned> planned = new ArrayList<>();
-        AddressSet reserved = new AddressSet();
-        Map<Long, PalTasksSupport.MapCreation> creationsByEntry = new HashMap<>();
-        for (PalTasksSupport.MapCreation creation : map.creations) {
-            creationsByEntry.put(creation.entry, creation);
-        }
-        if (ownership != null) {
-            AddressIterator owned = ownership.getPropertyIterator();
-            while (owned.hasNext()) {
-                Address address = owned.next();
-                phaseRemaining(phaseDeadline, address);
-                if (!address.getAddressSpace().equals(
-                        currentProgram.getAddressFactory().getDefaultAddressSpace())) {
-                    fail("the Thumb creation registry uses a non-default address space at "
-                            + address);
-                }
-                PalTasksSupport.MapCreation creation =
-                        creationsByEntry.get(address.getOffset());
-                if (creation == null) {
-                    fail("the Thumb creation registry has stale state at " + address);
-                }
-                PalTasksSupport.validateThumbCreationOwnershipIdentity(
-                        ownership.getString(address), map, creation);
+        try {
+            Register tMode = currentProgram.getLanguage().getRegister("TMode");
+            if (tMode == null) {
+                fail("the language lacks the TMode context register");
             }
-        }
+            long createdBytes = 0;
+            int created = 0;
+            int reapplied = 0;
+            int skippedExisting = 0;
+            int skippedCollision = 0;
+            long phaseDeadline = Math.addExact(System.currentTimeMillis(), PHASE_BUDGET_MS);
+            FunctionManager functions = currentProgram.getFunctionManager();
+            PropertyMapManager properties = currentProgram.getUsrPropertyManager();
+            PalTasksSupport.ThumbOwnershipState ownershipState = pass2State.thumbOwnership();
+            StringPropertyMap ownership = ownershipState.registry;
+            List<PalTasksSupport.MapCreation> verified = new ArrayList<>();
+            List<Planned> planned = new ArrayList<>();
+            AddressSet reserved = new AddressSet();
 
-        // Complete classification preflight. No context, instruction, function,
-        // or symbol mutation occurs until every candidate has reached exactly
-        // one replay/skip/planned outcome.
-        for (PalTasksSupport.MapCreation creation : map.creations) {
+            // Complete classification preflight. No registry, context,
+            // instruction, function, or symbol mutation occurs until every
+            // candidate has reached exactly one replay/skip/planned outcome.
+            for (PalTasksSupport.MapCreation creation : map.creations) {
             Address entry = PalTasksSupport.programAddress(currentProgram, creation.entry);
             TimeoutTaskMonitor preflightMonitor = phaseMonitor(phaseDeadline, entry);
             PalTasksSupport.validateThumbCreationExecution(
@@ -273,18 +251,14 @@ public class ApplyThumbNames extends HeadlessScript {
                 continue;
             }
             Function existing = functions.getFunctionAt(entry);
-            String ownedValue = ownership == null ? null : ownership.getString(entry);
-            if (ownedValue != null) {
-                PalTasksSupport.validateThumbCreationOwnershipIdentity(
-                        ownedValue, map, creation);
-            }
+            PalTasksSupport.ThumbCreationOwnership owned = ownershipState.at(creation.entry);
             SourceType wantedSource = "user_defined".equals(creation.finalSource)
                     ? SourceType.USER_DEFINED : SourceType.ANALYSIS;
             if (existing != null) {
-                if (ownedValue != null) {
+                if (owned != null) {
                     TimeoutTaskMonitor replayMonitor = phaseMonitor(phaseDeadline, entry);
                     PalTasksSupport.validateOwnedThumbCreation(
-                            currentProgram, replayMonitor, ownership, map, creation);
+                            currentProgram, replayMonitor, owned, creation);
                     if (replayMonitor.didTimeout()) {
                         fail("the ApplyThumbNames replay preflight budget was exhausted at "
                                 + entry);
@@ -303,7 +277,7 @@ public class ApplyThumbNames extends HeadlessScript {
                 phaseRemaining(phaseDeadline, entry);
                 continue;
             }
-            if (ownedValue != null) {
+            if (owned != null) {
                 fail("the Thumb creation registry names a missing function at " + entry);
             }
 
@@ -337,14 +311,25 @@ public class ApplyThumbNames extends HeadlessScript {
             reserved.add(authenticated);
             planned.add(new Planned(creation, entry, wantedSource, authenticated));
             phaseRemaining(phaseDeadline, entry);
-        }
-        long projectedFunctions = Math.addExact(
-                (long) functions.getFunctionCount(), (long) planned.size());
-        if (projectedFunctions > PalTasksSupport.MAX_FUNCTIONS) {
-            fail("the planned creations exceed the terminal function limit");
-        }
+            }
+            long projectedFunctions = Math.addExact(
+                    (long) functions.getFunctionCount(), (long) planned.size());
+            if (projectedFunctions > PalTasksSupport.MAX_FUNCTIONS) {
+                fail("the planned creations exceed the terminal function limit");
+            }
 
-        try {
+            if (!ownershipState.migrations.isEmpty()) {
+                if (ownership == null) {
+                    fail("Thumb ownership migration requires its registry");
+                }
+                final StringPropertyMap migrationRegistry = ownership;
+                for (PalTasksSupport.ThumbOwnershipMigration migration
+                        : ownershipState.migrations) {
+                    undoJournal.add(() -> migrationRegistry.add(
+                            migration.entry, migration.priorValue));
+                    migrationRegistry.add(migration.entry, migration.currentValue);
+                }
+            }
             if (!planned.isEmpty() && ownership == null) {
                 ownership = properties.createStringPropertyMap(
                         PalTasksSupport.THUMB_CREATION_OWNERSHIP_MAP);
@@ -489,6 +474,9 @@ public class ApplyThumbNames extends HeadlessScript {
             if (classified != map.creations.size()) {
                 fail("the ApplyThumbNames classification did not conserve candidates");
             }
+            pass2State.validate(ExceptionRootsSupport.Pass2MapPhase.BEFORE_MUTATION);
+            pass2State.verifyRetainedFiles();
+            pass2State.close();
 
             JsonObject payload = new JsonObject();
             payload.addProperty("image", label);
@@ -518,6 +506,12 @@ public class ApplyThumbNames extends HeadlessScript {
             }
             catch (Throwable abortFailure) {
                 suppress(original, abortFailure);
+            }
+            try {
+                pass2State.close();
+            }
+            catch (Throwable closeFailure) {
+                suppress(original, closeFailure);
             }
             if (original instanceof PalTasksSupport.PalError pal) {
                 throw pal;

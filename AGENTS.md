@@ -376,8 +376,9 @@ module; when a file outgrows that, split it.
   role, application, shared-entry, and `(entry, DecodeIsa)` state before returning the opaque
   `ExceptionPass2Context`. The context has no public fields, `Default`, deserializer, literal, or
   path-existence fallback. `ApplyExceptionRoots` summaries are closed typed state, not aggregate
-  hints: at most 256 KiB and 16 strictly ordered rows, with bounded IDs/names, exact name BLAKE3,
-  closed source/result/disposition enums, row-derived counters, and first-apply/replay conservation.
+  hints: at most 256 KiB, 1–2 tables, and 1–16 strictly ordered application rows, with bounded
+  IDs/names, exact name BLAKE3, closed source/result/disposition enums, row-derived counters, and
+  first-apply/replay conservation.
   The parsed state retains its image and manifest identity privately; context construction requires
   both to equal the independently authenticated artifact, so same-shaped summaries cannot be mixed
   across images or manifests. `function_result: existing` plus `name_result: reapplied` is valid:
@@ -402,10 +403,30 @@ module; when a file outgrows that, split it.
   already-`pass2_owned` exception registry key omitted by a successor map before mutation, then
   requires exact bidirectional `(entry, first decode-range ISA)` transition equality postflight;
   independent Export repeats the exact check. Immediately before publishing the token,
-  ApplySymbols revalidates the complete exception state, PAL state, every map-owned Thumb creation,
-  and every final decision primary, then rechecks and successfully closes the retained exception
-  files as the last fallible step before the property write. A clean replay performs zero renames;
-  stale/partial ownership emits no success summary and leaves prior program/export state intact.
+  ApplySymbols revalidates the complete exception state, PAL state, every map-owned Thumb row, and
+  every final decision primary, then rechecks and successfully closes the retained map/functions/
+  exception files as the last fallible step before the property write. A clean replay performs zero
+  renames; stale/partial ownership emits no success summary and leaves prior program/export state
+  intact.
+- **One retained pass-2 state serves all three phases.** `ApplyThumbNames` receives exactly ten
+  arguments: kit root, image label/hash, exception identity/manifest/scatter, retained
+  `functions.json` path/hash, and symbol-map path/hash. It opens the full retained map state and runs
+  `BEFORE_MUTATION` before classifying or mutating any creation. `ApplySymbols` runs the same
+  `BEFORE_MUTATION` and `AFTER_MUTATION` validator; `ExportDecomp` retains the map handle and runs
+  `TERMINAL` both before and after staging its outputs. Present and absent exception state,
+  authenticated runtime files, lineage, transition conservation, Thumb ownership, and current
+  decisions therefore have one implementation rather than script-local partial checks.
+- **Thumb ownership migrates forward without predecessor artifacts.** Every
+  `PixelModemExtractor.ThumbNames.v1.Ownership` row must be represented exactly once by a current
+  map creation or authenticated execution and must bind the concrete function/symbol IDs, producer
+  execution, current Ghidra execution, and phase-appropriate primary. A predecessor run has the
+  predecessor SymbolPass2 token and predecessor-hash rows; `ApplyThumbNames` journals each exact
+  row, rewrites only its map-hash field to the current hash, and deliberately leaves the property at
+  the predecessor token for `ApplySymbols` to publish. The only accepted intermediate is that
+  predecessor token plus an all-current row set, and only an identical current-map retry may consume
+  it. Current token plus current rows is terminal. Mixed, omitted, foreign-hash, or unrepresented
+  rows fail closed; no script opens a predecessor map or deletes a project-created function merely
+  because a successor map omits it.
 - **Ghidra-only constraints stay Ghidra-only.** Java preflight rejects intersections among the
   complete derived instruction spans before mutation and computes A32 architectural `PC + 8` before
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
@@ -1099,9 +1120,11 @@ hardcoded. Two reference images exercise both models end-to-end:
   whenever one is present (a no-op on an empty `creations` array), while an
   image with none of the three inputs starts no pass-2 process at all. Creation
   runs first so malformed producer or ownership state cannot follow another
-  pass-2 mutation. A later script failure may leave an owned creation in the
-  saved project; an identical retry must revalidate it as `reapplied` before
-  Rust publishes an export. See **Ghidra 12 headless API notes** below for the
+  pass-2 mutation. Ghidra rolls back earlier post-scripts when a later script
+  fails in the same headless invocation. A separately committed
+  `ApplyThumbNames`-only staged state is still accepted only by an identical
+  current-map retry, which must revalidate it as `reapplied` before Rust
+  publishes an export. See **Ghidra 12 headless API notes** below for the
   argument-construction details and the all-three example.
 
   **Pass-2 creation of named producer-owned Thumb functions.** The symbol map
@@ -2262,7 +2285,7 @@ hardcoded. Two reference images exercise both models end-to-end:
     `ApplyThumbNames.java -> ApplySymbols.java -> ApplyGlobals.java ->
     ApplyGlobalTypes.java -> ExportDecomp.java`. All-three example:
 
-        -postScript ApplyThumbNames.java <label> <image_blake3> <function_map> <map_blake3> -postScript ApplySymbols.java <function_map> -postScript ApplyGlobals.java <global_map> -postScript ApplyGlobalTypes.java <global_types_map> -postScript ExportDecomp.java <out>
+        -postScript ApplyThumbNames.java <kit-root> <label> <image-blake3> <exception-identity> <exception-manifest> <scatter-map> <functions-json> <functions-blake3> <function-map> <map-blake3> -postScript ApplySymbols.java <function-map> -postScript ApplyGlobals.java <global-map> -postScript ApplyGlobalTypes.java <global-types-map> -postScript ExportDecomp.java <out>
 
     At least one of the three typed maps must be `Some` or
     `headless_process_args` returns `Ok(None)` (nothing scheduled for that
