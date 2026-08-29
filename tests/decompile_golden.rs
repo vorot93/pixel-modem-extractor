@@ -2186,8 +2186,8 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     "decode_ranges":[{"isa":"thumb","start":"0x0","end":"0x2","blake3":"__RANGE_BLAKE3__"}],
     "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":[]
   }, {
-    "name":"retained_thumb_created","entry":"0x24","end":"0x28","size":4,
-    "decode_ranges":[{"isa":"thumb","start":"0x24","end":"0x28","blake3":"__CREATED_BLAKE3__"}],
+    "name":"retained_thumb_created","entry":"0x24","end":"0x2c","size":8,
+    "decode_ranges":[{"isa":"thumb","start":"0x24","end":"0x2c","blake3":"__CREATED_BLAKE3__"}],
     "decode_range_errors":[],"body_kind":"thumb_disassembly","body":"","data_refs":["0x20"]
   }, {
     "name":"retained_thumb_overlap","entry":"0x26","end":"0x28","size":2,
@@ -2206,7 +2206,7 @@ fn pass2_applies_functions_and_strict_globals_in_one_process() {
     )
     .replace(
         "__CREATED_BLAKE3__",
-        blake3::hash(&arm[0x24..0x28]).to_hex().as_ref(),
+        blake3::hash(&arm[0x24..0x2c]).to_hex().as_ref(),
     )
     .replace(
         "__OVERLAP_BLAKE3__",
@@ -2357,7 +2357,7 @@ public class SeedThumbCreationCollision extends GhidraScript {
     let creations_start = creation_only_map.find("  \"creations\": [").unwrap();
     assert!(executions_start < creations_start);
     let creation_only_map = format!(
-        "{}  \"executions\": [],\n  \"symbols\": [],\n{}",
+        "{}  \"executions\": [],\n  \"thumb_creation_lineage\": [],\n  \"symbols\": [],\n{}",
         &creation_only_map[..executions_start],
         &creation_only_map[creations_start..],
     );
@@ -2983,6 +2983,10 @@ public class ProbeProperty extends GhidraScript {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "Ghidra execution digest"
     );
+    assert_ne!(
+        ownership_parts[2], ownership_parts[5],
+        "producer and Ghidra identities must remain independently authenticated"
+    );
 
     // The export's mandatory execution projections are unchanged from pass 1
     // and the retained Thumb sidecar is preserved byte-for-byte.
@@ -2998,8 +3002,16 @@ public class ProbeProperty extends GhidraScript {
                 "the created function must carry its token name"
             );
             assert_eq!(function["primary_source"], "analysis");
+            assert_eq!(
+                function["thumb_creation_producer_blake3"], created_execution_blake3,
+                "the terminal owned function must nominate its producer identity"
+            );
             continue;
         }
+        assert!(
+            function.get("thumb_creation_producer_blake3").is_none(),
+            "ordinary functions must omit Thumb creation nomination: {function}"
+        );
         assert_eq!(
             serde_json::json!({
                 "decode_ranges": function["decode_ranges"],
@@ -3185,6 +3197,45 @@ public class ProbeThumbCreationSkips extends GhidraScript {
         );
         let successor_source = std::fs::read_to_string(&successor_base_path).unwrap();
         assert_eq!(successor_source.matches(predecessor_field).count(), 1);
+        let successor_json: serde_json::Value = serde_json::from_str(&successor_source).unwrap();
+        let owned_execution = successor_json["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|execution| execution["entry"] == "0x00000024")
+            .expect("successor map lost the owned Ghidra execution");
+        let lineage = successor_json["thumb_creation_lineage"]
+            .as_array()
+            .expect("successor map must carry required Thumb lineage");
+        assert_eq!(lineage.len(), 1, "successor lineage must stay sparse");
+        assert_eq!(lineage[0]["execution"], owned_execution);
+        assert_eq!(
+            lineage[0]["producer_execution_blake3"],
+            created_execution_blake3
+        );
+        assert_eq!(
+            lineage[0]["decode_ranges"],
+            serde_json::json!([{
+                "isa": "thumb",
+                "start": "0x00000024",
+                "end": "0x0000002c",
+                "blake3": blake3::hash(&arm[0x24..0x2c]).to_hex().to_string(),
+            }])
+        );
+        let successor_ghidra = &successor_json["executions"][owned_execution];
+        assert_eq!(
+            successor_ghidra["decode_ranges"],
+            serde_json::json!([{
+                "isa": "thumb",
+                "start": "0x00000024",
+                "end": "0x00000028",
+                "blake3": blake3::hash(&arm[0x24..0x28]).to_hex().to_string(),
+            }])
+        );
+        assert_ne!(
+            successor_ghidra["execution_blake3"], lineage[0]["producer_execution_blake3"],
+            "successor regression requires unequal producer and Ghidra digests"
+        );
         let successor_bytes = successor_source
             .replacen(predecessor_field, &predecessor_replacement, 1)
             .into_bytes();
@@ -3308,7 +3359,10 @@ public class FailAfterThumb extends GhidraScript {
             &[
                 ("ApplyThumbNames.java".to_string(), successor_thumb_args),
                 ("ApplySymbols.java".to_string(), successor_symbol_args),
-                ("ExportDecomp.java".to_string(), successor_export_args),
+                (
+                    "ExportDecomp.java".to_string(),
+                    successor_export_args.clone(),
+                ),
             ],
         );
         let retry_diagnostics = process_diagnostics(&retry);
@@ -3337,6 +3391,124 @@ public class FailAfterThumb extends GhidraScript {
             final_ownership.split(':').nth(1),
             Some(successor_prepared.map_blake3())
         );
+        let successor_functions: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(successor_out.join("export/00_BOOT/functions.json")).unwrap(),
+        )
+        .unwrap();
+        let owned = successor_functions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|function| function["entry"] == "0x24")
+            .expect("successor export lost the owned Thumb function");
+        assert_eq!(
+            owned["thumb_creation_producer_blake3"],
+            created_execution_blake3
+        );
+        assert!(
+            successor_functions
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|function| {
+                    function["entry"] == "0x24"
+                        || function.get("thumb_creation_producer_blake3").is_none()
+                })
+        );
+
+        std::fs::write(
+            successor_out.join("scripts/SetThumbOwnership.java"),
+            r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class SetThumbOwnership extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 1) {
+            throw new AssertionError("expected one ownership value");
+        }
+        StringPropertyMap ownership = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.ThumbNames.v1.Ownership");
+        if (ownership == null || ownership.getString(toAddr(0x24)) == null) {
+            throw new AssertionError("owned Thumb row is absent");
+        }
+        ownership.add(toAddr(0x24), args[0]);
+        System.out.println("SetThumbOwnership: set");
+    }
+}
+"#,
+        )
+        .unwrap();
+        let marker_path = successor_out.join("export/00_BOOT.complete");
+        let prior_marker = std::fs::read(&marker_path).unwrap();
+        let zero_digest = "00".repeat(32);
+        let set_ownership = |value: &str| {
+            let result = inspect_saved_project_with_args(
+                &home,
+                &successor_out,
+                "00_BOOT",
+                "SetThumbOwnership.java",
+                &[value.to_string()],
+            );
+            assert!(
+                result.status.success()
+                    && String::from_utf8_lossy(&result.stdout)
+                        .lines()
+                        .any(|line| line == "SetThumbOwnership: set"),
+                "could not set Thumb ownership:\n{}",
+                process_diagnostics(&result)
+            );
+        };
+        let exact_parts = final_ownership.split(':').collect::<Vec<_>>();
+        assert_eq!(exact_parts.len(), 6);
+
+        let mut producer_parts = exact_parts.clone();
+        producer_parts[2] = &zero_digest;
+        let producer_tamper = producer_parts.join(":");
+        set_ownership(&producer_tamper);
+        let rejected_producer = inspect_saved_project_with_args(
+            &home,
+            &successor_out,
+            "00_BOOT",
+            "ExportDecomp.java",
+            &successor_export_args,
+        );
+        let producer_diagnostics = process_diagnostics(&rejected_producer);
+        assert!(
+            producer_diagnostics.contains("the owned Thumb producer execution changed at"),
+            "producer identity tamper was not rejected specifically:\n{producer_diagnostics}"
+        );
+        assert!(
+            !producer_diagnostics.contains("ExportDecomp: wrote export"),
+            "producer identity tamper published an export:\n{producer_diagnostics}"
+        );
+        assert_eq!(std::fs::read(&marker_path).unwrap(), prior_marker);
+
+        set_ownership(final_ownership);
+        let mut ghidra_parts = exact_parts;
+        ghidra_parts[5] = &zero_digest;
+        let ghidra_tamper = ghidra_parts.join(":");
+        set_ownership(&ghidra_tamper);
+        let rejected_ghidra = inspect_saved_project_with_args(
+            &home,
+            &successor_out,
+            "00_BOOT",
+            "ExportDecomp.java",
+            &successor_export_args,
+        );
+        let ghidra_diagnostics = process_diagnostics(&rejected_ghidra);
+        assert!(
+            ghidra_diagnostics.contains("the owned Thumb Ghidra execution changed at"),
+            "Ghidra identity tamper was not rejected specifically:\n{ghidra_diagnostics}"
+        );
+        assert!(
+            !ghidra_diagnostics.contains("ExportDecomp: wrote export"),
+            "Ghidra identity tamper published an export:\n{ghidra_diagnostics}"
+        );
+        assert_eq!(std::fs::read(&marker_path).unwrap(), prior_marker);
+        set_ownership(final_ownership);
         let _ = std::fs::remove_dir_all(&successor_dir);
     }
 
@@ -4120,6 +4292,7 @@ public class PalSupportProbe extends GhidraScript {
         PalTasksSupport.SymbolMap map =
                 PalTasksSupport.readSymbolMap(functionsFile, functionsHash, mapFile, mapHash);
         if (!palIdentity.equals(map.palIdentity) || map.executions.size() != 2
+                || !map.thumbCreationLineage.isEmpty()
                 || map.decisions.size() != 2 || !map.functionsBlake3.equals(functionsHash)) {
             throw new AssertionError("symbol map shape is wrong");
         }
@@ -4142,6 +4315,21 @@ public class PalSupportProbe extends GhidraScript {
         expectFail("unknown map key", "expected key",
                 () -> PalTasksSupport.readSymbolMap(functionsFile, functionsHash, badMapFile,
                         badMapHash));
+
+        File malformedRoot = new File(caseRoot, "symbol_map_cases");
+        int malformedCount = Integer.parseInt(
+                readTrimmed(new File(malformedRoot, "count.txt")));
+        for (int index = 0; index < malformedCount; index++) {
+            File dir = new File(malformedRoot, "case" + index);
+            File malformed = new File(dir, "map.json");
+            String expected = readTrimmed(new File(dir, "expected.txt"));
+            String malformedHash = PalTasksSupport.blake3Hex(
+                    empty, Files.readAllBytes(malformed.toPath()));
+            final int caseIndex = index;
+            expectFail("symbol map case" + caseIndex, expected,
+                    () -> PalTasksSupport.readSymbolMap(functionsFile, functionsHash,
+                            malformed, malformedHash));
+        }
     }
 
     private void appliedStateChecks(PalTasksSupport.PalManifest manifest, String identity)
@@ -4619,6 +4807,148 @@ fn pal_support_strict_parsers_registry_and_digests() {
     );
     std::fs::write(case_root.join("symbol_map_bad.json"), &bad_symbol_map).unwrap();
 
+    let first_entry = pal_fixture::entry_a();
+    let second_entry = pal_fixture::entry_b();
+    let first_hash = serde_json::from_str::<serde_json::Value>(&symbol_map).unwrap()["executions"]
+        [0]["decode_ranges"][0]["blake3"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_producer = pal_fixture::execution_digest(
+        first_entry,
+        &[(first_entry, first_entry + 12, "thumb", &first_hash)],
+    );
+    let row = |execution: usize, digest: &str, isa: &str, start: u32, end: u32, hash: &str| {
+        format!(
+            "    {{\n      \"execution\": {execution},\n      \"producer_execution_blake3\": \"{digest}\",\n      \"decode_ranges\": [\n        {{\n          \"isa\": \"{isa}\",\n          \"start\": \"0x{start:08x}\",\n          \"end\": \"0x{end:08x}\",\n          \"blake3\": \"{hash}\"\n        }}\n      ]\n    }}"
+        )
+    };
+    let with_lineage = |map: &str, rows: &str| {
+        replace_once(
+            map,
+            "  \"thumb_creation_lineage\": []",
+            &format!("  \"thumb_creation_lineage\": [\n{rows}\n  ]"),
+        )
+    };
+    let first_thumb_map = symbol_map.replacen("\"isa\": \"arm\"", "\"isa\": \"thumb\"", 1);
+    let both_thumb_map = symbol_map.replacen("\"isa\": \"arm\"", "\"isa\": \"thumb\"", 2);
+    let zero_hash = "00".repeat(32);
+
+    let without_lineage = replace_once(&symbol_map, "  \"thumb_creation_lineage\": [],\n", "");
+    let wrong_order = replace_once(
+        &without_lineage,
+        "  \"executions\": [",
+        "  \"thumb_creation_lineage\": [],\n  \"executions\": [",
+    );
+    let valid_first_row = row(
+        0,
+        &first_producer,
+        "thumb",
+        first_entry,
+        first_entry + 12,
+        &first_hash,
+    );
+    let duplicate_execution = with_lineage(
+        &first_thumb_map,
+        &format!("{valid_first_row},\n{valid_first_row}"),
+    );
+    let duplicate_digest = with_lineage(
+        &both_thumb_map,
+        &format!(
+            "{},\n{}",
+            valid_first_row,
+            row(
+                1,
+                &first_producer,
+                "thumb",
+                second_entry,
+                second_entry + 8,
+                &zero_hash,
+            )
+        ),
+    );
+    let non_thumb = with_lineage(
+        &first_thumb_map,
+        &row(
+            0,
+            &zero_hash,
+            "arm",
+            first_entry,
+            first_entry + 12,
+            &first_hash,
+        ),
+    );
+    let wrong_first_range = with_lineage(
+        &first_thumb_map,
+        &row(
+            0,
+            &zero_hash,
+            "thumb",
+            first_entry + 2,
+            first_entry + 12,
+            &zero_hash,
+        ),
+    );
+    let mut excessive_ranges = String::new();
+    for index in 0..=65_536u32 {
+        if index != 0 {
+            excessive_ranges.push_str(",\n");
+        }
+        let start = first_entry + index * 4;
+        excessive_ranges.push_str(&format!(
+            "        {{\"isa\": \"thumb\", \"start\": \"0x{start:08x}\", \"end\": \"0x{:08x}\", \"blake3\": \"{zero_hash}\"}}",
+            start + 2,
+        ));
+    }
+    let range_cap = with_lineage(
+        &first_thumb_map,
+        &format!(
+            "    {{\n      \"execution\": 0,\n      \"producer_execution_blake3\": \"{zero_hash}\",\n      \"decode_ranges\": [\n{excessive_ranges}\n      ]\n    }}"
+        ),
+    );
+    let charged_cap = with_lineage(
+        &first_thumb_map,
+        &row(
+            0,
+            &zero_hash,
+            "thumb",
+            first_entry,
+            first_entry + 512 * 1024 * 1024,
+            &zero_hash,
+        ),
+    );
+    let symbol_map_cases = [
+        (wrong_order, "expected key"),
+        (duplicate_execution, "strictly sorted by execution"),
+        (
+            duplicate_digest,
+            "duplicate Thumb creation lineage producer digest",
+        ),
+        (non_thumb, "decode range is not Thumb"),
+        (
+            wrong_first_range,
+            "first decode range does not start at entry",
+        ),
+        (range_cap, "per-execution range limit"),
+        (
+            charged_cap,
+            "aggregate Thumb creation lineage charged-byte limit",
+        ),
+    ];
+    let symbol_map_case_root = case_root.join("symbol_map_cases");
+    std::fs::create_dir_all(&symbol_map_case_root).unwrap();
+    std::fs::write(
+        symbol_map_case_root.join("count.txt"),
+        symbol_map_cases.len().to_string(),
+    )
+    .unwrap();
+    for (index, (map, expected)) in symbol_map_cases.iter().enumerate() {
+        let dir = symbol_map_case_root.join(format!("case{index}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("map.json"), map).unwrap();
+        std::fs::write(dir.join("expected.txt"), expected).unwrap();
+    }
+
     std::fs::write(
         out.join("scripts/PalSupportProbe.java"),
         PAL_SUPPORT_PROBE_JAVA,
@@ -4684,7 +5014,8 @@ fn pal_support_strict_parsers_registry_and_digests() {
         .filter(|line| line.contains("PalSupportProbe ok "))
         .count();
     assert_eq!(
-        passed, 36,
+        passed,
+        36 + symbol_map_cases.len(),
         "expected the full probe battery, got {passed}:\n{diagnostics}"
     );
 

@@ -708,10 +708,18 @@ pub(crate) struct GhidraFunctionFields {
     pub tagged: TaggedExecutionRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThumbCreationNomination {
+    pub entry: u32,
+    pub producer_execution_blake3: [u8; 32],
+    pub ghidra_execution_blake3: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamedGhidraInventory {
     pub inventory: ValidatedInventory,
     pub functions: Vec<GhidraFunctionFields>,
+    pub thumb_creation_nominations: Vec<ThumbCreationNomination>,
 }
 
 const GHIDRA_REQUIRED_KEYS: [&str; 8] = [
@@ -725,7 +733,7 @@ const GHIDRA_REQUIRED_KEYS: [&str; 8] = [
     "data_refs",
 ];
 const GHIDRA_ENRICHMENT_KEYS: [&str; 2] = ["original_name", "annotations"];
-const GHIDRA_OPTIONAL_KEYS: [&str; 1] = ["thunk_of"];
+const GHIDRA_OPTIONAL_KEYS: [&str; 2] = ["thunk_of", "thumb_creation_producer_blake3"];
 
 fn validate_ghidra_record_shape(record: &Value) -> Result<&Map<String, Value>> {
     let object = record
@@ -758,6 +766,13 @@ fn validate_ghidra_record_shape(record: &Value) -> Result<&Map<String, Value>> {
             .is_none_or(|annotations| annotations.iter().any(|value| !value.is_string()))
     }) {
         return Err(invalid("Ghidra annotations must be an array of strings"));
+    }
+    if let Some(value) = object.get("thumb_creation_producer_blake3") {
+        parse_blake3(
+            value
+                .as_str()
+                .ok_or_else(|| invalid("Thumb creation nomination must be a BLAKE3 string"))?,
+        )?;
     }
     Ok(object)
 }
@@ -792,6 +807,7 @@ pub(crate) fn read_ghidra_inventory_streaming_capped(
         runtime,
         cap,
         functions: Vec::new(),
+        thumb_creation_nominations: Vec::new(),
         projections: Vec::new(),
         accepted_executions: BTreeSet::new(),
         accepted: 0,
@@ -811,6 +827,7 @@ struct GhidraInventoryScan<'runtime, 'data> {
     runtime: &'runtime RuntimeImage<'data>,
     cap: usize,
     functions: Vec<GhidraFunctionFields>,
+    thumb_creation_nominations: Vec<ThumbCreationNomination>,
     projections: Vec<ExecutionProjection>,
     accepted_executions: BTreeSet<OwnedExecutionIdentity>,
     accepted: usize,
@@ -826,6 +843,15 @@ impl GhidraInventoryScan<'_, '_> {
             ));
         }
         let object = validate_ghidra_record_shape(&record)?;
+        let producer_execution_blake3 =
+            object
+                .get("thumb_creation_producer_blake3")
+                .map(|value| {
+                    parse_blake3(value.as_str().ok_or_else(|| {
+                        invalid("Thumb creation nomination must be a BLAKE3 string")
+                    })?)
+                })
+                .transpose()?;
         let name = required_string(object, "name")?.to_owned();
         let original_name = object
             .get("original_name")
@@ -876,9 +902,22 @@ impl GhidraInventoryScan<'_, '_> {
                 .ok_or_else(|| invalid("accepted inventory count overflow"))?;
             self.accepted_executions.insert(OwnedExecutionIdentity {
                 owner: FunctionOwner::Ghidra,
-                identity,
+                identity: identity.clone(),
             });
+            if let Some(producer_execution_blake3) = producer_execution_blake3 {
+                self.thumb_creation_nominations
+                    .push(ThumbCreationNomination {
+                        entry: identity.entry,
+                        producer_execution_blake3,
+                        ghidra_execution_blake3: identity.execution_blake3,
+                    });
+            }
         } else {
+            if producer_execution_blake3.is_some() {
+                return Err(invalid(
+                    "Thumb creation nomination requires an accepted execution",
+                ));
+            }
             self.quarantined = self
                 .quarantined
                 .checked_add(1)
@@ -918,6 +957,7 @@ impl GhidraInventoryScan<'_, '_> {
                 records: self.functions.iter().map(|f| f.tagged.clone()).collect(),
             },
             functions: self.functions,
+            thumb_creation_nominations: self.thumb_creation_nominations,
         })
     }
 }
@@ -1776,6 +1816,81 @@ mod tests {
         assert_eq!(streamed.functions[1].name, "FUN_0008");
         assert_eq!(streamed.functions[0].entry, 0);
         assert_eq!(streamed.functions[1].entry, 8);
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_collects_sparse_thumb_creation_nomination() {
+        let image = [0u8; 16];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let mut nominated = ghidra_record("owned_thumb", 0, 4, &image);
+        nominated["thumb_creation_producer_blake3"] = json!("11".repeat(32));
+        let ordinary = ghidra_record("ordinary", 8, 12, &image);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![nominated, ordinary]).unwrap(),
+        )
+        .unwrap();
+
+        let streamed = read_ghidra_inventory_streaming(&path, &runtime).unwrap();
+
+        assert_eq!(streamed.functions.len(), 2);
+        assert_eq!(streamed.thumb_creation_nominations.len(), 1);
+        assert_eq!(streamed.thumb_creation_nominations[0].entry, 0);
+        assert_eq!(
+            streamed.thumb_creation_nominations[0].producer_execution_blake3,
+            [0x11; 32]
+        );
+        assert_eq!(
+            streamed.thumb_creation_nominations[0].ghidra_execution_blake3,
+            streamed.inventory.accepted_executions[0]
+                .identity
+                .execution_blake3
+        );
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_rejects_malformed_thumb_creation_nomination() {
+        let image = [0u8; 4];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+
+        for malformed in [json!("11".repeat(31)), json!("AA".repeat(32)), json!(7)] {
+            let mut record = ghidra_record("owned_thumb", 0, 4, &image);
+            record["thumb_creation_producer_blake3"] = malformed;
+            std::fs::write(&path, serde_json::to_vec(&vec![record]).unwrap()).unwrap();
+            assert!(
+                read_ghidra_inventory_streaming(&path, &runtime).is_err(),
+                "accepted malformed Thumb creation nomination"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_ghidra_inventory_rejects_nomination_on_quarantined_record() {
+        let image = [0u8; 4];
+        let runtime = RuntimeImage::from_plan(&image, 0, None).unwrap();
+        let mut record = ghidra_record("owned_thumb", 0, 4, &image);
+        record["decode_ranges"] = json!([]);
+        record["decode_range_errors"] = json!([{
+            "kind": "empty_projection",
+            "address": "0x0",
+            "end": null,
+        }]);
+        record["thumb_creation_producer_blake3"] = json!("11".repeat(32));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.json");
+        std::fs::write(&path, serde_json::to_vec(&vec![record]).unwrap()).unwrap();
+
+        let error = read_ghidra_inventory_streaming(&path, &runtime).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Thumb creation nomination requires an accepted execution"),
+            "{error}"
+        );
     }
 
     #[test]

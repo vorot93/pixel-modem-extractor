@@ -10233,6 +10233,63 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn symbol_map_thumb_creation_lineage_is_ordered_bounded_and_ownership_exact() {
+        let source = PAL_TASKS_SUPPORT_JAVA;
+        let executions_end = source
+            .find("endArray(reader, \"executions\");")
+            .expect("symbol map parser must finish executions");
+        let lineage_start = source
+            .find("name(reader, \"thumb_creation_lineage\");")
+            .expect("symbol map parser must require Thumb creation lineage");
+        let lineage_end = source
+            .find("endArray(reader, \"thumb_creation_lineage\");")
+            .expect("symbol map parser must finish Thumb creation lineage");
+        let symbols_start = source
+            .find("name(reader, \"symbols\");")
+            .expect("symbol map parser must require symbols");
+        assert!(executions_end < lineage_start && lineage_start < lineage_end);
+        assert!(lineage_end < symbols_start);
+
+        let lineage = &source[lineage_start..lineage_end];
+        for required in [
+            "MAX_EXECUTIONS",
+            "MAX_EXECUTION_RANGES_EACH",
+            "MAX_EXECUTION_RANGES_TOTAL",
+            "MAX_CHARGED_RANGE_BYTES",
+            "lineageProducerDigests",
+            "strictly sorted by execution",
+            "first decode range does not start at entry",
+            "producer digest does not match its ranges",
+        ] {
+            assert!(
+                lineage.contains(required),
+                "lineage parser must enforce {required:?}"
+            );
+        }
+        assert!(source.contains("long creationRangeTotal = totalRanges;"));
+        assert!(source.contains("long creationChargedTotal = chargedBytes;"));
+        assert!(
+            source.contains("MapThumbCreationLineage lineage = lineageByEntry.remove(offset);")
+        );
+        assert!(source.contains(
+            "Thumb creation lineage is not in exact bijection with the ownership registry"
+        ));
+        assert!(
+            source.contains("validateThumbProducerExecution(program, monitor, execution.entry")
+        );
+        assert!(source.contains("the owned Thumb producer execution changed at"));
+        assert!(source.contains("the owned Thumb Ghidra execution changed at"));
+
+        assert!(
+            EXPORT_DECOMP_JAVA.contains(
+                "PalTasksSupport.ThumbOwnershipState thumbOwnership = pass2State == null"
+            )
+        );
+        assert!(EXPORT_DECOMP_JAVA.contains("thumb_creation_producer_blake3"));
+        assert!(EXPORT_DECOMP_JAVA.contains("owned.producerExecutionBlake3"));
+    }
+
+    #[test]
     fn generated_kit_stages_pal_support() {
         // The Rust-side Ghidra leaf limit and the Java-side runtime
         // assertion must pin the same 2000-character ceiling.

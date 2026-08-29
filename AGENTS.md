@@ -427,6 +427,20 @@ module; when a file outgrows that, split it.
   it. Current token plus current rows is terminal. Mixed, omitted, foreign-hash, or unrepresented
   rows fail closed; no script opens a predecessor map or deletes a project-created function merely
   because a successor map omits it.
+- **Successor Thumb lineage is sparse and dual-authenticated.** Terminal `ExportDecomp` adds the
+  optional `thumb_creation_producer_blake3` selector only to a function whose ownership row passed
+  the shared terminal validator; ordinary records omit it. The selector grants no authority. The
+  centralized Rust inventory reader collects it outside the per-function record, and the v4 symbol
+  map requires `thumb_creation_lineage` immediately after `executions` (before `symbols`), including
+  an empty array when nothing is owned. Each row links one Ghidra execution index to one exact
+  current strict-v3 radare2/Rizin `(entry, producer digest)` and carries canonical authenticated
+  Thumb ranges beginning at the entry. Java requires an exact lineage/registry bijection, rehashes
+  those producer ranges and digest, proves the current Ghidra body is contained by them, and then
+  independently recomputes the Ghidra execution digest; the two digests may and normally do differ.
+  This owned-only surface is materially bounded: 165 Mustang and 64 Cheetah rows, versus conservative
+  all-overlap projections of 88,349 and 72,893 rows. The sparse choice does not change execution,
+  creation, report, or SymbolPass2 counts and does not relax the Task 9 boundary: no predecessor map
+  bytes, compatibility reader, or omitted-function deletion.
 - **Ghidra-only constraints stay Ghidra-only.** Java preflight rejects intersections among the
   complete derived instruction spans before mutation and computes A32 architectural `PC + 8` before
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust

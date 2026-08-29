@@ -489,21 +489,37 @@ final class PalTasksSupport {
     /** Re-authenticate the producer execution against current program memory. */
     static void validateThumbCreationExecution(Program program, TaskMonitor monitor,
             MapCreation creation) throws Exception {
-        for (ExecutionRangeWire range : creation.decodeRanges) {
+        validateThumbProducerExecution(program, monitor, creation.entry,
+                creation.executionBlake3, creation.decodeRanges, false);
+    }
+
+    private static void validateThumbProducerExecution(Program program, TaskMonitor monitor,
+            long entry, String executionBlake3, List<ExecutionRangeWire> decodeRanges,
+            boolean ownedLineage) throws Exception {
+        Address entryAddress = programAddress(program, entry);
+        for (ExecutionRangeWire range : decodeRanges) {
             if (!"thumb".equals(range.isa)) {
-                fail("a creation decode range is not Thumb at "
-                        + programAddress(program, creation.entry));
+                if (ownedLineage) {
+                    fail("the owned Thumb producer execution changed at " + entryAddress);
+                }
+                fail("a creation decode range is not Thumb at " + entryAddress);
             }
             String actual = hashMemory(program, monitor, range.start, range.end);
             if (!range.blake3.equals(actual)) {
+                if (ownedLineage) {
+                    fail("the owned Thumb producer execution changed at " + entryAddress);
+                }
                 fail("a creation decode range BLAKE3 changed at "
                         + programAddress(program, range.start));
             }
         }
-        String actualExecution = executionDigestHex(creation.entry, creation.decodeRanges);
-        if (!creation.executionBlake3.equals(actualExecution)) {
+        String actualExecution = executionDigestHex(entry, decodeRanges);
+        if (!executionBlake3.equals(actualExecution)) {
+            if (ownedLineage) {
+                fail("the owned Thumb producer execution changed at " + entryAddress);
+            }
             fail("a creation execution digest does not match its authenticated ranges at "
-                    + programAddress(program, creation.entry));
+                    + entryAddress);
         }
     }
 
@@ -566,7 +582,7 @@ final class PalTasksSupport {
 
     private static void validateOwnedThumbExecution(Program program, TaskMonitor monitor,
             ThumbCreationOwnership parsed, ExecutionDecision represented,
-            boolean currentProperty) throws Exception {
+            MapThumbCreationLineage lineage, boolean currentProperty) throws Exception {
         MapExecution execution = represented.execution;
         MapDecision decision = represented.decision;
         Address entry = programAddress(program, execution.entry);
@@ -583,13 +599,25 @@ final class PalTasksSupport {
                 || !primarySource(function.getSymbol().getSource()).equals(expectedSource)) {
             fail("the owned Thumb execution primary changed at " + entry);
         }
-        if (!parsed.producerExecutionBlake3.equals(execution.executionBlake3)) {
+        if (!parsed.producerExecutionBlake3.equals(lineage.producerExecutionBlake3)) {
             fail("the owned Thumb producer execution changed at " + entry);
         }
+        validateThumbProducerExecution(program, monitor, execution.entry,
+                lineage.producerExecutionBlake3, lineage.decodeRanges, true);
+        AddressSet authenticated = new AddressSet();
+        for (ExecutionRangeWire range : lineage.decodeRanges) {
+            authenticated.add(programAddress(program, range.start),
+                    programAddress(program, range.end - 1));
+        }
+        if (!authenticated.contains(function.getBody())) {
+            fail("the owned Thumb Ghidra body leaves producer-authenticated memory at " + entry);
+        }
         String currentDigest = currentExecutionDigest(program, monitor, function);
-        if (!parsed.ghidraExecutionBlake3.equals(currentDigest)
-                || !execution.executionBlake3.equals(currentDigest)) {
-            fail("the owned Thumb execution body changed at " + entry);
+        if (!parsed.ghidraExecutionBlake3.equals(currentDigest)) {
+            fail("the owned Thumb Ghidra execution changed at " + entry);
+        }
+        if (!execution.executionBlake3.equals(currentDigest)) {
+            fail("the owned Thumb Ghidra execution no longer matches the symbol map at " + entry);
         }
     }
 
@@ -621,6 +649,17 @@ final class PalTasksSupport {
             }
             if (creations.containsKey(execution.entry)) {
                 fail("the symbol map represents one Thumb-owned entry twice");
+            }
+        }
+        Map<Long, MapThumbCreationLineage> lineageByEntry =
+                new HashMap<Long, MapThumbCreationLineage>();
+        for (MapThumbCreationLineage lineage : map.thumbCreationLineage) {
+            MapExecution execution = map.executions.get((int) lineage.execution);
+            if (lineageByEntry.put(execution.entry, lineage) != null) {
+                fail("the symbol map carries duplicate Thumb creation lineage entries");
+            }
+            if (creations.containsKey(execution.entry)) {
+                fail("the symbol map carries lineage for a creation-represented entry");
             }
         }
 
@@ -665,8 +704,13 @@ final class PalTasksSupport {
                     validateOwnedThumbCreation(program, monitor, parsed, creation);
                 }
                 else {
+                    MapThumbCreationLineage lineage = lineageByEntry.remove(offset);
+                    if (lineage == null) {
+                        fail("the owned Thumb execution has no current producer lineage at "
+                                + entry);
+                    }
                     validateOwnedThumbExecution(
-                            program, monitor, parsed, execution, decisionsApplied);
+                            program, monitor, parsed, execution, lineage, decisionsApplied);
                 }
                 if (rows.put(offset, parsed) != null) {
                     fail("the Thumb creation registry carries duplicate entries at " + entry);
@@ -676,6 +720,9 @@ final class PalTasksSupport {
                             migrateThumbOwnershipValue(value, map.mapBlake3)));
                 }
             }
+        }
+        if (!lineageByEntry.isEmpty()) {
+            fail("Thumb creation lineage is not in exact bijection with the ownership registry");
         }
         return new ThumbOwnershipState(registry, rows, migrations);
     }
@@ -961,6 +1008,19 @@ final class PalTasksSupport {
         }
     }
 
+    static final class MapThumbCreationLineage {
+        final long execution;
+        final String producerExecutionBlake3;
+        final List<ExecutionRangeWire> decodeRanges;
+
+        MapThumbCreationLineage(long execution, String producerExecutionBlake3,
+                List<ExecutionRangeWire> decodeRanges) {
+            this.execution = execution;
+            this.producerExecutionBlake3 = producerExecutionBlake3;
+            this.decodeRanges = decodeRanges;
+        }
+    }
+
     static final class MapDecision {
         final long execution;
         final String originalPrimary;
@@ -1096,6 +1156,7 @@ final class PalTasksSupport {
         final String functionsBlake3;
         final String predecessorSymbolPass2;
         final List<MapExecution> executions;
+        final List<MapThumbCreationLineage> thumbCreationLineage;
         final List<MapDecision> decisions;
         final List<MapCreation> creations;
         final String mapBlake3;
@@ -1105,6 +1166,7 @@ final class PalTasksSupport {
                 String palIdentity, String manifestBlake3, String scatterLoadMapBlake3,
                 String functionsBlake3, String predecessorSymbolPass2,
                 List<MapExecution> executions,
+                List<MapThumbCreationLineage> thumbCreationLineage,
                 List<MapDecision> decisions, List<MapCreation> creations, String mapBlake3) {
             this.imageLabel = imageLabel;
             this.imageBase = imageBase;
@@ -1118,6 +1180,7 @@ final class PalTasksSupport {
             this.functionsBlake3 = functionsBlake3;
             this.predecessorSymbolPass2 = predecessorSymbolPass2;
             this.executions = executions;
+            this.thumbCreationLineage = thumbCreationLineage;
             this.decisions = decisions;
             this.creations = creations;
             this.mapBlake3 = mapBlake3;
@@ -3181,7 +3244,7 @@ final class PalTasksSupport {
                     wire.palIdentity, wire.manifestBlake3,
                     wire.scatterLoadMapBlake3, wire.functionsBlake3,
                     wire.predecessorSymbolPass2, wire.executions,
-                    wire.decisions, wire.creations, mapBlake3);
+                    wire.thumbCreationLineage, wire.decisions, wire.creations, mapBlake3);
         }
         catch (PalError error) {
             throw new Exception(error.getMessage(), error);
@@ -3204,6 +3267,7 @@ final class PalTasksSupport {
         String functionsBlake3;
         String predecessorSymbolPass2;
         List<MapExecution> executions = new ArrayList<>();
+        List<MapThumbCreationLineage> thumbCreationLineage = new ArrayList<>();
         List<MapDecision> decisions = new ArrayList<>();
         List<MapCreation> creations = new ArrayList<>();
     }
@@ -3374,6 +3438,101 @@ final class PalTasksSupport {
             wire.executions.add(new MapExecution("ghidra", entry, executionBlake3, ranges));
         }
         endArray(reader, "executions");
+
+        name(reader, "thumb_creation_lineage");
+        beginArray(reader, "thumb_creation_lineage");
+        long previousLineageExecution = -1;
+        Set<String> lineageProducerDigests = new HashSet<>();
+        while (arrayHasNext(reader)) {
+            if (wire.thumbCreationLineage.size() >= MAX_EXECUTIONS) {
+                fail("symbol map exceeds the Thumb creation lineage limit");
+            }
+            reader.beginObject();
+            name(reader, "execution");
+            long execution = unsignedValue(reader, UINT32_MAX,
+                    "Thumb creation lineage execution");
+            if (execution >= wire.executions.size()) {
+                fail("Thumb creation lineage execution is outside the execution array");
+            }
+            if (execution <= previousLineageExecution) {
+                fail("Thumb creation lineage rows are not strictly sorted by execution");
+            }
+            previousLineageExecution = execution;
+            MapExecution linked = wire.executions.get((int) execution);
+            if (linked.decodeRanges.get(0).start != linked.entry) {
+                fail("Thumb creation lineage links a Ghidra execution whose first range does not start at entry");
+            }
+            for (ExecutionRangeWire range : linked.decodeRanges) {
+                if (!"thumb".equals(range.isa)) {
+                    fail("Thumb creation lineage links a non-Thumb Ghidra execution");
+                }
+            }
+
+            name(reader, "producer_execution_blake3");
+            String producerExecutionBlake3 = hashValue(
+                    reader, "Thumb creation lineage producer_execution_blake3");
+            if (!lineageProducerDigests.add(producerExecutionBlake3)) {
+                fail("duplicate Thumb creation lineage producer digest");
+            }
+            name(reader, "decode_ranges");
+            beginArray(reader, "decode_ranges");
+            List<ExecutionRangeWire> ranges = new ArrayList<>();
+            long lineagePreviousEnd = -1;
+            while (arrayHasNext(reader)) {
+                if (ranges.size() >= MAX_EXECUTION_RANGES_EACH) {
+                    fail("Thumb creation lineage exceeds the per-execution range limit");
+                }
+                if (totalRanges >= MAX_EXECUTION_RANGES_TOTAL) {
+                    fail("symbol map exceeds the aggregate Thumb creation lineage range limit");
+                }
+                reader.beginObject();
+                name(reader, "isa");
+                String isa = requireIsa(stringValue(reader,
+                        "Thumb creation lineage decode range isa"));
+                if (!"thumb".equals(isa)) {
+                    fail("Thumb creation lineage decode range is not Thumb");
+                }
+                name(reader, "start");
+                long start = addressValue(reader,
+                        "Thumb creation lineage decode range start");
+                name(reader, "end");
+                long end = addressValue(reader,
+                        "Thumb creation lineage decode range end");
+                name(reader, "blake3");
+                String blake3 = hashValue(reader,
+                        "Thumb creation lineage decode range blake3");
+                endObject(reader, "blake3");
+                if (end <= start || (start & 1L) != 0 || ((end - start) & 1L) != 0) {
+                    fail("Thumb creation lineage decode range is empty, wraps, or misaligned");
+                }
+                if (lineagePreviousEnd != -1 && start <= lineagePreviousEnd) {
+                    fail("Thumb creation lineage decode ranges are not canonical");
+                }
+                lineagePreviousEnd = end;
+                chargedBytes = checkedAdd(chargedBytes, end - start,
+                        "Thumb creation lineage charged range bytes");
+                if (chargedBytes > MAX_CHARGED_RANGE_BYTES) {
+                    fail("symbol map exceeds the aggregate Thumb creation lineage charged-byte limit");
+                }
+                totalRanges++;
+                ranges.add(new ExecutionRangeWire(isa, start, end, blake3));
+            }
+            endArray(reader, "decode_ranges");
+            endObject(reader, "decode_ranges");
+            if (ranges.isEmpty()) {
+                fail("Thumb creation lineage carries no authenticated decode ranges");
+            }
+            if (ranges.get(0).start != linked.entry) {
+                fail("Thumb creation lineage first decode range does not start at entry");
+            }
+            String recomputed = executionDigestHex(linked.entry, ranges);
+            if (!producerExecutionBlake3.equals(recomputed)) {
+                fail("Thumb creation lineage producer digest does not match its ranges");
+            }
+            wire.thumbCreationLineage.add(new MapThumbCreationLineage(
+                    execution, producerExecutionBlake3, ranges));
+        }
+        endArray(reader, "thumb_creation_lineage");
 
         name(reader, "symbols");
         beginArray(reader, "symbols");

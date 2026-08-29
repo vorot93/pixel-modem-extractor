@@ -1044,15 +1044,19 @@ fn le_u32(value: u32, out: &mut Vec<u8>) {
 
 /// The execution digest grammar shared with Task 2 and the Java support:
 /// domain, little-endian u32 entry, little-endian u32 range count, then
-/// per range the ISA byte (0=arm), little-endian u32 start/end, and the
+/// per range the ISA byte (0=arm, 1=thumb), little-endian u32 start/end, and the
 /// 32 range-digest bytes.
 pub(super) fn execution_digest(entry: u32, ranges: &[(u32, u32, &str, &str)]) -> String {
     let mut framed = Vec::new();
     framed.extend_from_slice(b"pixel-modem-extractor-execution-v1\0");
     framed.extend_from_slice(&entry.to_le_bytes());
     le_u32(u32::try_from(ranges.len()).unwrap(), &mut framed);
-    for &(start, end, _isa, blake3_hex) in ranges {
-        framed.push(0);
+    for &(start, end, isa, blake3_hex) in ranges {
+        framed.push(match isa {
+            "arm" => 0,
+            "thumb" => 1,
+            other => panic!("unsupported fixture ISA {other}"),
+        });
         le_u32(start, &mut framed);
         le_u32(end, &mut framed);
         framed.extend_from_slice(
@@ -1159,6 +1163,9 @@ pub(super) fn canonical_symbol_map(
         json.close_array();
         json.close_object();
     }
+    json.close_array();
+    json.key(false, "thumb_creation_lineage");
+    json.open_array();
     json.close_array();
     json.key(false, "symbols");
     json.open_array();

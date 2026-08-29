@@ -1170,6 +1170,7 @@ struct SymbolMapFile<'a> {
     functions_blake3: &'a str,
     predecessor_symbol_pass2: Option<&'a str>,
     executions: Vec<ExecutionBlock<'a>>,
+    thumb_creation_lineage: Vec<ThumbCreationLineageBlock>,
     symbols: Vec<DecisionBlock<'a>>,
     creations: Vec<CreationBlock<'a>>,
 }
@@ -1200,6 +1201,13 @@ struct ExecutionBlock<'a> {
     producer: &'static str,
     entry: &'a str,
     execution_blake3: &'a str,
+    decode_ranges: Vec<DecodeRangeWire>,
+}
+
+#[derive(Serialize)]
+struct ThumbCreationLineageBlock {
+    execution: usize,
+    producer_execution_blake3: String,
     decode_ranges: Vec<DecodeRangeWire>,
 }
 
@@ -1299,6 +1307,241 @@ struct GhidraExecutionRecord {
     /// retained record carries the relation.
     thunk_of: Option<u32>,
     execution_digest: [u8; 32],
+}
+
+fn authenticate_nominated_thumb_execution(
+    symbol: &Symbol,
+    entry: u32,
+    expected_digest: [u8; 32],
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+    budget: &mut crate::execution_ranges::ExecutionBudget,
+) -> Result<ExecutionIdentity> {
+    if symbol.owner.analysis_tool() != symbol.tool
+        || !matches!(
+            symbol.owner,
+            FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2
+                    | crate::analysis_tool::AnalysisTool::Rizin,
+                ..
+            }
+        )
+    {
+        return Err(Error::Serialize(
+            "nominated producer execution is not owned by a strict-v3 Thumb run".into(),
+        ));
+    }
+    if symbol.execution_blake3 != Some(expected_digest) {
+        return Err(Error::Serialize(
+            "nominated producer execution digest does not match its symbol".into(),
+        ));
+    }
+    let symbol_entry = u32::try_from(parse_hex(&symbol.address)?).map_err(|_| {
+        Error::Serialize("nominated producer execution entry does not fit u32".into())
+    })?;
+    if symbol_entry != entry {
+        return Err(Error::Serialize(
+            "nominated producer execution entry does not match its Ghidra execution".into(),
+        ));
+    }
+    if symbol.decode_ranges.is_empty() {
+        return Err(Error::Serialize(
+            "nominated producer execution has no decode ranges".into(),
+        ));
+    }
+    let mut extents = Vec::new();
+    let mut expected_hashes = Vec::new();
+    extents
+        .try_reserve_exact(symbol.decode_ranges.len())
+        .map_err(|_| Error::Serialize("nominated producer range allocation failed".into()))?;
+    expected_hashes
+        .try_reserve_exact(symbol.decode_ranges.len())
+        .map_err(|_| Error::Serialize("nominated producer hash allocation failed".into()))?;
+    for range in &symbol.decode_ranges {
+        if range.isa != "thumb" {
+            return Err(Error::Serialize(
+                "nominated producer execution is not Thumb-only".into(),
+            ));
+        }
+        let start = u32::try_from(parse_hex(&range.start)?)
+            .map_err(|_| Error::Serialize("nominated producer range start exceeds u32".into()))?;
+        let end = u32::try_from(parse_hex(&range.end)?)
+            .map_err(|_| Error::Serialize("nominated producer range end exceeds u32".into()))?;
+        extents.push(crate::execution_ranges::DecodeExtent {
+            start,
+            end,
+            isa: crate::execution_ranges::DecodeIsa::Thumb,
+        });
+        expected_hashes.push(crate::execution_ranges::parse_blake3(&range.blake3)?);
+    }
+    if extents.first().map(|range| range.start) != Some(entry) {
+        return Err(Error::Serialize(
+            "nominated producer execution does not start at its entry".into(),
+        ));
+    }
+    let identity = crate::execution_ranges::validate_execution(entry, extents, runtime, budget)?;
+    if identity.decode_ranges.len() != symbol.decode_ranges.len()
+        || identity
+            .decode_ranges
+            .iter()
+            .zip(&symbol.decode_ranges)
+            .any(|(authenticated, claimed)| {
+                claimed.start != format!("0x{:08x}", authenticated.start)
+                    || claimed.end != format!("0x{:08x}", authenticated.end)
+            })
+    {
+        return Err(Error::Serialize(
+            "nominated producer decode ranges are not canonical".into(),
+        ));
+    }
+    if identity
+        .decode_ranges
+        .iter()
+        .map(|range| range.blake3)
+        .ne(expected_hashes.iter().copied())
+    {
+        return Err(Error::Serialize(
+            "nominated producer decode-range BLAKE3 does not match runtime bytes".into(),
+        ));
+    }
+    if identity.execution_blake3 != expected_digest {
+        return Err(Error::Serialize(
+            "nominated producer execution BLAKE3 does not match its ranges".into(),
+        ));
+    }
+    Ok(identity)
+}
+
+fn build_thumb_creation_lineage(
+    nominations: &[crate::execution_ranges::ThumbCreationNomination],
+    executions: &[GhidraExecutionRecord],
+    symbols: &[Symbol],
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+) -> Result<Vec<ThumbCreationLineageBlock>> {
+    type NominationKey = (u32, [u8; 32]);
+
+    let producer_keys = nominations
+        .iter()
+        .map(|nomination| (nomination.entry, nomination.producer_execution_blake3))
+        .collect::<BTreeSet<_>>();
+    let ghidra_keys = nominations
+        .iter()
+        .map(|nomination| (nomination.entry, nomination.ghidra_execution_blake3))
+        .collect::<BTreeSet<_>>();
+    let mut producer_index: BTreeMap<NominationKey, Option<&Symbol>> = BTreeMap::new();
+    for symbol in symbols {
+        if !matches!(
+            symbol.owner,
+            FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2
+                    | crate::analysis_tool::AnalysisTool::Rizin,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let Some(digest) = symbol.execution_blake3 else {
+            continue;
+        };
+        let entry = u32::try_from(parse_hex(&symbol.address)?).map_err(|_| {
+            Error::Serialize("strict-v3 producer symbol entry does not fit u32".into())
+        })?;
+        let key = (entry, digest);
+        if !producer_keys.contains(&key) {
+            continue;
+        }
+        match producer_index.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Some(symbol));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.insert(None);
+            }
+        }
+    }
+
+    let mut ghidra_index: BTreeMap<NominationKey, Option<usize>> = BTreeMap::new();
+    for (index, execution) in executions.iter().enumerate() {
+        let key = (execution.entry, execution.execution_digest);
+        if !ghidra_keys.contains(&key) {
+            continue;
+        }
+        match ghidra_index.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Some(index));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.insert(None);
+            }
+        }
+    }
+
+    let mut budget = crate::execution_ranges::ExecutionBudget::default();
+    let mut lineage = Vec::new();
+    lineage
+        .try_reserve_exact(nominations.len())
+        .map_err(|_| Error::Serialize("Thumb creation lineage allocation failed".into()))?;
+    let mut linked_executions = BTreeSet::new();
+    let mut linked_producers = BTreeSet::new();
+    for nomination in nominations {
+        let ghidra_key = (nomination.entry, nomination.ghidra_execution_blake3);
+        let Some(execution_index) = ghidra_index.get(&ghidra_key).copied().flatten() else {
+            return Err(Error::Serialize(format!(
+                "Thumb creation nomination at 0x{:08x} does not link exactly one Ghidra execution",
+                nomination.entry
+            )));
+        };
+        if executions[execution_index].first_isa != "thumb" {
+            return Err(Error::Serialize(format!(
+                "Thumb creation nomination at 0x{:08x} links a non-Thumb Ghidra execution",
+                nomination.entry
+            )));
+        }
+        if !linked_executions.insert(execution_index) {
+            return Err(Error::Serialize(
+                "duplicate Thumb creation lineage execution".into(),
+            ));
+        }
+        if !linked_producers.insert(nomination.producer_execution_blake3) {
+            return Err(Error::Serialize(
+                "duplicate Thumb creation lineage producer digest".into(),
+            ));
+        }
+
+        let producer_key = (nomination.entry, nomination.producer_execution_blake3);
+        let symbol = match producer_index.get(&producer_key) {
+            None => {
+                return Err(Error::Serialize(format!(
+                    "no nominated producer execution matches 0x{:08x}",
+                    nomination.entry
+                )));
+            }
+            Some(None) => {
+                return Err(Error::Serialize(format!(
+                    "ambiguous nominated producer execution at 0x{:08x}",
+                    nomination.entry
+                )));
+            }
+            Some(Some(symbol)) => *symbol,
+        };
+        let producer = authenticate_nominated_thumb_execution(
+            symbol,
+            nomination.entry,
+            nomination.producer_execution_blake3,
+            runtime,
+            &mut budget,
+        )?;
+        lineage.push(ThumbCreationLineageBlock {
+            execution: execution_index,
+            producer_execution_blake3: crate::manifest::blake3_fixed(producer.execution_blake3),
+            decode_ranges: producer
+                .decode_ranges
+                .iter()
+                .map(DecodeRangeWire::from_authenticated)
+                .collect(),
+        });
+    }
+    lineage.sort_by_key(|row| row.execution);
+    Ok(lineage)
 }
 
 /// The result of one successfully written pass-2 map.
@@ -1477,6 +1720,12 @@ pub(crate) fn write_pass2_symbol_map(
             &b.execution_blake3,
         ))
     });
+    let thumb_creation_lineage = build_thumb_creation_lineage(
+        &streamed.thumb_creation_nominations,
+        &executions,
+        symbols,
+        runtime,
+    )?;
 
     // One decision per execution, cross-checked against the Ghidra-owned
     // symbol for that exact execution identity.
@@ -1857,6 +2106,7 @@ pub(crate) fn write_pass2_symbol_map(
                 decode_ranges: execution.decode_ranges.clone(),
             })
             .collect(),
+        thumb_creation_lineage,
         symbols: decisions,
         creations,
     };
@@ -3732,9 +3982,11 @@ mod tests {
     fn rewrite_functions_json_sets_name_and_annotations() {
         let dir = tmp("pme_sym_rw_json");
         std::fs::create_dir_all(&dir).unwrap();
+        let mut function = ghidra_function("FUN_10", 0x10, 0x18, &[]);
+        function["thumb_creation_producer_blake3"] = serde_json::json!("11".repeat(32));
         std::fs::write(
             dir.join("functions.json"),
-            serde_json::to_vec(&vec![ghidra_function("FUN_10", 0x10, 0x18, &[])]).unwrap(),
+            serde_json::to_vec(&vec![function]).unwrap(),
         )
         .unwrap();
         let execution_blake3 = load_functions(&dir, &DisasmIndex::new(""), &test_runtime())
@@ -3762,6 +4014,7 @@ mod tests {
         assert_eq!(v[0]["name"], "real");
         assert_eq!(v[0]["original_name"], "FUN_10");
         assert_eq!(v[0]["annotations"][0], "logs: \"hi\"");
+        assert_eq!(v[0]["thumb_creation_producer_blake3"], "11".repeat(32));
     }
 
     #[test]
@@ -5003,6 +5256,420 @@ mod tests {
         crate::runtime_image::RuntimeImage::from_plan(image, load_addr, None).unwrap()
     }
 
+    fn authenticated_thumb_identity(
+        image: &[u8],
+        load_addr: u32,
+        entry: u32,
+        ranges: &[(u32, u32)],
+    ) -> ExecutionIdentity {
+        let mut budget = crate::execution_ranges::ExecutionBudget::default();
+        crate::execution_ranges::validate_execution(
+            entry,
+            ranges
+                .iter()
+                .map(|&(start, end)| crate::execution_ranges::DecodeExtent {
+                    start,
+                    end,
+                    isa: crate::execution_ranges::DecodeIsa::Thumb,
+                })
+                .collect(),
+            &runtime_for(image, load_addr),
+            &mut budget,
+        )
+        .unwrap()
+    }
+
+    fn strict_thumb_symbol(
+        entry: u32,
+        identity: &ExecutionIdentity,
+        region_index: usize,
+    ) -> Symbol {
+        Symbol {
+            address: format!("0x{entry:08x}"),
+            arch: "thumb",
+            tool: crate::recover_source::Tool::Radare2,
+            owner: FunctionOwner::Run {
+                producer: crate::analysis_tool::AnalysisTool::Radare2,
+                region_index,
+                run_index: 0,
+            },
+            execution_blake3: Some(identity.execution_blake3),
+            decode_ranges: identity
+                .decode_ranges
+                .iter()
+                .map(DecodeRangeWire::from_authenticated)
+                .collect(),
+            original_name: format!("thumb_{entry:08x}"),
+            name: None,
+            tier: Tier::None,
+            evidence: Vec::new(),
+            annotations: Vec::new(),
+            name_conflicts: Vec::new(),
+        }
+    }
+
+    struct ThumbLineageFixture {
+        dir: PathBuf,
+        image: Vec<u8>,
+        load_addr: u32,
+        owned_entry: u32,
+        owned_producer: ExecutionIdentity,
+        ordinary_entry: u32,
+        ordinary_producer: ExecutionIdentity,
+        symbols: Vec<Symbol>,
+    }
+
+    fn thumb_lineage_fixture(tag: &str) -> ThumbLineageFixture {
+        let dir = map_fixture_tree(tag);
+        let image = (0..0x400).map(|value| value as u8).collect::<Vec<_>>();
+        let load_addr = 0x4000_0000u32;
+        let owned_entry = load_addr + 0x100;
+        let ordinary_entry = load_addr + 0x200;
+        let owned_producer = authenticated_thumb_identity(
+            &image,
+            load_addr,
+            owned_entry,
+            &[(owned_entry, owned_entry + 8)],
+        );
+        let ordinary_producer = authenticated_thumb_identity(
+            &image,
+            load_addr,
+            ordinary_entry,
+            &[(ordinary_entry, ordinary_entry + 8)],
+        );
+
+        let mut owned = ghidra_function_in_image(
+            "FUN_owned",
+            owned_entry,
+            owned_entry + 4,
+            &[],
+            &image,
+            load_addr,
+        );
+        owned["decode_ranges"][0]["isa"] = serde_json::json!("thumb");
+        owned["thumb_creation_producer_blake3"] = serde_json::json!(crate::manifest::blake3_fixed(
+            owned_producer.execution_blake3
+        ));
+        let mut ordinary = ghidra_function_in_image(
+            "FUN_ordinary",
+            ordinary_entry,
+            ordinary_entry + 4,
+            &[],
+            &image,
+            load_addr,
+        );
+        ordinary["decode_ranges"][0]["isa"] = serde_json::json!("thumb");
+        write_map_functions(&dir, &[ordinary, owned]);
+
+        let (owned_ghidra, _) = identity_for(&dir, owned_entry, &image, load_addr);
+        let (ordinary_ghidra, _) = identity_for(&dir, ordinary_entry, &image, load_addr);
+        assert_ne!(
+            owned_ghidra.execution_blake3, owned_producer.execution_blake3,
+            "fixture must exercise independent producer and Ghidra identities"
+        );
+        let mut owned_symbol = ghidra_symbol_at(owned_entry, owned_ghidra.execution_blake3, None);
+        owned_symbol.original_name = "FUN_owned".into();
+        let mut ordinary_symbol =
+            ghidra_symbol_at(ordinary_entry, ordinary_ghidra.execution_blake3, None);
+        ordinary_symbol.original_name = "FUN_ordinary".into();
+        let symbols = vec![
+            ordinary_symbol,
+            strict_thumb_symbol(ordinary_entry, &ordinary_producer, 1),
+            owned_symbol,
+            strict_thumb_symbol(owned_entry, &owned_producer, 0),
+        ];
+
+        ThumbLineageFixture {
+            dir,
+            image,
+            load_addr,
+            owned_entry,
+            owned_producer,
+            ordinary_entry,
+            ordinary_producer,
+            symbols,
+        }
+    }
+
+    #[test]
+    fn map_emits_only_nominated_owned_thumb_lineage_in_canonical_order() {
+        let fixture = thumb_lineage_fixture("thumb_lineage");
+        let map_path = fixture.dir.join("map.json");
+        let written = write_pass2_symbol_map(
+            &map_path,
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &fixture.symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap();
+
+        assert_eq!(written.execution_count, 2);
+        assert_eq!(written.creation_count, 0);
+        let bytes = std::fs::read(&map_path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let executions_at = text.find("\n  \"executions\":").unwrap();
+        let lineage_at = text.find("\n  \"thumb_creation_lineage\":").unwrap();
+        let symbols_at = text.find("\n  \"symbols\":").unwrap();
+        assert!(executions_at < lineage_at && lineage_at < symbols_at);
+
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let lineage = parsed["thumb_creation_lineage"].as_array().unwrap();
+        assert_eq!(lineage.len(), 1, "ordinary overlap leaked into lineage");
+        assert_eq!(lineage[0]["execution"], 0);
+        assert_eq!(
+            lineage[0]["producer_execution_blake3"],
+            crate::manifest::blake3_fixed(fixture.owned_producer.execution_blake3)
+        );
+        assert_eq!(
+            lineage[0]["decode_ranges"],
+            serde_json::to_value(
+                fixture
+                    .owned_producer
+                    .decode_ranges
+                    .iter()
+                    .map(DecodeRangeWire::from_authenticated)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn map_requires_empty_thumb_lineage_without_nominations() {
+        let fixture = thumb_lineage_fixture("empty_thumb_lineage");
+        let functions_path = fixture.dir.join("decompiled/functions.json");
+        let mut records: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&functions_path).unwrap()).unwrap();
+        for record in &mut records {
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("thumb_creation_producer_blake3");
+        }
+        write_map_functions(&fixture.dir, &records);
+
+        let map_path = fixture.dir.join("map.json");
+        write_pass2_symbol_map(
+            &map_path,
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &fixture.symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(map_path).unwrap()).unwrap();
+        assert_eq!(parsed["thumb_creation_lineage"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn map_rejects_missing_or_ambiguous_nominated_producer_execution() {
+        let fixture = thumb_lineage_fixture("missing_thumb_lineage");
+        let symbols = fixture
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.execution_blake3 != Some(fixture.owned_producer.execution_blake3)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let error = write_pass2_symbol_map(
+            &fixture.dir.join("missing-map.json"),
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nominated producer execution"), "{error}");
+
+        let mut symbols = fixture.symbols.clone();
+        let mut duplicate = symbols
+            .iter()
+            .find(|symbol| symbol.execution_blake3 == Some(fixture.owned_producer.execution_blake3))
+            .unwrap()
+            .clone();
+        duplicate.owner = FunctionOwner::Run {
+            producer: crate::analysis_tool::AnalysisTool::Radare2,
+            region_index: 9,
+            run_index: 0,
+        };
+        symbols.push(duplicate);
+        let error = write_pass2_symbol_map(
+            &fixture.dir.join("ambiguous-map.json"),
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("ambiguous nominated producer execution"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn map_reauthenticates_nominated_producer_ranges() {
+        let fixture = thumb_lineage_fixture("authenticate_thumb_lineage");
+        let mut symbols = fixture.symbols.clone();
+        let producer = symbols
+            .iter_mut()
+            .find(|symbol| symbol.execution_blake3 == Some(fixture.owned_producer.execution_blake3))
+            .unwrap();
+        producer.decode_ranges[0].blake3 = "00".repeat(32);
+        let error = write_pass2_symbol_map(
+            &fixture.dir.join("map.json"),
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("runtime bytes"), "{error}");
+    }
+
+    #[test]
+    fn map_sorts_multiple_thumb_lineage_rows_by_ghidra_execution() {
+        let fixture = thumb_lineage_fixture("sorted_thumb_lineage");
+        let functions_path = fixture.dir.join("decompiled/functions.json");
+        let mut records: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&functions_path).unwrap()).unwrap();
+        let ordinary = records
+            .iter_mut()
+            .find(|record| record["entry"] == format!("0x{:x}", fixture.ordinary_entry))
+            .unwrap();
+        ordinary["thumb_creation_producer_blake3"] = serde_json::json!(
+            crate::manifest::blake3_fixed(fixture.ordinary_producer.execution_blake3)
+        );
+        write_map_functions(&fixture.dir, &records);
+
+        let map_path = fixture.dir.join("map.json");
+        write_pass2_symbol_map(
+            &map_path,
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &fixture.symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(map_path).unwrap()).unwrap();
+        let rows = parsed["thumb_creation_lineage"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["execution"], 0);
+        assert_eq!(rows[1]["execution"], 1);
+        assert_eq!(
+            rows[0]["producer_execution_blake3"],
+            crate::manifest::blake3_fixed(fixture.owned_producer.execution_blake3)
+        );
+        assert_eq!(
+            rows[1]["producer_execution_blake3"],
+            crate::manifest::blake3_fixed(fixture.ordinary_producer.execution_blake3)
+        );
+    }
+
+    #[test]
+    fn map_rejects_non_thumb_and_non_entry_first_nominated_ranges() {
+        let fixture = thumb_lineage_fixture("non_thumb_lineage");
+        let mut symbols = fixture.symbols.clone();
+        let producer = symbols
+            .iter_mut()
+            .find(|symbol| symbol.execution_blake3 == Some(fixture.owned_producer.execution_blake3))
+            .unwrap();
+        producer.decode_ranges[0].isa = "arm";
+        let error = write_pass2_symbol_map(
+            &fixture.dir.join("non-thumb-map.json"),
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Thumb-only"), "{error}");
+
+        let mut symbols = fixture.symbols.clone();
+        let producer = symbols
+            .iter_mut()
+            .find(|symbol| symbol.execution_blake3 == Some(fixture.owned_producer.execution_blake3))
+            .unwrap();
+        producer.decode_ranges[0].start = format!("0x{:08x}", fixture.owned_entry + 2);
+        let error = write_pass2_symbol_map(
+            &fixture.dir.join("non-entry-map.json"),
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("start at its entry"), "{error}");
+    }
+
+    #[test]
+    fn map_rejects_nominated_ranges_that_conflict_with_their_digest() {
+        let fixture = thumb_lineage_fixture("digest_conflict_lineage");
+        let mut symbols = fixture.symbols.clone();
+        let producer = symbols
+            .iter_mut()
+            .find(|symbol| symbol.execution_blake3 == Some(fixture.owned_producer.execution_blake3))
+            .unwrap();
+        producer.decode_ranges[0].end = format!("0x{:08x}", fixture.owned_entry + 6);
+        producer.decode_ranges[0].blake3 =
+            crate::manifest::blake3_bytes(&fixture.image[0x100..0x106]);
+        let error = write_pass2_symbol_map(
+            &fixture.dir.join("map.json"),
+            &fixture.dir,
+            "02_MAIN",
+            u64::from(fixture.load_addr),
+            &fixture.image,
+            &symbols,
+            None,
+            None,
+            &runtime_for(&fixture.image, fixture.load_addr),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not match its ranges"), "{error}");
+    }
+
     const EXCEPTION_TEST_BASE: u32 = 0x4001_0000;
     const EXCEPTION_RESET_ENTRY: u32 = 0x4001_0200;
     const EXCEPTION_SHARED_ENTRY: u32 = 0x4001_0280;
@@ -6008,8 +6675,11 @@ mod tests {
             "exception_roots",
             "pal",
             "functions_blake3",
+            "predecessor_symbol_pass2",
             "executions",
+            "thumb_creation_lineage",
             "symbols",
+            "creations",
         ]
         .to_vec();
         let mut positions: Vec<usize> = Vec::new();
@@ -6067,12 +6737,13 @@ mod tests {
             .split("\"executions\": [")
             .nth(1)
             .unwrap()
-            .split("],\n  \"symbols\"")
+            .split("],\n  \"thumb_creation_lineage\"")
             .next()
             .unwrap();
         for key in ["producer", "entry", "execution_blake3", "decode_ranges"] {
             assert!(execution_block.contains(&format!("\"{key}\":")));
         }
+        assert!(text.contains("\"thumb_creation_lineage\": []"));
         // Decision authorization fields follow the evidence-independent fields.
         let symbols_block = text.split("\"symbols\": [").nth(1).unwrap();
         let mut positions: Vec<usize> = Vec::new();

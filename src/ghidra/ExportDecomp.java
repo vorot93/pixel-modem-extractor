@@ -211,8 +211,10 @@ public class ExportDecomp extends HeadlessScript {
                     }
 
                     outDir.mkdirs();
+                    PalTasksSupport.ThumbOwnershipState thumbOwnership = pass2State == null
+                            ? null : pass2State.thumbOwnership();
                     stage(outDir, "functions.json", staged,
-                            (w) -> writeFunctionsJson(w, fm, listing));
+                            (w) -> writeFunctionsJson(w, fm, listing, thumbOwnership));
                     stage(outDir, "disasm.lst", staged,
                             (w) -> writeDisassembly(w, listing));
                     stage(outDir, "decompiled.c", staged, (w) -> writeDecompiledC(w, fm));
@@ -607,8 +609,8 @@ public class ExportDecomp extends HeadlessScript {
         }
     }
 
-    private void writeFunctionsJson(PrintWriter w, FunctionManager fm, Listing listing)
-            throws Exception {
+    private void writeFunctionsJson(PrintWriter w, FunctionManager fm, Listing listing,
+            PalTasksSupport.ThumbOwnershipState thumbOwnership) throws Exception {
         w.println("[");
         boolean first = true;
         for (Function fn : fm.getFunctions(true)) {
@@ -635,8 +637,13 @@ public class ExportDecomp extends HeadlessScript {
                             referenced.getEntryPoint().getOffset());
                 }
             }
+            PalTasksSupport.ThumbCreationOwnership owned = thumbOwnership == null
+                    ? null : thumbOwnership.at(entry);
+            String nomination = owned == null ? "" : String.format(
+                    ", \"thumb_creation_producer_blake3\": \"%s\"",
+                    owned.producerExecutionBlake3);
             w.print(String.format(
-                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s, \"thunk_of\": %s}",
+                "  {\"name\": \"%s\", \"primary_source\": \"%s\", \"entry\": \"0x%x\", \"end\": \"0x%x\", \"size\": %d, \"decode_ranges\": %s, \"decode_range_errors\": %s, \"data_refs\": %s, \"thunk_of\": %s%s}",
                 name,
                 PalTasksSupport.primarySource(fn.getSymbol().getSource()),
                 entry,
@@ -645,7 +652,8 @@ public class ExportDecomp extends HeadlessScript {
                 decodeRangesJson(projection.ranges),
                 decodeErrorsJson(projection.errors),
                 dataRefsJson(fn),
-                thunkOf));
+                thunkOf,
+                nomination));
             checkDeadline();
         }
         if (!first) {
