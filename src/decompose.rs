@@ -13,6 +13,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -193,6 +194,35 @@ pub struct ImageReport {
     /// wrong-image/non-conserving summary, or a missing pass-2 image result).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_types_error: Option<String>,
+    /// The eleven current-run `ApplyExceptionRoots` counters. The group is
+    /// all-or-none: `Some(0)` is an executed zero category, while `None`
+    /// means application did not run or did not complete for this image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_tables: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_roles: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_roots: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_functions_created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_functions_reapplied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_functions_existing: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_names_applied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_names_reapplied: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_names_preserved: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_names_not_requested: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_shared_entries: Option<usize>,
+    /// Reason-only exception application/currentness failure. Exclusive with
+    /// every numeric exception field above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception_error: Option<String>,
     /// The seven current-run PAL application counters, carried only by
     /// images whose pass-1 import applied a configured PAL task map
     /// (`ImageResult.pal_applied`); every image without one omits all seven.
@@ -263,6 +293,11 @@ impl ImageReport {
                 ("skipped", Some("opaque"), Some("opaque"), None, None)
             }
         };
+        let exception = if r.exception_error.is_none() {
+            r.exception_roots_applied.as_ref()
+        } else {
+            None
+        };
         ImageReport {
             image: r.label.clone(),
             status,
@@ -324,6 +359,25 @@ impl ImageReport {
             global_types_ineligible: None,
             global_types_skipped: None,
             global_types_error: None,
+            exception_tables: exception.map(decompile::AppliedExceptionRoots::tables),
+            exception_roles: exception.map(decompile::AppliedExceptionRoots::roles),
+            exception_roots: exception.map(decompile::AppliedExceptionRoots::entries),
+            exception_functions_created: exception
+                .map(decompile::AppliedExceptionRoots::functions_created),
+            exception_functions_reapplied: exception
+                .map(decompile::AppliedExceptionRoots::functions_reapplied),
+            exception_functions_existing: exception
+                .map(decompile::AppliedExceptionRoots::functions_existing),
+            exception_names_applied: exception.map(decompile::AppliedExceptionRoots::names_applied),
+            exception_names_reapplied: exception
+                .map(decompile::AppliedExceptionRoots::names_reapplied),
+            exception_names_preserved: exception
+                .map(decompile::AppliedExceptionRoots::names_preserved),
+            exception_names_not_requested: exception
+                .map(decompile::AppliedExceptionRoots::names_not_requested),
+            exception_shared_entries: exception
+                .map(decompile::AppliedExceptionRoots::shared_entries),
+            exception_error: r.exception_error.clone(),
             pal_tasks: r.pal_applied.as_ref().map(|pal| pal.tasks),
             pal_entries: r.pal_applied.as_ref().map(|pal| pal.entries),
             pal_functions_created: r.pal_applied.as_ref().map(|pal| pal.functions_created),
@@ -547,24 +601,66 @@ fn main_image_dir_name(images_dir: &Path) -> Option<String> {
 ///   `<ghidra>/images/<label>`   (slice file) -> `<images>/<label>/<label>.bin`
 ///   current `<ghidra>/export/<label>/`          -> `<images>/<label>/decompiled/`
 ///   present `<ghidra>/scatter/<label>/`         -> `<images>/<label>/scatter/`
+///   present `<ghidra>/exception_roots/<label>/roots.json`
+///                                -> `<images>/<label>/exception_roots/roots.json`
 ///   present `<ghidra>/pal_tasks/<label>/tasks.json`
 ///                                             -> `<images>/<label>/pal_tasks/tasks.json`
 ///   current raw-only scatter state              -> remove terminal `scatter/`
+///   explicit exception-root absence              -> remove owned terminal manifest
 ///   explicit PAL absence                        -> remove terminal `pal_tasks/`
 ///
-/// The PAL state follows the same explicit-ownership rule as scatter:
-/// `Unmanaged` (unrecognized image, or a non-current run) leaves both the
-/// terminal state and any leftover source untouched — currentness never
-/// comes from artifact existence.
-fn marshal_image(
+/// Every subsystem follows explicit ownership: its `Unmanaged` state leaves
+/// terminal and source bytes untouched. Exception generation completes before
+/// Ghidra, so a later analysis failure does not downgrade that independent
+/// state even though scatter/PAL terminal state does become unmanaged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExceptionMarshalStatus {
+    Present,
+    Absent,
+    Unmanaged,
+    Failed(String),
+}
+
+fn record_exception_marshal_status(
+    image: &mut decompile::ImageResult,
+    status: &ExceptionMarshalStatus,
+) {
+    match status {
+        ExceptionMarshalStatus::Present => {}
+        ExceptionMarshalStatus::Absent => {
+            image.exception_roots_applied = None;
+            image.exception_error = None;
+        }
+        ExceptionMarshalStatus::Unmanaged => {
+            image.exception_roots_applied = None;
+            if image.exception_error.is_none() {
+                image.exception_error =
+                    Some("current exception-root generation state is unmanaged".to_string());
+            }
+        }
+        ExceptionMarshalStatus::Failed(reason) => {
+            image.exception_roots_applied = None;
+            if image.exception_error.is_none() {
+                image.exception_error = Some(reason.clone());
+            }
+        }
+    }
+}
+
+struct MarshalImageStages {
+    exception: ExceptionMarshalStatus,
+    pal: Result<()>,
+}
+
+fn marshal_image_stages(
     ghidra_dir: &Path,
     images_dir: &Path,
     label: &str,
     export_current: bool,
-    scatter_state: decompile::RuntimeScatterState,
-    pal_state: &decompile::RuntimeTaskState,
+    runtime: &decompile::RuntimeAnalysisState,
+    exception_scatter_state: decompile::RuntimeScatterState,
     image_start: u32,
-) -> Result<()> {
+) -> Result<MarshalImageStages> {
     let dest = images_dir.join(label);
     std::fs::create_dir_all(&dest)?;
     let slice = ghidra_dir.join("images").join(label);
@@ -589,6 +685,17 @@ fn marshal_image(
     }
     let scatter = ghidra_dir.join("scatter").join(label);
     let scatter_dest = dest.join("scatter");
+    let scatter_state = if matches!(
+        runtime.exception,
+        decompile::RuntimeExceptionState::Present(_)
+    ) {
+        // Exception generation is independent of the later Ghidra outcome.
+        // Keep its runtime dependency terminal even when scatter/PAL state was
+        // downgraded for a failed analysis.
+        exception_scatter_state
+    } else {
+        runtime.scatter
+    };
     match scatter_state {
         decompile::RuntimeScatterState::Unmanaged => {}
         decompile::RuntimeScatterState::Absent => remove_any(&scatter_dest)?,
@@ -603,21 +710,281 @@ fn marshal_image(
             std::fs::rename(&scatter, scatter_dest)?;
         }
     }
-    let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
-    marshal_pal_tasks_with(
+    let exception = match marshal_exception_roots(
         ghidra_dir,
         images_dir,
         label,
-        pal_state,
+        &runtime.exception,
+        image_start,
+        exception_scatter_state,
+    ) {
+        Ok(()) => match runtime.exception {
+            decompile::RuntimeExceptionState::Present(_) => ExceptionMarshalStatus::Present,
+            decompile::RuntimeExceptionState::Absent => ExceptionMarshalStatus::Absent,
+            decompile::RuntimeExceptionState::Unmanaged => ExceptionMarshalStatus::Unmanaged,
+        },
+        Err(error) => ExceptionMarshalStatus::Failed(error.to_string()),
+    };
+    let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+    let pal = marshal_pal_tasks_with(
+        ghidra_dir,
+        images_dir,
+        label,
+        &runtime.tasks,
+        image_start,
+        runtime.scatter,
+        &mut rename,
+    );
+    Ok(MarshalImageStages { exception, pal })
+}
+
+#[cfg(test)]
+fn marshal_image(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    label: &str,
+    export_current: bool,
+    runtime: &decompile::RuntimeAnalysisState,
+    exception_scatter_state: decompile::RuntimeScatterState,
+    image_start: u32,
+) -> Result<ExceptionMarshalStatus> {
+    let stages = marshal_image_stages(
+        ghidra_dir,
+        images_dir,
+        label,
+        export_current,
+        runtime,
+        exception_scatter_state,
+        image_start,
+    )?;
+    stages.pal?;
+    Ok(stages.exception)
+}
+
+/// The terminal `pal_tasks/tasks.json` file name, shared by the marshal
+/// commit and the terminal validation paths.
+const PAL_MANIFEST_FILE: &str = "tasks.json";
+
+/// The terminal exception-root manifest leaf, shared by marshalling,
+/// terminal context construction, pass-2 restaging, and prune tests.
+const EXCEPTION_MANIFEST_FILE: &str = "roots.json";
+
+fn marshal_exception_roots(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    label: &str,
+    state: &decompile::RuntimeExceptionState,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+) -> Result<()> {
+    let mut rename = |from: &Path, to: &Path| std::fs::rename(from, to);
+    marshal_exception_roots_with(
+        ghidra_dir,
+        images_dir,
+        label,
+        state,
         image_start,
         scatter_state,
         &mut rename,
     )
 }
 
-/// The terminal `pal_tasks/tasks.json` file name, shared by the marshal
-/// commit and the terminal validation paths.
-const PAL_MANIFEST_FILE: &str = "tasks.json";
+/// Marshal exactly one owned exception-root manifest. Validation authenticates
+/// the source kit manifest against the already-terminal raw/scatter bytes
+/// before the destination leaf is touched. The rename is the atomic commit.
+fn marshal_exception_roots_with<R>(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    label: &str,
+    state: &decompile::RuntimeExceptionState,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    rename: &mut R,
+) -> Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let image_dir = images_dir.join(label);
+    let terminal_dir = image_dir.join("exception_roots");
+    let terminal_manifest = terminal_dir.join(EXCEPTION_MANIFEST_FILE);
+    match state {
+        decompile::RuntimeExceptionState::Unmanaged => return Ok(()),
+        decompile::RuntimeExceptionState::Absent => {
+            crate::exception_roots::clear_materialized(ghidra_dir, label)
+                .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+            let Some(image) = crate::trusted_fs::TrustedDirectory::open_existing(
+                &image_dir,
+                "terminal exception image directory",
+            )
+            .map_err(|error| Error::BadExceptionRoots(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            let Some(exception) = image
+                .open_directory_child("exception_roots", "terminal exception directory")
+                .map_err(|error| Error::BadExceptionRoots(error.to_string()))?
+            else {
+                return Ok(());
+            };
+            exception
+                .unlink_regular_file_if_exists(
+                    EXCEPTION_MANIFEST_FILE,
+                    "terminal exception manifest",
+                )
+                .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+            return Ok(());
+        }
+        decompile::RuntimeExceptionState::Present(map) => {
+            let source = ghidra_dir.join(&map.relative_path);
+            validate_terminal_exception_manifest(
+                &image_dir,
+                label,
+                image_start,
+                scatter_state,
+                &source,
+                map,
+            )?;
+            let image = crate::trusted_fs::TrustedDirectory::new(
+                &image_dir,
+                "terminal exception image directory",
+            )
+            .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+            let exception = image
+                .open_or_create_directory_child("exception_roots", "terminal exception directory")
+                .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+            exception
+                .require_regular_file_or_absent(
+                    EXCEPTION_MANIFEST_FILE,
+                    "terminal exception manifest",
+                )
+                .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+            rename(&source, &terminal_manifest).map_err(|error| {
+                Error::DecomposeIncomplete(format!(
+                    "exception-root manifest commit for {label} failed: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_exception_manifest(
+    image_dir: &Path,
+    label: &str,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    manifest: &Path,
+    expected: &crate::exception_roots::MaterializedExceptionRoots,
+) -> Result<crate::exception_roots::ValidatedExceptionRoots> {
+    let raw = std::fs::read(image_dir.join(format!("{label}.bin")))?;
+    let scatter_present = exception_scatter_present(label, scatter_state)?;
+    let scatter_load_map_blake3 = if scatter_present {
+        let bytes = std::fs::read(image_dir.join("scatter/load_map.json"))?;
+        Some(*blake3::hash(&bytes).as_bytes())
+    } else {
+        None
+    };
+    let runtime = if scatter_present {
+        crate::runtime_image::RuntimeImage::for_image_dir(&raw, image_start, image_dir)?
+    } else {
+        // Ignore a stale terminal scatter directory for structurally raw-only
+        // images. Currentness comes from the generation state above.
+        crate::runtime_image::RuntimeImage::from_plan(&raw, image_start, None)?
+    };
+    let validated = crate::exception_roots::read_with_identity(
+        manifest,
+        &runtime,
+        crate::exception_roots::ExceptionArtifactContext {
+            label,
+            toc_name: crate::manifest::toc_name(label),
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3,
+        },
+        &expected.identity,
+    )
+    .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+    let manifest_blake3 = crate::manifest::blake3_fixed(validated.manifest_blake3);
+    if manifest_blake3 != expected.blake3
+        || validated.plan.tables.len() != expected.tables
+        || validated.plan.roots.len() != expected.roots
+    {
+        return Err(Error::DecomposeIncomplete(format!(
+            "current exception-root manifest metadata for {label} does not match generation state"
+        )));
+    }
+    Ok(validated)
+}
+
+fn exception_scatter_present(label: &str, state: decompile::RuntimeScatterState) -> Result<bool> {
+    match state {
+        decompile::RuntimeScatterState::Present => Ok(true),
+        decompile::RuntimeScatterState::Absent => Ok(false),
+        // Scatter discovery is structurally MAIN-only. Every other image's
+        // exception discovery used a raw-only RuntimeImage even though the
+        // shared scatter state correctly remains unmanaged for that label.
+        decompile::RuntimeScatterState::Unmanaged if crate::manifest::toc_name(label) != "MAIN" => {
+            Ok(false)
+        }
+        decompile::RuntimeScatterState::Unmanaged => Err(Error::DecomposeIncomplete(format!(
+            "current scatter state for exception roots in {label} is unmanaged"
+        ))),
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExceptionMarshalTally {
+    images: usize,
+    tables: usize,
+    roots: usize,
+}
+
+impl ExceptionMarshalTally {
+    fn record(&mut self, map: &crate::exception_roots::MaterializedExceptionRoots) -> Result<()> {
+        let add = |total: usize, count: usize| {
+            total.checked_add(count).ok_or_else(|| {
+                Error::DecomposeIncomplete("exception-root marshalling totals overflow".to_string())
+            })
+        };
+        self.images = add(self.images, 1)?;
+        self.tables = add(self.tables, map.tables)?;
+        self.roots = add(self.roots, map.roots)?;
+        Ok(())
+    }
+}
+
+fn exception_roots_stage(
+    tally: Option<&ExceptionMarshalTally>,
+    absent_images: usize,
+    errors: &[(String, String)],
+    duration_ms: u128,
+) -> StageReport {
+    let Some(tally) = tally else {
+        return StageReport::failed(
+            "exception_roots",
+            "pass 1 state unavailable".to_string(),
+            duration_ms,
+        );
+    };
+    if !errors.is_empty() {
+        let error = errors
+            .iter()
+            .map(|(label, reason)| format!("{label}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return StageReport::failed("exception_roots", error, duration_ms);
+    }
+    if tally.images == 0 && absent_images > 0 {
+        return StageReport::skipped("exception_roots", "no exception vector tables");
+    }
+    StageReport::ok(
+        "exception_roots",
+        &format!(
+            "images/*/exception_roots/roots.json (images={}, tables={}, roots={})",
+            tally.images, tally.tables, tally.roots
+        ),
+        duration_ms,
+    )
+}
 
 /// Marshal one image's PAL task manifest under explicit-state ownership:
 ///
@@ -2051,6 +2418,245 @@ struct TerminalPalMap {
     context: symbolicate::PalPass2Context,
 }
 
+/// One image's authenticated exception-root state, reconstructed from the
+/// explicit current run after terminal marshalling. The canonical kit copies
+/// are the only paths passed to Ghidra; `context` binds those manifest bytes to
+/// the terminal raw/scatter bytes and exact pass-1 application summary.
+struct TerminalExceptionMap {
+    identity: String,
+    manifest_path: PathBuf,
+    scatter_manifest: Option<PathBuf>,
+    context: decompile::ExceptionPass2Context,
+}
+
+struct StagedExceptionFiles {
+    manifest_path: PathBuf,
+    scatter_manifest: Option<PathBuf>,
+    scatter_load_map_blake3: Option<[u8; 32]>,
+}
+
+fn copy_exception_file(
+    source_root: &crate::trusted_fs::TrustedDirectory,
+    source_relative: &Path,
+    target_dir: &crate::trusted_fs::TrustedDirectory,
+    target_name: &str,
+    context: &str,
+) -> Result<[u8; 32]> {
+    let mut source = source_root
+        .open_regular_file(source_relative, context)
+        .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+    let mut target = target_dir
+        .atomic_write_file(target_name, context)
+        .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        target.write_all(&buffer[..read])?;
+    }
+    target.commit()?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn canonical_staged_path(ghidra_dir: &Path, relative: &Path, context: &str) -> Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(ghidra_dir)?;
+    let expected = canonical_root.join(relative);
+    let canonical = std::fs::canonicalize(ghidra_dir.join(relative))?;
+    if canonical != expected || !canonical.is_file() {
+        return Err(Error::DecomposeIncomplete(format!(
+            "{context} is not a canonical regular file contained in the Ghidra kit: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn stage_terminal_scatter_files(
+    image_dir: &Path,
+    ghidra_dir: &Path,
+    label: &str,
+    image_base: u32,
+    raw: &[u8],
+) -> Result<(PathBuf, [u8; 32])> {
+    let digest = crate::scatter::restage_materialized(
+        image_dir,
+        &image_dir.join("scatter/load_map.json"),
+        raw,
+        image_base,
+        label,
+        ghidra_dir,
+    )?;
+    let relative = Path::new("scatter").join(label).join("load_map.json");
+    Ok((
+        canonical_staged_path(ghidra_dir, &relative, "pass-2 scatter artifact manifest")?,
+        digest,
+    ))
+}
+
+fn stage_terminal_exception_files(
+    image_dir: &Path,
+    ghidra_dir: &Path,
+    label: &str,
+    image_base: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    expected_manifest_blake3: &str,
+) -> Result<StagedExceptionFiles> {
+    let scatter_present = exception_scatter_present(label, scatter_state)?;
+    let source =
+        crate::trusted_fs::TrustedDirectory::new(image_dir, "terminal exception image directory")
+            .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+    let kit = crate::trusted_fs::TrustedDirectory::new(ghidra_dir, "Ghidra kit directory")
+        .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+
+    let exception_root = kit
+        .open_or_create_directory_child("exception_roots", "kit exception-root directory")
+        .and_then(|directory| {
+            directory.open_or_create_directory_child(label, "kit exception image directory")
+        })
+        .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+    let manifest_blake3 = copy_exception_file(
+        &source,
+        Path::new("exception_roots")
+            .join(EXCEPTION_MANIFEST_FILE)
+            .as_path(),
+        &exception_root,
+        EXCEPTION_MANIFEST_FILE,
+        "terminal exception manifest restage",
+    )?;
+    if crate::manifest::blake3_fixed(manifest_blake3) != expected_manifest_blake3 {
+        return Err(Error::DecomposeIncomplete(format!(
+            "terminal exception manifest for {label} changed after generation"
+        )));
+    }
+
+    let kit_images = kit
+        .open_or_create_directory_child("images", "kit image directory")
+        .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+    copy_exception_file(
+        &source,
+        Path::new(&format!("{label}.bin")),
+        &kit_images,
+        label,
+        "terminal exception raw-image restage",
+    )?;
+
+    let (scatter_manifest, scatter_load_map_blake3) = if scatter_present {
+        let raw = std::fs::read(ghidra_dir.join("images").join(label))?;
+        let (manifest, digest) =
+            stage_terminal_scatter_files(image_dir, ghidra_dir, label, image_base, &raw)?;
+        (Some(manifest), Some(digest))
+    } else {
+        (None, None)
+    };
+    let relative = Path::new("exception_roots")
+        .join(label)
+        .join(EXCEPTION_MANIFEST_FILE);
+    Ok(StagedExceptionFiles {
+        manifest_path: canonical_staged_path(ghidra_dir, &relative, "pass-2 exception manifest")?,
+        scatter_manifest,
+        scatter_load_map_blake3,
+    })
+}
+
+/// Reconstruct strict pass-2 exception contexts only for explicit present
+/// application state. Opaque skips retain generation output but have no Ghidra
+/// application summary, so they intentionally produce no context.
+fn load_terminal_exception_maps(
+    images_dir: &Path,
+    report: &decompile::DecompileReport,
+    ghidra_dir: &Path,
+) -> (HashMap<String, TerminalExceptionMap>, Vec<(String, String)>) {
+    let mut maps = HashMap::new();
+    let mut errors = Vec::new();
+    for image in &report.images {
+        let state = explicit_runtime_state(report, image);
+        match state.exception {
+            decompile::RuntimeExceptionState::Unmanaged => continue,
+            decompile::RuntimeExceptionState::Absent => {
+                if let Err(error) =
+                    crate::exception_roots::clear_materialized(ghidra_dir, &image.label)
+                {
+                    errors.push((
+                        image.label.clone(),
+                        format!("pass-2 exception absence restage: {error}"),
+                    ));
+                }
+                continue;
+            }
+            decompile::RuntimeExceptionState::Present(map) => {
+                let Some(applied) = image.exception_roots_applied.as_ref() else {
+                    if matches!(image.outcome, ImageOutcome::Analyzed(_)) {
+                        errors.push((
+                            image.label.clone(),
+                            "current exception application summary is missing".to_string(),
+                        ));
+                    }
+                    continue;
+                };
+                let label = &image.label;
+                let image_dir = images_dir.join(label);
+                let staged = stage_terminal_exception_files(
+                    &image_dir,
+                    ghidra_dir,
+                    label,
+                    image.image_start,
+                    report.runtime_scatter_state(label),
+                    &map.blake3,
+                );
+                let result = staged.and_then(|staged| {
+                    let context = decompile::read_exception_pass2_context(
+                        decompile::ExceptionPass2ContextInput {
+                            manifest_path: &staged.manifest_path,
+                            image_dir: &image_dir,
+                            image_label: label,
+                            toc_name: crate::manifest::toc_name(label),
+                            image_base: image.image_start,
+                            expected_identity: &map.identity,
+                            expected_scatter_load_map_blake3: staged.scatter_load_map_blake3,
+                            applied,
+                        },
+                    )?;
+                    Ok(TerminalExceptionMap {
+                        identity: map.identity.clone(),
+                        manifest_path: staged.manifest_path,
+                        scatter_manifest: staged.scatter_manifest,
+                        context,
+                    })
+                });
+                match result {
+                    Ok(terminal) => {
+                        maps.insert(label.clone(), terminal);
+                    }
+                    Err(error) => {
+                        let _ = crate::exception_roots::clear_materialized(ghidra_dir, label);
+                        errors.push((
+                            label.clone(),
+                            format!("terminal exception manifest: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    (maps, errors)
+}
+
+fn record_terminal_exception_errors(
+    report: &mut decompile::DecompileReport,
+    errors: &[(String, String)],
+) {
+    for (label, reason) in errors {
+        if let Some(image) = report.images.iter_mut().find(|image| image.label == *label) {
+            image.exception_roots_applied = None;
+            image.exception_error = Some(reason.clone());
+        }
+    }
+}
+
 /// Re-read every explicit `Present` image's terminal PAL manifest against
 /// the terminal raw/scatter bytes (validating the committed tree, never
 /// trusting directory existence) and derive the pass-2 symbolicate context.
@@ -2097,22 +2703,33 @@ fn load_terminal_pal_maps(
                         .join(label)
                         .join(PAL_MANIFEST_FILE);
                     stage_pass2_manifest(&terminal_manifest, &staged_manifest)?;
+                    // Both PAL and exception-root validators open every
+                    // file-backed scatter payload relative to the map. Copy
+                    // the raw bytes first, then restage the complete strict
+                    // artifact rather than only its load_map.json.
+                    let staged_raw = ghidra_dir.join("images").join(label);
+                    std::fs::create_dir_all(staged_raw.parent().expect("raw image parent"))?;
+                    std::fs::copy(image_dir.join(format!("{label}.bin")), &staged_raw)?;
                     let staged_scatter = match &terminal_scatter {
-                        Some(terminal) => {
-                            let staged =
-                                ghidra_dir.join("scatter").join(label).join("load_map.json");
-                            stage_pass2_manifest(terminal, &staged)?;
+                        Some(_) => {
+                            let raw = std::fs::read(&staged_raw)?;
+                            let (staged, digest) = stage_terminal_scatter_files(
+                                &image_dir,
+                                ghidra_dir,
+                                label,
+                                image.image_start,
+                                &raw,
+                            )?;
+                            if Some(digest) != artifact.scatter_load_map_blake3 {
+                                return Err(Error::BadScatter(
+                                    "pass-2 PAL scatter digest does not match the task manifest"
+                                        .into(),
+                                ));
+                            }
                             Some(staged)
                         }
                         None => None,
                     };
-                    // `readPal` re-authenticates the raw image at its pass-1
-                    // kit path (`<ghidra>/images/<label>`), which the marshal
-                    // moved to `images/<label>/<label>.bin`; restage those
-                    // bytes as well so the BLAKE3 check binds the same image.
-                    let staged_raw = ghidra_dir.join("images").join(label);
-                    std::fs::create_dir_all(staged_raw.parent().expect("raw image parent"))?;
-                    std::fs::copy(image_dir.join(format!("{label}.bin")), &staged_raw)?;
                     Ok((staged_manifest, staged_scatter))
                 })();
                 match restage {
@@ -2139,25 +2756,23 @@ fn load_terminal_pal_maps(
     (maps, errors)
 }
 
-/// The coherent runtime analysis state of one image, with the same
-/// non-current downgrade the pass-1 marshal applies: a failed or
-/// terminal-invalid run owns no current scatter or PAL state, so its
-/// explicit state is `Unmanaged` regardless of what an older run left on
-/// disk.
+/// The coherent runtime analysis state of one image. A failed or
+/// terminal-invalid Ghidra run owns no current terminal scatter or PAL state,
+/// but it does not invalidate exception-root generation that completed before
+/// Ghidra started.
 fn explicit_runtime_state(
     report: &decompile::DecompileReport,
     image: &decompile::ImageResult,
 ) -> decompile::RuntimeAnalysisState {
+    let mut runtime = report.runtime_analysis_state(&image.label);
     if matches!(
         image.outcome,
         ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid
     ) {
-        return decompile::RuntimeAnalysisState {
-            scatter: decompile::RuntimeScatterState::Unmanaged,
-            tasks: decompile::RuntimeTaskState::Unmanaged,
-        };
+        runtime.scatter = decompile::RuntimeScatterState::Unmanaged;
+        runtime.tasks = decompile::RuntimeTaskState::Unmanaged;
     }
-    report.runtime_analysis_state(&image.label)
+    runtime
 }
 
 /// Derive the symbolicate pass-2 PAL context from a validated artifact:
@@ -2235,6 +2850,7 @@ fn prepare_pass2_inputs(
     function_maps: &HashMap<String, PreparedFunctionMap>,
     global_maps: &HashMap<String, PreparedGlobalMap>,
     global_types_maps: &HashMap<String, decompile::PreparedPass2Map>,
+    exceptions: &HashMap<String, TerminalExceptionMap>,
     pal: &HashMap<String, TerminalPalMap>,
 ) -> HashMap<String, decompile::Pass2Input> {
     let mut inputs = HashMap::new();
@@ -2258,6 +2874,15 @@ fn prepare_pass2_inputs(
             .entry(label.clone())
             .or_insert_with(decompile::Pass2Input::default);
         input.global_types_map = Some(map.clone());
+    }
+    for (label, terminal) in exceptions {
+        let Some(input) = inputs.get_mut(label) else {
+            continue;
+        };
+        input.exception_context = Some(terminal.context.clone());
+        input.exception_identity = terminal.identity.clone();
+        input.exception_manifest = Some(terminal.manifest_path.clone());
+        input.scatter_manifest = terminal.scatter_manifest.clone();
     }
     // Pass-2 PAL wiring: every scheduled image whose run carried a present
     // PAL map agrees on that identity and receives the canonical terminal
@@ -3119,6 +3744,7 @@ fn build_and_write_symbol_maps(
     images_dir: &Path,
     token_db: &Path,
     manifest: &Path,
+    exceptions: &HashMap<String, TerminalExceptionMap>,
     pal: &HashMap<String, TerminalPalMap>,
 ) -> SymbolMapsResult {
     let mut errors: Vec<(String, String)> = Vec::new();
@@ -3175,7 +3801,7 @@ fn build_and_write_symbol_maps(
             &label,
             &tokens,
             manifest,
-            None,
+            exceptions.get(&label).map(|terminal| &terminal.context),
             pal.get(&label).map(|terminal| &terminal.context),
         );
         match bundle {
@@ -3278,36 +3904,80 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     };
     let mut pass1_report = match run_decompile_report(&modem_bin, &dopts, &ghidra_dir, &thumb_tools)
     {
-        Ok(rep) => {
+        Ok(mut rep) => {
             let mut image_reports = Vec::new();
             let mut marshal_err = None;
             let mut pal_tally = PalMarshalTally::default();
-            // The PAL stage measures its own marshal loop; it must not
-            // duplicate the decompile stage's pass-1 duration.
+            let mut exception_tally = ExceptionMarshalTally::default();
+            let mut exception_absent = 0usize;
+            let mut exception_errors = Vec::new();
+            // The terminal artifact stages share this marshal-loop clock;
+            // neither duplicates the decompile stage's pass-1 duration.
             let pal_started = Instant::now();
-            for ir in &rep.images {
+            for index in 0..rep.images.len() {
                 // A rejected export is as unusable as a failed Ghidra run, so
                 // its runtime scatter and PAL task state stay unmanaged
                 // either way — currentness is explicit state, never artifact
                 // existence.
-                let runtime_state = explicit_runtime_state(&rep, ir);
-                if let Err(e) = marshal_image(
+                let runtime_state = explicit_runtime_state(&rep, &rep.images[index]);
+                let exception_scatter_state = rep.runtime_scatter_state(&rep.images[index].label);
+                let export_current = rep.export_is_current(&rep.images[index].label);
+                let ir = &mut rep.images[index];
+                let marshal_stages = match marshal_image_stages(
                     &ghidra_dir,
                     &images_dir,
                     &ir.label,
-                    rep.export_is_current(&ir.label),
-                    runtime_state.scatter,
-                    &runtime_state.tasks,
+                    export_current,
+                    &runtime_state,
+                    exception_scatter_state,
                     ir.image_start,
                 ) {
-                    marshal_err = Some(e.to_string());
-                    break;
+                    Ok(stages) => stages,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        record_exception_marshal_status(
+                            ir,
+                            &ExceptionMarshalStatus::Failed(format!(
+                                "pass-1 marshal stopped before exception commit: {reason}"
+                            )),
+                        );
+                        exception_errors.push((ir.label.clone(), reason.clone()));
+                        marshal_err = Some(reason);
+                        break;
+                    }
+                };
+                record_exception_marshal_status(ir, &marshal_stages.exception);
+                match marshal_stages.exception {
+                    ExceptionMarshalStatus::Present => {
+                        let decompile::RuntimeExceptionState::Present(map) =
+                            &runtime_state.exception
+                        else {
+                            unreachable!("present marshal status requires present generation state")
+                        };
+                        if let Err(error) = exception_tally.record(map) {
+                            exception_errors.push((ir.label.clone(), error.to_string()));
+                        }
+                    }
+                    ExceptionMarshalStatus::Absent => exception_absent += 1,
+                    ExceptionMarshalStatus::Unmanaged => exception_errors.push((
+                        ir.label.clone(),
+                        "current exception-root generation state is unmanaged".to_string(),
+                    )),
+                    ExceptionMarshalStatus::Failed(error) => {
+                        exception_errors.push((ir.label.clone(), error));
+                    }
+                }
+                if let Err(error) = marshal_stages.pal {
+                    marshal_err.get_or_insert_with(|| error.to_string());
+                    image_reports.push(ImageReport::from_result(ir));
+                    continue;
                 }
                 if let decompile::RuntimeTaskState::Present(map) = &runtime_state.tasks
                     && let Err(e) = pal_tally.record(map)
                 {
-                    marshal_err = Some(e.to_string());
-                    break;
+                    marshal_err.get_or_insert_with(|| e.to_string());
+                    image_reports.push(ImageReport::from_result(ir));
+                    continue;
                 }
                 image_reports.push(ImageReport::from_result(ir));
             }
@@ -3316,6 +3986,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     stages.push(StageReport::decompile(
                         image_reports,
                         t.elapsed().as_millis(),
+                    ));
+                    stages.push(exception_roots_stage(
+                        Some(&exception_tally),
+                        exception_absent,
+                        &exception_errors,
+                        pal_started.elapsed().as_millis(),
                     ));
                     stages.push(pal_tasks_stage(
                         Some(&pal_tally),
@@ -3328,6 +4004,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         format!("marshal: {err}"),
                         t.elapsed().as_millis(),
                     ));
+                    stages.push(exception_roots_stage(
+                        Some(&exception_tally),
+                        exception_absent,
+                        &exception_errors,
+                        pal_started.elapsed().as_millis(),
+                    ));
                     stages.push(StageReport::skipped("pal_tasks", "pass 1 marshal failed"));
                 }
             }
@@ -3339,6 +4021,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 e.to_string(),
                 t.elapsed().as_millis(),
             ));
+            stages.push(exception_roots_stage(None, 0, &[], 0));
             // The failed decompile command owns the failure (e.g. malformed
             // PAL generation); the PAL stage defers to it.
             stages.push(pal_tasks_stage(None, 0));
@@ -3482,29 +4165,44 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
 
     // 6. Build the per-image symbol map from pass-1 outputs + attribution +
     //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
-    //    First resolve the terminal PAL maps (normal route only — the
-    //    symbol map's `pal` block and the pass-2 arguments both bind the
-    //    identity validated against the terminal raw/scatter bytes); a
-    //    terminal manifest the strict reader rejects fails the symbol-map
-    //    stage rather than binding an unauthenticated identity.
+    //    First resolve terminal exception-root and PAL maps (normal route
+    //    only). Their symbol-map blocks and pass-2 arguments bind identities
+    //    validated against terminal raw/scatter bytes; a terminal manifest
+    //    the strict reader rejects fails the symbol-map stage rather than
+    //    binding unauthenticated state.
+    let mut terminal_exception_maps: HashMap<String, TerminalExceptionMap> = HashMap::new();
     let mut terminal_pal_maps: HashMap<String, TerminalPalMap> = HashMap::new();
     let t = Instant::now();
     let (mut function_maps, symbol_map_errors) = if opts.no_symbol_pass {
         (HashMap::new(), Vec::new())
     } else {
-        let (pal_maps, pal_errors) = match pass1_report.as_ref() {
-            Some(report) => load_terminal_pal_maps(&images_dir, report, &ghidra_dir),
-            None => (HashMap::new(), Vec::new()),
+        let (exception_maps, exception_errors, pal_maps, pal_errors) = match pass1_report.as_ref() {
+            Some(report) => {
+                let (exception_maps, exception_errors) =
+                    load_terminal_exception_maps(&images_dir, report, &ghidra_dir);
+                let (pal_maps, pal_errors) =
+                    load_terminal_pal_maps(&images_dir, report, &ghidra_dir);
+                (exception_maps, exception_errors, pal_maps, pal_errors)
+            }
+            None => (HashMap::new(), Vec::new(), HashMap::new(), Vec::new()),
         };
+        if let Some(report) = pass1_report.as_mut() {
+            record_terminal_exception_errors(report, &exception_errors);
+        }
+        terminal_exception_maps = exception_maps;
         terminal_pal_maps = pal_maps;
         let (maps, errors) = build_and_write_symbol_maps(
             out,
             &images_dir,
             &token_db,
             &out.join("manifest.json"),
+            &terminal_exception_maps,
             &terminal_pal_maps,
         );
         let mut errors = errors;
+        for (label, error) in exception_errors {
+            errors.push((label, error));
+        }
         for (label, error) in pal_errors {
             errors.push((label, error));
         }
@@ -3670,6 +4368,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 &function_maps,
                 &prepared_global_maps,
                 &global_types_maps,
+                &terminal_exception_maps,
                 &terminal_pal_maps,
             );
             let scheduled_count = inputs.len();
@@ -4001,6 +4700,18 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+        }
+    }
+
+    fn runtime_state(
+        scatter: decompile::RuntimeScatterState,
+        tasks: decompile::RuntimeTaskState,
+        exception: decompile::RuntimeExceptionState,
+    ) -> decompile::RuntimeAnalysisState {
+        decompile::RuntimeAnalysisState {
+            scatter,
+            exception,
+            tasks,
         }
     }
 
@@ -4537,6 +5248,7 @@ mod tests {
             &global_maps,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(inputs.len(), 3);
@@ -4573,8 +5285,13 @@ mod tests {
             "02_MAIN".to_string(),
             decompile::PreparedPass2Map::new(&tp, std::num::NonZeroUsize::new(1).unwrap()).unwrap(),
         );
-        let inputs =
-            prepare_pass2_inputs(&HashMap::new(), &HashMap::new(), &types, &HashMap::new());
+        let inputs = prepare_pass2_inputs(
+            &HashMap::new(),
+            &HashMap::new(),
+            &types,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(inputs["02_MAIN"].global_types_map.is_some());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4666,6 +5383,7 @@ mod tests {
             ]),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(inputs["02_MAIN"].function_map.is_none());
         assert_eq!(inputs["02_MAIN"].global_map.as_ref().unwrap().count(), 1);
@@ -4752,6 +5470,7 @@ mod tests {
             &outcome.maps,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(
             inputs["02_MAIN"]
@@ -4816,6 +5535,7 @@ mod tests {
 
         let inputs = prepare_pass2_inputs(
             &function_maps,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -5725,6 +6445,7 @@ mod tests {
             &outcome.maps,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(
             inputs["02_MAIN"]
@@ -5789,6 +6510,7 @@ mod tests {
         let inputs = prepare_pass2_inputs(
             &function_maps,
             &outcome.maps,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -6207,6 +6929,18 @@ mod tests {
                         global_types_ineligible: None,
                         global_types_skipped: None,
                         global_types_error: None,
+                        exception_tables: None,
+                        exception_roles: None,
+                        exception_roots: None,
+                        exception_functions_created: None,
+                        exception_functions_reapplied: None,
+                        exception_functions_existing: None,
+                        exception_names_applied: None,
+                        exception_names_reapplied: None,
+                        exception_names_preserved: None,
+                        exception_names_not_requested: None,
+                        exception_shared_entries: None,
+                        exception_error: None,
                         pal_tasks: None,
                         pal_entries: None,
                         pal_functions_created: None,
@@ -6274,6 +7008,18 @@ mod tests {
                         global_types_ineligible: None,
                         global_types_skipped: None,
                         global_types_error: None,
+                        exception_tables: None,
+                        exception_roles: None,
+                        exception_roots: None,
+                        exception_functions_created: None,
+                        exception_functions_reapplied: None,
+                        exception_functions_existing: None,
+                        exception_names_applied: None,
+                        exception_names_reapplied: None,
+                        exception_names_preserved: None,
+                        exception_names_not_requested: None,
+                        exception_shared_entries: None,
+                        exception_error: None,
                         pal_tasks: None,
                         pal_entries: None,
                         pal_functions_created: None,
@@ -6917,6 +7663,18 @@ mod tests {
             global_types_ineligible: None,
             global_types_skipped: None,
             global_types_error: None,
+            exception_tables: None,
+            exception_roles: None,
+            exception_roots: None,
+            exception_functions_created: None,
+            exception_functions_reapplied: None,
+            exception_functions_existing: None,
+            exception_names_applied: None,
+            exception_names_reapplied: None,
+            exception_names_preserved: None,
+            exception_names_not_requested: None,
+            exception_shared_entries: None,
+            exception_error: None,
             pal_tasks: None,
             pal_entries: None,
             pal_functions_created: None,
@@ -7241,8 +7999,12 @@ mod tests {
             &images,
             "02_MAIN",
             true,
+            &runtime_state(
+                decompile::RuntimeScatterState::Present,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Present,
-            &decompile::RuntimeTaskState::Unmanaged,
             PAL_BASE,
         )
         .unwrap();
@@ -7313,8 +8075,12 @@ mod tests {
             &images,
             "02_MAIN",
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Present,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Present,
-            &decompile::RuntimeTaskState::Unmanaged,
             PAL_BASE,
         )
         .unwrap();
@@ -7330,8 +8096,12 @@ mod tests {
             &images,
             "02_MAIN",
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Absent,
-            &decompile::RuntimeTaskState::Unmanaged,
             PAL_BASE,
         )
         .unwrap();
@@ -7372,8 +8142,12 @@ mod tests {
             &images,
             "02_MAIN",
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Unmanaged,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Unmanaged,
-            &decompile::RuntimeTaskState::Unmanaged,
             PAL_BASE,
         )
         .unwrap();
@@ -7409,8 +8183,12 @@ mod tests {
             &root.join("images"),
             "02_MAIN",
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Present,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Present,
-            &decompile::RuntimeTaskState::Unmanaged,
             PAL_BASE,
         )
         .expect_err("a scatter metadata error must not be treated as absence");
@@ -7418,6 +8196,808 @@ mod tests {
         assert!(matches!(error, Error::Io(_)));
         assert_eq!(std::fs::read(retained).unwrap(), b"retained");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -------------------------------------------------------------------
+    // Exception-root terminal marshalling and reporting (Task 9)
+    // -------------------------------------------------------------------
+
+    const EXCEPTION_BASE: u32 = 0x4001_0000;
+    const EXCEPTION_LABEL: &str = "00_BOOT";
+
+    struct ExceptionMarshalFixture {
+        _root: tempfile::TempDir,
+        ghidra_dir: PathBuf,
+        images_dir: PathBuf,
+        image_dir: PathBuf,
+        source_manifest: PathBuf,
+        terminal_manifest: PathBuf,
+        state: decompile::RuntimeExceptionState,
+        image_start: u32,
+        scatter_state: decompile::RuntimeScatterState,
+        manifest_bytes: Vec<u8>,
+    }
+
+    impl ExceptionMarshalFixture {
+        fn present() -> Self {
+            Self::present_for(EXCEPTION_LABEL, "BOOT")
+        }
+
+        fn present_for(label: &str, toc_name: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let ghidra_dir = root.path().join("ghidra");
+            let images_dir = root.path().join("images");
+            let image_dir = images_dir.join(label);
+            std::fs::create_dir_all(&ghidra_dir).unwrap();
+            std::fs::create_dir_all(&image_dir).unwrap();
+            let raw = exception_root_fixture_bytes();
+            std::fs::write(image_dir.join(format!("{label}.bin")), &raw).unwrap();
+            let runtime =
+                crate::runtime_image::RuntimeImage::from_plan(&raw, EXCEPTION_BASE, None).unwrap();
+            let plan = crate::exception_roots::discover(&runtime, label, toc_name)
+                .unwrap()
+                .expect("fixture has a complete exception table");
+            let map = crate::exception_roots::materialize(
+                &plan,
+                crate::exception_roots::ExceptionArtifactContext {
+                    label,
+                    toc_name,
+                    image_blake3: *blake3::hash(&raw).as_bytes(),
+                    scatter_load_map_blake3: None,
+                },
+                &ghidra_dir,
+            )
+            .unwrap();
+            let source_manifest = ghidra_dir.join(&map.relative_path);
+            let manifest_bytes = std::fs::read(&source_manifest).unwrap();
+            let terminal_manifest = image_dir.join("exception_roots/roots.json");
+            Self {
+                _root: root,
+                ghidra_dir,
+                images_dir,
+                image_dir,
+                source_manifest,
+                terminal_manifest,
+                state: decompile::RuntimeExceptionState::Present(map),
+                image_start: EXCEPTION_BASE,
+                // Scatter discovery is structurally MAIN-only. Production
+                // records non-MAIN images as unmanaged, while exception-root
+                // discovery still builds their runtime view explicitly raw-only.
+                scatter_state: decompile::RuntimeScatterState::Unmanaged,
+                manifest_bytes,
+            }
+        }
+
+        fn absent() -> Self {
+            let mut fixture = Self::present();
+            fixture.state = decompile::RuntimeExceptionState::Absent;
+            fixture
+        }
+    }
+
+    fn exception_root_fixture_bytes() -> Vec<u8> {
+        let mut raw = vec![0u8; 0x400];
+        let targets = [0x200u32, 0x220, 0x240, 0x260, 0x280, 0x2c0, 0x2a0, 0x2c0];
+        for (index, offset) in targets.into_iter().enumerate() {
+            let slot = EXCEPTION_BASE + u32::try_from(index).unwrap() * 4;
+            let target = EXCEPTION_BASE + offset;
+            let displacement = (i64::from(target) - (i64::from(slot) + 8)) / 4;
+            let branch = 0xea00_0000 | u32::try_from(displacement & 0x00ff_ffff).unwrap();
+            raw[index * 4..index * 4 + 4].copy_from_slice(&branch.to_le_bytes());
+            let target_offset = usize::try_from(offset).unwrap();
+            raw[target_offset..target_offset + 4].copy_from_slice(&0xe12f_ff1eu32.to_le_bytes());
+        }
+        raw
+    }
+
+    fn exception_map(
+        state: &decompile::RuntimeExceptionState,
+    ) -> &crate::exception_roots::MaterializedExceptionRoots {
+        match state {
+            decompile::RuntimeExceptionState::Present(map) => map,
+            _ => panic!("fixture exception state is present"),
+        }
+    }
+
+    #[test]
+    fn marshal_exception_present_validates_before_terminal_replace() {
+        let fixture = ExceptionMarshalFixture::present();
+        std::fs::create_dir_all(fixture.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.terminal_manifest, b"old-complete-manifest").unwrap();
+        let error = marshal_exception_roots_with(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+            &mut |_from, _to| Err(std::io::Error::other("injected rename failure")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected rename failure"));
+        assert_eq!(
+            std::fs::read(&fixture.terminal_manifest).unwrap(),
+            b"old-complete-manifest"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.source_manifest).unwrap(),
+            fixture.manifest_bytes
+        );
+    }
+
+    #[test]
+    fn marshal_exception_present_replaces_only_owned_manifest() {
+        let fixture = ExceptionMarshalFixture::present();
+        std::fs::create_dir_all(fixture.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.terminal_manifest, b"stale").unwrap();
+        let foreign = fixture.image_dir.join("exception_roots/foreign.bin");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        let stale_scatter = fixture.image_dir.join("scatter/load_map.json");
+        std::fs::create_dir_all(stale_scatter.parent().unwrap()).unwrap();
+        std::fs::write(&stale_scatter, b"stale-non-main-scatter").unwrap();
+
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&fixture.terminal_manifest).unwrap(),
+            fixture.manifest_bytes
+        );
+        assert!(!fixture.source_manifest.exists());
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
+        assert_eq!(
+            std::fs::read(stale_scatter).unwrap(),
+            b"stale-non-main-scatter",
+            "raw-only exception validation must neither consume nor trust stale scatter"
+        );
+    }
+
+    #[test]
+    fn marshal_exception_absent_clears_only_owned_manifests() {
+        let fixture = ExceptionMarshalFixture::absent();
+        std::fs::create_dir_all(fixture.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.terminal_manifest, b"stale").unwrap();
+        let foreign = fixture.image_dir.join("exception_roots/foreign.bin");
+        std::fs::write(&foreign, b"foreign").unwrap();
+
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+
+        assert!(!fixture.terminal_manifest.exists());
+        assert!(!fixture.source_manifest.exists());
+        assert!(fixture.terminal_manifest.parent().unwrap().is_dir());
+        assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn marshal_exception_unmanaged_preserves_terminal_and_source_bytes() {
+        let mut fixture = ExceptionMarshalFixture::present();
+        fixture.state = decompile::RuntimeExceptionState::Unmanaged;
+        std::fs::create_dir_all(fixture.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.terminal_manifest, b"old-terminal").unwrap();
+        std::fs::write(&fixture.source_manifest, b"old-source").unwrap();
+
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&fixture.terminal_manifest).unwrap(),
+            b"old-terminal"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.source_manifest).unwrap(),
+            b"old-source"
+        );
+    }
+
+    #[test]
+    fn marshal_exception_strict_context_mismatch_preserves_old_manifest() {
+        let fixture = ExceptionMarshalFixture::present();
+        std::fs::create_dir_all(fixture.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.terminal_manifest, b"old-terminal").unwrap();
+        std::fs::write(
+            fixture.image_dir.join(format!("{EXCEPTION_LABEL}.bin")),
+            vec![0u8; 0x400],
+        )
+        .unwrap();
+
+        let error = marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exception"));
+        assert_eq!(
+            std::fs::read(&fixture.terminal_manifest).unwrap(),
+            b"old-terminal"
+        );
+        assert!(fixture.source_manifest.is_file());
+    }
+
+    #[test]
+    fn marshal_image_reports_exception_failure_without_hiding_later_images() {
+        let fixture = ExceptionMarshalFixture::present();
+        std::fs::create_dir_all(fixture.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.terminal_manifest, b"old-terminal").unwrap();
+        std::fs::write(&fixture.source_manifest, b"not a current manifest").unwrap();
+
+        let status = marshal_image(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            false,
+            &runtime_state(
+                fixture.scatter_state,
+                decompile::RuntimeTaskState::Unmanaged,
+                fixture.state.clone(),
+            ),
+            fixture.scatter_state,
+            fixture.image_start,
+        )
+        .expect("exception marshalling has its own stage failure surface");
+
+        assert!(
+            matches!(status, ExceptionMarshalStatus::Failed(reason) if reason.contains("exception"))
+        );
+        assert_eq!(
+            std::fs::read(&fixture.terminal_manifest).unwrap(),
+            b"old-terminal"
+        );
+    }
+
+    #[test]
+    fn exception_roots_stage_reports_tallies_absence_and_failures() {
+        let fixture = ExceptionMarshalFixture::present();
+        let mut tally = ExceptionMarshalTally::default();
+        tally.record(exception_map(&fixture.state)).unwrap();
+        let ok = exception_roots_stage(Some(&tally), 0, &[], 9);
+        assert_eq!(ok.stage, "exception_roots");
+        assert_eq!(ok.status, "ok");
+        assert_eq!(
+            ok.output.as_deref(),
+            Some("images/*/exception_roots/roots.json (images=1, tables=1, roots=7)")
+        );
+        assert_eq!(ok.duration_ms, 9);
+
+        let skipped = exception_roots_stage(Some(&ExceptionMarshalTally::default()), 2, &[], 4);
+        assert_eq!(skipped.status, "skipped");
+        assert_eq!(
+            skipped.reason.as_deref(),
+            Some("no exception vector tables")
+        );
+
+        let failed = exception_roots_stage(
+            Some(&ExceptionMarshalTally::default()),
+            1,
+            &[(
+                "01_MAIN".into(),
+                "current exception state is unmanaged".into(),
+            )],
+            5,
+        );
+        assert_eq!(failed.status, "failed");
+        assert!(failed.error.as_deref().unwrap().contains("01_MAIN"));
+
+        let unavailable = exception_roots_stage(None, 0, &[], 0);
+        assert_eq!(unavailable.status, "failed");
+        assert_eq!(
+            unavailable.error.as_deref(),
+            Some("pass 1 state unavailable")
+        );
+    }
+
+    fn image_result_with_current_exception_manifest(
+        outcome: ImageOutcome,
+    ) -> decompile::ImageResult {
+        let fixture = ExceptionMarshalFixture::present();
+        let map = exception_map(&fixture.state).clone();
+        let mut result = analyzed_image(EXCEPTION_LABEL);
+        result.outcome = outcome;
+        result.image_start = fixture.image_start;
+        result.image_len = u32::try_from(exception_root_fixture_bytes().len()).unwrap();
+        result.exception_state = decompile::RuntimeExceptionState::Present(map);
+        result
+    }
+
+    #[test]
+    fn image_report_serializes_exception_roots() {
+        let fixture = ExceptionMarshalFixture::present();
+        let map = exception_map(&fixture.state);
+        let mut result = analyzed_image(EXCEPTION_LABEL);
+        result.exception_state = fixture.state.clone();
+        result.exception_roots_applied = Some(decompile::test_applied_exception_roots(
+            EXCEPTION_LABEL,
+            &map.identity,
+        ));
+        let report = ImageReport::from_result(&result);
+        assert_eq!(report.exception_tables, Some(1));
+        assert_eq!(report.exception_roles, Some(8));
+        assert_eq!(report.exception_roots, Some(7));
+        assert_eq!(report.exception_functions_created, Some(5));
+        assert_eq!(report.exception_functions_reapplied, Some(0));
+        assert_eq!(report.exception_functions_existing, Some(2));
+        assert_eq!(report.exception_names_applied, Some(5));
+        assert_eq!(report.exception_names_reapplied, Some(0));
+        assert_eq!(report.exception_names_preserved, Some(1));
+        assert_eq!(report.exception_names_not_requested, Some(1));
+        assert_eq!(report.exception_shared_entries, Some(1));
+        assert_eq!(report.exception_error, None);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["exception_functions_reapplied"], 0);
+        assert_eq!(json["exception_names_reapplied"], 0);
+
+        result.exception_error = Some("strict context failed".into());
+        let failed = ImageReport::from_result(&result);
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["exception_error"], "strict context failed");
+        for field in [
+            "exception_tables",
+            "exception_roles",
+            "exception_roots",
+            "exception_functions_created",
+            "exception_functions_reapplied",
+            "exception_functions_existing",
+            "exception_names_applied",
+            "exception_names_reapplied",
+            "exception_names_preserved",
+            "exception_names_not_requested",
+            "exception_shared_entries",
+        ] {
+            assert!(
+                json.get(field).is_none(),
+                "{field} must be exclusive with error"
+            );
+        }
+
+        let plain =
+            serde_json::to_value(ImageReport::from_result(&analyzed_image("03_VSS"))).unwrap();
+        assert!(plain.get("exception_roots").is_none());
+        assert!(plain.get("exception_error").is_none());
+    }
+
+    #[test]
+    fn exception_marshal_failure_survives_report_refresh_without_stale_counts() {
+        let fixture = ExceptionMarshalFixture::present();
+        let map = exception_map(&fixture.state);
+        let mut result = image_result_with_current_exception_manifest(ImageOutcome::Analyzed(1));
+        result.exception_roots_applied = Some(decompile::test_applied_exception_roots(
+            EXCEPTION_LABEL,
+            &map.identity,
+        ));
+
+        record_exception_marshal_status(
+            &mut result,
+            &ExceptionMarshalStatus::Failed("injected terminal failure".to_string()),
+        );
+        let mut stages = vec![StageReport::decompile(
+            vec![ImageReport::from_result(&analyzed_image(EXCEPTION_LABEL))],
+            0,
+        )];
+        refresh_decompile_stage_images(&mut stages, &[result]);
+        let report = &stages[0].images[0];
+
+        assert_eq!(report.exception_tables, None);
+        assert_eq!(report.exception_roots, None);
+        assert_eq!(
+            report.exception_error.as_deref(),
+            Some("injected terminal failure")
+        );
+    }
+
+    #[test]
+    fn exception_marshal_preserves_the_pass1_root_cause() {
+        let mut result = analyzed_image(EXCEPTION_LABEL);
+        result.exception_error = Some("specific ApplyExceptionRoots failure".to_string());
+
+        record_exception_marshal_status(&mut result, &ExceptionMarshalStatus::Unmanaged);
+
+        assert_eq!(
+            result.exception_error.as_deref(),
+            Some("specific ApplyExceptionRoots failure")
+        );
+
+        record_exception_marshal_status(
+            &mut result,
+            &ExceptionMarshalStatus::Failed("later marshal failure".to_string()),
+        );
+        assert_eq!(
+            result.exception_error.as_deref(),
+            Some("specific ApplyExceptionRoots failure")
+        );
+    }
+
+    #[test]
+    fn terminal_exception_context_error_replaces_application_counts() {
+        let fixture = ExceptionMarshalFixture::present();
+        let mut report = current_exception_report(&fixture);
+
+        record_terminal_exception_errors(
+            &mut report,
+            &[(
+                EXCEPTION_LABEL.to_string(),
+                "terminal bytes drifted".to_string(),
+            )],
+        );
+        let image = ImageReport::from_result(&report.images[0]);
+
+        assert_eq!(image.exception_tables, None);
+        assert_eq!(image.exception_roots, None);
+        assert_eq!(
+            image.exception_error.as_deref(),
+            Some("terminal bytes drifted")
+        );
+    }
+
+    #[test]
+    fn opaque_skip_can_marshal_generation_manifest_without_application_counts() {
+        let result = image_result_with_current_exception_manifest(ImageOutcome::SkippedOpaque(
+            crate::classify::classify(&crate::classify::test_uniform_blob(256 * 1024)),
+        ));
+        let report = ImageReport::from_result(&result);
+        assert!(matches!(
+            result.exception_state,
+            decompile::RuntimeExceptionState::Present(_)
+        ));
+        assert_eq!(report.exception_roots, None);
+        assert_eq!(report.exception_functions_created, None);
+        assert_eq!(report.exception_error, None);
+    }
+
+    #[test]
+    fn failed_ghidra_does_not_downgrade_current_exception_generation() {
+        let fixture = ExceptionMarshalFixture::present();
+        let mut report = current_exception_report(&fixture);
+        report.images[0].outcome = ImageOutcome::Failed(1);
+
+        let state = explicit_runtime_state(&report, &report.images[0]);
+
+        assert!(matches!(
+            state.exception,
+            decompile::RuntimeExceptionState::Present(_)
+        ));
+        assert_eq!(state.scatter, decompile::RuntimeScatterState::Unmanaged);
+        assert_eq!(state.tasks, decompile::RuntimeTaskState::Unmanaged);
+    }
+
+    #[test]
+    fn failed_main_marshals_exception_against_generation_scatter_state() {
+        let fixture = ExceptionMarshalFixture::present_for("02_MAIN", "MAIN");
+        std::fs::create_dir_all(fixture.image_dir.join("scatter")).unwrap();
+        std::fs::write(
+            fixture.image_dir.join("scatter/load_map.json"),
+            b"stale-scatter",
+        )
+        .unwrap();
+        let mut image = analyzed_image("02_MAIN");
+        image.outcome = ImageOutcome::Failed(1);
+        image.image_start = fixture.image_start;
+        image.image_len = u32::try_from(exception_root_fixture_bytes().len()).unwrap();
+        image.exception_state = fixture.state.clone();
+        let report = decompile::test_decompile_report(
+            vec![image],
+            HashMap::from([(
+                "02_MAIN".to_string(),
+                decompile::RuntimeScatterState::Absent,
+            )]),
+        );
+        let runtime = explicit_runtime_state(&report, &report.images[0]);
+
+        let status = marshal_image(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            "02_MAIN",
+            false,
+            &runtime,
+            report.runtime_scatter_state("02_MAIN"),
+            fixture.image_start,
+        )
+        .unwrap();
+
+        assert_eq!(status, ExceptionMarshalStatus::Present);
+        assert!(!fixture.image_dir.join("scatter").exists());
+        assert_eq!(
+            std::fs::read(&fixture.terminal_manifest).unwrap(),
+            fixture.manifest_bytes
+        );
+    }
+
+    fn current_exception_report(fixture: &ExceptionMarshalFixture) -> decompile::DecompileReport {
+        let map = exception_map(&fixture.state);
+        let mut image = analyzed_image(EXCEPTION_LABEL);
+        image.image_start = fixture.image_start;
+        image.image_len = u32::try_from(exception_root_fixture_bytes().len()).unwrap();
+        image.exception_state = fixture.state.clone();
+        image.exception_roots_applied = Some(decompile::test_applied_exception_roots(
+            EXCEPTION_LABEL,
+            &map.identity,
+        ));
+        decompile::test_decompile_report(
+            vec![image],
+            HashMap::from([(
+                EXCEPTION_LABEL.to_string(),
+                decompile::RuntimeScatterState::Unmanaged,
+            )]),
+        )
+    }
+
+    #[test]
+    fn terminal_exception_context_is_strict_and_restaged_byte_identically() {
+        let fixture = ExceptionMarshalFixture::present();
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+        let stale_scatter = fixture.image_dir.join("scatter/load_map.json");
+        std::fs::create_dir_all(stale_scatter.parent().unwrap()).unwrap();
+        std::fs::write(&stale_scatter, b"stale-non-main-scatter").unwrap();
+        let report = current_exception_report(&fixture);
+
+        let (maps, errors) =
+            load_terminal_exception_maps(&fixture.images_dir, &report, &fixture.ghidra_dir);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        let terminal = &maps[EXCEPTION_LABEL];
+        assert_eq!(terminal.identity, exception_map(&fixture.state).identity);
+        assert_eq!(terminal.context.identity(), terminal.identity);
+        assert_eq!(
+            std::fs::read(&terminal.manifest_path).unwrap(),
+            fixture.manifest_bytes
+        );
+        assert_eq!(
+            terminal.manifest_path,
+            std::fs::canonicalize(
+                fixture
+                    .ghidra_dir
+                    .join("exception_roots/00_BOOT/roots.json")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(fixture.ghidra_dir.join("images/00_BOOT")).unwrap(),
+            exception_root_fixture_bytes()
+        );
+        assert!(terminal.scatter_manifest.is_none());
+        assert_eq!(
+            std::fs::read(stale_scatter).unwrap(),
+            b"stale-non-main-scatter"
+        );
+    }
+
+    #[test]
+    fn terminal_exception_restage_includes_authenticated_scatter_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let ghidra_dir = root.path().join("ghidra");
+        let producer_dir = root.path().join("producer");
+        let image_dir = root.path().join("images").join(EXCEPTION_LABEL);
+        std::fs::create_dir_all(&ghidra_dir).unwrap();
+        std::fs::create_dir_all(&producer_dir).unwrap();
+        std::fs::create_dir_all(&image_dir).unwrap();
+
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/scatter");
+        let raw = std::fs::read(fixture_dir.join("synthetic.bin")).unwrap();
+        std::fs::write(image_dir.join(format!("{EXCEPTION_LABEL}.bin")), &raw).unwrap();
+        let plan = crate::scatter::discover(&raw, EXCEPTION_BASE)
+            .unwrap()
+            .expect("fixture has a discoverable scatter map");
+        let materialized =
+            crate::scatter::materialize(&plan, &raw, EXCEPTION_LABEL, &producer_dir).unwrap();
+        std::fs::rename(
+            producer_dir.join("scatter").join(EXCEPTION_LABEL),
+            image_dir.join("scatter"),
+        )
+        .unwrap();
+
+        let manifest_bytes = std::fs::read(fixture_dir.join(EXCEPTION_MANIFEST_FILE)).unwrap();
+        let terminal_manifest = image_dir
+            .join("exception_roots")
+            .join(EXCEPTION_MANIFEST_FILE);
+        std::fs::create_dir_all(terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&terminal_manifest, &manifest_bytes).unwrap();
+        assert_eq!(
+            materialized.blake3,
+            crate::manifest::blake3_file(&image_dir.join("scatter/load_map.json")).unwrap()
+        );
+
+        let staged = stage_terminal_exception_files(
+            &image_dir,
+            &ghidra_dir,
+            EXCEPTION_LABEL,
+            EXCEPTION_BASE,
+            decompile::RuntimeScatterState::Present,
+            &crate::manifest::blake3_bytes(&manifest_bytes),
+        )
+        .unwrap();
+
+        let staged_runtime = crate::runtime_image::RuntimeImage::from_artifact(
+            &raw,
+            EXCEPTION_BASE,
+            &ghidra_dir,
+            staged.scatter_manifest.as_deref(),
+        )
+        .expect("the staged scatter map must retain every authenticated payload");
+        assert_eq!(
+            staged_runtime
+                .read_exact(EXCEPTION_BASE + 0x1000, 2)
+                .unwrap()
+                .as_ref(),
+            &raw[0x2c0..0x2c2]
+        );
+    }
+
+    #[test]
+    fn terminal_exception_context_rejects_drift_without_restaging() {
+        let fixture = ExceptionMarshalFixture::present();
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.image_dir.join(format!("{EXCEPTION_LABEL}.bin")),
+            vec![0u8; 0x400],
+        )
+        .unwrap();
+        let report = current_exception_report(&fixture);
+
+        let (maps, errors) =
+            load_terminal_exception_maps(&fixture.images_dir, &report, &fixture.ghidra_dir);
+
+        assert!(maps.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("terminal exception"));
+        assert!(!fixture.source_manifest.exists());
+    }
+
+    #[test]
+    fn terminal_exception_context_requires_explicit_application_state() {
+        let fixture = ExceptionMarshalFixture::present();
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fixture.source_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&fixture.source_manifest, b"stale-kit-bytes").unwrap();
+        let mut image = image_result_with_current_exception_manifest(ImageOutcome::SkippedOpaque(
+            crate::classify::classify(&crate::classify::test_uniform_blob(256 * 1024)),
+        ));
+        image.image_start = fixture.image_start;
+        image.image_len = u32::try_from(exception_root_fixture_bytes().len()).unwrap();
+        image.exception_state = fixture.state.clone();
+        let report = decompile::test_decompile_report(
+            vec![image],
+            HashMap::from([(
+                EXCEPTION_LABEL.to_string(),
+                decompile::RuntimeScatterState::Absent,
+            )]),
+        );
+
+        let (maps, errors) =
+            load_terminal_exception_maps(&fixture.images_dir, &report, &fixture.ghidra_dir);
+
+        assert!(maps.is_empty());
+        assert!(errors.is_empty());
+        assert_eq!(
+            std::fs::read(&fixture.source_manifest).unwrap(),
+            b"stale-kit-bytes",
+            "missing application state must not probe or consume a stale kit manifest"
+        );
+    }
+
+    #[test]
+    fn terminal_exception_context_skips_failed_image_without_application_state() {
+        let fixture = ExceptionMarshalFixture::present();
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+        let mut report = current_exception_report(&fixture);
+        report.images[0].outcome = ImageOutcome::Failed(1);
+        report.images[0].exception_roots_applied = None;
+
+        let (maps, errors) =
+            load_terminal_exception_maps(&fixture.images_dir, &report, &fixture.ghidra_dir);
+
+        assert!(maps.is_empty());
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn exception_prepare_pass2_inputs_wires_context_identity_and_manifest() {
+        let fixture = ExceptionMarshalFixture::present();
+        marshal_exception_roots(
+            &fixture.ghidra_dir,
+            &fixture.images_dir,
+            EXCEPTION_LABEL,
+            &fixture.state,
+            fixture.image_start,
+            fixture.scatter_state,
+        )
+        .unwrap();
+        let report = current_exception_report(&fixture);
+        let (exceptions, errors) =
+            load_terminal_exception_maps(&fixture.images_dir, &report, &fixture.ghidra_dir);
+        assert!(errors.is_empty(), "{errors:?}");
+        let function_maps = HashMap::from([(
+            EXCEPTION_LABEL.to_string(),
+            PreparedFunctionMap {
+                pass2_map: Some(prepared_symbol_test_map(
+                    "exception_wire",
+                    EXCEPTION_LABEL,
+                    1,
+                )),
+                creation_plan: Default::default(),
+                function_names: HashMap::new(),
+                evidence_name_projection: Default::default(),
+            },
+        )]);
+
+        let inputs = prepare_pass2_inputs(
+            &function_maps,
+            &HashMap::new(),
+            &HashMap::new(),
+            &exceptions,
+            &HashMap::new(),
+        );
+        let input = &inputs[EXCEPTION_LABEL];
+        let terminal = &exceptions[EXCEPTION_LABEL];
+        assert_eq!(input.exception_identity, terminal.identity);
+        assert_eq!(
+            input.exception_manifest.as_deref(),
+            Some(terminal.manifest_path.as_path())
+        );
+        assert_eq!(
+            input
+                .exception_context
+                .as_ref()
+                .map(|context| context.identity()),
+            Some(terminal.identity.as_str())
+        );
     }
 
     // -------------------------------------------------------------------
@@ -7513,8 +9093,12 @@ mod tests {
             &images,
             label,
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                decompile::RuntimeTaskState::Present(map.clone()),
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Absent,
-            &decompile::RuntimeTaskState::Present(map.clone()),
             PAL_BASE,
         )
         .unwrap();
@@ -7543,8 +9127,12 @@ mod tests {
             &images,
             label,
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Absent,
-            &decompile::RuntimeTaskState::Unmanaged,
             PAL_BASE,
         )
         .unwrap();
@@ -7561,8 +9149,12 @@ mod tests {
             &images,
             label,
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                decompile::RuntimeTaskState::Absent,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Absent,
-            &decompile::RuntimeTaskState::Absent,
             PAL_BASE,
         )
         .unwrap();
@@ -7593,8 +9185,12 @@ mod tests {
             &images,
             label,
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                present.clone(),
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Absent,
-            &present,
             PAL_BASE,
         )
         .expect_err("a corrupt source manifest must fail closed");
@@ -7640,6 +9236,46 @@ mod tests {
     }
 
     #[test]
+    fn pal_marshal_failure_does_not_block_exception_terminal_commit() {
+        let root = pal_temp_root("marshal_failure_after_exception");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let (present, _) = materialize_raw_pal_fixture(&ghidra, label);
+        pal_marshal_tree(&ghidra, &images, label, &craft_bytes());
+        std::fs::write(
+            ghidra.join("pal_tasks").join(label).join("tasks.json"),
+            b"{not a manifest",
+        )
+        .unwrap();
+        let terminal_exception = images.join(label).join("exception_roots/roots.json");
+        std::fs::create_dir_all(terminal_exception.parent().unwrap()).unwrap();
+        std::fs::write(&terminal_exception, b"stale exception state").unwrap();
+
+        let error = marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                present,
+                decompile::RuntimeExceptionState::Absent,
+            ),
+            decompile::RuntimeScatterState::Absent,
+            PAL_BASE,
+        )
+        .expect_err("the malformed PAL manifest still fails the image marshal");
+
+        assert!(error.to_string().to_lowercase().contains("pal"));
+        assert!(
+            !terminal_exception.exists(),
+            "exception absence commits independently before PAL validation"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn pal_marshal_authenticates_scatter_backed_manifest() {
         let root = pal_temp_root("marshal_scatter");
         let ghidra = root.join("ghidra");
@@ -7669,8 +9305,12 @@ mod tests {
             &images,
             label,
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Present,
+                present.clone(),
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Present,
-            &present,
             PAL_BASE,
         )
         .unwrap();
@@ -7706,6 +9346,67 @@ mod tests {
             std::fs::read(images.join(label).join("pal_tasks").join("tasks.json")).unwrap(),
             manifest_bytes
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn terminal_pal_restage_includes_authenticated_scatter_payloads() {
+        let root = pal_temp_root("pass2_scatter_payloads");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let image_bytes = crate::pal_tasks::test_support::craft_scatter_pal_main_image();
+        let scatter_plan = crate::scatter::discover(&image_bytes, PAL_BASE)
+            .unwrap()
+            .expect("fixture has a discoverable scatter map");
+        let scatter_map =
+            crate::scatter::materialize(&scatter_plan, &image_bytes, label, &ghidra).unwrap();
+        let runtime = crate::runtime_image::RuntimeImage::from_artifact(
+            &image_bytes,
+            PAL_BASE,
+            &ghidra,
+            Some(&ghidra.join(&scatter_map.relative_path)),
+        )
+        .unwrap();
+        let scatter_blake3 = crate::execution_ranges::parse_blake3(&scatter_map.blake3).unwrap();
+        let (present, _) =
+            materialize_pal_plan(&image_bytes, &runtime, Some(scatter_blake3), &ghidra, label);
+        pal_marshal_tree(&ghidra, &images, label, &image_bytes);
+        marshal_image(
+            &ghidra,
+            &images,
+            label,
+            false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Present,
+                present.clone(),
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
+            decompile::RuntimeScatterState::Present,
+            PAL_BASE,
+        )
+        .unwrap();
+
+        let mut image = analyzed_image(label);
+        image.image_start = PAL_BASE;
+        image.image_len = u32::try_from(image_bytes.len()).unwrap();
+        let mut report = decompile::test_decompile_report(
+            vec![image],
+            HashMap::from([(label.to_string(), decompile::RuntimeScatterState::Present)]),
+        );
+        decompile::test_set_runtime_task_state(&mut report, label, present);
+
+        let (maps, errors) = load_terminal_pal_maps(&images, &report, &ghidra);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        let terminal = &maps[label];
+        crate::runtime_image::RuntimeImage::from_artifact(
+            &image_bytes,
+            PAL_BASE,
+            &ghidra,
+            terminal.scatter_manifest.as_deref(),
+        )
+        .expect("the staged PAL scatter map must retain every authenticated payload");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7831,8 +9532,12 @@ mod tests {
             &images,
             label,
             false,
+            &runtime_state(
+                decompile::RuntimeScatterState::Absent,
+                present.clone(),
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
             decompile::RuntimeScatterState::Absent,
-            &present,
             PAL_BASE,
         )
         .unwrap();
@@ -7942,7 +9647,13 @@ mod tests {
             },
         );
 
-        let inputs = prepare_pass2_inputs(&function_maps, &HashMap::new(), &HashMap::new(), &pal);
+        let inputs = prepare_pass2_inputs(
+            &function_maps,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &pal,
+        );
         let wired = &inputs[label];
         assert_eq!(wired.pal_identity, identity);
         assert_eq!(wired.pal_manifest.as_deref(), Some(manifest_path.as_path()));
@@ -8717,6 +10428,12 @@ mod tests {
             b"{\"format\":\"pixel-modem-extractor-pal-tasks-v1\"}",
         )
         .unwrap();
+        std::fs::create_dir_all(out.join("images/02_MAIN/exception_roots")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/exception_roots/roots.json"),
+            b"{\"format\":\"pixel-modem-extractor-exception-roots-v1\"}",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
@@ -8764,6 +10481,11 @@ mod tests {
             std::fs::read(out.join("images/02_MAIN/pal_tasks/tasks.json")).unwrap(),
             b"{\"format\":\"pixel-modem-extractor-pal-tasks-v1\"}",
             "the PAL task manifest is a retained leaf"
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/exception_roots/roots.json")).unwrap(),
+            b"{\"format\":\"pixel-modem-extractor-exception-roots-v1\"}",
+            "the exception-root manifest is a retained leaf"
         );
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());

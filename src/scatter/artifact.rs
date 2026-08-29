@@ -6,7 +6,7 @@ use crate::trusted_fs::{TrustedDirectory, validate_relative_path};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -29,6 +29,7 @@ pub(crate) struct MaterializedScatter {
     pub image_size: u32,
     pub image_blake3: [u8; 32],
     pub manifest_blake3: [u8; 32],
+    manifest_bytes: Vec<u8>,
     pub(crate) segments: Vec<ArtifactSegment>,
 }
 
@@ -37,6 +38,8 @@ pub(crate) struct ArtifactSegment {
     address: u32,
     size: u32,
     scatter_entry: usize,
+    output_blake3: [u8; 32],
+    payload_path: Option<String>,
     backing: ArtifactBacking,
 }
 
@@ -92,6 +95,53 @@ impl ArtifactSegment {
             }
             ArtifactBacking::Zero => output.fill(0),
         }
+        Ok(())
+    }
+
+    fn restage_payload(&self, target: &TrustedDirectory) -> Result<()> {
+        let Some(path) = self.payload_path.as_deref() else {
+            return Ok(());
+        };
+        let name = canonical_payload_name(path, "scatter restage payload")?;
+        let ArtifactBacking::File(file) = &self.backing else {
+            return Err(bad("scatter payload path has no file backing"));
+        };
+        let mut source = file
+            .lock()
+            .map_err(|_| bad("authenticated scatter payload lock is poisoned"))?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| bad(format!("scatter restage payload rewind failed: {error}")))?;
+        let mut output = target.atomic_write_file(name, "scatter restage payload")?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut remaining = self.size;
+        while remaining > 0 {
+            let length = usize::try_from(remaining.min(buffer.len() as u32))
+                .map_err(|_| bad("scatter restage payload length does not fit the host"))?;
+            source
+                .read_exact(&mut buffer[..length])
+                .map_err(|error| bad(format!("scatter restage payload read failed: {error}")))?;
+            hasher.update(&buffer[..length]);
+            output.write_all(&buffer[..length])?;
+            remaining -= u32::try_from(length)
+                .map_err(|_| bad("scatter restage payload length does not fit u32"))?;
+        }
+        let mut trailing = [0u8; 1];
+        if source.read(&mut trailing).map_err(|error| {
+            bad(format!(
+                "scatter restage payload trailing read failed: {error}"
+            ))
+        })? != 0
+        {
+            return Err(bad("scatter restage payload exceeds its declared size"));
+        }
+        if *hasher.finalize().as_bytes() != self.output_blake3 {
+            return Err(bad(
+                "scatter restage payload BLAKE3 does not match the load map",
+            ));
+        }
+        output.commit()?;
         Ok(())
     }
 }
@@ -318,7 +368,7 @@ pub(crate) fn read_materialized(
     base: u32,
 ) -> Result<MaterializedScatter> {
     let (manifest, manifest_parent) = open_manifest(root, manifest_path)?;
-    let (wire, manifest_blake3) = read_manifest(manifest)?;
+    let (wire, manifest_blake3, manifest_bytes) = read_manifest(manifest)?;
 
     if wire.format != LOAD_MAP_FORMAT {
         return Err(bad("unexpected scatter load-map format"));
@@ -563,10 +613,13 @@ pub(crate) fn read_materialized(
                     address: entry.destination,
                     size: entry.size,
                     scatter_entry: entry.index,
+                    output_blake3: expected_hash,
+                    payload_path: None,
                     backing: ArtifactBacking::Zero,
                 });
             }
             MaterializationWire::File { path, .. } => {
+                canonical_payload_name(&path, &format!("{context} payload"))?;
                 let copy_source = if entry.operation == Operation::Copy {
                     Some(raw_slice(
                         raw_image,
@@ -590,6 +643,8 @@ pub(crate) fn read_materialized(
                     address: entry.destination,
                     size: entry.size,
                     scatter_entry: entry.index,
+                    output_blake3: expected_hash,
+                    payload_path: Some(path),
                     backing: ArtifactBacking::File(Mutex::new(file)),
                 });
             }
@@ -602,8 +657,48 @@ pub(crate) fn read_materialized(
         image_size: raw_size,
         image_blake3,
         manifest_blake3,
+        manifest_bytes,
         segments,
     })
+}
+
+pub(crate) fn restage_materialized(
+    source_root: &Path,
+    manifest_path: &Path,
+    raw_image: &[u8],
+    base: u32,
+    expected_label: &str,
+    target_root: &Path,
+) -> Result<[u8; 32]> {
+    validate_label(expected_label)?;
+    let artifact = read_materialized(source_root, manifest_path, raw_image, base)?;
+    if artifact.image_label != expected_label {
+        return Err(bad(
+            "scatter restage image label does not match the request",
+        ));
+    }
+
+    let target = TrustedDirectory::new(target_root, "scatter restage root")?;
+    let target_image = target
+        .open_or_create_directory_child("scatter", "scatter restage directory")?
+        .open_or_create_directory_child(expected_label, "scatter restage image directory")?;
+    if artifact
+        .segments
+        .iter()
+        .any(|segment| segment.payload_path.is_some())
+    {
+        let blocks = target_image
+            .open_or_create_directory_child("blocks", "scatter restage blocks directory")?;
+        for segment in &artifact.segments {
+            segment.restage_payload(&blocks)?;
+        }
+    }
+
+    let mut manifest =
+        target_image.atomic_write_file("load_map.json", "scatter restage load-map manifest")?;
+    manifest.write_all(&artifact.manifest_bytes)?;
+    manifest.commit()?;
+    Ok(artifact.manifest_blake3)
 }
 
 fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, TrustedDirectory)> {
@@ -621,7 +716,7 @@ fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, TrustedDire
     trusted_root.open_regular_file_with_parent(relative, "scatter load map")
 }
 
-fn read_manifest(mut file: File) -> Result<(LoadMapWire, [u8; 32])> {
+fn read_manifest(mut file: File) -> Result<(LoadMapWire, [u8; 32], Vec<u8>)> {
     let length = file
         .metadata()
         .map_err(|error| bad(format!("scatter load-map metadata is unavailable: {error}")))?
@@ -656,7 +751,28 @@ fn read_manifest(mut file: File) -> Result<(LoadMapWire, [u8; 32])> {
     let manifest_blake3 = *hash_bytes(&bytes).as_bytes();
     let wire = serde_json::from_slice(&bytes)
         .map_err(|error| bad(format!("scatter load map is not strict v1 JSON: {error}")))?;
-    Ok((wire, manifest_blake3))
+    Ok((wire, manifest_blake3, bytes))
+}
+
+fn canonical_payload_name<'a>(path: &'a str, context: &str) -> Result<&'a str> {
+    let path = Path::new(path);
+    validate_relative_path(path, context)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        .ok_or_else(|| bad(format!("{context} filename is not canonical")))?;
+    if path.parent() != Some(Path::new("blocks")) {
+        return Err(bad(format!(
+            "{context} path is not the canonical blocks/<name> form"
+        )));
+    }
+    Ok(name)
 }
 
 fn open_authenticated_payload(

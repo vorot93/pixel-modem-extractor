@@ -397,12 +397,27 @@ impl ExceptionPass2Context {
 }
 
 /// Authenticate the runtime image and exception manifest, then bind the
-/// strict opaque current-run token into an opaque pass-2 context.
+/// strict opaque current-run token into an opaque pass-2 context. The expected
+/// scatter digest is explicit currentness: `None` builds a raw-only runtime
+/// without probing stale paths, while `Some` requires those exact map bytes.
 pub fn read_exception_pass2_context(
     input: ExceptionPass2ContextInput<'_>,
 ) -> Result<ExceptionPass2Context> {
     let raw = std::fs::read(input.image_dir.join(format!("{}.bin", input.image_label)))?;
-    let runtime = RuntimeImage::for_image_dir(&raw, input.image_base, input.image_dir)?;
+    let runtime = if let Some(expected) = input.expected_scatter_load_map_blake3 {
+        let scatter = input.image_dir.join("scatter/load_map.json");
+        let bytes = std::fs::read(&scatter)?;
+        if *blake3::hash(&bytes).as_bytes() != expected {
+            return Err(Error::BadExceptionRoots(
+                "exception pass-2 context scatter manifest digest mismatch".into(),
+            ));
+        }
+        RuntimeImage::from_artifact(&raw, input.image_base, input.image_dir, Some(&scatter))?
+    } else {
+        // `None` is explicit raw-only state. Never let a stale scatter path
+        // expand the runtime view after currentness has already been decided.
+        RuntimeImage::from_plan(&raw, input.image_base, None)?
+    };
     let validated = exception_roots::read_with_identity(
         input.manifest_path,
         &runtime,

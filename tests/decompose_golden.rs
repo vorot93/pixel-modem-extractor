@@ -107,8 +107,8 @@ fn decompose_produces_unified_tree() {
         .expect("report.json must contain symbol_map stage");
     assert_eq!(symbol_map_stage["status"], "ok");
 
-    // PAL task inventory: exactly one `pal_tasks` stage, directly after the
-    // `decompile` stage whose marshal produced the terminal manifests.
+    // Exception roots and PAL task inventory: each has exactly one stage.
+    // Exception marshalling immediately follows decompile, then PAL.
     let stage_names: Vec<String> = report["stages"]
         .as_array()
         .map(|stages| {
@@ -121,11 +121,23 @@ fn decompose_produces_unified_tree() {
     assert_eq!(
         stage_names
             .iter()
+            .filter(|name| name.as_str() == "exception_roots")
+            .count(),
+        1,
+        "expected exactly one exception_roots stage: {stage_names:?}"
+    );
+    assert_eq!(
+        stage_names
+            .iter()
             .filter(|name| name.as_str() == "pal_tasks")
             .count(),
         1,
         "expected exactly one pal_tasks stage: {stage_names:?}"
     );
+    let exception_index = stage_names
+        .iter()
+        .position(|name| name == "exception_roots")
+        .unwrap();
     let pal_index = stage_names
         .iter()
         .position(|name| name == "pal_tasks")
@@ -135,9 +147,32 @@ fn decompose_produces_unified_tree() {
         .position(|name| name == "decompile")
         .expect("decompile stage");
     assert!(
-        pal_index == decompile_index + 1,
-        "pal_tasks must immediately follow the decompile stage: {stage_names:?}"
+        exception_index == decompile_index + 1,
+        "exception_roots must immediately follow the decompile stage: {stage_names:?}"
     );
+    assert!(
+        pal_index == exception_index + 1,
+        "pal_tasks must immediately follow exception_roots: {stage_names:?}"
+    );
+    let exception_stage = &report["stages"].as_array().unwrap()[exception_index];
+    assert!(
+        exception_stage["status"] == "ok"
+            || exception_stage["status"] == "skipped"
+            || exception_stage["status"] == "failed",
+        "unexpected exception_roots stage status: {exception_stage}"
+    );
+    if exception_stage["status"] == "ok" {
+        let output = exception_stage["output"]
+            .as_str()
+            .expect("ok exception_roots output");
+        assert!(
+            output.starts_with("images/*/exception_roots/roots.json ("),
+            "deterministic exception_roots output: {output}"
+        );
+        assert!(output_count_field(output, "images=") >= 1, "{output}");
+        assert!(output_count_field(output, "tables=") >= 1, "{output}");
+        assert!(output_count_field(output, "roots=") >= 1, "{output}");
+    }
     let pal_stage = &report["stages"].as_array().unwrap()[pal_index];
     assert!(
         pal_stage["status"] == "ok" || pal_stage["status"] == "skipped",
@@ -767,6 +802,20 @@ const SEVEN_PAL_COUNTER_FIELDS: [&str; 7] = [
     "pal_shared_entries",
 ];
 
+const ELEVEN_EXCEPTION_COUNTER_FIELDS: [&str; 11] = [
+    "exception_tables",
+    "exception_roles",
+    "exception_roots",
+    "exception_functions_created",
+    "exception_functions_reapplied",
+    "exception_functions_existing",
+    "exception_names_applied",
+    "exception_names_reapplied",
+    "exception_names_preserved",
+    "exception_names_not_requested",
+    "exception_shared_entries",
+];
+
 /// `key<value>` from a `(..., key=value, ...)` stage-output summary.
 fn output_count_field(output: &str, key: &str) -> u64 {
     let start = output
@@ -942,6 +991,129 @@ fn report_json_includes_global_shapes_fields() {
     }
 }
 
+/// Architectural exception roots: a retained current-vintage tree carries
+/// exactly one stage immediately after `decompile`, terminal manifests, and
+/// an all-or-none application-counter group exclusive with `exception_error`.
+/// Opaque skips may carry a generation manifest without application fields.
+#[test]
+fn report_json_includes_exception_roots_fields() {
+    let Some(dir) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = dir.join("report.json");
+    if !report_path.exists() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("report.json readable"))
+            .expect("report.json valid JSON");
+    let stages = report["stages"]
+        .as_array()
+        .expect("report.json stages must be an array");
+    let names: Vec<&str> = stages
+        .iter()
+        .filter_map(|stage| stage["stage"].as_str())
+        .collect();
+    let images = stages
+        .iter()
+        .find(|stage| stage["stage"] == "decompile")
+        .and_then(|stage| stage["images"].as_array())
+        .expect("decompile stage images");
+    let terminal_count = images
+        .iter()
+        .filter_map(|image| image["image"].as_str())
+        .filter(|label| {
+            dir.join("images")
+                .join(label)
+                .join("exception_roots/roots.json")
+                .is_file()
+        })
+        .count();
+    let has_fields = images.iter().any(|image| {
+        ELEVEN_EXCEPTION_COUNTER_FIELDS
+            .iter()
+            .any(|field| image.get(*field).is_some())
+            || image.get("exception_error").is_some()
+    });
+    if !names.contains(&"exception_roots") && terminal_count == 0 && !has_fields {
+        eprintln!(
+            "skip: retained tree predates the exception_roots stage ({})",
+            dir.display()
+        );
+        return;
+    }
+
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "exception_roots")
+            .count(),
+        1,
+        "exactly one exception_roots stage: {names:?}"
+    );
+    let decompile_index = names
+        .iter()
+        .position(|name| *name == "decompile")
+        .expect("decompile stage");
+    let exception_index = names
+        .iter()
+        .position(|name| *name == "exception_roots")
+        .unwrap();
+    assert_eq!(
+        exception_index,
+        decompile_index + 1,
+        "exception_roots must immediately follow decompile: {names:?}"
+    );
+    if let Some(pal_index) = names.iter().position(|name| *name == "pal_tasks") {
+        assert_eq!(
+            pal_index,
+            exception_index + 1,
+            "pal_tasks must immediately follow exception_roots: {names:?}"
+        );
+    }
+
+    let stage = &stages[exception_index];
+    if stage["status"] == "ok" {
+        let output = stage["output"].as_str().expect("ok exception_roots output");
+        assert_eq!(
+            output_count_field(output, "images="),
+            u64::try_from(terminal_count).unwrap(),
+            "stage count must match retained terminal manifests: {output}"
+        );
+    }
+
+    for image in images {
+        let present = ELEVEN_EXCEPTION_COUNTER_FIELDS
+            .iter()
+            .filter(|field| image.get(**field).is_some())
+            .count();
+        let error = image.get("exception_error");
+        assert!(
+            present == 0 || present == ELEVEN_EXCEPTION_COUNTER_FIELDS.len(),
+            "exception counters must be all present or all absent: {image}"
+        );
+        assert!(
+            present == 0 || error.is_none(),
+            "exception_error must be exclusive with counters: {image}"
+        );
+        if present != 0 {
+            for field in ELEVEN_EXCEPTION_COUNTER_FIELDS {
+                assert!(image[field].is_u64(), "{field} must be an integer: {image}");
+            }
+            let label = image["image"].as_str().expect("image label");
+            assert!(
+                dir.join("images")
+                    .join(label)
+                    .join("exception_roots/roots.json")
+                    .is_file(),
+                "reported application state requires a terminal manifest: {image}"
+            );
+        }
+    }
+}
+
 /// Phase 3.2 type application: on a real `02_MAIN`, the per-image entry in
 /// the `decompile` stage's `images[]` carries all four `global_types_*`
 /// counting fields (`global_types_applied`, `global_types_candidates`,
@@ -1036,7 +1208,8 @@ fn global_types_applied_on_retained_tree() {
 }
 
 /// PAL task inventory (Task 13): a retained decompose tree carries exactly
-/// one `pal_tasks` stage directly after `decompile`, and the decompile
+/// one `pal_tasks` stage directly after `exception_roots` on current trees
+/// (directly after `decompile` on older retained trees), and the decompile
 /// stage's per-image rows carry the seven optional PAL counters as an
 /// all-or-none group — present only for images whose pass-1 import applied
 /// a configured PAL map. When the stage reports `ok`, the terminal
@@ -1090,10 +1263,24 @@ fn report_json_includes_pal_fields() {
         .iter()
         .position(|name| *name == "decompile")
         .expect("decompile stage");
-    assert!(
-        pal_index == decompile_index + 1,
-        "pal_tasks must immediately follow decompile: {names:?}"
-    );
+    if let Some(exception_index) = names.iter().position(|name| *name == "exception_roots") {
+        assert_eq!(
+            exception_index,
+            decompile_index + 1,
+            "exception_roots must immediately follow decompile: {names:?}"
+        );
+        assert_eq!(
+            pal_index,
+            exception_index + 1,
+            "pal_tasks must immediately follow exception_roots: {names:?}"
+        );
+    } else {
+        assert_eq!(
+            pal_index,
+            decompile_index + 1,
+            "pre-exception-roots PAL stage must immediately follow decompile: {names:?}"
+        );
+    }
     let pal_stage = &stages[pal_index];
     assert!(
         pal_stage["status"] == "ok" || pal_stage["status"] == "skipped",

@@ -272,6 +272,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `exception_roots/mod.rs` | Architectural exception-root types, strict limits, and subsystem boundary |
 | `exception_roots/discover.rs` | A32 vector-table classification plus reset-side VBAR relocation proof |
 | `exception_roots/artifact.rs` | Canonical authenticated root manifest materialization, reading, and fixture provenance |
+| `exception_pass2.rs` | Strict ApplyExceptionRoots summary parsing and opaque authenticated pass-2 context construction |
 | `pal_tasks/mod.rs` | PAL shared types, named resource limits, the structured domain error, and the `discover` plan boundary |
 | `pal_tasks/cfg.rs` | Entry-rooted local CFG decode and its definition-aware dataflow/graph queries |
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
@@ -467,6 +468,20 @@ module; when a file outgrows that, split it.
   three outputs and writes the exact four-line `pixel-modem-extractor-ghidra-export-v4` marker last;
   old v3 bytes are stale. An opaque
   skip retains generation state but has no application summary.
+- **Terminal exception state remains generation-owned.** `decompose` authenticates every present
+  generation manifest against the terminal raw image and its explicit scatter dependency before
+  committing `images/<label>/exception_roots/roots.json`; absence clears only that owned leaf and
+  `--prune` retains it. A later Ghidra or PAL failure does not downgrade independently completed
+  exception generation or prevent later images from marshalling. Scatter is structurally MAIN-only:
+  non-MAIN `RuntimeScatterState::Unmanaged` means the exception runtime was deliberately raw-only,
+  so terminal validation and pass-2 context construction ignore any stale scatter path without
+  deleting it. Pass 2 copies the exact terminal manifest/raw/scatter bytes back into canonical kit
+  locations, including every file-backed `blocks/*.bin` dependency; the shared strict scatter
+  restager authenticates retained handles, writes payloads first, and commits `load_map.json` last.
+  It then rebuilds the opaque context from explicit application state and rejects drift before
+  scheduling Ghidra; path existence alone never establishes currentness. The adjacent
+  `exception_roots` report stage tallies terminal images/tables/roots, while eleven application
+  counters are all-or-none and exclusive with reason-only `exception_error`.
 - **Real-Ghidra fixtures have one production oracle.** Everything under
   `tests/fixtures/exception_roots/` is wholly synthetic. The private
   `committed_ghidra_fixture_matches_production_discovery_and_serialization` test regenerates the
@@ -2289,11 +2304,13 @@ hardcoded. Two reference images exercise both models end-to-end:
     move, including the v4 completion marker. Deadline expiry can therefore
     leave no current marker without accumulating one pending timer per function.
   - **Pass-2 manifest arguments must sit inside the Ghidra kit root.**
-    `readPal` authenticates the task manifest, the scatter load map, *and*
-    the raw image (`<ghidra>/images/<label>`) by canonical containment — all
-    three are terminal-moved to `images/<label>/` by the pass-1 marshal, so
-    `load_terminal_pal_maps` restages byte-identical copies at their pass-1
-    kit paths before building pass-2 inputs.
+    `readPal` authenticates the task manifest, the complete scatter artifact
+    (load map plus every referenced payload), and the raw image
+    (`<ghidra>/images/<label>`) by canonical containment — all are terminal-moved
+    to `images/<label>/` by the pass-1 marshal, so `load_terminal_pal_maps`
+    restages byte-identical copies at their pass-1 kit paths before building
+    pass-2 inputs. Map-only restaging is invalid because both PAL and exception
+    readers open file-backed `blocks/*.bin` entries relative to the map.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
     vectors all follow `<projectDir> <projectName> -process <label> -noanalysis
     -scriptPath …`. A function map appends `ApplyThumbNames.java` first and

@@ -299,13 +299,18 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   malformed or ambiguous fails closed.
 - **Architectural exception-root manifest** — `pixel-modem-extractor-exception-roots-v1`: the
   authenticated canonical manifest for one image's complete initial exception-vector table and any
-  semantically proven VBAR relocation, written at `exception_roots/<label>/roots.json`. It binds the
+  semantically proven VBAR relocation, written at `exception_roots/<label>/roots.json`
+  (`images/<label>/exception_roots/roots.json` under `decompose`, retained by `--prune`). It binds the
   raw image, optional scatter load map, supported slot instructions and literal targets, root entry
   bytes/ISA/storage, role relationships, and deterministic Ghidra application groups. Its external
   identity is `v1:<manifest-blake3>:<tables>:<roots>`. Ghidra applies it transactionally before
   auto-analysis and records concrete function, primary-symbol, and role-label ownership; the v4
   export marker binds the same identity as `exception_roots=<identity>`. Strict readers and Ghidra
-  postflight rederive all identities and reject stale or partial state.
+  postflight rederive all identities and reject stale or partial state. Before pass 2, `decompose`
+  restages the exact raw image and complete optional scatter artifact, including every referenced
+  `blocks/*.bin` payload, inside the Ghidra kit. `report.json` carries one
+  adjacent `exception_roots` stage plus an all-or-none per-image application-counter group; a
+  reason-only `exception_error` is exclusive with those counters.
 - **PAL task manifest** — `pixel-modem-extractor-pal-tasks-v1`: the authenticated canonical
   manifest of one validated PAL task plan, written at `pal_tasks/<label>/tasks.json`
   (`images/<MAIN>/pal_tasks/tasks.json` under `decompose`). It binds the image identity (BLAKE3),

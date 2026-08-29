@@ -695,6 +695,48 @@ pub(crate) use self::exception_pass2::{
 #[cfg(test)]
 pub(crate) use self::exception_pass2::{TestExceptionContextState, test_context_from_fixture};
 
+#[cfg(test)]
+pub(crate) fn test_applied_exception_roots(image: &str, identity: &str) -> AppliedExceptionRoots {
+    parse_apply_exception_roots_summary(
+        &exception_pass2::test_summary_for(image, identity),
+        image,
+        identity,
+    )
+    .expect("production exception summary fixture")
+}
+
+#[cfg(test)]
+pub(crate) fn test_decompile_report(
+    images: Vec<ImageResult>,
+    runtime_scatter: HashMap<String, RuntimeScatterState>,
+) -> DecompileReport {
+    let runtime_exception_roots = images
+        .iter()
+        .map(|image| (image.label.clone(), image.exception_state.clone()))
+        .collect();
+    let runtime_tasks = images
+        .iter()
+        .map(|image| (image.label.clone(), RuntimeTaskState::Unmanaged))
+        .collect();
+    DecompileReport {
+        images,
+        spec_path: PathBuf::new(),
+        current_exports: BTreeSet::new(),
+        runtime_scatter,
+        runtime_exception_roots,
+        runtime_tasks,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_runtime_task_state(
+    report: &mut DecompileReport,
+    label: &str,
+    state: RuntimeTaskState,
+) {
+    report.runtime_tasks.insert(label.to_string(), state);
+}
+
 /// The parsed `ApplyThumbNames: {json}` current-run summary for one scheduled
 /// symbol map. Every candidate is classified exactly once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,11 +799,11 @@ impl DecompileReport {
             .unwrap_or(RuntimeExceptionState::Unmanaged)
     }
 
-    /// One image's coherent runtime analysis state: the scatter and PAL
-    /// task states the generation loop measured for this run.
+    /// One image's coherent runtime analysis state measured by this run.
     pub(crate) fn runtime_analysis_state(&self, label: &str) -> RuntimeAnalysisState {
         RuntimeAnalysisState {
             scatter: self.runtime_scatter_state(label),
+            exception: self.runtime_exception_state(label),
             tasks: self.runtime_task_state(label),
         }
     }
@@ -796,6 +838,7 @@ pub(crate) enum RuntimeExceptionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeAnalysisState {
     pub scatter: RuntimeScatterState,
+    pub exception: RuntimeExceptionState,
     pub tasks: RuntimeTaskState,
 }
 
@@ -3314,8 +3357,10 @@ pub struct Pass2Input {
     pub function_map: Option<PreparedSymbolPass2Map>,
     pub global_map: Option<PreparedPass2Map>,
     pub global_types_map: Option<PreparedPass2Map>,
-    /// Explicit current exception-root state. Task 9 constructs this pair from
-    /// the terminal validated artifact; pass 2 never probes for one.
+    /// Explicit current exception-root state. Task 9 constructs this context,
+    /// identity, and manifest from the terminal validated artifact; pass 2
+    /// never probes for one.
+    pub exception_context: Option<ExceptionPass2Context>,
     pub exception_identity: String,
     pub exception_manifest: Option<PathBuf>,
     /// The PAL identity the pass-2 scripts must agree on (`none` when the
@@ -3339,16 +3384,20 @@ impl Pass2Input {
         }
     }
 
-    fn exception_args(&self) -> Result<(String, String)> {
-        let identity = if self.exception_identity.is_empty() {
+    fn exception_identity_or_none(&self) -> &str {
+        if self.exception_identity.is_empty() {
             "none"
         } else {
-            self.exception_identity.as_str()
-        };
+            &self.exception_identity
+        }
+    }
+
+    fn exception_args(&self, root: &str, label: &str) -> Result<(String, String)> {
+        let identity = self.exception_identity_or_none();
         if identity == "none" {
-            if self.exception_manifest.is_some() {
+            if self.exception_manifest.is_some() || self.exception_context.is_some() {
                 return Err(Error::DecomposeIncomplete(
-                    "pass-2 exception identity none carries a manifest".into(),
+                    "pass-2 exception identity none carries present state".into(),
                 ));
             }
             return Ok(("none".to_string(), "-".to_string()));
@@ -3379,6 +3428,16 @@ impl Pass2Input {
                 "a present pass-2 exception identity requires its manifest".into(),
             )
         })?;
+        let context = self.exception_context.as_ref().ok_or_else(|| {
+            Error::DecomposeIncomplete(
+                "a present pass-2 exception identity requires its authenticated context".into(),
+            )
+        })?;
+        if context.identity() != identity {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 exception context identity does not match its requested identity".into(),
+            ));
+        }
         let canonical = std::fs::canonicalize(manifest)?;
         if canonical != *manifest || !canonical.is_file() {
             return Err(Error::DecomposeIncomplete(format!(
@@ -3390,6 +3449,16 @@ impl Pass2Input {
             return Err(Error::DecomposeIncomplete(
                 "pass-2 exception manifest does not match its identity BLAKE3".into(),
             ));
+        }
+        let expected = std::fs::canonicalize(root)?
+            .join("exception_roots")
+            .join(label)
+            .join("roots.json");
+        if canonical != expected {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 exception manifest is outside its canonical kit location: {}",
+                canonical.display()
+            )));
         }
         Ok((
             identity.to_string(),
@@ -3437,7 +3506,7 @@ fn headless_process_args(
         map.validate_for_spawn()?;
     }
 
-    let (exception_identity, exception_manifest) = input.exception_args()?;
+    let (exception_identity, exception_manifest) = input.exception_args(root, label)?;
     let pal_identity = input.pal_identity_or_none().to_string();
     let pal_manifest = input
         .pal_manifest
@@ -4163,10 +4232,13 @@ pub fn run_two_pass(
                 .as_ref()
                 .map(|map| map.map_blake3().to_string())
                 .unwrap_or_else(|| "none".to_string());
+            let exception_identity = input.exception_identity_or_none().to_string();
             let pal_identity = input.pal_identity_or_none().to_string();
-            if let Err(error) =
-                export_attempt.validate_current("none", &pal_identity, &symbol_map_hash)
-            {
+            if let Err(error) = export_attempt.validate_current(
+                &exception_identity,
+                &pal_identity,
+                &symbol_map_hash,
+            ) {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let reason = format!(
@@ -6935,21 +7007,25 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     #[test]
     fn pass2_args_pass_exception_identity_and_manifest_through() {
         let root = pass2_test_root("exception_args");
-        let manifest = root.join("roots.json");
-        std::fs::write(&manifest, b"manifest").unwrap();
-        let identity = format!(
-            "v1:{}:1:1",
-            crate::manifest::blake3_file(&manifest).unwrap()
-        );
+        let manifest = root.join("exception_roots/00_BOOT/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
+            &manifest,
+        )
+        .unwrap();
+        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
+        let identity = context.identity().to_string();
         let manifest_arg = manifest.to_string_lossy().into_owned();
         let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map("exception_wired", "02_MAIN")),
+            function_map: Some(pass2_symbol_test_map("exception_wired", "00_BOOT")),
+            exception_context: Some(context),
             exception_identity: identity.clone(),
             exception_manifest: Some(manifest.clone()),
             ..Pass2Input::default()
         };
 
-        let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
+        let args = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
             .unwrap()
             .unwrap();
         let apply_at = args
@@ -6968,6 +7044,96 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             &args[export_at + 4..=export_at + 5],
             [identity.as_str(), manifest_arg.as_str()]
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pass2_args_reject_exception_identity_without_authenticated_context() {
+        let root = pass2_test_root("exception_missing_context");
+        let manifest = root.join("exception_roots/00_BOOT/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
+            &manifest,
+        )
+        .unwrap();
+        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
+        let input = Pass2Input {
+            function_map: Some(pass2_symbol_test_map(
+                "exception_missing_context",
+                "00_BOOT",
+            )),
+            exception_identity: context.identity().to_string(),
+            exception_manifest: Some(manifest),
+            ..Pass2Input::default()
+        };
+
+        let error = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("authenticated context"), "{error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pass2_args_reject_exception_context_identity_mismatch() {
+        let root = pass2_test_root("exception_context_identity");
+        let manifest = root.join("exception_roots/00_BOOT/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
+            &manifest,
+        )
+        .unwrap();
+        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
+        let digest = crate::manifest::blake3_file(&manifest).unwrap();
+        let input = Pass2Input {
+            function_map: Some(pass2_symbol_test_map(
+                "exception_context_identity",
+                "00_BOOT",
+            )),
+            exception_context: Some(context),
+            exception_identity: format!("v1:{digest}:1:2"),
+            exception_manifest: Some(manifest),
+            ..Pass2Input::default()
+        };
+
+        let error = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("context identity"), "{error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pass2_args_reject_exception_manifest_outside_canonical_kit_location() {
+        let root = pass2_test_root("exception_manifest_location");
+        let manifest = root.join("wrong/roots.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
+            &manifest,
+        )
+        .unwrap();
+        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
+        let input = Pass2Input {
+            function_map: Some(pass2_symbol_test_map(
+                "exception_manifest_location",
+                "00_BOOT",
+            )),
+            exception_identity: context.identity().to_string(),
+            exception_manifest: Some(manifest),
+            exception_context: Some(context),
+            ..Pass2Input::default()
+        };
+
+        let error = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("canonical kit location"), "{error}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -8792,6 +8958,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             report.runtime_analysis_state("00_BOOT"),
             RuntimeAnalysisState {
                 scatter: RuntimeScatterState::Unmanaged,
+                exception: RuntimeExceptionState::Absent,
                 tasks: RuntimeTaskState::Unmanaged,
             }
         );
@@ -8799,6 +8966,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             report.runtime_analysis_state("missing"),
             RuntimeAnalysisState {
                 scatter: RuntimeScatterState::Unmanaged,
+                exception: RuntimeExceptionState::Unmanaged,
                 tasks: RuntimeTaskState::Unmanaged,
             }
         );
