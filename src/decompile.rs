@@ -2726,6 +2726,7 @@ fn run_report_impl(
                     if let Err(reason) =
                         export_attempt.validate_current(&exception_identity, &pal_identity, "none")
                     {
+                        let reason = crate::error::bounded_reason(&reason);
                         tracing::warn!(
                             "ghidra: {label} current export is not this run's: {reason}"
                         );
@@ -3016,7 +3017,10 @@ fn run_report_impl(
                     globals_provisional_suppressed: None,
                     exception_state: r.exception_state,
                     exception_roots_applied: r.exception_roots_applied,
-                    exception_error: r.exception_error,
+                    exception_error: r
+                        .exception_error
+                        .as_deref()
+                        .map(crate::error::bounded_reason),
                     pal_applied: r.pal_applied,
                 }
             })
@@ -3820,6 +3824,7 @@ fn coordinate_application_summaries(
             }) {
             Ok(summary) => coordinated.exception_roots_applied = Some(summary),
             Err(reason) => {
+                let reason = crate::error::bounded_reason(&reason);
                 coordinated.exception_error = Some(reason.clone());
                 coordinated.terminal_error = Some(reason);
             }
@@ -7483,6 +7488,41 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .terminal_error
                 .as_deref()
                 .is_some_and(|reason| reason.contains("malformed ApplyExceptionRoots summary"))
+        );
+    }
+
+    #[test]
+    fn exception_summary_failure_is_bounded_before_result_storage() {
+        let manifest_blake3 = "a".repeat(64);
+        let roots = MaterializedExceptionRoots {
+            relative_path: "exception_roots/02_MAIN/roots.json".into(),
+            blake3: manifest_blake3.clone(),
+            identity: format!("v1:{manifest_blake3}:1:7"),
+            tables: 1,
+            roots: 7,
+        };
+        let mut value: serde_json::Value = serde_json::from_str(
+            exception_pass2::test_summary_for("02_MAIN", &roots.identity)
+                .strip_prefix("ApplyExceptionRoots: ")
+                .expect("summary prefix"),
+        )
+        .unwrap();
+        value["image"] = serde_json::json!("x".repeat(8 * 1024));
+
+        let coordinated = coordinate_application_summaries(
+            &format!("ApplyExceptionRoots: {value}"),
+            "02_MAIN",
+            Some(&roots),
+            None,
+        );
+
+        assert_eq!(
+            coordinated.exception_error.as_deref(),
+            Some("ApplyExceptionRoots summary image does not match the expected image")
+        );
+        assert_eq!(
+            coordinated.terminal_error, coordinated.exception_error,
+            "the terminal reason must retain the same bounded first cause"
         );
     }
 

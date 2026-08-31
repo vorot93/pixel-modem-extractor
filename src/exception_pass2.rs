@@ -693,16 +693,12 @@ fn parse_summary(
     let wire: SummaryWire = serde_json::from_str(payload)
         .map_err(|error| format!("malformed ApplyExceptionRoots summary: {error}"))?;
     if wire.image != expected_image {
-        return Err(format!(
-            "ApplyExceptionRoots summary image {:?} does not match {:?}",
-            wire.image, expected_image
-        ));
+        return Err(
+            "ApplyExceptionRoots summary image does not match the expected image".to_string(),
+        );
     }
     if wire.status != "ok" {
-        return Err(format!(
-            "ApplyExceptionRoots summary status {:?} is not \"ok\"",
-            wire.status
-        ));
+        return Err("ApplyExceptionRoots summary status is not \"ok\"".to_string());
     }
     if wire.identity != expected_identity {
         return Err(
@@ -1414,6 +1410,38 @@ mod tests {
         }
         assert!(parse_summary(&valid, "01_PSP", IDENTITY).is_err());
         assert!(parse_summary(&valid, "00_BOOT", "v1:stale").is_err());
+    }
+
+    #[test]
+    fn parser_does_not_reflect_near_limit_wrong_image_or_status() {
+        for (field, expected) in [
+            (
+                "image",
+                "ApplyExceptionRoots summary image does not match the expected image",
+            ),
+            ("status", "ApplyExceptionRoots summary status is not \"ok\""),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(
+                summary()
+                    .strip_prefix("ApplyExceptionRoots: ")
+                    .expect("summary prefix"),
+            )
+            .unwrap();
+            value[field] = serde_json::json!("x".repeat(SUMMARY_MAX_BYTES - 16 * 1024));
+            let payload = serde_json::to_string(&value).unwrap();
+            assert!(payload.len() <= SUMMARY_MAX_BYTES);
+            assert!(payload.len() > SUMMARY_MAX_BYTES - 32 * 1024);
+
+            let error = parse_summary(
+                &format!("ApplyExceptionRoots: {payload}"),
+                "00_BOOT",
+                IDENTITY,
+            )
+            .unwrap_err();
+
+            assert_eq!(error, expected);
+            assert!(error.chars().count() <= crate::error::REPORT_REASON_MAX_CHARS);
+        }
     }
 
     #[test]

@@ -18,6 +18,17 @@ pub(crate) fn bounded_reason(message: &str) -> String {
     bounded
 }
 
+pub(crate) fn bounded_labelled_reasons(errors: &[(String, String)], separator: &str) -> String {
+    let mut errors = errors.iter().collect::<Vec<_>>();
+    errors.sort_unstable();
+    let aggregate = errors
+        .into_iter()
+        .map(|(label, reason)| bounded_reason(&format!("{label}: {}", bounded_reason(reason))))
+        .collect::<Vec<_>>()
+        .join(separator);
+    bounded_reason(&aggregate)
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("bad or missing FBPK magic")]

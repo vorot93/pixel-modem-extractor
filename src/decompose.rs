@@ -378,7 +378,10 @@ impl ImageReport {
                 .map(decompile::AppliedExceptionRoots::names_not_requested),
             exception_shared_entries: exception
                 .map(decompile::AppliedExceptionRoots::shared_entries),
-            exception_error: r.exception_error.clone(),
+            exception_error: r
+                .exception_error
+                .as_deref()
+                .map(crate::error::bounded_reason),
             pal_tasks: r.pal_applied.as_ref().map(|pal| pal.tasks),
             pal_entries: r.pal_applied.as_ref().map(|pal| pal.entries),
             pal_functions_created: r.pal_applied.as_ref().map(|pal| pal.functions_created),
@@ -1262,25 +1265,27 @@ fn exception_roots_stage(
             duration_ms,
         );
     };
+    let output = || {
+        format!(
+            "images/*/exception_roots/roots.json (images={}, tables={}, roots={})",
+            tally.images, tally.tables, tally.roots
+        )
+    };
     if !errors.is_empty() {
-        let error = errors
-            .iter()
-            .map(|(label, reason)| format!("{label}: {reason}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return StageReport::failed("exception_roots", error, duration_ms);
+        return StageReport {
+            stage: "exception_roots",
+            status: "failed",
+            output: (tally.images > 0).then(output),
+            reason: None,
+            error: Some(crate::error::bounded_labelled_reasons(errors, "; ")),
+            images: Vec::new(),
+            duration_ms,
+        };
     }
     if tally.images == 0 && absent_images > 0 {
         return StageReport::skipped("exception_roots", "no exception vector tables");
     }
-    StageReport::ok(
-        "exception_roots",
-        &format!(
-            "images/*/exception_roots/roots.json (images={}, tables={}, roots={})",
-            tally.images, tally.tables, tally.roots
-        ),
-        duration_ms,
-    )
+    StageReport::ok("exception_roots", &output(), duration_ms)
 }
 
 /// Marshal one image's PAL task manifest under explicit-state ownership:
@@ -1453,22 +1458,12 @@ fn pal_tasks_stage(
         )
     };
     if !errors.is_empty() {
-        let mut errors = errors.to_vec();
-        errors.sort();
         return StageReport {
             stage: "pal_tasks",
             status: "failed",
             output: (tally.images > 0).then(output),
             reason: None,
-            error: Some(
-                errors
-                    .into_iter()
-                    .map(|(label, reason)| {
-                        format!("{label}: {}", crate::error::bounded_reason(&reason))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            error: Some(crate::error::bounded_labelled_reasons(errors, "\n")),
             images: Vec::new(),
             duration_ms,
         };
@@ -8844,6 +8839,103 @@ mod tests {
     }
 
     #[test]
+    fn failed_exception_stage_retains_a_later_real_commit_and_its_tally() {
+        let first = ExceptionMarshalFixture::present_for("00_BOOT", "BOOT");
+        let second = ExceptionMarshalFixture::present_for("01_PSP", "PSP");
+        std::fs::create_dir_all(first.terminal_manifest.parent().unwrap()).unwrap();
+        std::fs::write(&first.terminal_manifest, b"old-complete-manifest").unwrap();
+        std::fs::write(&first.source_manifest, b"corrupt-current-manifest").unwrap();
+
+        let mut first_image = analyzed_image("00_BOOT");
+        first_image.image_start = first.image_start;
+        first_image.image_len = u32::try_from(exception_root_fixture_bytes().len()).unwrap();
+        first_image.exception_state = first.state.clone();
+        first_image.exception_roots_applied = Some(decompile::test_applied_exception_roots(
+            "00_BOOT",
+            &exception_map(&first.state).identity,
+        ));
+        let mut second_image = analyzed_image("01_PSP");
+        second_image.image_start = second.image_start;
+        second_image.image_len = u32::try_from(exception_root_fixture_bytes().len()).unwrap();
+        second_image.exception_state = second.state.clone();
+        second_image.exception_roots_applied = Some(decompile::test_applied_exception_roots(
+            "01_PSP",
+            &exception_map(&second.state).identity,
+        ));
+        let mut report = decompile::test_decompile_report(
+            vec![first_image, second_image],
+            HashMap::from([
+                (
+                    "00_BOOT".to_string(),
+                    decompile::RuntimeScatterState::Unmanaged,
+                ),
+                (
+                    "01_PSP".to_string(),
+                    decompile::RuntimeScatterState::Unmanaged,
+                ),
+            ]),
+        );
+
+        let batch = marshal_pass1_images_with(
+            &mut report,
+            |_index, label, _export, runtime, scatter, image_start| {
+                let fixture = match label {
+                    "00_BOOT" => &first,
+                    "01_PSP" => &second,
+                    _ => unreachable!("unexpected fixture label"),
+                };
+                let exception = match marshal_exception_roots(
+                    &fixture.ghidra_dir,
+                    &fixture.images_dir,
+                    label,
+                    &runtime.exception,
+                    image_start,
+                    scatter,
+                ) {
+                    Ok(()) => ExceptionMarshalStatus::Present,
+                    Err(error) => ExceptionMarshalStatus::Failed(error.to_string()),
+                };
+                Ok(MarshalImageStages {
+                    raw: MarshalComponentOutcome::Current,
+                    export: MarshalComponentOutcome::Unmanaged,
+                    scatter: MarshalComponentOutcome::Unmanaged,
+                    exception,
+                    pal: MarshalComponentOutcome::Unmanaged,
+                })
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&first.terminal_manifest).unwrap(),
+            b"old-complete-manifest"
+        );
+        assert_eq!(
+            std::fs::read(&second.terminal_manifest).unwrap(),
+            second.manifest_bytes
+        );
+        assert_eq!(batch.exception_tally.images, 1);
+        assert_eq!(batch.exception_tally.tables, 1);
+        assert_eq!(batch.exception_tally.roots, 7);
+        assert!(report.images[0].exception_roots_applied.is_none());
+        assert!(report.images[0].exception_error.is_some());
+        assert!(report.images[1].exception_roots_applied.is_some());
+        assert!(report.images[1].exception_error.is_none());
+
+        let stage = exception_roots_stage(
+            Some(&batch.exception_tally),
+            batch.exception_absent,
+            &batch.exception_errors,
+            9,
+        );
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            stage.output.as_deref(),
+            Some("images/*/exception_roots/roots.json (images=1, tables=1, roots=7)")
+        );
+        assert!(stage.error.as_deref().unwrap().starts_with("00_BOOT: "));
+    }
+
+    #[test]
     fn exception_roots_stage_reports_tallies_absence_and_failures() {
         let fixture = ExceptionMarshalFixture::present();
         let mut tally = ExceptionMarshalTally::default();
@@ -8874,7 +8966,10 @@ mod tests {
             5,
         );
         assert_eq!(failed.status, "failed");
-        assert!(failed.error.as_deref().unwrap().contains("01_MAIN"));
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("01_MAIN: current exception state is unmanaged")
+        );
 
         let unavailable = exception_roots_stage(None, 0, &[], 0);
         assert_eq!(unavailable.status, "failed");
@@ -8882,6 +8977,23 @@ mod tests {
             unavailable.error.as_deref(),
             Some("pass 1 state unavailable")
         );
+    }
+
+    #[test]
+    fn exception_stage_bounds_the_complete_multi_error_aggregate() {
+        let reason = "\u{1f642}".repeat(900);
+        let errors = vec![
+            ("02_VSS".to_string(), reason.clone()),
+            ("00_BOOT".to_string(), reason.clone()),
+            ("01_PSP".to_string(), reason),
+        ];
+
+        let stage = exception_roots_stage(Some(&ExceptionMarshalTally::default()), 0, &errors, 0);
+        let error = stage.error.as_deref().unwrap();
+
+        assert_eq!(error.chars().count(), crate::error::REPORT_REASON_MAX_CHARS);
+        assert!(error.starts_with("00_BOOT: "));
+        assert!(error.ends_with(crate::error::REPORT_REASON_TRUNCATION_MARKER));
     }
 
     fn image_result_with_current_exception_manifest(
@@ -8951,6 +9063,23 @@ mod tests {
             serde_json::to_value(ImageReport::from_result(&analyzed_image("03_VSS"))).unwrap();
         assert!(plain.get("exception_roots").is_none());
         assert!(plain.get("exception_error").is_none());
+    }
+
+    #[test]
+    fn image_report_bounds_exception_error_at_serialization_boundary() {
+        let mut result = analyzed_image(EXCEPTION_LABEL);
+        result.exception_error = Some(format!("strict context: {}", "\u{1f642}".repeat(3_000)));
+
+        let report = ImageReport::from_result(&result);
+        let stored = report.exception_error.as_deref().unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            stored.chars().count(),
+            crate::error::REPORT_REASON_MAX_CHARS
+        );
+        assert!(stored.ends_with(crate::error::REPORT_REASON_TRUNCATION_MARKER));
+        assert_eq!(json["exception_error"], stored);
     }
 
     #[test]
@@ -9756,6 +9885,23 @@ mod tests {
             stage.error.as_deref(),
             Some("00_BOOT: injected PAL publication failure")
         );
+    }
+
+    #[test]
+    fn pal_stage_bounds_the_complete_multi_error_aggregate() {
+        let reason = "\u{1f642}".repeat(900);
+        let errors = vec![
+            ("02_VSS".to_string(), reason.clone()),
+            ("00_BOOT".to_string(), reason.clone()),
+            ("01_PSP".to_string(), reason),
+        ];
+
+        let stage = pal_tasks_stage(Some(&PalMarshalTally::default()), &errors, 0);
+        let error = stage.error.as_deref().unwrap();
+
+        assert_eq!(error.chars().count(), crate::error::REPORT_REASON_MAX_CHARS);
+        assert!(error.starts_with("00_BOOT: "));
+        assert!(error.ends_with(crate::error::REPORT_REASON_TRUNCATION_MARKER));
     }
 
     #[test]
