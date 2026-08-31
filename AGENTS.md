@@ -54,9 +54,11 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   tree in place** (idempotently), so point it at a disposable copy, not your only reference.
 - **Ghidra end-to-end** (`tests/decompile_golden.rs`) is self-contained — it crafts a
   tiny ARM blob in a valid TOC, so it needs **no firmware** — but it needs a real Ghidra.
-  It locates one via `GHIDRA_INSTALL_DIR` or `/opt/ghidra` (looking for
-  `support/analyzeHeadless`) and skips otherwise. CI runs it nightly / on demand via the
-  `ghidra-e2e` workflow. Run the real-Ghidra binary serially:
+  An explicit `GHIDRA_INSTALL_DIR` is authoritative: that exact root must contain the regular file
+  `support/analyzeHeadless`, or every real-Ghidra test fails its prerequisite without probing or
+  substituting `/opt/ghidra`. Only when the variable is unset does the resolver probe
+  `/opt/ghidra/support/analyzeHeadless` and skip cleanly if it is absent. CI runs the binary nightly
+  / on demand via the `ghidra-e2e` workflow. Run it serially:
 
       cargo test --test decompile_golden -- --nocapture --test-threads=1
 
@@ -75,8 +77,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   The exception-root cases in this binary use one production-generated synthetic fixture to cover
   ARM/Thumb roots, shared handlers, foreign primaries, exact replay, malformed/ambiguous maps,
   rollback, both datamark and tighten survival with exact bodies/flow, stronger pass-2 transitions,
-  stale ownership, and the v4 export marker. When `/opt/ghidra` is configured, those cases fail
-  rather than skip if it is unavailable or broken.
+  stale ownership, and the v4 export marker. Every case shares the resolver above: a selected
+  installation that is unavailable or broken fails rather than skipping.
 - **Runtime-scatter corpus goldens** (`tests/scatter_golden.rs`) authenticate and validate
   retained MAIN files supplied explicitly from outside the repository:
 
@@ -104,16 +106,18 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
       PME_S5300_MAIN=/path/to/s5300/MAIN.bin \
       cargo test --test exception_roots_golden -- --nocapture --test-threads=1
 
-  Each variable gates only its own model. Unset or missing inputs print that named leg as UNRUN;
-  a set non-regular path fails, one available corpus still runs, and a clean skip is never
-  acceptance. Verify the forced no-corpus path with
+  Each variable gates only its own model, and **only an unset variable skips** (printing that named
+  leg as UNRUN). Every set value must be valid Unicode and name a regular, non-symlink file under
+  non-following metadata; missing paths, directories, symlinks (including links to regular files),
+  special files, and metadata/path errors fail that named leg. One valid configured corpus still
+  runs when its sibling is unset. Verify the forced no-corpus path with
   `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test exception_roots_golden -- --nocapture`.
   Pins are structural only: one complete initial table, eight literal slots in architectural role
   order, confirmed-initial VBAR, eight distinct roots, canonical ordering/conservation, and the
   canonical manifest BLAKE3. Never commit firmware bytes, generated manifests, recovered names,
   messages, source paths, or absolute corpus paths. To populate a new lawful corpus pin, leave its
   digest sentinel empty, run that configured leg once, copy only the printed manifest BLAKE3, and
-  rerun it to PASS; an unavailable leg remains explicitly UNRUN and unpopulated.
+  rerun it to PASS; an unavailable leg remains unpopulated by leaving its variable unset.
 - **Private-corpus DBT debug-trace goldens** (`tests/dbt_traces_golden.rs`) consume the *same*
   two retained MAIN files (`PME_S5400_MAIN` / `PME_S5300_MAIN`) through a TOC wrap (name
   `MAIN`, base `0x40010000`, toc_index 3 for S5400 / 2 for S5300) and pin catalog counts,

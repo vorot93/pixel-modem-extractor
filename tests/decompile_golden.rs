@@ -1,11 +1,12 @@
 //! Self-contained end-to-end test of the `--run` path: craft a tiny ARM blob in a
-//! valid TOC, drive real Ghidra headless, and assert the export. Gated on locating
-//! Ghidra ($GHIDRA_INSTALL_DIR or /opt/ghidra); skips cleanly otherwise. No
-//! proprietary firmware needed.
+//! valid TOC, drive real Ghidra headless, and assert the export. An explicit
+//! $GHIDRA_INSTALL_DIR is authoritative and invalid values fail; when it is unset,
+//! /opt/ghidra is used or the tests skip cleanly. No proprietary firmware needed.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[path = "support/pal_fixture.rs"]
 mod pal_fixture;
@@ -16,7 +17,7 @@ const SCATTER_COPY_DESTINATION: u32 = SCATTER_BASE + SCATTER_IMAGE_LEN as u32;
 const SCATTER_DECOMPRESS1_DESTINATION: u32 = SCATTER_COPY_DESTINATION + 0x10;
 const SCATTER_ZERO_DESTINATION: u32 = SCATTER_COPY_DESTINATION + 0x20;
 
-fn analyze_headless_in_home(home: &std::path::Path) -> Option<PathBuf> {
+fn analyze_headless_in_home(home: &Path) -> Option<PathBuf> {
     [
         home.join("support/analyzeHeadless"),
         home.join("libexec/support/analyzeHeadless"),
@@ -25,18 +26,105 @@ fn analyze_headless_in_home(home: &std::path::Path) -> Option<PathBuf> {
     .find(|launcher| launcher.exists())
 }
 
-fn find_ghidra_home() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("GHIDRA_INSTALL_DIR") {
-        let p = PathBuf::from(dir);
-        if analyze_headless_in_home(&p).is_some() {
-            return Some(p);
+fn resolve_ghidra_home(
+    explicit: Option<OsString>,
+    default_home: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(explicit) = explicit {
+        let home = PathBuf::from(explicit);
+        if home.as_os_str().is_empty() {
+            return Err("GHIDRA_INSTALL_DIR is set but empty".to_string());
         }
+        let launcher = home.join("support/analyzeHeadless");
+        return match std::fs::metadata(&launcher) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(home)),
+            Ok(_) => Err(format!(
+                "GHIDRA_INSTALL_DIR requires a regular launcher at {}",
+                launcher.display()
+            )),
+            Err(error) => Err(format!(
+                "GHIDRA_INSTALL_DIR requires {}: {error}",
+                launcher.display()
+            )),
+        };
     }
-    let opt = PathBuf::from("/opt/ghidra");
-    if analyze_headless_in_home(&opt).is_some() {
-        return Some(opt);
+
+    let launcher = default_home.join("support/analyzeHeadless");
+    match std::fs::metadata(&launcher) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(default_home.to_path_buf())),
+        Ok(_) => Err(format!(
+            "default Ghidra launcher is not a regular file: {}",
+            launcher.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to inspect default Ghidra launcher {}: {error}",
+            launcher.display()
+        )),
     }
-    None
+}
+
+fn find_ghidra_home() -> Result<Option<PathBuf>, String> {
+    resolve_ghidra_home(
+        std::env::var_os("GHIDRA_INSTALL_DIR"),
+        Path::new("/opt/ghidra"),
+    )
+}
+
+macro_rules! ghidra_home_or_skip {
+    () => {{
+        match find_ghidra_home() {
+            Ok(Some(home)) => home,
+            Ok(None) => {
+                eprintln!("skip: Ghidra not found (/opt/ghidra; GHIDRA_INSTALL_DIR is unset)");
+                return;
+            }
+            Err(error) => panic!("Ghidra test prerequisite failed: {error}"),
+        }
+    }};
+}
+
+#[test]
+fn explicit_invalid_ghidra_home_never_falls_through_to_default() {
+    let root = tempfile::tempdir().unwrap();
+    let explicit = root.path().join("explicit");
+    let fallback = root.path().join("fallback");
+    std::fs::create_dir_all(explicit.join("libexec/support")).unwrap();
+    std::fs::create_dir_all(fallback.join("support")).unwrap();
+    std::fs::write(
+        explicit.join("libexec/support/analyzeHeadless"),
+        b"explicit wrong layout",
+    )
+    .unwrap();
+    std::fs::write(fallback.join("support/analyzeHeadless"), b"valid fallback").unwrap();
+
+    let error =
+        resolve_ghidra_home(Some(explicit.clone().into_os_string()), &fallback).unwrap_err();
+    assert!(
+        error.contains("GHIDRA_INSTALL_DIR")
+            && error.contains(
+                &explicit
+                    .join("support/analyzeHeadless")
+                    .display()
+                    .to_string()
+            ),
+        "unexpected explicit-home error: {error}"
+    );
+}
+
+#[test]
+fn unset_ghidra_home_uses_default_or_skips_when_default_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let fallback = root.path().join("fallback");
+    std::fs::create_dir_all(fallback.join("support")).unwrap();
+    std::fs::write(fallback.join("support/analyzeHeadless"), b"valid fallback").unwrap();
+    assert_eq!(
+        resolve_ghidra_home(None, &fallback).unwrap(),
+        Some(fallback)
+    );
+
+    let absent = root.path().join("absent");
+    assert_eq!(resolve_ghidra_home(None, &absent).unwrap(), None);
 }
 
 fn craft_single_image_modem_bin(name: &str, load_addr: u32, index: u32, payload: &[u8]) -> Vec<u8> {
@@ -531,10 +619,7 @@ fn raw_only_pass2_input(
 
 #[test]
 fn run_drives_ghidra_end_to_end() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     // ARM: `add r0, r0, r1` ; `bx lr`  (little-endian)
     let arm = [0x01u8, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1];
     let modem = craft_modem_bin(&arm);
@@ -624,10 +709,7 @@ fn run_drives_ghidra_end_to_end() {
 
 #[test]
 fn scatter_load_map_is_applied_before_analysis() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let dir = std::env::temp_dir().join(format!("pme_scatter_valid_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -750,10 +832,7 @@ fn generated_only_pal_seeding_is_default_on() {
 /// report and the identity-bound v4 marker is validated.
 #[test]
 fn immediate_run_applies_pal_tasks_by_default() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let dir = std::env::temp_dir().join(format!("pme_pal_run_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -821,10 +900,7 @@ fn immediate_run_applies_pal_tasks_by_default() {
 /// (datamark mode) — PAL seeding stays default-on in both modes.
 #[test]
 fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let dir = std::env::temp_dir().join(format!("pme_pal_dmk_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -892,10 +968,7 @@ fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
 /// partitioned as data only in datamark mode.
 #[test]
 fn tighten_and_datamark_runs_preserve_tasks_and_partition_controlled_gap() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let manifest_entries = |out: &std::path::Path| {
         let manifest: serde_json::Value = serde_json::from_slice(
             &std::fs::read(out.join("pal_tasks/02_MAIN/tasks.json"))
@@ -1028,10 +1101,7 @@ fn tighten_and_datamark_runs_preserve_tasks_and_partition_controlled_gap() {
 
 #[test]
 fn truncated_scatter_payload_fails_closed_without_partial_map() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_generated_scatter_failure_is_closed(
         &home,
         "truncated_payload",
@@ -1052,10 +1122,7 @@ fn truncated_scatter_payload_fails_closed_without_partial_map() {
 
 #[test]
 fn scatter_raw_collision_fails_closed_without_partial_map() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_generated_scatter_failure_is_closed(
         &home,
         "raw_collision",
@@ -1078,10 +1145,7 @@ fn scatter_raw_collision_fails_closed_without_partial_map() {
 
 #[test]
 fn lenient_scatter_json_fails_closed_without_partial_map() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_generated_scatter_failure_is_closed(
         &home,
         "lenient_json",
@@ -1098,10 +1162,7 @@ fn lenient_scatter_json_fails_closed_without_partial_map() {
 
 #[test]
 fn duplicate_scatter_json_member_fails_closed_without_partial_map() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_generated_scatter_failure_is_closed(
         &home,
         "duplicate_json_member",
@@ -1122,10 +1183,7 @@ fn duplicate_scatter_json_member_fails_closed_without_partial_map() {
 
 #[test]
 fn out_of_order_scatter_indices_fail_closed_without_partial_map() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_generated_scatter_failure_is_closed(
         &home,
         "out_of_order_indices",
@@ -1144,10 +1202,7 @@ fn out_of_order_scatter_indices_fail_closed_without_partial_map() {
 
 #[test]
 fn scatter_post_preflight_failure_rolls_back_created_blocks() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_generated_scatter_failure_is_closed(
         &home,
         "rollback",
@@ -1175,10 +1230,7 @@ fn scatter_post_preflight_failure_rolls_back_created_blocks() {
 
 #[test]
 fn generated_shell_rejects_partial_export_after_functions_json() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let (dir, out, _) = generate_scatter_kit(&home, "partial_export");
     let export = out.join("export/02_MAIN");
     std::fs::create_dir_all(&export).unwrap();
@@ -1229,10 +1281,7 @@ fn generated_shell_rejects_partial_export_after_functions_json() {
 
 #[test]
 fn generated_shell_rejects_suppressed_print_writer_error() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let (dir, out, _) = generate_scatter_kit(&home, "print_writer_error");
     let export = out.join("export/02_MAIN");
     let completion = out.join("export/02_MAIN.complete");
@@ -1414,10 +1463,7 @@ printf 'pixel-modem-extractor-ghidra-export-v1\n\n' > "$export_dir.complete"
 /// README), not a quoting defect here.
 #[test]
 fn generated_shell_completes_pal_run_from_root_with_spaces_and_metacharacters() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let dir = std::env::temp_dir().join(format!("pme_pal_shell_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1569,10 +1615,7 @@ fn generated_shell_fails_closed_on_spaced_tmpdir() {
 
 #[test]
 fn exporter_quarantines_instruction_when_tmode_register_is_missing() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let modem = craft_modem_bin(&[0xc3]); // x86 `ret`; language has no ARM TMode register.
     let dir = std::env::temp_dir().join(format!(
         "pme_decompile_missing_tmode_{}",
@@ -1623,10 +1666,7 @@ fn exporter_quarantines_instruction_when_tmode_register_is_missing() {
 
 #[test]
 fn saved_program_exports_mixed_isa_ranges_and_preserves_body_gap() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let payload = [
         0x1eu8, 0xff, 0x2f, 0xe1, // A32: bx lr
         0, 0, 0, 0, // exact Function-body gap
@@ -1765,10 +1805,7 @@ public class SeedMixedGap extends GhidraScript {
 
 #[test]
 fn saved_program_quarantines_when_same_isa_merge_makes_entry_interior() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let payload = [
         0x1eu8, 0xff, 0x2f, 0xe1, // A32: bx lr before the function entry
         0x1e, 0xff, 0x2f, 0xe1, // A32: bx lr at the function entry
@@ -1859,10 +1896,7 @@ public class SeedSavedProgram extends GhidraScript {
 
 #[test]
 fn saved_program_rejects_function_entry_outside_u32() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let modem = craft_modem_bin(&[0xc3]); // x86-64 `ret`
     let dir = std::env::temp_dir().join(format!(
         "pme_decompile_body_outside_u32_{}",
@@ -1948,10 +1982,7 @@ public class SeedSavedProgram extends GhidraScript {
 
 #[test]
 fn saved_program_quarantines_complete_defective_records_and_continues() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let mut payload = Vec::new();
     for _ in 0..7 {
         payload.extend([0x1e, 0xff, 0x2f, 0xe1]); // A32: bx lr
@@ -2095,10 +2126,7 @@ public class SeedSavedProgram extends GhidraScript {
 /// Subsequent attempts prove non-default preservation and invalid-map isolation.
 #[test]
 fn pass2_applies_functions_and_strict_globals_in_one_process() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
 
     // ARM: `ldr r0, [pc, #0x18]`; `bx lr`; six vector-slot self-branches;
     // one data word at 0x20. The LDR genuinely references 0x20, while the
@@ -3880,10 +3908,7 @@ fn parse_token_db(entries: &[(u32, &str)]) -> pixel_modem_extractor::tokens::Dat
 /// reflects the applied type at the right site, not as the primary signal.
 #[test]
 fn pass2_applies_global_types_and_skips_span_collision() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
 
     // ldr r0, [pc, #0x18]; bx lr; six vector-slot self-branches; one data word
     // at 0x20 — identical to the ApplyGlobals pass-2 test's fixture.
@@ -4657,10 +4682,7 @@ fn minify_json_whitespace(text: &str) -> String {
 
 #[test]
 fn pal_support_strict_parsers_registry_and_digests() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
 
     let dir = std::env::temp_dir().join(format!("pme_pal_support_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -5830,10 +5852,7 @@ fn pal_expected_summary(
 
 #[test]
 fn apply_pal_tasks_seeds_state_and_reapplies_idempotently() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let kit = generate_pal_apply_kit(&home, "ok");
     let import = pal_import(&home, &kit, Some("PalSeedMeaningful.java"));
     assert!(
@@ -5921,10 +5940,7 @@ fn assert_apply_fails_without_partial_state(
 
 #[test]
 fn apply_pal_tasks_rolls_back_injected_failure_after_several_functions() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "rollback",
@@ -5946,10 +5962,7 @@ fn apply_pal_tasks_rolls_back_injected_failure_after_several_functions() {
 
 #[test]
 fn apply_pal_tasks_rejects_entry_timeout_and_rolls_back() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "timeout",
@@ -5974,10 +5987,7 @@ fn apply_pal_tasks_rejects_entry_timeout_and_rolls_back() {
 
 #[test]
 fn apply_pal_tasks_rejects_code_byte_exhaustion_and_rolls_back() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "bytes",
@@ -5993,10 +6003,7 @@ fn apply_pal_tasks_rejects_code_byte_exhaustion_and_rolls_back() {
 
 #[test]
 fn apply_pal_tasks_rejects_wrong_isa_context() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "wrong_isa",
@@ -6009,10 +6016,7 @@ fn apply_pal_tasks_rejects_wrong_isa_context() {
 
 #[test]
 fn apply_pal_tasks_rejects_stray_close_marker_before_mutation() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "stray_close",
@@ -6025,10 +6029,7 @@ fn apply_pal_tasks_rejects_stray_close_marker_before_mutation() {
 
 #[test]
 fn apply_pal_tasks_rejects_containing_function() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "containing",
@@ -6041,10 +6042,7 @@ fn apply_pal_tasks_rejects_containing_function() {
 
 #[test]
 fn apply_pal_tasks_rejects_label_collision() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_apply_fails_without_partial_state(
         &home,
         "collision",
@@ -6057,10 +6055,7 @@ fn apply_pal_tasks_rejects_label_collision() {
 
 #[test]
 fn apply_pal_tasks_rejects_stale_registry() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let kit = generate_pal_apply_kit(&home, "stale");
     let import = pal_import(&home, &kit, None);
     assert!(
@@ -6110,10 +6105,7 @@ fn apply_pal_tasks_rejects_stale_registry() {
 /// manifest, then applied and validated inside real Ghidra.
 #[test]
 fn colliding_and_shared_names_allocate_deterministic_leaves() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let dir = std::env::temp_dir().join(format!("pme_pal_collide_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -6833,10 +6825,7 @@ fn patch_tame_script(out: &std::path::Path, replacements: &[(&str, &str)]) {
 
 #[test]
 fn datamark_preserves_code_functions_and_partitions_gaps() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let kit = generate_tame_kit(&home, "preserve");
     let seeded = tame_import(&home, &kit, true);
     assert!(
@@ -6934,10 +6923,7 @@ fn datamark_preserves_code_functions_and_partitions_gaps() {
 
 #[test]
 fn datamark_partitions_large_gaps_into_chunks_and_caps_digest_listing() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let kit = generate_tame_kit(&home, "chunks");
     let seeded = tame_import(&home, &kit, true);
     assert!(
@@ -7010,10 +6996,7 @@ fn datamark_partitions_large_gaps_into_chunks_and_caps_digest_listing() {
 
 #[test]
 fn datamark_rejects_strict_argument_contract_before_mutation() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let kit = generate_tame_kit(&home, "strict");
     let seeded = tame_import(&home, &kit, true);
     assert!(
@@ -7165,10 +7148,7 @@ fn assert_datamark_fails_pristine(
 
 #[test]
 fn datamark_rolls_back_injected_partial_failure() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_datamark_fails_pristine(
         &home,
         "rollback",
@@ -7188,10 +7168,7 @@ fn datamark_rolls_back_injected_partial_failure() {
 
 #[test]
 fn datamark_rejects_deadline_and_rolls_back() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_datamark_fails_pristine(
         &home,
         "deadline",
@@ -7208,10 +7185,7 @@ fn datamark_rejects_deadline_and_rolls_back() {
 
 #[test]
 fn datamark_rejects_aggregate_limit_and_rolls_back() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     assert_datamark_fails_pristine(
         &home,
         "limit",
@@ -7228,10 +7202,7 @@ fn datamark_rejects_aggregate_limit_and_rolls_back() {
 /// marker. The one-function fixture makes that final-operation boundary exact.
 #[test]
 fn export_rejects_deadline_expiry_after_final_decompile_operation() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let kit = generate_tame_kit(&home, "export_final_deadline");
     let seeded = tame_import(&home, &kit, true);
     assert!(
@@ -8047,10 +8018,7 @@ public class SeedCorrupt extends GhidraScript {
 /// rollback after several mutations.
 #[test]
 fn apply_symbols_pal_ownership_transitions_are_transactional() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let image = pal_fixture::craft_main_image();
 
     for (name, source) in [
@@ -8682,10 +8650,7 @@ public class ProbeProperty extends GhidraScript {
 /// publish.
 #[test]
 fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let image = pal_fixture::craft_main_image();
     let state = build_pal_pass2_kit(
         &home,
@@ -8797,10 +8762,7 @@ fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
 /// limits each fail before any output is published.
 #[test]
 fn export_pal_postflight_rejects_program_drift() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
     let image = pal_fixture::craft_main_image();
     let corrupt_dir = {
         let staging =
@@ -9060,9 +9022,7 @@ public class SeedExtraFunction extends GhidraScript {
 
 #[test]
 fn export_revalidates_pal_after_output_generation_before_publication() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra PAL final-postflight test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let image = pal_fixture::craft_main_image();
     for (case, injection, expected) in [
         (
@@ -11592,9 +11552,7 @@ fn assert_exception_rejected_unchanged(
 
 #[test]
 fn pass1_applies_exception_roots_transactionally() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
 
     // Drive the shipping pass-1 route, including generated discovery state,
@@ -11810,9 +11768,7 @@ fn pass1_applies_exception_roots_transactionally() {
 
 #[test]
 fn export_v4_rejects_removed_merged_and_retagged_exception_roots() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     for (mode, expected) in [
         ("removed", "registry function binding is stale"),
@@ -11854,9 +11810,7 @@ fn export_v4_rejects_removed_merged_and_retagged_exception_roots() {
 
 #[test]
 fn export_rejects_root_byte_drift_after_output_generation_without_publication() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception final-postflight test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "export_final_byte_drift", &fixture);
     let imported = exception_import(&home, &kit);
@@ -11924,9 +11878,7 @@ fn export_rejects_root_byte_drift_after_output_generation_without_publication() 
 
 #[test]
 fn pass1_applies_shared_exception_roles_with_nonlexical_label_order() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_nonlexical_shared_fixture();
     let kit = generate_exception_apply_kit(&home, "nonlexical_shared", &fixture);
     let imported = exception_import(&home, &kit);
@@ -11953,9 +11905,7 @@ fn pass1_applies_shared_exception_roles_with_nonlexical_label_order() {
 
 #[test]
 fn exception_support_guards_pc_spans_and_pal_unicode_policy() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "support_guards", &fixture);
     let imported = exception_import(&home, &kit);
@@ -11981,9 +11931,7 @@ fn exception_support_guards_pc_spans_and_pal_unicode_policy() {
 
 #[test]
 fn pass1_preserves_meaningful_primary_without_existing_function() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "primary_without_function", &fixture);
     let imported = exception_import(&home, &kit);
@@ -12020,9 +11968,7 @@ fn pass1_preserves_meaningful_primary_without_existing_function() {
 
 #[test]
 fn pass1_replay_rejects_not_requested_primary_drift() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "not_requested_primary", &fixture);
     assert!(exception_import(&home, &kit).status.success());
@@ -12053,9 +11999,7 @@ fn pass1_replay_rejects_not_requested_primary_drift() {
 
 #[test]
 fn failed_exception_applicator_stops_follow_on_scripts() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "headless_abort", &fixture);
     assert!(exception_import(&home, &kit).status.success());
@@ -12079,9 +12023,7 @@ fn failed_exception_applicator_stops_follow_on_scripts() {
 
 #[test]
 fn post_commit_close_failure_is_replayable_without_success_summary() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "close_after_commit", &fixture);
     assert!(exception_import(&home, &kit).status.success());
@@ -12148,9 +12090,7 @@ fn post_commit_close_failure_is_replayable_without_success_summary() {
 
 #[test]
 fn partial_throwable_preflight_closes_retained_handles() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let kit = generate_exception_apply_kit(&home, "partial_throwable_preflight", &fixture);
     assert!(exception_import(&home, &kit).status.success());
@@ -12230,9 +12170,7 @@ fn partial_throwable_preflight_closes_retained_handles() {
 
 #[test]
 fn defensive_rollback_precedes_abort_for_partial_commands_and_exact_context() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
 
     let context_kit = generate_exception_apply_kit(&home, "partial_disassembly", &fixture);
@@ -12371,9 +12309,7 @@ fn defensive_rollback_precedes_abort_for_partial_commands_and_exact_context() {
 
 #[test]
 fn complete_postflight_rejects_bytes_tmode_and_body_drift() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_fixture();
     let cases = [
         (
@@ -12468,9 +12404,7 @@ fn complete_postflight_rejects_bytes_tmode_and_body_drift() {
 
 #[test]
 fn pass1_relocated_same_role_claims_keep_unique_primaries() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let fixture = exception_relocated_same_targets_fixture();
     let kit = generate_exception_apply_kit(&home, "relocated_same_targets", &fixture);
     let imported = exception_import(&home, &kit);
@@ -12499,9 +12433,7 @@ fn pass1_relocated_same_role_claims_keep_unique_primaries() {
 
 #[test]
 fn pass1_applies_scatter_backed_exception_root() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
     let (kit, fixture) = generate_exception_scatter_apply_kit(&home, "scatter");
     let imported = exception_import(&home, &kit);
     assert!(
@@ -12586,9 +12518,7 @@ fn pass1_applies_scatter_backed_exception_root() {
 
 #[test]
 fn pass1_exception_roots_fail_closed_without_residue() {
-    let Some(home) = find_ghidra_home() else {
-        panic!("configured real-Ghidra exception test requires /opt/ghidra");
-    };
+    let home = ghidra_home_or_skip!();
 
     let unknown_base = exception_fixture();
     let mut unknown_manifest = unknown_base.manifest.strip_suffix('}').unwrap().to_string();
@@ -12991,10 +12921,7 @@ fn assert_exception_production_mode(home: &std::path::Path, mode: &str, no_thumb
 
 #[test]
 fn production_tighten_and_datamark_preserve_exact_exception_root_bodies_and_flow() {
-    let Some(home) = find_ghidra_home() else {
-        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
-        return;
-    };
+    let home = ghidra_home_or_skip!();
 
     for (mode, no_thumb_decompile) in [("tighten", false), ("datamark", true)] {
         assert_exception_production_mode(&home, mode, no_thumb_decompile);

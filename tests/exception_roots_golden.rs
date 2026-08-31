@@ -277,29 +277,34 @@ fn assert_manifest_digest(pins: &CorpusPin, observed: &str) {
 }
 
 fn corpus_path_value(env_var: &str, value: Option<OsString>) -> Result<Option<PathBuf>, String> {
-    let Some(path) = value.map(PathBuf::from) else {
+    let Some(value) = value else {
         eprintln!("UNRUN: {env_var} is unset");
         return Ok(None);
     };
-    match std::fs::metadata(&path) {
+    let path = PathBuf::from(
+        value
+            .into_string()
+            .map_err(|_| format!("{env_var} input path is not valid Unicode"))?,
+    );
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{env_var} input is a symlink, expected a regular file: {}",
+            path.display()
+        )),
         Ok(metadata) if metadata.is_file() => Ok(Some(path)),
         Ok(_) => Err(format!(
             "{env_var} input is not a regular file: {}",
             path.display()
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("UNRUN: {env_var} input does not exist: {}", path.display());
-            Ok(None)
-        }
         Err(error) => Err(format!(
-            "failed to inspect {env_var} input {}: {error}",
+            "failed to inspect configured {env_var} input {}: {error}",
             path.display()
         )),
     }
 }
 
 #[test]
-fn no_corpus_environment_skips_independently_and_rejects_nonregular_inputs() {
+fn unset_corpus_environment_skips_independently_and_configured_missing_fails() {
     assert_eq!(corpus_path_value("PME_S5400_MAIN", None).unwrap(), None);
     assert_eq!(corpus_path_value("PME_S5300_MAIN", None).unwrap(), None);
 
@@ -319,10 +324,10 @@ fn no_corpus_environment_skips_independently_and_rejects_nonregular_inputs() {
     );
 
     let missing = root.path().join("missing.bin");
-    assert_eq!(
-        corpus_path_value("PME_S5300_MAIN", Some(missing.into_os_string())).unwrap(),
-        None,
-        "a configured missing input remains an explicit skip"
+    let error = corpus_path_value("PME_S5300_MAIN", Some(missing.into_os_string())).unwrap_err();
+    assert!(
+        error.contains("failed to inspect configured PME_S5300_MAIN input"),
+        "unexpected configured-missing error: {error}"
     );
 
     let error = corpus_path_value(
@@ -331,4 +336,35 @@ fn no_corpus_environment_skips_independently_and_rejects_nonregular_inputs() {
     )
     .unwrap_err();
     assert!(error.contains("not a regular file"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_corpus_symlink_to_regular_file_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let regular = root.path().join("main.bin");
+    let link = root.path().join("main-link.bin");
+    std::fs::write(&regular, b"image").unwrap();
+    symlink(&regular, &link).unwrap();
+
+    let error = corpus_path_value("PME_S5400_MAIN", Some(link.into_os_string())).unwrap_err();
+    assert!(
+        error.contains("is a symlink, expected a regular file"),
+        "unexpected configured-symlink error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_non_utf8_corpus_path_is_rejected() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let error =
+        corpus_path_value("PME_S5300_MAIN", Some(OsString::from_vec(vec![0xff]))).unwrap_err();
+    assert!(
+        error.contains("PME_S5300_MAIN input path is not valid Unicode"),
+        "unexpected configured-non-UTF-8 error: {error}"
+    );
 }
