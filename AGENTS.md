@@ -72,6 +72,11 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   global application, strict ownership, atomic map rejection, and the independent final export.
   The sibling `pass2_applies_global_types_and_skips_span_collision` covers `ApplyGlobalTypes.java`
   the same way (applied + span-collision skip); see **Phase 3.2 type application** below.
+  The exception-root cases in this binary use one production-generated synthetic fixture to cover
+  ARM/Thumb roots, shared handlers, foreign primaries, exact replay, malformed/ambiguous maps,
+  rollback, both datamark and tighten survival with exact bodies/flow, stronger pass-2 transitions,
+  stale ownership, and the v4 export marker. When `/opt/ghidra` is configured, those cases fail
+  rather than skip if it is unavailable or broken.
 - **Runtime-scatter corpus goldens** (`tests/scatter_golden.rs`) authenticate and validate
   retained MAIN files supplied explicitly from outside the repository:
 
@@ -91,6 +96,24 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   **Runtime PAL task inventory** below for the commands, the digest-population procedure, and
   the gating test (`no_corpus_environment_skips_independently`) that proves each leg skips
   only on unset/missing input.
+- **Private-corpus exception-root goldens** (`tests/exception_roots_golden.rs`) consume those
+  same independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load
+  `0x40010000` through production runtime generation, materialization, and strict on-disk reading:
+
+      PME_S5400_MAIN=/path/to/s5400/MAIN.bin \
+      PME_S5300_MAIN=/path/to/s5300/MAIN.bin \
+      cargo test --test exception_roots_golden -- --nocapture --test-threads=1
+
+  Each variable gates only its own model. Unset or missing inputs print that named leg as UNRUN;
+  a set non-regular path fails, one available corpus still runs, and a clean skip is never
+  acceptance. Verify the forced no-corpus path with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test exception_roots_golden -- --nocapture`.
+  Pins are structural only: one complete initial table, eight literal slots in architectural role
+  order, confirmed-initial VBAR, eight distinct roots, canonical ordering/conservation, and the
+  canonical manifest BLAKE3. Never commit firmware bytes, generated manifests, recovered names,
+  messages, source paths, or absolute corpus paths. To populate a new lawful corpus pin, leave its
+  digest sentinel empty, run that configured leg once, copy only the printed manifest BLAKE3, and
+  rerun it to PASS; an unavailable leg remains explicitly UNRUN and unpopulated.
 - **Private-corpus DBT debug-trace goldens** (`tests/dbt_traces_golden.rs`) consume the *same*
   two retained MAIN files (`PME_S5400_MAIN` / `PME_S5300_MAIN`) through a TOC wrap (name
   `MAIN`, base `0x40010000`, toc_index 3 for S5400 / 2 for S5300) and pin catalog counts,
@@ -473,13 +496,18 @@ module; when a file outgrows that, split it.
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
   discovery does not reject overlapping roots: producer evidence may describe them, while Ghidra's
   single instruction/listing model cannot apply them simultaneously.
+- **VBAR proof ends at the startup handoff.** A later indirect/decode boundary does not downgrade an
+  exact unconditional VBAR write that dominates every startup handoff; a boundary outside that
+  dominance remains `analysis_incomplete`. Both retained MAIN corpora depend on this distinction:
+  their initial-table write precedes and dominates the later indirect startup handoff.
 - **Generation and pass-1 currentness are explicit.** After splitting every TOC image, `decompile`
   discovers MAIN scatter once, builds one `RuntimeImage` per embedded image, discovers exception
   roots for every image, then discovers MAIN PAL against the shared runtime. Every label records
   `RuntimeExceptionState::{Present, Absent, Unmanaged}`; filters, opaque skips, and stale files never
-  fabricate currentness. Exception discovery, materialization, and clear must each finish before
-  state insertion; any failure returns no `RuntimeAnalysis` and preserves an earlier complete
-  manifest rather than reporting it current. Present pass-1 order is `ApplyScatterLoad` →
+  fabricate currentness. Exception discovery, materialization, strict on-disk reading, and clear
+  must each finish before state insertion. Discovery/publication/clear failure preserves an earlier
+  complete manifest; a post-publication read failure still returns no `RuntimeAnalysis` and never
+  reports the bytes current. Present pass-1 order is `ApplyScatterLoad` →
   `ApplyExceptionRoots` → `ApplyPalTasks` → `TameAnalysis`; generated and in-process routes pass the same identities and
   parse exactly one conserving exception summary. Host summary coordination commits a valid
   exception result before parsing PAL: a later PAL-summary failure preserves the exception counts

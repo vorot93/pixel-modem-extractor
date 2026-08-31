@@ -1983,9 +1983,19 @@ fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<Runti
         |image, base| scatter::discover(image, base).map_err(|error| error.to_string()),
         exception_roots::discover,
         exception_roots::materialize,
+        validate_materialized_exception_roots,
         exception_roots::clear_materialized,
         pal_tasks::discover,
     )
+}
+
+fn validate_materialized_exception_roots(
+    path: &Path,
+    runtime: &RuntimeImage<'_>,
+    context: ExceptionArtifactContext<'_>,
+    identity: &str,
+) -> std::result::Result<(), exception_roots::ExceptionRootError> {
+    exception_roots::read_with_identity(path, runtime, context, identity).map(drop)
 }
 
 /// Generate the runtime-analysis artifacts in dependency order: MAIN scatter
@@ -1993,8 +2003,8 @@ fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<Runti
 /// then MAIN PAL against the already-built view. Publication is atomic
 /// replacement; an owned artifact is cleared only after successful absence.
 /// Any discovery, publication, or clear error returns no consumable current state.
-// Keep discovery, publication, and clear independently injectable so each
-// currentness boundary has deterministic failure coverage.
+// Keep discovery, publication, strict reading, and clear independently
+// injectable so each currentness boundary has deterministic failure coverage.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn generate_runtime_analysis_with(
     toc: &Toc,
@@ -2018,6 +2028,15 @@ fn generate_runtime_analysis_with(
         &Path,
     ) -> std::result::Result<
         MaterializedExceptionRoots,
+        exception_roots::ExceptionRootError,
+    >,
+    mut validate_exception_roots: impl FnMut(
+        &Path,
+        &RuntimeImage<'_>,
+        ExceptionArtifactContext<'_>,
+        &str,
+    ) -> std::result::Result<
+        (),
         exception_roots::ExceptionRootError,
     >,
     mut clear_exception_roots: impl FnMut(
@@ -2106,6 +2125,12 @@ fn generate_runtime_analysis_with(
         match discover_exception_roots(runtime, label, &entry.name)? {
             Some(plan) => {
                 let materialized = materialize_exception_roots(&plan, context, out)?;
+                validate_exception_roots(
+                    &out.join(&materialized.relative_path),
+                    runtime,
+                    context,
+                    &materialized.identity,
+                )?;
                 tracing::info!(
                     "exception roots: {label} -> {} ({})",
                     materialized.relative_path,
@@ -9230,6 +9255,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 Ok(None)
             },
             exception_roots::materialize,
+            validate_materialized_exception_roots,
             exception_roots::clear_materialized,
             |_runtime, _label| {
                 pal_calls.set(pal_calls.get() + 1);
@@ -9345,6 +9371,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 ))
             },
             |_plan, _context, _root| panic!("discovery failure must not publish"),
+            |_path, _runtime, _context, _identity| panic!("discovery failure must not validate"),
             |_root, _label| panic!("discovery failure must not clear"),
             |_runtime, _label| panic!("a BOOT-only fixture must not discover PAL"),
         );
@@ -9379,6 +9406,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     "injected publication failure".into(),
                 ))
             },
+            |_path, _runtime, _context, _identity| panic!("publication failure must not validate"),
             |_root, _label| panic!("present discovery must not clear"),
             |_runtime, _label| panic!("a BOOT-only fixture must not discover PAL"),
         );
@@ -9388,6 +9416,44 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         };
         assert!(error.to_string().contains("injected publication failure"));
         assert_eq!(std::fs::read(stale).unwrap(), prior_bytes);
+    }
+
+    #[test]
+    fn generation_strictly_reads_materialized_exception_manifest_before_current_state() {
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/exception_roots/synthetic.bin"),
+        )
+        .unwrap();
+        let data = craft_modem_bin(&[("BOOT", 0x4001_0000, 1, &fixture)]);
+        let toc = Toc::parse(&data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = generate_runtime_analysis_with(
+            &toc,
+            &data,
+            dir.path(),
+            |_image, _base| Ok(None),
+            exception_roots::discover,
+            |plan, context, root| {
+                let map = exception_roots::materialize(plan, context, root)?;
+                std::fs::write(root.join(&map.relative_path), b"{}").unwrap();
+                Ok(map)
+            },
+            |path, runtime, context, identity| {
+                exception_roots::read_with_identity(path, runtime, context, identity).map(drop)
+            },
+            |_root, _label| panic!("present discovery must not clear"),
+            |_runtime, _label| panic!("a BOOT-only fixture must not discover PAL"),
+        );
+
+        let Err(error) = result else {
+            panic!("a corrupt materialized manifest became current");
+        };
+        assert!(
+            error.to_string().contains("manifest schema is invalid"),
+            "unexpected strict-reader error: {error}"
+        );
     }
 
     #[test]
@@ -9404,6 +9470,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             |_image, _base| Ok(None),
             |_runtime, _label, _toc_name| Ok(None),
             |_plan, _context, _root| panic!("absent discovery must not publish"),
+            |_path, _runtime, _context, _identity| panic!("absent discovery must not validate"),
             |_root, _label| {
                 Err(exception_roots::ExceptionRootError::Artifact(
                     "injected clear failure".into(),
@@ -9443,6 +9510,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             },
             exception_roots::discover,
             exception_roots::materialize,
+            validate_materialized_exception_roots,
             exception_roots::clear_materialized,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
@@ -9474,6 +9542,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             },
             exception_roots::discover,
             exception_roots::materialize,
+            validate_materialized_exception_roots,
             exception_roots::clear_materialized,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);
@@ -9512,6 +9581,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             },
             exception_roots::discover,
             exception_roots::materialize,
+            validate_materialized_exception_roots,
             exception_roots::clear_materialized,
             |runtime, label| {
                 pal_calls.set(pal_calls.get() + 1);

@@ -9984,6 +9984,50 @@ public class ExceptionInspectHeterogeneousContext extends GhidraScript {
 }
 "#;
 
+const EXCEPTION_INSPECT_ANALYSIS_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.listing.FlowOverride;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
+
+public class ExceptionInspectAnalysis extends GhidraScript {
+    private static final long[] ENTRIES = {
+        0x40010200L, 0x40010220L, 0x40010240L, 0x40010260L,
+        0x40010280L, 0x400102a0L, 0x400102c0L
+    };
+    private static final int[] LENGTHS = {4, 4, 4, 2, 4, 4, 2};
+
+    @Override
+    public void run() throws Exception {
+        for (int index = 0; index < ENTRIES.length; index++) {
+            Address entry = toAddr(ENTRIES[index]);
+            Address end = entry.add(LENGTHS[index] - 1L);
+            Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+            if (function == null || !function.getBody().equals(new AddressSet(entry, end))) {
+                throw new AssertionError("exception function body changed at " + entry
+                        + ": " + (function == null ? "missing" : function.getBody()));
+            }
+            Instruction instruction = currentProgram.getListing().getInstructionAt(entry);
+            if (instruction == null || instruction.getLength() != LENGTHS[index]
+                    || instruction.getFlowOverride() != FlowOverride.NONE
+                    || instruction.getFlows().length != 0) {
+                throw new AssertionError("exception instruction flow changed at " + entry);
+            }
+            Address fallthrough = instruction.getFallThrough();
+            Address expectedFallthrough = index == 1 ? entry.add(LENGTHS[index]) : null;
+            if (expectedFallthrough == null ? fallthrough != null
+                    : !expectedFallthrough.equals(fallthrough)) {
+                throw new AssertionError("exception fallthrough changed at " + entry
+                        + ": " + fallthrough);
+            }
+        }
+        System.out.println("ExceptionInspectAnalysis: ok");
+    }
+}
+"#;
+
 const EXCEPTION_INSPECT_SCATTER_APPLIED_JAVA: &str = r#"//@category PixelModemTest
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -10136,6 +10180,10 @@ fn stage_exception_test_scripts(out: &std::path::Path) {
         (
             "ExceptionInspectHeterogeneousContext.java",
             EXCEPTION_INSPECT_HETEROGENEOUS_CONTEXT_JAVA,
+        ),
+        (
+            "ExceptionInspectAnalysis.java",
+            EXCEPTION_INSPECT_ANALYSIS_JAVA,
         ),
     ] {
         std::fs::write(out.join("scripts").join(name), source).unwrap();
@@ -12857,4 +12905,98 @@ fn pass1_exception_roots_fail_closed_without_residue() {
     assert!(after.status.success());
     assert_eq!(exception_state(&after), before);
     let _ = std::fs::remove_dir_all(&rollback_kit.dir);
+}
+
+fn assert_exception_production_mode(home: &std::path::Path, mode: &str, no_thumb_decompile: bool) {
+    let fixture = exception_fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "pme_exception_production_{mode}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(
+        &modem_path,
+        craft_single_image_modem_bin("BOOT", EXCEPTION_BASE, 1, &fixture.raw),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    let report = pixel_modem_extractor::decompile::run_report(
+        &modem_path,
+        &pixel_modem_extractor::decompile::Opts {
+            run: true,
+            image: None,
+            ghidra_home: Some(home.to_path_buf()),
+            processor: "ARM:LE:32:v7".to_string(),
+            no_thumb_decompile,
+            rizin_fallback: false,
+            tighten_wall_clock_budget_override: None,
+            no_skip_opaque: true,
+        },
+        &out,
+    )
+    .unwrap();
+    let image = report.images.first().expect("synthetic BOOT result");
+    assert!(
+        matches!(
+            image.outcome,
+            pixel_modem_extractor::decompile::ImageOutcome::Analyzed(_)
+        ),
+        "exception {mode} production run failed: {:?} ({:?})",
+        image.outcome,
+        image.terminal_error
+    );
+    let applied = image
+        .exception_roots_applied
+        .as_ref()
+        .unwrap_or_else(|| panic!("exception {mode} run emitted no application summary"));
+    assert_eq!(applied.identity(), fixture.identity);
+    assert_eq!(applied.tables(), 1);
+    assert_eq!(applied.roles(), 8);
+    assert_eq!(applied.entries(), 7);
+    assert_eq!(
+        applied.functions_created() + applied.functions_reapplied() + applied.functions_existing(),
+        applied.entries()
+    );
+    assert_eq!(
+        applied.names_applied()
+            + applied.names_reapplied()
+            + applied.names_preserved()
+            + applied.names_not_requested(),
+        applied.entries()
+    );
+
+    stage_exception_test_scripts(&out);
+    let inspection = inspect_saved_project(home, &out, "00_BOOT", "ExceptionInspectAnalysis.java");
+    let diagnostics = process_diagnostics(&inspection);
+    assert!(
+        inspection.status.success()
+            && String::from_utf8_lossy(&inspection.stdout)
+                .lines()
+                .any(|line| line == "ExceptionInspectAnalysis: ok"),
+        "exception {mode} body/flow inspection failed:\n{diagnostics}"
+    );
+    assert_eq!(
+        std::fs::read(out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            &fixture.identity,
+            "none",
+            "none",
+        ),
+        "exception {mode} export marker"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn production_tighten_and_datamark_preserve_exact_exception_root_bodies_and_flow() {
+    let Some(home) = find_ghidra_home() else {
+        eprintln!("skip: Ghidra not found ($GHIDRA_INSTALL_DIR or /opt/ghidra)");
+        return;
+    };
+
+    for (mode, no_thumb_decompile) in [("tighten", false), ("datamark", true)] {
+        assert_exception_production_mode(&home, mode, no_thumb_decompile);
+    }
 }

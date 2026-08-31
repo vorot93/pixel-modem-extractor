@@ -146,20 +146,10 @@ fn prove_reset_vbar(
     }
     observations.sort_by_key(|observation| observation.pc);
     observations.dedup();
-    if cfg
+    let has_incomplete_boundary = cfg
         .handoffs()
         .iter()
-        .any(|handoff| is_incomplete_boundary(handoff.kind))
-    {
-        return Ok((
-            RelocationEvidence::AnalysisIncomplete {
-                observations,
-                handoffs: cfg.handoffs().to_vec(),
-                reason: None,
-            },
-            None,
-        ));
-    }
+        .any(|handoff| is_incomplete_boundary(handoff.kind));
     let candidates = observations
         .iter()
         .filter(|observation| {
@@ -169,11 +159,28 @@ fn prove_reset_vbar(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let selected = select_final_vbar(&cfg, &candidates);
+    let selected_is_final = selected
+        .as_ref()
+        .is_some_and(|selected| selection_is_final(&cfg, selected, &observations));
+    // A barrier after an exact write that dominates every handoff cannot
+    // invalidate the already-established startup value. A barrier outside
+    // that dominance still prevents a complete proof.
+    if has_incomplete_boundary && !selected_is_final {
+        return Ok((
+            RelocationEvidence::AnalysisIncomplete {
+                observations,
+                handoffs: cfg.handoffs().to_vec(),
+                reason: None,
+            },
+            None,
+        ));
+    }
     let values = candidates
         .iter()
         .filter_map(|candidate| candidate.exact_value)
         .collect::<BTreeSet<_>>();
-    let Some(selected) = select_final_vbar(&cfg, &candidates) else {
+    let Some(selected) = selected else {
         if !observations.is_empty() {
             if values.len() > 1 {
                 return Err(ExceptionRootError::Ambiguous {
@@ -184,7 +191,7 @@ fn prove_reset_vbar(
         }
         return Ok((RelocationEvidence::NotObserved, None));
     };
-    if !selection_is_final(&cfg, &selected, &observations) {
+    if !selected_is_final {
         return Ok((RelocationEvidence::Unresolved { observations }, None));
     }
     let value = selected
@@ -1528,44 +1535,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_unmapped_indirect_and_exception_boundaries_are_incomplete() {
+    fn dominating_exact_vbar_survives_later_incomplete_boundaries() {
         let [movw, movt] = materialize(0, BASE);
         let branch_pc = RESET_ENTRY + 12;
         let cases = [
-            (
-                vec![movw, movt, a32_vbar_write(0), 0xe12f_ff11],
-                crate::semantic_cfg::BoundaryKind::Indirect,
-            ),
-            (
-                vec![movw, movt, a32_vbar_write(0), 0xef00_0000],
-                crate::semantic_cfg::BoundaryKind::ExceptionCall,
-            ),
-            (
-                vec![
-                    movw,
-                    movt,
-                    a32_vbar_write(0),
-                    a32_branch(branch_pc, BASE + 0x3000, 0xe, false),
-                ],
-                crate::semantic_cfg::BoundaryKind::Unmapped,
-            ),
+            vec![movw, movt, a32_vbar_write(0), 0xe12f_ff11],
+            vec![movw, movt, a32_vbar_write(0), 0xef00_0000],
+            vec![
+                movw,
+                movt,
+                a32_vbar_write(0),
+                a32_branch(branch_pc, BASE + 0x3000, 0xe, false),
+            ],
         ];
-        for (program, expected) in cases {
+        for program in cases {
             let fixture = reset_fixture_with_program(&program);
             let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
                 .unwrap()
                 .unwrap();
-            let RelocationEvidence::AnalysisIncomplete {
+            let RelocationEvidence::ConfirmedInitial {
+                selected,
                 observations,
-                handoffs,
-                reason,
             } = plan.relocation
             else {
-                panic!("{expected:?} boundary must make analysis incomplete");
+                panic!("a post-proof boundary must retain initial-table confirmation");
             };
+            assert_eq!(selected.exact_value, Some(BASE));
+            assert!(selected.dominates_handoffs);
             assert_eq!(observations[0].exact_value, Some(BASE));
-            assert!(handoffs.iter().any(|handoff| handoff.kind == expected));
-            assert_eq!(reason, None);
             assert_eq!(plan.tables.len(), 1);
         }
 
@@ -1573,14 +1570,45 @@ mod tests {
         let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
             .unwrap()
             .unwrap();
-        let RelocationEvidence::AnalysisIncomplete { handoffs, .. } = plan.relocation else {
-            panic!("decode barrier must make analysis incomplete");
+        let RelocationEvidence::ConfirmedInitial { selected, .. } = plan.relocation else {
+            panic!("a decode barrier after the proof must retain confirmation");
         };
+        assert_eq!(selected.exact_value, Some(BASE));
+        assert!(selected.dominates_handoffs);
+    }
+
+    #[test]
+    fn incomplete_boundary_outside_the_vbar_dominance_stays_incomplete() {
+        let [movw, movt] = materialize(0, BASE);
+        let branch_pc = RESET_ENTRY + 8;
+        let fixture = reset_fixture_with_program(&[
+            movw,
+            movt,
+            a32_branch(branch_pc, RESET_ENTRY + 20, 0x1, false),
+            a32_vbar_write(0),
+            0xe12f_ff1e,
+            0xe12f_ff11,
+        ]);
+        let plan = discover(&fixture.runtime(), "01_MAIN", "MAIN")
+            .unwrap()
+            .unwrap();
+
+        let RelocationEvidence::AnalysisIncomplete {
+            observations,
+            handoffs,
+            reason,
+        } = plan.relocation
+        else {
+            panic!("a non-dominated incomplete path must prevent confirmation");
+        };
+        assert_eq!(observations[0].exact_value, Some(BASE));
+        assert!(!observations[0].dominates_handoffs);
         assert!(
-            handoffs.iter().any(|handoff| {
-                handoff.kind == crate::semantic_cfg::BoundaryKind::DecodeFailure
-            })
+            handoffs
+                .iter()
+                .any(|handoff| { handoff.kind == crate::semantic_cfg::BoundaryKind::Indirect })
         );
+        assert_eq!(reason, None);
     }
 
     #[test]
