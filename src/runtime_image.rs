@@ -328,6 +328,15 @@ impl<'a> RuntimeImage<'a> {
         };
         let artifact: scatter::MaterializedScatter =
             scatter::read_materialized(kit_root, map, raw, base)?;
+        Self::from_materialized(raw, base, artifact)
+    }
+
+    pub(crate) fn from_materialized(
+        raw: &'a [u8],
+        base: u32,
+        artifact: scatter::MaterializedScatter,
+    ) -> Result<Self> {
+        let (_, raw_end) = raw_bounds(raw, base)?;
         let capacity = artifact
             .segments
             .len()

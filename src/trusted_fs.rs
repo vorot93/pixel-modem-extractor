@@ -3,11 +3,13 @@ use crate::error::{Error, Result};
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
@@ -49,6 +51,30 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const WINDOWS_DIRECTORY_ACCESS: FILE_ACCESS_RIGHTS =
     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedFileIdentity {
+    length: u64,
+    blake3: [u8; 32],
+}
+
+impl ExpectedFileIdentity {
+    pub(crate) fn new(length: u64, blake3: [u8; 32]) -> Self {
+        Self { length, blake3 }
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        Self::new(bytes.len() as u64, *blake3::hash(bytes).as_bytes())
+    }
+
+    pub(crate) fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(crate) fn blake3(self) -> [u8; 32] {
+        self.blake3
+    }
+}
 
 #[cfg(all(test, unix))]
 type ContainedOpenHook = Option<(String, Box<dyn FnOnce()>)>;
@@ -126,6 +152,28 @@ impl TrustedDirectory {
         Self::open_existing(path, context)?.ok_or_else(|| bad(format!("{context} does not exist")))
     }
 
+    pub(crate) fn verify_path_binding(&self, path: &Path, context: &str) -> Result<()> {
+        let reopened = open_unix_root(path).map_err(|error| {
+            bad(format!(
+                "{context} path binding cannot be reopened: {error}"
+            ))
+        })?;
+        let retained = self.file.metadata().map_err(|error| {
+            bad(format!(
+                "{context} retained identity is unavailable: {error}"
+            ))
+        })?;
+        let current = reopened.metadata().map_err(|error| {
+            bad(format!(
+                "{context} current identity is unavailable: {error}"
+            ))
+        })?;
+        if retained.dev() != current.dev() || retained.ino() != current.ino() {
+            return Err(bad(format!("{context} path binding changed")));
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_regular_file_with_parent(
         &self,
         relative: &Path,
@@ -179,6 +227,15 @@ impl TrustedDirectory {
     pub(crate) fn require_regular_file_or_absent(&self, name: &str, context: &str) -> Result<()> {
         match unix_entry_kind(&self.file, name, context)? {
             None | Some(UnixEntryKind::Regular) => Ok(()),
+            Some(UnixEntryKind::Symlink) => Err(bad(format!("{context} is a symlink"))),
+            Some(_) => Err(bad(format!("{context} is not a regular file"))),
+        }
+    }
+
+    pub(crate) fn regular_file_exists(&self, name: &str, context: &str) -> Result<bool> {
+        match unix_entry_kind(&self.file, name, context)? {
+            None => Ok(false),
+            Some(UnixEntryKind::Regular) => Ok(true),
             Some(UnixEntryKind::Symlink) => Err(bad(format!("{context} is a symlink"))),
             Some(_) => Err(bad(format!("{context} is not a regular file"))),
         }
@@ -631,6 +688,21 @@ impl TrustedDirectory {
         Self::open_existing(path, context)?.ok_or_else(|| bad(format!("{context} does not exist")))
     }
 
+    pub(crate) fn verify_path_binding(&self, path: &Path, context: &str) -> Result<()> {
+        let reopened = open_windows_root(path).map_err(|error| {
+            bad(format!(
+                "{context} path binding cannot be reopened: {error}"
+            ))
+        })?;
+        let information = windows_file_information(&reopened, context)?;
+        require_windows_directory(&information, context)?;
+        let current = windows_file_identity(&information, context)?;
+        if current != self.directory.identity {
+            return Err(bad(format!("{context} path binding changed")));
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_regular_file_with_parent(
         &self,
         relative: &Path,
@@ -686,6 +758,16 @@ impl TrustedDirectory {
                 context,
             )
             .map(|_| ())
+    }
+
+    pub(crate) fn regular_file_exists(&self, name: &str, context: &str) -> Result<bool> {
+        self.directory
+            .open_optional_regular_with_access(
+                OsStr::new(name),
+                SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                context,
+            )
+            .map(|file| file.is_some())
     }
 
     pub(crate) fn unlink_regular_file_if_exists(&self, name: &str, context: &str) -> Result<bool> {
@@ -1133,6 +1215,10 @@ impl TrustedDirectory {
         Err(unsupported(context))
     }
 
+    pub(crate) fn verify_path_binding(&self, _path: &Path, context: &str) -> Result<()> {
+        Err(unsupported(context))
+    }
+
     pub(crate) fn open_regular_file_with_parent(
         &self,
         _relative: &Path,
@@ -1158,6 +1244,10 @@ impl TrustedDirectory {
     }
 
     pub(crate) fn require_regular_file_or_absent(&self, _name: &str, context: &str) -> Result<()> {
+        Err(unsupported(context))
+    }
+
+    pub(crate) fn regular_file_exists(&self, _name: &str, context: &str) -> Result<bool> {
         Err(unsupported(context))
     }
 
@@ -1202,6 +1292,54 @@ impl Write for TrustedAtomicFile {
             io::ErrorKind::Unsupported,
             "trusted atomic publication is unsupported on this platform",
         ))
+    }
+}
+
+impl TrustedDirectory {
+    pub(crate) fn copy_verified_atomic<R: Read>(
+        &self,
+        target: &str,
+        source: &mut R,
+        expected: ExpectedFileIdentity,
+        context: &str,
+    ) -> Result<()> {
+        let mut output = self.atomic_write_file(target, context)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut length = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| bad(format!("{context} source read failed: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            length = length
+                .checked_add(read as u64)
+                .ok_or_else(|| bad(format!("{context} length overflows u64")))?;
+            if length > expected.length {
+                return Err(bad(format!(
+                    "{context} length does not match: expected {}, got more than {}",
+                    expected.length, expected.length
+                )));
+            }
+            hasher.update(&buffer[..read]);
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| bad(format!("{context} target write failed: {error}")))?;
+        }
+        if length != expected.length {
+            return Err(bad(format!(
+                "{context} length does not match: expected {}, got {length}",
+                expected.length
+            )));
+        }
+        if *hasher.finalize().as_bytes() != expected.blake3 {
+            return Err(bad(format!("{context} BLAKE3 does not match")));
+        }
+        output
+            .commit()
+            .map_err(|error| bad(format!("{context} atomic commit failed: {error}")))
     }
 }
 
@@ -1264,11 +1402,9 @@ fn bad(reason: impl Into<String>) -> Error {
 mod tests {
     use super::FileIdentity;
     use crate::error::{Error, Result};
-    #[cfg(unix)]
-    use std::io::Write as _;
+    use std::io::{self, Write as _};
     #[cfg(unix)]
     use std::path::Path;
-    #[cfg(unix)]
     use tempfile::tempdir;
 
     fn assert_bad<T>(result: Result<T>, expected: &str) {
@@ -1280,6 +1416,75 @@ mod tests {
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("expected trusted-filesystem rejection"),
         }
+    }
+
+    struct FailingReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        remaining: usize,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("injected source read failure"));
+            }
+            let limit = buffer.len().min(self.remaining);
+            let read = std::io::Read::read(&mut self.bytes, &mut buffer[..limit])?;
+            self.remaining -= read;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn verified_atomic_copy_midstream_error_preserves_existing_target() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("roots.json");
+        std::fs::write(&target, b"old target").unwrap();
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
+        let expected_bytes = b"authenticated replacement bytes";
+        let expected = super::ExpectedFileIdentity::from_bytes(expected_bytes);
+        let mut source = FailingReader {
+            bytes: std::io::Cursor::new(expected_bytes.to_vec()),
+            remaining: 7,
+        };
+
+        assert_bad(
+            trusted.copy_verified_atomic("roots.json", &mut source, expected, "test manifest"),
+            "injected source read failure",
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"old target");
+    }
+
+    #[test]
+    fn verified_atomic_copy_digest_mismatch_preserves_existing_target() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("roots.json");
+        std::fs::write(&target, b"old target").unwrap();
+        let trusted = super::TrustedDirectory::new(root.path(), "test root").unwrap();
+        let expected = super::ExpectedFileIdentity::from_bytes(b"expected replacement");
+        let mut source = std::io::Cursor::new(b"tampered replacement".to_vec());
+
+        assert_bad(
+            trusted.copy_verified_atomic("roots.json", &mut source, expected, "test manifest"),
+            "BLAKE3 does not match",
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"old target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_path_binding_rejects_parent_swap() {
+        let holder = tempdir().unwrap();
+        let root = holder.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let trusted = super::TrustedDirectory::new(&root, "test root").unwrap();
+        std::fs::rename(&root, holder.path().join("retained")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        assert_bad(
+            trusted.verify_path_binding(&root, "test root"),
+            "path binding changed",
+        );
     }
 
     #[cfg(unix)]

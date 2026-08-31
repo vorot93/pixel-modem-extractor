@@ -520,6 +520,15 @@ fn prepared_symbol_map(
     .unwrap()
 }
 
+fn raw_only_pass2_input(
+    kit_root: &std::path::Path,
+    label: &str,
+) -> pixel_modem_extractor::decompile::Pass2Input {
+    let toc_name = label.split_once('_').map(|(_, name)| name).unwrap_or(label);
+    pixel_modem_extractor::decompile::Pass2Input::prepare_raw_only(kit_root, label, toc_name, 0)
+        .unwrap()
+}
+
 #[test]
 fn run_drives_ghidra_end_to_end() {
     let Some(home) = find_ghidra_home() else {
@@ -2587,18 +2596,16 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
 
     let inputs = HashMap::from([(
         "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_symbol_map(
+        raw_only_pass2_input(&out, "00_BOOT")
+            .with_function_map(prepared_symbol_map(
                 &images_dir,
                 "00_BOOT",
                 &map_path,
                 bundle.map.execution_count,
                 bundle.map.creation_requests.clone(),
-            )),
-            global_map: Some(prepared_pass2_map(&global_map_path, 2)),
-            global_types_map: None,
-            ..Default::default()
-        },
+            ))
+            .unwrap()
+            .with_global_map(prepared_pass2_map(&global_map_path, 2)),
     )]);
 
     let apply_thumb_path = out.join("scripts/ApplyThumbNames.java");
@@ -2813,8 +2820,10 @@ public class ProbeThumbCreationRollback extends GhidraScript {
         ),
     )
     .unwrap();
-    let mut fault_inputs = inputs.clone();
-    fault_inputs.get_mut("00_BOOT").unwrap().global_map = None;
+    let fault_inputs = HashMap::from([(
+        "00_BOOT".to_string(),
+        inputs["00_BOOT"].clone().without_global_map(),
+    )]);
     let failed_attempt =
         pixel_modem_extractor::decompile::run_two_pass(pass1_report, &opts, &out, &fault_inputs)
             .unwrap()
@@ -3112,18 +3121,15 @@ public class ProbeThumbCreationSkips extends GhidraScript {
     // reporting zero new renames.
     let replay_inputs = HashMap::from([(
         "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: Some(prepared_symbol_map(
+        raw_only_pass2_input(&out, "00_BOOT")
+            .with_function_map(prepared_symbol_map(
                 &images_dir,
                 "00_BOOT",
                 &map_path,
                 bundle.map.execution_count,
                 bundle.map.creation_requests.clone(),
-            )),
-            global_map: None,
-            global_types_map: None,
-            ..Default::default()
-        },
+            ))
+            .unwrap(),
     )]);
     let replay = pixel_modem_extractor::decompile::run_two_pass(rep2, &opts, &out, &replay_inputs)
         .unwrap()
@@ -3745,12 +3751,8 @@ public class ReplaceThumbCreation extends GhidraScript {
     .unwrap();
     let globals_only = HashMap::from([(
         "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: None,
-            global_map: Some(prepared_pass2_map(&global_map_path2, 1)),
-            global_types_map: None,
-            ..Default::default()
-        },
+        raw_only_pass2_input(&out2, "00_BOOT")
+            .with_global_map(prepared_pass2_map(&global_map_path2, 1)),
     )]);
     let rep3 = pixel_modem_extractor::decompile::run_two_pass(pass1b, &opts, &out2, &globals_only)
         .unwrap()
@@ -3944,12 +3946,8 @@ fn pass2_applies_global_types_and_skips_span_collision() {
 
     let inputs = HashMap::from([(
         "00_BOOT".to_string(),
-        pixel_modem_extractor::decompile::Pass2Input {
-            function_map: None,
-            global_map: None,
-            global_types_map: Some(prepared_pass2_map(&map_path, 2)),
-            ..Default::default()
-        },
+        raw_only_pass2_input(&out, "00_BOOT")
+            .with_global_types_map(prepared_pass2_map(&map_path, 2)),
     )]);
     let pass2 =
         pixel_modem_extractor::decompile::run_two_pass(pass1, &opts, &out, &inputs).unwrap();

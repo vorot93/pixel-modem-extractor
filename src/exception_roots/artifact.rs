@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::{ExceptionArtifactContext, materialize, read};
+    use super::{ExceptionArtifactContext, materialize, read, read_bytes};
     use crate::exception_roots::discover;
     use crate::runtime_image::RuntimeImage;
     use crate::scatter::{
@@ -674,6 +674,28 @@ mod tests {
             Err(crate::exception_roots::ExceptionRootError::Artifact(_))
         ));
         assert_eq!(current.identity, materialized.identity);
+    }
+
+    #[test]
+    fn exact_bytes_reader_matches_the_retained_path_reader() {
+        let raw = canonical_raw_fixture();
+        let runtime = RuntimeImage::from_plan(&raw, BASE, None).unwrap();
+        let plan = discover(&runtime, "01_MAIN", "MAIN").unwrap().unwrap();
+        let context = ExceptionArtifactContext {
+            label: "01_MAIN",
+            toc_name: "MAIN",
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let materialized = materialize(&plan, context, root.path()).unwrap();
+        let path = root.path().join(materialized.relative_path);
+        let bytes = std::fs::read(&path).unwrap();
+
+        assert_eq!(
+            read_bytes(&bytes, &runtime, context).unwrap(),
+            read(&path, &runtime, context).unwrap()
+        );
     }
 
     #[test]
@@ -1758,6 +1780,11 @@ pub(crate) fn read(
     validate_label(expected.label, "artifact label")?;
     validate_label(expected.toc_name, "artifact TOC name")?;
     let mut file = open_manifest_file(path, expected.label)?;
+    let bytes = read_manifest_bytes(&mut file)?;
+    read_bytes(&bytes, runtime, expected)
+}
+
+fn read_manifest_bytes(file: &mut File) -> Result<Vec<u8>> {
     let length = file
         .metadata()
         .map_err(|error| invalid(format!("manifest metadata is unavailable: {error}")))?
@@ -1785,7 +1812,23 @@ pub(crate) fn read(
         return Err(invalid("manifest grew while it was being authenticated"));
     }
 
-    let wire: WireManifest = serde_json::from_slice(&bytes)
+    Ok(bytes)
+}
+
+pub(crate) fn read_bytes(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    expected: ExceptionArtifactContext<'_>,
+) -> Result<ValidatedExceptionRoots> {
+    validate_label(expected.label, "artifact label")?;
+    validate_label(expected.toc_name, "artifact TOC name")?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(invalid(
+            "manifest exceeds the 1 MiB ceiling and is rejected before parsing",
+        ));
+    }
+
+    let wire: WireManifest = serde_json::from_slice(bytes)
         .map_err(|error| invalid(format!("manifest schema is invalid: {error}")))?;
     let canonical = serde_json::to_vec_pretty(&wire)
         .map_err(|error| invalid(format!("manifest canonicalization failed: {error}")))?;
@@ -1794,7 +1837,7 @@ pub(crate) fn read(
             "manifest bytes are not in the canonical field order or JSON spelling",
         ));
     }
-    let manifest_blake3 = *blake3::hash(&bytes).as_bytes();
+    let manifest_blake3 = *blake3::hash(bytes).as_bytes();
     revalidate(wire, runtime, &expected, manifest_blake3)
 }
 
@@ -1805,6 +1848,21 @@ pub(crate) fn read_with_identity(
     expected_identity: &str,
 ) -> Result<ValidatedExceptionRoots> {
     let validated = read(path, runtime, expected)?;
+    if validated.identity != expected_identity {
+        return Err(invalid(
+            "exception-root identity does not match the current manifest bytes and counts",
+        ));
+    }
+    Ok(validated)
+}
+
+pub(crate) fn read_bytes_with_identity(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    expected: ExceptionArtifactContext<'_>,
+    expected_identity: &str,
+) -> Result<ValidatedExceptionRoots> {
+    let validated = read_bytes(bytes, runtime, expected)?;
     if validated.identity != expected_identity {
         return Err(invalid(
             "exception-root identity does not match the current manifest bytes and counts",

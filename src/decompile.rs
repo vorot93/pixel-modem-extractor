@@ -25,6 +25,7 @@ use std::{
     io::BufRead,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[path = "exception_pass2.rs"]
@@ -690,7 +691,8 @@ pub use self::exception_pass2::{
     read_exception_pass2_context,
 };
 pub(crate) use self::exception_pass2::{
-    ExceptionApplicationRef, ExceptionDispositionKind, ExceptionPrimaryRef,
+    ExceptionApplicationRef, ExceptionDispositionKind, ExceptionPass2ContextExactInput,
+    ExceptionPrimaryRef, read_exception_pass2_context_exact,
 };
 #[cfg(test)]
 pub(crate) use self::exception_pass2::{TestExceptionContextState, test_context_from_fixture};
@@ -703,6 +705,16 @@ pub(crate) fn test_applied_exception_roots(image: &str, identity: &str) -> Appli
         identity,
     )
     .expect("production exception summary fixture")
+}
+
+#[cfg(test)]
+pub(crate) fn test_applied_exception_roots_from_summary(
+    stdout: &str,
+    image: &str,
+    identity: &str,
+) -> AppliedExceptionRoots {
+    parse_apply_exception_roots_summary(stdout, image, identity)
+        .expect("production exception summary fixture")
 }
 
 #[cfg(test)]
@@ -729,12 +741,8 @@ pub(crate) fn test_decompile_report(
 }
 
 #[cfg(test)]
-pub(crate) fn test_set_runtime_task_state(
-    report: &mut DecompileReport,
-    label: &str,
-    state: RuntimeTaskState,
-) {
-    report.runtime_tasks.insert(label.to_string(), state);
+pub(crate) fn test_mark_current_export(report: &mut DecompileReport, label: &str) {
+    report.current_exports.insert(label.to_string());
 }
 
 /// The parsed `ApplyThumbNames: {json}` current-run summary for one scheduled
@@ -3170,10 +3178,10 @@ impl RetainedPass2File {
 /// The authenticated function-map input for pass 2: the strict v4 symbol map
 /// and the retained pass-1 files it binds, plus the image identity the
 /// twelve-argument `ApplySymbols` and ten-argument `ExportDecomp` contracts
-/// consume. The PAL identity and its manifest paths live on
-/// [`Pass2Input`] — a pass-2 run may carry PAL state without a function map.
-/// The driver computes every expected hash from retained current inputs
-/// before spawning pass 2.
+/// consume. All terminal raw/scatter/exception/PAL state lives on
+/// [`Pass2Input`]'s immutable snapshot, so a pass-2 run may carry that state
+/// without a function map. The driver computes every expected hash from
+/// retained current inputs before spawning pass 2.
 #[derive(Debug, Clone)]
 pub struct PreparedSymbolPass2Map {
     map: RetainedPass2File,
@@ -3183,6 +3191,7 @@ pub struct PreparedSymbolPass2Map {
     execution_count: usize,
     applied_decision_count: usize,
     creation_requests: Vec<crate::symbolicate::Pass2CreationRequest>,
+    terminal_binding: Option<crate::terminal_pass2::TerminalPass2Binding>,
 }
 
 impl PreparedSymbolPass2Map {
@@ -3237,6 +3246,7 @@ impl PreparedSymbolPass2Map {
             execution_count,
             applied_decision_count,
             creation_requests,
+            terminal_binding: None,
         })
     }
 
@@ -3292,11 +3302,46 @@ impl PreparedSymbolPass2Map {
         )
     }
 
-    fn validate_for_spawn(&self) -> Result<()> {
+    fn bind_terminal_snapshot(
+        mut self,
+        snapshot: &crate::terminal_pass2::TerminalPass2Snapshot,
+    ) -> Result<Self> {
+        if self.image_label != snapshot.image_label() {
+            return Err(Error::DecomposeIncomplete(format!(
+                "pass-2 symbol map was built for image {:?}, not {:?}",
+                self.image_label,
+                snapshot.image_label()
+            )));
+        }
+        if self.image.blake3() != snapshot.image_blake3() {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 symbol map image does not match its terminal snapshot".into(),
+            ));
+        }
+        let image = RetainedPass2File::prepare(&snapshot.raw_path(), "snapshot raw image")?;
+        if image.blake3() != snapshot.image_blake3() {
+            return Err(Error::DecomposeIncomplete(
+                "terminal snapshot raw image changed while binding the pass-2 symbol map".into(),
+            ));
+        }
+        self.image = image;
+        self.terminal_binding = Some(snapshot.binding());
+        Ok(self)
+    }
+
+    fn validate_for_spawn(
+        &self,
+        snapshot: &crate::terminal_pass2::TerminalPass2Snapshot,
+    ) -> Result<()> {
         self.map.validate_for_spawn("pass-2 symbol map")?;
         self.functions
             .validate_for_spawn("retained pass-1 functions.json")?;
         self.image.validate_for_spawn("raw image")?;
+        if self.terminal_binding.as_ref() != Some(&snapshot.binding()) {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 symbol map terminal snapshot binding changed".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -3352,54 +3397,92 @@ impl PreparedPass2Map {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Pass2Input {
-    pub function_map: Option<PreparedSymbolPass2Map>,
-    pub global_map: Option<PreparedPass2Map>,
-    pub global_types_map: Option<PreparedPass2Map>,
-    /// Explicit current exception-root state. Task 9 constructs this context,
-    /// identity, and manifest from the terminal validated artifact; pass 2
-    /// never probes for one.
-    pub exception_context: Option<ExceptionPass2Context>,
-    pub exception_identity: String,
-    pub exception_manifest: Option<PathBuf>,
-    /// The PAL identity the pass-2 scripts must agree on (`none` when the
-    /// orchestrator drives no PAL state) plus the canonical task/scatter
-    /// manifest paths when a PAL state is present.
-    pub pal_identity: String,
-    pub pal_manifest: Option<PathBuf>,
-    pub scatter_manifest: Option<PathBuf>,
+    pub(crate) function_map: Option<PreparedSymbolPass2Map>,
+    pub(crate) global_map: Option<PreparedPass2Map>,
+    pub(crate) global_types_map: Option<PreparedPass2Map>,
+    terminal: Arc<crate::terminal_pass2::TerminalPass2Snapshot>,
 }
 
 impl Pass2Input {
-    fn has_maps(&self) -> bool {
+    pub(crate) fn new(terminal: Arc<crate::terminal_pass2::TerminalPass2Snapshot>) -> Self {
+        Self {
+            function_map: None,
+            global_map: None,
+            global_types_map: None,
+            terminal,
+        }
+    }
+
+    /// Prepare a direct pass-2 input whose current terminal state is
+    /// explicitly raw-only. The raw image must already be the canonical
+    /// `<kit_root>/images/<label>` file; stale managed optional artifacts are
+    /// cleared before the immutable snapshot is returned.
+    pub fn prepare_raw_only(
+        kit_root: &Path,
+        image_label: &str,
+        toc_name: &str,
+        image_base: u32,
+    ) -> Result<Self> {
+        Ok(Self::new(Arc::new(
+            crate::terminal_pass2::TerminalPass2Snapshot::build_raw_only_from_kit(
+                kit_root,
+                image_label,
+                toc_name,
+                image_base,
+            )?,
+        )))
+    }
+
+    pub fn with_function_map(mut self, map: PreparedSymbolPass2Map) -> Result<Self> {
+        self.set_function_map(map)?;
+        Ok(self)
+    }
+
+    pub fn with_global_map(mut self, map: PreparedPass2Map) -> Self {
+        self.set_global_map(map);
+        self
+    }
+
+    pub fn without_global_map(mut self) -> Self {
+        self.global_map = None;
+        self
+    }
+
+    pub fn with_global_types_map(mut self, map: PreparedPass2Map) -> Self {
+        self.set_global_types_map(map);
+        self
+    }
+
+    pub(crate) fn set_function_map(&mut self, map: PreparedSymbolPass2Map) -> Result<()> {
+        self.function_map = Some(map.bind_terminal_snapshot(&self.terminal)?);
+        Ok(())
+    }
+
+    pub(crate) fn set_global_map(&mut self, map: PreparedPass2Map) {
+        self.global_map = Some(map);
+    }
+
+    pub(crate) fn set_global_types_map(&mut self, map: PreparedPass2Map) {
+        self.global_types_map = Some(map);
+    }
+
+    pub(crate) fn has_maps(&self) -> bool {
         self.function_map.is_some() || self.global_map.is_some() || self.global_types_map.is_some()
     }
 
     fn pal_identity_or_none(&self) -> &str {
-        if self.pal_identity.is_empty() {
-            "none"
-        } else {
-            &self.pal_identity
-        }
+        self.terminal.pal_identity()
     }
 
     fn exception_identity_or_none(&self) -> &str {
-        if self.exception_identity.is_empty() {
-            "none"
-        } else {
-            &self.exception_identity
-        }
+        self.terminal.exception_identity()
     }
 
-    fn exception_args(&self, root: &str, label: &str) -> Result<(String, String)> {
+    fn exception_args(&self, label: &str) -> Result<(String, String)> {
         let identity = self.exception_identity_or_none();
         if identity == "none" {
-            if self.exception_manifest.is_some() || self.exception_context.is_some() {
-                return Err(Error::DecomposeIncomplete(
-                    "pass-2 exception identity none carries present state".into(),
-                ));
-            }
             return Ok(("none".to_string(), "-".to_string()));
         }
 
@@ -3423,12 +3506,12 @@ impl Pass2Input {
                 "pass-2 exception identity is not the strict v1 grammar".into(),
             ));
         }
-        let manifest = self.exception_manifest.as_ref().ok_or_else(|| {
+        let manifest = self.terminal.exception_manifest().ok_or_else(|| {
             Error::DecomposeIncomplete(
                 "a present pass-2 exception identity requires its manifest".into(),
             )
         })?;
-        let context = self.exception_context.as_ref().ok_or_else(|| {
+        let context = self.terminal.exception_context().ok_or_else(|| {
             Error::DecomposeIncomplete(
                 "a present pass-2 exception identity requires its authenticated context".into(),
             )
@@ -3438,32 +3521,42 @@ impl Pass2Input {
                 "pass-2 exception context identity does not match its requested identity".into(),
             ));
         }
-        let canonical = std::fs::canonicalize(manifest)?;
-        if canonical != *manifest || !canonical.is_file() {
-            return Err(Error::DecomposeIncomplete(format!(
-                "pass-2 exception manifest is not a canonical regular file: {}",
-                manifest.display()
-            )));
-        }
-        if crate::manifest::blake3_file(&canonical)? != parts[1] {
-            return Err(Error::DecomposeIncomplete(
-                "pass-2 exception manifest does not match its identity BLAKE3".into(),
-            ));
-        }
-        let expected = std::fs::canonicalize(root)?
+        let expected = self
+            .terminal
+            .kit_root_path()
             .join("exception_roots")
             .join(label)
             .join("roots.json");
-        if canonical != expected {
+        if manifest != expected {
             return Err(Error::DecomposeIncomplete(format!(
                 "pass-2 exception manifest is outside its canonical kit location: {}",
-                canonical.display()
+                manifest.display()
             )));
         }
         Ok((
             identity.to_string(),
-            canonical.to_string_lossy().into_owned(),
+            manifest.to_string_lossy().into_owned(),
         ))
+    }
+
+    fn validate_for_spawn(&self, root: &str, label: &str) -> Result<()> {
+        let root = std::fs::canonicalize(root)?;
+        if root != self.terminal.kit_root_path() || label != self.terminal.image_label() {
+            return Err(Error::DecomposeIncomplete(
+                "pass-2 input does not match its terminal snapshot root and label".into(),
+            ));
+        }
+        self.terminal.validate_for_spawn()?;
+        if let Some(map) = &self.function_map {
+            map.validate_for_spawn(&self.terminal)?;
+        }
+        if let Some(map) = &self.global_map {
+            map.validate_for_spawn()?;
+        }
+        if let Some(map) = &self.global_types_map {
+            map.validate_for_spawn()?;
+        }
+        Ok(())
     }
 }
 
@@ -3496,25 +3589,19 @@ fn headless_process_args(
         return Ok(None);
     }
 
-    if let Some(map) = function_map {
-        map.validate_for_spawn()?;
-    }
-    if let Some(map) = global_map {
-        map.validate_for_spawn()?;
-    }
-    if let Some(map) = global_types_map {
-        map.validate_for_spawn()?;
-    }
+    input.validate_for_spawn(root, label)?;
 
-    let (exception_identity, exception_manifest) = input.exception_args(root, label)?;
+    let (exception_identity, exception_manifest) = input.exception_args(label)?;
     let pal_identity = input.pal_identity_or_none().to_string();
     let pal_manifest = input
-        .pal_manifest
+        .terminal
+        .pal_manifest()
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "-".to_string());
     let scatter_manifest = input
-        .scatter_manifest
+        .terminal
+        .scatter_manifest()
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "-".to_string());
@@ -4185,17 +4272,6 @@ pub fn run_two_pass(
                 }
             }
         }
-        let args = match headless_process_args(&root_str, &ir.label, input) {
-            Ok(Some(args)) => args,
-            Ok(None) => continue,
-            Err(error) => {
-                let reason = format!("map validation: {error}");
-                ir.pass2_error = Some(reason.clone());
-                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
-                continue;
-            }
-        };
-
         let applies_functions = input.function_map.is_some();
         let applies_globals = input.global_map.is_some();
 
@@ -4204,6 +4280,19 @@ pub fn run_two_pass(
             Ok(attempt) => attempt,
             Err(error) => {
                 let reason = format!("export invalidation: {error}");
+                ir.pass2_error = Some(reason.clone());
+                outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
+                continue;
+            }
+        };
+        // This is the final filesystem validation before spawn. Export
+        // invalidation deliberately precedes it so a late-drift refusal can
+        // never leave an older completion marker current.
+        let args = match headless_process_args(&root_str, &ir.label, input) {
+            Ok(Some(args)) => args,
+            Ok(None) => continue,
+            Err(error) => {
+                let reason = format!("terminal snapshot validation: {error}");
                 ir.pass2_error = Some(reason.clone());
                 outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::Failed(reason));
                 continue;
@@ -6357,30 +6446,29 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(relative_global_path.is_relative());
         assert!(relative_map_path.is_relative());
 
-        let input = Pass2Input {
-            function_map: Some(
-                PreparedSymbolPass2Map::new(
-                    &relative_map_path,
-                    &relative_function_path,
-                    &image_path,
-                    "02_MAIN",
-                    1,
-                    1,
-                    Vec::new(),
-                )
-                .unwrap(),
-            ),
-            global_map: Some(
-                PreparedPass2Map::new(
-                    &relative_global_path,
-                    std::num::NonZeroUsize::new(2).unwrap(),
-                )
-                .unwrap(),
-            ),
-            global_types_map: None,
-            ..Pass2Input::default()
-        };
-        let args = headless_process_args("/out", "02_MAIN", &input)
+        let function_map = PreparedSymbolPass2Map::new(
+            &relative_map_path,
+            &relative_function_path,
+            &image_path,
+            "02_MAIN",
+            1,
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let global_map = PreparedPass2Map::new(
+            &relative_global_path,
+            std::num::NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
+        let (kit, input) = pass2_test_input(
+            "relative_maps",
+            "02_MAIN",
+            Some(function_map),
+            Some(global_map),
+            None,
+        );
+        let args = headless_process_args(kit.to_str().unwrap(), "02_MAIN", &input)
             .unwrap()
             .expect("typed maps schedule pass two");
         // ApplySymbols' ninth argument is the retained functions.json; the
@@ -6472,35 +6560,35 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             std::fs::write(&global_path, b"globals").unwrap();
             std::fs::write(&map_path, b"map").unwrap();
             std::fs::write(&image_path, b"image").unwrap();
-            let input = Pass2Input {
-                function_map: Some(
-                    PreparedSymbolPass2Map::new(
-                        &map_path,
-                        &relative_spelling_from_current_dir(&function_path),
-                        &image_path,
-                        "02_MAIN",
-                        1,
-                        1,
-                        Vec::new(),
-                    )
-                    .unwrap(),
-                ),
-                global_map: Some(
-                    PreparedPass2Map::new(
-                        &relative_spelling_from_current_dir(&global_path),
-                        NonZeroUsize::new(2).unwrap(),
-                    )
-                    .unwrap(),
-                ),
-                global_types_map: None,
-                ..Pass2Input::default()
-            };
+            let function_map = PreparedSymbolPass2Map::new(
+                &map_path,
+                &relative_spelling_from_current_dir(&function_path),
+                &image_path,
+                "02_MAIN",
+                1,
+                1,
+                Vec::new(),
+            )
+            .unwrap();
+            let global_map = PreparedPass2Map::new(
+                &relative_spelling_from_current_dir(&global_path),
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .unwrap();
+            let (kit, input) = pass2_test_input(
+                &format!("late_{}", missing_map.trim_end_matches(".json")),
+                "02_MAIN",
+                Some(function_map),
+                Some(global_map),
+                None,
+            );
             std::fs::remove_file(root.join(missing_map)).unwrap();
             let mut spawn_called = false;
 
-            let result = headless_process_args("/out", "02_MAIN", &input).inspect(|args| {
-                spawn_called = args.is_some();
-            });
+            let result =
+                headless_process_args(kit.to_str().unwrap(), "02_MAIN", &input).inspect(|args| {
+                    spawn_called = args.is_some();
+                });
 
             let error = result.unwrap_err();
             assert!(error.to_string().contains("no longer"));
@@ -6526,27 +6614,101 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::write(&function_path, b"functions").unwrap();
         std::fs::write(&map_path, b"original map").unwrap();
         std::fs::write(&image_path, b"image").unwrap();
-        let input = Pass2Input {
-            function_map: Some(
-                PreparedSymbolPass2Map::new(
-                    &map_path,
-                    &function_path,
-                    &image_path,
-                    "02_MAIN",
-                    1,
-                    1,
-                    Vec::new(),
-                )
-                .unwrap(),
-            ),
-            ..Pass2Input::default()
-        };
+        let function_map = PreparedSymbolPass2Map::new(
+            &map_path,
+            &function_path,
+            &image_path,
+            "02_MAIN",
+            1,
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let (kit, input) = pass2_test_input(
+            "late_content_change",
+            "02_MAIN",
+            Some(function_map),
+            None,
+            None,
+        );
         std::fs::write(&map_path, b"changed map").unwrap();
 
-        let error = headless_process_args("/out", "02_MAIN", &input)
+        let error = headless_process_args(kit.to_str().unwrap(), "02_MAIN", &input)
             .expect_err("retained map content changed after preparation");
 
         assert!(error.to_string().contains("contents changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_snapshot_drift_gate_invalidates_old_export_without_spawning() {
+        let root = pass2_test_root("snapshot_spawn_gate");
+        let ghidra_home = root.join("fake-ghidra");
+        let sentinel = root.join("spawned");
+        write_executable(
+            &ghidra_home.join("support/analyzeHeadless"),
+            &format!("#!/bin/sh\nset -eu\ntouch '{}'\n", sentinel.display()),
+        );
+        let image = b"snapshot_spawn_gate image bytes";
+        std::fs::write(root.join("images/02_MAIN"), image).unwrap();
+        let mut input = Pass2Input::prepare_raw_only(&root, "02_MAIN", "MAIN", 0).unwrap();
+        input
+            .set_function_map(pass2_symbol_test_map("snapshot_spawn_gate", "02_MAIN"))
+            .unwrap();
+        let export = root.join("export/02_MAIN");
+        std::fs::create_dir_all(&export).unwrap();
+        for name in GHIDRA_EXPORT_FILES {
+            std::fs::write(export.join(name), b"stale").unwrap();
+        }
+        std::fs::write(
+            root.join("export/02_MAIN.complete"),
+            export_completion_marker(
+                "none",
+                "none",
+                input.function_map.as_ref().unwrap().map_blake3(),
+            ),
+        )
+        .unwrap();
+        let mut changed = image.to_vec();
+        changed[0] ^= 0xff;
+        std::fs::write(root.join("images/02_MAIN"), changed).unwrap();
+        let report = exception_report(
+            ImageOutcome::Analyzed(1),
+            RuntimeExceptionState::Unmanaged,
+            None,
+            None,
+            None,
+        );
+        let mut opts = generation_opts(None);
+        opts.run = true;
+        opts.ghidra_home = Some(ghidra_home);
+
+        let result = run_two_pass(
+            report,
+            &opts,
+            &root,
+            &HashMap::from([("02_MAIN".to_string(), input)]),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.outcomes.get("02_MAIN"), Some(Pass2ProcessOutcome::Failed(reason))
+                if reason.contains("terminal snapshot validation")
+                    && reason.contains("raw image changed")),
+            "{:?}",
+            result.outcomes
+        );
+        assert!(
+            !sentinel.exists(),
+            "invalid snapshot reached analyzeHeadless"
+        );
+        assert!(!root.join("export/02_MAIN.complete").exists());
+        for name in GHIDRA_EXPORT_FILES {
+            assert!(
+                !export.join(name).exists(),
+                "stale {name} survived invalidation"
+            );
+        }
     }
 
     #[test]
@@ -6630,7 +6792,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     fn pass2_test_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("pme_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::create_dir(root.join("images")).unwrap();
         root
     }
 
@@ -6666,25 +6830,74 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         .unwrap()
     }
 
-    fn pass2_input(function_count: usize, global_count: usize) -> Pass2Input {
-        Pass2Input {
-            function_map: (function_count > 0).then(|| pass2_symbol_test_map("input", "02_MAIN")),
-            global_map: pass2_test_map("globals.json", global_count),
-            global_types_map: None,
-            ..Pass2Input::default()
+    fn pass2_test_input(
+        tag: &str,
+        label: &str,
+        function_map: Option<PreparedSymbolPass2Map>,
+        global_map: Option<PreparedPass2Map>,
+        global_types_map: Option<PreparedPass2Map>,
+    ) -> (PathBuf, Pass2Input) {
+        let root = pass2_test_root(tag);
+        let image = function_map
+            .as_ref()
+            .map(|map| std::fs::read(map.image.path()).unwrap())
+            .unwrap_or_else(|| b"image".to_vec());
+        std::fs::write(root.join("images").join(label), image).unwrap();
+        let mut input =
+            Pass2Input::prepare_raw_only(&root, label, crate::manifest::toc_name(label), 0)
+                .unwrap();
+        if let Some(map) = function_map {
+            input.set_function_map(map).unwrap();
         }
+        if let Some(map) = global_map {
+            input.set_global_map(map);
+        }
+        if let Some(map) = global_types_map {
+            input.set_global_types_map(map);
+        }
+        (root, input)
+    }
+
+    fn pass2_input(tag: &str, function_count: usize, global_count: usize) -> (PathBuf, Pass2Input) {
+        pass2_test_input(
+            tag,
+            "02_MAIN",
+            (function_count > 0).then(|| pass2_symbol_test_map("input", "02_MAIN")),
+            pass2_test_map("globals.json", global_count),
+            None,
+        )
+    }
+
+    #[test]
+    fn pass2_input_rejects_symbol_map_built_from_different_snapshot_bytes() {
+        let root = pass2_test_root("snapshot_binding_mismatch");
+        std::fs::write(root.join("images/02_MAIN"), b"current snapshot bytes").unwrap();
+        let mut input = Pass2Input::prepare_raw_only(&root, "02_MAIN", "MAIN", 0).unwrap();
+        let map = pass2_symbol_test_map("different_snapshot", "02_MAIN");
+
+        let error = input.set_function_map(map).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its terminal snapshot")
+        );
+        assert!(input.function_map.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn pass2_args_wire_twelve_apply_symbols_and_ten_export_arguments() {
         let symbol_map = pass2_symbol_test_map("wired", "02_MAIN");
-        let input = Pass2Input {
-            function_map: Some(symbol_map.clone()),
-            global_map: pass2_test_map("globals.json", 1),
-            global_types_map: None,
-            ..Pass2Input::default()
-        };
-        let args = headless_process_args("/out", "02_MAIN", &input)
+        let (root, input) = pass2_test_input(
+            "wired_args",
+            "02_MAIN",
+            Some(symbol_map.clone()),
+            pass2_test_map("globals.json", 1),
+            None,
+        );
+        let root_str = root.to_string_lossy().into_owned();
+        let args = headless_process_args(&root_str, "02_MAIN", &input)
             .unwrap()
             .expect("non-empty prepared input must invoke pass two");
         let functions_path = symbol_map.functions.path().to_string_lossy().into_owned();
@@ -6695,7 +6908,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .position(|arg| arg == "ApplyThumbNames.java")
             .unwrap();
         let expected_thumb = [
-            "/out",
+            &root_str,
             "02_MAIN",
             symbol_map.image_blake3(),
             "none",
@@ -6718,7 +6931,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .position(|arg| arg == "ApplySymbols.java")
             .unwrap();
         let expected_apply = [
-            "/out",
+            &root_str,
             "02_MAIN",
             symbol_map.image_blake3(),
             "none",
@@ -6742,9 +6955,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .iter()
             .position(|arg| arg == "ExportDecomp.java")
             .unwrap();
+        let export_path = root.join("export/02_MAIN").to_string_lossy().into_owned();
         let expected_export = [
-            "/out/export/02_MAIN",
-            "/out",
+            export_path.as_str(),
+            root_str.as_str(),
             "02_MAIN",
             "none",
             "-",
@@ -6955,221 +7169,53 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     #[test]
     fn pass2_args_reject_map_built_for_a_different_label() {
         let mismatched = pass2_symbol_test_map("label", "03_APM");
-        let input = Pass2Input {
-            function_map: Some(mismatched),
-            ..Pass2Input::default()
-        };
-        let error = headless_process_args("/out", "02_MAIN", &input)
-            .unwrap_err()
-            .to_string();
+        let root = pass2_test_root("mismatched_label");
+        std::fs::write(root.join("images/02_MAIN"), b"label image bytes").unwrap();
+        let mut input = Pass2Input::prepare_raw_only(&root, "02_MAIN", "MAIN", 0).unwrap();
+        let error = input.set_function_map(mismatched).unwrap_err().to_string();
         assert!(error.contains("03_APM"), "{error}");
     }
 
     #[test]
-    fn pass2_args_pass_pal_identity_and_manifests_through() {
-        let root = pass2_test_root("pal_args");
-        let manifest = root.join("tasks.json");
-        let scatter = root.join("load_map.json");
-        std::fs::write(&manifest, b"manifest").unwrap();
-        std::fs::write(&scatter, b"scatter").unwrap();
-        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:1";
-        let manifest_arg = manifest.to_string_lossy().into_owned();
-        let scatter_arg = scatter.to_string_lossy().into_owned();
-        let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map("palwired", "02_MAIN")),
-            pal_identity: identity.to_string(),
-            pal_manifest: Some(manifest.clone()),
-            scatter_manifest: Some(scatter.clone()),
-            ..Pass2Input::default()
-        };
-        let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
-            .unwrap()
-            .unwrap();
-        let apply_at = args
-            .iter()
-            .position(|arg| arg == "ApplySymbols.java")
-            .unwrap();
-        assert_eq!(
-            &args[apply_at + 6..=apply_at + 8],
-            [identity, manifest_arg.as_str(), scatter_arg.as_str()]
-        );
-        let export_at = args
-            .iter()
-            .position(|arg| arg == "ExportDecomp.java")
-            .unwrap();
-        assert_eq!(
-            &args[export_at + 6..=export_at + 8],
-            [identity, manifest_arg.as_str(), scatter_arg.as_str()]
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn pass2_args_pass_exception_identity_and_manifest_through() {
-        let root = pass2_test_root("exception_args");
-        let manifest = root.join("exception_roots/00_BOOT/roots.json");
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
-            &manifest,
-        )
-        .unwrap();
-        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
-        let identity = context.identity().to_string();
-        let manifest_arg = manifest.to_string_lossy().into_owned();
-        let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map("exception_wired", "00_BOOT")),
-            exception_context: Some(context),
-            exception_identity: identity.clone(),
-            exception_manifest: Some(manifest.clone()),
-            ..Pass2Input::default()
-        };
-
-        let args = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
-            .unwrap()
-            .unwrap();
-        let apply_at = args
-            .iter()
-            .position(|arg| arg == "ApplySymbols.java")
-            .unwrap();
-        assert_eq!(
-            &args[apply_at + 4..=apply_at + 5],
-            [identity.as_str(), manifest_arg.as_str()]
-        );
-        let export_at = args
-            .iter()
-            .position(|arg| arg == "ExportDecomp.java")
-            .unwrap();
-        assert_eq!(
-            &args[export_at + 4..=export_at + 5],
-            [identity.as_str(), manifest_arg.as_str()]
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn pass2_args_reject_exception_identity_without_authenticated_context() {
-        let root = pass2_test_root("exception_missing_context");
-        let manifest = root.join("exception_roots/00_BOOT/roots.json");
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
-            &manifest,
-        )
-        .unwrap();
-        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
-        let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map(
-                "exception_missing_context",
-                "00_BOOT",
-            )),
-            exception_identity: context.identity().to_string(),
-            exception_manifest: Some(manifest),
-            ..Pass2Input::default()
-        };
-
-        let error = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("authenticated context"), "{error}");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn pass2_args_reject_exception_context_identity_mismatch() {
-        let root = pass2_test_root("exception_context_identity");
-        let manifest = root.join("exception_roots/00_BOOT/roots.json");
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
-            &manifest,
-        )
-        .unwrap();
-        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
-        let digest = crate::manifest::blake3_file(&manifest).unwrap();
-        let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map(
-                "exception_context_identity",
-                "00_BOOT",
-            )),
-            exception_context: Some(context),
-            exception_identity: format!("v1:{digest}:1:2"),
-            exception_manifest: Some(manifest),
-            ..Pass2Input::default()
-        };
-
-        let error = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("context identity"), "{error}");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn pass2_args_reject_exception_manifest_outside_canonical_kit_location() {
-        let root = pass2_test_root("exception_manifest_location");
-        let manifest = root.join("wrong/roots.json");
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
-            &manifest,
-        )
-        .unwrap();
-        let context = test_context_from_fixture(TestExceptionContextState::Fresh);
-        let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map(
-                "exception_manifest_location",
-                "00_BOOT",
-            )),
-            exception_identity: context.identity().to_string(),
-            exception_manifest: Some(manifest),
-            exception_context: Some(context),
-            ..Pass2Input::default()
-        };
-
-        let error = headless_process_args(root.to_str().unwrap(), "00_BOOT", &input)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("canonical kit location"), "{error}");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
     fn pass2_args_wires_globals_only_then_export() {
-        let input = pass2_input(0, 1);
-        let args = headless_process_args("/out", "02_MAIN", &input)
+        let (root, input) = pass2_input("globals_only", 0, 1);
+        let root_str = root.to_string_lossy().into_owned();
+        let args = headless_process_args(&root_str, "02_MAIN", &input)
             .unwrap()
             .expect("prepared global input must invoke pass two");
-        let global_path = input.global_map.as_ref().unwrap().path().to_string_lossy();
+        let global_path = input
+            .global_map
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_string_lossy()
+            .into_owned();
 
         assert_eq!(
             args,
             vec![
-                "/out/ghidra_project",
-                "pixel-modem",
-                "-process",
-                "02_MAIN",
-                "-noanalysis",
-                "-scriptPath",
-                "/out/scripts",
-                "-postScript",
-                "ApplyGlobals.java",
-                global_path.as_ref(),
-                "-postScript",
-                "ExportDecomp.java",
-                "/out/export/02_MAIN",
-                "/out",
-                "02_MAIN",
-                "none",
-                "-",
-                "none",
-                "-",
-                "-",
-                "-",
-                "none",
+                root.join("ghidra_project").to_string_lossy().into_owned(),
+                "pixel-modem".to_string(),
+                "-process".to_string(),
+                "02_MAIN".to_string(),
+                "-noanalysis".to_string(),
+                "-scriptPath".to_string(),
+                root.join("scripts").to_string_lossy().into_owned(),
+                "-postScript".to_string(),
+                "ApplyGlobals.java".to_string(),
+                global_path,
+                "-postScript".to_string(),
+                "ExportDecomp.java".to_string(),
+                root.join("export/02_MAIN").to_string_lossy().into_owned(),
+                root_str,
+                "02_MAIN".to_string(),
+                "none".to_string(),
+                "-".to_string(),
+                "none".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "none".to_string(),
             ]
         );
         assert!(!args.iter().any(|argument| argument == "ApplySymbols.java"));
@@ -7177,8 +7223,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn headless_process_args_skips_when_prepared_counts_are_zero() {
+        let (root, input) = pass2_input("zero_counts", 0, 0);
         assert!(
-            headless_process_args("/out", "02_MAIN", &pass2_input(0, 0))
+            headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
                 .unwrap()
                 .is_none()
         );
@@ -7186,13 +7233,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn pass2_args_insert_apply_global_types_between_globals_and_export() {
-        let root = pass2_test_root("gt_args");
-        let input = Pass2Input {
-            function_map: Some(pass2_symbol_test_map("gt", "02_MAIN")),
-            global_map: pass2_test_map("globals.json", 1),
-            global_types_map: pass2_test_map("global_types.json", 1),
-            ..Pass2Input::default()
-        };
+        let (root, input) = pass2_test_input(
+            "gt_args",
+            "02_MAIN",
+            Some(pass2_symbol_test_map("gt", "02_MAIN")),
+            pass2_test_map("globals.json", 1),
+            pass2_test_map("global_types.json", 1),
+        );
         let args = headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
             .unwrap()
             .unwrap();
@@ -7209,13 +7256,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn pass2_args_present_for_types_only_input() {
-        let root = pass2_test_root("gt_only");
-        let input = Pass2Input {
-            function_map: None,
-            global_map: None,
-            global_types_map: pass2_test_map("global_types.json", 1),
-            ..Pass2Input::default()
-        };
+        let (root, input) = pass2_test_input(
+            "gt_only",
+            "02_MAIN",
+            None,
+            None,
+            pass2_test_map("global_types.json", 1),
+        );
         assert!(
             headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
                 .unwrap()
@@ -7233,15 +7280,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::create_dir_all(ghidra_home.join("support")).unwrap();
         std::fs::write(ghidra_home.join("support/analyzeHeadless"), b"unused").unwrap();
         let out = dir.path().join("out");
-        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(out.join("images")).unwrap();
+        std::fs::write(out.join("images/07_MISSING"), b"image").unwrap();
         let type_map_path = dir.path().join("global-types.json");
         std::fs::write(&type_map_path, b"type map").unwrap();
-        let input = Pass2Input {
-            global_types_map: Some(
+        let input = Pass2Input::prepare_raw_only(&out, "07_MISSING", "MISSING", 0)
+            .unwrap()
+            .with_global_types_map(
                 PreparedPass2Map::new(&type_map_path, NonZeroUsize::new(1).unwrap()).unwrap(),
-            ),
-            ..Pass2Input::default()
-        };
+            );
         let report = DecompileReport {
             images: Vec::new(),
             spec_path: out.join("ghidra_load.json"),

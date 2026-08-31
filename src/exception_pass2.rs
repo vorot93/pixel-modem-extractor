@@ -227,6 +227,16 @@ pub struct ExceptionPass2ContextInput<'a> {
     pub applied: &'a AppliedExceptionRoots,
 }
 
+pub(crate) struct ExceptionPass2ContextExactInput<'a, 'runtime> {
+    pub manifest_bytes: &'a [u8],
+    pub runtime: &'a RuntimeImage<'runtime>,
+    pub image_label: &'a str,
+    pub toc_name: &'a str,
+    pub expected_identity: &'a str,
+    pub expected_scatter_load_map_blake3: Option<[u8; 32]>,
+    pub applied: &'a AppliedExceptionRoots,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoleRef {
     table_kind: &'static str,
@@ -418,13 +428,30 @@ pub fn read_exception_pass2_context(
         // expand the runtime view after currentness has already been decided.
         RuntimeImage::from_plan(&raw, input.image_base, None)?
     };
-    let validated = exception_roots::read_with_identity(
-        input.manifest_path,
-        &runtime,
+    let manifest_bytes = std::fs::read(input.manifest_path)?;
+    read_exception_pass2_context_exact(ExceptionPass2ContextExactInput {
+        manifest_bytes: &manifest_bytes,
+        runtime: &runtime,
+        image_label: input.image_label,
+        toc_name: input.toc_name,
+        expected_identity: input.expected_identity,
+        expected_scatter_load_map_blake3: input.expected_scatter_load_map_blake3,
+        applied: input.applied,
+    })
+}
+
+pub(crate) fn read_exception_pass2_context_exact(
+    input: ExceptionPass2ContextExactInput<'_, '_>,
+) -> Result<ExceptionPass2Context> {
+    let (image_base, image_size) = input.runtime.image_bounds();
+    let image_blake3 = input.runtime.hash_range(image_base, image_size)?;
+    let validated = exception_roots::read_bytes_with_identity(
+        input.manifest_bytes,
+        input.runtime,
         ExceptionArtifactContext {
             label: input.image_label,
             toc_name: input.toc_name,
-            image_blake3: *blake3::hash(&raw).as_bytes(),
+            image_blake3,
             scatter_load_map_blake3: input.expected_scatter_load_map_blake3,
         },
         input.expected_identity,

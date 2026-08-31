@@ -273,6 +273,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `exception_roots/discover.rs` | A32 vector-table classification plus reset-side VBAR relocation proof |
 | `exception_roots/artifact.rs` | Canonical authenticated root manifest materialization, reading, and fixture provenance |
 | `exception_pass2.rs` | Strict ApplyExceptionRoots summary parsing and opaque authenticated pass-2 context construction |
+| `terminal_pass2.rs` | One immutable per-label canonical-kit snapshot: retained raw/scatter/exception/PAL staging, shared runtime contexts, map binding, and final spawn validation |
 | `pal_tasks/mod.rs` | PAL shared types, named resource limits, the structured domain error, and the `discover` plan boundary |
 | `pal_tasks/cfg.rs` | Entry-rooted local CFG decode and its definition-aware dataflow/graph queries |
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
@@ -341,6 +342,27 @@ module; when a file outgrows that, split it.
 - **Clear commits at the owned leaf and stops there.** Once the regular manifest was unlinked or
   confirmed absent through the retained label handle, clear succeeds and performs no label-directory
   removal. Empty label directories are allowed noncanonical residue.
+- **Terminal publication is capability-bound and exhaustive.** Exception/PAL publication opens the
+  current source through a retained kit capability, authenticates those exact bytes against the
+  already-terminal raw/scatter runtime, then opens the destination label through a retained image
+  capability. It verifies that destination's pathname still names the retained directory before and
+  after an exact-length/BLAKE3 atomic leaf replacement. Validation and copy failures before commit
+  preserve the prior target; a namespace swap never mutates the replacement tree, and a swap detected
+  after commit leaves the copied bytes only in the detached retained directory and marks publication
+  non-current. Every foreign sibling is preserved. Marshalling records explicit raw/export/scatter/
+  exception/PAL outcomes for every image and never stops at the first failed label; only dependent
+  authority is cleared. Report reasons are bounded to 2,048 Unicode scalar values including
+  ` [truncated]`, and an earlier actionable exception cause is sticky.
+- **One terminal snapshot owns pass 2.** Each current pass-1 export whose complete terminal outcome
+  matrix committed gets at most one `TerminalPass2Snapshot` in the existing Ghidra kit: raw is staged
+  once, one authenticated scatter object stages every payload before `load_map.json`, and current
+  exception/PAL manifests stage once.
+  Both opaque application contexts derive from that snapshot's single `RuntimeImage`; failed
+  construction returns no object. `Pass2Input` owns an `Arc` to the snapshot plus typed function,
+  global, and global-type maps. A function map must match the snapshot's original raw digest and full
+  terminal binding. After stale export invalidation, `run_two_pass` validates the kit-root binding,
+  raw/scatter/manifests, contexts, and maps immediately before constructing argv and spawning, with no
+  intervening filesystem mutation. Path existence never establishes currentness.
 
 ### Architectural exception roots
 
@@ -475,11 +497,12 @@ module; when a file outgrows that, split it.
   exception generation or prevent later images from marshalling. Scatter is structurally MAIN-only:
   non-MAIN `RuntimeScatterState::Unmanaged` means the exception runtime was deliberately raw-only,
   so terminal validation and pass-2 context construction ignore any stale scatter path without
-  deleting it. Pass 2 copies the exact terminal manifest/raw/scatter bytes back into canonical kit
-  locations, including every file-backed `blocks/*.bin` dependency; the shared strict scatter
-  restager authenticates retained handles, writes payloads first, and commits `load_map.json` last.
-  It then rebuilds the opaque context from explicit application state and rejects drift before
-  scheduling Ghidra; path existence alone never establishes currentness. The adjacent
+  deleting it. The one per-label terminal snapshot copies exact terminal raw/scatter/exception/PAL
+  bytes into canonical kit locations, including every file-backed `blocks/*.bin` dependency; the
+  shared strict scatter restager authenticates retained handles, writes payloads first, and commits
+  `load_map.json` last. Exception and PAL contexts are rebuilt from the same staged runtime and
+  explicit application state. The snapshot and its map binding reject drift at the final pre-spawn
+  gate; path existence alone never establishes currentness. The adjacent
   `exception_roots` report stage tallies terminal images/tables/roots, while eleven application
   counters are all-or-none and exclusive with reason-only `exception_error`.
 - **Real-Ghidra fixtures have one production oracle.** Everything under
@@ -2306,11 +2329,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   - **Pass-2 manifest arguments must sit inside the Ghidra kit root.**
     `readPal` authenticates the task manifest, the complete scatter artifact
     (load map plus every referenced payload), and the raw image
-    (`<ghidra>/images/<label>`) by canonical containment — all are terminal-moved
-    to `images/<label>/` by the pass-1 marshal, so `load_terminal_pal_maps`
-    restages byte-identical copies at their pass-1 kit paths before building
-    pass-2 inputs. Map-only restaging is invalid because both PAL and exception
-    readers open file-backed `blocks/*.bin` entries relative to the map.
+    (`<ghidra>/images/<label>`) by canonical containment. The single
+    `TerminalPass2Snapshot` stages those bytes once from explicit terminal outcomes and owns every
+    Java terminal argument; there is no independent PAL or exception loader. Map-only restaging is
+    invalid because both readers open file-backed `blocks/*.bin` entries relative to the map.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
     vectors all follow `<projectDir> <projectName> -process <label> -noanalysis
     -scriptPath …`. A function map appends `ApplyThumbNames.java` first and

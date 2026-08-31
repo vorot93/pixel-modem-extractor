@@ -3,7 +3,8 @@ mod artifact;
 mod decompress;
 
 pub(crate) use self::artifact::{
-    ArtifactSegment, MaterializedScatter, read_materialized, restage_materialized,
+    ArtifactSegment, MaterializedScatter, read_materialized, read_materialized_from_trusted,
+    restage_retained_to,
 };
 pub use self::artifact::{LOAD_MAP_FORMAT, MaterializedLoadMap, clear_materialized, materialize};
 use self::decompress::{DecodeBudget, Decoded, decompress1};

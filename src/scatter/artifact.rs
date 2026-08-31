@@ -2,11 +2,11 @@ use super::{LoadPlan, Operation, PlannedEntry, PlannedOutput, PlannedStorage};
 use crate::error::{Error, Result};
 #[cfg(all(test, unix))]
 use crate::trusted_fs::set_before_contained_open;
-use crate::trusted_fs::{TrustedDirectory, validate_relative_path};
+use crate::trusted_fs::{ExpectedFileIdentity, TrustedDirectory, validate_relative_path};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -112,37 +112,12 @@ impl ArtifactSegment {
         source
             .seek(SeekFrom::Start(0))
             .map_err(|error| bad(format!("scatter restage payload rewind failed: {error}")))?;
-        let mut output = target.atomic_write_file(name, "scatter restage payload")?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = [0u8; 64 * 1024];
-        let mut remaining = self.size;
-        while remaining > 0 {
-            let length = usize::try_from(remaining.min(buffer.len() as u32))
-                .map_err(|_| bad("scatter restage payload length does not fit the host"))?;
-            source
-                .read_exact(&mut buffer[..length])
-                .map_err(|error| bad(format!("scatter restage payload read failed: {error}")))?;
-            hasher.update(&buffer[..length]);
-            output.write_all(&buffer[..length])?;
-            remaining -= u32::try_from(length)
-                .map_err(|_| bad("scatter restage payload length does not fit u32"))?;
-        }
-        let mut trailing = [0u8; 1];
-        if source.read(&mut trailing).map_err(|error| {
-            bad(format!(
-                "scatter restage payload trailing read failed: {error}"
-            ))
-        })? != 0
-        {
-            return Err(bad("scatter restage payload exceeds its declared size"));
-        }
-        if *hasher.finalize().as_bytes() != self.output_blake3 {
-            return Err(bad(
-                "scatter restage payload BLAKE3 does not match the load map",
-            ));
-        }
-        output.commit()?;
-        Ok(())
+        target.copy_verified_atomic(
+            name,
+            &mut *source,
+            ExpectedFileIdentity::new(u64::from(self.size), self.output_blake3),
+            "scatter restage payload",
+        )
     }
 }
 
@@ -368,6 +343,30 @@ pub(crate) fn read_materialized(
     base: u32,
 ) -> Result<MaterializedScatter> {
     let (manifest, manifest_parent) = open_manifest(root, manifest_path)?;
+    read_materialized_opened(manifest, manifest_parent, raw_image, base)
+}
+
+pub(crate) fn read_materialized_from_trusted(
+    root: &TrustedDirectory,
+    manifest_relative: &Path,
+    raw_image: &[u8],
+    base: u32,
+) -> Result<MaterializedScatter> {
+    validate_relative_path(manifest_relative, "scatter load map")?;
+    if manifest_relative.file_name().and_then(|name| name.to_str()) != Some("load_map.json") {
+        return Err(bad("scatter load-map filename is not load_map.json"));
+    }
+    let (manifest, manifest_parent) =
+        root.open_regular_file_with_parent(manifest_relative, "scatter load map")?;
+    read_materialized_opened(manifest, manifest_parent, raw_image, base)
+}
+
+fn read_materialized_opened(
+    manifest: File,
+    manifest_parent: TrustedDirectory,
+    raw_image: &[u8],
+    base: u32,
+) -> Result<MaterializedScatter> {
     let (wire, manifest_blake3, manifest_bytes) = read_manifest(manifest)?;
 
     if wire.format != LOAD_MAP_FORMAT {
@@ -662,23 +661,18 @@ pub(crate) fn read_materialized(
     })
 }
 
-pub(crate) fn restage_materialized(
-    source_root: &Path,
-    manifest_path: &Path,
-    raw_image: &[u8],
-    base: u32,
+pub(crate) fn restage_retained_to(
+    artifact: &MaterializedScatter,
     expected_label: &str,
-    target_root: &Path,
+    target: &TrustedDirectory,
 ) -> Result<[u8; 32]> {
     validate_label(expected_label)?;
-    let artifact = read_materialized(source_root, manifest_path, raw_image, base)?;
     if artifact.image_label != expected_label {
         return Err(bad(
             "scatter restage image label does not match the request",
         ));
     }
 
-    let target = TrustedDirectory::new(target_root, "scatter restage root")?;
     let target_image = target
         .open_or_create_directory_child("scatter", "scatter restage directory")?
         .open_or_create_directory_child(expected_label, "scatter restage image directory")?;
@@ -694,11 +688,23 @@ pub(crate) fn restage_materialized(
         }
     }
 
-    let mut manifest =
-        target_image.atomic_write_file("load_map.json", "scatter restage load-map manifest")?;
-    manifest.write_all(&artifact.manifest_bytes)?;
-    manifest.commit()?;
+    let mut manifest = std::io::Cursor::new(artifact.manifest_bytes.as_slice());
+    target_image.copy_verified_atomic(
+        "load_map.json",
+        &mut manifest,
+        ExpectedFileIdentity::new(
+            artifact.manifest_bytes.len() as u64,
+            artifact.manifest_blake3,
+        ),
+        "scatter restage load-map manifest",
+    )?;
     Ok(artifact.manifest_blake3)
+}
+
+impl MaterializedScatter {
+    pub(crate) fn manifest_blake3(&self) -> [u8; 32] {
+        self.manifest_blake3
+    }
 }
 
 fn open_manifest(root: &Path, manifest_path: &Path) -> Result<(File, TrustedDirectory)> {
@@ -1876,6 +1882,82 @@ mod tests {
             segment.read_exact(0, &mut bytes).unwrap();
             assert_eq!(bytes, [0x11, 0x22, 0x33, 0x44]);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_scatter_restages_without_reopening_replaced_source_paths() {
+        let (fixture, root, manifest) = strict_case();
+        let retained = read_materialized(root.path(), &manifest, &fixture.image, BASE).unwrap();
+        let authenticated = root.path().join("authenticated-scatter");
+        fs::rename(root.path().join("scatter"), &authenticated).unwrap();
+        fs::create_dir_all(root.path().join("scatter/02_MAIN/blocks")).unwrap();
+        fs::write(
+            root.path().join("scatter/02_MAIN/load_map.json"),
+            b"foreign manifest",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("scatter/02_MAIN/blocks/03-copy.bin"),
+            b"evil",
+        )
+        .unwrap();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+
+        let first_target =
+            crate::trusted_fs::TrustedDirectory::new(first.path(), "first scatter target").unwrap();
+        let second_target =
+            crate::trusted_fs::TrustedDirectory::new(second.path(), "second scatter target")
+                .unwrap();
+        super::restage_retained_to(&retained, "02_MAIN", &first_target).unwrap();
+        super::restage_retained_to(&retained, "02_MAIN", &second_target).unwrap();
+
+        for target in [first.path(), second.path()] {
+            assert_eq!(
+                fs::read(target.join("scatter/02_MAIN/load_map.json")).unwrap(),
+                retained.manifest_bytes
+            );
+            assert_eq!(
+                fs::read(target.join("scatter/02_MAIN/blocks/03-copy.bin")).unwrap(),
+                [0x11, 0x22, 0x33, 0x44]
+            );
+        }
+    }
+
+    #[test]
+    fn retained_scatter_digest_failure_preserves_old_payload_and_map() {
+        let (fixture, root, manifest) = strict_case();
+        let retained = read_materialized(root.path(), &manifest, &fixture.image, BASE).unwrap();
+        fs::write(
+            root.path().join("scatter/02_MAIN/blocks/03-copy.bin"),
+            [0xde, 0xad, 0xbe, 0xef],
+        )
+        .unwrap();
+        let target = tempdir().unwrap();
+        let target_label = target.path().join("scatter/02_MAIN");
+        fs::create_dir_all(target_label.join("blocks")).unwrap();
+        fs::write(target_label.join("load_map.json"), b"old complete map").unwrap();
+        fs::write(
+            target_label.join("blocks/03-copy.bin"),
+            b"old complete payload",
+        )
+        .unwrap();
+        let target_root =
+            crate::trusted_fs::TrustedDirectory::new(target.path(), "scatter target").unwrap();
+
+        let error = super::restage_retained_to(&retained, "02_MAIN", &target_root).unwrap_err();
+
+        assert!(error.to_string().contains("BLAKE3"), "{error}");
+        assert_eq!(
+            fs::read(target_label.join("blocks/03-copy.bin")).unwrap(),
+            b"old complete payload"
+        );
+        assert_eq!(
+            fs::read(target_label.join("load_map.json")).unwrap(),
+            b"old complete map",
+            "load_map.json must remain the last commit"
+        );
     }
 
     #[test]

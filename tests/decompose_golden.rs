@@ -4,7 +4,7 @@
 
 use pixel_modem_extractor::{decompile, decompose};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn decompose_produces_unified_tree() {
@@ -169,9 +169,17 @@ fn decompose_produces_unified_tree() {
             output.starts_with("images/*/exception_roots/roots.json ("),
             "deterministic exception_roots output: {output}"
         );
-        assert!(output_count_field(output, "images=") >= 1, "{output}");
-        assert!(output_count_field(output, "tables=") >= 1, "{output}");
-        assert!(output_count_field(output, "roots=") >= 1, "{output}");
+        let decompile_images = report["stages"][decompile_index]["images"]
+            .as_array()
+            .expect("decompile images");
+        let (images, tables, roots) = exception_terminal_totals(&out, decompile_images);
+        assert!(
+            images >= 1,
+            "an ok exception stage needs a terminal manifest"
+        );
+        assert_eq!(output_count_field(output, "images="), images, "{output}");
+        assert_eq!(output_count_field(output, "tables="), tables, "{output}");
+        assert_eq!(output_count_field(output, "roots="), roots, "{output}");
     }
     let pal_stage = &report["stages"].as_array().unwrap()[pal_index];
     assert!(
@@ -830,6 +838,43 @@ fn output_count_field(output: &str, key: &str) -> u64 {
         .unwrap_or_else(|_| panic!("invalid {key} in {output}"))
 }
 
+fn exception_terminal_totals(root: &Path, images: &[serde_json::Value]) -> (u64, u64, u64) {
+    let mut terminal_images = 0u64;
+    let mut tables = 0u64;
+    let mut roots = 0u64;
+    for image in images {
+        let label = image["image"].as_str().expect("decompile image label");
+        let manifest = root
+            .join("images")
+            .join(label)
+            .join("exception_roots/roots.json");
+        if !manifest.is_file() {
+            continue;
+        }
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest)
+                .unwrap_or_else(|error| panic!("{} is unreadable: {error}", manifest.display())),
+        )
+        .unwrap_or_else(|error| panic!("{} is invalid JSON: {error}", manifest.display()));
+        terminal_images += 1;
+        tables += u64::try_from(
+            document["tables"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{} has no tables array", manifest.display()))
+                .len(),
+        )
+        .unwrap();
+        roots += u64::try_from(
+            document["roots"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{} has no roots array", manifest.display()))
+                .len(),
+        )
+        .unwrap();
+    }
+    (terminal_images, tables, roots)
+}
+
 fn current_global_shapes_inputs_succeeded(image: &serde_json::Value) -> bool {
     if image
         .get("functions")
@@ -1021,16 +1066,7 @@ fn report_json_includes_exception_roots_fields() {
         .find(|stage| stage["stage"] == "decompile")
         .and_then(|stage| stage["images"].as_array())
         .expect("decompile stage images");
-    let terminal_count = images
-        .iter()
-        .filter_map(|image| image["image"].as_str())
-        .filter(|label| {
-            dir.join("images")
-                .join(label)
-                .join("exception_roots/roots.json")
-                .is_file()
-        })
-        .count();
+    let (terminal_count, terminal_tables, terminal_roots) = exception_terminal_totals(&dir, images);
     let has_fields = images.iter().any(|image| {
         ELEVEN_EXCEPTION_COUNTER_FIELDS
             .iter()
@@ -1079,8 +1115,18 @@ fn report_json_includes_exception_roots_fields() {
         let output = stage["output"].as_str().expect("ok exception_roots output");
         assert_eq!(
             output_count_field(output, "images="),
-            u64::try_from(terminal_count).unwrap(),
+            terminal_count,
             "stage count must match retained terminal manifests: {output}"
+        );
+        assert_eq!(
+            output_count_field(output, "tables="),
+            terminal_tables,
+            "table count must match retained terminal manifests: {output}"
+        );
+        assert_eq!(
+            output_count_field(output, "roots="),
+            terminal_roots,
+            "root count must match retained terminal manifests: {output}"
         );
     }
 

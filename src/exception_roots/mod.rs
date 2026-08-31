@@ -15,7 +15,8 @@ mod discover;
 #[allow(unused_imports)]
 pub(crate) use artifact::{
     ExceptionArtifactContext, MaterializedExceptionRoots, ValidatedExceptionRoots,
-    clear_materialized, materialize, read, read_with_identity,
+    clear_materialized, materialize, read, read_bytes, read_bytes_with_identity,
+    read_with_identity,
 };
 #[allow(unused_imports)]
 pub(crate) use discover::discover;

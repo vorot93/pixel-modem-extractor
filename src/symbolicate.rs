@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 pub use crate::execution_ranges::DecodeIsa;
 use crate::execution_ranges::{ExecutionIdentity, FunctionEvidenceKey, FunctionOwner};
 use crate::recover_source::{Confidence, Tool};
+use crate::runtime_image::RuntimeImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -128,7 +129,7 @@ pub struct PalApplicationRef {
 
 /// The PAL state a pass-2 map binds: identity, dependency hashes, and the
 /// application groups keyed by normalized entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PalPass2Context {
     pub identity: String,
     pub manifest_blake3: String,
@@ -2200,18 +2201,51 @@ pub fn prepare_pass2_symbol_map(
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
     let image_bytes = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
-    let symbols = build_map(image_dir, image_label, tokens, manifest, exception, pal)?;
     let runtime = thumb_runtime(image_dir, &image_bytes, load_addr)?;
+    prepare_pass2_symbol_map_from_runtime(
+        map_out_path,
+        image_dir,
+        image_label,
+        tokens,
+        load_addr,
+        &image_bytes,
+        &runtime,
+        exception,
+        pal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_pass2_symbol_map_from_runtime(
+    map_out_path: &Path,
+    image_dir: &Path,
+    image_label: &str,
+    tokens: &HashMap<u32, String>,
+    load_addr: u64,
+    image_bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    exception: Option<&ExceptionPass2Context>,
+    pal: Option<&PalPass2Context>,
+) -> Result<Pass2MapBundle> {
+    let symbols = build_map_from_runtime(
+        image_dir,
+        tokens,
+        image_bytes,
+        load_addr,
+        runtime,
+        exception,
+        pal,
+    )?;
     let map = write_pass2_symbol_map(
         map_out_path,
         image_dir,
         image_label,
         load_addr,
-        &image_bytes,
+        image_bytes,
         &symbols,
         exception,
         pal,
-        &runtime,
+        runtime,
     )?;
     let function_names = symbols
         .iter()
@@ -2621,6 +2655,31 @@ pub(crate) fn build_map(
     exception: Option<&ExceptionPass2Context>,
     pal: Option<&PalPass2Context>,
 ) -> Result<Vec<Symbol>> {
+    let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
+        .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
+    let image_bytes = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
+    let runtime = thumb_runtime(image_dir, &image_bytes, load_addr)?;
+    build_map_from_runtime(
+        image_dir,
+        tokens,
+        &image_bytes,
+        load_addr,
+        &runtime,
+        exception,
+        pal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_map_from_runtime(
+    image_dir: &Path,
+    tokens: &HashMap<u32, String>,
+    image_bytes: &[u8],
+    load_addr: u64,
+    runtime: &RuntimeImage<'_>,
+    exception: Option<&ExceptionPass2Context>,
+    pal: Option<&PalPass2Context>,
+) -> Result<Vec<Symbol>> {
     let decompiled = image_dir.join("decompiled");
     let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
     let index = crate::disasm_index::DisasmIndex::new(&disasm);
@@ -2633,44 +2692,12 @@ pub(crate) fn build_map(
     };
     let attribution = load_attribution(&source_tree)?;
 
-    // Loaded before the function inventories so the Thumb artifact can be
-    // validated against the image it was produced for.
-    let raw_image_path = image_dir.join(format!("{image_label}.bin"));
-    let image_and_load: Option<(Vec<u8>, u64)> = match crate::manifest::load_addr_for_image(
-        manifest,
-        image_label,
-    )? {
-        Some(load_addr) if raw_image_path.exists() => {
-            Some((std::fs::read(&raw_image_path)?, load_addr))
-        }
-        _ => {
-            if !file_occ.is_empty() {
-                tracing::warn!(
-                    "symbolicate: {image_label}: raw image or load_addr missing — skipping __func__ recovery"
-                );
-            }
-            None
-        }
-    };
-
-    let runtime = image_and_load
-        .as_ref()
-        .map(|(image, load_addr)| thumb_runtime(image_dir, image, *load_addr))
-        .transpose()?
-        .ok_or_else(|| {
-            Error::Serialize(
-                "symbolicate: function inventory requires its raw image and load address".into(),
-            )
-        })?;
-    let mut funcs = load_functions(&decompiled, &index, &runtime)?;
+    let mut funcs = load_functions(&decompiled, &index, runtime)?;
     if decompiled.join("thumb_functions.json").exists() {
-        funcs.extend(load_thumb_functions(&decompiled, &runtime)?);
+        funcs.extend(load_thumb_functions(&decompiled, runtime)?);
     }
 
-    let string_map = match &image_and_load {
-        Some((img, load_addr)) => build_string_map(img, *load_addr, 3),
-        None => HashMap::new(),
-    };
+    let string_map = build_string_map(image_bytes, load_addr, 3);
 
     // Recovered (`__func__`) names, computed once and reused below.
     let recovered_names: Vec<Option<String>> = funcs
@@ -2707,14 +2734,15 @@ pub(crate) fn build_map(
 
     // Registration-table tier (authoritative). Scans the raw image for
     // `{name, fn}` tables whose pointer resolves to a known function entry.
-    let reg_names: HashMap<u64, String> = match &image_and_load {
-        Some((img, load_addr)) => {
-            let fn_entries: HashMap<u64, &'static str> =
-                funcs.iter().map(|f| (f.entry, f.arch)).collect();
-            reg_table::scan(img, *load_addr, &fn_entries, &global_names, &fn_names).names
-        }
-        None => HashMap::new(),
-    };
+    let fn_entries: HashMap<u64, &'static str> = funcs.iter().map(|f| (f.entry, f.arch)).collect();
+    let reg_names: HashMap<u64, String> = reg_table::scan(
+        image_bytes,
+        load_addr,
+        &fn_entries,
+        &global_names,
+        &fn_names,
+    )
+    .names;
 
     // String-reference guess tier (fail-closed, lowest precedence). Active only
     // when the raw image (=> non-empty string_map) and globals.json are present.

@@ -55,6 +55,7 @@ pub(crate) struct TaskArtifactContext<'a> {
 
 /// One strict-reader verdict: the revalidated plan plus the identities
 /// the artifact was pinned against.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ValidatedTaskArtifact {
     pub plan: TaskPlan,
     pub image_label: String,
@@ -1672,6 +1673,11 @@ pub(crate) fn read(
     expected: TaskArtifactContext<'_>,
 ) -> Result<ValidatedTaskArtifact> {
     let mut file = open_manifest_file(path)?;
+    let bytes = read_manifest_bytes(&mut file)?;
+    read_bytes(&bytes, runtime, expected)
+}
+
+fn read_manifest_bytes(file: &mut File) -> Result<Vec<u8>> {
     let length = file
         .metadata()
         .map_err(|error| invalid(format!("manifest metadata is unavailable: {error}")))?
@@ -1699,8 +1705,22 @@ pub(crate) fn read(
         return Err(invalid("manifest grew while it was being authenticated"));
     }
 
-    let manifest_blake3 = *blake3::hash(&bytes).as_bytes();
-    let wire = parse_manifest(&bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_bytes(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    expected: TaskArtifactContext<'_>,
+) -> Result<ValidatedTaskArtifact> {
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(invalid(
+            "manifest exceeds the 4 MiB ceiling and is rejected before parsing",
+        ));
+    }
+
+    let manifest_blake3 = *blake3::hash(bytes).as_bytes();
+    let wire = parse_manifest(bytes)?;
     revalidate(wire, runtime, &expected, manifest_blake3)
 }
 
@@ -2532,6 +2552,7 @@ fn open_manifest_file(path: &Path) -> Result<File> {
 mod tests {
     use super::{
         FORMAT, TaskArtifactContext, ValidatedTaskArtifact, clear_materialized, materialize, read,
+        read_bytes,
     };
     use crate::arm32::Register;
     use crate::pal_tasks::MaterializedTaskMap;
@@ -3258,6 +3279,22 @@ mod tests {
         assert_eq!(hex(artifact.manifest_blake3), map.blake3);
         assert_eq!(artifact.identity, map.identity);
         assert_eq!(artifact.plan, plan);
+    }
+
+    #[test]
+    fn exact_bytes_reader_matches_the_retained_path_reader() {
+        let (raw, runtime) = raw_fixture();
+        let plan = synthetic_plan(&runtime);
+        let context = raw_context(*blake3::hash(&raw).as_bytes());
+        let root = tempdir().unwrap();
+        materialize(&plan, context, root.path()).unwrap();
+        let path = manifest_path(root.path());
+        let bytes = fs::read(&path).unwrap();
+
+        assert_eq!(
+            read_bytes(&bytes, &runtime, context).unwrap(),
+            read(&path, &runtime, context).unwrap()
+        );
     }
 
     #[test]

@@ -307,8 +307,13 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   auto-analysis and records concrete function, primary-symbol, and role-label ownership; the v4
   export marker binds the same identity as `exception_roots=<identity>`. Strict readers and Ghidra
   postflight rederive all identities and reject stale or partial state. Before pass 2, `decompose`
-  restages the exact raw image and complete optional scatter artifact, including every referenced
-  `blocks/*.bin` payload, inside the Ghidra kit. `report.json` carries one
+  builds one immutable per-image terminal snapshot, gated by the exact completed marshal outcomes,
+  inside the existing Ghidra kit. It retained-copies the exact raw image, complete optional scatter
+  artifact (including every referenced `blocks/*.bin` payload), and current exception/PAL manifests
+  once, then derives both strict application contexts from that one runtime. Symbol maps bind the
+  snapshot identities. After invalidating stale exports, the host revalidates the complete snapshot
+  and map binding immediately before spawning Ghidra; drift blocks the process and leaves no old
+  export current. `report.json` carries one
   adjacent `exception_roots` stage plus an all-or-none per-image application-counter group; a
   reason-only `exception_error` is exclusive with those counters.
 - **PAL task manifest** — `pixel-modem-extractor-pal-tasks-v1`: the authenticated canonical

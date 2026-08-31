@@ -31,6 +31,7 @@ pub mod scatter;
 pub(crate) mod semantic_cfg;
 pub mod source_tree;
 pub mod symbolicate;
+pub(crate) mod terminal_pass2;
 pub mod thumb_analysis;
 pub mod toc;
 pub mod tokens;
