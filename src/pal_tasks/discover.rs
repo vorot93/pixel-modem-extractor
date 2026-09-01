@@ -315,8 +315,11 @@ fn code_storage_spans(
     Ok(spans)
 }
 
-/// Whether an instruction provably writes (or provably does not write)
-/// one register. Unmodeled effects and predicated writes are unknown.
+/// Whether an instruction provably writes one register. Predicated-linear
+/// and otherwise truly unknown effects return `None`. `Unsupported` only
+/// leaves the value transform unmodeled: its conservative write-set membership
+/// is precise for known instructions; generic fallback marks every core register
+/// and therefore remains fail-closed.
 fn register_write(instruction: &DecodedInstruction, register: Register) -> Option<bool> {
     if instruction.conditional && matches!(instruction.flow, ControlFlow::Linear) {
         return None;
