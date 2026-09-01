@@ -298,6 +298,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `gzip.rs` | Gunzip the `RF_CFG_*` calibration blobs |
 | `toc.rs` | `modem.bin` TOC parse + split into the model-dependent embedded images |
 | `classify.rs` | 5-test opaque battery — whole-image H, χ²/df, serial correlation, 64-KiB window entropies; unanimous fail-closed verdict |
+| `semantic_cfg.rs` | Shared bounded A32/T32 direct-edge CFG, compact dominance, typed handoffs, and exact must-value dataflow used by PAL and exception roots |
 | `scatter/mod.rs` | Semantic A32 scatter discovery, exact bounded-table classification, and checked runtime planning |
 | `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
 | `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
@@ -385,10 +386,13 @@ module; when a file outgrows that, split it.
   exception/PAL outcomes for every image and never stops at the first failed label; only dependent
   authority is cleared. Report reasons are bounded to 2,048 Unicode scalar values including
   ` [truncated]`, and an earlier actionable exception cause is sticky.
-- **One terminal snapshot owns pass 2.** Each current pass-1 export whose complete terminal outcome
-  matrix committed gets at most one `TerminalPass2Snapshot` in the existing Ghidra kit: raw is staged
+- **One terminal snapshot owns pass 2, at one precise time.** Exhaustive pass-1 marshalling first
+  records the complete raw/export/scatter/exception/PAL outcome matrix for every image. Later, after
+  pass-1 enrichment/source stages and immediately before symbol-map construction, each eligible
+  current image gets at most one `TerminalPass2Snapshot` in the existing Ghidra kit: raw is staged
   once, one authenticated scatter object stages every payload before `load_map.json`, and current
-  exception/PAL manifests stage once.
+  exception/PAL manifests stage once. It snapshots pass-2 inputs, not final pass-2 outputs, and is
+  not deferred until `DispatchPass2`.
   Both opaque application contexts derive from that snapshot's single `RuntimeImage`; failed
   construction returns no object. `Pass2Input` owns an `Arc` to the snapshot plus typed function,
   global, and global-type maps. A function map must match the snapshot's original raw digest and full
@@ -398,6 +402,37 @@ module; when a file outgrows that, split it.
 
 ### Architectural exception roots
 
+- **Discovery is all-image, default-on, and has no CLI bypass.** Generation examines every
+  `Toc::embedded()` image before `--image` filtering or opaque skipping. TOC label, load address,
+  and that image's `RuntimeImage` are inputs, never model selectors; scatter remains structurally
+  MAIN-only and analyzer inventories never nominate roots. The sole initial candidate is the image
+  load address. Arbitrary image scanning is forbidden, and a relocated candidate can arise only
+  from reset-side VBAR proof after the initial table has validated.
+- **The threshold is exactly eight supported A32 slots.** Architectural order is reset, undefined
+  instruction, supervisor call, prefetch abort, data abort, reserved, IRQ, and FIQ. Every slot must
+  be either an unconditional non-linking direct A32 branch or an unconditional literal word load to
+  PC with architectural-PC base, decoded immediate offset, and no unsupported writeback. Calls,
+  conditional forms, register-indirect/computed PC writes, returns, exception calls, and table
+  branches are unsupported. Zero through seven supported forms is clean `NoCandidate`; after all
+  eight forms survive, every literal and target must be byte-backed in the same raw/scatter runtime,
+  architecturally aligned, and decode one complete selected-ISA instruction with no cross-ISA
+  fallback. Same-ISA duplicate targets are valid; ARM/Thumb identities normalizing to one address
+  are malformed. Any post-threshold failure is typed malformed/ambiguous/resource failure and
+  publishes no current plan rather than truncating to a prefix.
+- **VBAR conclusions are explicit and bounded to the reset prefix.** Shared `semantic_cfg` follows
+  direct edges, does not enter callees, applies the call-clobber boundary, and joins an exact value
+  only when every incoming path agrees. An unconditional VBAR write establishes active-table state
+  only when it dominates every explored startup handoff. `confirmed_initial` selects the image-base
+  table; `relocated` validates one second table under the identical rules; `unresolved` records a
+  real write whose value or table cannot be proven; `not_observed` records a complete prefix with no
+  VBAR write; `analysis_incomplete` records a decode/control boundary before a dominance conclusion.
+  A later indirect/decode boundary does not downgrade an already-proven dominating write, while a
+  boundary outside its dominance remains incomplete. Conflicting exact selections are ambiguous.
+- **Resource limits are part of validity.** Per image: at most 2 tables, exactly 8 slots per table,
+  at most 16 distinct roots, 64 KiB non-refundable charged reset-CFG bytes, 32,768 decoded CFG
+  instructions, 4,096 CFG blocks, 64 VBAR observations, and a 1 MiB manifest. Java symbol leaves
+  retain the shared 2,000-byte cap. Exhaustion after threshold fails the generation and preserves
+  any previous complete artifact without reporting it current.
 - **Canonical means exact production bytes.** `ExceptionRootsSupport` first applies its ordered,
   typed v1 grammar, then rewrites the same JSON generically to Rust `serde_json`'s two-space pretty
   spelling and compares exact UTF-8 bytes. This rejects changed key/string escaping, minification,
@@ -463,6 +498,12 @@ module; when a file outgrows that, split it.
   exception files as the last fallible step before the property write. A clean replay performs zero
   renames; stale/partial ownership emits no success summary and leaves prior program/export state
   intact.
+- **The wire/currentness bumps are inseparable.** Exception evidence writes
+  `pixel-modem-extractor-symbols-v4`; application input writes
+  `pixel-modem-extractor-symbol-map-v4`; `PixelModemExtractor.SymbolPass2` accepts only its strict
+  v3 token; and every current export ends with `pixel-modem-extractor-ghidra-export-v4` carrying
+  `exception_roots`, `pal_tasks`, and `symbol_map` identities. There is no compatibility grammar for
+  the unshipped exception semantics in older symbol/map/export state.
 - **One retained pass-2 state serves all three phases.** `ApplyThumbNames` receives exactly ten
   arguments: kit root, image label/hash, exception identity/manifest/scatter, retained
   `functions.json` path/hash, and symbol-map path/hash. It opens the full retained map state and runs
@@ -517,10 +558,15 @@ module; when a file outgrows that, split it.
   must each finish before state insertion. Discovery/publication/clear failure preserves an earlier
   complete manifest; a post-publication read failure still returns no `RuntimeAnalysis` and never
   reports the bytes current. Present pass-1 order is `ApplyScatterLoad` →
-  `ApplyExceptionRoots` → `ApplyPalTasks` → `TameAnalysis`; generated and in-process routes pass the same identities and
-  parse exactly one conserving exception summary. Host summary coordination commits a valid
-  exception result before parsing PAL: a later PAL-summary failure preserves the exception counts
-  but leaves the image terminal-invalid and the export non-current. `TameAnalysis` validates root
+  `ApplyExceptionRoots` → `ApplyPalTasks` → `TameAnalysis` → auto-analysis → `ExportDecomp`.
+  Generated and in-process routes pass the same explicit identities, and the Java applicator emits
+  exactly one conserving exception summary in either route. Only the Rust-driven in-process route
+  captures and host-parses that line into `ImageResult`; generated `run_ghidra.sh` deliberately does
+  not parse stdout and instead requires process success, all three exports, and the exact v4 marker
+  whose Java preconditions include summary conservation and complete postflight. Host summary
+  coordination commits a valid exception result before parsing PAL: a later PAL-summary failure
+  preserves the exception counts but leaves the image terminal-invalid and the export non-current.
+  `TameAnalysis` validates root
   ownership before and after both modes, so datamark treats root instructions as protected code. `ExportDecomp`
   retains both exception and PAL inputs, reauthenticates both manifest/program states before and
   after generating sibling staging files, closes both retained states successfully, then moves the
@@ -541,7 +587,10 @@ module; when a file outgrows that, split it.
   explicit application state. The snapshot and its map binding reject drift at the final pre-spawn
   gate; path existence alone never establishes currentness. The adjacent
   `exception_roots` report stage tallies terminal images/tables/roots, while eleven application
-  counters are all-or-none and exclusive with reason-only `exception_error`.
+  counters are all-or-none and exclusive with reason-only `exception_error`. `None` means no current
+  Ghidra invocation result; `Some(0)` means the application ran and produced zero in that category.
+  Exception application fields live on `decompile::ImageResult`, so every later report snapshot
+  rebuild preserves them rather than requiring a post-pass-2 patch.
 - **Real-Ghidra fixtures have one production oracle.** Everything under
   `tests/fixtures/exception_roots/` is wholly synthetic. The private
   `committed_ghidra_fixture_matches_production_discovery_and_serialization` test regenerates the
@@ -550,6 +599,44 @@ module; when a file outgrows that, split it.
   `PME_UPDATE_EXCEPTION_ROOT_FIXTURE=1` only when intentionally regenerating those fixtures. The
   integration suite loads them directly; malformed cases are focused text/byte mutations, never a
   parallel test-owned wire schema.
+- **Two-model Phase 3A acceptance is closed (2026-09-01).** Fresh locked release-mode `decompose`
+  with pixel-modem-extractor 2.0.0, Ghidra 12.1.2 DEV, and radare2 6.1.4 produced exactly one
+  current MAIN manifest on each reference model and clean current absence on Mustang's other five
+  images and Cheetah's other three. Both tables are at `0x40010000`, all eight slots are literal
+  A32 loads, every root is distinct A32, and exact dominating VBAR writes at `0x40010180`
+  (Mustang) / `0x40010100` (Cheetah) select the initial table. In architectural order (reset,
+  undefined, SVC, prefetch abort, data abort, reserved, IRQ, FIQ), the targets are
+  `[0x4001017c, 0x400100b4, 0x400100c0, 0x400100cc, 0x40010140, 0x40010168,
+  0x4001016c, 0x40010174]` on Mustang and
+  `[0x400100fc, 0x400100b0, 0x400100bc, 0x400100c8, 0x400100d8, 0x400100e8,
+  0x400100ec, 0x400100f4]` on Cheetah. Canonical manifest BLAKE3 values remain
+  `dfb5b19229432824e86394798a1545ce28cbceebe103aef02922b0cad391f402` and
+  `2597eab66f60c7be950c9671e4f14d443eca4b7c826446f5e2bd65ae4c12516f`.
+  Each run created and named all eight functions, preserved all eight role labels through pass 2,
+  and emitted the identity-bound export-v4 marker. End-to-end wall/RSS was 2:05:11 / 5,184,752 KiB
+  for Mustang and 1:34:30 / 16,751,636 KiB for Cheetah, with no swap; the Cheetah peak includes the
+  documented `0x42310000` radare2 `RLIMIT_AS` failure, durably recorded while six regions
+  succeeded. PAL, Thumb creation, globals, global shapes/types, DBT, terminal inventories, and all
+  conservation gates passed; the overlap-repair fallback did not recur. This lands Shannon-loader
+  roadmap Phase 3A alongside landed Phases 1 and 2. Phase 3B is the next focused design: hardware-init
+  roots, compiler metadata, stack non-return proof/application, and broader privileged-operation
+  evidence over the improved mutable final inventories; it remains architecturally separate from
+  immutable pre-analysis Phase 3A.
+- **Focused verification is explicit.** Run exception discovery/artifact/CFG/PAL unit batteries,
+  both independently configured corpus legs, the complete serial real-Ghidra binary, and the
+  retained-tree report-shape gate:
+
+      cargo test exception_roots:: -- --nocapture
+      cargo test semantic_cfg:: -- --nocapture
+      cargo test pal_tasks:: -- --nocapture
+      cargo test --test exception_roots_golden -- --nocapture --test-threads=1
+      GHIDRA_INSTALL_DIR=/opt/ghidra \
+        cargo test --test decompile_golden -- --nocapture --test-threads=1
+      cargo test --test decompose_golden \
+        report_json_includes_exception_roots_fields -- --exact --nocapture
+
+  A configured corpus/Ghidra prerequisite must run or fail; only an unset corpus variable or an
+  unset Ghidra variable with no default installation can produce its documented UNRUN/skip state.
 
 ### Dense Thumb analyzer invariants
 
@@ -901,6 +988,13 @@ hardcoded. Two reference images exercise both models end-to-end:
   first-slot plausibility threshold and then fails is the contextual malformed error; several
   complete survivors are the typed ambiguity error. A malformed sibling never lets a valid one
   pass silently.
+- **Unknown values do not erase precise write sets.** `ValueEffect::Unsupported` means the decoder
+  cannot model the written value; it does not mean a known instruction writes every register.
+  PAL preservation queries must use that instruction's conservative exact core-register `writes`
+  set while retaining the existing predication and call-boundary rules. The genuinely unsupported
+  fallback already declares all core registers writable and therefore remains fail-closed. This
+  distinction is required by Cheetah's valid suffix: a Thumb `MLA` writes `r0` with an unsupported
+  value transform but still proves that induction registers `r4` and `r7` survive.
 - **The corrected corpus baseline is 133/162 from true slot 0.** Earlier research described
   Cheetah as 161 records from `0x441c8398` — that is slot 1's descriptor projection, not the
   table start (`FUN_42118f76(0)` returns `slot_base + 0x118`, and a forward-only margin search
@@ -928,6 +1022,11 @@ hardcoded. Two reference images exercise both models end-to-end:
   and Thumb pointers normalizing to one address reject the candidate; shared entries with one
   ISA stay valid. The manifest binds the scatter load-map BLAKE3 it was validated against plus
   the sorted unique scatter entries used, and readers re-authenticate both.
+- **PAL identity counts semantic applications, not storage dependencies.** The final component of
+  `v1:<manifest-blake3>:<task-records>:<distinct-entries>` is the strictly revalidated canonical
+  application count. It must never come from task-record count (shared entries are valid) or
+  `scatter_entries_used` (storage provenance is independent). Both accepted corpora use zero
+  scatter dependencies yet correctly emit `:133:133` and `:162:162`.
 - **Resource limits are named constants** (`pal_tasks/mod.rs`): 4096 anchor occurrences, 16384
   anchor references, 4096 bytes anchor-reference distance, 32 instructions per `MOVW`/`MOVT`
   span, 256-byte prologue window, 512-byte/256-instruction entry-rooted CFG, 64 candidate

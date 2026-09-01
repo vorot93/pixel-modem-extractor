@@ -95,19 +95,36 @@ streaming host Thumb analyzer, including opt-in failure-only Rizin fallback, sti
 mode every architectural exception-root instruction and authoritative PAL task function (see below)
 stays code — only undefined regions that neither subsystem owns are marked as data.
 
-**Architectural exception-root seeding (default on).** Generation probes every embedded TOC image,
-before image filtering or the opaque skip, for a complete A32 exception-vector table and an optional
-semantically proven VBAR relocation. A validated plan publishes
-`exception_roots/<label>/roots.json`; clean absence clears stale owned output, while malformed,
-ambiguous, or resource-exhausted evidence fails closed. With Ghidra enabled, the strict
-`ApplyExceptionRoots.java` transaction runs after scatter application and before PAL seeding,
-`TameAnalysis`, and auto-analysis. It creates or reuses exact-entry ARM/Thumb functions, assigns
-conventional primaries only when safe, retains role labels and concrete ownership, and never replaces
-a meaningful foreign primary. Generated and immediate runs bind the exact root identity through
-TameAnalysis and the four-line `pixel-modem-extractor-ghidra-export-v4` completion marker; missing,
-duplicate, malformed, stale, removed, merged, or retagged root state publishes no current export. An
-opaque-skipped image can still retain a current generation manifest, but has no Ghidra application
-counts because no process ran.
+**Architectural exception-root seeding (default on, with no disable flag).** Every generation-only
+`decompile`, `decompile --run`, and `decompose` examines every embedded TOC image before image
+selection and the opaque skip. The sole initial candidate is the image load address. Fewer than eight
+supported A32 slots is clean absence and clears stale owned output; the threshold is all eight slots,
+each an unconditional non-linking direct branch or an unconditional literal `LDR PC`. Once that
+threshold is crossed, every literal, target, ISA, first instruction, and resource bound must validate
+through the image's raw-plus-scatter runtime view or generation fails closed. A second table is accepted
+only when exact reset-prefix dataflow proves its address through VBAR; partial vector-like prefixes are
+never promoted by scanning arbitrary image bytes or consulting an analyzer inventory.
+
+A validated plan publishes `exception_roots/<label>/roots.json` in a standalone decompile kit and is
+named by optional `ghidra_load.json.images[].exception_root_map`. `decompose` authenticates and moves
+the same manifest to `images/<label>/exception_roots/roots.json`. With Ghidra enabled, the pass-1 order
+is exactly `ApplyScatterLoad.java` -> `ApplyExceptionRoots.java` -> `ApplyPalTasks.java` ->
+`TameAnalysis.java` -> auto-analysis -> `ExportDecomp.java`, omitting only optional scripts whose
+explicit current state is absent. The exception transaction creates or reuses each exact-entry
+ARM/Thumb function, records concrete ownership, and always preserves an architectural role label in
+`PixelModemExtractor_ExceptionRoots_v1`. A conventional role primary is requested only for an
+unshared one-to-one role, never over a meaningful foreign primary. Firmware-native names remain
+stronger: `__func__` > registration > exception root > PAL task > token > string reference; a stronger
+pass-2 primary does not remove the role label.
+
+Immediate Rust-driven runs capture stdout and require exactly one identity-bound, conserving
+`ApplyExceptionRoots: {json}` summary. Generated `run_ghidra.sh` exposes that script output but does
+not parse it in shell; instead it requires process success, all three exports, and the exact four-line
+`pixel-modem-extractor-ghidra-export-v4` marker that Java writes only after complete root postflight.
+Both routes bind the same manifest identity through `TameAnalysis` and export. Missing, malformed,
+stale, removed, merged, retagged, role-changed, or ownership-inconsistent root state therefore
+publishes no current export. An opaque-skipped image can still retain a current generation manifest,
+but has no Ghidra application counts because no process ran.
 
 **PAL task seeding (default on).** Every recognized MAIN image is probed, at generation time and on
 every run, for a PAL task initializer: a semantic proof (anchor materialization of `PALTskTm\0`,
@@ -170,10 +187,17 @@ its full set of flags.
 | `decode-traces <modem.bin>` | Decode the MAIN image's DBT debug-trace catalog (28-byte `DBT:` records) to `debug_traces/`: five catalog tables. `references.json` is published only when function inventories exist (standalone is catalog-only). The input is a `modem.bin` TOC; the tool selects the entry named `MAIN` and binds only a scatter map this run materializes (a leftover `scatter/MAIN` under `--out` is not rebound; a plausible malformed or ambiguous map fails the command). Default out `./decoded_traces/`. |
 | `hardware-config <hardware_config.json>` | Structural stats + RF_CFG-coverage summary. `--rf-dir` cross-checks which calibration blobs are actually present. Default out `./hwcfg_summary/`. |
 | `decompile <modem.bin>` | Write a Ghidra import kit for all code images at their load addresses (the image set is model-dependent — six on mustang, four on cheetah). For a recognized MAIN, generation validates and emits a runtime scatter map; Ghidra retains the raw mapping and applies those runtime blocks before analysis. No candidate leaves the image raw-only, while a plausible malformed or ambiguous map fails the command. Generation also discovers the PAL task plan semantically (default on): a validated plan publishes `pal_tasks/<label>/tasks.json` and seeds one Ghidra function per task entry before auto-analysis; no initializer is clean absence, and a plausible malformed or ambiguous one fails the command. `--run` drives `analyzeHeadless` (needs a local Ghidra) to export decompiled C, a disassembly listing, and a function inventory; unanimously-opaque images are skipped without spawning Ghidra (`--no-skip-opaque` forces a run); selected images with dense Thumb regions use radare2 primary and, with `--rizin-fallback`, one Rizin attempt after a region failure. The Thumb stage fails if every requested region fails and publishes no new sidecar. `--image`, `--ghidra-home`, `--processor` (default `ARM:LE:32:v7`). `--no-thumb-decompile` selects Ghidra datamark mode and skips `body_c` enrichment; host Thumb analysis and strict-v3 output remain enabled, and every authoritative PAL task function stays code. |
-| `symbolicate <decomposed_dir>` | Recover function names + inline log/assert/file annotations from evidence already produced (pw_tokenizer DB, `__func__`, attributed strings), rewriting `decompiled.c`/`disasm.lst`/`functions.json`/`thumb_functions.json` **in place** and emitting `symbols.json`. Tiered + fail-closed (precedence `__func__` > registration > token > string-ref): `__func__` and `{name,fn}` **registration-table** matches yield authoritative (`Recovered`) renames; token matches become marked `guess_…` names; strings/files are comments. `--token-db` gives the raw `pw_token_db` (TOKENS); without it, token evidence is skipped. Registration names come from scanning the raw image for handler/dispatch tables (AT-command, protocol) whose pointer resolves to a known function entry — the crown-jewel names (e.g. `AtiParsePlusCOPS`), ~100% precision but a small set (113 mustang / 77 cheetah evidence names on the 2026-08-25 goldens). Also derives lowest-precedence `guess_*` names from a function's uniquely-referenced identifier string (fail-closed: dropped if all-caps, a recovered global, or another function's name), recorded as `string_ref` evidence. It also runs automatically as a `decompose` stage. |
+| `symbolicate <decomposed_dir>` | Recover function names + inline log/assert/file annotations from evidence already produced (pw_tokenizer DB, `__func__`, attributed strings), rewriting `decompiled.c`/`disasm.lst`/`functions.json`/`thumb_functions.json` **in place** and emitting `symbols.json`. Tiered + fail-closed (precedence `__func__` > registration > exception-root role > PAL-task role > token > string-ref): `__func__` and `{name,fn}` **registration-table** matches yield authoritative (`Recovered`) renames; architectural/task roles remain durable evidence below firmware-native names; token matches become marked `guess_…` names; strings/files are comments. `--token-db` gives the raw `pw_token_db` (TOKENS); without it, token evidence is skipped. Registration names come from scanning the raw image for handler/dispatch tables (AT-command, protocol) whose pointer resolves to a known function entry — the crown-jewel names (e.g. `AtiParsePlusCOPS`), ~100% precision but a small set (113 mustang / 77 cheetah evidence names on the 2026-08-25 goldens). Also derives lowest-precedence `guess_*` names from a function's uniquely-referenced identifier string (fail-closed: dropped if all-caps, a recovered global, or another function's name), recorded as `string_ref` evidence. It also runs automatically as a `decompose` stage. |
 | `tree-hash <dir>` | Print the whole-tree `pme-paq-v1` hash of `<dir>` — one lowercase 64-hex value — and write nothing. Fails closed with no hash printed if the target is missing, not a directory, contains a symlink, or has any non-UTF-8 path component. No external tools. |
 | `unpack-fbpk <radio.img>` | Lower-level: emit `modem.ext4` (a partial-pipeline shortcut — currently runs the full `extract` under the hood). |
 | `split-toc <modem.bin>` | Lower-level: split a `modem.bin` into its TOC images (stage 5 of `extract`). |
+
+Both `decompile` and `decompose` always perform architectural exception-root discovery for every
+embedded image before image filtering or opaque skipping; there is no feature flag. A validated
+image adds the authenticated manifest and, when Ghidra runs, seeds its exact ARM/Thumb roots before
+auto-analysis using the ordering and currentness contract described above. `decompile` keeps the
+standalone manifest under `exception_roots/<label>/`, while `decompose` publishes the terminal copy
+under `images/<label>/exception_roots/` and reports generation separately from application.
 
 ## Output layout
 
@@ -215,6 +239,7 @@ The manifest is the auditable map; payload files exist only for materialized cop
     │   │   ├── decompiled/           # …+ strict-v3 thumb_functions.json, thumb/ captures, symbols.json, globals.json, global_shapes.json
     │   │   ├── source_tree/          # reconstructed tree + recovered_index.json (MAIN image only)
     │   │   ├── scatter/              # load_map.json + blocks/; retained by --prune (MAIN when recognized)
+    │   │   ├── exception_roots/      # roots.json when validated; retained by --prune (any image)
     │   │   ├── pal_tasks/            # tasks.json; retained by --prune (MAIN when recognized)
     │   │   └── debug_traces/         # five catalog tables + separately published references.json
     │   ├── 03_APM/decompiled/
@@ -228,11 +253,12 @@ The manifest is the auditable map; payload files exist only for materialized cop
 
 The `images/` set above is the mustang (S5400) layout. The image set and the MAIN dir are
 model-dependent: cheetah (S5300) has `00_BOOT 01_MAIN 02_VSS 03_APM`, with `source_tree/` under
-`01_MAIN`. A recognized map lives at `images/<MAIN>/scatter/`, a validated PAL plan at
+`01_MAIN`. A recognized map lives at `images/<MAIN>/scatter/`, a validated exception plan at
+`images/<label>/exception_roots/roots.json` for whichever image proved one, a validated PAL plan at
 `images/<MAIN>/pal_tasks/tasks.json`, and a published debug-trace catalog at
-`images/<MAIN>/debug_traces/` on either model; all three survive `--prune`. `rf/` appears only
-when the model ships RF_CFG blobs (cheetah has none). Pruning retains `thumb_functions.json` but
-removes `decompiled/thumb/` captures and carved inputs.
+`images/<MAIN>/debug_traces/` on either model; all four terminal surfaces survive `--prune`. `rf/`
+appears only when the model ships RF_CFG blobs (cheetah has none). Pruning retains
+`thumb_functions.json` but removes `decompiled/thumb/` captures and carved inputs.
 
 `report.json` keeps its top-level `ghidra` object. It always records `headless`, `radare2`,
 `radare2_version`, and boolean `rizin_fallback`; enabled runs additionally record `rizin` and
@@ -241,6 +267,16 @@ run reports `thumb_regions_requested`, `thumb_regions_succeeded`, `thumb_regions
 `thumb_radare2_runs`, and `thumb_rizin_runs`; a seeded PAL plan reports `pal_applied`
 (`tasks`, `entries`, `functions_created`, `functions_existing`, `names_applied`,
 `names_preserved`, `shared_entries`) and `decompose` adds the per-image `pal_tasks` counter.
+The adjacent `exception_roots` stage follows `decompile` and precedes `pal_tasks`; it tallies
+terminal manifests, tables, and roots after reauthentication. A completed Ghidra application emits
+the all-or-none per-image fields `exception_tables`, `exception_roles`, `exception_roots`,
+`exception_functions_created`, `exception_functions_reapplied`,
+`exception_functions_existing`, `exception_names_applied`, `exception_names_reapplied`,
+`exception_names_preserved`, `exception_names_not_requested`, and `exception_shared_entries`.
+Omitted means application was not invoked/current; `0` means it ran and produced zero in that
+category. Reason-only `exception_error` is exclusive with every numeric exception field. Generation
+and application are intentionally separate, so an opaque-skipped image may contribute to the stage
+tally while carrying no application fields.
 A built pass-2 function map reports `pass2_creation_candidates` and the nested
 `pass2_creation_map_skips`; an invoked `ApplyThumbNames` additionally reports
 `pass2_created`, `pass2_creation_reapplied`, `pass2_creation_skipped_existing`, and
@@ -306,14 +342,15 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
   identity is `v1:<manifest-blake3>:<tables>:<roots>`. Ghidra applies it transactionally before
   auto-analysis and records concrete function, primary-symbol, and role-label ownership; the v4
   export marker binds the same identity as `exception_roots=<identity>`. Strict readers and Ghidra
-  postflight rederive all identities and reject stale or partial state. Before pass 2, `decompose`
-  builds one immutable per-image terminal snapshot, gated by the exact completed marshal outcomes,
-  inside the existing Ghidra kit. It retained-copies the exact raw image, complete optional scatter
-  artifact (including every referenced `blocks/*.bin` payload), and current exception/PAL manifests
-  once, then derives both strict application contexts from that one runtime. Symbol maps bind the
-  snapshot identities. After invalidating stale exports, the host revalidates the complete snapshot
-  and map binding immediately before spawning Ghidra; drift blocks the process and leaves no old
-  export current. `report.json` carries one
+  postflight rederive all identities and reject stale or partial state. After pass-1 terminal
+  marshalling completes, and immediately before symbol-map construction, `decompose` builds at most
+  one immutable per-image pass-2 input snapshot gated by the exact completed marshal outcomes. It
+  retained-copies the exact raw image, complete optional scatter artifact (including every referenced
+  `blocks/*.bin` payload), and current exception/PAL manifests into the existing Ghidra kit once,
+  then derives both strict application contexts from that one runtime. It is not a snapshot of
+  post-pass-2 output. Symbol maps bind these input identities. After invalidating stale exports, the
+  host revalidates the complete snapshot and map binding immediately before spawning Ghidra; drift
+  blocks the process and leaves no old export current. `report.json` carries one
   adjacent `exception_roots` stage plus an all-or-none per-image application-counter group; a
   reason-only `exception_error` is exclusive with those counters.
 - **PAL task manifest** — `pixel-modem-extractor-pal-tasks-v1`: the authenticated canonical
