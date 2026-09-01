@@ -107,8 +107,8 @@ const S5400: CorpusPins = CorpusPins {
     entries_two_mod_four: None,
     retained_ghidra_exact: 0,
     retained_radare2_exact: 11,
-    manifest_blake3: "",
-    metadata_blake3: "",
+    manifest_blake3: "e922d03bc6a7f556f11237154ca40da81dedf92556fa30096090d17550411c9d",
+    metadata_blake3: "d58950f66cde2230dcf0f473f5ae560b3d56d0ad3e45e6728e5f94bcfc8160ed",
 };
 
 const S5300: CorpusPins = CorpusPins {
@@ -135,8 +135,8 @@ const S5300: CorpusPins = CorpusPins {
     entries_two_mod_four: Some(57),
     retained_ghidra_exact: 3,
     retained_radare2_exact: 19,
-    manifest_blake3: "",
-    metadata_blake3: "",
+    manifest_blake3: "1adff05a4540877c4a9d66e57b89653008bb9a8a46eed245e070af33e1b1fae6",
+    metadata_blake3: "7b197e1840454529d63f0211b4d0dd66fae899caab3937d815e1764f3385f5e3",
 };
 
 #[test]

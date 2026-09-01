@@ -338,11 +338,10 @@ fn register_write(instruction: &DecodedInstruction, register: Register) -> Optio
                 }),
         ),
         ValueEffect::Compare { .. } | ValueEffect::None => Some(false),
-        // An unmodeled effect whose decoded write set is empty (hints
-        // such as NOP) provably writes no core register; any other
-        // unmodeled effect is unknown.
-        ValueEffect::Unsupported if instruction.writes.is_empty() => Some(false),
-        ValueEffect::Unsupported => None,
+        // Unsupported value transforms still carry a conservative core
+        // register write set. Known instructions list exact destinations;
+        // truly unsupported fallbacks list every core register.
+        ValueEffect::Unsupported => Some(instruction.writes.contains(&register)),
     }
 }
 
@@ -3168,6 +3167,50 @@ mod tests {
         ));
         assert!(budget.charge(0, "candidate validation bytes").is_ok());
         assert!(budget.charge(1, "candidate validation bytes").is_err());
+    }
+
+    #[test]
+    fn loop_topology_suffix_allows_precise_unmodeled_write_sets() {
+        let items = replace_insn(canonical_items(), "zero", |_, _| {
+            T32::Mov_Immediate_T1(low(7), 0)
+        });
+        let items = replace_insn(items, "lstr", |_, _| {
+            T32::Str_Immediate_T1(low(7), low(4), 0x0c)
+        });
+        let items = replace_insn(items, "ladd", |_, _| T32::Add_Immediate_T2(low(7), 1));
+        let items = replace_insn(items, "lcmp", |_, _| T32::Cmp_Immediate_T2(gpr(7), 1000));
+        let items = replace_insn(items, "tstr", |_, _| {
+            T32::Str_Immediate_T1(low(7), low(0), 0)
+        });
+        let items = replace_insn(items, "glsr", |_, _| {
+            T32::Lsr_Immediate_T1(low(0), low(7), 3)
+        });
+        let items = replace_insn(items, "sstr", |_, _| {
+            T32::Str_Immediate_T1(low(7), low(4), 0x0c)
+        });
+        let items = replace_insn(items, "sadd", |_, _| T32::Add_Immediate_T2(low(7), 1));
+        let items = replace_insn(items, "scmp", |_, _| T32::Cmp_Immediate_T2(gpr(7), 1000));
+        let items = insert_after(
+            items,
+            "sslot",
+            insn("smla", |_, _| T32::Mla_T1(gpr(0), gpr(1), gpr(2), gpr(3))),
+        );
+
+        let (bytes, at) = assemble(BASE, &items);
+        let candidates = discover_initializer_candidates(&raw_image(&bytes), "fixture").unwrap();
+        let [candidate] = candidates.as_slice() else {
+            panic!("expected exactly one candidate, got {candidates:#?}")
+        };
+        assert_eq!(candidate.evidence.suffix_loop, at["sstr"]);
+        assert_eq!(candidate.evidence.join, at["join"]);
+
+        let offset = usize::try_from(at["smla"] - BASE).unwrap();
+        let mut state = crate::arm32::ItRangeState::default();
+        let mla = crate::arm32::decode_t32(&mut state, at["smla"], &bytes[offset..]).unwrap();
+        assert!(matches!(mla.effect, crate::arm32::ValueEffect::Unsupported));
+        assert_eq!(mla.writes, BTreeSet::from([Register(0)]));
+        assert_eq!(super::register_write(&mla, Register(4)), Some(false));
+        assert_eq!(super::register_write(&mla, Register(7)), Some(false));
     }
 
     #[test]
