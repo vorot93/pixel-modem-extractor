@@ -54,17 +54,22 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   tree in place** (idempotently), so point it at a disposable copy, not your only reference.
 - **Ghidra end-to-end** (`tests/decompile_golden.rs`) is self-contained — it crafts a
   tiny ARM blob in a valid TOC, so it needs **no firmware** — but it needs a real Ghidra.
-  An explicit `GHIDRA_INSTALL_DIR` is authoritative: that exact root must contain the regular file
-  `support/analyzeHeadless`, or every real-Ghidra test fails its prerequisite without probing or
-  substituting `/opt/ghidra`. Only when the variable is unset does the resolver probe
-  `/opt/ghidra/support/analyzeHeadless` and skip cleanly if it is absent. CI runs the binary nightly
-  / on demand via the `ghidra-e2e` workflow. Run it serially:
+  An explicit `GHIDRA_INSTALL_DIR` is authoritative: that exact root must contain a regular launcher
+  at either the upstream `support/analyzeHeadless` path or Homebrew's
+  `libexec/support/analyzeHeadless` path. If neither is valid, every real-Ghidra test fails its
+  prerequisite without probing or substituting `/opt/ghidra`. Only when the variable is unset does
+  the resolver probe `/opt/ghidra/support/analyzeHeadless` and skip cleanly if it is absent. CI runs
+  the binary nightly / on demand via the `ghidra-e2e` workflow. Run it serially:
 
       cargo test --test decompile_golden -- --nocapture --test-threads=1
 
   Parallel tests share Ghidra launcher/JDK state and have produced a baseline exit-127
   failure even though focused and full serial runs pass. The focused pass-2 application
-  test is:
+  test is below. When other worktrees may build concurrently, give a long all-target run an
+  isolated `CARGO_TARGET_DIR`: a shared target can replace prebuilt integration-test executables
+  while the serial Ghidra binary is still running.
+
+  The focused pass-2 application test is:
 
       cargo test --test decompile_golden \
         pass2_applies_functions_and_strict_globals_in_one_process -- --nocapture --test-threads=1

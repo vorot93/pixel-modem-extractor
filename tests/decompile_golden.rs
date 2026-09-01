@@ -1,7 +1,8 @@
 //! Self-contained end-to-end test of the `--run` path: craft a tiny ARM blob in a
 //! valid TOC, drive real Ghidra headless, and assert the export. An explicit
-//! $GHIDRA_INSTALL_DIR is authoritative and invalid values fail; when it is unset,
-//! /opt/ghidra is used or the tests skip cleanly. No proprietary firmware needed.
+//! $GHIDRA_INSTALL_DIR is authoritative, accepts upstream and Homebrew layouts,
+//! and fails when neither launcher is valid; when it is unset, /opt/ghidra is used
+//! or the tests skip cleanly. No proprietary firmware needed.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -23,7 +24,7 @@ fn analyze_headless_in_home(home: &Path) -> Option<PathBuf> {
         home.join("libexec/support/analyzeHeadless"),
     ]
     .into_iter()
-    .find(|launcher| launcher.exists())
+    .find(|launcher| launcher.is_file())
 }
 
 fn resolve_ghidra_home(
@@ -35,18 +36,14 @@ fn resolve_ghidra_home(
         if home.as_os_str().is_empty() {
             return Err("GHIDRA_INSTALL_DIR is set but empty".to_string());
         }
-        let launcher = home.join("support/analyzeHeadless");
-        return match std::fs::metadata(&launcher) {
-            Ok(metadata) if metadata.is_file() => Ok(Some(home)),
-            Ok(_) => Err(format!(
-                "GHIDRA_INSTALL_DIR requires a regular launcher at {}",
-                launcher.display()
-            )),
-            Err(error) => Err(format!(
-                "GHIDRA_INSTALL_DIR requires {}: {error}",
-                launcher.display()
-            )),
-        };
+        if analyze_headless_in_home(&home).is_some() {
+            return Ok(Some(home));
+        }
+        return Err(format!(
+            "GHIDRA_INSTALL_DIR requires a regular launcher at {} or {}",
+            home.join("support/analyzeHeadless").display(),
+            home.join("libexec/support/analyzeHeadless").display()
+        ));
     }
 
     let launcher = default_home.join("support/analyzeHeadless");
@@ -85,7 +82,31 @@ macro_rules! ghidra_home_or_skip {
 }
 
 #[test]
-fn explicit_invalid_ghidra_home_never_falls_through_to_default() {
+fn explicit_standard_ghidra_home_is_returned_exactly_and_precedes_default() {
+    let root = tempfile::tempdir().unwrap();
+    let explicit = root.path().join("explicit");
+    let fallback = root.path().join("fallback");
+    std::fs::create_dir_all(explicit.join("support")).unwrap();
+    std::fs::create_dir_all(fallback.join("support")).unwrap();
+    std::fs::write(
+        explicit.join("support/analyzeHeadless"),
+        b"explicit standard launcher",
+    )
+    .unwrap();
+    std::fs::write(
+        fallback.join("support/analyzeHeadless"),
+        b"different fallback launcher",
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_ghidra_home(Some(explicit.clone().into_os_string()), &fallback).unwrap(),
+        Some(explicit)
+    );
+}
+
+#[test]
+fn explicit_homebrew_ghidra_home_is_returned_exactly() {
     let root = tempfile::tempdir().unwrap();
     let explicit = root.path().join("explicit");
     let fallback = root.path().join("fallback");
@@ -93,7 +114,31 @@ fn explicit_invalid_ghidra_home_never_falls_through_to_default() {
     std::fs::create_dir_all(fallback.join("support")).unwrap();
     std::fs::write(
         explicit.join("libexec/support/analyzeHeadless"),
-        b"explicit wrong layout",
+        b"explicit Homebrew launcher",
+    )
+    .unwrap();
+    std::fs::write(
+        fallback.join("support/analyzeHeadless"),
+        b"different fallback launcher",
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_ghidra_home(Some(explicit.clone().into_os_string()), &fallback).unwrap(),
+        Some(explicit)
+    );
+}
+
+#[test]
+fn explicit_invalid_ghidra_home_with_no_supported_launcher_never_falls_through_to_default() {
+    let root = tempfile::tempdir().unwrap();
+    let explicit = root.path().join("explicit");
+    let fallback = root.path().join("fallback");
+    std::fs::create_dir_all(explicit.join("bin")).unwrap();
+    std::fs::create_dir_all(fallback.join("support")).unwrap();
+    std::fs::write(
+        explicit.join("bin/analyzeHeadless"),
+        b"unsupported explicit layout",
     )
     .unwrap();
     std::fs::write(fallback.join("support/analyzeHeadless"), b"valid fallback").unwrap();
@@ -107,8 +152,31 @@ fn explicit_invalid_ghidra_home_never_falls_through_to_default() {
                     .join("support/analyzeHeadless")
                     .display()
                     .to_string()
+            )
+            && error.contains(
+                &explicit
+                    .join("libexec/support/analyzeHeadless")
+                    .display()
+                    .to_string()
             ),
         "unexpected explicit-home error: {error}"
+    );
+}
+
+#[test]
+fn explicit_nonregular_ghidra_home_launchers_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let explicit = root.path().join("explicit");
+    let fallback = root.path().join("fallback");
+    std::fs::create_dir_all(explicit.join("support/analyzeHeadless")).unwrap();
+    std::fs::create_dir_all(explicit.join("libexec/support/analyzeHeadless")).unwrap();
+    std::fs::create_dir_all(fallback.join("support")).unwrap();
+    std::fs::write(fallback.join("support/analyzeHeadless"), b"valid fallback").unwrap();
+
+    let error = resolve_ghidra_home(Some(explicit.into_os_string()), &fallback).unwrap_err();
+    assert!(
+        error.contains("requires a regular launcher"),
+        "unexpected non-regular-launcher error: {error}"
     );
 }
 
