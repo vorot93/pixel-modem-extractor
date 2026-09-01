@@ -870,7 +870,7 @@ fn generated_only_pal_seeding_is_default_on() {
         let manifest_bytes = std::fs::read(&manifest_path).unwrap_or_else(|_| {
             panic!("PAL manifest missing under no_thumb_decompile={no_thumb_decompile}")
         });
-        let identity = format!("v1:{}:2:0", blake3::hash(&manifest_bytes));
+        let identity = format!("v1:{}:2:2", blake3::hash(&manifest_bytes));
         let spec: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
         assert_eq!(
@@ -1572,7 +1572,7 @@ fn generated_shell_completes_pal_run_from_root_with_spaces_and_metacharacters() 
         .map(|task| task["task_label"].as_str().unwrap())
         .collect();
     let identity = format!(
-        "v1:{}:2:0",
+        "v1:{}:2:2",
         blake3::hash(&std::fs::read(&manifest_path).unwrap()).to_hex()
     );
 
@@ -4270,12 +4270,12 @@ public class PalSupportProbe extends GhidraScript {
 
         PalTasksSupport.PalManifest manifest =
                 PalTasksSupport.readPal(kitRoot, label, palFile, scatterFile);
-        if (manifest.taskRecords != 2 || manifest.distinctEntries != 0
+        if (manifest.taskRecords != 2 || manifest.distinctEntries != 2
                 || manifest.applications.size() != 2) {
             throw new AssertionError("canonical manifest shape is wrong");
         }
         String identity = PalTasksSupport.expectedPalIdentity(manifest);
-        if (!identity.startsWith("v1:") || !identity.endsWith(":2:0")) {
+        if (!identity.startsWith("v1:") || !identity.endsWith(":2:2")) {
             throw new AssertionError("identity grammar is wrong: " + identity);
         }
         ok("readPal canonical");
@@ -6275,7 +6275,7 @@ fn colliding_and_shared_names_allocate_deterministic_leaves() {
         4,
         "four tasks entered the table"
     );
-    let identity = format!("v1:{}:4:0", blake3::hash(&manifest_bytes).to_hex());
+    let identity = format!("v1:{}:4:3", blake3::hash(&manifest_bytes).to_hex());
     let modem = pal_fixture::discoverable::craft_colliding_names_modem_bin();
     let main_slice = &modem[0x40..];
     assert_eq!(

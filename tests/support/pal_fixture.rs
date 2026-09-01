@@ -320,17 +320,16 @@ pub(super) fn blake3_hex(bytes: &[u8]) -> String {
 
 /// The PAL identity grammar: `v1:<manifest-blake3>:<task-records>:<distinct-entries>`.
 pub(super) fn identity(manifest: &str) -> String {
-    format!("v1:{}:2:0", blake3_hex(manifest.as_bytes()))
+    format!("v1:{}:2:2", blake3_hex(manifest.as_bytes()))
 }
 
-/// The identity of the extended seven-task manifest: one scatter entry
-/// backs task storage, so `distinct-entries` is 1.
+/// The identity of the extended seven-task, six-application manifest.
 pub(super) fn extended_identity(manifest: &str) -> String {
     format!(
         "v1:{}:{}:{}",
         blake3_hex(manifest.as_bytes()),
         EXTENDED_TASKS,
-        1
+        6
     )
 }
 

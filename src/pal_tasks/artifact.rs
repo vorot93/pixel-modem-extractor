@@ -121,9 +121,8 @@ pub(crate) fn materialize(
     file.commit()
         .map_err(|error| invalid(format!("atomic manifest commit failed: {error}")))?;
 
-    let used = scatter_entries_used(plan);
     let task_records = plan.tasks.len();
-    let distinct_entries = used.len();
+    let distinct_entries = plan.applications.len();
     Ok(MaterializedTaskMap {
         relative_path: format!("pal_tasks/{}/{}", context.label, ARTIFACT_FILE_NAME),
         blake3: blake3_hex(manifest_blake3),
@@ -1826,9 +1825,8 @@ fn revalidate(
     let applications = revalidate_applications(&wire, &tasks)?;
 
     let initializer = &wire.initializer;
-    let used = wire.scatter_entries_used.clone();
     let task_records = wire.tasks.len();
-    let distinct_entries = used.len();
+    let distinct_entries = applications.len();
     let plan = TaskPlan {
         image_base,
         image_size,
@@ -3225,13 +3223,62 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(map.blake3, hex(*blake3::hash(&bytes).as_bytes()));
         assert_eq!(map.task_records, 2);
-        assert_eq!(map.distinct_entries, 0);
-        assert_eq!(map.identity, format!("v1:{}:2:0", map.blake3));
+        assert_eq!(map.distinct_entries, 2);
+        assert_eq!(map.identity, format!("v1:{}:2:2", map.blake3));
         // Package version and lowercase canonical addresses are pinned.
         let text = PINNED_RAW_MANIFEST;
         assert!(text.contains("\"tool_version\": \"2.0.0\""));
         assert!(text.contains("\"backend_version\": \"2.0.0\""));
         assert!(text.contains("\"cfg_entry\": \"0x00001000\""));
+    }
+
+    #[test]
+    fn identity_counts_task_applications_not_scatter_dependencies() {
+        let (raw, raw_runtime) = raw_fixture();
+        let raw_plan = synthetic_plan(&raw_runtime);
+        let raw_context = raw_context(*blake3::hash(&raw).as_bytes());
+        let raw_root = tempdir().unwrap();
+        let raw_map = materialize(&raw_plan, raw_context, raw_root.path()).unwrap();
+        let raw_path = manifest_path(raw_root.path());
+        let raw_artifact = read(&raw_path, &raw_runtime, raw_context).unwrap();
+        let raw_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(raw_path).unwrap()).unwrap();
+
+        let (_raw, scatter_runtime, image_blake3) = scatter_fixture();
+        let scatter_plan = synthetic_plan(&scatter_runtime);
+        let scatter_context = scatter_context(image_blake3);
+        let scatter_root = tempdir().unwrap();
+        let scatter_map = materialize(&scatter_plan, scatter_context, scatter_root.path()).unwrap();
+        let scatter_path = manifest_path(scatter_root.path());
+        let scatter_artifact = read(&scatter_path, &scatter_runtime, scatter_context).unwrap();
+        let scatter_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(scatter_path).unwrap()).unwrap();
+
+        assert_eq!(
+            (raw_plan.applications.len(), scatter_plan.applications.len()),
+            (2, 2)
+        );
+        assert_eq!(
+            (
+                raw_manifest["runtime_view"]["scatter_entries_used"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                scatter_manifest["runtime_view"]["scatter_entries_used"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+            ),
+            (0, 3)
+        );
+        assert_eq!(
+            (raw_map.distinct_entries, scatter_map.distinct_entries),
+            (2, 2)
+        );
+        for (map, artifact) in [(&raw_map, &raw_artifact), (&scatter_map, &scatter_artifact)] {
+            assert_eq!(map.identity, format!("v1:{}:2:2", map.blake3));
+            assert_eq!(artifact.identity, map.identity);
+        }
     }
 
     #[test]
@@ -3434,8 +3481,8 @@ mod tests {
 
         let map = materialize(&plan, context, root.path()).unwrap();
         assert_eq!(map.task_records, 2);
-        assert_eq!(map.distinct_entries, 3);
-        assert_eq!(map.identity, format!("v1:{}:2:3", map.blake3));
+        assert_eq!(map.distinct_entries, 2);
+        assert_eq!(map.identity, format!("v1:{}:2:2", map.blake3));
 
         let artifact = read(&manifest_path(root.path()), &runtime, context).unwrap();
         assert_eq!(artifact.identity, map.identity);

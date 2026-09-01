@@ -2541,7 +2541,7 @@ final class PalTasksSupport {
             return new PalManifest(wire.imageLabel, wire.imageBase, wire.imageSize,
                     wire.imageBlake3, wire.scatterLoadMapBlake3, wire.slotBase, wire.stride,
                     wire.capacity, wire.tasks, wire.applications, manifestBlake3,
-                    wire.scatterEntriesUsed.size());
+                    wire.applications.size());
         }
         catch (PalError error) {
             throw new Exception(error.getMessage(), error);

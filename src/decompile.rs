@@ -6176,7 +6176,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     fn pal_pre_script_order_and_nullability() {
         let pal_plan = PalScriptPlan {
             manifest: "pal_tasks/02_MAIN/tasks.json",
-            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
         };
         // Present PAL map plus a scatter map: the pre-script order is
         // ApplyScatterLoad, ApplyPalTasks, TameAnalysis, and ApplyPalTasks
@@ -6243,7 +6243,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(!pal_only.iter().any(|arg| arg == "ApplyScatterLoad.java"));
         assert_eq!(
             pal_only[tame_only_at + 3],
-            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2"
         );
         assert_eq!(pal_only[pal_only_at + 4], "-");
 
@@ -6270,7 +6270,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         };
         let pal = PalScriptPlan {
             manifest: "pal_tasks/02_MAIN/tasks.json",
-            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
         };
         let args = headless_args(
             "/out",
@@ -6327,7 +6327,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         };
         let pal = PalScriptPlan {
             manifest: "pal_tasks/02_MAIN/tasks.json",
-            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
         };
         for scatter_present in [false, true] {
             for exception_present in [false, true] {
@@ -6403,7 +6403,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let mode = mode_from_opts(&opts);
         let plan = PalScriptPlan {
             manifest: "pal_tasks/02_MAIN/tasks.json",
-            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+            identity: "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
         };
         let args = headless_args(
             "$HERE",
@@ -6434,7 +6434,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert_eq!(args[tame_at + 2], "none");
         assert_eq!(
             args[tame_at + 3],
-            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0"
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2"
         );
         assert!(args[tame_at + 4..].iter().any(|a| a == "40e12000:100000"));
     }
@@ -7109,7 +7109,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             export_completion_marker("none", "none", "none"),
             b"pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=none\nsymbol_map=none\n",
         );
-        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:1";
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:6";
         assert_eq!(
             export_completion_marker("none", identity, "none"),
             format!(
@@ -7162,7 +7162,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         for name in GHIDRA_EXPORT_FILES {
             std::fs::write(run.directory.join(name), b"current\n").unwrap();
         }
-        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0";
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2";
         let hash = "c".repeat(64);
 
         // A stale PAL identity under a marker that binds a map hash.
@@ -7358,7 +7358,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
 
     #[test]
     fn parse_apply_pal_tasks_summary_is_strict() {
-        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0";
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2";
         let ok = format!(
             "ApplyPalTasks: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\"identity\":\"{identity}\",\"tasks\":2,\"entries\":2,\"functions_created\":2,\"functions_existing\":0,\"names_applied\":2,\"names_preserved\":0,\"shared_entries\":0}}"
         );
@@ -9120,7 +9120,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         };
         assert_eq!(map.relative_path, "pal_tasks/02_MAIN/tasks.json");
         assert_eq!(map.task_records, 2);
-        assert_eq!(map.distinct_entries, 0);
+        assert_eq!(map.distinct_entries, 2);
         let manifest_path = out.join(&map.relative_path);
         let manifest_bytes = std::fs::read(&manifest_path).unwrap();
         assert_eq!(
@@ -11036,7 +11036,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         run.validate_current("none", "none", "none").unwrap();
         // Stale identity or map binding values are rejected exactly.
         let bound = export_completion_marker(
-            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+            "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
             "none",
             "none",
         );
@@ -11044,7 +11044,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(run.validate_current("none", "none", "none").is_err());
         assert!(
             run.validate_current(
-                "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:0",
+                "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
                 "none",
                 "none"
             )
