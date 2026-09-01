@@ -417,8 +417,9 @@ module; when a file outgrows that, split it.
   eight forms survive, every literal and target must be byte-backed in the same raw/scatter runtime,
   architecturally aligned, and decode one complete selected-ISA instruction with no cross-ISA
   fallback. Same-ISA duplicate targets are valid; ARM/Thumb identities normalizing to one address
-  are malformed. Any post-threshold failure is typed malformed/ambiguous/resource failure and
-  publishes no current plan rather than truncating to a prefix.
+  are malformed. Every post-threshold discovery failure uses the closed typed
+  `ExceptionRootError::{Malformed, Ambiguous, Decode, Runtime, ResourceLimit}` outcome and publishes
+  no current plan rather than truncating to a prefix.
 - **VBAR conclusions are explicit and bounded to the reset prefix.** Shared `semantic_cfg` follows
   direct edges, does not enter callees, applies the call-clobber boundary, and joins an exact value
   only when every incoming path agrees. An unconditional VBAR write establishes active-table state
@@ -537,10 +538,11 @@ module; when a file outgrows that, split it.
   lineage validation: both sides share the 1,048,576-range and 512 MiB sum-of-exclusive-extent-byte
   limits across those two map sections. Function/lineage row limits remain independent, matching
   Java; never restart the aggregate range/byte budget at the lineage boundary.
-  This owned-only surface is materially bounded: 165 Mustang and 64 Cheetah rows, versus conservative
-  all-overlap projections of 88,349 and 72,893 rows. The sparse choice does not change execution,
-  creation, report, or SymbolPass2 counts and does not relax the Task 9 boundary: no predecessor map
-  bytes, compatibility reader, or omitted-function deletion.
+  This owned-only surface is materially bounded. Mustang conserves 169 = 165 created + 4
+  `skipped_existing`; only the 165 created candidates own lineage. Cheetah conserves 64 = 64 created
+  lineage rows. The conservative all-overlap projections were 88,349 and 72,893 rows. The sparse
+  choice does not change execution, creation, report, or SymbolPass2 counts and does not relax the
+  Task 9 boundary: no predecessor map bytes, compatibility reader, or omitted-function deletion.
 - **Ghidra-only constraints stay Ghidra-only.** Java preflight rejects intersections among the
   complete derived instruction spans before mutation and computes A32 architectural `PC + 8` before
   applying a signed branch/literal displacement, with each step checked in the u32 domain. Rust
@@ -1151,11 +1153,13 @@ hardcoded. Two reference images exercise both models end-to-end:
   `BadMagic`, `BadToc`, `SizeMismatch`, `ToolNotFound`). `anyhow` is used only at the CLI
   edge (`cli::run() -> anyhow::Result<()>`). `bin/main.rs` initializes `tracing` on
   stderr, prints `error: {e:#}` on failure, and exits 1.
-- **Symbolication is fail-closed.** `symbolicate.rs` only *renames* from a
-  recovered `__func__` (an assert site referencing both its `__FILE__` and a
-  unique identifier string); a pw_tokenizer token match yields a *marked*
-  `guess_<slug>_<addr>` name (never unmarked); attributed strings / file
-  attribution are comments only. Token immediates are recovered by `movw`/`movt`
+- **Symbolication is fail-closed.** Every primary-name decision uses one order:
+  `__func__ > registration > exception_root > pal_task > token > string_ref`. A recovered
+  `__func__` (an assert site referencing both its `__FILE__` and a unique identifier string) and a
+  registration-table match are authoritative `Recovered` names. Exception-root and PAL-task names
+  are durable role evidence below those firmware-native names. Token and string-ref survivors are
+  marked `Provisional` `guess_*_<addr>` names, never unmarked; file attribution and DBT evidence
+  are annotations only and never primary names. Token immediates are recovered by `movw`/`movt`
   reconstruction over the emitted disasm; string evidence needs the raw split
   image (`images/<label>/<label>.bin`), so the `decompose` stage runs before
   `--prune`. It rewrites in place **idempotently** — a sentinel guards `.c`/`.lst`, an
@@ -1183,10 +1187,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   bullets; pw_tokenizer strings are structured
   `■format♦…■domain♦…`, and tokens appear as `movw`/`movt` immediates (not
   raw literals, so a byte search won't find them).
-- **String-reference name guesses.** Beyond `__func__` (Recovered) and token
-  matches (Provisional `guess_`), `symbolicate` recovers a third, lowest-
-  precedence evidence source: a function's single *distinct* referenced
-  identifier string (`name_guess::unique_ident`), when that identifier is
+- **String-reference name guesses.** At the lowest naming precedence, `symbolicate` may recover a
+  function's single *distinct* referenced identifier string (`name_guess::unique_ident`), when it is
   referenced by exactly one function image-wide and is not an all-caps message
   constant, a recovered global name (`globals.json`), or another function's
   name. Survivors become marked `guess_<ident>_<addr>` `Provisional` names with
@@ -1213,9 +1215,9 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **Registration-table names (authoritative).** `symbolicate/reg_table.rs`
   scans the raw split image for contiguous `{name_ptr, fn_ptr}` tables — the
   AT-command dispatch, ISR, and protocol-handler tables baseband firmware is
-  full of — and mints a **bare `Recovered` name** for each. Precedence:
-  `__func__` > **registration** > token > string-ref. The **fail-closed gate is
-  the function inventory**: the pointer (Thumb bit stripped) must resolve to a
+  full of — and mints a **bare `Recovered` name** for each. The same global order applies:
+  `__func__ > registration > exception_root > pal_task > token > string_ref`. The **fail-closed gate
+  is the function inventory**: the pointer (Thumb bit stripped) must resolve to a
   known ARM/Thumb entry, so a name is only minted for a confirmed function — no
   prologue heuristics. Further fail-closed rules: the name must be a clean
   `is_ident`; strict **1:1** (a name at >1 function, or a function under >1
@@ -1326,9 +1328,9 @@ hardcoded. Two reference images exercise both models end-to-end:
   inventory never discovered. Readable v1/v2 legacy records remain valid
   consumer evidence but are never creation authority; only a concrete
   strict-v3 radare2/Rizin producer run may enter `creations`. Fresh clean-root
-  acceptance (2026-08-27) observed 169 candidates / 165 exact creations on
-  mustang MAIN and 64 / 64 on cheetah; these are corpus/tool observations, not
-  universal inventory promises. The earlier ~4.2k / ~2.8k development-tree
+  acceptance (2026-08-27) observed Mustang MAIN conservation of 169 candidates = 165 created + 4
+  `skipped_existing`, and Cheetah conservation of 64 candidates = 64 created; these are corpus/tool
+  observations, not universal inventory promises. The earlier ~4.2k / ~2.8k development-tree
   estimates are superseded and are not fresh-root acceptance baselines.
   Every validated retained Ghidra entry excludes creation, whether its
   projection is accepted or quarantined: both mean Ghidra discovered the
