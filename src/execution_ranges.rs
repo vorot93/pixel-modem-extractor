@@ -844,6 +844,21 @@ pub(crate) fn read_ghidra_inventory_streaming_capped(
     cap: usize,
 ) -> Result<StreamedGhidraInventory> {
     let file = std::fs::File::open(path)?;
+    read_ghidra_inventory_file_capped(file, runtime, cap)
+}
+
+pub(crate) fn read_ghidra_inventory_file(
+    file: std::fs::File,
+    runtime: &RuntimeImage<'_>,
+) -> Result<StreamedGhidraInventory> {
+    read_ghidra_inventory_file_capped(file, runtime, MAX_EXECUTION_FUNCTIONS)
+}
+
+fn read_ghidra_inventory_file_capped(
+    file: std::fs::File,
+    runtime: &RuntimeImage<'_>,
+    cap: usize,
+) -> Result<StreamedGhidraInventory> {
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
     let mut scan = GhidraInventoryScan {
         runtime,

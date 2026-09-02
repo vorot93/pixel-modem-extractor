@@ -693,6 +693,7 @@ pub use self::exception_pass2::{
 pub(crate) use self::exception_pass2::{
     ExceptionApplicationRef, ExceptionDispositionKind, ExceptionPass2ContextExactInput,
     ExceptionPrimaryRef, read_exception_pass2_context_exact,
+    read_exception_pass2_context_exact_with_validated,
 };
 #[cfg(test)]
 pub(crate) use self::exception_pass2::{TestExceptionContextState, test_context_from_fixture};

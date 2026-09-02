@@ -4785,7 +4785,7 @@ fn pal_support_strict_parsers_registry_and_digests() {
     );
     let scatter_hash = pal_fixture::blake3_hex(&std::fs::read(&scatter_path).unwrap());
 
-    let image = pal_fixture::craft_main_image();
+    let image = pal_fixture::craft_canonical_main_image();
     let manifest = pal_fixture::canonical_manifest(&image, &scatter_hash);
     let manifest_dir = out.join("pal_tasks/02_MAIN");
     std::fs::create_dir_all(&manifest_dir).unwrap();
@@ -7468,6 +7468,8 @@ fn build_pal_pass2_kit(
     std::fs::create_dir_all(image_dir.join("decompiled")).unwrap();
     std::fs::write(image_dir.join("02_MAIN.bin"), image).unwrap();
     copy_dir(&kit.out.join("scatter/02_MAIN"), &image_dir.join("scatter"));
+    std::fs::create_dir_all(image_dir.join("pal_tasks")).unwrap();
+    std::fs::copy(&kit.manifest_path, image_dir.join("pal_tasks/tasks.json")).unwrap();
     std::fs::copy(
         kit.out.join("export/02_MAIN/functions.json"),
         image_dir.join("decompiled/functions.json"),
@@ -7484,25 +7486,11 @@ fn build_pal_pass2_kit(
 
     let mut applications = std::collections::BTreeMap::new();
     for (entry, isa, desired, tasks) in pal_fixture::extended_application_summaries() {
-        let applied = std::fs::read(image_dir.join("decompiled/functions.json"))
-            .map(|bytes| {
-                serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .unwrap()
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|record| {
-                        record["entry"].as_str() == Some(&format!("0x{entry:08x}"))
-                            && record["name"].as_str() == Some(desired)
-                    })
-            })
-            .unwrap_or(false);
         applications.insert(
             entry,
             pixel_modem_extractor::symbolicate::PalApplicationRef {
                 isa,
                 desired_primary: desired.to_string(),
-                applied,
                 tasks: tasks
                     .into_iter()
                     .map(|(index, name, slot, priority, stack)| {
@@ -10609,6 +10597,12 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     .unwrap();
 
     let context = exception_pass2_context(&fixture, authority, &kit.manifest_path, &image_dir);
+    std::fs::create_dir_all(image_dir.join("exception_roots")).unwrap();
+    std::fs::copy(
+        &kit.manifest_path,
+        image_dir.join("exception_roots/roots.json"),
+    )
+    .unwrap();
     let map_path = kit.out.join("symbol_maps/00_BOOT-exception-v4.json");
     std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
     let bundle = pixel_modem_extractor::symbolicate::prepare_pass2_symbol_map(

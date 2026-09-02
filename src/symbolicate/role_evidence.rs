@@ -58,24 +58,8 @@ impl RuntimeBinding {
         }
     }
 
-    pub(crate) fn image_label(&self) -> &str {
-        &self.image_label
-    }
-
-    pub(crate) fn toc_name(&self) -> &str {
-        &self.toc_name
-    }
-
     pub(crate) const fn image_base(&self) -> u32 {
         self.image_base
-    }
-
-    pub(crate) const fn image_blake3(&self) -> [u8; 32] {
-        self.image_blake3
-    }
-
-    pub(crate) const fn scatter(&self) -> &ArtifactState<[u8; 32]> {
-        &self.scatter
     }
 
     fn role_scatter_blake3(&self) -> Option<[u8; 32]> {
@@ -132,10 +116,12 @@ pub(crate) struct ExceptionRoleApplication {
 }
 
 impl ExceptionRoleApplication {
+    #[cfg(test)]
     pub(crate) const fn entry(&self) -> u32 {
         self.entry
     }
 
+    #[cfg(test)]
     pub(crate) const fn isa(&self) -> DecodeIsa {
         self.isa
     }
@@ -270,6 +256,7 @@ impl ExceptionRoleSet {
         self.manifest_blake3
     }
 
+    #[cfg(test)]
     pub(crate) fn applications(&self) -> &[ExceptionRoleApplication] {
         &self.applications
     }
@@ -343,10 +330,12 @@ pub(crate) struct PalRoleApplication {
 }
 
 impl PalRoleApplication {
+    #[cfg(test)]
     pub(crate) const fn entry(&self) -> u32 {
         self.entry
     }
 
+    #[cfg(test)]
     pub(crate) const fn isa(&self) -> DecodeIsa {
         self.isa
     }
@@ -501,6 +490,7 @@ impl PalRoleSet {
         self.scatter_load_map_blake3
     }
 
+    #[cfg(test)]
     pub(crate) fn applications(&self) -> &[PalRoleApplication] {
         &self.applications
     }
@@ -683,7 +673,12 @@ impl CurrentSymbolicationContext {
     pub(crate) fn validate<T>(
         &self,
         image_dir: &Path,
-        use_runtime: impl FnOnce(&[u8], &RuntimeImage<'_>, &AuthenticatedRoleEvidence) -> Result<T>,
+        use_runtime: impl FnOnce(
+            &TrustedDirectory,
+            &[u8],
+            &RuntimeImage<'_>,
+            &AuthenticatedRoleEvidence,
+        ) -> Result<T>,
     ) -> Result<T> {
         validate_image_dir(image_dir, &self.runtime.image_label)?;
         let image = TrustedDirectory::new(image_dir, "current symbolication image directory")?;
@@ -697,15 +692,16 @@ impl CurrentSymbolicationContext {
         validate_exception_state(&image, &runtime, &self.runtime, &self.roles.exception)?;
         validate_pal_state(&image, &runtime, &self.runtime, &self.roles.pal)?;
         image.verify_path_binding(image_dir, "current symbolication image directory")?;
-        use_runtime(&raw, &runtime, &self.roles)
+        let result = use_runtime(&image, &raw, &runtime, &self.roles);
+        image.verify_path_binding(image_dir, "current symbolication image directory")?;
+        result
     }
 
     pub(crate) const fn runtime(&self) -> &RuntimeBinding {
         &self.runtime
     }
 
-    #[cfg(test)]
-    const fn roles(&self) -> &AuthenticatedRoleEvidence {
+    pub(crate) const fn roles(&self) -> &AuthenticatedRoleEvidence {
         &self.roles
     }
 }
@@ -1052,6 +1048,135 @@ fn current_error(reason: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
+pub(crate) fn retained_pal_fixture_tree(
+    with_scatter: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    const BASE: u32 = crate::pal_tasks::test_support::BASE;
+    const LABEL: &str = "02_MAIN";
+
+    let root = tempfile::tempdir().unwrap();
+    let image_dir = root.path().join("images").join(LABEL);
+    let generation = root.path().join("generation");
+    std::fs::create_dir_all(&image_dir).unwrap();
+    std::fs::create_dir(&generation).unwrap();
+
+    let raw = if with_scatter {
+        crate::pal_tasks::test_support::craft_scatter_pal_main_image()
+    } else {
+        crate::pal_tasks::test_support::craft_discoverable_pal_main_image()
+    };
+    std::fs::write(image_dir.join(format!("{LABEL}.bin")), &raw).unwrap();
+
+    let (runtime, scatter_blake3) = if with_scatter {
+        let plan = crate::scatter::discover(&raw, BASE)
+            .unwrap()
+            .expect("fixture has scatter");
+        let map = crate::scatter::materialize(&plan, &raw, LABEL, &generation).unwrap();
+        std::fs::rename(
+            generation.join("scatter").join(LABEL),
+            image_dir.join("scatter"),
+        )
+        .unwrap();
+        let artifact = crate::scatter::read_materialized(
+            &image_dir,
+            &image_dir.join("scatter/load_map.json"),
+            &raw,
+            BASE,
+        )
+        .unwrap();
+        let digest = crate::execution_ranges::parse_blake3(&map.blake3).unwrap();
+        (
+            RuntimeImage::from_materialized(&raw, BASE, artifact).unwrap(),
+            Some(digest),
+        )
+    } else {
+        (RuntimeImage::from_plan(&raw, BASE, None).unwrap(), None)
+    };
+    let plan = crate::pal_tasks::discover(&runtime, LABEL)
+        .unwrap()
+        .expect("fixture has PAL tasks");
+    crate::pal_tasks::materialize(
+        &plan,
+        crate::pal_tasks::TaskArtifactContext {
+            label: LABEL,
+            image_blake3: *blake3::hash(&raw).as_bytes(),
+            scatter_load_map_blake3: scatter_blake3,
+        },
+        &generation,
+    )
+    .unwrap();
+    std::fs::create_dir(image_dir.join("pal_tasks")).unwrap();
+    std::fs::copy(
+        generation.join("pal_tasks").join(LABEL).join("tasks.json"),
+        image_dir.join("pal_tasks/tasks.json"),
+    )
+    .unwrap();
+    (root, image_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn context_from_test_pal_pass2(
+    mut runtime: RuntimeBinding,
+    pal: &super::PalPass2Context,
+) -> Result<CurrentSymbolicationContext> {
+    let manifest_blake3 = crate::execution_ranges::parse_blake3(&pal.manifest_blake3)?;
+    let scatter_load_map_blake3 = pal
+        .scatter_load_map_blake3
+        .as_deref()
+        .map(crate::execution_ranges::parse_blake3)
+        .transpose()?;
+    runtime.scatter = scatter_load_map_blake3
+        .map(ArtifactState::Present)
+        .unwrap_or(ArtifactState::Absent);
+    let mut applications = Vec::with_capacity(pal.applications.len());
+    let mut application_index = BTreeMap::new();
+    for (entry, application) in &pal.applications {
+        let isa = match application.isa {
+            "arm" => DecodeIsa::Arm,
+            "thumb" => DecodeIsa::Thumb,
+            other => {
+                return Err(model_error(format!(
+                    "test PAL application has invalid ISA {other:?}"
+                )));
+            }
+        };
+        application_index.insert((*entry, isa), applications.len());
+        applications.push(PalRoleApplication {
+            entry: *entry,
+            isa,
+            desired_primary: application.desired_primary.clone(),
+            tasks: application
+                .tasks
+                .iter()
+                .map(|task| PalRoleTask {
+                    task_index: task.task_index,
+                    name: task.name.clone(),
+                    slot: task.slot,
+                    priority: task.priority,
+                    stack_size: task.stack_size,
+                })
+                .collect(),
+        });
+    }
+    let pal = PalRoleSet {
+        identity: pal.identity.clone(),
+        manifest_blake3,
+        image_label: runtime.image_label.clone(),
+        image_base: runtime.image_base,
+        image_blake3: runtime.image_blake3,
+        scatter_load_map_blake3,
+        applications,
+        application_index,
+    };
+    let roles = AuthenticatedRoleEvidence {
+        exception: ArtifactState::Unmanaged,
+        pal: ArtifactState::Present(pal),
+    };
+    roles.validate_runtime_binding(&runtime)?;
+    Ok(CurrentSymbolicationContext { runtime, roles })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::exception_roots::{ExceptionArtifactContext, ValidatedExceptionRoots};
@@ -1080,70 +1205,6 @@ mod tests {
         std::fs::copy(
             fixture.join("roots.json"),
             image_dir.join("exception_roots/roots.json"),
-        )
-        .unwrap();
-        (root, image_dir)
-    }
-
-    fn retained_pal_tree(with_scatter: bool) -> (tempfile::TempDir, PathBuf) {
-        let root = tempfile::tempdir().unwrap();
-        let image_dir = root.path().join("images").join(PAL_LABEL);
-        let generation = root.path().join("generation");
-        std::fs::create_dir_all(&image_dir).unwrap();
-        std::fs::create_dir(&generation).unwrap();
-
-        let raw = if with_scatter {
-            crate::pal_tasks::test_support::craft_scatter_pal_main_image()
-        } else {
-            crate::pal_tasks::test_support::craft_discoverable_pal_main_image()
-        };
-        std::fs::write(image_dir.join(format!("{PAL_LABEL}.bin")), &raw).unwrap();
-
-        let (runtime, scatter_blake3) = if with_scatter {
-            let plan = crate::scatter::discover(&raw, PAL_BASE)
-                .unwrap()
-                .expect("fixture has scatter");
-            let map = crate::scatter::materialize(&plan, &raw, PAL_LABEL, &generation).unwrap();
-            std::fs::rename(
-                generation.join("scatter").join(PAL_LABEL),
-                image_dir.join("scatter"),
-            )
-            .unwrap();
-            let artifact = crate::scatter::read_materialized(
-                &image_dir,
-                &image_dir.join("scatter/load_map.json"),
-                &raw,
-                PAL_BASE,
-            )
-            .unwrap();
-            let digest = crate::execution_ranges::parse_blake3(&map.blake3).unwrap();
-            (
-                RuntimeImage::from_materialized(&raw, PAL_BASE, artifact).unwrap(),
-                Some(digest),
-            )
-        } else {
-            (RuntimeImage::from_plan(&raw, PAL_BASE, None).unwrap(), None)
-        };
-        let plan = crate::pal_tasks::discover(&runtime, PAL_LABEL)
-            .unwrap()
-            .expect("fixture has PAL tasks");
-        crate::pal_tasks::materialize(
-            &plan,
-            TaskArtifactContext {
-                label: PAL_LABEL,
-                image_blake3: *blake3::hash(&raw).as_bytes(),
-                scatter_load_map_blake3: scatter_blake3,
-            },
-            &generation,
-        )
-        .unwrap();
-        std::fs::create_dir(image_dir.join("pal_tasks")).unwrap();
-        std::fs::copy(
-            generation
-                .join("pal_tasks")
-                .join(PAL_LABEL)
-                .join("tasks.json"),
-            image_dir.join("pal_tasks/tasks.json"),
         )
         .unwrap();
         (root, image_dir)
@@ -1276,7 +1337,7 @@ mod tests {
         assert_eq!(undefined.claims()[0].slot_address(), EXCEPTION_BASE + 4);
         assert_eq!(undefined.claims()[0].role(), "undefined_instruction");
 
-        let (_pal_root, pal_dir) = retained_pal_tree(false);
+        let (_pal_root, pal_dir) = retained_pal_fixture_tree(false);
         let pal_context =
             CurrentSymbolicationContext::from_retained(&pal_dir, PAL_LABEL, "MAIN", PAL_BASE)
                 .unwrap();
@@ -1332,7 +1393,7 @@ mod tests {
         .to_string();
         assert!(error.contains("application limit"), "{error}");
 
-        let (_pal_root, pal_dir) = retained_pal_tree(false);
+        let (_pal_root, pal_dir) = retained_pal_fixture_tree(false);
         let mut pal = validated_pal(&pal_dir, false);
         let task = pal.plan.tasks[0].clone();
         pal.plan
@@ -1379,7 +1440,7 @@ mod tests {
         std::fs::remove_file(exception_dir.join("exception_roots/roots.json")).unwrap();
         let called = Cell::new(false);
         let error = exception_context
-            .validate(&exception_dir, |_, _, _| {
+            .validate(&exception_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1391,14 +1452,14 @@ mod tests {
             "{error}"
         );
 
-        let (_pal_root, pal_dir) = retained_pal_tree(false);
+        let (_pal_root, pal_dir) = retained_pal_fixture_tree(false);
         let pal_context =
             CurrentSymbolicationContext::from_retained(&pal_dir, PAL_LABEL, "MAIN", PAL_BASE)
                 .unwrap();
         std::fs::remove_file(pal_dir.join("pal_tasks/tasks.json")).unwrap();
         let called = Cell::new(false);
         let error = pal_context
-            .validate(&pal_dir, |_, _, _| {
+            .validate(&pal_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1427,7 +1488,7 @@ mod tests {
         )
         .unwrap();
         let error = absent_exception
-            .validate(&exception_dir, |_, _, _| Ok(()))
+            .validate(&exception_dir, |_, _, _, _| Ok(()))
             .unwrap_err()
             .to_string();
         assert!(
@@ -1435,7 +1496,7 @@ mod tests {
             "{error}"
         );
 
-        let (_pal_root, pal_dir) = retained_pal_tree(false);
+        let (_pal_root, pal_dir) = retained_pal_fixture_tree(false);
         let absent_pal = CurrentSymbolicationContext::new(
             runtime_binding(&pal_dir, PAL_LABEL, "MAIN", PAL_BASE, ArtifactState::Absent),
             ArtifactState::Absent,
@@ -1443,7 +1504,7 @@ mod tests {
         )
         .unwrap();
         let error = absent_pal
-            .validate(&pal_dir, |_, _, _| Ok(()))
+            .validate(&pal_dir, |_, _, _, _| Ok(()))
             .unwrap_err()
             .to_string();
         assert!(
@@ -1481,7 +1542,7 @@ mod tests {
         .unwrap();
 
         context
-            .validate(&image_dir, |raw, runtime, roles| {
+            .validate(&image_dir, |_, raw, runtime, roles| {
                 assert_eq!(raw, [0u8; 16]);
                 assert_eq!(runtime.image_bounds(), (0x1000, 16));
                 assert!(matches!(roles.exception(), ArtifactState::Unmanaged));
@@ -1512,7 +1573,7 @@ mod tests {
         .to_string();
         assert!(error.contains("raw-image binding"), "{error}");
 
-        let (_pal_root, pal_dir) = retained_pal_tree(true);
+        let (_pal_root, pal_dir) = retained_pal_fixture_tree(true);
         let pal = validated_pal(&pal_dir, true);
         let error = CurrentSymbolicationContext::new(
             runtime_binding(
@@ -1574,7 +1635,7 @@ mod tests {
         let before = snapshot_tree(&raw_dir);
         let called = Cell::new(false);
         let error = raw_context
-            .validate(&raw_dir, |_, _, _| {
+            .validate(&raw_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1584,7 +1645,7 @@ mod tests {
         assert!(error.contains("raw image BLAKE3"), "{error}");
         assert_eq!(snapshot_tree(&raw_dir), before);
 
-        let (_scatter_root, scatter_dir) = retained_pal_tree(true);
+        let (_scatter_root, scatter_dir) = retained_pal_fixture_tree(true);
         let scatter_context =
             CurrentSymbolicationContext::from_retained(&scatter_dir, PAL_LABEL, "MAIN", PAL_BASE)
                 .unwrap();
@@ -1595,7 +1656,7 @@ mod tests {
         let before = snapshot_tree(&scatter_dir);
         let called = Cell::new(false);
         let error = scatter_context
-            .validate(&scatter_dir, |_, _, _| {
+            .validate(&scatter_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1621,7 +1682,7 @@ mod tests {
         let before = snapshot_tree(&exception_dir);
         let called = Cell::new(false);
         let error = exception_context
-            .validate(&exception_dir, |_, _, _| {
+            .validate(&exception_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1631,7 +1692,7 @@ mod tests {
         assert!(error.contains("exception"), "{error}");
         assert_eq!(snapshot_tree(&exception_dir), before);
 
-        let (_pal_root, pal_dir) = retained_pal_tree(false);
+        let (_pal_root, pal_dir) = retained_pal_fixture_tree(false);
         let pal_context =
             CurrentSymbolicationContext::from_retained(&pal_dir, PAL_LABEL, "MAIN", PAL_BASE)
                 .unwrap();
@@ -1639,7 +1700,7 @@ mod tests {
         let before = snapshot_tree(&pal_dir);
         let called = Cell::new(false);
         let error = pal_context
-            .validate(&pal_dir, |_, _, _| {
+            .validate(&pal_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1653,7 +1714,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn validation_rejects_image_namespace_swap_before_use() {
-        let (root, image_dir) = retained_pal_tree(false);
+        let (root, image_dir) = retained_pal_fixture_tree(false);
         let context =
             CurrentSymbolicationContext::from_retained(&image_dir, PAL_LABEL, "MAIN", PAL_BASE)
                 .unwrap();
@@ -1675,7 +1736,7 @@ mod tests {
 
         let called = Cell::new(false);
         let error = context
-            .validate(&image_dir, |_, _, _| {
+            .validate(&image_dir, |_, _, _, _| {
                 called.set(true);
                 Ok(())
             })
@@ -1693,14 +1754,14 @@ mod tests {
 
     #[test]
     fn successful_validation_has_no_filesystem_side_effects() {
-        let (_root, image_dir) = retained_pal_tree(true);
+        let (_root, image_dir) = retained_pal_fixture_tree(true);
         let context =
             CurrentSymbolicationContext::from_retained(&image_dir, PAL_LABEL, "MAIN", PAL_BASE)
                 .unwrap();
         let before = snapshot_tree(&image_dir);
 
         context
-            .validate(&image_dir, |raw, runtime, roles| {
+            .validate(&image_dir, |_, raw, runtime, roles| {
                 assert_eq!(*blake3::hash(raw).as_bytes(), context.runtime.image_blake3);
                 assert_eq!(runtime.image_bounds().0, PAL_BASE);
                 assert!(roles.pal().present().is_some());

@@ -5,17 +5,19 @@
 //! `scatter/02_MAIN/load_map.json` whose digest pins the PAL manifest's
 //! scatter dependency), disassemblable ARM and Thumb task entries (the
 //! scatter-backed entry is Thumb, materialized through copy entry 3), a
-//! shared-entry pair, two anchor occurrences, the task slot/name storage
-//! the canonical manifests reference, and a controlled undefined gap the
+//! shared-entry pair, two anchor occurrences, each manifest's task slot/name
+//! storage, and a controlled undefined gap the
 //! datamark battery partitions as data. The manifest bytes follow the
 //! exact `pal_tasks::artifact` wire layout (two-space indent, exact key
-//! order, lowercase `0x` addresses, canonical decimals). Two manifest
-//! variants share the image: `canonical_manifest` (Task 8's two-task
-//! probe) and `extended_manifest` (Task 9's seven-task battery). The
+//! order, lowercase `0x` addresses, canonical decimals). The two-task
+//! `canonical_manifest` and seven-task `extended_manifest` variants share
+//! code/scatter layout but use images with their corresponding slot bytes. The
 //! `discoverable` submodule builds MAIN images whose initializer CFG and
 //! descriptor-v1 slot table the production `pal_tasks::discover`
 //! boundary proves semantically, including the colliding/shared-name
 //! allocator fixture.
+
+use scaleservers_arm32_assembly::{Arm32Condition, ArmT32Instruction as T32};
 
 pub(super) const BASE: u32 = 0x4001_0000;
 pub(super) const IMAGE_LEN: usize = 0x1000;
@@ -182,9 +184,9 @@ fn put_u32(image: &mut [u8], offset: usize, value: u32) {
     image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// The MAIN slice: scatter loader/table/sources copied from the
-/// scatter-kit fixture, plus PAL task content (entries, anchors, names)
-/// and the zeroed slot region.
+/// The extended MAIN slice: scatter loader/table/sources copied from the
+/// scatter-kit fixture, plus PAL task content, seven populated slots, and an
+/// all-zero terminal slot.
 pub(super) fn craft_main_image() -> Vec<u8> {
     const LOADER_OFFSET: usize = 0x40;
     const LOADER_IMMEDIATE: u32 = 0x38;
@@ -273,6 +275,12 @@ pub(super) fn craft_main_image() -> Vec<u8> {
         .copy_from_slice(&[0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1]);
     image[SCATTER_COPY_SOURCE_OFF..SCATTER_COPY_SOURCE_OFF + SCATTER_COPY_SIZE]
         .copy_from_slice(&[0x70, 0x47]);
+    // The manifest's capacity guard is a conditional Thumb branch to the
+    // common join, with the next halfword as its declared fallthrough.
+    let guard = T32::B_T1(Arm32Condition::NotEqual, 4)
+        .encode()
+        .expect("fixture capacity guard encodes");
+    image[CFG_ENTRY_OFF + 0x1c..CFG_ENTRY_OFF + 0x1c + guard.len()].copy_from_slice(&guard);
     // The controlled undefined gap: no task, anchor, slot, or table byte
     // ever lands here.
     image[GAP_OFF..GAP_OFF + GAP_LEN].fill(GAP_FILL);
@@ -285,6 +293,90 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     image[NAME_DELTA_TWO_OFF..NAME_DELTA_TWO_OFF + 10].copy_from_slice(b"delta_two\0");
     image[NAME_EPSILON_OFF..NAME_EPSILON_OFF + 8].copy_from_slice(b"epsilon\0");
     image[NAME_ZETA_OFF..NAME_ZETA_OFF + 5].copy_from_slice(b"zeta\0");
+    for (slot, name, priority, stack, entry, thumb, callback, unknown) in [
+        (
+            SLOT_BASE_OFF,
+            NAME_ALPHA_OFF,
+            100,
+            512,
+            ENTRY_A_OFF,
+            false,
+            0,
+            0,
+        ),
+        (
+            SLOT_BASE_OFF + STRIDE,
+            NAME_BETA_OFF,
+            255,
+            33000,
+            ENTRY_B_OFF,
+            false,
+            0x6789_abcd,
+            0x1234,
+        ),
+        (
+            SLOT_BASE_OFF + 2 * STRIDE,
+            NAME_GAMMA_OFF,
+            7,
+            1024,
+            ENTRY_C_OFF,
+            true,
+            0,
+            0,
+        ),
+        (
+            SLOT_BASE_OFF + 3 * STRIDE,
+            NAME_DELTA_ONE_OFF,
+            3,
+            2048,
+            ENTRY_D_OFF,
+            false,
+            0,
+            0,
+        ),
+        (
+            SLOT_BASE_OFF + 4 * STRIDE,
+            NAME_DELTA_TWO_OFF,
+            4,
+            4096,
+            ENTRY_D_OFF,
+            false,
+            0,
+            0,
+        ),
+        (
+            SLOT_BASE_OFF + 5 * STRIDE,
+            NAME_EPSILON_OFF,
+            9,
+            8192,
+            SCATTER_TASK_OFF,
+            true,
+            0,
+            0,
+        ),
+        (
+            SLOT_BASE_OFF + 6 * STRIDE,
+            NAME_ZETA_OFF,
+            5,
+            2048,
+            ENTRY_E_OFF,
+            false,
+            0,
+            0,
+        ),
+    ] {
+        put_u32(&mut image, slot + NAME_OFFSET as usize, BASE + name as u32);
+        put_u32(&mut image, slot + NAME_OFFSET as usize + 4, priority);
+        put_u32(&mut image, slot + NAME_OFFSET as usize + 8, stack);
+        let entry = BASE + entry as u32;
+        put_u32(
+            &mut image,
+            slot + NAME_OFFSET as usize + 12,
+            if thumb { entry | 1 } else { entry },
+        );
+        put_u32(&mut image, slot + NAME_OFFSET as usize + 16, callback);
+        put_u32(&mut image, slot + NAME_OFFSET as usize + 20, unknown);
+    }
     // Task 11: a {name, fn} registration table entry whose pointer resolves
     // to the alpha task entry, so registration-rank evidence can displace the
     // applied PAL primary in the pass-2 map battery.
@@ -297,9 +389,17 @@ pub(super) fn craft_main_image() -> Vec<u8> {
     image
 }
 
+/// The two-task parser fixture shares the code/scatter image but keeps slot 2
+/// as its all-zero terminal record.
+pub(super) fn craft_canonical_main_image() -> Vec<u8> {
+    let mut image = craft_main_image();
+    image[TERMINAL_OFF..TABLE_OFFSET].fill(0);
+    image
+}
+
 /// The modem.bin wrapping the MAIN slice (TOC label `02_MAIN`).
 pub(super) fn craft_pal_main_modem_bin() -> Vec<u8> {
-    let image = craft_main_image();
+    let image = craft_canonical_main_image();
     let entry_off = 0x20usize;
     let payload_off = entry_off + 0x20;
     let mut buf = vec![0u8; payload_off + image.len()];
@@ -334,8 +434,8 @@ pub(super) fn extended_identity(manifest: &str) -> String {
 }
 
 /// The seven-task manifest exercising raw ARM, raw Thumb, shared-entry,
-/// meaningful-name, and scatter-backed applications against the same
-/// image as the two-task canonical manifest.
+/// meaningful-name, and scatter-backed applications. Its image shares the
+/// canonical variant's code/scatter layout but carries seven populated slots.
 pub(super) fn extended_manifest(image: &[u8], scatter_blake3_hex: &str) -> String {
     let mut json = Json::new();
     write_manifest_skeleton(

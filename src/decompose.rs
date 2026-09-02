@@ -12,7 +12,9 @@ use crate::{
     recover_source, source_tree, symbolicate, tokens,
 };
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::io::Read as _;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -707,6 +709,9 @@ struct MarshalImageStages {
     scatter: MarshalComponentOutcome,
     exception: ExceptionMarshalStatus,
     pal: MarshalComponentOutcome,
+    symbolication: Option<
+        std::result::Result<Arc<symbolicate::role_evidence::CurrentSymbolicationContext>, String>,
+    >,
 }
 
 impl MarshalImageStages {
@@ -714,6 +719,11 @@ impl MarshalImageStages {
         [&self.raw, &self.export, &self.scatter, &self.pal]
             .into_iter()
             .find_map(MarshalComponentOutcome::failure_reason)
+            .or_else(|| {
+                self.symbolication
+                    .as_ref()
+                    .and_then(|context| context.as_ref().err().map(String::as_str))
+            })
     }
 
     fn is_terminal_pass2_ready(
@@ -796,6 +806,47 @@ fn exception_status_matches_state(
     )
 }
 
+fn build_current_symbolication_context(
+    image_dir: &Path,
+    label: &str,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    exception: symbolicate::role_evidence::ArtifactState<
+        crate::exception_roots::ValidatedExceptionRoots,
+    >,
+    pal: symbolicate::role_evidence::ArtifactState<crate::pal_tasks::ValidatedTaskArtifact>,
+) -> Result<Arc<symbolicate::role_evidence::CurrentSymbolicationContext>> {
+    let raw = std::fs::read(image_dir.join(format!("{label}.bin")))?;
+    let scatter = match scatter_state {
+        decompile::RuntimeScatterState::Present => {
+            let artifact = crate::scatter::read_materialized(
+                image_dir,
+                &image_dir.join("scatter/load_map.json"),
+                &raw,
+                image_start,
+            )?;
+            symbolicate::role_evidence::ArtifactState::Present(artifact.manifest_blake3())
+        }
+        decompile::RuntimeScatterState::Absent => symbolicate::role_evidence::ArtifactState::Absent,
+        decompile::RuntimeScatterState::Unmanaged => {
+            symbolicate::role_evidence::ArtifactState::Unmanaged
+        }
+    };
+    Ok(Arc::new(
+        symbolicate::role_evidence::CurrentSymbolicationContext::new(
+            symbolicate::role_evidence::RuntimeBinding::new(
+                label,
+                crate::manifest::toc_name(label),
+                image_start,
+                *blake3::hash(&raw).as_bytes(),
+                scatter,
+            ),
+            exception,
+            pal,
+        )?,
+    ))
+}
+
 fn marshal_image_stages(
     ghidra_dir: &Path,
     images_dir: &Path,
@@ -814,6 +865,7 @@ fn marshal_image_stages(
             scatter: MarshalComponentOutcome::blocked(&reason),
             exception: ExceptionMarshalStatus::Failed(crate::error::bounded_reason(&reason)),
             pal: MarshalComponentOutcome::blocked(&reason),
+            symbolication: None,
         };
     }
     let slice = ghidra_dir.join("images").join(label);
@@ -912,10 +964,13 @@ fn marshal_image_stages(
         }
     })
     .flatten();
-    let exception = if let Some(reason) = exception_dependency {
-        ExceptionMarshalStatus::Failed(crate::error::bounded_reason(&format!(
-            "exception-root publication for {label} blocked: {reason}"
-        )))
+    let (exception, exception_artifact) = if let Some(reason) = exception_dependency {
+        (
+            ExceptionMarshalStatus::Failed(crate::error::bounded_reason(&format!(
+                "exception-root publication for {label} blocked: {reason}"
+            ))),
+            None,
+        )
     } else {
         match marshal_exception_roots(
             ghidra_dir,
@@ -925,14 +980,24 @@ fn marshal_image_stages(
             image_start,
             exception_scatter_state,
         ) {
-            Ok(()) => match runtime.exception {
-                decompile::RuntimeExceptionState::Present(_) => ExceptionMarshalStatus::Present,
-                decompile::RuntimeExceptionState::Absent => ExceptionMarshalStatus::Absent,
-                decompile::RuntimeExceptionState::Unmanaged => ExceptionMarshalStatus::Unmanaged,
-            },
-            Err(error) => {
-                ExceptionMarshalStatus::Failed(crate::error::bounded_reason(&error.to_string()))
+            Ok(artifact) => {
+                let status = match &artifact {
+                    symbolicate::role_evidence::ArtifactState::Present(_) => {
+                        ExceptionMarshalStatus::Present
+                    }
+                    symbolicate::role_evidence::ArtifactState::Absent => {
+                        ExceptionMarshalStatus::Absent
+                    }
+                    symbolicate::role_evidence::ArtifactState::Unmanaged => {
+                        ExceptionMarshalStatus::Unmanaged
+                    }
+                };
+                (status, Some(artifact))
             }
+            Err(error) => (
+                ExceptionMarshalStatus::Failed(crate::error::bounded_reason(&error.to_string())),
+                None,
+            ),
         }
     };
     let pal_dependency = matches!(runtime.tasks, decompile::RuntimeTaskState::Present(_))
@@ -948,8 +1013,13 @@ fn marshal_image_stages(
             }
         })
         .flatten();
-    let pal = if let Some(reason) = pal_dependency {
-        MarshalComponentOutcome::blocked(format!("PAL publication for {label} blocked: {reason}"))
+    let (pal, pal_artifact) = if let Some(reason) = pal_dependency {
+        (
+            MarshalComponentOutcome::blocked(format!(
+                "PAL publication for {label} blocked: {reason}"
+            )),
+            None,
+        )
     } else {
         let mut publish_hook = |_point: TerminalPublishPoint| Ok(());
         match marshal_pal_tasks_with(
@@ -961,21 +1031,50 @@ fn marshal_image_stages(
             runtime.scatter,
             &mut publish_hook,
         ) {
-            Ok(()) => match runtime.tasks {
-                decompile::RuntimeTaskState::Present(_) => MarshalComponentOutcome::Current,
-                decompile::RuntimeTaskState::Absent => MarshalComponentOutcome::Absent,
-                decompile::RuntimeTaskState::Unmanaged => MarshalComponentOutcome::Unmanaged,
-            },
-            Err(error) => MarshalComponentOutcome::failed(error.to_string()),
+            Ok(artifact) => {
+                let outcome = match &artifact {
+                    symbolicate::role_evidence::ArtifactState::Present(_) => {
+                        MarshalComponentOutcome::Current
+                    }
+                    symbolicate::role_evidence::ArtifactState::Absent => {
+                        MarshalComponentOutcome::Absent
+                    }
+                    symbolicate::role_evidence::ArtifactState::Unmanaged => {
+                        MarshalComponentOutcome::Unmanaged
+                    }
+                };
+                (outcome, Some(artifact))
+            }
+            Err(error) => (MarshalComponentOutcome::failed(error.to_string()), None),
         }
     };
-    MarshalImageStages {
+    let mut stages = MarshalImageStages {
         raw,
         export,
         scatter,
         exception,
         pal,
+        symbolication: None,
+    };
+    if stages.is_terminal_pass2_ready(export_current, runtime, exception_scatter_state) {
+        stages.symbolication = Some(
+            match (exception_artifact, pal_artifact) {
+                (Some(exception), Some(pal)) => build_current_symbolication_context(
+                    &dest,
+                    label,
+                    image_start,
+                    scatter_state,
+                    exception,
+                    pal,
+                ),
+                _ => Err(Error::DecomposeIncomplete(format!(
+                    "terminal role artifacts for {label} were not retained after publication"
+                ))),
+            }
+            .map_err(|error| crate::error::bounded_reason(&error.to_string())),
+        );
     }
+    stages
 }
 
 #[cfg(test)]
@@ -1018,7 +1117,9 @@ fn marshal_exception_roots(
     state: &decompile::RuntimeExceptionState,
     image_start: u32,
     scatter_state: decompile::RuntimeScatterState,
-) -> Result<()> {
+) -> Result<
+    symbolicate::role_evidence::ArtifactState<crate::exception_roots::ValidatedExceptionRoots>,
+> {
     let mut publish_hook = |_point: TerminalPublishPoint| Ok(());
     marshal_exception_roots_with(
         ghidra_dir,
@@ -1043,14 +1144,18 @@ fn marshal_exception_roots_with<H>(
     image_start: u32,
     scatter_state: decompile::RuntimeScatterState,
     publish_hook: &mut H,
-) -> Result<()>
+) -> Result<
+    symbolicate::role_evidence::ArtifactState<crate::exception_roots::ValidatedExceptionRoots>,
+>
 where
     H: FnMut(TerminalPublishPoint) -> std::io::Result<()>,
 {
     let image_dir = images_dir.join(label);
     let terminal_dir = image_dir.join("exception_roots");
     match state {
-        decompile::RuntimeExceptionState::Unmanaged => return Ok(()),
+        decompile::RuntimeExceptionState::Unmanaged => {
+            Ok(symbolicate::role_evidence::ArtifactState::Unmanaged)
+        }
         decompile::RuntimeExceptionState::Absent => {
             crate::exception_roots::clear_materialized(ghidra_dir, label)
                 .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
@@ -1060,13 +1165,13 @@ where
             )
             .map_err(|error| Error::BadExceptionRoots(error.to_string()))?
             else {
-                return Ok(());
+                return Ok(symbolicate::role_evidence::ArtifactState::Absent);
             };
             let Some(exception) = image
                 .open_directory_child("exception_roots", "terminal exception directory")
                 .map_err(|error| Error::BadExceptionRoots(error.to_string()))?
             else {
-                return Ok(());
+                return Ok(symbolicate::role_evidence::ArtifactState::Absent);
             };
             exception
                 .unlink_regular_file_if_exists(
@@ -1074,7 +1179,7 @@ where
                     "terminal exception manifest",
                 )
                 .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
-            return Ok(());
+            Ok(symbolicate::role_evidence::ArtifactState::Absent)
         }
         decompile::RuntimeExceptionState::Present(map) => {
             let source_root =
@@ -1097,7 +1202,7 @@ where
                 &map.blake3,
                 "current exception-root manifest",
             )?;
-            validate_terminal_exception_manifest_bytes(
+            let validated = validate_terminal_exception_manifest_bytes(
                 &image_dir,
                 label,
                 image_start,
@@ -1133,9 +1238,11 @@ where
             exception
                 .verify_path_binding(&terminal_dir, "terminal exception directory")
                 .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
+            Ok(symbolicate::role_evidence::ArtifactState::Present(
+                validated,
+            ))
         }
     }
-    Ok(())
 }
 
 fn validate_terminal_exception_manifest_bytes(
@@ -1307,15 +1414,20 @@ fn marshal_pal_tasks_with<H>(
     image_start: u32,
     scatter_state: decompile::RuntimeScatterState,
     publish_hook: &mut H,
-) -> Result<()>
+) -> Result<symbolicate::role_evidence::ArtifactState<crate::pal_tasks::ValidatedTaskArtifact>>
 where
     H: FnMut(TerminalPublishPoint) -> std::io::Result<()>,
 {
     let image_dir = images_dir.join(label);
     let pal_dir = image_dir.join("pal_tasks");
     let map = match pal_state {
-        decompile::RuntimeTaskState::Unmanaged => return Ok(()),
-        decompile::RuntimeTaskState::Absent => return remove_any(&pal_dir),
+        decompile::RuntimeTaskState::Unmanaged => {
+            return Ok(symbolicate::role_evidence::ArtifactState::Unmanaged);
+        }
+        decompile::RuntimeTaskState::Absent => {
+            remove_any(&pal_dir)?;
+            return Ok(symbolicate::role_evidence::ArtifactState::Absent);
+        }
         decompile::RuntimeTaskState::Present(map) => map,
     };
     let source_root = crate::trusted_fs::TrustedDirectory::new(ghidra_dir, "PAL source kit")
@@ -1334,7 +1446,7 @@ where
         &map.blake3,
         "current PAL task manifest",
     )?;
-    validate_terminal_pal_manifest_bytes(
+    let validated = validate_terminal_pal_manifest_bytes(
         &image_dir,
         label,
         image_start,
@@ -1367,7 +1479,9 @@ where
     terminal
         .verify_path_binding(&pal_dir, "terminal PAL directory")
         .map_err(|error| Error::BadPalTasks(error.to_string()))?;
-    Ok(())
+    Ok(symbolicate::role_evidence::ArtifactState::Present(
+        validated,
+    ))
 }
 
 fn validate_terminal_pal_manifest_bytes(
@@ -1482,7 +1596,7 @@ struct MarshalPass1Batch {
     exception_absent: usize,
     exception_errors: Vec<(String, String)>,
     pal_errors: Vec<(String, String)>,
-    terminal_pass2_ready: HashSet<String>,
+    symbolication_contexts: CurrentSymbolicationContexts,
 }
 
 fn marshal_pass1_images_with<F>(
@@ -1520,7 +1634,7 @@ where
     let mut exception_absent = 0usize;
     let mut exception_errors = Vec::new();
     let mut pal_errors = Vec::new();
-    let mut terminal_pass2_ready = HashSet::new();
+    let mut symbolication_contexts = HashMap::new();
 
     for (index, label, export_current, runtime, exception_scatter, image_start) in requests {
         let image = &mut report.images[index];
@@ -1609,7 +1723,19 @@ where
             marshal_error.get_or_insert(reason);
         }
         if snapshot_ready {
-            terminal_pass2_ready.insert(label);
+            match stages.symbolication {
+                Some(Ok(context)) => {
+                    symbolication_contexts.insert(label, context);
+                }
+                Some(Err(reason)) => {
+                    marshal_error.get_or_insert(reason);
+                }
+                None => {
+                    marshal_error.get_or_insert_with(|| {
+                        format!("missing current symbolication context for {label}")
+                    });
+                }
+            }
         }
     }
 
@@ -1621,7 +1747,7 @@ where
         exception_absent,
         exception_errors,
         pal_errors,
-        terminal_pass2_ready,
+        symbolication_contexts,
     }
 }
 
@@ -2650,6 +2776,8 @@ struct GlobalsStageOutcome {
 type SymbolMapsResult = (HashMap<String, PreparedFunctionMap>, Vec<(String, String)>);
 
 type TerminalPass2Snapshots = HashMap<String, Arc<crate::terminal_pass2::TerminalPass2Snapshot>>;
+type CurrentSymbolicationContexts =
+    HashMap<String, Arc<symbolicate::role_evidence::CurrentSymbolicationContext>>;
 
 #[derive(Debug)]
 struct TerminalPass2SnapshotIssue {
@@ -2686,7 +2814,12 @@ enum SymbolRouteStep {
     RefreshGlobalShapes,
 }
 
-fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(SymbolRouteStep)) {
+fn orchestrate_symbol_route(
+    no_symbol_pass: bool,
+    symbolication_contexts: &CurrentSymbolicationContexts,
+    mut run_step: impl FnMut(SymbolRouteStep, &CurrentSymbolicationContexts),
+) {
+    let mut visit = |step| run_step(step, symbolication_contexts);
     if no_symbol_pass {
         // Two finalizes. globals recovery consumes the finalized function names
         // (LoadFinalizedNames reads them off disk, since this route skips the
@@ -2697,12 +2830,12 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // block pass 2; (2) run globals (writes globals.json); (3) finalize again —
         // now the string-ref tier activates, and this pass rewrites decompiled.c
         // with the full name set. See AGENTS (symbolication) for the rationale.
-        run_step(SymbolRouteStep::Finalize {
+        visit(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
         });
-        run_step(SymbolRouteStep::LoadFinalizedNames);
-        run_step(SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly));
-        run_step(SymbolRouteStep::Finalize {
+        visit(SymbolRouteStep::LoadFinalizedNames);
+        visit(SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly));
+        visit(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: true,
         });
         // This route has no pass 2 to feed (RunGlobalShapes only matters as
@@ -2712,10 +2845,10 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // unchanged by the normal-route reorder below. No input is rewritten
         // after this point, so — unlike the normal route — there is nothing
         // to re-commit and no RefreshGlobalShapes/ApplyGlobalTypes steps.
-        run_step(SymbolRouteStep::RunGlobalShapes);
+        visit(SymbolRouteStep::RunGlobalShapes);
     } else {
-        run_step(SymbolRouteStep::PrepareNamesAndProjection);
-        run_step(SymbolRouteStep::RunGlobals(
+        visit(SymbolRouteStep::PrepareNamesAndProjection);
+        visit(SymbolRouteStep::RunGlobals(
             GlobalsRouteMode::PrepareApplicationInput,
         ));
         // First shape sweep — after globals.json exists, before pass 2 — so
@@ -2728,10 +2861,10 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // never changes function boundaries — the pass-1 inventory the shape
         // stage consumes is identical pre/post pass 2. See AGENTS
         // (Phase 3.2) for the full rationale.
-        run_step(SymbolRouteStep::RunGlobalShapes);
-        run_step(SymbolRouteStep::DispatchPass2);
-        run_step(SymbolRouteStep::ApplyGlobalTypes);
-        run_step(SymbolRouteStep::Finalize {
+        visit(SymbolRouteStep::RunGlobalShapes);
+        visit(SymbolRouteStep::DispatchPass2);
+        visit(SymbolRouteStep::ApplyGlobalTypes);
+        visit(SymbolRouteStep::Finalize {
             rewrite_decompiled_c: false,
         });
         // The first sweep's committed sidecar is born stale — twice over.
@@ -2750,7 +2883,7 @@ fn orchestrate_symbol_route(no_symbol_pass: bool, mut run_step: impl FnMut(Symbo
         // decode inputs and totals; the input hashes and the observation
         // context names (functions.json names rewritten by pass 2 / finalize)
         // may differ.
-        run_step(SymbolRouteStep::RefreshGlobalShapes);
+        visit(SymbolRouteStep::RefreshGlobalShapes);
     }
 }
 
@@ -2943,12 +3076,15 @@ fn build_terminal_pass2_snapshots(
     images_dir: &Path,
     ghidra_dir: &Path,
     report: &decompile::DecompileReport,
-    terminal_ready: &HashSet<String>,
+    symbolication_contexts: &CurrentSymbolicationContexts,
 ) -> (TerminalPass2Snapshots, Vec<TerminalPass2SnapshotIssue>) {
     let mut snapshots = HashMap::new();
     let mut errors = Vec::new();
     for image in &report.images {
-        if !report.export_is_current(&image.label) || !terminal_ready.contains(&image.label) {
+        let Some(symbolication) = symbolication_contexts.get(&image.label) else {
+            continue;
+        };
+        if !report.export_is_current(&image.label) {
             continue;
         }
         let runtime = explicit_runtime_state(report, image);
@@ -2964,6 +3100,7 @@ fn build_terminal_pass2_snapshots(
             exception_applied: image.exception_roots_applied.as_ref(),
             pal: &runtime.tasks,
             pal_applied: image.pal_applied.as_ref(),
+            symbolication: Arc::clone(symbolication),
         };
         match crate::terminal_pass2::TerminalPass2Snapshot::build(request) {
             Ok(snapshot) => {
@@ -3915,6 +4052,7 @@ fn build_and_write_symbol_maps(
                 u64::from(snapshot.image_base()),
                 image_bytes,
                 runtime,
+                snapshot.symbolication_context().roles(),
                 snapshot.exception_context(),
                 snapshot.pal_context(),
             )
@@ -4017,7 +4155,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         tighten_wall_clock_budget_override: opts.tighten_wall_clock_budget_override,
         no_skip_opaque: opts.no_skip_opaque,
     };
-    let mut terminal_pass2_ready = HashSet::new();
+    let mut symbolication_contexts = HashMap::new();
     let mut pass1_report = match run_decompile_report(&modem_bin, &dopts, &ghidra_dir, &thumb_tools)
     {
         Ok(mut rep) => {
@@ -4043,7 +4181,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     ))
                 },
             );
-            terminal_pass2_ready = batch.terminal_pass2_ready.clone();
+            symbolication_contexts = batch.symbolication_contexts.clone();
             match batch.marshal_error {
                 None => {
                     stages.push(StageReport::decompile(
@@ -4248,7 +4386,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     &images_dir,
                     &ghidra_dir,
                     report,
-                    &terminal_pass2_ready,
+                    &symbolication_contexts,
                 )
             })
             .unwrap_or_default();
@@ -4311,294 +4449,308 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     // arm populates it too (unused there); it stays empty only when there is
     // no pass-1 report or pass 2 scheduled zero images.
     let mut retained_pass1_images: Vec<decompile::ImageResult> = Vec::new();
-    orchestrate_symbol_route(opts.no_symbol_pass, |step| match step {
-        SymbolRouteStep::PrepareNamesAndProjection => {
-            function_inputs = Some(take_globals_function_inputs(&mut function_maps));
-        }
-        SymbolRouteStep::Finalize {
-            rewrite_decompiled_c,
-        } => {
-            run_stage(
-                &mut stages,
-                "symbolicate_finalize",
-                "images/*/decompiled/symbols.json",
-                || {
-                    symbolicate::run(
-                        out,
-                        &symbolicate::Opts {
-                            token_db: token_db.exists().then(|| token_db.clone()),
-                            rewrite_decompiled_c,
-                        },
-                    )
-                },
-            );
-        }
-        SymbolRouteStep::LoadFinalizedNames => {
-            let recovered_names = pass1_report
-                .as_ref()
-                .map(|report| load_finalized_function_name_indexes(&images_dir, &report.images))
-                .unwrap_or_default();
-            function_inputs = Some(PreparedGlobalsFunctionInputs {
-                recovered_names,
-                evidence_names: HashMap::new(),
-            });
-        }
-        SymbolRouteStep::RunGlobals(mode) => {
-            let function_inputs = function_inputs
-                .take()
-                .expect("route prepares function inputs before globals");
-            let active_images = pass1_report
-                .as_mut()
-                .map(|report| report.images.as_mut_slice())
-                .unwrap_or(&mut []);
-            let globals_outcome = run_globals_stage(
-                active_images,
-                &images_dir,
-                &out.join("manifest.json"),
-                &function_inputs,
-                &globals_opts,
-            );
-            drop(function_inputs);
-            let refresh_source = pass1_report
-                .as_ref()
-                .map(|report| report.images.as_slice())
-                .unwrap_or(&[]);
-            let application_uninvoked = mode == GlobalsRouteMode::RecordOnly;
-            let maps = record_globals_stage(
-                &mut stages,
-                globals_outcome,
-                refresh_source,
-                application_uninvoked,
-            );
-            if application_uninvoked {
-                // `record_globals_stage` just refreshed the decompile stage's
-                // rows (application is conclusively uninvoked on this
-                // route), which rebuilt them via `ImageReport::from_result`
-                // and nulled the `dbt_*` counters patched before this route
-                // ran — re-apply the retained outcome (see `DbtCounters`).
-                reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
-                stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
-                stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
-                // No pass 2 on this route, so `derive_global_types_maps` never
-                // runs and there is no ineligible map to patch; report_images
-                // is irrelevant since `no_symbol_pass` short-circuits first.
-                stages.push(global_types_apply_stage(
-                    true,
-                    opts.no_apply_global_types,
-                    &HashMap::new(),
-                    &HashMap::new(),
-                    None,
-                    &mut [],
-                    0,
-                ));
-                stages.push(StageReport::skipped(
-                    "thumb_enrich_post_pass2",
-                    "--no-symbol-pass",
-                ));
-            } else {
-                prepared_global_maps = maps;
+    orchestrate_symbol_route(
+        opts.no_symbol_pass,
+        &symbolication_contexts,
+        |step, current_contexts| match step {
+            SymbolRouteStep::PrepareNamesAndProjection => {
+                function_inputs = Some(take_globals_function_inputs(&mut function_maps));
             }
-        }
-        SymbolRouteStep::RunGlobalShapes => {
-            let current_results = pass1_report
-                .as_ref()
-                .map(|report| report.images.as_slice())
-                .unwrap_or(&[]);
-            global_shapes_outcomes = run_global_shapes_stage(
-                &mut stages,
-                &images_dir,
-                &out.join("manifest.json"),
-                current_results,
-            );
-        }
-        SymbolRouteStep::DispatchPass2 => {
-            // Derive the strict `undefinedN` apply-map from `global_shapes.json`
-            // (written by `RunGlobalShapes` above) before pass 2 runs, so
-            // `ApplyGlobalTypes.java` has real input alongside `ApplyGlobals`.
-            (global_types_maps, global_types_ineligible) = if opts.no_apply_global_types {
-                (HashMap::new(), HashMap::new())
-            } else {
-                derive_global_types_maps(&images_dir, &ghidra_dir)
-            };
-            let (inputs, preparation_errors) = prepare_pass2_inputs(
-                &function_maps,
-                &prepared_global_maps,
-                &global_types_maps,
-                &terminal_pass2_snapshots,
-            );
-            let scheduled_count = inputs.len();
-            drop(std::mem::take(&mut function_maps));
-
-            if let Some(rep) = pass1_report.take() {
-                let fallback_images: Vec<ImageReport> =
-                    rep.images.iter().map(ImageReport::from_result).collect();
-                let pass2_started = Instant::now();
-                if scheduled_count == 0 {
-                    stages.push(decompile_pass2_stage(0, 0, preparation_errors, 0));
-                    stages.push(globals_apply_stage(
-                        false,
-                        &prepared_global_maps,
-                        Some(&rep.images),
+            SymbolRouteStep::Finalize {
+                rewrite_decompiled_c,
+            } => {
+                run_stage(
+                    &mut stages,
+                    "symbolicate_finalize",
+                    "images/*/decompiled/symbols.json",
+                    || {
+                        symbolicate::run_current(
+                            out,
+                            &symbolicate::Opts {
+                                token_db: token_db.exists().then(|| token_db.clone()),
+                                rewrite_decompiled_c,
+                            },
+                            current_contexts,
+                        )
+                    },
+                );
+            }
+            SymbolRouteStep::LoadFinalizedNames => {
+                let recovered_names = pass1_report
+                    .as_ref()
+                    .map(|report| load_finalized_function_name_indexes(&images_dir, &report.images))
+                    .unwrap_or_default();
+                function_inputs = Some(PreparedGlobalsFunctionInputs {
+                    recovered_names,
+                    evidence_names: HashMap::new(),
+                });
+            }
+            SymbolRouteStep::RunGlobals(mode) => {
+                let function_inputs = function_inputs
+                    .take()
+                    .expect("route prepares function inputs before globals");
+                let active_images = pass1_report
+                    .as_mut()
+                    .map(|report| report.images.as_mut_slice())
+                    .unwrap_or(&mut []);
+                let globals_outcome = run_globals_stage(
+                    active_images,
+                    &images_dir,
+                    &out.join("manifest.json"),
+                    &function_inputs,
+                    &globals_opts,
+                );
+                drop(function_inputs);
+                let refresh_source = pass1_report
+                    .as_ref()
+                    .map(|report| report.images.as_slice())
+                    .unwrap_or(&[]);
+                let application_uninvoked = mode == GlobalsRouteMode::RecordOnly;
+                let maps = record_globals_stage(
+                    &mut stages,
+                    globals_outcome,
+                    refresh_source,
+                    application_uninvoked,
+                );
+                if application_uninvoked {
+                    // `record_globals_stage` just refreshed the decompile stage's
+                    // rows (application is conclusively uninvoked on this
+                    // route), which rebuilt them via `ImageReport::from_result`
+                    // and nulled the `dbt_*` counters patched before this route
+                    // ran — re-apply the retained outcome (see `DbtCounters`).
+                    reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
+                    stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
+                    stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
+                    // No pass 2 on this route, so `derive_global_types_maps` never
+                    // runs and there is no ineligible map to patch; report_images
+                    // is irrelevant since `no_symbol_pass` short-circuits first.
+                    stages.push(global_types_apply_stage(
+                        true,
+                        opts.no_apply_global_types,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        None,
+                        &mut [],
                         0,
                     ));
-                    pass1_report = Some(rep);
-                } else {
-                    // Retain before `run_two_pass` consumes `rep` by value —
-                    // see `retained_pass1_images`'s declaration for why the
-                    // Err branch below still needs these.
-                    retained_pass1_images = rep.images.clone();
-                    match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &inputs) {
-                        Ok(mut pass2) => {
-                            let (refreshed_count, mut errors) = refresh_pass2_outputs(
-                                &pass2.outcomes,
-                                &mut pass2.report.images,
-                                &ghidra_dir,
-                                &images_dir,
-                            );
-                            errors.extend(preparation_errors);
-                            let elapsed = pass2_started.elapsed().as_millis();
-                            pass2_elapsed_ms = elapsed;
-                            stages.push(decompile_pass2_stage(
-                                scheduled_count,
-                                refreshed_count,
-                                errors,
-                                elapsed,
-                            ));
-                            stages.push(globals_apply_stage(
-                                false,
-                                &prepared_global_maps,
-                                Some(&pass2.report.images),
-                                elapsed,
-                            ));
-                            pass1_report = Some(pass2.report);
-                        }
-                        Err(error) => {
-                            let elapsed = pass2_started.elapsed().as_millis();
-                            pass2_elapsed_ms = elapsed;
-                            let mut errors = preparation_errors;
-                            errors.push(("<pass2>".to_string(), error.to_string()));
-                            stages.push(decompile_pass2_stage(scheduled_count, 0, errors, elapsed));
-                            install_decompile_stage_image_snapshot(&mut stages, fallback_images);
-                            stages.push(globals_apply_stage(
-                                false,
-                                &prepared_global_maps,
-                                None,
-                                elapsed,
-                            ));
-                        }
-                    }
-                }
-            } else {
-                let errors = if scheduled_count > 0 {
-                    vec![(
-                        "<pass2>".to_string(),
-                        "missing pass-1 decompile report".to_string(),
-                    )]
-                } else {
-                    Vec::new()
-                };
-                stages.push(decompile_pass2_stage(scheduled_count, 0, errors, 0));
-                stages.push(globals_apply_stage(false, &prepared_global_maps, None, 0));
-            }
-
-            if let Some(report) = pass1_report.as_mut() {
-                if opts.no_thumb_decompile {
                     stages.push(StageReport::skipped(
                         "thumb_enrich_post_pass2",
-                        "--no-thumb-decompile",
+                        "--no-symbol-pass",
                     ));
                 } else {
-                    let enrich_started = Instant::now();
-                    let outcome = run_thumb_enrich_per_image(&mut report.images, &images_dir);
-                    stages.push(thumb_enrich_stage(
-                        "thumb_enrich_post_pass2",
-                        outcome,
-                        enrich_started.elapsed().as_millis(),
-                    ));
+                    prepared_global_maps = maps;
                 }
-                refresh_decompile_stage_images(&mut stages, &report.images);
             }
+            SymbolRouteStep::RunGlobalShapes => {
+                let current_results = pass1_report
+                    .as_ref()
+                    .map(|report| report.images.as_slice())
+                    .unwrap_or(&[]);
+                global_shapes_outcomes = run_global_shapes_stage(
+                    &mut stages,
+                    &images_dir,
+                    &out.join("manifest.json"),
+                    current_results,
+                );
+            }
+            SymbolRouteStep::DispatchPass2 => {
+                // Derive the strict `undefinedN` apply-map from `global_shapes.json`
+                // (written by `RunGlobalShapes` above) before pass 2 runs, so
+                // `ApplyGlobalTypes.java` has real input alongside `ApplyGlobals`.
+                (global_types_maps, global_types_ineligible) = if opts.no_apply_global_types {
+                    (HashMap::new(), HashMap::new())
+                } else {
+                    derive_global_types_maps(&images_dir, &ghidra_dir)
+                };
+                let (inputs, preparation_errors) = prepare_pass2_inputs(
+                    &function_maps,
+                    &prepared_global_maps,
+                    &global_types_maps,
+                    &terminal_pass2_snapshots,
+                );
+                let scheduled_count = inputs.len();
+                drop(std::mem::take(&mut function_maps));
 
-            // This call must run after every rebuild of
-            // `stages[decompile_pos].images` above — the final
-            // `refresh_decompile_stage_images` just above, but also the
-            // `Err(error)` branch's earlier `install_decompile_stage_image_snapshot`
-            // (installs `fallback_images`, reached when `pass1_report` stays
-            // `None` and the refresh above never runs). Both rebuilds go
-            // through `ImageReport::from_result`, which always nulls the
-            // nine `global_shapes_*` fields, so patching them any earlier
-            // would be silently discarded (this exact bug shipped for
-            // `global_shapes_*` in the shape-stage reorder — RunGlobalShapes's
-            // in-place patch ran before DispatchPass2 existed to refresh over
-            // it — until this fix; see `GlobalShapesOutcome`'s doc comment).
-            // Placing it once, unconditionally, here — after every branch
-            // above has run, regardless of which one fired — fixes every
-            // rebuild site in one place instead of duplicating a fix-up per
-            // branch. The five `global_types_*` fields get the same treatment
-            // one step later, in `ApplyGlobalTypes`.
-            reapply_global_shapes_outcomes(
-                decompile_stage_images_mut(&mut stages),
-                &global_shapes_outcomes,
-            );
-            // Same hazard, same fix: the `dbt_*` counters were patched
-            // before this route ran (step 3c), and every DispatchPass2
-            // rebuild above nulls them along with the shape fields.
-            reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
-        }
-        SymbolRouteStep::RefreshGlobalShapes => {
-            // Re-run the stage after the route's LAST rewrite of the
-            // sidecar's hashed inputs — Finalize's symbolicate pass just
-            // stamped both functions.json and thumb_functions.json (on top
-            // of DispatchPass2's earlier pass-2 refresh and
-            // thumb_enrich_post_pass2 rewrites) — so the re-committed
-            // sidecar (and the single stage entry, replaced in place)
-            // hashes the tree's FINAL inputs; nothing after this point
-            // writes a hashed input (decode_rf/hardware_config write only
-            // under rf/). Always runs: Finalize rewrites inputs on every
-            // normal-route branch, including the pass-2 infrastructure
-            // failure where `pass1_report` is `None` — currentness binds
-            // there from the pass-1 ImageResults retained by DispatchPass2
-            // (pass 2 processed zero images, so the pass-1 inventories are
-            // still the current truth). The returned outcome map replaces
-            // the first sweep's so the report fields reflect this FINAL run.
-            let current_results = pass1_report
-                .as_ref()
-                .map(|report| report.images.as_slice())
-                .unwrap_or(&retained_pass1_images);
-            global_shapes_outcomes = run_global_shapes_stage(
-                &mut stages,
-                &images_dir,
-                &out.join("manifest.json"),
-                current_results,
-            );
-        }
-        SymbolRouteStep::ApplyGlobalTypes => {
-            // Reading `pass1_report` here (rather than threading a separate
-            // captured value through each branch above) is deliberate: it is
-            // `Some` in exactly the DispatchPass2 branches that passed
-            // `Some(&images)` to `globals_apply_stage` (scheduled_count==0,
-            // and Ok(pass2)), and `None` in exactly the branches that passed
-            // `None` (run_two_pass Err, and no pass-1 report at all) — so it
-            // already carries the right value per branch. Must run after
-            // every DispatchPass2 rebuild of the decompile stage's
-            // `ImageReport`s: those rebuilds null the five `global_types_*`
-            // fields this stage patches back in. Pure reporting — it writes
-            // no file, so the later `RefreshGlobalShapes` re-commit (whose
-            // in-place patch touches only the nine disjoint
-            // `global_shapes_*` fields) cannot disturb it.
-            let post_dispatch_images = pass1_report.as_ref().map(|report| report.images.as_slice());
-            let global_types_stage = global_types_apply_stage(
-                false,
-                opts.no_apply_global_types,
-                &global_types_maps,
-                &global_types_ineligible,
-                post_dispatch_images,
-                decompile_stage_images_mut(&mut stages),
-                pass2_elapsed_ms,
-            );
-            stages.push(global_types_stage);
-        }
-    });
+                if let Some(rep) = pass1_report.take() {
+                    let fallback_images: Vec<ImageReport> =
+                        rep.images.iter().map(ImageReport::from_result).collect();
+                    let pass2_started = Instant::now();
+                    if scheduled_count == 0 {
+                        stages.push(decompile_pass2_stage(0, 0, preparation_errors, 0));
+                        stages.push(globals_apply_stage(
+                            false,
+                            &prepared_global_maps,
+                            Some(&rep.images),
+                            0,
+                        ));
+                        pass1_report = Some(rep);
+                    } else {
+                        // Retain before `run_two_pass` consumes `rep` by value —
+                        // see `retained_pass1_images`'s declaration for why the
+                        // Err branch below still needs these.
+                        retained_pass1_images = rep.images.clone();
+                        match decompile::run_two_pass(rep, &dopts, &ghidra_dir, &inputs) {
+                            Ok(mut pass2) => {
+                                let (refreshed_count, mut errors) = refresh_pass2_outputs(
+                                    &pass2.outcomes,
+                                    &mut pass2.report.images,
+                                    &ghidra_dir,
+                                    &images_dir,
+                                );
+                                errors.extend(preparation_errors);
+                                let elapsed = pass2_started.elapsed().as_millis();
+                                pass2_elapsed_ms = elapsed;
+                                stages.push(decompile_pass2_stage(
+                                    scheduled_count,
+                                    refreshed_count,
+                                    errors,
+                                    elapsed,
+                                ));
+                                stages.push(globals_apply_stage(
+                                    false,
+                                    &prepared_global_maps,
+                                    Some(&pass2.report.images),
+                                    elapsed,
+                                ));
+                                pass1_report = Some(pass2.report);
+                            }
+                            Err(error) => {
+                                let elapsed = pass2_started.elapsed().as_millis();
+                                pass2_elapsed_ms = elapsed;
+                                let mut errors = preparation_errors;
+                                errors.push(("<pass2>".to_string(), error.to_string()));
+                                stages.push(decompile_pass2_stage(
+                                    scheduled_count,
+                                    0,
+                                    errors,
+                                    elapsed,
+                                ));
+                                install_decompile_stage_image_snapshot(
+                                    &mut stages,
+                                    fallback_images,
+                                );
+                                stages.push(globals_apply_stage(
+                                    false,
+                                    &prepared_global_maps,
+                                    None,
+                                    elapsed,
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    let errors = if scheduled_count > 0 {
+                        vec![(
+                            "<pass2>".to_string(),
+                            "missing pass-1 decompile report".to_string(),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                    stages.push(decompile_pass2_stage(scheduled_count, 0, errors, 0));
+                    stages.push(globals_apply_stage(false, &prepared_global_maps, None, 0));
+                }
+
+                if let Some(report) = pass1_report.as_mut() {
+                    if opts.no_thumb_decompile {
+                        stages.push(StageReport::skipped(
+                            "thumb_enrich_post_pass2",
+                            "--no-thumb-decompile",
+                        ));
+                    } else {
+                        let enrich_started = Instant::now();
+                        let outcome = run_thumb_enrich_per_image(&mut report.images, &images_dir);
+                        stages.push(thumb_enrich_stage(
+                            "thumb_enrich_post_pass2",
+                            outcome,
+                            enrich_started.elapsed().as_millis(),
+                        ));
+                    }
+                    refresh_decompile_stage_images(&mut stages, &report.images);
+                }
+
+                // This call must run after every rebuild of
+                // `stages[decompile_pos].images` above — the final
+                // `refresh_decompile_stage_images` just above, but also the
+                // `Err(error)` branch's earlier `install_decompile_stage_image_snapshot`
+                // (installs `fallback_images`, reached when `pass1_report` stays
+                // `None` and the refresh above never runs). Both rebuilds go
+                // through `ImageReport::from_result`, which always nulls the
+                // nine `global_shapes_*` fields, so patching them any earlier
+                // would be silently discarded (this exact bug shipped for
+                // `global_shapes_*` in the shape-stage reorder — RunGlobalShapes's
+                // in-place patch ran before DispatchPass2 existed to refresh over
+                // it — until this fix; see `GlobalShapesOutcome`'s doc comment).
+                // Placing it once, unconditionally, here — after every branch
+                // above has run, regardless of which one fired — fixes every
+                // rebuild site in one place instead of duplicating a fix-up per
+                // branch. The five `global_types_*` fields get the same treatment
+                // one step later, in `ApplyGlobalTypes`.
+                reapply_global_shapes_outcomes(
+                    decompile_stage_images_mut(&mut stages),
+                    &global_shapes_outcomes,
+                );
+                // Same hazard, same fix: the `dbt_*` counters were patched
+                // before this route ran (step 3c), and every DispatchPass2
+                // rebuild above nulls them along with the shape fields.
+                reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
+            }
+            SymbolRouteStep::RefreshGlobalShapes => {
+                // Re-run the stage after the route's LAST rewrite of the
+                // sidecar's hashed inputs — Finalize's symbolicate pass just
+                // stamped both functions.json and thumb_functions.json (on top
+                // of DispatchPass2's earlier pass-2 refresh and
+                // thumb_enrich_post_pass2 rewrites) — so the re-committed
+                // sidecar (and the single stage entry, replaced in place)
+                // hashes the tree's FINAL inputs; nothing after this point
+                // writes a hashed input (decode_rf/hardware_config write only
+                // under rf/). Always runs: Finalize rewrites inputs on every
+                // normal-route branch, including the pass-2 infrastructure
+                // failure where `pass1_report` is `None` — currentness binds
+                // there from the pass-1 ImageResults retained by DispatchPass2
+                // (pass 2 processed zero images, so the pass-1 inventories are
+                // still the current truth). The returned outcome map replaces
+                // the first sweep's so the report fields reflect this FINAL run.
+                let current_results = pass1_report
+                    .as_ref()
+                    .map(|report| report.images.as_slice())
+                    .unwrap_or(&retained_pass1_images);
+                global_shapes_outcomes = run_global_shapes_stage(
+                    &mut stages,
+                    &images_dir,
+                    &out.join("manifest.json"),
+                    current_results,
+                );
+            }
+            SymbolRouteStep::ApplyGlobalTypes => {
+                // Reading `pass1_report` here (rather than threading a separate
+                // captured value through each branch above) is deliberate: it is
+                // `Some` in exactly the DispatchPass2 branches that passed
+                // `Some(&images)` to `globals_apply_stage` (scheduled_count==0,
+                // and Ok(pass2)), and `None` in exactly the branches that passed
+                // `None` (run_two_pass Err, and no pass-1 report at all) — so it
+                // already carries the right value per branch. Must run after
+                // every DispatchPass2 rebuild of the decompile stage's
+                // `ImageReport`s: those rebuilds null the five `global_types_*`
+                // fields this stage patches back in. Pure reporting — it writes
+                // no file, so the later `RefreshGlobalShapes` re-commit (whose
+                // in-place patch touches only the nine disjoint
+                // `global_shapes_*` fields) cannot disturb it.
+                let post_dispatch_images =
+                    pass1_report.as_ref().map(|report| report.images.as_slice());
+                let global_types_stage = global_types_apply_stage(
+                    false,
+                    opts.no_apply_global_types,
+                    &global_types_maps,
+                    &global_types_ineligible,
+                    post_dispatch_images,
+                    decompile_stage_images_mut(&mut stages),
+                    pass2_elapsed_ms,
+                );
+                stages.push(global_types_stage);
+            }
+        },
+    );
 
     // Remaining post-symbol stages: the RF and hardware decoders. Global
     // shape recovery no longer lives here — both symbol routes now run it
@@ -4680,6 +4832,25 @@ fn run_prune_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_symbolication_context(
+        label: &str,
+    ) -> Arc<symbolicate::role_evidence::CurrentSymbolicationContext> {
+        Arc::new(
+            symbolicate::role_evidence::CurrentSymbolicationContext::new(
+                symbolicate::role_evidence::RuntimeBinding::new(
+                    label,
+                    crate::manifest::toc_name(label),
+                    0,
+                    [0x44; 32],
+                    symbolicate::role_evidence::ArtifactState::Unmanaged,
+                ),
+                symbolicate::role_evidence::ArtifactState::Unmanaged,
+                symbolicate::role_evidence::ArtifactState::Unmanaged,
+            )
+            .unwrap(),
+        )
+    }
 
     fn test_symbol(
         address: &str,
@@ -6672,8 +6843,9 @@ mod tests {
 
     #[test]
     fn direct_symbol_routes_preserve_exact_once_order() {
+        let contexts = HashMap::new();
         let mut normal = Vec::new();
-        orchestrate_symbol_route(false, |step| normal.push(step));
+        orchestrate_symbol_route(false, &contexts, |step, _| normal.push(step));
         assert_eq!(
             normal,
             vec![
@@ -6716,7 +6888,7 @@ mod tests {
         }
 
         let mut disabled = Vec::new();
-        orchestrate_symbol_route(true, |step| disabled.push(step));
+        orchestrate_symbol_route(true, &contexts, |step, _| disabled.push(step));
         assert_eq!(
             disabled,
             vec![
@@ -6778,7 +6950,9 @@ mod tests {
         // it — before the post-symbol RF/hwcfg stages (which rewrite no
         // hashed input).
         let mut combined = Vec::new();
-        orchestrate_symbol_route(false, |step| combined.push(format!("{step:?}")));
+        orchestrate_symbol_route(false, &contexts, |step, _| {
+            combined.push(format!("{step:?}"));
+        });
         orchestrate_post_symbol_route(|step| combined.push(format!("{step:?}")));
         let shapes = combined
             .iter()
@@ -6828,6 +7002,42 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn symbolication_context_reaches_normal_and_both_no_symbol_finalizers() {
+        let context = Arc::new(
+            symbolicate::role_evidence::CurrentSymbolicationContext::new(
+                symbolicate::role_evidence::RuntimeBinding::new(
+                    "00_BOOT",
+                    "BOOT",
+                    0x4001_0000,
+                    [0x55; 32],
+                    symbolicate::role_evidence::ArtifactState::Unmanaged,
+                ),
+                symbolicate::role_evidence::ArtifactState::Unmanaged,
+                symbolicate::role_evidence::ArtifactState::Unmanaged,
+            )
+            .unwrap(),
+        );
+        let contexts = HashMap::from([("00_BOOT".to_string(), Arc::clone(&context))]);
+
+        let collect = |no_symbol_pass| {
+            let mut seen = Vec::new();
+            orchestrate_symbol_route(no_symbol_pass, &contexts, |step, routed| {
+                if matches!(step, SymbolRouteStep::Finalize { .. }) {
+                    seen.push(Arc::clone(&routed["00_BOOT"]));
+                }
+            });
+            seen
+        };
+        let normal = collect(false);
+        let no_symbol = collect(true);
+
+        assert_eq!(normal.len(), 1);
+        assert_eq!(no_symbol.len(), 2);
+        assert!(normal.iter().all(|seen| Arc::ptr_eq(seen, &context)));
+        assert!(no_symbol.iter().all(|seen| Arc::ptr_eq(seen, &context)));
     }
 
     #[test]
@@ -8037,23 +8247,23 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pme_marshal_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ghidra = root.join("ghidra");
+        let image_bytes = crate::pal_tasks::test_support::craft_scatter_pal_main_image();
         std::fs::create_dir_all(ghidra.join("images")).unwrap();
         std::fs::create_dir_all(ghidra.join("export").join("02_MAIN")).unwrap();
-        std::fs::create_dir_all(ghidra.join("scatter").join("02_MAIN").join("blocks")).unwrap();
-        std::fs::write(ghidra.join("images").join("02_MAIN"), b"slice").unwrap();
+        std::fs::write(ghidra.join("images").join("02_MAIN"), &image_bytes).unwrap();
         std::fs::write(ghidra.join("export").join("02_MAIN").join("out.c"), b"// c").unwrap();
-        std::fs::write(
-            ghidra.join("scatter").join("02_MAIN").join("load_map.json"),
-            b"{\"format\":\"scatter-test\"}",
-        )
-        .unwrap();
-        std::fs::write(
+        let scatter_plan = crate::scatter::discover(&image_bytes, PAL_BASE)
+            .unwrap()
+            .expect("fixture has a discoverable scatter map");
+        crate::scatter::materialize(&scatter_plan, &image_bytes, "02_MAIN", &ghidra).unwrap();
+        let expected_map =
+            std::fs::read(ghidra.join("scatter").join("02_MAIN").join("load_map.json")).unwrap();
+        let expected_payload = std::fs::read(
             ghidra
                 .join("scatter")
                 .join("02_MAIN")
                 .join("blocks")
                 .join("04-decompress1.bin"),
-            b"payload",
         )
         .unwrap();
 
@@ -8082,7 +8292,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read(images.join("02_MAIN").join("02_MAIN.bin")).unwrap(),
-            b"slice"
+            image_bytes
         );
         assert!(
             images
@@ -8093,7 +8303,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(images.join("02_MAIN").join("scatter").join("load_map.json")).unwrap(),
-            b"{\"format\":\"scatter-test\"}"
+            expected_map
         );
         assert_eq!(
             std::fs::read(
@@ -8104,7 +8314,7 @@ mod tests {
                     .join("04-decompress1.bin")
             )
             .unwrap(),
-            b"payload"
+            expected_payload
         );
         assert!(
             !images
@@ -8759,6 +8969,7 @@ mod tests {
                         scatter: MarshalComponentOutcome::Unmanaged,
                         exception: ExceptionMarshalStatus::Absent,
                         pal: MarshalComponentOutcome::Unmanaged,
+                        symbolication: None,
                     })
                 }
             },
@@ -8829,12 +9040,48 @@ mod tests {
                 },
                 exception: ExceptionMarshalStatus::Unmanaged,
                 pal: MarshalComponentOutcome::Unmanaged,
+                symbolication: (index == 1).then(|| Ok(test_symbolication_context("01_MAIN"))),
             })
         });
 
         assert_eq!(
-            batch.terminal_pass2_ready,
+            batch
+                .symbolication_contexts
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
             HashSet::from(["01_MAIN".to_string()])
+        );
+    }
+
+    #[test]
+    fn marshal_batch_rejects_terminal_ready_image_without_symbolication_context() {
+        let mut report = decompile::test_decompile_report(
+            vec![analyzed_image("00_BOOT")],
+            HashMap::from([(
+                "00_BOOT".to_string(),
+                decompile::RuntimeScatterState::Unmanaged,
+            )]),
+        );
+        decompile::test_mark_current_export(&mut report, "00_BOOT");
+
+        let batch = marshal_pass1_images_with(&mut report, |_, _, _, _, _, _| {
+            Ok(MarshalImageStages {
+                raw: MarshalComponentOutcome::Current,
+                export: MarshalComponentOutcome::Current,
+                scatter: MarshalComponentOutcome::Unmanaged,
+                exception: ExceptionMarshalStatus::Unmanaged,
+                pal: MarshalComponentOutcome::Unmanaged,
+                symbolication: None,
+            })
+        });
+
+        assert!(batch.symbolication_contexts.is_empty());
+        assert!(
+            batch
+                .marshal_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("missing current symbolication context"))
         );
     }
 
@@ -8892,7 +9139,7 @@ mod tests {
                     image_start,
                     scatter,
                 ) {
-                    Ok(()) => ExceptionMarshalStatus::Present,
+                    Ok(_) => ExceptionMarshalStatus::Present,
                     Err(error) => ExceptionMarshalStatus::Failed(error.to_string()),
                 };
                 Ok(MarshalImageStages {
@@ -8901,6 +9148,7 @@ mod tests {
                     scatter: MarshalComponentOutcome::Unmanaged,
                     exception,
                     pal: MarshalComponentOutcome::Unmanaged,
+                    symbolication: None,
                 })
             },
         );
@@ -9235,7 +9483,7 @@ mod tests {
             &fixture.images_dir,
             &fixture.ghidra_dir,
             &report,
-            &std::collections::HashSet::new(),
+            &CurrentSymbolicationContexts::new(),
         );
         assert!(snapshots.is_empty());
         assert!(
@@ -9248,7 +9496,7 @@ mod tests {
             &fixture.images_dir,
             &fixture.ghidra_dir,
             &report,
-            &std::collections::HashSet::new(),
+            &CurrentSymbolicationContexts::new(),
         );
         assert!(snapshots.is_empty());
         assert!(
@@ -9256,11 +9504,19 @@ mod tests {
             "an uncommitted terminal outcome synthesized {errors:?}"
         );
 
+        let context = symbolicate::role_evidence::CurrentSymbolicationContext::from_retained(
+            &fixture.image_dir,
+            EXCEPTION_LABEL,
+            "BOOT",
+            fixture.image_start,
+        )
+        .unwrap();
+        let contexts = HashMap::from([(EXCEPTION_LABEL.to_string(), Arc::new(context))]);
         let (snapshots, errors) = build_terminal_pass2_snapshots(
             &fixture.images_dir,
             &fixture.ghidra_dir,
             &report,
-            &std::collections::HashSet::from([EXCEPTION_LABEL.to_string()]),
+            &contexts,
         );
         assert!(snapshots.is_empty());
         assert_eq!(errors.len(), 1);
@@ -10733,6 +10989,11 @@ mod tests {
             b"{\"format\":\"thumb-sentinel\"}",
         )
         .unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/decompiled/symbols.json"),
+            b"{\"symbols\":[{\"evidence\":[{\"kind\":\"pal_task\"}]}]}",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("images/02_MAIN/decompiled/thumb")).unwrap();
         std::fs::write(
             out.join("images/02_MAIN/decompiled/thumb/40000000.radare2.stdout"),
@@ -10797,6 +11058,11 @@ mod tests {
         assert_eq!(
             std::fs::read(out.join("images/02_MAIN/decompiled/thumb_functions.json")).unwrap(),
             b"{\"format\":\"thumb-sentinel\"}"
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/decompiled/symbols.json")).unwrap(),
+            b"{\"symbols\":[{\"evidence\":[{\"kind\":\"pal_task\"}]}]}",
+            "final role evidence is a retained leaf"
         );
         assert!(!out.join("images/02_MAIN/decompiled/thumb").exists());
         assert_eq!(
@@ -12315,7 +12581,7 @@ mod tests {
             let current = [eligible_shape_result(
                 "02_MAIN", 1, 1, 0, None, None, None, 0,
             )];
-            orchestrate_symbol_route(no_symbol_pass, |step| match step {
+            orchestrate_symbol_route(no_symbol_pass, &HashMap::new(), |step, _| match step {
                 SymbolRouteStep::DispatchPass2 => events.push("refresh".into()),
                 SymbolRouteStep::RunGlobals(GlobalsRouteMode::RecordOnly) => {
                     events.push("skip".into())

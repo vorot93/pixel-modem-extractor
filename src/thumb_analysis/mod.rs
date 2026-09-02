@@ -16,8 +16,9 @@ pub(crate) use artifact::{
     OwnedThumbFunction, ParsedThumbArtifact, RegionRecord, THUMB_V1_FORMAT, THUMB_V2_FORMAT,
     THUMB_V3_FORMAT, ThumbDecodeRange, ThumbFormat, ThumbFunctionRecord, ThumbTerminalMetadata,
     ValidatedThumbInventory, assemble_v3_atomic, assemble_v3_into, parse_thumb_artifact,
-    read_thumb_artifact, read_thumb_functions_streaming, stream_rewrite_json_array,
-    stream_rewrite_thumb_functions, validate_thumb_inventory_streaming,
+    read_thumb_artifact, read_thumb_functions_file, read_thumb_functions_streaming,
+    stream_rewrite_json_array, stream_rewrite_json_array_trusted, stream_rewrite_thumb_functions,
+    stream_rewrite_thumb_functions_trusted, validate_thumb_inventory_streaming,
 };
 pub use radare2::discover_radare2;
 pub use rizin::discover_rizin;

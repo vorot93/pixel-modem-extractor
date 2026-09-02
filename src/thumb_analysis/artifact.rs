@@ -12,6 +12,7 @@ use crate::execution_ranges::{
     validate_projection_shape,
 };
 use crate::runtime_image::RuntimeImage;
+use crate::trusted_fs::{TrustedAtomicFile, TrustedDirectory};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -1208,12 +1209,20 @@ pub(crate) fn read_thumb_functions_streaming(
     runtime: &RuntimeImage<'_>,
 ) -> Result<Vec<OwnedThumbFunction>> {
     let file = std::fs::File::open(path)?;
+    read_thumb_functions_file(file, runtime, &path.display().to_string())
+}
+
+pub(crate) fn read_thumb_functions_file(
+    file: std::fs::File,
+    runtime: &RuntimeImage<'_>,
+    context: &str,
+) -> Result<Vec<OwnedThumbFunction>> {
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
     let mut scan = TypedFunctionScan::new(runtime);
     let parsed = deserializer.deserialize_map(TypedFunctionVisitor { scan: &mut scan });
     parsed
         .and_then(|()| deserializer.end())
-        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))?;
+        .map_err(|error| Error::Serialize(format!("parse {context}: {error}")))?;
     scan.finish()
 }
 
@@ -2415,13 +2424,32 @@ impl<'de> Visitor<'de> for FormatProbe {
     }
 }
 
-fn probe_thumb_format(path: &Path) -> Result<ThumbFormat> {
-    let input = std::fs::File::open(path)?;
+fn probe_thumb_format_reader(input: impl Read, context: &str) -> Result<ThumbFormat> {
     let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
     deserializer
         .deserialize_map(FormatProbe)
         .and_then(|format| deserializer.end().map(|()| format))
-        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))
+        .map_err(|error| Error::Serialize(format!("parse {context}: {error}")))
+}
+
+fn probe_thumb_format(path: &Path) -> Result<ThumbFormat> {
+    probe_thumb_format_reader(std::fs::File::open(path)?, &path.display().to_string())
+}
+
+trait CommitWrite: Write {
+    fn commit(self) -> std::io::Result<()>;
+}
+
+impl CommitWrite for atomic_write_file::AtomicWriteFile {
+    fn commit(self) -> std::io::Result<()> {
+        self.commit()
+    }
+}
+
+impl CommitWrite for TrustedAtomicFile {
+    fn commit(self) -> std::io::Result<()> {
+        self.commit()
+    }
 }
 
 /// Atomically rewrite a current v3 artifact one function at a time. The format
@@ -2440,21 +2468,96 @@ where
         ));
     }
     let input = std::fs::File::open(path)?;
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
-    let mut scan = ThumbRewriteScan::new(
+    stream_rewrite_thumb_functions_with(
+        input,
         atomic_write_file::AtomicWriteFile::open(path)?,
+        &path.display().to_string(),
         runtime,
         on_function,
-    );
+    )
+}
+
+pub(crate) fn stream_rewrite_thumb_functions_trusted<F>(
+    directory: &TrustedDirectory,
+    file_name: &str,
+    runtime: &RuntimeImage<'_>,
+    mut make_on_function: impl FnMut() -> F,
+) -> Result<()>
+where
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
+{
+    let relative = Path::new(file_name);
+    let context = format!("trusted {file_name}");
+    let probe = directory.open_regular_file(relative, &context)?;
+    if probe_thumb_format_reader(probe, &context)? != ThumbFormat::V3 {
+        return Err(invalid_artifact(
+            "legacy Thumb artifacts are read-only replay inputs",
+        ));
+    }
+    let input = directory.open_regular_file(relative, &context)?;
+    let (_, changed) = rewrite_thumb_functions_into(
+        input,
+        std::io::sink(),
+        &context,
+        runtime,
+        make_on_function(),
+    )?;
+    if !changed {
+        return Ok(());
+    }
+    let input = directory.open_regular_file(relative, &context)?;
+    let output = directory.atomic_write_file(file_name, &context)?;
+    let (output, changed) =
+        rewrite_thumb_functions_into(input, output, &context, runtime, make_on_function())?;
+    if !changed {
+        return Err(invalid_artifact(
+            "trusted Thumb rewrite changed between validation and commit",
+        ));
+    }
+    output.commit()?;
+    Ok(())
+}
+
+fn stream_rewrite_thumb_functions_with<R, W, F>(
+    input: R,
+    output: W,
+    context: &str,
+    runtime: &RuntimeImage<'_>,
+    on_function: F,
+) -> Result<()>
+where
+    R: Read,
+    W: CommitWrite,
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
+{
+    let (output, changed) =
+        rewrite_thumb_functions_into(input, output, context, runtime, on_function)?;
+    if changed {
+        output.commit()?;
+    }
+    Ok(())
+}
+
+fn rewrite_thumb_functions_into<R, W, F>(
+    input: R,
+    output: W,
+    context: &str,
+    runtime: &RuntimeImage<'_>,
+    on_function: F,
+) -> Result<(W, bool)>
+where
+    R: Read,
+    W: Write,
+    F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
+{
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(input));
+    let mut scan = ThumbRewriteScan::new(output, runtime, on_function);
     let parsed = deserializer.deserialize_map(ThumbRewriteVisitor { scan: &mut scan });
     parsed
         .and_then(|()| deserializer.end())
-        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))?;
+        .map_err(|error| Error::Serialize(format!("parse {context}: {error}")))?;
     scan.finish()?;
-    if scan.changed {
-        scan.output.commit()?;
-    }
-    Ok(())
+    Ok((scan.output, scan.changed))
 }
 
 const V3_IMMUTABLE_FUNCTION_FIELDS: [&str; 8] = [
@@ -2468,8 +2571,8 @@ const V3_IMMUTABLE_FUNCTION_FIELDS: [&str; 8] = [
     "decode_range_errors",
 ];
 
-struct ThumbRewriteScan<'runtime, 'data, F> {
-    output: atomic_write_file::AtomicWriteFile,
+struct ThumbRewriteScan<'runtime, 'data, W, F> {
+    output: W,
     runtime: &'runtime RuntimeImage<'data>,
     budget: ExecutionBudget,
     on_function: F,
@@ -2484,15 +2587,12 @@ struct ThumbRewriteScan<'runtime, 'data, F> {
     wrote_function: bool,
 }
 
-impl<'runtime, 'data, F> ThumbRewriteScan<'runtime, 'data, F>
+impl<'runtime, 'data, W, F> ThumbRewriteScan<'runtime, 'data, W, F>
 where
+    W: Write,
     F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
-    fn new(
-        output: atomic_write_file::AtomicWriteFile,
-        runtime: &'runtime RuntimeImage<'data>,
-        on_function: F,
-    ) -> Self {
+    fn new(output: W, runtime: &'runtime RuntimeImage<'data>, on_function: F) -> Self {
         Self {
             output,
             runtime,
@@ -2634,12 +2734,13 @@ where
     }
 }
 
-struct ThumbRewriteVisitor<'a, 'runtime, 'data, F> {
-    scan: &'a mut ThumbRewriteScan<'runtime, 'data, F>,
+struct ThumbRewriteVisitor<'a, 'runtime, 'data, W, F> {
+    scan: &'a mut ThumbRewriteScan<'runtime, 'data, W, F>,
 }
 
-impl<'de, F> Visitor<'de> for ThumbRewriteVisitor<'_, '_, '_, F>
+impl<'de, W, F> Visitor<'de> for ThumbRewriteVisitor<'_, '_, '_, W, F>
 where
+    W: Write,
     F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
     type Value = ();
@@ -2715,12 +2816,13 @@ where
     }
 }
 
-struct RewriteV3Functions<'a, 'runtime, 'data, F> {
-    scan: &'a mut ThumbRewriteScan<'runtime, 'data, F>,
+struct RewriteV3Functions<'a, 'runtime, 'data, W, F> {
+    scan: &'a mut ThumbRewriteScan<'runtime, 'data, W, F>,
 }
 
-impl<'de, F> DeserializeSeed<'de> for RewriteV3Functions<'_, '_, '_, F>
+impl<'de, W, F> DeserializeSeed<'de> for RewriteV3Functions<'_, '_, '_, W, F>
 where
+    W: Write,
     F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
     type Value = ();
@@ -2733,8 +2835,9 @@ where
     }
 }
 
-impl<'de, F> Visitor<'de> for RewriteV3Functions<'_, '_, '_, F>
+impl<'de, W, F> Visitor<'de> for RewriteV3Functions<'_, '_, '_, W, F>
 where
+    W: Write,
     F: FnMut(FunctionOwner, Option<&ExecutionIdentity>, &mut Value) -> Result<()>,
 {
     type Value = ();
@@ -2761,9 +2864,74 @@ pub(crate) fn stream_rewrite_json_array<F>(path: &Path, source: &[u8], on_elemen
 where
     F: FnMut(&mut Value) -> Result<()>,
 {
+    stream_rewrite_json_array_with(
+        atomic_write_file::AtomicWriteFile::open(path)?,
+        source,
+        &path.display().to_string(),
+        on_element,
+    )
+}
+
+pub(crate) fn stream_rewrite_json_array_trusted<F>(
+    directory: &TrustedDirectory,
+    file_name: &str,
+    source: &[u8],
+    mut make_on_element: impl FnMut() -> F,
+) -> Result<()>
+where
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    let context = format!("trusted {file_name}");
+    let (_, changed) =
+        rewrite_json_array_into(std::io::sink(), source, &context, make_on_element())?;
+    if !changed {
+        return Ok(());
+    }
+    let (output, changed) = rewrite_json_array_into(
+        directory.atomic_write_file(file_name, &context)?,
+        source,
+        &context,
+        make_on_element(),
+    )?;
+    if !changed {
+        return Err(invalid_artifact(
+            "trusted JSON rewrite changed between validation and commit",
+        ));
+    }
+    output.commit()?;
+    Ok(())
+}
+
+fn stream_rewrite_json_array_with<W, F>(
+    output: W,
+    source: &[u8],
+    context: &str,
+    on_element: F,
+) -> Result<()>
+where
+    W: CommitWrite,
+    F: FnMut(&mut Value) -> Result<()>,
+{
+    let (output, changed) = rewrite_json_array_into(output, source, context, on_element)?;
+    if changed {
+        output.commit()?;
+    }
+    Ok(())
+}
+
+fn rewrite_json_array_into<W, F>(
+    output: W,
+    source: &[u8],
+    context: &str,
+    on_element: F,
+) -> Result<(W, bool)>
+where
+    W: Write,
+    F: FnMut(&mut Value) -> Result<()>,
+{
     let mut deserializer = serde_json::Deserializer::from_slice(source);
     let mut scan = ArrayRewriteScan {
-        output: atomic_write_file::AtomicWriteFile::open(path)?,
+        output,
         on_element,
         changed: false,
         wrote_element: false,
@@ -2771,25 +2939,23 @@ where
     let parsed = deserializer.deserialize_seq(ArrayRewriteVisitor { scan: &mut scan });
     parsed
         .and_then(|()| deserializer.end())
-        .map_err(|error| Error::Serialize(format!("parse {}: {error}", path.display())))?;
+        .map_err(|error| Error::Serialize(format!("parse {context}: {error}")))?;
     if scan.wrote_element {
         scan.output.write_all(b"\n]")?;
     }
-    if scan.changed {
-        scan.output.commit()?;
-    }
-    Ok(())
+    Ok((scan.output, scan.changed))
 }
 
-struct ArrayRewriteScan<F> {
-    output: atomic_write_file::AtomicWriteFile,
+struct ArrayRewriteScan<W, F> {
+    output: W,
     on_element: F,
     changed: bool,
     wrote_element: bool,
 }
 
-impl<F> ArrayRewriteScan<F>
+impl<W, F> ArrayRewriteScan<W, F>
 where
+    W: Write,
     F: FnMut(&mut Value) -> Result<()>,
 {
     fn rewrite(&mut self, mut element: Value) -> Result<()> {
@@ -2815,12 +2981,13 @@ where
     }
 }
 
-struct ArrayRewriteVisitor<'a, F> {
-    scan: &'a mut ArrayRewriteScan<F>,
+struct ArrayRewriteVisitor<'a, W, F> {
+    scan: &'a mut ArrayRewriteScan<W, F>,
 }
 
-impl<'de, F> Visitor<'de> for ArrayRewriteVisitor<'_, F>
+impl<'de, W, F> Visitor<'de> for ArrayRewriteVisitor<'_, W, F>
 where
+    W: Write,
     F: FnMut(&mut Value) -> Result<()>,
 {
     type Value = ();

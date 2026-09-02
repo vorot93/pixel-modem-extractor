@@ -1,7 +1,7 @@
 use crate::decompile::{
     AppliedExceptionRoots, AppliedPalTasks, ExceptionPass2Context, ExceptionPass2ContextExactInput,
     RuntimeExceptionState, RuntimeScatterState, RuntimeTaskState,
-    read_exception_pass2_context_exact,
+    read_exception_pass2_context_exact, read_exception_pass2_context_exact_with_validated,
 };
 use crate::error::{Error, Result};
 use crate::runtime_image::RuntimeImage;
@@ -26,6 +26,7 @@ pub(crate) struct SnapshotBuildRequest<'a> {
     pub exception_applied: Option<&'a AppliedExceptionRoots>,
     pub pal: &'a RuntimeTaskState,
     pub pal_applied: Option<&'a AppliedPalTasks>,
+    pub symbolication: Arc<symbolicate::role_evidence::CurrentSymbolicationContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,7 @@ pub(crate) struct TerminalPass2Snapshot {
     exception: Option<SnapshotException>,
     pal_managed: bool,
     pal: Option<SnapshotPal>,
+    symbolication: Arc<symbolicate::role_evidence::CurrentSymbolicationContext>,
 }
 
 impl TerminalPass2Snapshot {
@@ -285,6 +287,7 @@ impl TerminalPass2Snapshot {
             exception,
             pal_managed,
             pal,
+            symbolication: request.symbolication,
         };
         snapshot.validate_for_spawn()?;
         Ok(snapshot)
@@ -333,6 +336,19 @@ impl TerminalPass2Snapshot {
             "tasks.json",
             "raw-only snapshot PAL manifest",
         )?;
+        let symbolication = Arc::new(
+            symbolicate::role_evidence::CurrentSymbolicationContext::new(
+                symbolicate::role_evidence::RuntimeBinding::new(
+                    image_label,
+                    toc_name,
+                    image_base,
+                    *blake3::hash(&raw).as_bytes(),
+                    symbolicate::role_evidence::ArtifactState::Absent,
+                ),
+                symbolicate::role_evidence::ArtifactState::Absent,
+                symbolicate::role_evidence::ArtifactState::Absent,
+            )?,
+        );
         let snapshot = Self {
             kit_root_path,
             kit_root,
@@ -347,6 +363,7 @@ impl TerminalPass2Snapshot {
             exception: None,
             pal_managed: true,
             pal: None,
+            symbolication,
         };
         snapshot.validate_for_spawn()?;
         Ok(snapshot)
@@ -412,6 +429,12 @@ impl TerminalPass2Snapshot {
         self.pal.as_ref().map(|state| &state.context)
     }
 
+    pub(crate) fn symbolication_context(
+        &self,
+    ) -> &symbolicate::role_evidence::CurrentSymbolicationContext {
+        &self.symbolication
+    }
+
     pub(crate) fn binding(&self) -> TerminalPass2Binding {
         TerminalPass2Binding {
             image_label: self.image_label.clone(),
@@ -439,24 +462,31 @@ impl TerminalPass2Snapshot {
 
     pub(crate) fn validate_for_spawn(&self) -> Result<()> {
         self.validate_with_runtime(|_, runtime| {
-            if let Some(exception) = &self.exception {
-                let context = read_exception_pass2_context_exact(ExceptionPass2ContextExactInput {
-                    manifest_bytes: &exception.manifest_bytes,
-                    runtime,
-                    image_label: &self.image_label,
-                    toc_name: &self.toc_name,
-                    expected_identity: &exception.identity,
-                    expected_scatter_load_map_blake3: self.scatter_blake3,
-                    applied: &exception.applied,
-                })
+            let exception = if let Some(exception) = &self.exception {
+                let (context, validated) = read_exception_pass2_context_exact_with_validated(
+                    ExceptionPass2ContextExactInput {
+                        manifest_bytes: &exception.manifest_bytes,
+                        runtime,
+                        image_label: &self.image_label,
+                        toc_name: &self.toc_name,
+                        expected_identity: &exception.identity,
+                        expected_scatter_load_map_blake3: self.scatter_blake3,
+                        applied: &exception.applied,
+                    },
+                )
                 .map_err(|error| Error::BadExceptionRoots(error.to_string()))?;
                 if context != exception.context {
                     return Err(Error::BadExceptionRoots(
                         "snapshot exception application context changed".into(),
                     ));
                 }
-            }
-            if let Some(pal) = &self.pal {
+                symbolicate::role_evidence::ArtifactState::Present(validated)
+            } else if self.exception_managed {
+                symbolicate::role_evidence::ArtifactState::Absent
+            } else {
+                symbolicate::role_evidence::ArtifactState::Unmanaged
+            };
+            let pal = if let Some(pal) = &self.pal {
                 let artifact = pal_tasks::read_bytes(
                     &pal.manifest_bytes,
                     runtime,
@@ -476,6 +506,50 @@ impl TerminalPass2Snapshot {
                         "snapshot PAL application context changed".into(),
                     ));
                 }
+                symbolicate::role_evidence::ArtifactState::Present(artifact)
+            } else if self.pal_managed {
+                symbolicate::role_evidence::ArtifactState::Absent
+            } else {
+                symbolicate::role_evidence::ArtifactState::Unmanaged
+            };
+            let scatter = match self.scatter_state {
+                RuntimeScatterState::Present => symbolicate::role_evidence::ArtifactState::Present(
+                    self.scatter_blake3.ok_or_else(|| {
+                        Error::DecomposeIncomplete(
+                            "snapshot present scatter state has no manifest digest".into(),
+                        )
+                    })?,
+                ),
+                RuntimeScatterState::Absent => symbolicate::role_evidence::ArtifactState::Absent,
+                RuntimeScatterState::Unmanaged => {
+                    symbolicate::role_evidence::ArtifactState::Unmanaged
+                }
+            };
+            let projected = symbolicate::role_evidence::CurrentSymbolicationContext::new(
+                symbolicate::role_evidence::RuntimeBinding::new(
+                    &self.image_label,
+                    &self.toc_name,
+                    self.image_base,
+                    self.raw_identity.blake3(),
+                    scatter,
+                ),
+                exception,
+                pal,
+            )?;
+            if projected.runtime() != self.symbolication.runtime() {
+                return Err(Error::DecomposeIncomplete(
+                    "snapshot symbolication runtime binding changed".into(),
+                ));
+            }
+            if projected.roles().exception() != self.symbolication.roles().exception() {
+                return Err(Error::BadExceptionRoots(
+                    "snapshot exception role evidence changed".into(),
+                ));
+            }
+            if projected.roles().pal() != self.symbolication.roles().pal() {
+                return Err(Error::BadPalTasks(
+                    "snapshot PAL role evidence changed".into(),
+                ));
             }
             Ok(())
         })
@@ -742,7 +816,6 @@ fn pal_pass2_context(artifact: &pal_tasks::ValidatedTaskArtifact) -> symbolicate
                     pal_tasks::TaskIsa::Thumb => "thumb",
                 },
                 desired_primary: application.desired_primary.clone(),
-                applied: true,
                 tasks,
             },
         );
@@ -768,6 +841,8 @@ mod tests {
         image: std::path::PathBuf,
         kit: std::path::PathBuf,
         snapshot: TerminalPass2Snapshot,
+        symbolication:
+            std::sync::Arc<crate::symbolicate::role_evidence::CurrentSymbolicationContext>,
         exception_bytes: Vec<u8>,
         pal_bytes: Vec<u8>,
     }
@@ -936,6 +1011,12 @@ mod tests {
         };
         let exception_state = RuntimeExceptionState::Present(exception_map);
         let pal_state = RuntimeTaskState::Present(pal_map);
+        let symbolication = std::sync::Arc::new(
+            crate::symbolicate::role_evidence::CurrentSymbolicationContext::from_retained(
+                &image, "02_MAIN", "MAIN", BASE,
+            )
+            .unwrap(),
+        );
         let snapshot = TerminalPass2Snapshot::build(SnapshotBuildRequest {
             image_dir: &image,
             kit_root: &kit,
@@ -947,6 +1028,7 @@ mod tests {
             exception_applied: Some(&exception_applied),
             pal: &pal_state,
             pal_applied: Some(&pal_applied),
+            symbolication: std::sync::Arc::clone(&symbolication),
         })
         .unwrap();
 
@@ -955,6 +1037,7 @@ mod tests {
             image,
             kit,
             snapshot,
+            symbolication,
             exception_bytes,
             pal_bytes,
         }
@@ -968,6 +1051,26 @@ mod tests {
         std::fs::create_dir(&kit).unwrap();
         std::fs::write(image.join("00_BOOT.bin"), [0x11; 64]).unwrap();
         (root, image, kit)
+    }
+
+    fn raw_only_symbolication(
+        image: &std::path::Path,
+    ) -> std::sync::Arc<crate::symbolicate::role_evidence::CurrentSymbolicationContext> {
+        let raw = std::fs::read(image.join("00_BOOT.bin")).unwrap();
+        std::sync::Arc::new(
+            crate::symbolicate::role_evidence::CurrentSymbolicationContext::new(
+                crate::symbolicate::role_evidence::RuntimeBinding::new(
+                    "00_BOOT",
+                    "BOOT",
+                    0x4001_0000,
+                    *blake3::hash(&raw).as_bytes(),
+                    crate::symbolicate::role_evidence::ArtifactState::Absent,
+                ),
+                crate::symbolicate::role_evidence::ArtifactState::Absent,
+                crate::symbolicate::role_evidence::ArtifactState::Absent,
+            )
+            .unwrap(),
+        )
     }
 
     fn build_raw_only<'a>(
@@ -985,6 +1088,7 @@ mod tests {
             exception_applied: None,
             pal: &RuntimeTaskState::Absent,
             pal_applied: None,
+            symbolication: raw_only_symbolication(image),
         })
         .unwrap()
     }
@@ -1111,6 +1215,57 @@ mod tests {
     }
 
     #[test]
+    fn terminal_snapshot_shares_and_revalidates_symbolication_context() {
+        let raw = combined_fixture();
+        assert!(std::ptr::eq(
+            std::sync::Arc::as_ptr(&raw.symbolication),
+            raw.snapshot.symbolication_context(),
+        ));
+        std::fs::write(raw.snapshot.raw_path(), [0x22; 0x4700]).unwrap();
+        assert!(raw.snapshot.validate_for_spawn().is_err());
+        assert!(std::ptr::eq(
+            std::sync::Arc::as_ptr(&raw.symbolication),
+            raw.snapshot.symbolication_context(),
+        ));
+
+        let scatter = combined_fixture();
+        std::fs::write(
+            scatter.kit.join("scatter/02_MAIN/blocks/03-copy.bin"),
+            b"changed scatter payload",
+        )
+        .unwrap();
+        assert!(scatter.snapshot.validate_for_spawn().is_err());
+        assert!(std::ptr::eq(
+            std::sync::Arc::as_ptr(&scatter.symbolication),
+            scatter.snapshot.symbolication_context(),
+        ));
+
+        let exception = combined_fixture();
+        std::fs::write(
+            exception.snapshot.exception_manifest().unwrap(),
+            b"changed exception manifest",
+        )
+        .unwrap();
+        assert!(exception.snapshot.validate_for_spawn().is_err());
+        assert!(std::ptr::eq(
+            std::sync::Arc::as_ptr(&exception.symbolication),
+            exception.snapshot.symbolication_context(),
+        ));
+
+        let pal = combined_fixture();
+        std::fs::write(
+            pal.snapshot.pal_manifest().unwrap(),
+            b"changed PAL manifest",
+        )
+        .unwrap();
+        assert!(pal.snapshot.validate_for_spawn().is_err());
+        assert!(std::ptr::eq(
+            std::sync::Arc::as_ptr(&pal.symbolication),
+            pal.snapshot.symbolication_context(),
+        ));
+    }
+
+    #[test]
     fn failed_snapshot_build_returns_no_object_and_preserves_old_manifest() {
         const BASE: u32 = 0x4001_0000;
         let root = tempfile::tempdir().unwrap();
@@ -1167,6 +1322,7 @@ mod tests {
             exception_applied: Some(&applied),
             pal: &RuntimeTaskState::Absent,
             pal_applied: None,
+            symbolication: raw_only_symbolication(&image),
         });
 
         assert!(

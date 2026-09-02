@@ -23,13 +23,15 @@ pub use crate::execution_ranges::DecodeIsa;
 use crate::execution_ranges::{ExecutionIdentity, FunctionEvidenceKey, FunctionOwner};
 use crate::recover_source::{Confidence, Tool};
 use crate::runtime_image::RuntimeImage;
+use crate::trusted_fs::TrustedDirectory;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 pub mod name_guess;
 pub mod reg_table;
-#[allow(dead_code)] // Task 1 defines the model; the following tasks wire its consumers.
 pub(crate) mod role_evidence;
 pub use crate::decompile::ExceptionPass2Context;
 
@@ -114,18 +116,15 @@ pub struct PalTaskRef {
     pub stack_size: u32,
 }
 
-/// One PAL application group at a normalized entry: the applied desired
-/// primary plus every attached task (role identities, in table order).
-/// `applied` is true only when the retained primary already IS the desired
-/// task primary (ApplyPalTasks applied it); a preserved meaningful name
-/// leaves the rank present but proposal-less.
+/// One PAL application group at a normalized entry: the desired primary plus
+/// every attached task (role identities, in table order). Whether PAL owns a
+/// retained primary is derived per Ghidra record from exact name equality.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PalApplicationRef {
     /// The application's declared ISA ("arm" | "thumb"): only records in the
     /// same ISA at this entry carry the evidence.
     pub isa: &'static str,
     pub desired_primary: String,
-    pub applied: bool,
     pub tasks: Vec<PalTaskRef>,
 }
 
@@ -137,6 +136,137 @@ pub struct PalPass2Context {
     pub manifest_blake3: String,
     pub scatter_load_map_blake3: Option<String>,
     pub applications: BTreeMap<u32, PalApplicationRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExceptionRoleRef {
+    table_kind: &'static str,
+    table_address: u32,
+    slot_address: u32,
+    role: &'static str,
+}
+
+impl ExceptionRoleRef {
+    const fn table_kind(&self) -> &'static str {
+        self.table_kind
+    }
+
+    const fn table_address(&self) -> u32 {
+        self.table_address
+    }
+
+    const fn slot_address(&self) -> u32 {
+        self.slot_address
+    }
+
+    const fn role(&self) -> &'static str {
+        self.role
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExceptionRoleRefSet {
+    desired_primary: Option<String>,
+    roles: Vec<ExceptionRoleRef>,
+}
+
+impl ExceptionRoleRefSet {
+    fn from_role_application(application: &role_evidence::ExceptionRoleApplication) -> Self {
+        Self {
+            desired_primary: application.desired_primary().map(str::to_owned),
+            roles: application
+                .claims()
+                .iter()
+                .map(|claim| ExceptionRoleRef {
+                    table_kind: claim.table_kind(),
+                    table_address: claim.table_address(),
+                    slot_address: claim.slot_address(),
+                    role: claim.role(),
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pass2(application: &ExceptionApplicationRef) -> Self {
+        Self {
+            desired_primary: application.desired_primary().map(str::to_owned),
+            roles: application
+                .roles()
+                .iter()
+                .map(|role| ExceptionRoleRef {
+                    table_kind: role.table_kind(),
+                    table_address: role.table_address(),
+                    slot_address: role.slot_address(),
+                    role: role.role(),
+                })
+                .collect(),
+        }
+    }
+
+    fn desired_primary(&self) -> Option<&str> {
+        self.desired_primary.as_deref()
+    }
+
+    fn roles(&self) -> &[ExceptionRoleRef] {
+        &self.roles
+    }
+
+    fn matches_pass2(&self, application: &ExceptionApplicationRef) -> bool {
+        self.desired_primary() == application.desired_primary()
+            && self.roles.len() == application.roles().len()
+            && self
+                .roles
+                .iter()
+                .zip(application.roles())
+                .all(|(role, applied)| {
+                    role.table_kind() == applied.table_kind()
+                        && role.table_address() == applied.table_address()
+                        && role.slot_address() == applied.slot_address()
+                        && role.role() == applied.role()
+                })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PalRoleRefSet {
+    desired_primary: String,
+    tasks: Vec<PalTaskRef>,
+}
+
+impl PalRoleRefSet {
+    fn from_role_application(
+        application: &role_evidence::PalRoleApplication,
+        manifest_blake3: [u8; 32],
+    ) -> Self {
+        Self {
+            desired_primary: application.desired_primary().to_string(),
+            tasks: application
+                .tasks()
+                .iter()
+                .map(|task| PalTaskRef {
+                    manifest_blake3: crate::manifest::blake3_fixed(manifest_blake3),
+                    task_index: task.task_index(),
+                    name: task.name().to_string(),
+                    slot: task.slot(),
+                    priority: task.priority(),
+                    stack_size: task.stack_size(),
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pass2(application: &PalApplicationRef) -> Self {
+        Self {
+            desired_primary: application.desired_primary.clone(),
+            tasks: application.tasks.clone(),
+        }
+    }
+
+    fn matches_pass2(&self, application: &PalApplicationRef) -> bool {
+        self.desired_primary == application.desired_primary && self.tasks == application.tasks
+    }
 }
 
 /// Tagged evidence variant. Every kind serializes with a `kind` tag plus its
@@ -297,21 +427,29 @@ pub(crate) struct RawEvidence {
     /// (`reg_table::scan`). Outranks exception_root, pal_task, token, and
     /// string-ref; only `__func__` wins.
     pub(crate) registration: Option<String>,
-    /// Manifest identity attached separately so `ExceptionApplicationRef`
-    /// remains the exact application model shared by the pass-2 context.
+    /// Manifest identity attached separately from the role-only projection.
     pub(crate) exception_manifest_blake3: Option<String>,
     /// The authenticated exception application at this exact entry and decode
     /// ISA. Occupies the `exception_root` authority rank.
-    pub(crate) exception: Option<ExceptionApplicationRef>,
+    pub(crate) exception: Option<ExceptionRoleRefSet>,
+    /// The exception primary proposed for this build purpose. Absence leaves
+    /// the authenticated role rank as an empty blocker.
+    pub(crate) exception_proposed_primary: Option<String>,
     /// The PAL application at this entry, when the PAL task manifest claims
     /// it. Occupies the `pal_task` authority rank.
-    pub(crate) pal: Option<PalApplicationRef>,
+    pub(crate) pal: Option<PalRoleRefSet>,
+    /// The PAL primary proposed for this build purpose. Absence leaves the
+    /// authenticated role rank as an empty blocker.
+    pub(crate) pal_proposed_primary: Option<String>,
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
 pub struct FuncRec<'a> {
     pub arch: &'static str, // "arm" | "thumb"
-    pub name: String,       // original, e.g. "FUN_40e1bff4"
+    pub name: String,       // stable original, e.g. "FUN_40e1bff4"
+    /// Primary currently carried by this concrete producer record. This can
+    /// differ from `name` after an earlier idempotent symbolication rewrite.
+    pub current_primary: String,
     pub entry: u64,
     pub end: u64,
     pub data_refs: Vec<u64>,
@@ -616,11 +754,7 @@ pub(crate) fn decide(
         candidates.push(NameCandidate {
             authority: Authority::ExceptionRoot,
             kind: "exception_root",
-            proposed_name: app
-                .desired_primary()
-                .filter(|_| app.proposes_exception_primary())
-                .map(str::to_owned)
-                .unwrap_or_default(),
+            proposed_name: raw.exception_proposed_primary.clone().unwrap_or_default(),
         });
     }
 
@@ -634,18 +768,14 @@ pub(crate) fn decide(
                 task.name, task.slot, task.priority, task.stack_size
             ));
         }
-        // A single-task application whose desired primary was applied
-        // re-proposes it as a role identity (a preserve against weaker
-        // tiers); a shared entry or an unapplied (preserved) primary proposes
-        // nothing but still occupies the rank so token/string-ref guesses
-        // cannot displace the task identity.
-        if app.tasks.len() == 1 && app.applied {
-            candidates.push(NameCandidate {
-                authority: Authority::PalTask,
-                kind: "pal_task",
-                proposed_name: app.desired_primary.clone(),
-            });
-        }
+        // A single-task application whose desired primary is current may
+        // re-propose it. Shared or preserved entries still occupy this rank
+        // with an empty proposal, blocking token/string-ref guesses.
+        candidates.push(NameCandidate {
+            authority: Authority::PalTask,
+            kind: "pal_task",
+            proposed_name: raw.pal_proposed_primary.clone().unwrap_or_default(),
+        });
     }
 
     if let Some(fname) = &raw.func_name {
@@ -688,29 +818,9 @@ pub(crate) fn decide(
     }
 
     // Resolve by rank. Duplicate proposals at one rank collapse; distinct
-    // proposals at the winning rank are an unresolved conflict. A shared
-    // multi-task application contributes an empty blocking rank: it proposes
-    // no name, yet no weaker tier may displace the neutral shared primary.
+    // proposals at the winning rank are an unresolved conflict. Role evidence
+    // may contribute an empty rank that blocks weaker guesses without naming.
     candidates.sort_by_key(|candidate| candidate.authority);
-    if let Some(app) = &raw.pal
-        && (app.tasks.len() > 1 || !app.applied)
-        && !candidates
-            .iter()
-            .any(|candidate| candidate.authority == Authority::PalTask)
-    {
-        let position = candidates
-            .iter()
-            .position(|candidate| candidate.authority > Authority::PalTask)
-            .unwrap_or(candidates.len());
-        candidates.insert(
-            position,
-            NameCandidate {
-                authority: Authority::PalTask,
-                kind: "pal_task",
-                proposed_name: String::new(),
-            },
-        );
-    }
     let mut by_rank: Vec<(Authority, Vec<NameCandidate>)> = Vec::new();
     for candidate in candidates {
         if candidate.proposed_name.is_empty() {
@@ -823,13 +933,12 @@ fn parse_hex(s: &str) -> Result<u64> {
     u64::from_str_radix(t, 16).map_err(|e| Error::Serialize(format!("bad hex {s}: {e}")))
 }
 
-fn load_functions<'a>(
-    decompiled: &Path,
+fn load_functions_file<'a>(
+    functions: File,
     index: &DisasmIndex<'a>,
     runtime: &crate::runtime_image::RuntimeImage<'_>,
 ) -> Result<Vec<FuncRec<'a>>> {
-    let path = decompiled.join("functions.json");
-    let streamed = crate::execution_ranges::read_ghidra_inventory_streaming(&path, runtime)?;
+    let streamed = crate::execution_ranges::read_ghidra_inventory_file(functions, runtime)?;
     let mut out = Vec::with_capacity(streamed.functions.len());
     for record in streamed.functions {
         let entry = u64::from(record.entry);
@@ -857,9 +966,14 @@ fn load_functions<'a>(
             }
             None => std::borrow::Cow::Borrowed(""),
         };
+        let current_primary = record.name;
+        let name = record
+            .original_name
+            .unwrap_or_else(|| current_primary.clone());
         out.push(FuncRec {
             arch: "arm",
-            name: record.original_name.unwrap_or(record.name),
+            name,
+            current_primary,
             entry,
             end,
             data_refs,
@@ -872,6 +986,20 @@ fn load_functions<'a>(
     Ok(out)
 }
 
+#[cfg(test)]
+fn load_functions<'a>(
+    decompiled: &Path,
+    index: &DisasmIndex<'a>,
+    runtime: &RuntimeImage<'_>,
+) -> Result<Vec<FuncRec<'a>>> {
+    load_functions_file(
+        File::open(decompiled.join("functions.json"))?,
+        index,
+        runtime,
+    )
+}
+
+#[cfg(test)]
 fn thumb_runtime<'a>(
     image_dir: &Path,
     image: &'a [u8],
@@ -885,15 +1013,15 @@ fn thumb_runtime<'a>(
     crate::runtime_image::RuntimeImage::for_image_dir(image, start, image_dir)
 }
 
-fn load_thumb_functions<'a>(
-    decompiled: &Path,
+fn load_thumb_functions_file<'a>(
+    thumb_functions: File,
     runtime: &crate::runtime_image::RuntimeImage<'_>,
 ) -> Result<Vec<FuncRec<'a>>> {
-    let path = decompiled.join("thumb_functions.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let functions = crate::thumb_analysis::read_thumb_functions_streaming(&path, runtime)?;
+    let functions = crate::thumb_analysis::read_thumb_functions_file(
+        thumb_functions,
+        runtime,
+        "trusted Thumb functions inventory",
+    )?;
     let mut out = Vec::with_capacity(functions.len());
     for owned in functions {
         let f = owned.function;
@@ -908,9 +1036,12 @@ fn load_thumb_functions<'a>(
             .iter()
             .map(|r| parse_hex(r))
             .collect::<Result<Vec<_>>>()?;
+        let current_primary = f.name;
+        let name = f.original_name.unwrap_or_else(|| current_primary.clone());
         out.push(FuncRec {
             arch: "thumb",
-            name: f.original_name.unwrap_or(f.name),
+            name,
+            current_primary,
             entry,
             end,
             data_refs,
@@ -921,6 +1052,17 @@ fn load_thumb_functions<'a>(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+fn load_thumb_functions<'a>(
+    decompiled: &Path,
+    runtime: &RuntimeImage<'_>,
+) -> Result<Vec<FuncRec<'a>>> {
+    load_thumb_functions_file(
+        File::open(decompiled.join("thumb_functions.json"))?,
+        runtime,
+    )
 }
 
 #[derive(Deserialize)]
@@ -945,10 +1087,15 @@ type FileOccurrences = (HashSet<u64>, HashMap<String, Vec<String>>);
 
 /// `(all __FILE__ occurrence vaddrs, path -> attributed_strings)` from the
 /// source_tree manifest.
+#[cfg(test)]
 fn load_file_occurrences(source_tree: &Path) -> Result<FileOccurrences> {
     let bytes = std::fs::read(source_tree.join("manifest.json"))?;
+    load_file_occurrences_bytes(&bytes)
+}
+
+fn load_file_occurrences_bytes(bytes: &[u8]) -> Result<FileOccurrences> {
     let m: StManifest =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|e| Error::Serialize(e.to_string()))?;
     let mut occ = HashSet::new();
     let mut strs = HashMap::new();
     for (path, f) in m.files {
@@ -1005,14 +1152,19 @@ fn tool_wire_name(tool: Tool) -> &'static str {
 /// the strongest tier are dropped, and only a same-tier path conflict is a
 /// hard failure (dbt_exact > direct > proximity). Returned as a `BTreeMap`
 /// (not `HashMap`) so repeated loads and conflict path order are deterministic.
+#[cfg(test)]
 fn load_attribution(source_tree: &Path) -> Result<BTreeMap<FunctionEvidenceKey, AttributionPath>> {
     let path = source_tree.join("recovered_index.json");
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
     let bytes = std::fs::read(&path)?;
+    load_attribution_bytes(&bytes)
+}
+
+fn load_attribution_bytes(bytes: &[u8]) -> Result<BTreeMap<FunctionEvidenceKey, AttributionPath>> {
     let idx: RiIndex =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialize(e.to_string()))?;
+        serde_json::from_slice(bytes).map_err(|e| Error::Serialize(e.to_string()))?;
     // Walk sources in path order so first-seen conflict path is stable.
     let sources: BTreeMap<String, RiSource> = idx.sources.into_iter().collect();
     let mut claims: BTreeMap<FunctionEvidenceKey, Vec<(String, Confidence, Tool)>> =
@@ -1137,6 +1289,7 @@ struct SymbolsFile<'a> {
 }
 
 /// Write `symbols.json` into the image's `decompiled/` dir; return its path.
+#[cfg(test)]
 fn write_symbols_json(
     decompiled: &Path,
     image: &str,
@@ -1155,6 +1308,35 @@ fn write_symbols_json(
     let path = decompiled.join("symbols.json");
     std::fs::write(&path, json)?;
     Ok(path)
+}
+
+fn write_symbols_json_trusted(
+    decompiled: &TrustedDirectory,
+    image: &str,
+    symbols: &[Symbol],
+    inputs: HashMap<String, String>,
+) -> Result<()> {
+    let file = SymbolsFile {
+        format: SYMBOLS_FORMAT,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        image,
+        inputs,
+        counts: counts(symbols),
+        symbols,
+    };
+    let json =
+        serde_json::to_string_pretty(&file).map_err(|error| Error::Serialize(error.to_string()))?;
+    if decompiled.regular_file_exists("symbols.json", "final symbols artifact")?
+        && read_open_file(
+            decompiled.open_regular_file(Path::new("symbols.json"), "final symbols artifact")?,
+        )? == json.as_bytes()
+    {
+        return Ok(());
+    }
+    let mut output = decompiled.atomic_write_file("symbols.json", "final symbols artifact")?;
+    output.write_all(json.as_bytes())?;
+    output.commit()?;
+    Ok(())
 }
 
 /// Serializable shape of the strict pass-2 symbol map
@@ -2197,24 +2379,36 @@ pub fn prepare_pass2_symbol_map(
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
-    exception: Option<&ExceptionPass2Context>,
-    pal: Option<&PalPass2Context>,
+    exception_application: Option<&ExceptionPass2Context>,
+    pal_application: Option<&PalPass2Context>,
 ) -> Result<Pass2MapBundle> {
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
-    let image_bytes = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
-    let runtime = thumb_runtime(image_dir, &image_bytes, load_addr)?;
-    prepare_pass2_symbol_map_from_runtime(
-        map_out_path,
+    let image_base = u32::try_from(load_addr).map_err(|_| {
+        Error::Serialize(format!(
+            "load_addr for {image_label} exceeds the u32 address domain"
+        ))
+    })?;
+    let context = role_evidence::CurrentSymbolicationContext::from_retained(
         image_dir,
         image_label,
-        tokens,
-        load_addr,
-        &image_bytes,
-        &runtime,
-        exception,
-        pal,
-    )
+        crate::manifest::toc_name(image_label),
+        image_base,
+    )?;
+    context.validate(image_dir, |_, image_bytes, runtime, roles| {
+        prepare_pass2_symbol_map_from_runtime(
+            map_out_path,
+            image_dir,
+            image_label,
+            tokens,
+            load_addr,
+            image_bytes,
+            runtime,
+            roles,
+            exception_application,
+            pal_application,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2226,8 +2420,9 @@ pub(crate) fn prepare_pass2_symbol_map_from_runtime(
     load_addr: u64,
     image_bytes: &[u8],
     runtime: &RuntimeImage<'_>,
-    exception: Option<&ExceptionPass2Context>,
-    pal: Option<&PalPass2Context>,
+    roles: &role_evidence::AuthenticatedRoleEvidence,
+    exception_application: Option<&ExceptionPass2Context>,
+    pal_application: Option<&PalPass2Context>,
 ) -> Result<Pass2MapBundle> {
     let symbols = build_map_from_runtime(
         image_dir,
@@ -2235,8 +2430,11 @@ pub(crate) fn prepare_pass2_symbol_map_from_runtime(
         image_bytes,
         load_addr,
         runtime,
-        exception,
-        pal,
+        roles,
+        SymbolBuildPurpose::Pass2 {
+            exception_application,
+            pal_application,
+        },
     )?;
     let map = write_pass2_symbol_map(
         map_out_path,
@@ -2245,8 +2443,8 @@ pub(crate) fn prepare_pass2_symbol_map_from_runtime(
         load_addr,
         image_bytes,
         &symbols,
-        exception,
-        pal,
+        exception_application,
+        pal_application,
         runtime,
     )?;
     let function_names = symbols
@@ -2322,23 +2520,8 @@ fn apply_rename_map(text: &str, renames: &[(&str, &str)]) -> String {
     .into_owned()
 }
 
-/// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
-/// and `thumb_functions.json`, matched by concrete owner, entry, and execution
-/// digest. Both files are rewritten element-by-element through the shared
-/// streaming rewriters (`thumb_analysis::stream_rewrite_json_array` /
-/// `stream_rewrite_thumb_functions`) with no whole-document mutation tree. The
-/// retired whole-file implementation is kept test-only as
-/// `rewrite_functions_json_whole`, the differential oracle.
-/// `pub(crate)` so `decompose`'s route tests can drive the real finalize
-/// rewriter when modeling the symbol-route input-rewrite sequence.
-pub(crate) fn rewrite_functions_json(
-    decompiled: &Path,
-    runtime: &crate::runtime_image::RuntimeImage<'_>,
-    symbols: &[Symbol],
-) -> Result<()> {
-    // Numeric address spelling does not matter, while concrete ownership and
-    // authenticated execution remain identity-bearing.
-    let by_owner: HashMap<FunctionEvidenceKey, &Symbol> = symbols
+fn symbol_index(symbols: &[Symbol]) -> HashMap<FunctionEvidenceKey, &Symbol> {
+    symbols
         .iter()
         .filter_map(|symbol| {
             parse_hex(&symbol.address).ok().map(|entry| {
@@ -2352,77 +2535,100 @@ pub(crate) fn rewrite_functions_json(
                 )
             })
         })
-        .collect();
+        .collect()
+}
 
-    let stamp = |owner: FunctionOwner,
-                 execution: Option<&ExecutionIdentity>,
-                 item: &mut serde_json::Value|
-     -> Result<()> {
-        let Some(addr) = item
-            .get("entry")
-            .and_then(|v| v.as_str())
-            .and_then(|e| parse_hex(e).ok())
-        else {
-            return Ok(());
-        };
-        let key = FunctionEvidenceKey {
-            owner,
-            entry: addr,
-            execution_blake3: execution.map(|execution| execution.execution_blake3),
-        };
-        let Some(sym) = by_owner.get(&key) else {
-            return Ok(());
-        };
-        let Some(obj) = item.as_object_mut() else {
-            return Ok(());
-        };
-        if obj.contains_key("original_name") {
-            return Ok(()); // already symbolicated — idempotent re-run
-        }
-        // Source original_name from the Symbol record, not from obj["name"]:
-        // on the Phase-1 two-pass path, obj["name"] already holds the
-        // recovered name (pass 2 renamed in-program before regenerating
-        // functions.json). The Symbol preserves the true original.
-        obj.insert(
-            "original_name".into(),
-            serde_json::Value::String(sym.original_name.clone()),
-        );
-        if let Some(name) = &sym.name {
-            obj.insert("name".into(), serde_json::Value::String(name.clone()));
-        }
-        obj.insert(
-            "annotations".into(),
-            serde_json::Value::Array(
-                sym.annotations
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-        Ok(())
+fn stamp_function_record(
+    by_owner: &HashMap<FunctionEvidenceKey, &Symbol>,
+    owner: FunctionOwner,
+    execution: Option<&ExecutionIdentity>,
+    item: &mut serde_json::Value,
+) -> Result<()> {
+    let Some(addr) = item
+        .get("entry")
+        .and_then(|value| value.as_str())
+        .and_then(|entry| parse_hex(entry).ok())
+    else {
+        return Ok(());
     };
+    let key = FunctionEvidenceKey {
+        owner,
+        entry: addr,
+        execution_blake3: execution.map(|execution| execution.execution_blake3),
+    };
+    let Some(symbol) = by_owner.get(&key) else {
+        return Ok(());
+    };
+    let Some(object) = item.as_object_mut() else {
+        return Ok(());
+    };
+    if object.contains_key("original_name") {
+        return Ok(());
+    }
+    object.insert(
+        "original_name".into(),
+        serde_json::Value::String(symbol.original_name.clone()),
+    );
+    if let Some(name) = &symbol.name {
+        object.insert("name".into(), serde_json::Value::String(name.clone()));
+    }
+    object.insert(
+        "annotations".into(),
+        serde_json::Value::Array(
+            symbol
+                .annotations
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
+fn ghidra_execution_identities(
+    functions: File,
+    runtime: &RuntimeImage<'_>,
+) -> Result<Vec<Option<ExecutionIdentity>>> {
+    crate::execution_ranges::read_ghidra_inventory_file(functions, runtime)?
+        .inventory
+        .records
+        .iter()
+        .map(|record| crate::execution_ranges::execution_identity(record.entry, &record.projection))
+        .collect()
+}
+
+/// Set `name` + `original_name` + `annotations` on each entry of `functions.json`
+/// and `thumb_functions.json`, matched by concrete owner, entry, and execution
+/// digest. Both files are rewritten element-by-element through the shared
+/// streaming rewriters (`thumb_analysis::stream_rewrite_json_array` /
+/// `stream_rewrite_thumb_functions`) with no whole-document mutation tree. The
+/// retired whole-file implementation is kept test-only as
+/// `rewrite_functions_json_whole`, the differential oracle.
+/// `pub(crate)` so `decompose`'s route tests can drive the real finalize
+/// rewriter when modeling the symbol-route input-rewrite sequence.
+#[cfg(test)]
+pub(crate) fn rewrite_functions_json(
+    decompiled: &Path,
+    runtime: &crate::runtime_image::RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
+    // Numeric address spelling does not matter, while concrete ownership and
+    // authenticated execution remain identity-bearing.
+    let by_owner = symbol_index(symbols);
 
     // functions.json (a bare array) is always Ghidra's inventory.
     let fpath = decompiled.join("functions.json");
     if fpath.exists() {
         let source = std::fs::read(&fpath)?;
-        let streamed = crate::execution_ranges::read_ghidra_inventory_streaming(&fpath, runtime)?;
-        let executions = streamed
-            .inventory
-            .records
-            .iter()
-            .map(|record| {
-                crate::execution_ranges::execution_identity(record.entry, &record.projection)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let executions = ghidra_execution_identities(File::open(&fpath)?, runtime)?;
         let mut function_index = 0usize;
         crate::thumb_analysis::stream_rewrite_json_array(&fpath, &source, |item| {
             let execution = executions.get(function_index).ok_or_else(|| {
                 Error::Serialize("Ghidra function count changed during mutation".into())
             })?;
             function_index += 1;
-            stamp(FunctionOwner::Ghidra, execution.as_ref(), item)
+            stamp_function_record(&by_owner, FunctionOwner::Ghidra, execution.as_ref(), item)
         })?;
         if function_index != executions.len() {
             return Err(Error::Serialize(
@@ -2438,7 +2644,61 @@ pub(crate) fn rewrite_functions_json(
         crate::thumb_analysis::stream_rewrite_thumb_functions(
             &tpath,
             runtime,
-            |owner, execution, item| stamp(owner, execution, item),
+            |owner, execution, item| stamp_function_record(&by_owner, owner, execution, item),
+        )?;
+    }
+    Ok(())
+}
+
+fn rewrite_functions_json_trusted(
+    decompiled: &TrustedDirectory,
+    runtime: &RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
+    let by_owner = symbol_index(symbols);
+    let source = read_open_file(decompiled.open_regular_file(
+        Path::new("functions.json"),
+        "final symbolication Ghidra functions",
+    )?)?;
+    let executions = ghidra_execution_identities(
+        decompiled.open_regular_file(
+            Path::new("functions.json"),
+            "final symbolication Ghidra functions",
+        )?,
+        runtime,
+    )?;
+    let function_index = std::cell::Cell::new(0usize);
+    crate::thumb_analysis::stream_rewrite_json_array_trusted(
+        decompiled,
+        "functions.json",
+        &source,
+        || {
+            function_index.set(0);
+            |item| {
+                let index = function_index.get();
+                let execution = executions.get(index).ok_or_else(|| {
+                    Error::Serialize("Ghidra function count changed during mutation".into())
+                })?;
+                function_index.set(index + 1);
+                stamp_function_record(&by_owner, FunctionOwner::Ghidra, execution.as_ref(), item)
+            }
+        },
+    )?;
+    if function_index.get() != executions.len() {
+        return Err(Error::Serialize(
+            "Ghidra function count changed during mutation".into(),
+        ));
+    }
+
+    if decompiled.regular_file_exists(
+        "thumb_functions.json",
+        "final symbolication Thumb functions",
+    )? {
+        crate::thumb_analysis::stream_rewrite_thumb_functions_trusted(
+            decompiled,
+            "thumb_functions.json",
+            runtime,
+            || |owner, execution, item| stamp_function_record(&by_owner, owner, execution, item),
         )?;
     }
     Ok(())
@@ -2520,6 +2780,7 @@ fn rewrite_functions_json_whole(decompiled: &Path, symbols: &[Symbol]) -> Result
 /// (when present) using the same rename map — symmetric with `decompiled.c`
 /// since `body_c` is sourced from it. Gated at the call site by
 /// `FinalizeOpts::rewrite_decompiled_c`.
+#[cfg(test)]
 fn rewrite_text_files(
     decompiled: &Path,
     runtime: &crate::runtime_image::RuntimeImage<'_>,
@@ -2536,6 +2797,31 @@ fn rewrite_text_files(
     Ok(())
 }
 
+fn rewrite_text_files_trusted(
+    decompiled: &TrustedDirectory,
+    runtime: &RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
+    for name in ["decompiled.c", "disasm.lst"] {
+        let context = format!("final symbolication {name}");
+        if !decompiled.regular_file_exists(name, &context)? {
+            continue;
+        }
+        let source = read_open_file(decompiled.open_regular_file(Path::new(name), &context)?)?;
+        let text = String::from_utf8(source).map_err(|error| {
+            Error::Serialize(format!("final symbolication {name} is not UTF-8: {error}"))
+        })?;
+        let rewritten = rewrite_text(&text, symbols);
+        if rewritten == text {
+            continue;
+        }
+        let mut output = decompiled.atomic_write_file(name, &context)?;
+        output.write_all(rewritten.as_bytes())?;
+        output.commit()?;
+    }
+    rewrite_body_c_in_thumb_functions_trusted(decompiled, runtime, symbols)
+}
+
 /// Walk `thumb_functions.json` and apply the `original_name -> name` rename map
 /// to each function's `body_c` field (when present). Mirrors the `decompiled.c`
 /// text substitution — Phase-2's `body_c` is sourced from `decompiled.c`, so on
@@ -2550,6 +2836,7 @@ fn rewrite_text_files(
 /// rewrite_decompiled_c` is `false` on that path, skipping this rewrite. Live
 /// on the standalone `symbolicate` subcommand and on `decompose
 /// --no-symbol-pass` (where `rewrite_decompiled_c` is `true`).
+#[cfg(test)]
 fn rewrite_body_c_in_thumb_functions(
     decompiled: &Path,
     runtime: &crate::runtime_image::RuntimeImage<'_>,
@@ -2573,6 +2860,40 @@ fn rewrite_body_c_in_thumb_functions(
         }
         Ok(())
     })
+}
+
+fn rewrite_body_c_in_thumb_functions_trusted(
+    decompiled: &TrustedDirectory,
+    runtime: &RuntimeImage<'_>,
+    symbols: &[Symbol],
+) -> Result<()> {
+    if !decompiled.regular_file_exists(
+        "thumb_functions.json",
+        "final symbolication Thumb functions",
+    )? {
+        return Ok(());
+    }
+    let renames = build_rename_map(symbols);
+    crate::thumb_analysis::stream_rewrite_thumb_functions_trusted(
+        decompiled,
+        "thumb_functions.json",
+        runtime,
+        || {
+            |_, _, function| {
+                let Some(object) = function.as_object_mut() else {
+                    return Ok(());
+                };
+                let Some(body_c) = object.get("body_c").and_then(|value| value.as_str()) else {
+                    return Ok(());
+                };
+                let renamed = apply_rename_map(body_c, &renames);
+                if renamed != body_c {
+                    object.insert("body_c".into(), serde_json::Value::String(renamed));
+                }
+                Ok(())
+            }
+        },
+    )
 }
 
 /// Retired whole-file `rewrite_body_c_in_thumb_functions`, kept verbatim as
@@ -2622,11 +2943,8 @@ fn is_real_name(name: &str) -> bool {
 /// Recovered global names from a per-image `globals.json` (`.globals[].name`).
 /// Empty on any read/parse failure — the tier that consumes it is gated on the
 /// file's presence separately.
-fn load_global_names(path: &Path) -> HashSet<String> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return HashSet::new();
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+fn load_global_names_bytes(bytes: &[u8]) -> HashSet<String> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return HashSet::new();
     };
     v.get("globals")
@@ -2644,18 +2962,152 @@ fn load_global_names(path: &Path) -> HashSet<String> {
 /// computed unconditionally above it (the registration tier shares them).
 type StringRefPrecompute = (Vec<Option<String>>, HashMap<String, usize>);
 
+struct SymbolicationInputFiles {
+    disasm: Option<File>,
+    source_manifest: Option<File>,
+    source_index: Option<File>,
+    functions: File,
+    thumb_functions: Option<File>,
+    globals: Option<File>,
+}
+
+impl SymbolicationInputFiles {
+    fn from_path(image_dir: &Path) -> Result<Self> {
+        let decompiled = image_dir.join("decompiled");
+        let source_tree = image_dir.join("source_tree");
+        Ok(Self {
+            disasm: open_optional_path_file(&decompiled.join("disasm.lst"))?,
+            source_manifest: open_optional_path_file(&source_tree.join("manifest.json"))?,
+            source_index: open_optional_path_file(&source_tree.join("recovered_index.json"))?,
+            functions: File::open(decompiled.join("functions.json"))?,
+            thumb_functions: open_optional_path_file(&decompiled.join("thumb_functions.json"))?,
+            globals: open_optional_path_file(&decompiled.join("globals.json"))?,
+        })
+    }
+
+    fn from_trusted(image: &TrustedDirectory) -> Result<(TrustedDirectory, Self)> {
+        let decompiled = image
+            .open_directory_child("decompiled", "final symbolication decompiled directory")?
+            .ok_or_else(|| {
+                Error::Serialize("final symbolication decompiled directory is missing".into())
+            })?;
+        let source_tree = image
+            .open_directory_child("source_tree", "final symbolication source-tree directory")?;
+        let source_manifest = match &source_tree {
+            Some(source_tree) => open_optional_trusted_file(
+                source_tree,
+                "manifest.json",
+                "final symbolication source-tree manifest",
+            )?,
+            None => None,
+        };
+        let source_index = match &source_tree {
+            Some(source_tree) => open_optional_trusted_file(
+                source_tree,
+                "recovered_index.json",
+                "final symbolication recovered source index",
+            )?,
+            None => None,
+        };
+        let files = Self {
+            disasm: open_optional_trusted_file(
+                &decompiled,
+                "disasm.lst",
+                "final symbolication disassembly",
+            )?,
+            source_manifest,
+            source_index,
+            functions: decompiled.open_regular_file(
+                Path::new("functions.json"),
+                "final symbolication Ghidra functions",
+            )?,
+            thumb_functions: open_optional_trusted_file(
+                &decompiled,
+                "thumb_functions.json",
+                "final symbolication Thumb functions",
+            )?,
+            globals: open_optional_trusted_file(
+                &decompiled,
+                "globals.json",
+                "final symbolication globals",
+            )?,
+        };
+        Ok((decompiled, files))
+    }
+}
+
+fn open_optional_path_file(path: &Path) -> Result<Option<File>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn open_optional_trusted_file(
+    directory: &TrustedDirectory,
+    file_name: &str,
+    context: &str,
+) -> Result<Option<File>> {
+    if !directory.regular_file_exists(file_name, context)? {
+        return Ok(None);
+    }
+    directory
+        .open_regular_file(Path::new(file_name), context)
+        .map(Some)
+}
+
+fn read_open_file(mut file: File) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SymbolBuildPurpose<'a> {
+    Pass2 {
+        exception_application: Option<&'a ExceptionPass2Context>,
+        pal_application: Option<&'a PalPass2Context>,
+    },
+    FinalArtifact,
+}
+
+fn pass2_role_owns_current_primary(
+    owner: FunctionOwner,
+    exception: Option<&ExceptionApplicationRef>,
+    pal: Option<&PalApplicationRef>,
+    current_primary: &str,
+) -> bool {
+    owner == FunctionOwner::Ghidra
+        && (exception.is_some_and(ExceptionApplicationRef::owns_current_primary)
+            || pal.is_some_and(|application| application.desired_primary == current_primary))
+}
+
+fn registration_for_record(
+    current_primary: &str,
+    role_owns_current_primary: bool,
+    candidate: Option<&String>,
+) -> Option<String> {
+    if is_real_name(current_primary) && !role_owns_current_primary {
+        None
+    } else {
+        candidate.cloned()
+    }
+}
+
 /// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
 /// `pal` supplies the authenticated PAL task state when the generation claims
 /// one; it attaches `pal_task` evidence per exact entry and lets the
 /// registration rank displace an applied task primary (which is a "real"
 /// name every other tier must defer to).
+#[cfg(test)]
 pub(crate) fn build_map(
     image_dir: &Path,
     image_label: &str,
     tokens: &HashMap<u32, String>,
     manifest: &Path,
-    exception: Option<&ExceptionPass2Context>,
-    pal: Option<&PalPass2Context>,
+    roles: &role_evidence::AuthenticatedRoleEvidence,
+    purpose: SymbolBuildPurpose<'_>,
 ) -> Result<Vec<Symbol>> {
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
@@ -2667,9 +3119,50 @@ pub(crate) fn build_map(
         &image_bytes,
         load_addr,
         &runtime,
-        exception,
-        pal,
+        roles,
+        purpose,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn build_final_map_from_runtime(
+    image_dir: &Path,
+    tokens: &HashMap<u32, String>,
+    image_bytes: &[u8],
+    load_addr: u64,
+    runtime: &RuntimeImage<'_>,
+    roles: &role_evidence::AuthenticatedRoleEvidence,
+) -> Result<Vec<Symbol>> {
+    build_map_from_runtime(
+        image_dir,
+        tokens,
+        image_bytes,
+        load_addr,
+        runtime,
+        roles,
+        SymbolBuildPurpose::FinalArtifact,
+    )
+}
+
+fn build_final_map_from_trusted(
+    image: &TrustedDirectory,
+    tokens: &HashMap<u32, String>,
+    image_bytes: &[u8],
+    load_addr: u64,
+    runtime: &RuntimeImage<'_>,
+    roles: &role_evidence::AuthenticatedRoleEvidence,
+) -> Result<(TrustedDirectory, Vec<Symbol>)> {
+    let (decompiled, inputs) = SymbolicationInputFiles::from_trusted(image)?;
+    let symbols = build_map_from_input_files(
+        inputs,
+        tokens,
+        image_bytes,
+        load_addr,
+        runtime,
+        roles,
+        SymbolBuildPurpose::FinalArtifact,
+    )?;
+    Ok((decompiled, symbols))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2679,24 +3172,87 @@ fn build_map_from_runtime(
     image_bytes: &[u8],
     load_addr: u64,
     runtime: &RuntimeImage<'_>,
-    exception: Option<&ExceptionPass2Context>,
-    pal: Option<&PalPass2Context>,
+    roles: &role_evidence::AuthenticatedRoleEvidence,
+    purpose: SymbolBuildPurpose<'_>,
 ) -> Result<Vec<Symbol>> {
-    let decompiled = image_dir.join("decompiled");
-    let disasm = std::fs::read_to_string(decompiled.join("disasm.lst")).unwrap_or_default();
+    if let SymbolBuildPurpose::Pass2 {
+        exception_application,
+        pal_application,
+    } = purpose
+    {
+        if let Some(application) = exception_application {
+            let evidence = roles.exception().present().ok_or_else(|| {
+                Error::Serialize(
+                    "exception pass-2 application has no authenticated role evidence".into(),
+                )
+            })?;
+            if application.identity() != evidence.identity()
+                || application.manifest_blake3()
+                    != crate::manifest::blake3_fixed(evidence.manifest_blake3())
+            {
+                return Err(Error::Serialize(
+                    "exception pass-2 application does not match authenticated role evidence"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(application) = pal_application {
+            let evidence = roles.pal().present().ok_or_else(|| {
+                Error::Serialize("PAL pass-2 application has no authenticated role evidence".into())
+            })?;
+            if application.identity != evidence.identity()
+                || application.manifest_blake3
+                    != crate::manifest::blake3_fixed(evidence.manifest_blake3())
+                || application.scatter_load_map_blake3
+                    != evidence
+                        .scatter_load_map_blake3()
+                        .map(crate::manifest::blake3_fixed)
+            {
+                return Err(Error::Serialize(
+                    "PAL pass-2 application does not match authenticated role evidence".into(),
+                ));
+            }
+        }
+    }
+    build_map_from_input_files(
+        SymbolicationInputFiles::from_path(image_dir)?,
+        tokens,
+        image_bytes,
+        load_addr,
+        runtime,
+        roles,
+        purpose,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_map_from_input_files(
+    mut inputs: SymbolicationInputFiles,
+    tokens: &HashMap<u32, String>,
+    image_bytes: &[u8],
+    load_addr: u64,
+    runtime: &RuntimeImage<'_>,
+    roles: &role_evidence::AuthenticatedRoleEvidence,
+    purpose: SymbolBuildPurpose<'_>,
+) -> Result<Vec<Symbol>> {
+    let disasm = match inputs.disasm.take() {
+        Some(file) => String::from_utf8(read_open_file(file)?).unwrap_or_default(),
+        None => String::new(),
+    };
     let index = crate::disasm_index::DisasmIndex::new(&disasm);
 
-    let source_tree = image_dir.join("source_tree");
-    let (file_occ, file_strings) = if source_tree.join("manifest.json").exists() {
-        load_file_occurrences(&source_tree)?
-    } else {
-        (HashSet::new(), HashMap::new())
+    let (file_occ, file_strings) = match inputs.source_manifest.take() {
+        Some(file) => load_file_occurrences_bytes(&read_open_file(file)?)?,
+        None => (HashSet::new(), HashMap::new()),
     };
-    let attribution = load_attribution(&source_tree)?;
+    let attribution = match inputs.source_index.take() {
+        Some(file) => load_attribution_bytes(&read_open_file(file)?)?,
+        None => BTreeMap::new(),
+    };
 
-    let mut funcs = load_functions(&decompiled, &index, runtime)?;
-    if decompiled.join("thumb_functions.json").exists() {
-        funcs.extend(load_thumb_functions(&decompiled, runtime)?);
+    let mut funcs = load_functions_file(inputs.functions, &index, runtime)?;
+    if let Some(thumb_functions) = inputs.thumb_functions {
+        funcs.extend(load_thumb_functions_file(thumb_functions, runtime)?);
     }
 
     let string_map = build_string_map(image_bytes, load_addr, 3);
@@ -2720,6 +3276,9 @@ fn build_map_from_runtime(
     // `globals.json` exists, so it is empty there (registration still fires).
     let mut fn_names: HashSet<String> = HashSet::new();
     for (i, f) in funcs.iter().enumerate() {
+        if is_real_name(&f.current_primary) {
+            fn_names.insert(f.current_primary.clone());
+        }
         if is_real_name(&f.name) {
             fn_names.insert(f.name.clone());
         }
@@ -2727,11 +3286,10 @@ fn build_map_from_runtime(
             fn_names.insert(n.clone());
         }
     }
-    let globals_path = decompiled.join("globals.json");
-    let global_names = if globals_path.exists() {
-        load_global_names(&globals_path)
-    } else {
-        HashSet::new()
+    let globals_present = inputs.globals.is_some();
+    let global_names = match inputs.globals {
+        Some(file) => load_global_names_bytes(&read_open_file(file)?),
+        None => HashSet::new(),
     };
 
     // Registration-table tier (authoritative). Scans the raw image for
@@ -2748,7 +3306,7 @@ fn build_map_from_runtime(
 
     // String-reference guess tier (fail-closed, lowest precedence). Active only
     // when the raw image (=> non-empty string_map) and globals.json are present.
-    let string_ref_enabled = !string_map.is_empty() && globals_path.exists();
+    let string_ref_enabled = !string_map.is_empty() && globals_present;
     let (cand_idents, ident_count): StringRefPrecompute = if string_ref_enabled {
         let cand_idents: Vec<Option<String>> = funcs
             .iter()
@@ -2794,29 +3352,119 @@ fn build_map_from_runtime(
                 )));
             }
         };
-        let exception_app = exception
-            .and_then(|context| {
-                context.application(&(u32::try_from(f.entry).ok()?, record_decode_isa))
-            })
-            .cloned();
-        if let Some(application) = &exception_app
-            && f.owner == FunctionOwner::Ghidra
-            && application.current_primary().name() != f.name
-        {
-            return Err(Error::Serialize(format!(
-                "exception application current primary does not match the retained record at 0x{:08x}",
-                f.entry
-            )));
-        }
-        let pal_app = pal
-            .and_then(|ctx| ctx.applications.get(&u32::try_from(f.entry).ok()?))
-            .filter(|app| app.isa == record_isa)
-            .map(|app| PalApplicationRef {
-                isa: app.isa,
-                desired_primary: app.desired_primary.clone(),
-                applied: app.desired_primary == f.name,
-                tasks: app.tasks.clone(),
-            });
+        let entry = u32::try_from(f.entry).ok();
+        let exception_set = roles.exception().present();
+        let exception_application = exception_set
+            .and_then(|set| entry.and_then(|entry| set.application(entry, record_decode_isa)));
+        let exception_app = exception_application.map(ExceptionRoleRefSet::from_role_application);
+        let exception_manifest_blake3 = exception_set
+            .filter(|_| exception_application.is_some())
+            .map(|set| crate::manifest::blake3_fixed(set.manifest_blake3()));
+        let pal_set = roles.pal().present();
+        let pal_application = pal_set
+            .and_then(|set| entry.and_then(|entry| set.application(entry, record_decode_isa)));
+        let pal_app = pal_application.map(|application| {
+            PalRoleRefSet::from_role_application(
+                application,
+                pal_set.expect("matched PAL application").manifest_blake3(),
+            )
+        });
+        let (exception_proposed_primary, pal_proposed_primary, role_owns_current_primary) =
+            match purpose {
+                SymbolBuildPurpose::Pass2 {
+                    exception_application: exception_context,
+                    pal_application: pal_context,
+                } => {
+                    let applied_exception = exception_context.and_then(|context| {
+                        entry.and_then(|entry| context.application(&(entry, record_decode_isa)))
+                    });
+                    if let Some(applied) = applied_exception {
+                        let role = exception_app.as_ref().ok_or_else(|| {
+                        Error::Serialize(format!(
+                            "exception application at 0x{:08x} has no authenticated role evidence",
+                            f.entry
+                        ))
+                    })?;
+                        if !role.matches_pass2(applied) {
+                            return Err(Error::Serialize(format!(
+                                "exception application at 0x{:08x} differs from authenticated role evidence",
+                                f.entry
+                            )));
+                        }
+                        if f.owner == FunctionOwner::Ghidra
+                            && applied.current_primary().name() != f.current_primary
+                        {
+                            return Err(Error::Serialize(format!(
+                                "exception application current primary does not match the retained record at 0x{:08x}",
+                                f.entry
+                            )));
+                        }
+                    }
+                    let applied_pal = pal_context
+                        .and_then(|context| {
+                            entry.and_then(|entry| context.applications.get(&entry))
+                        })
+                        .filter(|application| application.isa == record_isa);
+                    if let Some(applied) = applied_pal {
+                        let role = pal_app.as_ref().ok_or_else(|| {
+                            Error::Serialize(format!(
+                                "PAL application at 0x{:08x} has no authenticated role evidence",
+                                f.entry
+                            ))
+                        })?;
+                        if !role.matches_pass2(applied) {
+                            return Err(Error::Serialize(format!(
+                                "PAL application at 0x{:08x} differs from authenticated role evidence",
+                                f.entry
+                            )));
+                        }
+                    }
+                    let role_owns_current_primary = pass2_role_owns_current_primary(
+                        f.owner,
+                        applied_exception,
+                        applied_pal,
+                        &f.current_primary,
+                    );
+                    (
+                        applied_exception
+                            .filter(|application| application.proposes_exception_primary())
+                            .and_then(|_| {
+                                exception_app.as_ref()?.desired_primary().map(str::to_owned)
+                            }),
+                        applied_pal
+                            .filter(|_| pal_app.as_ref().is_some_and(|role| role.tasks.len() == 1))
+                            .filter(|_| {
+                                pal_app
+                                    .as_ref()
+                                    .is_some_and(|role| role.desired_primary == f.current_primary)
+                            })
+                            .and_then(|_| {
+                                pal_app.as_ref().map(|role| role.desired_primary.clone())
+                            }),
+                        role_owns_current_primary,
+                    )
+                }
+                SymbolBuildPurpose::FinalArtifact => {
+                    let exception_proposed_primary = exception_app
+                        .as_ref()
+                        .and_then(ExceptionRoleRefSet::desired_primary)
+                        .filter(|primary| *primary == f.current_primary)
+                        .map(str::to_owned);
+                    let pal_proposed_primary = pal_app
+                        .as_ref()
+                        .filter(|role| {
+                            role.tasks.len() == 1 && role.desired_primary == f.current_primary
+                        })
+                        .map(|role| role.desired_primary.clone());
+                    let role_owns_current_primary =
+                        exception_proposed_primary.is_some() || pal_proposed_primary.is_some();
+                    (
+                        exception_proposed_primary,
+                        pal_proposed_primary,
+                        role_owns_current_primary,
+                    )
+                }
+            };
         let claim = attribution.get(&FunctionEvidenceKey {
             owner: f.owner,
             entry: f.entry,
@@ -2840,7 +3488,7 @@ fn build_map_from_runtime(
         let ident_guess = if string_ref_enabled
             && func_name.is_none()
             && hits.is_empty()
-            && !is_real_name(&f.name)
+            && !is_real_name(&f.current_primary)
         {
             name_guess::string_ref_guess(
                 cand_idents[i].as_deref(),
@@ -2852,12 +3500,8 @@ fn build_map_from_runtime(
             None
         };
 
-        // A PAL-applied primary is a real name every weaker rank defers to —
-        // but registration (rank above pal_task) may still displace it.
-        let role_primary = exception_app
-            .as_ref()
-            .is_some_and(ExceptionApplicationRef::owns_current_primary)
-            || pal_app.is_some();
+        // A role-owned primary may be displaced by stronger registration
+        // evidence. A preserved foreign primary remains authoritative.
         let raw = RawEvidence {
             func_name,
             tokens: hits,
@@ -2865,16 +3509,16 @@ fn build_map_from_runtime(
             file_strings: fstrings,
             dbt_sources,
             ident_guess,
-            registration: if is_real_name(&f.name) && !role_primary {
-                None
-            } else {
-                reg_names.get(&f.entry).cloned()
-            },
-            exception_manifest_blake3: exception
-                .filter(|_| exception_app.is_some())
-                .map(|context| context.manifest_blake3().to_string()),
+            registration: registration_for_record(
+                &f.current_primary,
+                role_owns_current_primary,
+                reg_names.get(&f.entry),
+            ),
+            exception_manifest_blake3,
             exception: exception_app,
+            exception_proposed_primary,
             pal: pal_app,
+            pal_proposed_primary,
         };
         let (name, tier, evidence, annotations, name_conflicts) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
@@ -2909,6 +3553,7 @@ fn build_map_from_runtime(
 /// the `symbols.json` path. `rewrite_decompiled_c = false` skips the text
 /// rewrite of `decompiled.c` / `disasm.lst` (the two-pass decompose path
 /// regenerates them from Ghidra).
+#[cfg(test)]
 fn finalize_image(
     image_dir: &Path,
     image_label: &str,
@@ -2917,19 +3562,41 @@ fn finalize_image(
     opts: &FinalizeOpts,
 ) -> Result<PathBuf> {
     let decompiled = image_dir.join("decompiled");
-    let mut inputs = HashMap::new();
-    if let Ok(b) = std::fs::read(decompiled.join("functions.json")) {
-        inputs.insert(
-            "functions_json_blake3".into(),
-            crate::manifest::blake3_bytes(&b),
-        );
-    }
-
     rewrite_functions_json(&decompiled, runtime, symbols)?;
     if opts.rewrite_decompiled_c {
         rewrite_text_files(&decompiled, runtime, symbols)?;
     }
+    let mut inputs = HashMap::new();
+    let functions = std::fs::read(decompiled.join("functions.json"))?;
+    inputs.insert(
+        "functions_json_blake3".into(),
+        crate::manifest::blake3_bytes(&functions),
+    );
     write_symbols_json(&decompiled, image_label, symbols, inputs)
+}
+
+fn finalize_image_trusted(
+    image_dir: &Path,
+    decompiled: &TrustedDirectory,
+    image_label: &str,
+    runtime: &RuntimeImage<'_>,
+    symbols: &[Symbol],
+    opts: &FinalizeOpts,
+) -> Result<PathBuf> {
+    rewrite_functions_json_trusted(decompiled, runtime, symbols)?;
+    if opts.rewrite_decompiled_c {
+        rewrite_text_files_trusted(decompiled, runtime, symbols)?;
+    }
+    let functions = read_open_file(decompiled.open_regular_file(
+        Path::new("functions.json"),
+        "final symbolication Ghidra functions",
+    )?)?;
+    let inputs = HashMap::from([(
+        "functions_json_blake3".into(),
+        crate::manifest::blake3_bytes(&functions),
+    )]);
+    write_symbols_json_trusted(decompiled, image_label, symbols, inputs)?;
+    Ok(image_dir.join("decompiled/symbols.json"))
 }
 
 /// Backward-compatible wrapper: build_map + finalize_image with the rewrite on.
@@ -2942,11 +3609,30 @@ fn symbolicate_image(
     tokens: &HashMap<u32, String>,
     manifest: &Path,
 ) -> Result<PathBuf> {
-    let symbols = build_map(image_dir, image_label, tokens, manifest, None, None)?;
     let image = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
     let runtime = thumb_runtime(image_dir, &image, load_addr)?;
+    let context = role_evidence::CurrentSymbolicationContext::new(
+        role_evidence::RuntimeBinding::new(
+            image_label,
+            crate::manifest::toc_name(image_label),
+            u32::try_from(load_addr)
+                .map_err(|_| Error::Serialize("test load address exceeds u32".into()))?,
+            *blake3::hash(&image).as_bytes(),
+            role_evidence::ArtifactState::Unmanaged,
+        ),
+        role_evidence::ArtifactState::Unmanaged,
+        role_evidence::ArtifactState::Unmanaged,
+    )?;
+    let symbols = build_final_map_from_runtime(
+        image_dir,
+        tokens,
+        &image,
+        load_addr,
+        &runtime,
+        context.roles(),
+    )?;
     finalize_image(
         image_dir,
         image_label,
@@ -2958,20 +3644,69 @@ fn symbolicate_image(
     )
 }
 
+fn load_symbolication_tokens(opts: &Opts) -> Result<HashMap<u32, String>> {
+    match &opts.token_db {
+        Some(path) if path.exists() => Ok(token_map(&crate::tokens::parse(&std::fs::read(path)?)?)),
+        _ => {
+            tracing::warn!("symbolicate: no token DB — token evidence skipped");
+            Ok(HashMap::new())
+        }
+    }
+}
+
+pub(crate) fn run_current(
+    root: &Path,
+    opts: &Opts,
+    contexts: &HashMap<String, std::sync::Arc<role_evidence::CurrentSymbolicationContext>>,
+) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(root)?;
+    let images = root.join("images");
+    let tokens = load_symbolication_tokens(opts)?;
+    let mut labels = contexts.keys().cloned().collect::<Vec<_>>();
+    labels.sort();
+
+    for label in &labels {
+        let image_dir = images.join(label);
+        contexts[label].validate(&image_dir, |_, _, _, _| Ok(()))?;
+    }
+
+    for label in &labels {
+        let image_dir = images.join(label);
+        let output =
+            contexts[label].validate(&image_dir, |trusted_image, image, runtime, roles| {
+                let (decompiled, symbols) = build_final_map_from_trusted(
+                    trusted_image,
+                    &tokens,
+                    image,
+                    u64::from(contexts[label].runtime().image_base()),
+                    runtime,
+                    roles,
+                )?;
+                finalize_image_trusted(
+                    &image_dir,
+                    &decompiled,
+                    label,
+                    runtime,
+                    &symbols,
+                    &FinalizeOpts {
+                        rewrite_decompiled_c: opts.rewrite_decompiled_c,
+                    },
+                )
+            })?;
+        println!("symbolicated {label} -> {}", output.display());
+    }
+    println!("symbolicate: {} image(s)", labels.len());
+    Ok(root)
+}
+
 /// Symbolicate every image under `<root>/images/*` that has a `decompiled/` dir.
 /// `opts.token_db` is the raw pw_token_db (TOKENS); without it, token evidence is
 /// skipped. Returns `root`.
 pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
-    let tokens = match &opts.token_db {
-        Some(p) if p.exists() => token_map(&crate::tokens::parse(&std::fs::read(p)?)?),
-        _ => {
-            tracing::warn!("symbolicate: no token DB — token evidence skipped");
-            HashMap::new()
-        }
-    };
+    let root = std::fs::canonicalize(root)?;
     let manifest = root.join("manifest.json");
     let images = root.join("images");
-    let mut count = 0usize;
+    let mut contexts = HashMap::new();
     for entry in std::fs::read_dir(&images)? {
         let dir = entry?.path();
         let label = dir
@@ -2982,30 +3717,78 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
         if !dir.join("decompiled").join("functions.json").exists() {
             continue;
         }
-        let symbols = build_map(&dir, &label, &tokens, &manifest, None, None)?;
-        let image = std::fs::read(dir.join(format!("{label}.bin")))?;
         let load_addr = crate::manifest::load_addr_for_image(&manifest, &label)?
             .ok_or_else(|| Error::Serialize(format!("load_addr missing for {label}")))?;
-        let runtime = thumb_runtime(&dir, &image, load_addr)?;
-        let out = finalize_image(
+        let load_addr = u32::try_from(load_addr).map_err(|_| {
+            Error::Serialize(format!(
+                "load_addr for {label} exceeds the u32 address domain"
+            ))
+        })?;
+        let context = role_evidence::CurrentSymbolicationContext::from_retained(
             &dir,
             &label,
-            &runtime,
-            &symbols,
-            &FinalizeOpts {
-                rewrite_decompiled_c: opts.rewrite_decompiled_c,
-            },
+            crate::manifest::toc_name(&label),
+            load_addr,
         )?;
-        println!("symbolicated {label} -> {}", out.display());
-        count += 1;
+        contexts.insert(label, std::sync::Arc::new(context));
     }
-    println!("symbolicate: {count} image(s)");
-    Ok(root.to_path_buf())
+    run_current(&root, opts, &contexts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_map(
+        image_dir: &Path,
+        image_label: &str,
+        tokens: &HashMap<u32, String>,
+        manifest: &Path,
+        exception_application: Option<&ExceptionPass2Context>,
+        pal_application: Option<&PalPass2Context>,
+    ) -> Result<Vec<Symbol>> {
+        let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
+            .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
+        let image_base = u32::try_from(load_addr)
+            .map_err(|_| Error::Serialize("test load address exceeds u32".into()))?;
+        let image = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
+        let binding = role_evidence::RuntimeBinding::new(
+            image_label,
+            crate::manifest::toc_name(image_label),
+            image_base,
+            *blake3::hash(&image).as_bytes(),
+            role_evidence::ArtifactState::Unmanaged,
+        );
+        let context = if image_dir.join("exception_roots/roots.json").is_file()
+            || image_dir.join("pal_tasks/tasks.json").is_file()
+        {
+            role_evidence::CurrentSymbolicationContext::from_retained(
+                image_dir,
+                image_label,
+                crate::manifest::toc_name(image_label),
+                image_base,
+            )?
+        } else if let Some(pal) = pal_application {
+            role_evidence::context_from_test_pal_pass2(binding, pal)?
+        } else {
+            role_evidence::CurrentSymbolicationContext::new(
+                binding,
+                role_evidence::ArtifactState::Unmanaged,
+                role_evidence::ArtifactState::Unmanaged,
+            )?
+        };
+        super::build_map(
+            image_dir,
+            image_label,
+            tokens,
+            manifest,
+            context.roles(),
+            SymbolBuildPurpose::Pass2 {
+                exception_application,
+                pal_application,
+            },
+        )
+    }
 
     fn ghidra_function(name: &str, entry: u32, end: u32, data_refs: &[u32]) -> serde_json::Value {
         ghidra_function_in_image(name, entry, end, data_refs, &TEST_IMAGE, 0)
@@ -3254,7 +4037,9 @@ mod tests {
             registration: None,
             exception_manifest_blake3: None,
             exception: None,
+            exception_proposed_primary: None,
             pal: None,
+            pal_proposed_primary: None,
         }
     }
 
@@ -4616,6 +5401,159 @@ mod tests {
     }
 
     #[test]
+    fn pass2_preserved_pal_primary_from_current_context_blocks_registration() {
+        let root = tmp("pme_sym_regtable_preserved_pal");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let mut image = vec![0u8; 0x300];
+        for (offset, name) in [
+            (0x100, "Handler_One"),
+            (0x120, "Handler_Two"),
+            (0x140, "Handler_Three"),
+        ] {
+            image[offset..offset + name.len()].copy_from_slice(name.as_bytes());
+        }
+        for (index, (name, function)) in [
+            (0x4000_0100u32, 0x4000_0200u32),
+            (0x4000_0120, 0x4000_0240),
+            (0x4000_0140, 0x4000_0280),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = 0x10 + index * 8;
+            image[offset..offset + 4].copy_from_slice(&name.to_le_bytes());
+            image[offset + 4..offset + 8].copy_from_slice(&function.to_le_bytes());
+        }
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &image).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            serde_json::to_vec(&vec![
+                ghidra_function_in_image(
+                    "foreign_task_primary",
+                    0x4000_0200,
+                    0x4000_0208,
+                    &[],
+                    &image,
+                    0x4000_0000,
+                ),
+                ghidra_function_in_image(
+                    "FUN_240",
+                    0x4000_0240,
+                    0x4000_0248,
+                    &[],
+                    &image,
+                    0x4000_0000,
+                ),
+                ghidra_function_in_image(
+                    "FUN_280",
+                    0x4000_0280,
+                    0x4000_0288,
+                    &[],
+                    &image,
+                    0x4000_0000,
+                ),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "0x40000200: 4770 bx lr\n").unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073741824}]}"#,
+        )
+        .unwrap();
+        let pal = pal_ctx(
+            "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1:1",
+            vec![(0x4000_0200, pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]))],
+        );
+
+        let symbols = build_map(
+            &root.join("images/02_MAIN"),
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+            None,
+            Some(&pal),
+        )
+        .unwrap();
+
+        let preserved = symbols
+            .iter()
+            .find(|symbol| symbol.address == "0x40000200")
+            .unwrap();
+        assert_eq!(preserved.tier, Tier::None);
+        assert!(preserved.name.is_none());
+        assert!(
+            !preserved
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind() == "registration")
+        );
+    }
+
+    #[test]
+    fn preserved_exception_and_pal_primaries_block_registration() {
+        let candidate = "registration_candidate".to_string();
+        let preserved = crate::decompile::test_context_from_fixture(
+            crate::decompile::TestExceptionContextState::PreservedReset,
+        );
+        let preserved_exception = preserved
+            .application(&(EXCEPTION_RESET_ENTRY, DecodeIsa::Arm))
+            .unwrap();
+        assert!(!pass2_role_owns_current_primary(
+            FunctionOwner::Ghidra,
+            Some(preserved_exception),
+            None,
+            "foreign_primary",
+        ));
+        assert_eq!(
+            registration_for_record("foreign_primary", false, Some(&candidate)),
+            None
+        );
+
+        let owned = crate::decompile::test_context_from_fixture(
+            crate::decompile::TestExceptionContextState::Fresh,
+        );
+        let owned_exception = owned
+            .application(&(EXCEPTION_RESET_ENTRY, DecodeIsa::Arm))
+            .unwrap();
+        assert!(pass2_role_owns_current_primary(
+            FunctionOwner::Ghidra,
+            Some(owned_exception),
+            None,
+            "Reset",
+        ));
+        assert_eq!(
+            registration_for_record("Reset", true, Some(&candidate)),
+            Some(candidate.clone())
+        );
+
+        let pal = pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]);
+        assert!(!pass2_role_owns_current_primary(
+            FunctionOwner::Ghidra,
+            None,
+            Some(&pal),
+            "foreign_task_primary",
+        ));
+        assert_eq!(
+            registration_for_record("foreign_task_primary", false, Some(&candidate)),
+            None
+        );
+        assert!(pass2_role_owns_current_primary(
+            FunctionOwner::Ghidra,
+            None,
+            Some(&pal),
+            "pal_TaskEntry_alpha",
+        ));
+        assert_eq!(
+            registration_for_record("pal_TaskEntry_alpha", true, Some(&candidate)),
+            Some(candidate)
+        );
+    }
+
+    #[test]
     fn build_map_does_not_string_ref_guess_an_already_real_name() {
         let root = tmp("pme_sym_stringref_realname");
         let dec = root.join("images/02_MAIN/decompiled");
@@ -4912,6 +5850,7 @@ mod tests {
         let root = tmp("pme_sym_body_c_preserve");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(dec.join("functions.json"), b"[]").unwrap();
         write_thumb_functions_v3_with_body_c(&dec);
 
         let symbols = vec![real_name_symbol_for_4000()];
@@ -4945,6 +5884,7 @@ mod tests {
         let root = tmp("pme_sym_body_c_rename");
         let dec = root.join("images/02_MAIN/decompiled");
         std::fs::create_dir_all(&dec).unwrap();
+        std::fs::write(dec.join("functions.json"), b"[]").unwrap();
         write_thumb_functions_v3_with_body_c(&dec);
 
         let symbols = vec![real_name_symbol_for_4000()];
@@ -4967,6 +5907,73 @@ mod tests {
         assert!(
             !after.contains("thumb_4000(void)"),
             "original name must be gone from body_c after rewrite: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalization_namespace_swap_does_not_mutate_replacement_tree() {
+        let root = tmp("pme_sym_finalize_namespace_swap");
+        let image_dir = root.join("images/00_BOOT");
+        let decompiled = image_dir.join("decompiled");
+        std::fs::create_dir_all(&decompiled).unwrap();
+        let image = vec![0u8; 0x10];
+        let functions = serde_json::to_vec(&vec![ghidra_function_in_image(
+            "FUN_4000",
+            0x4000,
+            0x4004,
+            &[],
+            &image,
+            0x4000,
+        )])
+        .unwrap();
+        std::fs::write(image_dir.join("00_BOOT.bin"), &image).unwrap();
+        std::fs::write(decompiled.join("functions.json"), &functions).unwrap();
+        let context = role_evidence::CurrentSymbolicationContext::new(
+            role_evidence::RuntimeBinding::new(
+                "00_BOOT",
+                "BOOT",
+                0x4000,
+                *blake3::hash(&image).as_bytes(),
+                role_evidence::ArtifactState::Unmanaged,
+            ),
+            role_evidence::ArtifactState::Unmanaged,
+            role_evidence::ArtifactState::Unmanaged,
+        )
+        .unwrap();
+        let detached = root.join("detached-image");
+        let replacement_symbols = b"replacement symbols";
+
+        let result = context.validate(&image_dir, |trusted_image, _, runtime, _| {
+            std::fs::rename(&image_dir, &detached)?;
+            std::fs::create_dir_all(&decompiled)?;
+            std::fs::write(image_dir.join("00_BOOT.bin"), &image)?;
+            std::fs::write(decompiled.join("functions.json"), &functions)?;
+            std::fs::write(decompiled.join("symbols.json"), replacement_symbols)?;
+            let retained_decompiled = trusted_image
+                .open_directory_child("decompiled", "namespace-swap retained decompiled directory")?
+                .unwrap();
+            finalize_image_trusted(
+                &image_dir,
+                &retained_decompiled,
+                "00_BOOT",
+                runtime,
+                &[],
+                &FinalizeOpts {
+                    rewrite_decompiled_c: false,
+                },
+            )
+        });
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("path binding changed"), "{error}");
+        assert_eq!(
+            std::fs::read(decompiled.join("symbols.json")).unwrap(),
+            replacement_symbols
+        );
+        assert_eq!(
+            std::fs::read(decompiled.join("functions.json")).unwrap(),
+            functions
         );
     }
 
@@ -5022,7 +6029,7 @@ mod tests {
 
     fn pal_ref(name: &str, index: u32) -> PalTaskRef {
         PalTaskRef {
-            manifest_blake3: "a".repeat(64),
+            manifest_blake3: "b".repeat(64),
             task_index: index,
             name: name.to_string(),
             slot: 0x4001_0100,
@@ -5035,7 +6042,6 @@ mod tests {
         PalApplicationRef {
             isa: "arm",
             desired_primary: desired.to_string(),
-            applied: true,
             tasks: tasks
                 .iter()
                 .map(|&(name, index)| pal_ref(name, index))
@@ -5051,7 +6057,15 @@ mod tests {
     }
 
     fn raw_with_pal(pal: Option<PalApplicationRef>) -> RawEvidence {
-        RawEvidence { pal, ..raw() }
+        let pal_proposed_primary = pal
+            .as_ref()
+            .filter(|application| application.tasks.len() == 1)
+            .map(|application| application.desired_primary.clone());
+        RawEvidence {
+            pal: pal.as_ref().map(PalRoleRefSet::from_pass2),
+            pal_proposed_primary,
+            ..raw()
+        }
     }
 
     #[test]
@@ -5061,7 +6075,9 @@ mod tests {
         let registration = Some("Reg_Winner".to_string());
         let token = vec![(0x3c2a, "■format♦tok■domain♦D".into())];
         let ident = Some(("StringRef_Guess".to_string(), name_guess::Class::FnName));
-        let pal = Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]));
+        let pal_application = pal_app("pal_TaskEntry_alpha", &[("alpha", 0)]);
+        let pal = Some(PalRoleRefSet::from_pass2(&pal_application));
+        let pal_proposed_primary = Some("pal_TaskEntry_alpha".to_string());
 
         let (name, tier, _, _, _) = decide(
             "40e1bff4",
@@ -5071,6 +6087,7 @@ mod tests {
                 tokens: token.clone(),
                 ident_guess: ident.clone(),
                 pal: pal.clone(),
+                pal_proposed_primary: pal_proposed_primary.clone(),
                 ..raw()
             },
         );
@@ -5084,6 +6101,7 @@ mod tests {
                 tokens: token.clone(),
                 ident_guess: ident,
                 pal: pal.clone(),
+                pal_proposed_primary: pal_proposed_primary.clone(),
                 ..raw()
             },
         );
@@ -5096,6 +6114,7 @@ mod tests {
                 tokens: token,
                 ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
                 pal,
+                pal_proposed_primary,
                 ..raw()
             },
         );
@@ -5188,8 +6207,7 @@ mod tests {
         // Token guesses must not rename a shared task entry.
         let r = RawEvidence {
             tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
-            pal: Some(shared),
-            ..raw()
+            ..raw_with_pal(Some(shared))
         };
         let (name, tier, _, _, _) = decide("40e1bff4", &r);
         assert!(
@@ -5200,11 +6218,10 @@ mod tests {
         // A stronger rank still wins over the shared role blocker.
         let r = RawEvidence {
             func_name: Some("Func_Winner".into()),
-            pal: Some(pal_app(
+            ..raw_with_pal(Some(pal_app(
                 "pal_TaskEntry_shared_40010430",
                 &[("delta_one", 3), ("delta_two", 4)],
-            )),
-            ..raw()
+            )))
         };
         let (name, tier, _, _, _) = decide("40e1bff4", &r);
         assert_eq!(name.as_deref(), Some("Func_Winner"));
@@ -5215,8 +6232,7 @@ mod tests {
     fn pal_annotation_survives_stronger_rename() {
         let r = RawEvidence {
             func_name: Some("Func_Winner".into()),
-            pal: Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])),
-            ..raw()
+            ..raw_with_pal(Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])))
         };
         let (name, _, _, ann, _) = decide("40e1bff4", &r);
         assert_eq!(name.as_deref(), Some("Func_Winner"));
@@ -5231,8 +6247,7 @@ mod tests {
         let r = RawEvidence {
             tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
             ident_guess: Some(("Other".into(), name_guess::Class::FnName)),
-            pal: Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])),
-            ..raw()
+            ..raw_with_pal(Some(pal_app("pal_TaskEntry_alpha", &[("alpha", 0)])))
         };
         let (name, tier, _, _, _) = decide("40e1bff4", &r);
         assert_eq!(name.as_deref(), Some("pal_TaskEntry_alpha"));
@@ -5843,9 +6858,20 @@ mod tests {
     }
 
     fn exception_build_map_tree(tag: &str, decode_isa: &str, name: &str) -> PathBuf {
-        let root = map_fixture_tree(tag);
+        let parent = tmp(&format!(
+            "pme_sym_exception_final_{tag}_{}",
+            std::process::id()
+        ));
+        let root = parent.join("00_BOOT");
+        std::fs::create_dir_all(root.join("decompiled")).unwrap();
         let image = exception_fixture_image();
         std::fs::write(root.join("00_BOOT.bin"), &image).unwrap();
+        std::fs::create_dir(root.join("exception_roots")).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exception_roots/roots.json"),
+            root.join("exception_roots/roots.json"),
+        )
+        .unwrap();
         let entry = 0x4001_0220u32;
         let instruction_size = if decode_isa == "thumb" { 2 } else { 4 };
         let start = (entry - EXCEPTION_TEST_BASE) as usize;
@@ -5875,6 +6901,459 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    fn standalone_exception_tree(tag: &str) -> (PathBuf, PathBuf) {
+        let staged = exception_build_map_tree(tag, "thumb", "UndefinedInstruction");
+        let root = staged.parent().unwrap().to_path_buf();
+        let manifest = std::fs::read(staged.join("manifest.json")).unwrap();
+        std::fs::remove_file(staged.join("manifest.json")).unwrap();
+        std::fs::create_dir(root.join("images")).unwrap();
+        let image_dir = root.join("images/00_BOOT");
+        std::fs::rename(&staged, &image_dir).unwrap();
+        std::fs::write(root.join("manifest.json"), manifest).unwrap();
+        (root, image_dir)
+    }
+
+    fn add_same_entry_thumb_producers(root: &Path, image: &[u8]) {
+        let entry = 0x4001_0220u32;
+        let mut artifact = std::str::from_utf8(
+            crate::thumb_analysis::ParsedThumbArtifact::future_multi_run_v3_fixture(),
+        )
+        .unwrap()
+        .to_string();
+        for (from, to) in [
+            ("0x1000", format!("0x{entry:x}")),
+            ("0x1002", format!("0x{:x}", entry + 2)),
+            ("0x1010", format!("0x{:x}", entry + 0x10)),
+            ("0x1080", format!("0x{:x}", entry + 0x80)),
+            ("0x1090", format!("0x{:x}", entry + 0x90)),
+            ("0x1100", format!("0x{:x}", entry + 0x100)),
+            ("00001000", format!("{entry:08x}")),
+        ] {
+            artifact = artifact.replace(from, &to);
+        }
+        let offset = usize::try_from(entry - EXCEPTION_TEST_BASE).unwrap();
+        artifact = artifact.replacen(
+            "1ad48f49627079d806b802c74f40c39d55fe1d78b3faf0f8017aec62cec42122",
+            &crate::manifest::blake3_bytes(&image[offset..offset + 2]),
+            1,
+        );
+        let repeated = "e572dff82304700b856a555ac3a4558d0df3646a3727816500270a93c66aac1e";
+        artifact = artifact.replacen(
+            repeated,
+            &crate::manifest::blake3_bytes(&image[offset..offset + 0x10]),
+            1,
+        );
+        artifact = artifact.replacen(
+            repeated,
+            &crate::manifest::blake3_bytes(&image[offset + 0x80..offset + 0x90]),
+            1,
+        );
+        std::fs::write(root.join("decompiled/thumb_functions.json"), artifact).unwrap();
+    }
+
+    #[test]
+    fn final_artifact_keeps_authenticated_exception_and_pal_evidence() {
+        let root =
+            exception_build_map_tree("final_exception_evidence", "thumb", "UndefinedInstruction");
+        let image = exception_fixture_image();
+        let runtime = runtime_for(&image, EXCEPTION_TEST_BASE);
+        let context = role_evidence::CurrentSymbolicationContext::from_retained(
+            &root,
+            "00_BOOT",
+            "BOOT",
+            EXCEPTION_TEST_BASE,
+        )
+        .unwrap();
+
+        let symbols = build_final_map_from_runtime(
+            &root,
+            &HashMap::new(),
+            &image,
+            u64::from(EXCEPTION_TEST_BASE),
+            &runtime,
+            context.roles(),
+        )
+        .unwrap();
+        let symbol = symbols
+            .iter()
+            .find(|symbol| symbol.address == "0x40010220")
+            .unwrap();
+
+        assert_eq!(symbol.name.as_deref(), Some("UndefinedInstruction"));
+        assert_eq!(symbol.tier, Tier::Recovered);
+        assert!(symbol.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaggedEvidence::ExceptionRoot {
+                role: "undefined_instruction",
+                ..
+            }
+        )));
+
+        let (_pal_root, pal_dir) = role_evidence::retained_pal_fixture_tree(false);
+        let pal_image = std::fs::read(pal_dir.join("02_MAIN.bin")).unwrap();
+        let pal_context = role_evidence::CurrentSymbolicationContext::from_retained(
+            &pal_dir,
+            "02_MAIN",
+            "MAIN",
+            crate::pal_tasks::test_support::BASE,
+        )
+        .unwrap();
+        let application = &pal_context.roles().pal().present().unwrap().applications()[0];
+        assert_eq!(application.isa(), DecodeIsa::Thumb);
+        let entry = application.entry();
+        let start = usize::try_from(entry - crate::pal_tasks::test_support::BASE).unwrap();
+        std::fs::create_dir(pal_dir.join("decompiled")).unwrap();
+        let mut record = ghidra_function_in_image(
+            application.desired_primary(),
+            entry,
+            entry + 2,
+            &[],
+            &pal_image,
+            crate::pal_tasks::test_support::BASE,
+        );
+        record["primary_source"] = serde_json::json!("analysis");
+        record["decode_ranges"][0]["isa"] = serde_json::json!("thumb");
+        record["decode_ranges"][0]["blake3"] =
+            serde_json::json!(crate::manifest::blake3_bytes(&pal_image[start..start + 2]));
+        write_map_functions(&pal_dir, &[record]);
+
+        let pal_symbols = build_final_map_from_runtime(
+            &pal_dir,
+            &HashMap::new(),
+            &pal_image,
+            u64::from(crate::pal_tasks::test_support::BASE),
+            &runtime_for(&pal_image, crate::pal_tasks::test_support::BASE),
+            pal_context.roles(),
+        )
+        .unwrap();
+        let pal_symbol = pal_symbols
+            .iter()
+            .find(|symbol| symbol.address == format!("0x{entry:08x}"))
+            .unwrap();
+        assert_eq!(pal_symbol.name.as_deref(), Some("pal_TaskEntry_first_task"));
+        assert!(pal_symbol.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaggedEvidence::PalTask { task } if task.name == "first_task"
+        )));
+    }
+
+    #[test]
+    fn standalone_reauthenticates_retained_role_artifacts() {
+        let (root, image_dir) = standalone_exception_tree("standalone_reauthenticate");
+        let opts = Opts {
+            token_db: None,
+            rewrite_decompiled_c: false,
+        };
+
+        run(&root, &opts).unwrap();
+        let symbols_path = image_dir.join("decompiled/symbols.json");
+        let first = std::fs::read(&symbols_path).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert!(
+            artifact["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| {
+                    symbol["evidence"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|evidence| {
+                            evidence["kind"] == "exception_root"
+                                && evidence["role"] == "undefined_instruction"
+                        })
+                })
+        );
+
+        run(&root, &opts).unwrap();
+        assert_eq!(std::fs::read(symbols_path).unwrap(), first);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_idempotent_replay_opens_no_atomic_writer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (root, image_dir) = standalone_exception_tree("standalone_read_only_replay");
+        let decompiled = image_dir.join("decompiled");
+        std::fs::write(
+            decompiled.join("decompiled.c"),
+            "void UndefinedInstruction(void) {}\n",
+        )
+        .unwrap();
+        std::fs::write(decompiled.join("disasm.lst"), "0x40010220: 4770 bx lr\n").unwrap();
+        let opts = Opts {
+            token_db: None,
+            rewrite_decompiled_c: true,
+        };
+        run(&root, &opts).unwrap();
+        let before = std::fs::read_dir(&decompiled)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    std::fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let original_mode = std::fs::metadata(&decompiled).unwrap().permissions().mode();
+        std::fs::set_permissions(&decompiled, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = run(&root, &opts);
+
+        std::fs::set_permissions(&decompiled, std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+        result.expect("an idempotent replay must not require a writable artifact directory");
+        let after = std::fs::read_dir(&decompiled)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    std::fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(after, before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_pruned_tree_fails_before_any_mutation() {
+        let (root, image_dir) = standalone_exception_tree("standalone_pruned");
+        let decompiled = image_dir.join("decompiled");
+        for (name, bytes) in [
+            ("thumb_functions.json", b"THUMB".as_slice()),
+            ("decompiled.c", b"DECOMPILED".as_slice()),
+            ("disasm.lst", b"DISASM".as_slice()),
+            ("symbols.json", b"SYMBOLS".as_slice()),
+        ] {
+            std::fs::write(decompiled.join(name), bytes).unwrap();
+        }
+        let watched = [
+            "functions.json",
+            "thumb_functions.json",
+            "decompiled.c",
+            "disasm.lst",
+            "symbols.json",
+        ];
+        let before = watched
+            .iter()
+            .map(|name| (*name, std::fs::read(decompiled.join(name)).unwrap()))
+            .collect::<Vec<_>>();
+        std::fs::remove_file(image_dir.join("00_BOOT.bin")).unwrap();
+
+        run(
+            &root,
+            &Opts {
+                token_db: None,
+                rewrite_decompiled_c: true,
+            },
+        )
+        .unwrap_err();
+
+        for (name, bytes) in before {
+            assert_eq!(std::fs::read(decompiled.join(name)).unwrap(), bytes);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn final_artifact_uses_actual_primary_and_blocks_weaker_guesses() {
+        let root = exception_build_map_tree(
+            "final_exception_blocker",
+            "thumb",
+            "firmware_native_primary",
+        );
+        let image = exception_fixture_image();
+        let runtime = runtime_for(&image, EXCEPTION_TEST_BASE);
+        let functions_path = root.join("decompiled/functions.json");
+        let mut functions: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&functions_path).unwrap()).unwrap();
+        functions[0]["original_name"] = serde_json::json!("UndefinedInstruction");
+        functions[0]["data_refs"] = serde_json::json!(["0x0"]);
+        std::fs::write(&functions_path, serde_json::to_vec(&functions).unwrap()).unwrap();
+        let context = role_evidence::CurrentSymbolicationContext::from_retained(
+            &root,
+            "00_BOOT",
+            "BOOT",
+            EXCEPTION_TEST_BASE,
+        )
+        .unwrap();
+        let tokens = HashMap::from([(0u32, "■format♦weaker_token_name■domain♦test".to_string())]);
+
+        let symbols = build_final_map_from_runtime(
+            &root,
+            &tokens,
+            &image,
+            u64::from(EXCEPTION_TEST_BASE),
+            &runtime,
+            context.roles(),
+        )
+        .unwrap();
+        let symbol = symbols
+            .iter()
+            .find(|symbol| symbol.address == "0x40010220")
+            .unwrap();
+
+        assert!(symbol.name.is_none());
+        assert_eq!(symbol.original_name, "UndefinedInstruction");
+        assert_eq!(symbol.tier, Tier::None);
+        assert!(symbol.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaggedEvidence::ExceptionRoot {
+                role: "undefined_instruction",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn final_artifact_attaches_roles_to_each_exact_owner_entry_and_isa() {
+        let root =
+            exception_build_map_tree("final_exception_owner_isa", "thumb", "UndefinedInstruction");
+        let image = exception_fixture_image();
+        add_same_entry_thumb_producers(&root, &image);
+        let runtime = runtime_for(&image, EXCEPTION_TEST_BASE);
+        let context = role_evidence::CurrentSymbolicationContext::from_retained(
+            &root,
+            "00_BOOT",
+            "BOOT",
+            EXCEPTION_TEST_BASE,
+        )
+        .unwrap();
+
+        let symbols = build_final_map_from_runtime(
+            &root,
+            &HashMap::new(),
+            &image,
+            u64::from(EXCEPTION_TEST_BASE),
+            &runtime,
+            context.roles(),
+        )
+        .unwrap();
+        let matching = symbols
+            .iter()
+            .filter(|symbol| symbol.address == "0x40010220")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            3,
+            "owners/addresses: {:?}",
+            symbols
+                .iter()
+                .map(|symbol| (symbol.owner, symbol.address.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(matching[0].owner, FunctionOwner::Ghidra);
+        assert_eq!(
+            matching[1].owner,
+            FunctionOwner::Run {
+                producer: Tool::Radare2,
+                region_index: 0,
+                run_index: 0,
+            }
+        );
+        assert_eq!(
+            matching[2].owner,
+            FunctionOwner::Run {
+                producer: Tool::Rizin,
+                region_index: 0,
+                run_index: 1,
+            }
+        );
+        assert!(
+            matching
+                .iter()
+                .all(|symbol| symbol.execution_blake3.is_some())
+        );
+        assert_eq!(matching[0].execution_blake3, matching[1].execution_blake3);
+        assert_ne!(matching[1].execution_blake3, matching[2].execution_blake3);
+        assert!(
+            matching
+                .iter()
+                .all(|symbol| symbol.evidence.iter().any(|evidence| matches!(
+                    evidence,
+                    TaggedEvidence::ExceptionRoot {
+                        role: "undefined_instruction",
+                        ..
+                    }
+                )))
+        );
+
+        let arm_root =
+            exception_build_map_tree("final_exception_owner_isa_mismatch", "arm", "FUN_40010220");
+        let arm_context = role_evidence::CurrentSymbolicationContext::from_retained(
+            &arm_root,
+            "00_BOOT",
+            "BOOT",
+            EXCEPTION_TEST_BASE,
+        )
+        .unwrap();
+        let arm_symbols = build_final_map_from_runtime(
+            &arm_root,
+            &HashMap::new(),
+            &image,
+            u64::from(EXCEPTION_TEST_BASE),
+            &runtime,
+            arm_context.roles(),
+        )
+        .unwrap();
+        assert!(arm_symbols.iter().all(|symbol| {
+            !symbol
+                .evidence
+                .iter()
+                .any(|evidence| matches!(evidence, TaggedEvidence::ExceptionRoot { .. }))
+        }));
+    }
+
+    #[test]
+    fn pass2_role_attachment_comes_from_immutable_evidence() {
+        let root = exception_build_map_tree(
+            "pass2_immutable_exception_evidence",
+            "thumb",
+            "UndefinedInstruction",
+        );
+        let image = exception_fixture_image();
+        let runtime = runtime_for(&image, EXCEPTION_TEST_BASE);
+        let context = role_evidence::CurrentSymbolicationContext::from_retained(
+            &root,
+            "00_BOOT",
+            "BOOT",
+            EXCEPTION_TEST_BASE,
+        )
+        .unwrap();
+
+        let symbols = build_map_from_runtime(
+            &root,
+            &HashMap::new(),
+            &image,
+            u64::from(EXCEPTION_TEST_BASE),
+            &runtime,
+            context.roles(),
+            SymbolBuildPurpose::Pass2 {
+                exception_application: None,
+                pal_application: None,
+            },
+        )
+        .unwrap();
+        let symbol = symbols
+            .iter()
+            .find(|symbol| symbol.address == "0x40010220")
+            .unwrap();
+        assert!(symbol.name.is_none());
+        assert!(symbol.evidence.iter().any(|evidence| matches!(
+            evidence,
+            TaggedEvidence::ExceptionRoot {
+                role: "undefined_instruction",
+                ..
+            }
+        )));
     }
 
     /// Two-entry fixture: writes functions.json, derives each execution

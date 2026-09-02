@@ -6,6 +6,112 @@ use pixel_modem_extractor::{decompile, decompose};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+fn assert_final_role_evidence(image_dir: &Path, relative: &str, kind: &str) -> bool {
+    let manifest = image_dir.join(relative);
+    if !manifest.is_file() {
+        return false;
+    }
+    let manifest_blake3 = blake3::hash(&std::fs::read(&manifest).unwrap()).to_string();
+    let symbols_path = image_dir.join("decompiled/symbols.json");
+    if !symbols_path.is_file() {
+        return true;
+    }
+    let symbols: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&symbols_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", symbols_path.display())),
+    )
+    .unwrap();
+    assert!(
+        symbols["symbols"].as_array().unwrap().iter().any(|symbol| {
+            symbol["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|evidence| {
+                    if evidence["kind"] != kind {
+                        return false;
+                    }
+                    if kind == "pal_task" {
+                        evidence["task"]["manifest_blake3"].as_str() == Some(&manifest_blake3)
+                    } else {
+                        evidence["manifest_blake3"].as_str() == Some(&manifest_blake3)
+                    }
+                })
+        }),
+        "{kind} evidence bound to {} is absent from {}",
+        manifest.display(),
+        symbols_path.display()
+    );
+    true
+}
+
+fn report_claims_role_manifests(report: &serde_json::Value, stage_name: &str) -> bool {
+    report["stages"].as_array().is_some_and(|stages| {
+        stages.iter().any(|stage| {
+            stage["stage"] == stage_name
+                && stage["status"] == "ok"
+                && stage["output"].as_str().is_some_and(|output| {
+                    output.contains("images=") && output_count_field(output, "images=") > 0
+                })
+        })
+    })
+}
+
+#[test]
+fn final_symbols_retain_authenticated_role_evidence() {
+    let Some(root) = std::env::var_os("PME_GOLDEN_DIR").map(PathBuf::from) else {
+        eprintln!("skip: set PME_GOLDEN_DIR");
+        return;
+    };
+    let report_path = root.join("report.json");
+    if !report_path.is_file() {
+        eprintln!("skip: PME_GOLDEN_DIR/report.json not found");
+        return;
+    }
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    let pruned = report["pruned"].as_bool().unwrap_or(false);
+    let mut exception_manifests = 0usize;
+    let mut pal_manifests = 0usize;
+    for entry in std::fs::read_dir(root.join("images")).unwrap() {
+        let image_dir = entry.unwrap().path();
+        if !image_dir.is_dir() {
+            continue;
+        }
+        exception_manifests += usize::from(assert_final_role_evidence(
+            &image_dir,
+            "exception_roots/roots.json",
+            "exception_root",
+        ));
+        pal_manifests += usize::from(assert_final_role_evidence(
+            &image_dir,
+            "pal_tasks/tasks.json",
+            "pal_task",
+        ));
+        if pruned && image_dir.join("decompiled/symbols.json").is_file() {
+            let label = image_dir.file_name().unwrap().to_str().unwrap();
+            assert!(
+                !image_dir.join(format!("{label}.bin")).exists(),
+                "pruned tree retained raw image {}",
+                image_dir.display()
+            );
+        }
+    }
+    for (stage, kind, manifests) in [
+        ("exception_roots", "exception-root", exception_manifests),
+        ("pal_tasks", "PAL", pal_manifests),
+    ] {
+        assert!(
+            manifests > 0 || !report_claims_role_manifests(&report, stage),
+            "report claims current {kind} manifests but none exist under {}",
+            root.display()
+        );
+    }
+    if exception_manifests == 0 && pal_manifests == 0 {
+        eprintln!("skip: retained tree predates terminal role manifests");
+    }
+}
+
 #[test]
 fn decompose_produces_unified_tree() {
     let Some(img) = std::env::var_os("PME_RADIO_IMG").map(PathBuf::from) else {

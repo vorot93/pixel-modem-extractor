@@ -443,6 +443,15 @@ pub fn read_exception_pass2_context(
 pub(crate) fn read_exception_pass2_context_exact(
     input: ExceptionPass2ContextExactInput<'_, '_>,
 ) -> Result<ExceptionPass2Context> {
+    read_exception_pass2_context_exact_with_validated(input).map(|(context, _)| context)
+}
+
+pub(crate) fn read_exception_pass2_context_exact_with_validated(
+    input: ExceptionPass2ContextExactInput<'_, '_>,
+) -> Result<(
+    ExceptionPass2Context,
+    exception_roots::ValidatedExceptionRoots,
+)> {
     let (image_base, image_size) = input.runtime.image_bounds();
     let image_blake3 = input.runtime.hash_range(image_base, image_size)?;
     let validated = exception_roots::read_bytes_with_identity(
@@ -456,7 +465,8 @@ pub(crate) fn read_exception_pass2_context_exact(
         },
         input.expected_identity,
     )?;
-    context_from_validated(&validated, input.applied)
+    let context = context_from_validated(&validated, input.applied)?;
+    Ok((context, validated))
 }
 
 fn context_from_validated(
@@ -1264,7 +1274,8 @@ fn test_fixture_summary(identity: &str, state: TestExceptionContextState) -> Str
 mod tests {
     use super::*;
     use crate::symbolicate::{
-        PalApplicationRef, PalTaskRef, RawEvidence, TaggedEvidence, Tier, decide,
+        ExceptionRoleRefSet, PalApplicationRef, PalRoleRefSet, PalTaskRef, RawEvidence,
+        TaggedEvidence, Tier, decide,
     };
 
     const IDENTITY: &str =
@@ -1275,6 +1286,10 @@ mod tests {
     }
 
     fn raw_exception(manifest_blake3: &str, application: ExceptionApplicationRef) -> RawEvidence {
+        let exception_proposed_primary = application
+            .proposes_exception_primary()
+            .then(|| application.desired_primary().map(str::to_owned))
+            .flatten();
         RawEvidence {
             func_name: None,
             tokens: Vec::new(),
@@ -1284,8 +1299,10 @@ mod tests {
             ident_guess: None,
             registration: None,
             exception_manifest_blake3: Some(manifest_blake3.to_string()),
-            exception: Some(application),
+            exception: Some(ExceptionRoleRefSet::from_pass2(&application)),
+            exception_proposed_primary,
             pal: None,
+            pal_proposed_primary: None,
         }
     }
 
@@ -1323,10 +1340,9 @@ mod tests {
         );
 
         let mut with_pal = raw_exception(context.manifest_blake3(), application.clone());
-        with_pal.pal = Some(PalApplicationRef {
+        let pal = PalApplicationRef {
             isa: "arm",
             desired_primary: "pal_TaskEntry_reset".into(),
-            applied: true,
             tasks: vec![PalTaskRef {
                 manifest_blake3: "b".repeat(64),
                 task_index: 0,
@@ -1335,7 +1351,9 @@ mod tests {
                 priority: 1,
                 stack_size: 1024,
             }],
-        });
+        };
+        with_pal.pal = Some(PalRoleRefSet::from_pass2(&pal));
+        with_pal.pal_proposed_primary = Some(pal.desired_primary);
         assert_eq!(decide("40010200", &with_pal).0.as_deref(), Some("Reset"));
 
         let mut with_token = raw_exception(context.manifest_blake3(), application);

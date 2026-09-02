@@ -334,6 +334,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `thumb_analysis/rizin.rs` | Rizin command profile, inventory aliases/bounds, trailing `axlj` streaming, filtering, and range assignment |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
+| `symbolicate/role_evidence.rs` | Bounded immutable exception/PAL role projection, explicit artifact state, and strict retained/current runtime reauthentication |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
 | `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by Ghidra, both Thumb backends, and `global_shapes` |
 | `global_shapes/mod.rs` | Phase 3.2 per-image coordinator: one-function decode/track/aggregate, panic containment, atomic sidecar commit |
@@ -394,11 +395,23 @@ module; when a file outgrows that, split it.
   exception/PAL manifests stage once. It snapshots pass-2 inputs, not final pass-2 outputs, and is
   not deferred until `DispatchPass2`.
   Both opaque application contexts derive from that snapshot's single `RuntimeImage`; failed
-  construction returns no object. `Pass2Input` owns an `Arc` to the snapshot plus typed function,
-  global, and global-type maps. A function map must match the snapshot's original raw digest and full
-  terminal binding. After stale export invalidation, `run_two_pass` validates the kit-root binding,
-  raw/scatter/manifests, contexts, and maps immediately before constructing argv and spawning, with no
-  intervening filesystem mutation. Path existence never establishes currentness.
+  construction returns no object. The snapshot and every normal/no-symbol finalizer share the same
+  `Arc<CurrentSymbolicationContext>` produced from terminal marshalling; no later phase reconstructs
+  immutable role facts from application disposition. `Pass2Input` owns an `Arc` to the snapshot plus
+  typed function, global, and global-type maps. A function map must match the snapshot's original raw
+  digest and full terminal binding. After stale export invalidation, `run_two_pass` validates the
+  kit-root binding, raw/scatter/manifests, contexts, and maps immediately before constructing argv and
+  spawning, with no intervening filesystem mutation. Path existence never establishes currentness.
+- **Final symbolication stays inside the retained image capability.** Context validation passes the
+  retained image directory into final symbol construction, and every `decompiled/` / `source_tree/`
+  read plus every function/text/symbol atomic write is relative to that capability. A second image-path
+  identity check runs after the callback: an ancestor namespace swap can mutate only the detached
+  retained tree and makes the stage non-current; it never redirects a write into the replacement tree.
+  Trusted streaming mutation first validates and detects change into a sink, then creates an atomic
+  writer only for a real change; rewritten text and serialized `symbols.json` likewise compare exact
+  terminal bytes before opening a writer. This is required on Unix, where safely abandoning an
+  already-created staging name is impossible under the retained-directory threat model and would
+  leave no-op residue. An idempotent standalone replay therefore needs no directory write permission.
 
 ### Architectural exception roots
 
@@ -1164,7 +1177,18 @@ hardcoded. Two reference images exercise both models end-to-end:
   image (`images/<label>/<label>.bin`), so the `decompose` stage runs before
   `--prune`. It rewrites in place **idempotently** — a sentinel guards `.c`/`.lst`, an
   `original_name` key guards the JSONs, and the loaders prefer `original_name` on a re-run
-  (so `symbols.json` provenance stays stable); preserve this if you touch the rewrite path.
+  (so `symbols.json` provenance stays stable); `symbols.json.inputs.functions_json_blake3` is
+  captured after the function rewrite and therefore names the terminal companion bytes, not the
+  pre-rewrite input. Preserve that ordering if you touch the rewrite path.
+  Final exception/PAL evidence comes only from the bounded immutable strict-reader projection and
+  attaches by exact entry plus decode ISA independently for each function owner. Public standalone
+  `symbolicate` constructs and validates every eligible image context before its first mutation; it
+  requires the raw image and any managed scatter/role artifacts. A pruned tree intentionally lacks
+  those raw authentication bytes, so replay fails before mutation while the already-finalized typed
+  evidence in retained `symbols.json` remains authoritative. PAL's current-run summary is aggregate
+  only and never supplies per-record `applied` state: pass-2 ownership exists only for a Ghidra record
+  whose actual current primary exactly equals the authenticated PAL desired primary. A preserved
+  foreign primary therefore keeps role evidence but cannot unlock a registration rename.
   Name substitution in the rewrite is **whole-identifier** (`[A-Za-z0-9_]+` match +
   exact-key lookup), not `str::replace` — `FUN_10` must never fire inside `FUN_100`; the
   `apply_rename_map_does_not_substring_match` test is the regression sentinel. The token
