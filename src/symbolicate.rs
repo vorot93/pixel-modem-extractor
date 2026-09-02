@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 pub mod name_guess;
 pub mod reg_table;
+#[allow(dead_code)] // Task 1 defines the model; the following tasks wire its consumers.
+pub(crate) mod role_evidence;
 pub use crate::decompile::ExceptionPass2Context;
 
 pub const GUESS_PREFIX: &str = "guess_";

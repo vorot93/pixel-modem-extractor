@@ -17,6 +17,7 @@ use crate::pal_tasks::{
     TaskPlan, TaskRecord, TaskTable, TerminalRecord,
 };
 use crate::runtime_image::{RuntimeImage, StorageKind, StorageSpan};
+use crate::trusted_fs::{TrustedDirectory, validate_relative_path};
 use atomic_write_file::AtomicWriteFile;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -1672,6 +1673,24 @@ pub(crate) fn read(
     expected: TaskArtifactContext<'_>,
 ) -> Result<ValidatedTaskArtifact> {
     let mut file = open_manifest_file(path)?;
+    let bytes = read_manifest_bytes(&mut file)?;
+    read_bytes(&bytes, runtime, expected)
+}
+
+pub(crate) fn read_from_trusted(
+    root: &TrustedDirectory,
+    manifest_relative: &Path,
+    runtime: &RuntimeImage<'_>,
+    expected: TaskArtifactContext<'_>,
+) -> Result<ValidatedTaskArtifact> {
+    validate_relative_path(manifest_relative, "PAL task manifest")
+        .map_err(|error| invalid(error.to_string()))?;
+    if manifest_relative.file_name().and_then(|name| name.to_str()) != Some(ARTIFACT_FILE_NAME) {
+        return Err(invalid("manifest file name is not tasks.json"));
+    }
+    let (mut file, _parent) = root
+        .open_regular_file_with_parent(manifest_relative, "PAL task manifest")
+        .map_err(|error| invalid(error.to_string()))?;
     let bytes = read_manifest_bytes(&mut file)?;
     read_bytes(&bytes, runtime, expected)
 }
