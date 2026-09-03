@@ -109,8 +109,7 @@ fn collect_semantic_refs(
         Some(span),
     ) {
         Ok(cfg) => cfg,
-        Err(error) if is_unsupported_cfg_encoding(&error) => return Ok(()),
-        Err(error) => return Err(cfg_error(error, first.isa)),
+        Err(_) => return Ok(()),
     };
     let function = OwnedExecutionIdentity {
         owner: record.owner,
@@ -665,8 +664,7 @@ fn collect_compiler_sites(
         window,
     ) {
         Ok(cfg) => cfg,
-        Err(error) if is_unsupported_cfg_encoding(&error) => return Ok(()),
-        Err(error) => return Err(cfg_error(error, isa)),
+        Err(_) => return Ok(()),
     };
     for pc in cfg.reachable() {
         let Some(instruction) = cfg.instructions().get(pc) else {
@@ -906,14 +904,6 @@ fn identity_isa(function: &OwnedExecutionIdentity) -> Option<DecodeIsa> {
         .decode_ranges
         .first()
         .map(|range| range.isa)
-}
-
-fn is_unsupported_cfg_encoding(error: &SemanticCfgError) -> bool {
-    matches!(
-        error,
-        SemanticCfgError::InvalidFlow { reason, .. }
-            if reason == "IT blocks are not supported by direct-edge traversal"
-    )
 }
 
 fn cfg_error(error: SemanticCfgError, isa: DecodeIsa) -> StartupMetadataError {
@@ -1409,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn cfg_resource_limit_during_refs_fails_the_image() {
+    fn cfg_resource_limit_during_refs_skips_the_function() {
         const SPAN: usize = 64 * 1024 + 4;
         let mut image = vec![0u8; SPAN + 32];
         for chunk in image[..SPAN].as_chunks_mut::<4>().0 {
@@ -1418,13 +1408,40 @@ mod tests {
         let string_start = plant_seed(&mut image, SPAN);
         let runtime = runtime(&image);
         let record = accepted_arm(&runtime, BASE, BASE + SPAN as u32);
-        match semantic_refs(&runtime, &[record], string_start) {
-            Err(StartupMetadataError::ResourceLimit { what, limit, .. }) => {
-                assert_eq!(what, "charged bytes");
-                assert_eq!(limit, 64 * 1024);
-            }
-            other => panic!("expected ResourceLimit, got {other:?}"),
+        assert_eq!(
+            semantic_refs(&runtime, std::slice::from_ref(&record), string_start)
+                .expect("oversized CFG is skipped"),
+            []
+        );
+        assert_eq!(
+            prove_hardware_init(
+                &runtime,
+                std::slice::from_ref(&record),
+                Some((BASE, DecodeIsa::Arm))
+            )
+            .expect("only oversized ref is absence"),
+            Section::Absent
+        );
+    }
+
+    #[test]
+    fn cfg_resource_limit_during_refs_does_not_drop_other_refs() {
+        const SPAN: usize = 64 * 1024 + 4;
+        let mut image = vec![0u8; SPAN + 0x40];
+        for chunk in image[..SPAN].as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&0xe1a0_0000u32.to_le_bytes());
         }
+        let hw_off = SPAN;
+        image[hw_off..hw_off + 4].copy_from_slice(&A32_ADD_R0_PC_8);
+        image[hw_off + 4..hw_off + 8].copy_from_slice(&A32_BX_LR);
+        let string_start = plant_seed(&mut image, hw_off + 0x10);
+        let runtime = runtime(&image);
+        let huge = accepted_arm(&runtime, BASE, BASE + SPAN as u32);
+        let hw = accepted_arm(&runtime, BASE + hw_off as u32, BASE + hw_off as u32 + 8);
+        let refs = semantic_refs(&runtime, &[huge, hw], string_start)
+            .expect("oversized sibling is skipped");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].function.identity.entry, BASE + hw_off as u32);
     }
 
     #[test]
@@ -1506,6 +1523,29 @@ mod tests {
                 .expect("reset-reachable unique ref"),
             Section::Present(expected)
         );
+    }
+
+    #[test]
+    fn hw_init_reset_walk_resource_limit_still_fails() {
+        const SPAN: usize = 64 * 1024 + 4;
+        let mut image = vec![0u8; SPAN + 0x40];
+        for chunk in image[..SPAN].as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&0xe1a0_0000u32.to_le_bytes());
+        }
+        let hw_off = SPAN;
+        image[hw_off..hw_off + 4].copy_from_slice(&A32_ADD_R0_PC_8);
+        image[hw_off + 4..hw_off + 8].copy_from_slice(&A32_BX_LR);
+        plant_seed(&mut image, hw_off + 0x10);
+        let runtime = runtime(&image);
+        let reset = accepted_arm(&runtime, BASE, BASE + SPAN as u32);
+        let hw = accepted_arm(&runtime, BASE + hw_off as u32, BASE + hw_off as u32 + 8);
+        match prove_hardware_init(&runtime, &[reset, hw], Some((BASE, DecodeIsa::Arm))) {
+            Err(StartupMetadataError::ResourceLimit { what, limit, .. }) => {
+                assert_eq!(what, "charged bytes");
+                assert_eq!(limit, 64 * 1024);
+            }
+            other => panic!("expected reset-walk ResourceLimit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1799,6 +1839,38 @@ mod tests {
             prove_compiler(&runtime, &[caller]).expect("unique agreeing callsite"),
             Section::Present(expected)
         );
+    }
+
+    #[test]
+    fn compiler_skips_oversized_cfg_and_keeps_a_later_callsite() {
+        const SPAN: usize = 64 * 1024 + 4;
+        let mut image = vec![0u8; SPAN + 0x40];
+        for chunk in image[..SPAN].as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&0xe1a0_0000u32.to_le_bytes());
+        }
+        let call_off = SPAN;
+        let string_start = plant_cstr(&mut image, call_off + 0x20, SEED_RVCT);
+        plant_rvct_call(
+            &mut image,
+            call_off,
+            string_start,
+            RVCT_OPERAND,
+            BASE + call_off as u32 + 0x30,
+        );
+        let runtime = runtime(&image);
+        let huge = accepted_arm(&runtime, BASE, BASE + SPAN as u32);
+        let caller = accepted_arm(
+            &runtime,
+            BASE + call_off as u32,
+            BASE + call_off as u32 + RVCT_CALL_LEN,
+        );
+        match prove_compiler(&runtime, &[huge, caller]) {
+            Ok(Section::Present(meta)) => {
+                assert_eq!(meta.format_address, string_start);
+                assert_eq!(meta.callsite_pc, BASE + call_off as u32 + 12);
+            }
+            other => panic!("expected Present after skipping oversized CFG, got {other:?}"),
+        }
     }
 
     #[test]
