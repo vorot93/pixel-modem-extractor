@@ -3665,6 +3665,10 @@ impl Pass2Input {
         self.function_map.is_some() || self.global_map.is_some() || self.global_types_map.is_some()
     }
 
+    pub(crate) fn should_schedule(&self) -> bool {
+        self.has_maps() || self.terminal.startup_identity() != "none"
+    }
+
     fn pal_identity_or_none(&self) -> &str {
         self.terminal.pal_identity()
     }
@@ -3778,7 +3782,7 @@ fn headless_process_args(
     let function_map = input.function_map.as_ref();
     let global_map = input.global_map.as_ref();
     let global_types_map = input.global_types_map.as_ref();
-    if !input.has_maps() {
+    if !input.should_schedule() {
         return Ok(None);
     }
 
@@ -3852,27 +3856,45 @@ fn headless_process_args(
         ]);
     }
     if input.terminal.startup_identity() != "none" {
-        let Some(map) = function_map else {
-            return Err(Error::DecomposeIncomplete(
-                "present startup metadata requires retained functions.json".into(),
-            ));
-        };
         let startup_manifest = input.terminal.startup_manifest().ok_or_else(|| {
             Error::DecomposeIncomplete(
                 "a present pass-2 startup identity requires its manifest".into(),
             )
         })?;
+        let (image_blake3, functions_path, functions_blake3) = if let Some(map) = function_map {
+            (
+                map.image_blake3().to_string(),
+                map.functions.path().to_string_lossy().into_owned(),
+                map.functions_blake3().to_string(),
+            )
+        } else {
+            let functions_path = input.terminal.startup_functions_path().ok_or_else(|| {
+                Error::DecomposeIncomplete(
+                    "present startup metadata requires retained functions.json".into(),
+                )
+            })?;
+            let functions_blake3 = input.terminal.startup_functions_blake3().ok_or_else(|| {
+                Error::DecomposeIncomplete(
+                    "present startup metadata requires retained functions.json".into(),
+                )
+            })?;
+            (
+                input.terminal.image_blake3(),
+                functions_path.to_string_lossy().into_owned(),
+                functions_blake3.to_string(),
+            )
+        };
         args.extend([
             "-postScript".to_string(),
             "ApplyStartupMetadata.java".to_string(),
             root.to_string(),
             label.to_string(),
-            map.image_blake3().to_string(),
+            image_blake3,
             input.terminal.startup_identity().to_string(),
             startup_manifest.to_string_lossy().into_owned(),
             scatter_manifest.clone(),
-            map.functions.path().to_string_lossy().into_owned(),
-            map.functions_blake3().to_string(),
+            functions_path,
+            functions_blake3,
         ]);
     }
     if let Some(map) = global_map {
@@ -4575,7 +4597,7 @@ pub fn run_two_pass(
     }
 
     for (label, input) in inputs {
-        if input.has_maps() && !report.images.iter().any(|image| image.label == *label) {
+        if input.should_schedule() && !report.images.iter().any(|image| image.label == *label) {
             outcomes.insert(
                 label.clone(),
                 Pass2ProcessOutcome::Failed("input label absent from pass-1 report".to_string()),
@@ -7700,6 +7722,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 crn: Some(12),
                 crm: Some(0),
                 opcode2: Some(0),
+                register: None,
+                immediate: None,
             }],
             applications: vec![
                 StartupApplication {
@@ -7767,7 +7791,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             symbolication,
         })
         .unwrap();
-        let map_dir = PathBuf::from("target").join("pme_task13_pass2_startup");
+        let map_dir = root.path().join("pass2_maps");
         std::fs::create_dir_all(&map_dir).unwrap();
         let map_path = map_dir.join("map.json");
         let functions_path = map_dir.join("functions.json");
@@ -7845,6 +7869,32 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             args[export_at + 1..=export_at + 12].len(),
             12,
             "ExportDecomp must consume twelve arguments including the startup pair"
+        );
+    }
+
+    #[test]
+    fn headless_process_args_schedules_present_startup_without_maps() {
+        let (_temp, kit, mut input) = pass2_input_with_present_startup();
+        input.function_map = None;
+        let kit_str = kit.to_string_lossy().into_owned();
+        let args = headless_process_args(&kit_str, "02_MAIN", &input)
+            .unwrap()
+            .expect("present startup must invoke pass two without a function map");
+        assert!(
+            args.iter().any(|arg| arg == "ApplyStartupMetadata.java"),
+            "Present startup must run ApplyStartupMetadata"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "ApplyThumbNames.java"),
+            "startup-only pass 2 must not invent ApplyThumbNames"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "ApplySymbols.java"),
+            "startup-only pass 2 must not invent ApplySymbols"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "ExportDecomp.java"),
+            "startup-only pass 2 must still export"
         );
     }
 

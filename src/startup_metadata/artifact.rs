@@ -173,6 +173,8 @@ struct WirePrivilegedOp {
     crn: Option<u8>,
     crm: Option<u8>,
     opcode2: Option<u8>,
+    register: Option<u8>,
+    immediate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -884,6 +886,8 @@ fn wire_privileged_op(op: &PrivilegedOp) -> Result<WirePrivilegedOp> {
         crn: op.crn,
         crm: op.crm,
         opcode2: op.opcode2,
+        register: op.register,
+        immediate: op.immediate,
     })
 }
 
@@ -901,6 +905,8 @@ fn parse_privileged_op(op: WirePrivilegedOp) -> Result<PrivilegedOp> {
         crn: op.crn,
         crm: op.crm,
         opcode2: op.opcode2,
+        register: op.register,
+        immediate: op.immediate,
     })
 }
 
@@ -1271,6 +1277,8 @@ mod tests {
                 crn: Some(12),
                 crm: Some(0),
                 opcode2: Some(0),
+                register: None,
+                immediate: None,
             }],
             applications: vec![
                 StartupApplication {

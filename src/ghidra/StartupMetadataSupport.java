@@ -798,6 +798,10 @@ final class StartupMetadataSupport {
         nullableUnsigned(reader, 255, "privileged_ops.crm");
         name(reader, "opcode2");
         nullableUnsigned(reader, 255, "privileged_ops.opcode2");
+        name(reader, "register");
+        nullableUnsigned(reader, 15, "privileged_ops.register");
+        name(reader, "immediate");
+        nullableUnsigned(reader, PmeScriptSupport.UINT32_MAX, "privileged_ops.immediate");
         reader.endObject();
     }
 

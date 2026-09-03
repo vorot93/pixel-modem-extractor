@@ -1715,11 +1715,20 @@ fn discover_image_startup(
     }
 
     let functions_path = image_dir.join("decompiled/functions.json");
-    if !functions_path.is_file() {
-        return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
-            "missing functions.json",
-        ));
-    }
+    let functions_bytes = match std::fs::read(&functions_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                "missing functions.json",
+            ));
+        }
+        Err(error) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(&format!(
+                "functions.json unreadable: {error}"
+            )));
+        }
+    };
+    let functions_blake3 = *blake3::hash(&functions_bytes).as_bytes();
 
     let raw_path = image_dir.join(format!("{label}.bin"));
     let raw = match std::fs::read(&raw_path) {
@@ -1753,7 +1762,7 @@ fn discover_image_startup(
     };
 
     let streamed =
-        match crate::execution_ranges::read_ghidra_inventory_streaming(&functions_path, &runtime) {
+        match crate::execution_ranges::read_ghidra_inventory_bytes(&functions_bytes, &runtime) {
             Ok(streamed) => streamed,
             Err(error) => {
                 return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
@@ -1763,34 +1772,37 @@ fn discover_image_startup(
         };
     let mut inventories = streamed.inventory.records;
     let thumb_path = image_dir.join("decompiled/thumb_functions.json");
-    let thumb_functions_blake3 = match (image.thumb_functions, thumb_path.is_file()) {
-        (None, false) => None,
-        (None, true) => {
+    let thumb_functions_blake3 = match (image.thumb_functions, std::fs::read(&thumb_path)) {
+        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        (None, Ok(_)) => {
             return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
                 "unexpected thumb_functions.json without a current Thumb inventory",
             ));
         }
-        (Some(_), false) => {
+        (None, Err(error)) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(&format!(
+                "thumb_functions.json unreadable: {error}"
+            )));
+        }
+        (Some(_), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
                 "missing thumb_functions.json",
             ));
         }
-        (Some(substantial), true) => {
-            match crate::thumb_analysis::validate_thumb_inventory_streaming(
-                &thumb_path,
+        (Some(_), Err(error)) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(&format!(
+                "thumb_functions.json unreadable: {error}"
+            )));
+        }
+        (Some(substantial), Ok(bytes)) => {
+            match crate::thumb_analysis::validate_thumb_inventory_bytes(
+                &bytes,
                 &runtime,
                 substantial,
             ) {
                 Ok(validated) => {
                     inventories.extend(validated.inventory.records);
-                    match std::fs::read(&thumb_path) {
-                        Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
-                        Err(error) => {
-                            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
-                                &error.to_string(),
-                            ));
-                        }
-                    }
+                    Some(*blake3::hash(&bytes).as_bytes())
                 }
                 Err(error) => {
                     return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
@@ -1798,15 +1810,6 @@ fn discover_image_startup(
                     ));
                 }
             }
-        }
-    };
-
-    let functions_blake3 = match std::fs::read(&functions_path) {
-        Ok(bytes) => *blake3::hash(&bytes).as_bytes(),
-        Err(error) => {
-            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
-                &error.to_string(),
-            ));
         }
     };
     let toc_name = crate::manifest::toc_name(label);
@@ -3501,6 +3504,12 @@ fn prepare_pass2_inputs(
     labels.extend(function_maps.keys().cloned());
     labels.extend(global_maps.keys().cloned());
     labels.extend(global_types_maps.keys().cloned());
+    labels.extend(
+        snapshots
+            .iter()
+            .filter(|(_, snapshot)| snapshot.startup_identity() != "none")
+            .map(|(label, _)| label.clone()),
+    );
     let mut inputs = HashMap::new();
     let mut errors = Vec::new();
     for label in labels {
@@ -3525,7 +3534,7 @@ fn prepare_pass2_inputs(
         if let Some(map) = global_types_maps.get(&label) {
             input.set_global_types_map(map.clone());
         }
-        if input.has_maps() {
+        if input.should_schedule() {
             inputs.insert(label, input);
         }
     }

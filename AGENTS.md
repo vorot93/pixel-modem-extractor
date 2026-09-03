@@ -663,11 +663,14 @@ module; when a file outgrows that, split it.
   documented `0x42310000` radare2 `RLIMIT_AS` failure, durably recorded while six regions
   succeeded. PAL, Thumb creation, globals, global shapes/types, DBT, terminal inventories, and all
   conservation gates passed; the overlap-repair fallback did not recur. This lands Shannon-loader
-  roadmap Phase 3A alongside landed Phases 1 and 2. Phase 3B is landed (2026-09-03) as a separate
-  post-inventory discovery — hardware-init, stack-protection handler with gated no-return,
+  roadmap Phase 3A alongside landed Phases 1 and 2. Phase 3B is implemented in this tree as a
+  separate post-inventory discovery — hardware-init, stack-protection handler with gated no-return,
   uninterpreted RVCT operands, and privileged-operation evidence — and remains architecturally
-  separate from immutable pre-analysis Phase 3A. That 3A acceptance emitted export-v4; current HEAD
-  emits export-v5. Phase 4 is next.
+  separate from immutable pre-analysis Phase 3A. That 3A acceptance emitted export-v4; this tree
+  emits export-v5. Present startup is a pass-2 scheduling reason even with empty applications and
+  no recovered names; `functions.json` / blake3 then come from the terminal snapshot. Do not call
+  3B landed until inventory-gated corpus pins are populated or explicitly still-unrun. Phase 4
+  follows 3B.
 - **Focused verification is explicit.** Run exception discovery/artifact/CFG/PAL/startup unit
   batteries, both independently configured corpus legs, focused serial real-Ghidra tests (not the
   full `decompile_golden` binary in parallel), and the retained-tree report-shape gate:
@@ -1432,16 +1435,18 @@ hardcoded. Two reference images exercise both models end-to-end:
   pass 2, and retains those exact entry/name/source requests. Initial validation is component-local (an
   invalid map is omitted without suppressing its valid siblings); a late
   identity/type change fails the whole scheduled image rather than changing
-  its script set. It starts exactly one `analyzeHeadless -process -noanalysis`
+  its script set.   It starts exactly one `analyzeHeadless -process -noanalysis`
   saved-project process for each image having at least one of the three
-  inputs. With all maps present, the fixed post-script order is
+  maps or Present startup. With all maps present, the fixed post-script order is
   `ApplyThumbNames.java -> ApplySymbols.java -> ApplyStartupMetadata.java ->
   ApplyGlobals.java -> ApplyGlobalTypes.java -> ExportDecomp.java`.
   `ApplyStartupMetadata.java` is present only when startup state is `Present`.
   Each map remains independently
   optional; `ApplyThumbNames.java` rides in the function map and runs first
-  whenever one is present (a no-op on an empty `creations` array), while an
-  image with none of the three inputs starts no pass-2 process at all. Creation
+  whenever one is present (a no-op on an empty `creations` array). Present
+  startup schedules pass 2 even with empty applications and no maps; snapshot
+  `functions.json` / blake3 feed `ApplyStartupMetadata`. An image with none of
+  the three maps and startup `none` starts no pass-2 process. Creation
   runs first so malformed producer or ownership state cannot follow another
   pass-2 mutation. Ghidra rolls back earlier post-scripts when a later script
   fails in the same headless invocation. A separately committed
@@ -2617,11 +2622,13 @@ hardcoded. Two reference images exercise both models end-to-end:
 
         -postScript ApplyThumbNames.java <kit-root> <label> <image-blake3> <exception-identity> <exception-manifest> <scatter-map> <functions-json> <functions-blake3> <function-map> <map-blake3> -postScript ApplySymbols.java <kit-root> <label> <image-blake3> <exception-identity> <exception-manifest> <pal-identity> <pal-manifest> <scatter-map> <functions-json> <functions-blake3> <function-map> <map-blake3> -postScript ApplyStartupMetadata.java <kit-root> <label> <image-blake3> <startup-identity> <startup-manifest> <scatter-map> <functions-json> <functions-blake3> -postScript ApplyGlobals.java <global-map> -postScript ApplyGlobalTypes.java <global-types-map> -postScript ExportDecomp.java <out> <kit-root> <label> <exception-identity> <exception-manifest> <pal-identity> <pal-manifest> <startup-identity> <startup-manifest> <scatter-map> <function-map> <map-blake3>
 
-    At least one of the three typed maps must be `Some` or
-    `headless_process_args` returns `Ok(None)` (nothing scheduled for that
-    image — see `prepare_pass2_inputs`, which only creates a `Pass2Input`
-    entry for a label present in at least one of `function_maps` /
-    `global_maps` / `global_types_maps`).
+    At least one of the three typed maps must be `Some`, or startup state must
+    be `Present`, or `headless_process_args` returns `Ok(None)` (nothing
+    scheduled for that image — see `prepare_pass2_inputs`, which creates a
+    `Pass2Input` for a label present in `function_maps` / `global_maps` /
+    `global_types_maps` or whose terminal snapshot has Present startup).
+    Mapless Present startup still runs `ApplyStartupMetadata.java` then
+    `ExportDecomp.java`, taking `functions.json` / blake3 from the snapshot.
 
     `-noanalysis` is mandatory — re-running auto-analysis would (a) undo
     `ApplySymbols` renames that aren't `USER_DEFINED`, and (b) re-trigger the

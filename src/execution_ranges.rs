@@ -5,6 +5,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 
 pub(crate) const MAX_EXECUTION_FUNCTIONS: usize = 262_144;
@@ -851,7 +852,18 @@ pub(crate) fn read_ghidra_inventory_file(
     file: std::fs::File,
     runtime: &RuntimeImage<'_>,
 ) -> Result<StreamedGhidraInventory> {
-    read_ghidra_inventory_file_capped(file, runtime, MAX_EXECUTION_FUNCTIONS)
+    read_ghidra_inventory_reader_capped(file, runtime, MAX_EXECUTION_FUNCTIONS)
+}
+
+pub(crate) fn read_ghidra_inventory_bytes(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+) -> Result<StreamedGhidraInventory> {
+    read_ghidra_inventory_reader_capped(
+        std::io::Cursor::new(bytes),
+        runtime,
+        MAX_EXECUTION_FUNCTIONS,
+    )
 }
 
 fn read_ghidra_inventory_file_capped(
@@ -859,7 +871,15 @@ fn read_ghidra_inventory_file_capped(
     runtime: &RuntimeImage<'_>,
     cap: usize,
 ) -> Result<StreamedGhidraInventory> {
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    read_ghidra_inventory_reader_capped(file, runtime, cap)
+}
+
+fn read_ghidra_inventory_reader_capped<R: Read>(
+    reader: R,
+    runtime: &RuntimeImage<'_>,
+    cap: usize,
+) -> Result<StreamedGhidraInventory> {
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(reader));
     let mut scan = GhidraInventoryScan {
         runtime,
         cap,

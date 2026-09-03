@@ -1217,7 +1217,23 @@ pub(crate) fn read_thumb_functions_file(
     runtime: &RuntimeImage<'_>,
     context: &str,
 ) -> Result<Vec<OwnedThumbFunction>> {
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    read_thumb_functions_reader(file, runtime, context)
+}
+
+pub(crate) fn read_thumb_functions_bytes(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    context: &str,
+) -> Result<Vec<OwnedThumbFunction>> {
+    read_thumb_functions_reader(std::io::Cursor::new(bytes), runtime, context)
+}
+
+fn read_thumb_functions_reader<R: std::io::Read>(
+    reader: R,
+    runtime: &RuntimeImage<'_>,
+    context: &str,
+) -> Result<Vec<OwnedThumbFunction>> {
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(reader));
     let mut scan = TypedFunctionScan::new(runtime);
     let parsed = deserializer.deserialize_map(TypedFunctionVisitor { scan: &mut scan });
     parsed
@@ -1525,8 +1541,15 @@ pub(crate) fn validate_thumb_inventory_streaming(
     runtime: &RuntimeImage<'_>,
     expected_substantial: usize,
 ) -> Result<ValidatedThumbInventory> {
-    let file = std::fs::File::open(path)?;
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    validate_thumb_inventory_bytes(&std::fs::read(path)?, runtime, expected_substantial)
+}
+
+pub(crate) fn validate_thumb_inventory_bytes(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    expected_substantial: usize,
+) -> Result<ValidatedThumbInventory> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let mut scan = ThumbScan::new(runtime);
     let parsed = deserializer.deserialize_any(ThumbInventoryVisitor { scan: &mut scan });
     match parsed.and_then(|()| deserializer.end()) {

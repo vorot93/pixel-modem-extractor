@@ -79,7 +79,9 @@ pub(crate) enum SystemEffect {
     CoprocessorTransfer(CoprocessorTransfer),
     PsrTransfer {
         direction: SystemDirection,
-        rd_or_rm: Register,
+        register: Option<Register>,
+        mask: u8,
+        immediate: Option<u32>,
     },
 }
 
@@ -3315,29 +3317,35 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
             a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rd)])).with_system(
                 SystemEffect::PsrTransfer {
                     direction: SystemDirection::Read,
-                    rd_or_rm: gpr(*rd),
+                    register: Some(gpr(*rd)),
+                    mask: 0,
+                    immediate: None,
                 },
             )
         }
         ArmA32Instruction::MrsBanked_A1(cond, _, _, rd) => {
             a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rd)]))
         }
-        ArmA32Instruction::Msr_Register_A1(cond, _, _, rm) => {
+        ArmA32Instruction::Msr_Register_A1(cond, _, mask, rm) => {
             a32_linear(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new()).with_system(
                 SystemEffect::PsrTransfer {
                     direction: SystemDirection::Write,
-                    rd_or_rm: gpr(*rm),
+                    register: Some(gpr(*rm)),
+                    mask: *mask,
+                    immediate: None,
                 },
             )
         }
         ArmA32Instruction::MsrBanked_A1(cond, _, _, rm) => {
             a32_linear(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new())
         }
-        ArmA32Instruction::Msr_Immediate_A1(cond, _, _, _) => {
+        ArmA32Instruction::Msr_Immediate_A1(cond, _, mask, imm) => {
             a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new()).with_system(
                 SystemEffect::PsrTransfer {
                     direction: SystemDirection::Write,
-                    rd_or_rm: Register(0),
+                    register: None,
+                    mask: *mask,
+                    immediate: Some(*imm),
                 },
             )
         }
@@ -3668,7 +3676,9 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
             t32_linear(pc, length, BTreeSet::new(), set([gpr(*rd)])).with_system(
                 SystemEffect::PsrTransfer {
                     direction: SystemDirection::Read,
-                    rd_or_rm: gpr(*rd),
+                    register: Some(gpr(*rd)),
+                    mask: 0,
+                    immediate: None,
                 },
             )
         }
@@ -3747,7 +3757,9 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
             t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new()).with_system(
                 SystemEffect::PsrTransfer {
                     direction: SystemDirection::Write,
-                    rd_or_rm: gpr(*rn),
+                    register: Some(gpr(*rn)),
+                    mask: 0,
+                    immediate: None,
                 },
             )
         }
@@ -4194,7 +4206,9 @@ mod tests {
             insn.system,
             SystemEffect::PsrTransfer {
                 direction: SystemDirection::Read,
-                rd_or_rm: R0,
+                register: Some(R0),
+                mask: 0,
+                immediate: None,
             }
         );
         assert_eq!(insn.writes, regs(&[R0]));
@@ -4211,7 +4225,9 @@ mod tests {
             insn.system,
             SystemEffect::PsrTransfer {
                 direction: SystemDirection::Write,
-                rd_or_rm: R1,
+                register: Some(R1),
+                mask: 0b1000,
+                immediate: None,
             }
         );
         assert_eq!(insn.reads, regs(&[R1]));
@@ -4224,12 +4240,15 @@ mod tests {
             0x1000,
             &ArmA32Instruction::Msr_Immediate_A1(always(), false, 0b1000, 0xF000_0000),
         );
-        match insn.system {
-            SystemEffect::PsrTransfer { direction, .. } => {
-                assert_eq!(direction, SystemDirection::Write);
+        assert_eq!(
+            insn.system,
+            SystemEffect::PsrTransfer {
+                direction: SystemDirection::Write,
+                register: None,
+                mask: 0b1000,
+                immediate: Some(0xF000_0000),
             }
-            other => panic!("expected PsrTransfer, got {other:?}"),
-        }
+        );
         assert!(insn.reads.is_empty());
         assert!(insn.writes.is_empty());
     }
@@ -4244,7 +4263,9 @@ mod tests {
             insn.system,
             SystemEffect::PsrTransfer {
                 direction: SystemDirection::Read,
-                rd_or_rm: R0,
+                register: Some(R0),
+                mask: 0,
+                immediate: None,
             }
         );
         assert_eq!(insn.writes, regs(&[R0]));
@@ -4261,7 +4282,9 @@ mod tests {
             insn.system,
             SystemEffect::PsrTransfer {
                 direction: SystemDirection::Write,
-                rd_or_rm: R1,
+                register: Some(R1),
+                mask: 0,
+                immediate: None,
             }
         );
         assert_eq!(insn.reads, regs(&[R1]));

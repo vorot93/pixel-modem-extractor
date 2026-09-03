@@ -9,8 +9,9 @@ use super::{
     StartupMetadataError, StartupPlan, StartupRole,
 };
 use crate::arm32::{
-    ControlFlow, CoprocessorTransfer, InstructionDecoder, PureRustDecoder, Register,
-    SystemDirection, SystemEffect, valid_isa_length,
+    AddressBase, AddressOffset, ControlFlow, CoprocessorTransfer, DecodedInstruction,
+    InstructionDecoder, PureRustDecoder, Register, SystemDirection, SystemEffect, ValueEffect,
+    ValueExpr, valid_isa_length, visible_pc, wrapping_offset,
 };
 use crate::execution_ranges::{
     AuthenticatedDecodeRange, DecodeIsa, ExecutionProjection, OwnedExecutionIdentity,
@@ -99,15 +100,17 @@ fn collect_semantic_refs(
     let Some(span) = window_end.checked_sub(record.entry) else {
         return Ok(());
     };
-    let Ok(cfg) = SemanticCfg::decode_with_address_window(
+    let cfg = match SemanticCfg::decode_with_address_window(
         runtime,
         record.entry,
         first.isa,
         CfgLimits::startup_metadata(),
         CallPolicy::Fallthrough,
         Some(span),
-    ) else {
-        return Ok(());
+    ) {
+        Ok(cfg) => cfg,
+        Err(error) if is_unsupported_cfg_encoding(&error) => return Ok(()),
+        Err(error) => return Err(cfg_error(error, first.isa)),
     };
     let function = OwnedExecutionIdentity {
         owner: record.owner,
@@ -122,6 +125,15 @@ fn collect_semantic_refs(
             let Some(pc) = value.root() else {
                 continue;
             };
+            let Some(definition) = value.definition() else {
+                continue;
+            };
+            let Some(instruction) = cfg.instructions().get(&definition) else {
+                continue;
+            };
+            if !is_pal_materialization(instruction, string_start, runtime) {
+                continue;
+            }
             if !pc_in_ranges(pc, ranges) || !seen.insert(pc) {
                 continue;
             }
@@ -140,6 +152,43 @@ fn collect_semantic_refs(
         }
     }
     Ok(())
+}
+
+fn is_pal_materialization(
+    instruction: &DecodedInstruction,
+    string_start: u32,
+    runtime: &RuntimeImage<'_>,
+) -> bool {
+    match &instruction.effect {
+        ValueEffect::RegisterWrite {
+            value:
+                ValueExpr::ArchitecturalPc {
+                    addend,
+                    align_to_four,
+                },
+            ..
+        } => wrapping_offset(visible_pc(instruction.pc, *align_to_four), *addend) == string_start,
+        ValueEffect::RegisterWrite {
+            value: ValueExpr::Immediate(value),
+            ..
+        } => *value == string_start,
+        ValueEffect::RegisterWrite {
+            value: ValueExpr::ReplaceHighHalf { .. },
+            ..
+        } => true,
+        ValueEffect::LiteralWordLoad { address, .. } => {
+            let crate::arm32::AddressExpr {
+                base: AddressBase::ArchitecturalPc { align_to_four },
+                offset: AddressOffset::Immediate(offset),
+            } = address
+            else {
+                return false;
+            };
+            let literal = wrapping_offset(visible_pc(instruction.pc, *align_to_four), *offset);
+            runtime.read_u32(literal).ok() == Some(string_start)
+        }
+        _ => false,
+    }
 }
 
 fn pc_in_ranges(pc: u32, ranges: &[AuthenticatedDecodeRange]) -> bool {
@@ -508,8 +557,15 @@ fn push_privileged_op(
             crn: Some(transfer.crn),
             crm: Some(transfer.crm),
             opcode2: Some(transfer.opcode2),
+            register: None,
+            immediate: None,
         },
-        SystemEffect::PsrTransfer { direction, .. } => PrivilegedOp {
+        SystemEffect::PsrTransfer {
+            direction,
+            register,
+            mask,
+            immediate,
+        } => PrivilegedOp {
             pc: instruction.pc,
             isa: instruction.isa,
             entry: record.entry,
@@ -518,10 +574,12 @@ fn push_privileged_op(
             direction,
             class: PrivilegedClass::CpsrSpsr,
             coprocessor: None,
-            opcode1: None,
+            opcode1: Some(mask),
             crn: None,
             crm: None,
             opcode2: None,
+            register: register.map(|register| register.0),
+            immediate,
         },
         SystemEffect::None | SystemEffect::CoprocessorTransfer(_) => return Ok(()),
     };
@@ -598,15 +656,17 @@ fn collect_compiler_sites(
         return Err(malformed("accepted execution has no decode range"));
     };
     let window = identity_window(record)?;
-    let Ok(cfg) = SemanticCfg::decode_with_address_window(
+    let cfg = match SemanticCfg::decode_with_address_window(
         runtime,
         record.entry,
         isa,
         CfgLimits::startup_metadata(),
         CallPolicy::Fallthrough,
         window,
-    ) else {
-        return Ok(());
+    ) {
+        Ok(cfg) => cfg,
+        Err(error) if is_unsupported_cfg_encoding(&error) => return Ok(()),
+        Err(error) => return Err(cfg_error(error, isa)),
     };
     for pc in cfg.reachable() {
         let Some(instruction) = cfg.instructions().get(pc) else {
@@ -846,6 +906,14 @@ fn identity_isa(function: &OwnedExecutionIdentity) -> Option<DecodeIsa> {
         .decode_ranges
         .first()
         .map(|range| range.isa)
+}
+
+fn is_unsupported_cfg_encoding(error: &SemanticCfgError) -> bool {
+    matches!(
+        error,
+        SemanticCfgError::InvalidFlow { reason, .. }
+            if reason == "IT blocks are not supported by direct-edge traversal"
+    )
 }
 
 fn cfg_error(error: SemanticCfgError, isa: DecodeIsa) -> StartupMetadataError {
@@ -1215,6 +1283,22 @@ mod tests {
     }
 
     #[test]
+    fn add_immediate_after_movw_movt_is_not_a_ref() {
+        let mut image = vec![0u8; 0x40];
+        let string_start = plant_seed(&mut image, 0x20);
+        plant_movw_movt_seed(&mut image, 0, string_start.wrapping_sub(4));
+        image[8..12].copy_from_slice(&0xe280_0004u32.to_le_bytes());
+        image[12..16].copy_from_slice(&A32_BX_LR);
+        let runtime = runtime(&image);
+        let accepted = accepted_arm(&runtime, BASE, BASE + 16);
+        assert_eq!(
+            semantic_refs(&runtime, &[accepted], string_start)
+                .expect("ADD is not a PAL materialization"),
+            []
+        );
+    }
+
+    #[test]
     fn more_than_max_seed_refs_is_resource_limit() {
         const FN_LEN: u32 = 12;
         const COUNT: usize = MAX_SEED_REFS + 1;
@@ -1276,6 +1360,25 @@ mod tests {
         let refs = semantic_refs(&runtime, &[it, accepted], string_start)
             .expect("IT identity is skipped, not fatal");
         assert_eq!(refs, [expected]);
+    }
+
+    #[test]
+    fn cfg_resource_limit_during_refs_fails_the_image() {
+        const SPAN: usize = 64 * 1024 + 4;
+        let mut image = vec![0u8; SPAN + 32];
+        for chunk in image[..SPAN].as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&0xe1a0_0000u32.to_le_bytes());
+        }
+        let string_start = plant_seed(&mut image, SPAN);
+        let runtime = runtime(&image);
+        let record = accepted_arm(&runtime, BASE, BASE + SPAN as u32);
+        match semantic_refs(&runtime, &[record], string_start) {
+            Err(StartupMetadataError::ResourceLimit { what, limit, .. }) => {
+                assert_eq!(what, "charged bytes");
+                assert_eq!(limit, 64 * 1024);
+            }
+            other => panic!("expected ResourceLimit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1725,6 +1828,8 @@ mod tests {
                     crn: Some(12),
                     crm: Some(0),
                     opcode2: Some(0),
+                    register: None,
+                    immediate: None,
                 },
                 PrivilegedOp {
                     pc: BASE + 4,
@@ -1735,10 +1840,12 @@ mod tests {
                     direction: SystemDirection::Read,
                     class: PrivilegedClass::CpsrSpsr,
                     coprocessor: None,
-                    opcode1: None,
+                    opcode1: Some(0),
                     crn: None,
                     crm: None,
                     opcode2: None,
+                    register: Some(0),
+                    immediate: None,
                 },
             ]
         );

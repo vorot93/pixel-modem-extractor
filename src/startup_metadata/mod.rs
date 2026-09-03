@@ -131,6 +131,8 @@ pub(crate) struct PrivilegedOp {
     pub crn: Option<u8>,
     pub crm: Option<u8>,
     pub opcode2: Option<u8>,
+    pub register: Option<u8>,
+    pub immediate: Option<u32>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -312,8 +314,29 @@ pub fn generate_corpus(
         rvct: discover::find_unique_seed(&runtime, SEED_RVCT)?.is_some(),
         shannon_os: discover::find_unique_seed(&runtime, SEED_SHANNON_OS)?.is_some(),
     };
+    let image_blake3 = *blake3::hash(raw).as_bytes();
     let exception = crate::exception_roots::discover(&runtime, label, toc_name)?;
     let reset = exception.as_ref().and_then(reset_from_plan);
+    let exception_identity = if inventories_dir.is_some() {
+        match exception.as_ref() {
+            Some(plan) => Some(
+                crate::exception_roots::materialize(
+                    plan,
+                    crate::exception_roots::ExceptionArtifactContext {
+                        label,
+                        toc_name,
+                        image_blake3,
+                        scatter_load_map_blake3: scatter_blake3,
+                    },
+                    out,
+                )?
+                .identity,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     let inventories = match inventories_dir {
         Some(dir) => load_inventories(dir, &runtime)?,
         None => LoadedInventories::empty(),
@@ -327,12 +350,12 @@ pub fn generate_corpus(
             toc_name,
             image_base,
             image_size,
-            image_blake3: *blake3::hash(raw).as_bytes(),
+            image_blake3,
             scatter_blake3,
             scatter_entries: &[],
             functions_blake3: inventories.functions_blake3,
             thumb_functions_blake3: inventories.thumb_functions_blake3,
-            exception_identity: None,
+            exception_identity: exception_identity.as_deref(),
             tool_version: env!("CARGO_PKG_VERSION"),
         };
         let materialized = materialize(&plan, context, out)?;
@@ -388,27 +411,31 @@ fn load_inventories(
     let functions_path = dir.join("functions.json");
     let functions_bytes = std::fs::read(&functions_path)?;
     let functions_blake3 = *blake3::hash(&functions_bytes).as_bytes();
-    let streamed =
-        crate::execution_ranges::read_ghidra_inventory_streaming(&functions_path, runtime)?;
+    let streamed = crate::execution_ranges::read_ghidra_inventory_bytes(&functions_bytes, runtime)?;
     let mut records = streamed.inventory.records;
     let thumb_path = dir.join("thumb_functions.json");
-    let thumb_functions_blake3 = if thumb_path.is_file() {
-        let thumb_bytes = std::fs::read(&thumb_path)?;
-        let digest = *blake3::hash(&thumb_bytes).as_bytes();
-        let owned = crate::thumb_analysis::read_thumb_functions_streaming(&thumb_path, runtime)?;
-        for record in owned {
-            let Some(identity) = record.execution else {
-                continue;
-            };
-            records.push(TaggedExecutionRecord {
-                owner: record.owner,
-                entry: identity.entry,
-                projection: ExecutionProjection::Accepted(identity.decode_ranges),
-            });
+    let thumb_functions_blake3 = match std::fs::read(&thumb_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+        Ok(thumb_bytes) => {
+            let digest = *blake3::hash(&thumb_bytes).as_bytes();
+            let owned = crate::thumb_analysis::read_thumb_functions_bytes(
+                &thumb_bytes,
+                runtime,
+                "thumb_functions.json",
+            )?;
+            for record in owned {
+                let Some(identity) = record.execution else {
+                    continue;
+                };
+                records.push(TaggedExecutionRecord {
+                    owner: record.owner,
+                    entry: identity.entry,
+                    projection: ExecutionProjection::Accepted(identity.decode_ranges),
+                });
+            }
+            Some(digest)
         }
-        Some(digest)
-    } else {
-        None
     };
     Ok(LoadedInventories {
         records,

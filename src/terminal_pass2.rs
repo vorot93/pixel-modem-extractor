@@ -63,6 +63,8 @@ struct SnapshotPal {
 struct SnapshotStartup {
     identity: String,
     manifest_bytes: Arc<[u8]>,
+    functions_path: PathBuf,
+    functions_blake3: String,
 }
 
 #[derive(Debug)]
@@ -327,9 +329,12 @@ impl TerminalPass2Snapshot {
                     "snapshot startup manifest",
                 )
                 .map_err(|error| Error::BadStartupMetadata(error.to_string()))?;
+                let functions_path = request.image_dir.join("decompiled").join("functions.json");
                 Some(SnapshotStartup {
                     identity: expected.identity().to_string(),
                     manifest_bytes: bytes.into(),
+                    functions_path,
+                    functions_blake3: crate::manifest::blake3_fixed(validated.functions_blake3),
                 })
             }
             symbolicate::role_evidence::ArtifactState::Absent => {
@@ -520,6 +525,18 @@ impl TerminalPass2Snapshot {
             .as_ref()
             .map(|state| state.identity.as_str())
             .unwrap_or("none")
+    }
+
+    pub(crate) fn startup_functions_path(&self) -> Option<&Path> {
+        self.startup
+            .as_ref()
+            .map(|state| state.functions_path.as_path())
+    }
+
+    pub(crate) fn startup_functions_blake3(&self) -> Option<&str> {
+        self.startup
+            .as_ref()
+            .map(|state| state.functions_blake3.as_str())
     }
 
     pub(crate) fn exception_context(&self) -> Option<&ExceptionPass2Context> {
@@ -1629,6 +1646,8 @@ mod tests {
                 crn: Some(12),
                 crm: Some(0),
                 opcode2: Some(0),
+                register: None,
+                immediate: None,
             }],
             applications: vec![
                 StartupApplication {
