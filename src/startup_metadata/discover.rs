@@ -57,7 +57,7 @@ pub(crate) fn find_unique_seed(
     }
     match hits.as_slice() {
         [] => Ok(None),
-        [hit] => parse_cstring(runtime, *hit).map(Some),
+        [hit] => parse_cstring(runtime, *hit, needle.len()).map(Some),
         _ => Err(StartupMetadataError::Ambiguous {
             values: hits.iter().map(|hit| hit.address).collect(),
         }),
@@ -982,9 +982,14 @@ fn collect_hits(
     Ok(())
 }
 
+fn cstring_content_byte(byte: u8) -> bool {
+    byte == b'\t' || byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte)
+}
+
 fn parse_cstring(
     runtime: &RuntimeImage<'_>,
     hit: Occurrence,
+    needle_len: usize,
 ) -> Result<SeedHit, StartupMetadataError> {
     let mut string_start = hit.address;
     while string_start > hit.range.start {
@@ -992,7 +997,7 @@ fn parse_cstring(
         let byte = runtime
             .read_u8(prev)
             .map_err(|error| runtime_error(prev, 1, error))?;
-        if byte == 0 {
+        if byte == 0 || !cstring_content_byte(byte) {
             break;
         }
         string_start = prev;
@@ -1016,13 +1021,25 @@ fn parse_cstring(
             .map_err(|error| runtime_error(cursor, 1, error))?;
         string_len += 1;
         if byte == 0 {
+            let needle_end = hit
+                .address
+                .checked_add(u32::try_from(needle_len).map_err(|_| {
+                    malformed("seed needle length does not fit u32")
+                })?)
+                .ok_or_else(|| malformed("seed needle wraps the address space"))?;
+            let string_end = string_start
+                .checked_add(string_len)
+                .ok_or_else(|| malformed("containing C-string wraps the address space"))?;
+            if hit.address < string_start || needle_end >= string_end {
+                return Err(malformed("seed needle is not inside the containing C-string"));
+            }
             return Ok(SeedHit {
                 address: hit.address,
                 string_start,
                 string_len,
             });
         }
-        if byte != b'\t' && !(0x20..=0x7e).contains(&byte) {
+        if !cstring_content_byte(byte) {
             return Err(malformed("containing C-string has a non-printable byte"));
         }
     }
@@ -1153,6 +1170,35 @@ mod tests {
             find_unique_seed(&runtime(&nonprintable), SEED_WARM_BOOT),
             Err(StartupMetadataError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn unique_seed_after_thumb_padding_starts_at_the_needle() {
+        let mut image = vec![0u8, 0xbf];
+        image.extend_from_slice(SEED_STACK_GUARD);
+        image.extend_from_slice(b" (0x%08x)\0");
+        let hit = find_unique_seed(&runtime(&image), SEED_STACK_GUARD)
+            .expect("unique seed")
+            .expect("present");
+        assert_eq!(hit.address, BASE + 2);
+        assert_eq!(hit.string_start, BASE + 2);
+        assert_eq!(
+            hit.string_len,
+            (SEED_STACK_GUARD.len() + b" (0x%08x)\0".len()) as u32
+        );
+    }
+
+    #[test]
+    fn unique_seed_inside_newline_terminated_format_string_is_present() {
+        let mut image = b"Version    : ".to_vec();
+        image.extend_from_slice(SEED_RVCT);
+        image.extend_from_slice(b" %d.%d [Build %d]\n\0");
+        let hit = find_unique_seed(&runtime(&image), SEED_RVCT)
+            .expect("unique seed")
+            .expect("present");
+        assert_eq!(hit.address, BASE + 13);
+        assert_eq!(hit.string_start, BASE);
+        assert_eq!(hit.string_len, image.len() as u32);
     }
 
     const A32_ADD_R0_PC_8: [u8; 4] = [0x08, 0x00, 0x8f, 0xe2];
