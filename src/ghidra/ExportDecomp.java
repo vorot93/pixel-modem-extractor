@@ -7,10 +7,12 @@
 // Arg[4] = canonical exception-root manifest or "-".
 // Arg[5] = expected PAL identity or "none".
 // Arg[6] = canonical task manifest or "-" under the ApplyPalTasks rule.
-// Arg[7] = canonical scatter manifest or "-" shared by both manifests.
-// Arg[8] = canonical pass-1 symbol map or "-" for pass 1 and generated
-//          single-pass kits.
-// Arg[9] = expected lowercase symbol-map BLAKE3, or literal "none" with "-".
+// Arg[7] = expected startup-metadata identity or "none".
+// Arg[8] = canonical startup-metadata manifest or "-".
+// Arg[9] = canonical scatter manifest or "-" shared by the manifests.
+// Arg[10] = canonical pass-1 symbol map or "-" for pass 1 and generated
+//           single-pass kits.
+// Arg[11] = expected lowercase symbol-map BLAKE3, or literal "none" with "-".
 //
 // A strict HeadlessScript: before any export output or marker is written it
 // retains and validates exception roots through ExceptionRootsSupport and PAL
@@ -26,12 +28,13 @@
 // cancellation and receive only the remaining deadline; every long operation
 // is checked on return. All three outputs remain sibling staging files until
 // both states pass final postflight and their retained handles close. They are
-// then moved into place, and the exact four-line v4 marker is replaced LAST
+// then moved into place, and the exact five-line v5 marker is replaced LAST
 // under the same gate:
 //
-// pixel-modem-extractor-ghidra-export-v4
+// pixel-modem-extractor-ghidra-export-v5
 // exception_roots=<identity-or-none>
 // pal_tasks=<identity-or-none>
+// startup_metadata=<identity-or-none>
 // symbol_map=<lowercase-map-blake3-or-none>
 //
 // FIDELITY POSTURE (Phase 1+): this script intentionally does NOT call
@@ -51,9 +54,9 @@
 //   - UseHexadecimal: TRUE (default). Display-only; matches disasm.lst.
 //
 // Pass 2 of `decompose` re-runs this script unchanged after the applicable
-// fixed-order ApplyThumbNames -> ApplySymbols -> ApplyGlobals ->
-// ApplyGlobalTypes application; getC() then emits regenerated C with names +
-// plate comments baked in.
+// fixed-order ApplyThumbNames -> ApplySymbols -> ApplyStartupMetadata ->
+// ApplyGlobals -> ApplyGlobalTypes application; getC() then emits regenerated
+// C with names + plate comments baked in.
 //@category PixelModem
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
@@ -86,7 +89,7 @@ import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 
 public class ExportDecomp extends HeadlessScript {
-    private static final String COMPLETION_FORMAT = "pixel-modem-extractor-ghidra-export-v4";
+    private static final String COMPLETION_FORMAT = "pixel-modem-extractor-ghidra-export-v5";
     private static final long TASK_BODY_BYTES = PalTasksSupport.MAX_TASK_BODY_BYTES;
     private static final long VALIDATION_BUDGET_MS =
             PalTasksSupport.EXPORT_VALIDATION_BUDGET_MS;
@@ -102,10 +105,11 @@ public class ExportDecomp extends HeadlessScript {
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length != 10) {
-            fail("expected exactly ten arguments: output directory, kit root, image label, "
+        if (args.length != 12) {
+            fail("expected exactly twelve arguments: output directory, kit root, image label, "
                     + "exception-root identity, exception-root manifest, PAL identity, "
-                    + "task manifest, scatter manifest, pass-1 symbol map, expected map BLAKE3");
+                    + "task manifest, startup identity, startup manifest, scatter manifest, "
+                    + "pass-1 symbol map, expected map BLAKE3");
         }
         deadline = Math.addExact(System.currentTimeMillis(), VALIDATION_BUDGET_MS);
         File outDir = new File(args[0]);
@@ -115,10 +119,12 @@ public class ExportDecomp extends HeadlessScript {
         File exceptionManifest = "-".equals(args[4]) ? null : new File(args[4]);
         String palIdentity = args[5];
         File taskManifest = "-".equals(args[6]) ? null : new File(args[6]);
-        String scatterArgument = args[7];
+        String startupIdentity = args[7];
+        File startupManifest = "-".equals(args[8]) ? null : new File(args[8]);
+        String scatterArgument = args[9];
         File scatterManifest = "-".equals(scatterArgument) ? null : new File(scatterArgument);
-        File mapFile = "-".equals(args[8]) ? null : new File(args[8]);
-        String mapHash = args[9];
+        File mapFile = "-".equals(args[10]) ? null : new File(args[10]);
+        String mapHash = args[11];
 
         File canonicalRoot = requireCanonicalDirectory(kitRoot);
         if (!label.equals(currentProgram.getName())) {
@@ -139,6 +145,13 @@ public class ExportDecomp extends HeadlessScript {
         if (!palPresent && taskManifest != null) {
             fail("identity none requires the literal '-' task manifest");
         }
+        boolean startupPresent = !PalTasksSupport.NONE_IDENTITY.equals(startupIdentity);
+        if (startupPresent && startupManifest == null) {
+            fail("a present startup-metadata identity requires the manifest argument");
+        }
+        if (!startupPresent && startupManifest != null) {
+            fail("startup identity none requires the literal '-' manifest");
+        }
         String symbolMapArgument = "none";
         List<StagedOutput> staged = new ArrayList<StagedOutput>();
         try {
@@ -149,6 +162,10 @@ public class ExportDecomp extends HeadlessScript {
                     PalTasksSupport.ValidatedPal pal = palPresent
                             ? PalTasksSupport.retainPal(
                                     canonicalRoot, label, taskManifest, scatterManifest)
+                            : null;
+                    StartupMetadataSupport.Validated startup = startupPresent
+                            ? StartupMetadataSupport.retainForExport(currentProgram, canonicalRoot,
+                                    label, startupIdentity, startupManifest, scatterArgument)
                             : null) {
                 if (mapFile == null && !"none".equals(mapHash)) {
                     fail("an absent symbol map requires the literal 'none' hash");
@@ -163,6 +180,7 @@ public class ExportDecomp extends HeadlessScript {
                                 roots, mapFile, mapHash)) {
                     validateExceptionState(roots);
                     validatePalState(pal, palIdentity);
+                    validateStartupState(startup, startupIdentity);
                     if (pal != null) {
                         chargeTaskBodies(pal.manifest);
                         checkDeadline();
@@ -220,13 +238,15 @@ public class ExportDecomp extends HeadlessScript {
                     stage(outDir, "decompiled.c", staged, (w) -> writeDecompiledC(w, fm));
                     validateExceptionState(roots);
                     validatePalState(pal, palIdentity);
+                    validateStartupState(startup, startupIdentity);
                     if (pass2State != null) {
                         pass2State.validate(ExceptionRootsSupport.Pass2MapPhase.TERMINAL);
                     }
                 }
             }
             publishStaged(staged);
-            writeCompletionMarker(outDir, exceptionIdentity, palIdentity, symbolMapArgument);
+            writeCompletionMarker(outDir, exceptionIdentity, palIdentity, startupIdentity,
+                    symbolMapArgument);
         }
         finally {
             for (StagedOutput output : staged) {
@@ -282,6 +302,22 @@ public class ExportDecomp extends HeadlessScript {
             }
             PalTasksSupport.validateApplied(currentProgram, pal.manifest, pal.identity);
             pal.verifyRetainedFiles();
+        }
+        checkDeadline();
+    }
+
+    private void validateStartupState(StartupMetadataSupport.Validated startup,
+            String expectedIdentity) throws Exception {
+        if (startup == null) {
+            StartupMetadataSupport.validateAbsent(currentProgram);
+        }
+        else {
+            if (!startup.identity.equals(expectedIdentity)) {
+                fail("the expected startup-metadata identity does not match the manifest");
+            }
+            StartupMetadataSupport.validateApplied(currentProgram, startup.manifest,
+                    startup.identity);
+            startup.verifyRetainedFiles();
         }
         checkDeadline();
     }
@@ -475,7 +511,7 @@ public class ExportDecomp extends HeadlessScript {
     }
 
     private void writeCompletionMarker(File outDir, String exceptionIdentity,
-            String palIdentity, String symbolMap) throws Exception {
+            String palIdentity, String startupIdentity, String symbolMap) throws Exception {
         checkDeadline();
         File parent = outDir.getParentFile();
         if (parent == null) {
@@ -488,6 +524,7 @@ public class ExportDecomp extends HeadlessScript {
                 writer.write(COMPLETION_FORMAT + "\n");
                 writer.write("exception_roots=" + exceptionIdentity + "\n");
                 writer.write("pal_tasks=" + palIdentity + "\n");
+                writer.write("startup_metadata=" + startupIdentity + "\n");
                 writer.write("symbol_map=" + symbolMap + "\n");
             }
             checkDeadline();

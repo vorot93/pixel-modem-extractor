@@ -79,10 +79,15 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   global application, strict ownership, atomic map rejection, and the independent final export.
   The sibling `pass2_applies_global_types_and_skips_span_collision` covers `ApplyGlobalTypes.java`
   the same way (applied + span-collision skip); see **Phase 3.2 type application** below.
+  Startup-metadata pass-2 coverage is `pass2_applies_startup_labels_and_gated_no_return` (labels,
+  empty-application Present, gated no-return, export-v5),
+  `pass2_startup_missing_target_rolls_back_without_success_summary`, and
+  `pass2_stronger_name_preserves_startup_role_label`. Run those focused names serially; do not
+  launch the full `decompile_golden` binary in parallel with other worktrees.
   The exception-root cases in this binary use one production-generated synthetic fixture to cover
   ARM/Thumb roots, shared handlers, foreign primaries, exact replay, malformed/ambiguous maps,
   rollback, both datamark and tighten survival with exact bodies/flow, stronger pass-2 transitions,
-  stale ownership, and the v4 export marker. Every case shares the resolver above: a selected
+  stale ownership, and the v5 export marker. Every case shares the resolver above: a selected
   installation that is unavailable or broken fails rather than skipping.
 - **Runtime-scatter corpus goldens** (`tests/scatter_golden.rs`) authenticate and validate
   retained MAIN files supplied explicitly from outside the repository:
@@ -123,6 +128,18 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   messages, source paths, or absolute corpus paths. To populate a new lawful corpus pin, leave its
   digest sentinel empty, run that configured leg once, copy only the printed manifest BLAKE3, and
   rerun it to PASS; an unavailable leg remains unpopulated by leaving its variable unset.
+- **Private-corpus startup-metadata goldens** (`tests/startup_metadata_golden.rs`) consume those
+  same independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load `0x40010000`
+  through production scatter + exception reset + `discover` (optional `PME_DECOMPOSED_GOLDEN_DIR`
+  inventories). Seed pins are unique `Invalid warm boot` / `Check a function` / `ARM RVCT` present
+  and `_ShannonOS_` no-evidence on both models. Without inventories, `privileged_ops` must be 0.
+  Inventory-gated section statuses, counts, identity, and `manifest_blake3` are empty sentinels
+  until a lawful first run prints `PIN OBSERVED` and those values are copied — unique seeds are
+  not named roots, and unproven sections stay honest `Absent` rather than guessed Present. Only an
+  unset variable skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path
+  with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN -u PME_DECOMPOSED_GOLDEN_DIR cargo test --test startup_metadata_golden -- --nocapture`.
+  Never infer a corpus pass from a clean env-gated skip. No Ghidra legs.
 - **Private-corpus DBT debug-trace goldens** (`tests/dbt_traces_golden.rs`) consume the *same*
   two retained MAIN files (`PME_S5400_MAIN` / `PME_S5300_MAIN`) through a TOC wrap (name
   `MAIN`, base `0x40010000`, toc_index 3 for S5400 / 2 for S5300) and pin catalog counts,
@@ -298,7 +315,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `gzip.rs` | Gunzip the `RF_CFG_*` calibration blobs |
 | `toc.rs` | `modem.bin` TOC parse + split into the model-dependent embedded images |
 | `classify.rs` | 5-test opaque battery — whole-image H, χ²/df, serial correlation, 64-KiB window entropies; unanimous fail-closed verdict |
-| `semantic_cfg.rs` | Shared bounded A32/T32 direct-edge CFG, compact dominance, typed handoffs, and exact must-value dataflow used by PAL and exception roots |
+| `semantic_cfg.rs` | Shared bounded A32/T32 direct-edge CFG, compact dominance, typed handoffs, and exact must-value dataflow used by PAL, exception roots, and startup metadata |
 | `scatter/mod.rs` | Semantic A32 scatter discovery, exact bounded-table classification, and checked runtime planning |
 | `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
 | `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
@@ -306,7 +323,10 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `exception_roots/discover.rs` | A32 vector-table classification plus reset-side VBAR relocation proof |
 | `exception_roots/artifact.rs` | Canonical authenticated root manifest materialization, reading, and fixture provenance |
 | `exception_pass2.rs` | Strict ApplyExceptionRoots summary parsing and opaque authenticated pass-2 context construction |
-| `terminal_pass2.rs` | One immutable per-label canonical-kit snapshot: retained raw/scatter/exception/PAL staging, shared runtime contexts, map binding, and final spawn validation |
+| `startup_metadata/mod.rs` | Domain types, named limits, `StartupMetadataError`, conventional primaries/role labels, identity, and the discover/materialize/read/clear boundary |
+| `startup_metadata/discover.rs` | Unique-seed search, PAL-style materialization, four independent proofs, and the single-plan allocator |
+| `startup_metadata/artifact.rs` | Canonical v1 serializer, strict reader, atomic publish, and owned absence clearing |
+| `terminal_pass2.rs` | One immutable per-label canonical-kit snapshot: retained raw/scatter/exception/PAL/startup staging, shared runtime contexts, map binding, and final spawn validation |
 | `pal_tasks/mod.rs` | PAL shared types, named resource limits, the structured domain error, and the `discover` plan boundary |
 | `pal_tasks/cfg.rs` | Entry-rooted local CFG decode and its definition-aware dataflow/graph queries |
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
@@ -334,7 +354,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `thumb_analysis/rizin.rs` | Rizin command profile, inventory aliases/bounds, trailing `axlj` streaming, filtering, and range assignment |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
-| `symbolicate/role_evidence.rs` | Bounded immutable exception/PAL role projection, explicit artifact state, and strict retained/current runtime reauthentication |
+| `symbolicate/role_evidence.rs` | Bounded immutable exception/PAL/startup role projection, explicit artifact state, and strict retained/current runtime reauthentication |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
 | `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by Ghidra, both Thumb backends, and `global_shapes` |
 | `global_shapes/mod.rs` | Phase 3.2 per-image coordinator: one-function decode/track/aggregate, panic containment, atomic sidecar commit |
@@ -344,14 +364,14 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `global_shapes/artifact.rs` | Input validation, source hashes, v4 schema, deterministic serialize, atomic replace |
 | `global_shapes/validate.rs` | Shared v4 sidecar checks for goldens and retained-tree replay |
 | `global_types.rs` | Selects apply-worthy scalar shapes from `global_shapes.json` (width 1/2/4/8 `inferred` scalars only) and writes the strict `ApplyGlobalTypes.java` apply-map |
-| `decompose.rs` | One-shot pipeline over all decoders; owns `global_shapes` and `global_types_apply` route placement and report fields |
+| `decompose.rs` | One-shot pipeline over all decoders; owns `startup_metadata`, `global_shapes`, and `global_types_apply` route placement and report fields |
 | `manifest.rs` | `manifest.json` writing + `blake3` helpers |
 | `tree_hash.rs` | `pme-paq-v1` whole-tree hash behind the `tree-hash` subcommand (fail-closed tree validation) |
 | `trusted_fs.rs` | Retained directory capabilities, no-follow traversal, and platform-specific atomic leaf mutation |
 | `error.rs` | Error types |
 | `cli.rs` | `clap` subcommands + dispatch |
 | `bin/main.rs` | Binary entry point |
-| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyExceptionRoots` + `ExceptionRootsSupport`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
+| `ghidra/*.java` | Ghidra headless scripts (`ApplyScatterLoad`, `ApplyExceptionRoots` + `ExceptionRootsSupport`, `ApplyPalTasks` + `PalTasksSupport`, `TameAnalysis`, `ApplyThumbNames`, `ApplySymbols`, `ApplyStartupMetadata` + `StartupMetadataSupport`, `ApplyGlobals`, `ApplyGlobalTypes`, `ExportDecomp`) |
 
 Also: `tests/` holds the golden integration tests. Keep one clear responsibility per
 module; when a file outgrows that, split it.
@@ -376,23 +396,28 @@ module; when a file outgrows that, split it.
 - **Clear commits at the owned leaf and stops there.** Once the regular manifest was unlinked or
   confirmed absent through the retained label handle, clear succeeds and performs no label-directory
   removal. Empty label directories are allowed noncanonical residue.
-- **Terminal publication is capability-bound and exhaustive.** Exception/PAL publication opens the
-  current source through a retained kit capability, authenticates those exact bytes against the
-  already-terminal raw/scatter runtime, then opens the destination label through a retained image
+- **Terminal publication is capability-bound and exhaustive.** Exception/PAL/startup publication
+  opens the current source through a retained kit capability, authenticates those exact bytes against
+  the already-terminal raw/scatter runtime, then opens the destination label through a retained image
   capability. It verifies that destination's pathname still names the retained directory before and
   after an exact-length/BLAKE3 atomic leaf replacement. Validation and copy failures before commit
   preserve the prior target; a namespace swap never mutates the replacement tree, and a swap detected
   after commit leaves the copied bytes only in the detached retained directory and marks publication
   non-current. Every foreign sibling is preserved. Marshalling records explicit raw/export/scatter/
   exception/PAL outcomes for every image and never stops at the first failed label; only dependent
-  authority is cleared. Report reasons are bounded to 2,048 Unicode scalar values including
+  authority is cleared. Startup stays `Unmanaged` through that pass-1 matrix and becomes Present only
+  after later discovery publishes. Report reasons are bounded to 2,048 Unicode scalar values including
   ` [truncated]`, and an earlier actionable exception cause is sticky.
 - **One terminal snapshot owns pass 2, at one precise time.** Exhaustive pass-1 marshalling first
   records the complete raw/export/scatter/exception/PAL outcome matrix for every image. Later, after
   pass-1 enrichment/source stages and immediately before symbol-map construction, each eligible
   current image gets at most one `TerminalPass2Snapshot` in the existing Ghidra kit: raw is staged
   once, one authenticated scatter object stages every payload before `load_map.json`, and current
-  exception/PAL manifests stage once. It snapshots pass-2 inputs, not final pass-2 outputs, and is
+  exception/PAL/startup manifests stage once. Startup is taken only after publication (pipeline
+  steps 5-7): Present authenticates terminal `startup.json` against the published digest and writes
+  kit `startup_metadata/<label>/startup.json`; `none` / `-` when not Present; leftover `startup.json`
+  without publication is Unmanaged, never current. Path existence never establishes currentness.
+  It snapshots pass-2 inputs, not final pass-2 outputs, and is
   not deferred until `DispatchPass2`.
   Both opaque application contexts derive from that snapshot's single `RuntimeImage`; failed
   construction returns no object. The snapshot and every normal/no-symbol finalizer share the same
@@ -491,14 +516,14 @@ module; when a file outgrows that, split it.
   claims for one role remain non-shared and keep their unique primary.
 - **Exception naming survives pass 2 through closed primary dispositions.** Symbolication attaches
   `exception_root` evidence only on exact normalized `(entry, decode ISA)` keys and ranks names as
-  `__func__ > registration > exception_root > pal_task > token > string_ref`. The summary supplies
+  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`. The summary supplies
   exactly `exception_owned`, `preserved`, `not_requested`, or `pass2_owned` state. Only
   `exception_owned` may create a `func`/`registration` transition; preserved and shared label-only
   applications force exact preservation and cannot acquire generic, PAL, or thunk-mirror renames.
   A replayed `pass2_owned` row reproduces its exact authority plus original/final symbol ID, source,
   name, and digest. Current-primary equality applies only to the Ghidra-owned execution at that key;
   radare2/Rizin records may retain the role evidence without becoming program-state authority.
-- **Pass-2 lineage is strict v3 and transition-complete.** Fresh symbol maps are v4 and require the
+- **Pass-2 lineage is strict v3 and transition-complete.** Fresh symbol maps are v5 and require the
   nullable `predecessor_symbol_pass2` field. `PixelModemExtractor.SymbolPass2` has only
   `v3:<map-blake3>:<functions-blake3>:<execution-count>` grammar; there is no v2 reader. The current
   property must equal the map's explicit predecessor or its exact current token. Any existing
@@ -512,12 +537,13 @@ module; when a file outgrows that, split it.
   exception files as the last fallible step before the property write. A clean replay performs zero
   renames; stale/partial ownership emits no success summary and leaves prior program/export state
   intact.
-- **The wire/currentness bumps are inseparable.** Exception evidence writes
-  `pixel-modem-extractor-symbols-v4`; application input writes
-  `pixel-modem-extractor-symbol-map-v4`; `PixelModemExtractor.SymbolPass2` accepts only its strict
-  v3 token; and every current export ends with `pixel-modem-extractor-ghidra-export-v4` carrying
-  `exception_roots`, `pal_tasks`, and `symbol_map` identities. There is no compatibility grammar for
-  the unshipped exception semantics in older symbol/map/export state.
+- **The wire/currentness bumps are inseparable.** Fresh evidence writes
+  `pixel-modem-extractor-symbols-v5`; application input writes
+  `pixel-modem-extractor-symbol-map-v5`; `PixelModemExtractor.SymbolPass2` accepts only its strict
+  v3 token; and every current export ends with `pixel-modem-extractor-ghidra-export-v5` carrying
+  `exception_roots`, `pal_tasks`, `startup_metadata`, and `symbol_map` identities. There is no
+  compatibility grammar for v4 symbol, map, or export bytes, or for the unshipped exception
+  semantics in older state. Generated pass-1 kits write `startup_metadata=none`.
 - **One retained pass-2 state serves all three phases.** `ApplyThumbNames` receives exactly ten
   arguments: kit root, image label/hash, exception identity/manifest/scatter, retained
   `functions.json` path/hash, and symbol-map path/hash. It opens the full retained map state and runs
@@ -540,7 +566,7 @@ module; when a file outgrows that, split it.
 - **Successor Thumb lineage is sparse and dual-authenticated.** Terminal `ExportDecomp` adds the
   optional `thumb_creation_producer_blake3` selector only to a function whose ownership row passed
   the shared terminal validator; ordinary records omit it. The selector grants no authority. The
-  centralized Rust inventory reader collects it outside the per-function record, and the v4 symbol
+  centralized Rust inventory reader collects it outside the per-function record, and the v5 symbol
   map requires `thumb_creation_lineage` immediately after `executions` (before `symbols`), including
   an empty array when nothing is owned. Each row links one Ghidra execution index to one exact
   current strict-v3 radare2/Rizin `(entry, producer digest)` and carries canonical authenticated
@@ -577,16 +603,17 @@ module; when a file outgrows that, split it.
   Generated and in-process routes pass the same explicit identities, and the Java applicator emits
   exactly one conserving exception summary in either route. Only the Rust-driven in-process route
   captures and host-parses that line into `ImageResult`; generated `run_ghidra.sh` deliberately does
-  not parse stdout and instead requires process success, all three exports, and the exact v4 marker
-  whose Java preconditions include summary conservation and complete postflight. Host summary
+  not parse stdout and instead requires process success, all three exports, and the exact five-line
+  v5 marker (`startup_metadata=none` on generated pass-1 kits) whose Java preconditions include
+  summary conservation and complete postflight. Host summary
   coordination commits a valid exception result before parsing PAL: a later PAL-summary failure
   preserves the exception counts but leaves the image terminal-invalid and the export non-current.
   `TameAnalysis` validates root
   ownership before and after both modes, so datamark treats root instructions as protected code. `ExportDecomp`
-  retains both exception and PAL inputs, reauthenticates both manifest/program states before and
-  after generating sibling staging files, closes both retained states successfully, then moves the
-  three outputs and writes the exact four-line `pixel-modem-extractor-ghidra-export-v4` marker last;
-  old v3 bytes are stale. An opaque
+  retains exception, PAL, and startup inputs, reauthenticates those manifest/program states before
+  and after generating sibling staging files, closes retained states successfully, then moves the
+  three outputs and writes the exact five-line `pixel-modem-extractor-ghidra-export-v5` marker last
+  (`startup_metadata=<identity-or-none>`); old v4 bytes are stale. An opaque
   skip retains generation state but has no application summary.
 - **Terminal exception state remains generation-owned.** `decompose` authenticates every present
   generation manifest against the terminal raw image and its explicit scatter dependency before
@@ -595,11 +622,14 @@ module; when a file outgrows that, split it.
   exception generation or prevent later images from marshalling. Scatter is structurally MAIN-only:
   non-MAIN `RuntimeScatterState::Unmanaged` means the exception runtime was deliberately raw-only,
   so terminal validation and pass-2 context construction ignore any stale scatter path without
-  deleting it. The one per-label terminal snapshot copies exact terminal raw/scatter/exception/PAL
-  bytes into canonical kit locations, including every file-backed `blocks/*.bin` dependency; the
-  shared strict scatter restager authenticates retained handles, writes payloads first, and commits
-  `load_map.json` last. Exception and PAL contexts are rebuilt from the same staged runtime and
-  explicit application state. The snapshot and its map binding reject drift at the final pre-spawn
+  deleting it. The one per-label terminal snapshot copies exact terminal
+  raw/scatter/exception/PAL/startup bytes into canonical kit locations, including every file-backed
+  `blocks/*.bin` dependency; the shared strict scatter restager authenticates retained handles,
+  writes payloads first, and commits `load_map.json` last. Startup is taken only after publication
+  (pipeline steps 5-7): Present authenticates terminal `startup.json` against the published digest
+  and writes kit `startup_metadata/<label>/startup.json`; `none` / `-` when not Present; leftover
+  `startup.json` without publication is Unmanaged, never current. Exception and PAL contexts are
+  rebuilt from the same staged runtime and explicit application state. The snapshot and its map binding reject drift at the final pre-spawn
   gate; path existence alone never establishes currentness. The adjacent
   `exception_roots` report stage tallies terminal images/tables/roots, while eleven application
   counters are all-or-none and exclusive with reason-only `exception_error`. `None` means no current
@@ -633,20 +663,30 @@ module; when a file outgrows that, split it.
   documented `0x42310000` radare2 `RLIMIT_AS` failure, durably recorded while six regions
   succeeded. PAL, Thumb creation, globals, global shapes/types, DBT, terminal inventories, and all
   conservation gates passed; the overlap-repair fallback did not recur. This lands Shannon-loader
-  roadmap Phase 3A alongside landed Phases 1 and 2. Phase 3B is the next focused design: hardware-init
-  roots, compiler metadata, stack non-return proof/application, and broader privileged-operation
-  evidence over the improved mutable final inventories; it remains architecturally separate from
-  immutable pre-analysis Phase 3A.
-- **Focused verification is explicit.** Run exception discovery/artifact/CFG/PAL unit batteries,
-  both independently configured corpus legs, the complete serial real-Ghidra binary, and the
-  retained-tree report-shape gate:
+  roadmap Phase 3A alongside landed Phases 1 and 2. Phase 3B is landed (2026-09-03) as a separate
+  post-inventory discovery — hardware-init, stack-protection handler with gated no-return,
+  uninterpreted RVCT operands, and privileged-operation evidence — and remains architecturally
+  separate from immutable pre-analysis Phase 3A. That 3A acceptance emitted export-v4; current HEAD
+  emits export-v5. Phase 4 is next.
+- **Focused verification is explicit.** Run exception discovery/artifact/CFG/PAL/startup unit
+  batteries, both independently configured corpus legs, focused serial real-Ghidra tests (not the
+  full `decompile_golden` binary in parallel), and the retained-tree report-shape gate:
 
       cargo test exception_roots:: -- --nocapture
       cargo test semantic_cfg:: -- --nocapture
       cargo test pal_tasks:: -- --nocapture
+      cargo test startup_metadata:: -- --nocapture
       cargo test --test exception_roots_golden -- --nocapture --test-threads=1
-      GHIDRA_INSTALL_DIR=/opt/ghidra \
-        cargo test --test decompile_golden -- --nocapture --test-threads=1
+      cargo test --test startup_metadata_golden -- --nocapture
+      GHIDRA_INSTALL_DIR=/opt/ghidra cargo test --test decompile_golden \
+        pass2_applies_startup_labels_and_gated_no_return \
+        -- --exact --nocapture --test-threads=1
+      GHIDRA_INSTALL_DIR=/opt/ghidra cargo test --test decompile_golden \
+        pass2_startup_missing_target_rolls_back_without_success_summary \
+        -- --exact --nocapture --test-threads=1
+      GHIDRA_INSTALL_DIR=/opt/ghidra cargo test --test decompile_golden \
+        pass2_stronger_name_preserves_startup_role_label \
+        -- --exact --nocapture --test-threads=1
       cargo test --test decompose_golden \
         report_json_includes_exception_roots_fields -- --exact --nocapture
 
@@ -1110,6 +1150,69 @@ hardcoded. Two reference images exercise both models end-to-end:
   signatures for the loader, and any artifact-only or opt-in seeding fallback (a MAIN either
   proves its initializer or the command fails; it never ships half-seeded).
 
+### Runtime startup metadata
+
+- **Discovery is post-inventory and default-on.** 3B cannot run at generation time: inventories
+  do not exist yet. Every embedded TOC image with a current pass-1 Ghidra inventory is examined;
+  opaque skips and generation-only `decompile` skip cleanly. Pass-1 marshalling leaves startup
+  `Unmanaged` until this step; leftover `startup.json` is never current. `decompose` discovers
+  after terminal raw/scatter/exception/PAL marshalling and before `symbol_map`. `decompile --run`
+  discovers after a successful per-image export and writes kit `startup_metadata/<label>/startup.json`.
+  `--no-symbol-pass` still publishes the sidecar and attaches evidence through `FinalArtifact`; it
+  does not spawn `ApplyStartupMetadata` or set Ghidra no-return. Do not re-run after pass 2 or
+  finalize: proofs are name-independent and hash the pass-1 inventories actually decoded.
+- **Four independent sections, one plan.** Unique ASCII seeds are 0 = `Absent`, 1 = unique,
+  more than one = image-wide `Ambiguous`. Materialization is PAL-style (`ADR` / PC-relative
+  literal / `MOVW`/`MOVT`); analyzer xrefs are diagnostic only. `hardware_init` names `hw_Init`
+  only when exactly one accepted container is reachable from that image's proven reset root (no
+  reset root is clean `Absent`, never a string-only guess). `stack_guard` names
+  `StackProtectionFailure` from a unique container; non-return is a separate local-CFG must-proof
+  (`CallPolicy::Fallthrough`) and incomplete CFG names without applying no-return. `compiler`
+  records uninterpreted RVCT callsite operands (no major/minor/build); `_ShannonOS_` is optional
+  no-evidence on both retained MAIN images. `privileged_ops` always sweeps accepted identities on
+  a discovered image (empty is valid; no Ghidra comments; no MPU). A section that crosses
+  plausibility and then fails fails the whole image artifact; later images continue; prior
+  complete artifacts are preserved.
+- **Resource limits are named constants** (`startup_metadata/mod.rs`): 1 seed occurrence, 128-byte
+  C-strings, 64 refs/callsites, 64 KiB / 32,768 insns / 4,096 blocks per CFG (`CfgLimits::startup_metadata()`),
+  4,096 visited functions, depth 64, 2 applications, 65,536 privileged ops, 1 MiB manifest,
+  2,000-byte Java leaves, 2,048-char reasons. Charged CFG bytes are non-refundable inside one
+  image discovery. Exhaustion after plausibility is `ResourceLimit`.
+- **Canonical artifact and identity.** Format `pixel-modem-extractor-startup-metadata-v1`; two-space
+  pretty JSON with no trailing newline. Identity `v1:<manifest-blake3>:<named-roots>:<no-return-roots>:<privileged-ops>`
+  is rederived by the strict reader. Terminal leaf is `images/<label>/startup_metadata/startup.json`
+  (`--prune` retains it). Because privileged-op sweep always runs, a discovered image with all
+  string sections absent is still `Present` with an empty array; `Absent` is only for images that
+  were not discovered.
+- **Pass-2 application is labels plus gated no-return.** Order is
+  `ApplyThumbNames -> ApplySymbols -> ApplyStartupMetadata -> ApplyGlobals -> ApplyGlobalTypes -> ExportDecomp`,
+  all `-noanalysis`. `ApplyStartupMetadata` is present only when startup state is `Present`. It
+  never creates functions, never re-analyzes, and never enables Repair Flow Damage. Role labels
+  `startup_hardware_init` / `startup_stack_protection_failure` survive a stronger primary.
+  `Function.setNoReturn(true)` only when `set_no_return` is true. First-apply `ApplySymbols`
+  accepts absent startup ownership; a later retry must not let token/string-ref replace a
+  startup-owned primary. Export-v5 binds `startup_metadata=<identity-or-none>`; generated pass-1
+  kits write `none`.
+- **Naming precedence includes startup.**
+  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`.
+  `kind: "startup"` attaches by exact `(entry, DecodeIsa)` without merging producer identities.
+- **Report surface.** Stage `startup_metadata` after inventories and before `symbol_map`; stage
+  `startup_metadata_apply` after pass 2 (skipped for `--no-symbol-pass` or no Present artifact).
+  Per-image discovery fields omit when discovery did not complete and emit `null` / `0` / `false`
+  when it completed with zero; `startup_error` is exclusive with the counts. Apply counters use
+  the same None-versus-Some(0) rule as exception application. Re-apply after
+  `refresh_decompile_stage_images` the same way global-shapes outcomes survive that rebuild.
+- **Corpus pins stay honest.** Both retained MAIN images have unique warm-boot / stack-guard /
+  RVCT seeds and no `_ShannonOS_`. Inventory-gated statuses, counts, identity, and manifest
+  BLAKE3 remain empty sentinels until `PIN OBSERVED` is copied from a lawful first run. Unique
+  seeds are not named roots: the 2026-08-27 probe did not close hardware-init reset reachability
+  or stack-handler non-return. Never infer a corpus pass from an unset-variable skip.
+- **Rejected approaches, keep rejecting them.** Pre-analysis function creation, re-enabling
+  Repair Flow Damage, string-only `hw_Init` without reset reachability, applying no-return
+  during analysis, publishing proven sections while another section is malformed, MPU permission
+  application, RVCT field labels, FLIRT/Function ID, and a compatibility reader for v4 symbol,
+  map, or export bytes.
+
 ### Debug-trace catalog
 
 - **Scan threshold then quarantine.** `dbt_traces::discover` sweeps every offset of every
@@ -1167,10 +1270,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   edge (`cli::run() -> anyhow::Result<()>`). `bin/main.rs` initializes `tracing` on
   stderr, prints `error: {e:#}` on failure, and exits 1.
 - **Symbolication is fail-closed.** Every primary-name decision uses one order:
-  `__func__ > registration > exception_root > pal_task > token > string_ref`. A recovered
+  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`. A recovered
   `__func__` (an assert site referencing both its `__FILE__` and a unique identifier string) and a
-  registration-table match are authoritative `Recovered` names. Exception-root and PAL-task names
-  are durable role evidence below those firmware-native names. Token and string-ref survivors are
+  registration-table match are authoritative `Recovered` names. Exception-root, PAL-task, and startup
+  names are durable role evidence below those firmware-native names. Token and string-ref survivors are
   marked `Provisional` `guess_*_<addr>` names, never unmarked; file attribution and DBT evidence
   are annotations only and never primary names. Token immediates are recovered by `movw`/`movt`
   reconstruction over the emitted disasm; string evidence needs the raw split
@@ -1180,8 +1283,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   (so `symbols.json` provenance stays stable); `symbols.json.inputs.functions_json_blake3` is
   captured after the function rewrite and therefore names the terminal companion bytes, not the
   pre-rewrite input. Preserve that ordering if you touch the rewrite path.
-  Final exception/PAL evidence comes only from the bounded immutable strict-reader projection and
-  attaches by exact entry plus decode ISA independently for each function owner. Public standalone
+  Final exception/PAL/startup evidence comes only from the bounded immutable strict-reader projection
+  and attaches by exact entry plus decode ISA independently for each function owner. Public standalone
   `symbolicate` constructs and validates every eligible image context before its first mutation; it
   requires the raw image and any managed scatter/role artifacts. A pruned tree intentionally lacks
   those raw authentication bytes, so replay fails before mutation while the already-finalized typed
@@ -1240,7 +1343,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   scans the raw split image for contiguous `{name_ptr, fn_ptr}` tables — the
   AT-command dispatch, ISR, and protocol-handler tables baseband firmware is
   full of — and mints a **bare `Recovered` name** for each. The same global order applies:
-  `__func__ > registration > exception_root > pal_task > token > string_ref`. The **fail-closed gate
+  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`. The **fail-closed gate
   is the function inventory**: the pointer (Thumb bit stripped) must resolve to a
   known ARM/Thumb entry, so a name is only minted for a confirmed function — no
   prologue heuristics. Further fail-closed rules: the name must be a clean
@@ -1320,7 +1423,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   recovery consumes that index and writes `globals.json` before pass 2 on the
   normal route; on that same route, global-*shape* recovery also runs before
   pass 2 and can feed a global-types map (see **Phase 3.2 type application**
-  below). `decompile::run_two_pass` accepts a typed per-image input with up to
+  below).   `decompile::run_two_pass` accepts a typed per-image input with up to
   three optional maps — function, global, and global-types. Each map is
   constructed only from a non-empty regular file, stores its canonical
   absolute path, and is revalidated immediately before Ghidra arguments are
@@ -1332,8 +1435,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   its script set. It starts exactly one `analyzeHeadless -process -noanalysis`
   saved-project process for each image having at least one of the three
   inputs. With all maps present, the fixed post-script order is
-  `ApplyThumbNames.java -> ApplySymbols.java -> ApplyGlobals.java ->
-  ApplyGlobalTypes.java -> ExportDecomp.java`. Each map remains independently
+  `ApplyThumbNames.java -> ApplySymbols.java -> ApplyStartupMetadata.java ->
+  ApplyGlobals.java -> ApplyGlobalTypes.java -> ExportDecomp.java`.
+  `ApplyStartupMetadata.java` is present only when startup state is `Present`.
+  Each map remains independently
   optional; `ApplyThumbNames.java` rides in the function map and runs first
   whenever one is present (a no-op on an empty `creations` array), while an
   image with none of the three inputs starts no pass-2 process at all. Creation
@@ -1346,7 +1451,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   argument-construction details and the all-three example.
 
   **Pass-2 creation of named producer-owned Thumb functions.** The symbol map
-  is `pixel-modem-extractor-symbol-map-v4` with a `creations` section: named
+  is `pixel-modem-extractor-symbol-map-v5` with a `creations` section: named
   (`Recovered` or provisional) Thumb executions authenticated by a validated
   producer inventory (radare2/Rizin strict v3) whose entry Ghidra's own
   inventory never discovered. Readable v1/v2 legacy records remain valid
@@ -2448,9 +2553,9 @@ hardcoded. Two reference images exercise both models end-to-end:
     and any invalidation failure prevents launch. Unsuccessful, aborted, missing-marker,
     and invalid-output attempts scrub every removable owned path before marshalling.
     `ExportDecomp.java` checks each `PrintWriter` after its write/flush/close path while all three
-    outputs remain sibling staging files. It repeats exception and PAL postflight, closes retained
-    inputs, atomically moves the three destinations, then atomically renames a sibling temp marker
-    into place. A pre-move validation or close failure removes only staging and leaves prior
+    outputs remain sibling staging files. It repeats exception, PAL, and startup postflight, closes
+    retained inputs, atomically moves the three destinations, then atomically renames a sibling temp
+    marker into place. A pre-move validation or close failure removes only staging and leaves prior
     destinations untouched; a later partial move or marker failure remains non-current for host
     cleanup. Direct and generated validation require the exact marker bytes,
     including its one trailing newline. Keep the marker outside `export/<label>/` so
@@ -2486,25 +2591,31 @@ hardcoded. Two reference images exercise both models end-to-end:
     is load-bearing: Ghidra 12's completed `TimeoutTaskMonitor`s retain their
     scheduled timer, while cancelling one also cancels its parent. The exporter
     checks each long operation on return and gates every temporary-to-terminal
-    move, including the v4 completion marker. Deadline expiry can therefore
+    move, including the v5 completion marker. Deadline expiry can therefore
     leave no current marker without accumulating one pending timer per function.
   - **Pass-2 manifest arguments must sit inside the Ghidra kit root.**
     `readPal` authenticates the task manifest, the complete scatter artifact
     (load map plus every referenced payload), and the raw image
     (`<ghidra>/images/<label>`) by canonical containment. The single
     `TerminalPass2Snapshot` stages those bytes once from explicit terminal outcomes and owns every
-    Java terminal argument; there is no independent PAL or exception loader. Map-only restaging is
-    invalid because both readers open file-backed `blocks/*.bin` entries relative to the map.
+    Java terminal argument; there is no independent PAL, exception, or startup loader. Map-only
+    restaging is invalid because both readers open file-backed `blocks/*.bin` entries relative to
+    the map. `ExportDecomp` takes twelve arguments: output, kit root, label, exception
+    identity/manifest, PAL identity/manifest, startup identity/manifest (`none` / `-` when not
+    Present), scatter, symbol map, map BLAKE3.
   - **`-process` mode, not `-import`, for pass 2.** Applicable post-script
     vectors all follow `<projectDir> <projectName> -process <label> -noanalysis
     -scriptPath …`. A function map appends `ApplyThumbNames.java` first and
-    then `ApplySymbols.java`; global and global-types maps independently append
+    then `ApplySymbols.java`; Present startup appends `ApplyStartupMetadata.java`
+    next; global and global-types maps independently append
     `ApplyGlobals.java` and `ApplyGlobalTypes.java`. Every scheduled vector
     ends with `ExportDecomp.java`, so the all-map order is exactly
-    `ApplyThumbNames.java -> ApplySymbols.java -> ApplyGlobals.java ->
-    ApplyGlobalTypes.java -> ExportDecomp.java`. All-three example:
+    `ApplyThumbNames.java -> ApplySymbols.java -> ApplyStartupMetadata.java ->
+    ApplyGlobals.java -> ApplyGlobalTypes.java -> ExportDecomp.java`.
+    `ApplyStartupMetadata.java` is omitted when startup identity is `none`.
+    All-maps example:
 
-        -postScript ApplyThumbNames.java <kit-root> <label> <image-blake3> <exception-identity> <exception-manifest> <scatter-map> <functions-json> <functions-blake3> <function-map> <map-blake3> -postScript ApplySymbols.java <function-map> -postScript ApplyGlobals.java <global-map> -postScript ApplyGlobalTypes.java <global-types-map> -postScript ExportDecomp.java <out>
+        -postScript ApplyThumbNames.java <kit-root> <label> <image-blake3> <exception-identity> <exception-manifest> <scatter-map> <functions-json> <functions-blake3> <function-map> <map-blake3> -postScript ApplySymbols.java <kit-root> <label> <image-blake3> <exception-identity> <exception-manifest> <pal-identity> <pal-manifest> <scatter-map> <functions-json> <functions-blake3> <function-map> <map-blake3> -postScript ApplyStartupMetadata.java <kit-root> <label> <image-blake3> <startup-identity> <startup-manifest> <scatter-map> <functions-json> <functions-blake3> -postScript ApplyGlobals.java <global-map> -postScript ApplyGlobalTypes.java <global-types-map> -postScript ExportDecomp.java <out> <kit-root> <label> <exception-identity> <exception-manifest> <pal-identity> <pal-manifest> <startup-identity> <startup-manifest> <scatter-map> <function-map> <map-blake3>
 
     At least one of the three typed maps must be `Some` or
     `headless_process_args` returns `Ok(None)` (nothing scheduled for that

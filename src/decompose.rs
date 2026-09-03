@@ -271,6 +271,39 @@ pub struct ImageReport {
     /// all-or-none group as the six counters above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dbt_refs_producers: Option<Vec<String>>,
+    /// Canonical hardware-init entry, or JSON `null` when discovery completed
+    /// with that section absent. Omitted when discovery did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_hardware_init: Option<Option<String>>,
+    /// Canonical stack-guard entry, or JSON `null` when discovery completed
+    /// with that section absent. Omitted when discovery did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_stack_guard: Option<Option<String>>,
+    /// Proven non-return for a present stack guard. Exclusive with a null
+    /// stack guard and omitted when discovery did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_stack_non_return: Option<bool>,
+    /// Count of uninterpreted exact RVCT operands. `Some(0)` is a completed
+    /// zero; omitted when discovery did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_compiler_operands: Option<usize>,
+    /// Privileged-operation count. `Some(0)` is a completed zero; omitted
+    /// when discovery did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_privileged_ops: Option<usize>,
+    /// Reason-only discovery failure. Exclusive with the completed counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<String>,
+    /// Pass-2 `ApplyStartupMetadata` label count. `None` until application
+    /// runs; `Some(0)` is an executed zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_apply_labeled: Option<usize>,
+    /// Pass-2 proven no-return applications. Same None-versus-Some(0) rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_apply_no_return: Option<usize>,
+    /// Reason-only application failure. Exclusive with the apply counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_apply_error: Option<String>,
 }
 
 impl ImageReport {
@@ -398,6 +431,15 @@ impl ImageReport {
             dbt_unresolved_messages: None,
             dbt_references: None,
             dbt_refs_producers: None,
+            startup_hardware_init: None,
+            startup_stack_guard: None,
+            startup_stack_non_return: None,
+            startup_compiler_operands: None,
+            startup_privileged_ops: None,
+            startup_error: None,
+            startup_apply_labeled: r.startup_apply_labeled,
+            startup_apply_no_return: r.startup_apply_no_return,
+            startup_apply_error: r.startup_apply_error.clone(),
         }
     }
 }
@@ -843,6 +885,7 @@ fn build_current_symbolication_context(
             ),
             exception,
             pal,
+            symbolicate::role_evidence::ArtifactState::Unmanaged,
         )?,
     ))
 }
@@ -1586,6 +1629,333 @@ fn pal_tasks_stage(
         return StageReport::skipped("pal_tasks", "no PAL task initializer");
     }
     StageReport::ok("pal_tasks", &output(), duration_ms)
+}
+
+enum StartupMetadataOutcome {
+    Success {
+        hardware_init: Option<String>,
+        stack_guard: Option<String>,
+        stack_non_return: Option<bool>,
+        compiler_operands: usize,
+        privileged_ops: usize,
+    },
+    Skipped,
+    Failure(String),
+}
+
+fn apply_startup_metadata_outcome(image: &mut ImageReport, outcome: &StartupMetadataOutcome) {
+    image.startup_hardware_init = None;
+    image.startup_stack_guard = None;
+    image.startup_stack_non_return = None;
+    image.startup_compiler_operands = None;
+    image.startup_privileged_ops = None;
+    image.startup_error = None;
+    match outcome {
+        StartupMetadataOutcome::Success {
+            hardware_init,
+            stack_guard,
+            stack_non_return,
+            compiler_operands,
+            privileged_ops,
+        } => {
+            image.startup_hardware_init = Some(hardware_init.clone());
+            image.startup_stack_guard = Some(stack_guard.clone());
+            image.startup_stack_non_return = *stack_non_return;
+            image.startup_compiler_operands = Some(*compiler_operands);
+            image.startup_privileged_ops = Some(*privileged_ops);
+        }
+        StartupMetadataOutcome::Skipped => {}
+        StartupMetadataOutcome::Failure(reason) => {
+            image.startup_error = Some(reason.clone());
+        }
+    }
+}
+
+fn reapply_startup_metadata_outcomes(
+    report_images: &mut [ImageReport],
+    outcomes: &HashMap<String, StartupMetadataOutcome>,
+) {
+    for image in report_images {
+        if let Some(outcome) = outcomes.get(&image.image) {
+            apply_startup_metadata_outcome(image, outcome);
+        }
+    }
+}
+
+fn startup_canonical_address(address: u32) -> String {
+    format!("{address:#010x}")
+}
+
+fn discover_image_startup(
+    image: &decompile::ImageResult,
+    images_dir: &Path,
+    contexts: &mut CurrentSymbolicationContexts,
+) -> StartupMetadataOutcome {
+    let label = image.label.as_str();
+    let image_dir = images_dir.join(label);
+    match &image.outcome {
+        ImageOutcome::SkippedOpaque(_) => {
+            if let Err(error) = crate::startup_metadata::clear_image(&image_dir) {
+                return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                    &error.to_string(),
+                ));
+            }
+            if let Some(context) = contexts.get(label).cloned()
+                && let Ok(updated) =
+                    context.with_startup(symbolicate::role_evidence::ArtifactState::Absent)
+            {
+                contexts.insert(label.to_string(), Arc::new(updated));
+            }
+            return StartupMetadataOutcome::Skipped;
+        }
+        ImageOutcome::Failed(_) | ImageOutcome::TerminalInvalid => {
+            return StartupMetadataOutcome::Skipped;
+        }
+        ImageOutcome::Analyzed(_) => {}
+    }
+
+    let functions_path = image_dir.join("decompiled/functions.json");
+    if !functions_path.is_file() {
+        return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+            "missing functions.json",
+        ));
+    }
+
+    let raw_path = image_dir.join(format!("{label}.bin"));
+    let raw = match std::fs::read(&raw_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(&format!(
+                "raw image unreadable: {error}"
+            )));
+        }
+    };
+    let scatter = contexts
+        .get(label)
+        .map(|context| context.runtime().scatter().clone())
+        .unwrap_or(symbolicate::role_evidence::ArtifactState::Unmanaged);
+    let runtime = match scatter {
+        symbolicate::role_evidence::ArtifactState::Present(_) => {
+            crate::runtime_image::RuntimeImage::for_image_dir(&raw, image.image_start, &image_dir)
+        }
+        symbolicate::role_evidence::ArtifactState::Absent
+        | symbolicate::role_evidence::ArtifactState::Unmanaged => {
+            crate::runtime_image::RuntimeImage::from_plan(&raw, image.image_start, None)
+        }
+    };
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                &error.to_string(),
+            ));
+        }
+    };
+
+    let streamed =
+        match crate::execution_ranges::read_ghidra_inventory_streaming(&functions_path, &runtime) {
+            Ok(streamed) => streamed,
+            Err(error) => {
+                return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                    &error.to_string(),
+                ));
+            }
+        };
+    let mut inventories = streamed.inventory.records;
+    let thumb_path = image_dir.join("decompiled/thumb_functions.json");
+    let thumb_functions_blake3 = match (image.thumb_functions, thumb_path.is_file()) {
+        (None, false) => None,
+        (None, true) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                "unexpected thumb_functions.json without a current Thumb inventory",
+            ));
+        }
+        (Some(_), false) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                "missing thumb_functions.json",
+            ));
+        }
+        (Some(substantial), true) => {
+            match crate::thumb_analysis::validate_thumb_inventory_streaming(
+                &thumb_path,
+                &runtime,
+                substantial,
+            ) {
+                Ok(validated) => {
+                    inventories.extend(validated.inventory.records);
+                    match std::fs::read(&thumb_path) {
+                        Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
+                        Err(error) => {
+                            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                                &error.to_string(),
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let functions_blake3 = match std::fs::read(&functions_path) {
+        Ok(bytes) => *blake3::hash(&bytes).as_bytes(),
+        Err(error) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                &error.to_string(),
+            ));
+        }
+    };
+    let toc_name = crate::manifest::toc_name(label);
+    let exception_identity = contexts.get(label).and_then(|context| {
+        context
+            .roles()
+            .exception()
+            .present()
+            .map(|exception| exception.identity().to_string())
+    });
+    let reset = contexts
+        .get(label)
+        .and_then(|context| context.roles().exception().present())
+        .and_then(|exception| exception.reset_root());
+    let (image_base, image_size) = runtime.image_bounds();
+    let image_blake3 = *blake3::hash(&raw).as_bytes();
+    let scatter_blake3 = match scatter {
+        symbolicate::role_evidence::ArtifactState::Present(digest) => Some(digest),
+        symbolicate::role_evidence::ArtifactState::Absent
+        | symbolicate::role_evidence::ArtifactState::Unmanaged => None,
+    };
+    let plan =
+        match crate::startup_metadata::discover(&runtime, label, toc_name, &inventories, reset) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                    &error.to_string(),
+                ));
+            }
+        };
+    let context = crate::startup_metadata::StartupArtifactContext {
+        label,
+        toc_name,
+        image_base,
+        image_size,
+        image_blake3,
+        scatter_blake3,
+        scatter_entries: &[],
+        functions_blake3,
+        thumb_functions_blake3,
+        exception_identity: exception_identity.as_deref(),
+        tool_version: env!("CARGO_PKG_VERSION"),
+    };
+    let materialized = match crate::startup_metadata::materialize_image(&plan, context, &image_dir)
+    {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                &error.to_string(),
+            ));
+        }
+    };
+    let manifest_path = image_dir.join(&materialized.relative_path);
+    let validated = match std::fs::read(&manifest_path) {
+        Ok(bytes) => match crate::startup_metadata::read_bytes(&bytes, &runtime, context) {
+            Ok(validated) => validated,
+            Err(error) => {
+                return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                    &error.to_string(),
+                ));
+            }
+        },
+        Err(error) => {
+            return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                &error.to_string(),
+            ));
+        }
+    };
+    if let Some(existing) = contexts.get(label).cloned() {
+        match existing.with_startup(symbolicate::role_evidence::ArtifactState::Present(
+            validated,
+        )) {
+            Ok(updated) => {
+                contexts.insert(label.to_string(), Arc::new(updated));
+            }
+            Err(error) => {
+                return StartupMetadataOutcome::Failure(crate::error::bounded_reason(
+                    &error.to_string(),
+                ));
+            }
+        }
+    }
+
+    let hardware_init = match &plan.hardware_init {
+        crate::startup_metadata::Section::Present(hw) => Some(startup_canonical_address(hw.entry)),
+        crate::startup_metadata::Section::Absent => None,
+    };
+    let (stack_guard, stack_non_return) = match &plan.stack_guard {
+        crate::startup_metadata::Section::Present(guard) => (
+            Some(startup_canonical_address(guard.entry)),
+            Some(guard.non_return),
+        ),
+        crate::startup_metadata::Section::Absent => (None, None),
+    };
+    let compiler_operands = match &plan.compiler {
+        crate::startup_metadata::Section::Present(meta) => meta.operands.len(),
+        crate::startup_metadata::Section::Absent => 0,
+    };
+    StartupMetadataOutcome::Success {
+        hardware_init,
+        stack_guard,
+        stack_non_return,
+        compiler_operands,
+        privileged_ops: plan.privileged_ops.len(),
+    }
+}
+
+fn run_startup_metadata_stage(
+    stages: &mut Vec<StageReport>,
+    images: &[decompile::ImageResult],
+    images_dir: &Path,
+    contexts: &mut CurrentSymbolicationContexts,
+) -> HashMap<String, StartupMetadataOutcome> {
+    let started = Instant::now();
+    let mut outcomes = HashMap::new();
+    let mut errors = Vec::new();
+    let mut discovered = 0usize;
+    for image in images {
+        let outcome = discover_image_startup(image, images_dir, contexts);
+        match &outcome {
+            StartupMetadataOutcome::Success { .. } => {
+                discovered = discovered.saturating_add(1);
+            }
+            StartupMetadataOutcome::Skipped => {}
+            StartupMetadataOutcome::Failure(reason) => {
+                discovered = discovered.saturating_add(1);
+                errors.push((image.label.clone(), reason.clone()));
+            }
+        }
+        outcomes.insert(image.label.clone(), outcome);
+    }
+    reapply_startup_metadata_outcomes(decompile_stage_images_mut(stages), &outcomes);
+    let duration_ms = started.elapsed().as_millis();
+    let output = format!("images/*/startup_metadata/startup.json (images={discovered})");
+    let stage = if !errors.is_empty() {
+        StageReport {
+            stage: "startup_metadata",
+            status: "failed",
+            output: (discovered > errors.len()).then_some(output),
+            reason: None,
+            error: Some(crate::error::bounded_labelled_reasons(&errors, "; ")),
+            images: Vec::new(),
+            duration_ms,
+        }
+    } else {
+        StageReport::ok("startup_metadata", &output, duration_ms)
+    };
+    stages.push(stage);
+    outcomes
 }
 
 struct MarshalPass1Batch {
@@ -3069,7 +3439,7 @@ fn terminal_snapshot_error_invalidates_exception(
     matches!(
         runtime.exception,
         decompile::RuntimeExceptionState::Present(_)
-    ) && !matches!(error, Error::BadPalTasks(_))
+    ) && !matches!(error, Error::BadPalTasks(_) | Error::BadStartupMetadata(_))
 }
 
 fn build_terminal_pass2_snapshots(
@@ -3315,6 +3685,87 @@ fn globals_apply_stage(
         output: Some(format!(
             "{processed} image(s) processed; {applied_total} globals applied; \
              {skipped_total} skipped"
+        )),
+        reason: None,
+        error: first_error,
+        images: Vec::new(),
+        duration_ms,
+    }
+}
+
+fn present_startup_labels(snapshots: &TerminalPass2Snapshots) -> Vec<String> {
+    let mut labels: Vec<String> = snapshots
+        .iter()
+        .filter(|(_, snapshot)| snapshot.startup_identity() != "none")
+        .map(|(label, _)| label.clone())
+        .collect();
+    labels.sort();
+    labels
+}
+
+fn startup_metadata_apply_stage(
+    no_symbol_pass: bool,
+    present_labels: &[String],
+    images: Option<&[decompile::ImageResult]>,
+    duration_ms: u128,
+) -> StageReport {
+    if no_symbol_pass {
+        return StageReport::skipped("startup_metadata_apply", "--no-symbol-pass");
+    }
+    if present_labels.is_empty() {
+        return StageReport::skipped("startup_metadata_apply", "no Present artifact");
+    }
+
+    let mut remaining = present_labels.to_vec();
+    let mut processed = 0usize;
+    let mut labeled_total = 0usize;
+    let mut no_return_total = 0usize;
+    let mut first_error = None;
+
+    if let Some(images) = images {
+        for image in images {
+            let Ok(index) = remaining.binary_search(&image.label) else {
+                continue;
+            };
+            remaining.remove(index);
+            if let Some(error) = &image.pass2_error {
+                first_error.get_or_insert_with(|| format!("{}: {error}", image.label));
+                continue;
+            }
+            if let Some(error) = &image.startup_apply_error {
+                first_error.get_or_insert_with(|| format!("{}: {error}", image.label));
+                continue;
+            }
+            let (Some(labeled), Some(no_return)) =
+                (image.startup_apply_labeled, image.startup_apply_no_return)
+            else {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "{}: no valid ApplyStartupMetadata success summary",
+                        image.label
+                    )
+                });
+                continue;
+            };
+            labeled_total = labeled_total.saturating_add(labeled);
+            no_return_total = no_return_total.saturating_add(no_return);
+            processed += 1;
+        }
+    }
+    for label in remaining {
+        first_error.get_or_insert_with(|| format!("{label}: missing pass-2 image result"));
+    }
+
+    StageReport {
+        stage: "startup_metadata_apply",
+        status: if first_error.is_some() {
+            "failed"
+        } else {
+            "ok"
+        },
+        output: Some(format!(
+            "{processed} image(s) processed; {labeled_total} labeled; \
+             {no_return_total} no-return"
         )),
         reason: None,
         error: first_error,
@@ -4369,11 +4820,28 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         stages.push(StageReport::skipped("decode_tokens", "no pw_token_db"));
     }
 
+    // 5b. Startup metadata discovery against terminal RuntimeImage and current
+    //     pass-1 inventories, after exception/PAL marshalling and before
+    //     symbol maps. Pass-1 marshalling left startup Unmanaged.
+    let startup_outcomes = if let Some(report) = pass1_report.as_ref() {
+        run_startup_metadata_stage(
+            &mut stages,
+            &report.images,
+            &images_dir,
+            &mut symbolication_contexts,
+        )
+    } else {
+        stages.push(StageReport::skipped("startup_metadata", "pass 1 failed"));
+        HashMap::new()
+    };
+
     // 6. Build the per-image symbol map from pass-1 outputs + attribution +
     //    tokens. Writes <out>/ghidra/symbol_maps/<label>.json per image.
-    //    First build one immutable terminal snapshot per current pass-1 image.
-    //    The snapshot stages and authenticates raw/scatter/exception/PAL once;
-    //    symbol-map construction and pass 2 share that exact runtime state.
+    //    First build one immutable terminal snapshot per current pass-1 image,
+    //    after startup publication (pipeline steps 5-7). The snapshot stages and
+    //    authenticates raw/scatter/exception/PAL/startup once; symbol-map
+    //    construction and pass 2 share that exact runtime state. Path existence
+    //    never establishes currentness.
     let mut terminal_pass2_snapshots = TerminalPass2Snapshots::new();
     let t = Instant::now();
     let (mut function_maps, symbol_map_errors) = if opts.no_symbol_pass {
@@ -4519,8 +4987,13 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     // and nulled the `dbt_*` counters patched before this route
                     // ran — re-apply the retained outcome (see `DbtCounters`).
                     reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
+                    reapply_startup_metadata_outcomes(
+                        decompile_stage_images_mut(&mut stages),
+                        &startup_outcomes,
+                    );
                     stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
                     stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
+                    stages.push(startup_metadata_apply_stage(true, &[], None, 0));
                     // No pass 2 on this route, so `derive_global_types_maps` never
                     // runs and there is no ineligible map to patch; report_images
                     // is irrelevant since `no_symbol_pass` short-circuits first.
@@ -4569,6 +5042,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     &terminal_pass2_snapshots,
                 );
                 let scheduled_count = inputs.len();
+                let present_startup = present_startup_labels(&terminal_pass2_snapshots);
                 drop(std::mem::take(&mut function_maps));
 
                 if let Some(rep) = pass1_report.take() {
@@ -4580,6 +5054,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         stages.push(globals_apply_stage(
                             false,
                             &prepared_global_maps,
+                            Some(&rep.images),
+                            0,
+                        ));
+                        stages.push(startup_metadata_apply_stage(
+                            false,
+                            &present_startup,
                             Some(&rep.images),
                             0,
                         ));
@@ -4612,6 +5092,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                                     Some(&pass2.report.images),
                                     elapsed,
                                 ));
+                                stages.push(startup_metadata_apply_stage(
+                                    false,
+                                    &present_startup,
+                                    Some(&pass2.report.images),
+                                    elapsed,
+                                ));
                                 pass1_report = Some(pass2.report);
                             }
                             Err(error) => {
@@ -4635,6 +5121,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                                     None,
                                     elapsed,
                                 ));
+                                stages.push(startup_metadata_apply_stage(
+                                    false,
+                                    &present_startup,
+                                    None,
+                                    elapsed,
+                                ));
                             }
                         }
                     }
@@ -4649,6 +5141,12 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     };
                     stages.push(decompile_pass2_stage(scheduled_count, 0, errors, 0));
                     stages.push(globals_apply_stage(false, &prepared_global_maps, None, 0));
+                    stages.push(startup_metadata_apply_stage(
+                        false,
+                        &present_startup,
+                        None,
+                        0,
+                    ));
                 }
 
                 if let Some(report) = pass1_report.as_mut() {
@@ -4694,6 +5192,10 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                 // before this route ran (step 3c), and every DispatchPass2
                 // rebuild above nulls them along with the shape fields.
                 reapply_dbt_outcomes(decompile_stage_images_mut(&mut stages), &dbt_outcomes);
+                reapply_startup_metadata_outcomes(
+                    decompile_stage_images_mut(&mut stages),
+                    &startup_outcomes,
+                );
             }
             SymbolRouteStep::RefreshGlobalShapes => {
                 // Re-run the stage after the route's LAST rewrite of the
@@ -4847,6 +5349,7 @@ mod tests {
                 ),
                 symbolicate::role_evidence::ArtifactState::Unmanaged,
                 symbolicate::role_evidence::ArtifactState::Unmanaged,
+                symbolicate::role_evidence::ArtifactState::Unmanaged,
             )
             .unwrap(),
         )
@@ -4924,6 +5427,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         }
     }
 
@@ -5939,6 +6445,31 @@ mod tests {
                 "stage": "globals_apply",
                 "status": "skipped",
                 "reason": "no recovered globals",
+                "duration_ms": 0
+            })
+        );
+    }
+
+    #[test]
+    fn startup_metadata_apply_stage_uses_exact_skip_policies() {
+        let images = vec![analyzed_image("02_MAIN")];
+        let disabled = startup_metadata_apply_stage(true, &["02_MAIN".into()], Some(&images), 99);
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap(),
+            serde_json::json!({
+                "stage": "startup_metadata_apply",
+                "status": "skipped",
+                "reason": "--no-symbol-pass",
+                "duration_ms": 0
+            })
+        );
+        let absent = startup_metadata_apply_stage(false, &[], Some(&images), 99);
+        assert_eq!(
+            serde_json::to_value(absent).unwrap(),
+            serde_json::json!({
+                "stage": "startup_metadata_apply",
+                "status": "skipped",
+                "reason": "no Present artifact",
                 "duration_ms": 0
             })
         );
@@ -7017,6 +7548,7 @@ mod tests {
                 ),
                 symbolicate::role_evidence::ArtifactState::Unmanaged,
                 symbolicate::role_evidence::ArtifactState::Unmanaged,
+                symbolicate::role_evidence::ArtifactState::Unmanaged,
             )
             .unwrap(),
         );
@@ -7236,6 +7768,15 @@ mod tests {
                         dbt_unresolved_messages: None,
                         dbt_references: None,
                         dbt_refs_producers: None,
+                        startup_hardware_init: None,
+                        startup_stack_guard: None,
+                        startup_stack_non_return: None,
+                        startup_compiler_operands: None,
+                        startup_privileged_ops: None,
+                        startup_error: None,
+                        startup_apply_labeled: None,
+                        startup_apply_no_return: None,
+                        startup_apply_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -7315,6 +7856,15 @@ mod tests {
                         dbt_unresolved_messages: None,
                         dbt_references: None,
                         dbt_refs_producers: None,
+                        startup_hardware_init: None,
+                        startup_stack_guard: None,
+                        startup_stack_non_return: None,
+                        startup_compiler_operands: None,
+                        startup_privileged_ops: None,
+                        startup_error: None,
+                        startup_apply_labeled: None,
+                        startup_apply_no_return: None,
+                        startup_apply_error: None,
                     },
                 ],
                 10,
@@ -7567,6 +8117,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         });
         assert_eq!(image.status, "failed");
         assert_eq!(image.functions, Some(42));
@@ -7626,6 +8179,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         });
 
         assert_eq!(image.status, "analyzed");
@@ -7735,6 +8291,9 @@ mod tests {
                 exception_roots_applied: None,
                 exception_error: None,
                 pal_applied: None,
+                startup_apply_labeled: None,
+                startup_apply_no_return: None,
+                startup_apply_error: None,
             },
             decompile::ImageResult {
                 label: "01_BOOT".into(),
@@ -7775,6 +8334,9 @@ mod tests {
                 exception_roots_applied: None,
                 exception_error: None,
                 pal_applied: None,
+                startup_apply_labeled: None,
+                startup_apply_no_return: None,
+                startup_apply_error: None,
             },
         ];
         let images_dir = root.join("images");
@@ -7854,6 +8416,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
 
@@ -7970,6 +8535,15 @@ mod tests {
             dbt_unresolved_messages: None,
             dbt_references: None,
             dbt_refs_producers: None,
+            startup_hardware_init: None,
+            startup_stack_guard: None,
+            startup_stack_non_return: None,
+            startup_compiler_operands: None,
+            startup_privileged_ops: None,
+            startup_error: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -8013,6 +8587,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         }];
 
         refresh_decompile_stage_images(&mut stages, &post_enrich_images);
@@ -8091,6 +8668,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         }];
         let outcome = run_thumb_enrich_per_image(&mut images, &root.join("images"));
         assert_eq!(outcome.counts.len(), 0);
@@ -9456,6 +10036,38 @@ mod tests {
             &[TerminalPass2SnapshotIssue {
                 label: EXCEPTION_LABEL.to_string(),
                 reason: "PAL snapshot manifest changed".to_string(),
+                invalidates_exception: false,
+            }],
+        );
+
+        assert!(report.images[0].exception_roots_applied.is_some());
+        assert!(report.images[0].exception_error.is_none());
+    }
+
+    #[test]
+    fn startup_only_terminal_snapshot_issue_preserves_current_exception_counts() {
+        let fixture = ExceptionMarshalFixture::present();
+        let mut report = current_exception_report(&fixture);
+        let runtime = runtime_state(
+            decompile::RuntimeScatterState::Absent,
+            decompile::RuntimeTaskState::Absent,
+            fixture.state.clone(),
+        );
+
+        assert!(!terminal_snapshot_error_invalidates_exception(
+            &runtime,
+            &Error::BadStartupMetadata("startup snapshot manifest changed".to_string()),
+        ));
+        assert!(terminal_snapshot_error_invalidates_exception(
+            &runtime,
+            &Error::BadExceptionRoots("exception snapshot changed".to_string()),
+        ));
+
+        record_terminal_snapshot_issues(
+            &mut report,
+            &[TerminalPass2SnapshotIssue {
+                label: EXCEPTION_LABEL.to_string(),
+                reason: "startup snapshot manifest changed".to_string(),
                 invalidates_exception: false,
             }],
         );
@@ -10943,6 +11555,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         };
 
         assert!(refresh_decompiled(&ghidra, &images, &image).is_err());
@@ -11025,6 +11640,12 @@ mod tests {
             b"{\"format\":\"pixel-modem-extractor-exception-roots-v1\"}",
         )
         .unwrap();
+        std::fs::create_dir_all(out.join("images/02_MAIN/startup_metadata")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/startup_metadata/startup.json"),
+            b"{\"format\":\"pixel-modem-extractor-startup-metadata-v1\"}",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
@@ -11083,9 +11704,301 @@ mod tests {
             b"{\"format\":\"pixel-modem-extractor-exception-roots-v1\"}",
             "the exception-root manifest is a retained leaf"
         );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/startup_metadata/startup.json")).unwrap(),
+            b"{\"format\":\"pixel-modem-extractor-startup-metadata-v1\"}",
+            "the startup-metadata manifest is a retained leaf"
+        );
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());
         assert!(out.join("manifest.json").exists());
+    }
+
+    const STARTUP_INVENTORY_BASE: u32 = 0x4000;
+    const STARTUP_INVENTORY_LEN: u32 = 0x40;
+    const A32_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
+
+    fn startup_inventory_bytes() -> Vec<u8> {
+        let mut raw = vec![0u8; STARTUP_INVENTORY_LEN as usize];
+        raw[..4].copy_from_slice(&A32_BX_LR);
+        raw
+    }
+
+    fn write_startup_functions_json(decompiled: &Path, raw: &[u8]) {
+        let range_blake3 = crate::manifest::blake3_fixed(*blake3::hash(&raw[..4]).as_bytes());
+        let functions = serde_json::json!([{
+            "name": "FUN_4000",
+            "primary_source": "default",
+            "entry": "0x4000",
+            "end": "0x4004",
+            "size": 4,
+            "decode_ranges": [{
+                "isa": "arm",
+                "start": "0x4000",
+                "end": "0x4004",
+                "blake3": range_blake3
+            }],
+            "decode_range_errors": [],
+            "data_refs": []
+        }]);
+        std::fs::write(
+            decompiled.join("functions.json"),
+            serde_json::to_vec(&functions).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_startup_inventory_image(images_dir: &Path, label: &str) -> decompile::ImageResult {
+        let raw = startup_inventory_bytes();
+        let image_dir = images_dir.join(label);
+        let decompiled = image_dir.join("decompiled");
+        std::fs::create_dir_all(&decompiled).unwrap();
+        std::fs::write(image_dir.join(format!("{label}.bin")), &raw).unwrap();
+        write_startup_functions_json(&decompiled, &raw);
+        let mut image = analyzed_image(label);
+        image.outcome = ImageOutcome::Analyzed(1);
+        image.image_start = STARTUP_INVENTORY_BASE;
+        image.image_len = STARTUP_INVENTORY_LEN;
+        image.ghidra_execution_accepted = Some(1);
+        image.ghidra_execution_quarantined = Some(0);
+        image
+    }
+
+    fn write_previous_startup_artifact(images_dir: &Path, label: &str, bytes: &[u8]) {
+        let dir = images_dir.join(label).join("startup_metadata");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("startup.json"), bytes).unwrap();
+    }
+
+    fn startup_leaf(images_dir: &Path, label: &str) -> PathBuf {
+        images_dir.join(label).join("startup_metadata/startup.json")
+    }
+
+    #[test]
+    fn startup_metadata_stage_runs_after_inventories_and_before_symbol_map() {
+        let root =
+            std::env::temp_dir().join(format!("pme_startup_stage_order_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ghidra = root.join("ghidra");
+        let images_dir = root.join("images");
+        std::fs::create_dir_all(ghidra.join("images")).unwrap();
+        std::fs::create_dir_all(ghidra.join("export/02_MAIN")).unwrap();
+        std::fs::write(ghidra.join("images/02_MAIN"), startup_inventory_bytes()).unwrap();
+        std::fs::write(
+            ghidra.join("export/02_MAIN/decompiled.c"),
+            b"void x(void) {}",
+        )
+        .unwrap();
+
+        let marshalled = marshal_image_stages(
+            &ghidra,
+            &images_dir,
+            "02_MAIN",
+            true,
+            &runtime_state(
+                decompile::RuntimeScatterState::Unmanaged,
+                decompile::RuntimeTaskState::Unmanaged,
+                decompile::RuntimeExceptionState::Unmanaged,
+            ),
+            decompile::RuntimeScatterState::Unmanaged,
+            STARTUP_INVENTORY_BASE,
+        );
+        let context = marshalled
+            .symbolication
+            .expect("export-current marshal retains a symbolication context")
+            .expect("unmanaged roles still construct");
+        assert!(
+            matches!(
+                context.roles().startup(),
+                symbolicate::role_evidence::ArtifactState::Unmanaged
+            ),
+            "pass-1 marshalling must leave startup Unmanaged"
+        );
+
+        write_startup_functions_json(
+            &images_dir.join("02_MAIN/decompiled"),
+            &startup_inventory_bytes(),
+        );
+        let image = {
+            let mut image = analyzed_image("02_MAIN");
+            image.outcome = ImageOutcome::Analyzed(1);
+            image.image_start = STARTUP_INVENTORY_BASE;
+            image.image_len = STARTUP_INVENTORY_LEN;
+            image.ghidra_execution_accepted = Some(1);
+            image.ghidra_execution_quarantined = Some(0);
+            image
+        };
+        let mut stages = vec![
+            StageReport::decompile(vec![ImageReport::from_result(&image)], 1),
+            StageReport::ok("exception_roots", "images/*/exception_roots/roots.json", 0),
+            StageReport::ok("pal_tasks", "images/*/pal_tasks/tasks.json", 0),
+        ];
+        let mut contexts = HashMap::from([("02_MAIN".to_string(), context)]);
+        run_startup_metadata_stage(
+            &mut stages,
+            std::slice::from_ref(&image),
+            &images_dir,
+            &mut contexts,
+        );
+
+        let names: Vec<&str> = stages.iter().map(|stage| stage.stage).collect();
+        assert_eq!(
+            names,
+            [
+                "decompile",
+                "exception_roots",
+                "pal_tasks",
+                "startup_metadata"
+            ]
+        );
+        assert!(
+            !names.contains(&"symbol_map"),
+            "startup discovery runs before symbol_map"
+        );
+        assert_eq!(stages[3].status, "ok");
+        assert!(startup_leaf(&images_dir, "02_MAIN").is_file());
+        let json = serde_json::to_value(&stages[0].images[0]).unwrap();
+        assert!(
+            json.as_object()
+                .unwrap()
+                .contains_key("startup_hardware_init"),
+            "completed discovery emits hardware_init as null, not omitted"
+        );
+        assert_eq!(json["startup_hardware_init"], serde_json::Value::Null);
+        assert_eq!(json["startup_stack_guard"], serde_json::Value::Null);
+        assert!(json.get("startup_stack_non_return").is_none());
+        assert_eq!(json["startup_compiler_operands"], 0);
+        assert_eq!(json["startup_privileged_ops"], 0);
+        assert!(json.get("startup_error").is_none());
+        assert!(
+            matches!(
+                contexts["02_MAIN"].roles().startup(),
+                symbolicate::role_evidence::ArtifactState::Present(_)
+                    | symbolicate::role_evidence::ArtifactState::Absent
+            ),
+            "successful discovery replaces Unmanaged with Present or Absent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skipped_opaque_image_does_not_fail_startup_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("pme_startup_opaque_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        std::fs::create_dir_all(images_dir.join("01_PSP")).unwrap();
+        write_previous_startup_artifact(&images_dir, "01_PSP", b"{\"previous\":true}");
+        let mut image = analyzed_image("01_PSP");
+        image.outcome = ImageOutcome::SkippedOpaque(crate::classify::classify(
+            &crate::classify::test_uniform_blob(256 * 1024),
+        ));
+        image.classification = Some("opaque");
+        let mut stages = vec![StageReport::decompile(
+            vec![ImageReport::from_result(&image)],
+            1,
+        )];
+        let mut contexts = HashMap::new();
+        run_startup_metadata_stage(
+            &mut stages,
+            std::slice::from_ref(&image),
+            &images_dir,
+            &mut contexts,
+        );
+        let stage = stages
+            .iter()
+            .find(|stage| stage.stage == "startup_metadata")
+            .expect("startup_metadata stage");
+        assert_ne!(stage.status, "failed");
+        assert!(
+            !startup_leaf(&images_dir, "01_PSP").exists(),
+            "successful opaque skip clears the owned leaf"
+        );
+        let json = serde_json::to_value(&stages[0].images[0]).unwrap();
+        assert!(
+            !json
+                .as_object()
+                .unwrap()
+                .contains_key("startup_hardware_init")
+        );
+        assert!(json.get("startup_error").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_failure_preserves_previous_complete_startup_artifact() {
+        let root =
+            std::env::temp_dir().join(format!("pme_startup_preserve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let images_dir = root.join("images");
+        let previous = br#"{"previous":true,"complete":true}"#;
+        std::fs::create_dir_all(images_dir.join("00_BOOT/decompiled")).unwrap();
+        std::fs::write(
+            images_dir.join("00_BOOT/00_BOOT.bin"),
+            startup_inventory_bytes(),
+        )
+        .unwrap();
+        write_previous_startup_artifact(&images_dir, "00_BOOT", previous);
+        let mut missing = analyzed_image("00_BOOT");
+        missing.outcome = ImageOutcome::Analyzed(1);
+        missing.image_start = STARTUP_INVENTORY_BASE;
+        missing.image_len = STARTUP_INVENTORY_LEN;
+        let later = write_startup_inventory_image(&images_dir, "03_APM");
+        let mut stages = vec![StageReport::decompile(
+            vec![
+                ImageReport::from_result(&missing),
+                ImageReport::from_result(&later),
+            ],
+            1,
+        )];
+        let mut contexts = HashMap::new();
+        run_startup_metadata_stage(&mut stages, &[missing, later], &images_dir, &mut contexts);
+        let stage = stages
+            .iter()
+            .find(|stage| stage.stage == "startup_metadata")
+            .expect("startup_metadata stage");
+        assert_eq!(stage.status, "failed");
+        assert_eq!(
+            std::fs::read(startup_leaf(&images_dir, "00_BOOT")).unwrap(),
+            previous
+        );
+        assert!(
+            startup_leaf(&images_dir, "03_APM").is_file(),
+            "a later image still publishes after a sibling failure"
+        );
+        let json = serde_json::to_value(&stages[0].images[0]).unwrap();
+        assert!(json.get("startup_error").is_some());
+        assert!(
+            !json
+                .as_object()
+                .unwrap()
+                .contains_key("startup_privileged_ops")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_retains_startup_json() {
+        let out = std::env::temp_dir().join(format!("pme_prune_startup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let images_dir = out.join("images");
+        let image = write_startup_inventory_image(&images_dir, "02_MAIN");
+        let mut stages = vec![StageReport::decompile(
+            vec![ImageReport::from_result(&image)],
+            1,
+        )];
+        let mut contexts = HashMap::new();
+        run_startup_metadata_stage(
+            &mut stages,
+            std::slice::from_ref(&image),
+            &images_dir,
+            &mut contexts,
+        );
+        let leaf = startup_leaf(&images_dir, "02_MAIN");
+        let published = std::fs::read(&leaf).unwrap();
+        prune(&out).unwrap();
+        assert_eq!(std::fs::read(&leaf).unwrap(), published);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     /// `report.json` must describe the tree that exists, not the flag that was
@@ -11229,6 +12142,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -11279,6 +12195,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -11364,6 +12283,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         };
         let report = ImageReport::from_result(&r);
         let json = serde_json::to_string(&report).unwrap();
@@ -11405,6 +12327,9 @@ mod tests {
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
             globals_error: Some("malformed functions.json".into()),
             globals_applied: None,
             globals_apply_skipped: None,

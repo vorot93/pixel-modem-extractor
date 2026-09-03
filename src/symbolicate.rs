@@ -14,7 +14,7 @@
 //! Registration names, being `Recovered`, are computed at the symbol_map stage
 //! and therefore *do* reach Ghidra pass 2. Everything else is a comment.
 //! Precedence from strongest to weakest: `__func__`, registration,
-//! exception_root, pal_task, token, string-ref.
+//! exception_root, pal_task, startup, token, string-ref.
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::decompile::{ExceptionApplicationRef, ExceptionDispositionKind, ExceptionPrimaryRef};
 use crate::disasm_index::DisasmIndex;
@@ -61,11 +61,11 @@ pub enum Tier {
     None,
 }
 
-/// `symbols.json` format tag (v4 adds authenticated exception-root evidence).
-pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v4";
+/// `symbols.json` format tag (v5 adds authenticated startup-metadata evidence).
+pub const SYMBOLS_FORMAT: &str = "pixel-modem-extractor-symbols-v5";
 
 /// Strict pass-2 map format name shared with the Java reader.
-pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v4";
+pub const SYMBOL_MAP_FORMAT: &str = "pixel-modem-extractor-symbol-map-v5";
 
 /// Interface limits for the strict map (mirrored by `PalTasksSupport.java`).
 pub const MAX_MAP_ANNOTATIONS_PER_DECISION: usize = 256;
@@ -80,7 +80,7 @@ pub const MAX_PRIMARY_CHARS: usize = 2000;
 
 /// Explicit naming authority. Lower rank (ordinal) is stronger; the order is
 /// the pinned precedence: `__func__`, registration, exception_root, pal_task,
-/// token, string_ref. `file` and `dbt_source` evidence are annotation-only.
+/// startup, token, string_ref. `file` and `dbt_source` evidence are annotation-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Authority {
@@ -88,6 +88,7 @@ pub enum Authority {
     Registration,
     ExceptionRoot,
     PalTask,
+    Startup,
     Token,
     StringRef,
 }
@@ -99,6 +100,7 @@ impl Authority {
             Self::Registration => "registration",
             Self::ExceptionRoot => "exception_root",
             Self::PalTask => "pal_task",
+            Self::Startup => "startup",
             Self::Token => "token",
             Self::StringRef => "string_ref",
         }
@@ -269,6 +271,44 @@ impl PalRoleRefSet {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupRoleRefSet {
+    desired_primary: String,
+    role: &'static str,
+    set_no_return: bool,
+}
+
+impl StartupRoleRefSet {
+    fn from_role_application(application: &role_evidence::StartupRoleApplication) -> Self {
+        Self {
+            desired_primary: application.desired_primary().to_string(),
+            role: application.role(),
+            set_no_return: application.set_no_return(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(primary: &str, role: &'static str, set_no_return: bool) -> Self {
+        Self {
+            desired_primary: primary.to_string(),
+            role,
+            set_no_return,
+        }
+    }
+
+    fn desired_primary(&self) -> &str {
+        &self.desired_primary
+    }
+
+    fn role(&self) -> &'static str {
+        self.role
+    }
+
+    fn set_no_return(&self) -> bool {
+        self.set_no_return
+    }
+}
+
 /// Tagged evidence variant. Every kind serializes with a `kind` tag plus its
 /// own exact fields — no bag of unrelated optional members.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -290,6 +330,11 @@ pub enum TaggedEvidence {
     PalTask {
         #[serde(flatten)]
         task: PalTaskRef,
+    },
+    Startup {
+        manifest_blake3: String,
+        role: &'static str,
+        set_no_return: bool,
     },
     Token {
         token: String,
@@ -318,6 +363,7 @@ impl TaggedEvidence {
             Self::Registration { .. } => "registration",
             Self::ExceptionRoot { .. } => "exception_root",
             Self::PalTask { .. } => "pal_task",
+            Self::Startup { .. } => "startup",
             Self::Token { .. } => "token",
             Self::File { .. } => "file",
             Self::DbtSource { .. } => "dbt_source",
@@ -441,6 +487,14 @@ pub(crate) struct RawEvidence {
     /// The PAL primary proposed for this build purpose. Absence leaves the
     /// authenticated role rank as an empty blocker.
     pub(crate) pal_proposed_primary: Option<String>,
+    /// Manifest identity attached separately from the role-only projection.
+    pub(crate) startup_manifest_blake3: Option<String>,
+    /// The authenticated startup application at this exact entry and decode
+    /// ISA. Occupies the `startup` authority rank.
+    pub(crate) startup: Option<StartupRoleRefSet>,
+    /// The startup primary proposed for this build purpose. Absence leaves
+    /// the authenticated role rank as an empty blocker.
+    pub(crate) startup_proposed_primary: Option<String>,
 }
 
 /// One function to symbolicate (unifies ARM + Thumb).
@@ -778,6 +832,24 @@ pub(crate) fn decide(
         });
     }
 
+    if let (Some(manifest_blake3), Some(app)) = (&raw.startup_manifest_blake3, &raw.startup) {
+        ev.push(TaggedEvidence::Startup {
+            manifest_blake3: manifest_blake3.clone(),
+            role: app.role(),
+            set_no_return: app.set_no_return(),
+        });
+        ann.push(format!(
+            "startup: {} no_return={}",
+            app.role(),
+            app.set_no_return()
+        ));
+        candidates.push(NameCandidate {
+            authority: Authority::Startup,
+            kind: "startup",
+            proposed_name: raw.startup_proposed_primary.clone().unwrap_or_default(),
+        });
+    }
+
     if let Some(fname) = &raw.func_name {
         ev.insert(
             0,
@@ -871,7 +943,8 @@ pub(crate) fn decide(
         Authority::Func
         | Authority::Registration
         | Authority::ExceptionRoot
-        | Authority::PalTask => Tier::Recovered,
+        | Authority::PalTask
+        | Authority::Startup => Tier::Recovered,
         Authority::Token | Authority::StringRef => Tier::Provisional,
     };
     (Some(name), tier, ev, ann, Vec::new())
@@ -1340,7 +1413,7 @@ fn write_symbols_json_trusted(
 }
 
 /// Serializable shape of the strict pass-2 symbol map
-/// (`pixel-modem-extractor-symbol-map-v4`), consumed first by
+/// (`pixel-modem-extractor-symbol-map-v5`), consumed first by
 /// `ApplyThumbNames.java` (creation of named functions Ghidra never discovered),
 /// then by `ApplySymbols.java` (application), and finally by
 /// `ExportDecomp.java` (postflight identity comparison) through the shared
@@ -3369,102 +3442,120 @@ fn build_map_from_input_files(
                 pal_set.expect("matched PAL application").manifest_blake3(),
             )
         });
-        let (exception_proposed_primary, pal_proposed_primary, role_owns_current_primary) =
-            match purpose {
-                SymbolBuildPurpose::Pass2 {
-                    exception_application: exception_context,
-                    pal_application: pal_context,
-                } => {
-                    let applied_exception = exception_context.and_then(|context| {
-                        entry.and_then(|entry| context.application(&(entry, record_decode_isa)))
-                    });
-                    if let Some(applied) = applied_exception {
-                        let role = exception_app.as_ref().ok_or_else(|| {
+        let startup_set = roles.startup().present();
+        let startup_application = startup_set
+            .and_then(|set| entry.and_then(|entry| set.application(entry, record_decode_isa)));
+        let startup_app = startup_application.map(StartupRoleRefSet::from_role_application);
+        let startup_manifest_blake3 = startup_set
+            .filter(|_| startup_application.is_some())
+            .map(|set| crate::manifest::blake3_fixed(set.manifest_blake3()));
+        let (
+            exception_proposed_primary,
+            pal_proposed_primary,
+            startup_proposed_primary,
+            role_owns_current_primary,
+        ) = match purpose {
+            SymbolBuildPurpose::Pass2 {
+                exception_application: exception_context,
+                pal_application: pal_context,
+            } => {
+                let applied_exception = exception_context.and_then(|context| {
+                    entry.and_then(|entry| context.application(&(entry, record_decode_isa)))
+                });
+                if let Some(applied) = applied_exception {
+                    let role = exception_app.as_ref().ok_or_else(|| {
                         Error::Serialize(format!(
                             "exception application at 0x{:08x} has no authenticated role evidence",
                             f.entry
                         ))
                     })?;
-                        if !role.matches_pass2(applied) {
-                            return Err(Error::Serialize(format!(
-                                "exception application at 0x{:08x} differs from authenticated role evidence",
-                                f.entry
-                            )));
-                        }
-                        if f.owner == FunctionOwner::Ghidra
-                            && applied.current_primary().name() != f.current_primary
-                        {
-                            return Err(Error::Serialize(format!(
-                                "exception application current primary does not match the retained record at 0x{:08x}",
-                                f.entry
-                            )));
-                        }
+                    if !role.matches_pass2(applied) {
+                        return Err(Error::Serialize(format!(
+                            "exception application at 0x{:08x} differs from authenticated role evidence",
+                            f.entry
+                        )));
                     }
-                    let applied_pal = pal_context
-                        .and_then(|context| {
-                            entry.and_then(|entry| context.applications.get(&entry))
-                        })
-                        .filter(|application| application.isa == record_isa);
-                    if let Some(applied) = applied_pal {
-                        let role = pal_app.as_ref().ok_or_else(|| {
-                            Error::Serialize(format!(
-                                "PAL application at 0x{:08x} has no authenticated role evidence",
-                                f.entry
-                            ))
-                        })?;
-                        if !role.matches_pass2(applied) {
-                            return Err(Error::Serialize(format!(
-                                "PAL application at 0x{:08x} differs from authenticated role evidence",
-                                f.entry
-                            )));
-                        }
+                    if f.owner == FunctionOwner::Ghidra
+                        && applied.current_primary().name() != f.current_primary
+                    {
+                        return Err(Error::Serialize(format!(
+                            "exception application current primary does not match the retained record at 0x{:08x}",
+                            f.entry
+                        )));
                     }
-                    let role_owns_current_primary = pass2_role_owns_current_primary(
-                        f.owner,
-                        applied_exception,
-                        applied_pal,
-                        &f.current_primary,
-                    );
-                    (
-                        applied_exception
-                            .filter(|application| application.proposes_exception_primary())
-                            .and_then(|_| {
-                                exception_app.as_ref()?.desired_primary().map(str::to_owned)
-                            }),
-                        applied_pal
-                            .filter(|_| pal_app.as_ref().is_some_and(|role| role.tasks.len() == 1))
-                            .filter(|_| {
-                                pal_app
-                                    .as_ref()
-                                    .is_some_and(|role| role.desired_primary == f.current_primary)
-                            })
-                            .and_then(|_| {
-                                pal_app.as_ref().map(|role| role.desired_primary.clone())
-                            }),
-                        role_owns_current_primary,
-                    )
                 }
-                SymbolBuildPurpose::FinalArtifact => {
-                    let exception_proposed_primary = exception_app
-                        .as_ref()
-                        .and_then(ExceptionRoleRefSet::desired_primary)
-                        .filter(|primary| *primary == f.current_primary)
-                        .map(str::to_owned);
-                    let pal_proposed_primary = pal_app
-                        .as_ref()
-                        .filter(|role| {
-                            role.tasks.len() == 1 && role.desired_primary == f.current_primary
+                let applied_pal = pal_context
+                    .and_then(|context| entry.and_then(|entry| context.applications.get(&entry)))
+                    .filter(|application| application.isa == record_isa);
+                if let Some(applied) = applied_pal {
+                    let role = pal_app.as_ref().ok_or_else(|| {
+                        Error::Serialize(format!(
+                            "PAL application at 0x{:08x} has no authenticated role evidence",
+                            f.entry
+                        ))
+                    })?;
+                    if !role.matches_pass2(applied) {
+                        return Err(Error::Serialize(format!(
+                            "PAL application at 0x{:08x} differs from authenticated role evidence",
+                            f.entry
+                        )));
+                    }
+                }
+                let startup_proposed_primary = startup_app
+                    .as_ref()
+                    .map(|role| role.desired_primary().to_string());
+                let role_owns_current_primary = pass2_role_owns_current_primary(
+                    f.owner,
+                    applied_exception,
+                    applied_pal,
+                    &f.current_primary,
+                ) || startup_proposed_primary
+                    .as_deref()
+                    .is_some_and(|primary| primary == f.current_primary);
+                (
+                    applied_exception
+                        .filter(|application| application.proposes_exception_primary())
+                        .and_then(|_| exception_app.as_ref()?.desired_primary().map(str::to_owned)),
+                    applied_pal
+                        .filter(|_| pal_app.as_ref().is_some_and(|role| role.tasks.len() == 1))
+                        .filter(|_| {
+                            pal_app
+                                .as_ref()
+                                .is_some_and(|role| role.desired_primary == f.current_primary)
                         })
-                        .map(|role| role.desired_primary.clone());
-                    let role_owns_current_primary =
-                        exception_proposed_primary.is_some() || pal_proposed_primary.is_some();
-                    (
-                        exception_proposed_primary,
-                        pal_proposed_primary,
-                        role_owns_current_primary,
-                    )
-                }
-            };
+                        .and_then(|_| pal_app.as_ref().map(|role| role.desired_primary.clone())),
+                    startup_proposed_primary,
+                    role_owns_current_primary,
+                )
+            }
+            SymbolBuildPurpose::FinalArtifact => {
+                let exception_proposed_primary = exception_app
+                    .as_ref()
+                    .and_then(ExceptionRoleRefSet::desired_primary)
+                    .filter(|primary| *primary == f.current_primary)
+                    .map(str::to_owned);
+                let pal_proposed_primary = pal_app
+                    .as_ref()
+                    .filter(|role| {
+                        role.tasks.len() == 1 && role.desired_primary == f.current_primary
+                    })
+                    .map(|role| role.desired_primary.clone());
+                let startup_proposed_primary = startup_app
+                    .as_ref()
+                    .map(StartupRoleRefSet::desired_primary)
+                    .filter(|primary| *primary == f.current_primary)
+                    .map(str::to_owned);
+                let role_owns_current_primary = exception_proposed_primary.is_some()
+                    || pal_proposed_primary.is_some()
+                    || startup_proposed_primary.is_some();
+                (
+                    exception_proposed_primary,
+                    pal_proposed_primary,
+                    startup_proposed_primary,
+                    role_owns_current_primary,
+                )
+            }
+        };
         let claim = attribution.get(&FunctionEvidenceKey {
             owner: f.owner,
             entry: f.entry,
@@ -3519,6 +3610,9 @@ fn build_map_from_input_files(
             exception_proposed_primary,
             pal: pal_app,
             pal_proposed_primary,
+            startup_manifest_blake3,
+            startup: startup_app,
+            startup_proposed_primary,
         };
         let (name, tier, evidence, annotations, name_conflicts) = decide(&addr_hex, &raw);
         symbols.push(Symbol {
@@ -3622,6 +3716,7 @@ fn symbolicate_image(
             *blake3::hash(&image).as_bytes(),
             role_evidence::ArtifactState::Unmanaged,
         ),
+        role_evidence::ArtifactState::Unmanaged,
         role_evidence::ArtifactState::Unmanaged,
         role_evidence::ArtifactState::Unmanaged,
     )?;
@@ -3773,6 +3868,7 @@ mod tests {
         } else {
             role_evidence::CurrentSymbolicationContext::new(
                 binding,
+                role_evidence::ArtifactState::Unmanaged,
                 role_evidence::ArtifactState::Unmanaged,
                 role_evidence::ArtifactState::Unmanaged,
             )?
@@ -4040,6 +4136,9 @@ mod tests {
             exception_proposed_primary: None,
             pal: None,
             pal_proposed_primary: None,
+            startup_manifest_blake3: None,
+            startup: None,
+            startup_proposed_primary: None,
         }
     }
 
@@ -5109,7 +5208,7 @@ mod tests {
 
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dec.join("symbols.json")).unwrap()).unwrap();
-        assert_eq!(v["format"], "pixel-modem-extractor-symbols-v4");
+        assert_eq!(v["format"], "pixel-modem-extractor-symbols-v5");
         assert_eq!(v["symbols"].as_array().unwrap().len(), 1);
         let symbol = &v["symbols"][0];
         let evidence = symbol["evidence"].as_array().unwrap();
@@ -5939,6 +6038,7 @@ mod tests {
             ),
             role_evidence::ArtifactState::Unmanaged,
             role_evidence::ArtifactState::Unmanaged,
+            role_evidence::ArtifactState::Unmanaged,
         )
         .unwrap();
         let detached = root.join("detached-image");
@@ -6252,6 +6352,130 @@ mod tests {
         let (name, tier, _, _, _) = decide("40e1bff4", &r);
         assert_eq!(name.as_deref(), Some("pal_TaskEntry_alpha"));
         assert_eq!(tier, Tier::Recovered);
+    }
+
+    fn startup_role(primary: &str, role: &'static str) -> StartupRoleRefSet {
+        StartupRoleRefSet::from_test(primary, role, false)
+    }
+
+    fn raw_with_startup(primary: &str, role: &'static str) -> RawEvidence {
+        RawEvidence {
+            startup_manifest_blake3: Some("c".repeat(64)),
+            startup: Some(startup_role(primary, role)),
+            startup_proposed_primary: Some(primary.to_string()),
+            ..raw()
+        }
+    }
+
+    #[test]
+    fn startup_ranks_below_pal_and_above_token() {
+        let token = vec![(0x3c2a, "■format♦tok■domain♦D".into())];
+        let pal = Some(PalRoleRefSet::from_pass2(&pal_app(
+            "pal_TaskEntry_alpha",
+            &[("alpha", 0)],
+        )));
+        let pal_proposed_primary = Some("pal_TaskEntry_alpha".to_string());
+
+        let (name, tier, _, _, _) = decide(
+            "40e1bff4",
+            &RawEvidence {
+                tokens: token.clone(),
+                pal: pal.clone(),
+                pal_proposed_primary: pal_proposed_primary.clone(),
+                startup_manifest_blake3: Some("c".repeat(64)),
+                startup: Some(startup_role("hw_Init", "hardware_init")),
+                startup_proposed_primary: Some("hw_Init".into()),
+                ..raw()
+            },
+        );
+        assert_eq!(name.as_deref(), Some("pal_TaskEntry_alpha"));
+        assert_eq!(tier, Tier::Recovered);
+
+        let (name, tier, evidence, _, _) = decide(
+            "40e1bff4",
+            &RawEvidence {
+                tokens: token,
+                startup_manifest_blake3: Some("c".repeat(64)),
+                startup: Some(startup_role("hw_Init", "hardware_init")),
+                startup_proposed_primary: Some("hw_Init".into()),
+                ..raw()
+            },
+        );
+        assert_eq!(name.as_deref(), Some("hw_Init"));
+        assert_eq!(tier, Tier::Recovered);
+        assert!(
+            evidence.iter().any(|item| item.kind() == "startup"),
+            "startup evidence missing under a token: {evidence:?}"
+        );
+        assert!(!name.unwrap().starts_with(GUESS_PREFIX));
+    }
+
+    #[test]
+    fn stronger_primary_keeps_startup_evidence() {
+        let r = RawEvidence {
+            func_name: Some("Func_Winner".into()),
+            registration: Some("Reg_Loser".into()),
+            tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+            ..raw_with_startup("hw_Init", "hardware_init")
+        };
+        let (name, tier, ev, _, _) = decide("40e1bff4", &r);
+        assert_eq!(name.as_deref(), Some("Func_Winner"));
+        assert_eq!(tier, Tier::Recovered);
+        let kinds: Vec<&str> = ev.iter().map(TaggedEvidence::kind).collect();
+        assert!(
+            kinds.contains(&"startup"),
+            "stronger primary dropped startup evidence: {kinds:?}"
+        );
+        assert!(kinds.contains(&"func"));
+        assert!(kinds.contains(&"token"));
+    }
+
+    #[test]
+    fn symbols_and_maps_write_v5() {
+        assert_eq!(SYMBOLS_FORMAT, "pixel-modem-extractor-symbols-v5");
+        assert_eq!(SYMBOL_MAP_FORMAT, "pixel-modem-extractor-symbol-map-v5");
+
+        let root = tmp("pme_sym_v5_write");
+        let dec = root.join("decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        let symbols_path = write_symbols_json(&dec, "02_MAIN", &[], HashMap::new()).unwrap();
+        let symbols: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(symbols_path).unwrap()).unwrap();
+        assert_eq!(symbols["format"], "pixel-modem-extractor-symbols-v5");
+
+        let dir = map_fixture_tree("v5_write");
+        let image = vec![0u8; 0x20];
+        let load_addr = 0u32;
+        write_map_functions(
+            &dir,
+            &[ghidra_function_in_image(
+                "FUN_10",
+                0x10,
+                0x18,
+                &[],
+                &image,
+                load_addr,
+            )],
+        );
+        let (identity, _) = identity_for(&dir, 0x10, &image, load_addr);
+        let mut symbol = ghidra_symbol_at(0x10, identity.execution_blake3, None);
+        symbol.original_name = "FUN_10".into();
+        let map_path = dir.join("map.json");
+        write_pass2_symbol_map(
+            &map_path,
+            &dir,
+            "02_MAIN",
+            u64::from(load_addr),
+            &image,
+            &[symbol],
+            None,
+            None,
+            &runtime_for(&image, load_addr),
+        )
+        .unwrap();
+        let map: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(map_path).unwrap()).unwrap();
+        assert_eq!(map["format"], "pixel-modem-extractor-symbol-map-v5");
     }
 
     // A fixture image directory with a valid single-argument Ghidra inventory
@@ -8081,7 +8305,7 @@ mod tests {
 
         let parsed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&map_path).unwrap()).unwrap();
-        assert_eq!(parsed["format"], "pixel-modem-extractor-symbol-map-v4");
+        assert_eq!(parsed["format"], "pixel-modem-extractor-symbol-map-v5");
         assert_eq!(parsed["exception_roots"]["identity"], exception.identity());
         assert_eq!(
             parsed["exception_roots"]["manifest_blake3"],

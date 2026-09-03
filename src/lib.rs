@@ -30,6 +30,12 @@ pub(crate) mod runtime_image;
 pub mod scatter;
 pub(crate) mod semantic_cfg;
 pub mod source_tree;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod startup_metadata;
+pub use startup_metadata::{
+    StartupCorpusArtifact, StartupCorpusReport, StartupCorpusSeeds,
+    generate_corpus as generate_startup_metadata,
+};
 pub mod symbolicate;
 pub(crate) mod terminal_pass2;
 pub mod thumb_analysis;

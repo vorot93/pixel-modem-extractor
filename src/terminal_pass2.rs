@@ -6,7 +6,7 @@ use crate::decompile::{
 use crate::error::{Error, Result};
 use crate::runtime_image::RuntimeImage;
 use crate::trusted_fs::{ExpectedFileIdentity, TrustedDirectory, validate_relative_path};
-use crate::{pal_tasks, scatter, symbolicate};
+use crate::{pal_tasks, scatter, startup_metadata, symbolicate};
 use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 const EXCEPTION_MANIFEST_LIMIT: usize = 1024 * 1024;
 const PAL_MANIFEST_LIMIT: usize = 4 * 1024 * 1024;
+const STARTUP_MANIFEST_LIMIT: usize = startup_metadata::MAX_MANIFEST_BYTES;
 
 pub(crate) struct SnapshotBuildRequest<'a> {
     pub image_dir: &'a Path,
@@ -38,6 +39,8 @@ pub(crate) struct TerminalPass2Binding {
     pub exception_manifest_blake3: Option<String>,
     pub pal_identity: String,
     pub pal_manifest_blake3: Option<String>,
+    pub startup_identity: String,
+    pub startup_manifest_blake3: Option<String>,
 }
 
 #[derive(Debug)]
@@ -57,6 +60,12 @@ struct SnapshotPal {
 }
 
 #[derive(Debug)]
+struct SnapshotStartup {
+    identity: String,
+    manifest_bytes: Arc<[u8]>,
+}
+
+#[derive(Debug)]
 pub(crate) struct TerminalPass2Snapshot {
     kit_root_path: PathBuf,
     kit_root: TrustedDirectory,
@@ -71,6 +80,8 @@ pub(crate) struct TerminalPass2Snapshot {
     exception: Option<SnapshotException>,
     pal_managed: bool,
     pal: Option<SnapshotPal>,
+    startup_managed: bool,
+    startup: Option<SnapshotStartup>,
     symbolication: Arc<symbolicate::role_evidence::CurrentSymbolicationContext>,
 }
 
@@ -273,6 +284,68 @@ impl TerminalPass2Snapshot {
             RuntimeTaskState::Unmanaged => None,
         };
 
+        let startup_state = request.symbolication.roles().startup();
+        let startup_managed = !matches!(
+            startup_state,
+            symbolicate::role_evidence::ArtifactState::Unmanaged
+        );
+        let startup = match startup_state {
+            symbolicate::role_evidence::ArtifactState::Present(expected) => {
+                let digest = crate::manifest::blake3_fixed(expected.manifest_blake3());
+                let bytes = read_relative(
+                    &source,
+                    Path::new("startup_metadata/startup.json"),
+                    STARTUP_MANIFEST_LIMIT,
+                    Some(&digest),
+                    "terminal startup manifest",
+                )
+                .map_err(|error| Error::BadStartupMetadata(error.to_string()))?;
+                let exception_identity = exception.as_ref().map(|state| state.identity.as_str());
+                let validated = authenticate_startup(
+                    &bytes,
+                    &runtime,
+                    request.image_label,
+                    request.toc_name,
+                    raw_identity.blake3(),
+                    scatter_blake3,
+                    exception_identity,
+                )?;
+                if validated.identity != expected.identity()
+                    || validated.manifest_blake3 != expected.manifest_blake3()
+                {
+                    return Err(Error::BadStartupMetadata(format!(
+                        "{} startup snapshot does not match current publication identity",
+                        request.image_label
+                    )));
+                }
+                stage_manifest(
+                    &kit_root,
+                    "startup_metadata",
+                    request.image_label,
+                    "startup.json",
+                    &bytes,
+                    "snapshot startup manifest",
+                )
+                .map_err(|error| Error::BadStartupMetadata(error.to_string()))?;
+                Some(SnapshotStartup {
+                    identity: expected.identity().to_string(),
+                    manifest_bytes: bytes.into(),
+                })
+            }
+            symbolicate::role_evidence::ArtifactState::Absent => {
+                clear_staged_leaf(
+                    &kit_root,
+                    "startup_metadata",
+                    request.image_label,
+                    "startup.json",
+                    "absent snapshot startup manifest",
+                )
+                .map_err(|error| Error::BadStartupMetadata(error.to_string()))?;
+                None
+            }
+            symbolicate::role_evidence::ArtifactState::Unmanaged => None,
+        };
+
         let snapshot = Self {
             kit_root_path,
             kit_root,
@@ -287,6 +360,8 @@ impl TerminalPass2Snapshot {
             exception,
             pal_managed,
             pal,
+            startup_managed,
+            startup,
             symbolication: request.symbolication,
         };
         snapshot.validate_for_spawn()?;
@@ -336,6 +411,13 @@ impl TerminalPass2Snapshot {
             "tasks.json",
             "raw-only snapshot PAL manifest",
         )?;
+        clear_staged_leaf(
+            &kit_root,
+            "startup_metadata",
+            image_label,
+            "startup.json",
+            "raw-only snapshot startup manifest",
+        )?;
         let symbolication = Arc::new(
             symbolicate::role_evidence::CurrentSymbolicationContext::new(
                 symbolicate::role_evidence::RuntimeBinding::new(
@@ -345,6 +427,7 @@ impl TerminalPass2Snapshot {
                     *blake3::hash(&raw).as_bytes(),
                     symbolicate::role_evidence::ArtifactState::Absent,
                 ),
+                symbolicate::role_evidence::ArtifactState::Absent,
                 symbolicate::role_evidence::ArtifactState::Absent,
                 symbolicate::role_evidence::ArtifactState::Absent,
             )?,
@@ -363,6 +446,8 @@ impl TerminalPass2Snapshot {
             exception: None,
             pal_managed: true,
             pal: None,
+            startup_managed: true,
+            startup: None,
             symbolication,
         };
         snapshot.validate_for_spawn()?;
@@ -407,6 +492,15 @@ impl TerminalPass2Snapshot {
             .map(|_| self.kit_root_path.join(pal_relative(&self.image_label)))
     }
 
+    pub(crate) fn startup_manifest(&self) -> Option<PathBuf> {
+        self.startup.as_ref().map(|_| {
+            self.kit_root_path
+                .join("startup_metadata")
+                .join(&self.image_label)
+                .join("startup.json")
+        })
+    }
+
     pub(crate) fn exception_identity(&self) -> &str {
         self.exception
             .as_ref()
@@ -416,6 +510,13 @@ impl TerminalPass2Snapshot {
 
     pub(crate) fn pal_identity(&self) -> &str {
         self.pal
+            .as_ref()
+            .map(|state| state.identity.as_str())
+            .unwrap_or("none")
+    }
+
+    pub(crate) fn startup_identity(&self) -> &str {
+        self.startup
             .as_ref()
             .map(|state| state.identity.as_str())
             .unwrap_or("none")
@@ -448,6 +549,11 @@ impl TerminalPass2Snapshot {
             pal_identity: self.pal_identity().to_string(),
             pal_manifest_blake3: self
                 .pal
+                .as_ref()
+                .map(|state| crate::manifest::blake3_bytes(&state.manifest_bytes)),
+            startup_identity: self.startup_identity().to_string(),
+            startup_manifest_blake3: self
+                .startup
                 .as_ref()
                 .map(|state| crate::manifest::blake3_bytes(&state.manifest_bytes)),
         }
@@ -525,6 +631,28 @@ impl TerminalPass2Snapshot {
                     symbolicate::role_evidence::ArtifactState::Unmanaged
                 }
             };
+            let exception_identity = self.exception.as_ref().map(|state| state.identity.as_str());
+            let startup = if let Some(startup) = &self.startup {
+                let validated = authenticate_startup(
+                    &startup.manifest_bytes,
+                    runtime,
+                    &self.image_label,
+                    &self.toc_name,
+                    self.raw_identity.blake3(),
+                    self.scatter_blake3,
+                    exception_identity,
+                )?;
+                if validated.identity != startup.identity {
+                    return Err(Error::BadStartupMetadata(
+                        "snapshot startup identity changed".into(),
+                    ));
+                }
+                symbolicate::role_evidence::ArtifactState::Present(validated)
+            } else if self.startup_managed {
+                symbolicate::role_evidence::ArtifactState::Absent
+            } else {
+                symbolicate::role_evidence::ArtifactState::Unmanaged
+            };
             let projected = symbolicate::role_evidence::CurrentSymbolicationContext::new(
                 symbolicate::role_evidence::RuntimeBinding::new(
                     &self.image_label,
@@ -535,6 +663,7 @@ impl TerminalPass2Snapshot {
                 ),
                 exception,
                 pal,
+                startup,
             )?;
             if projected.runtime() != self.symbolication.runtime() {
                 return Err(Error::DecomposeIncomplete(
@@ -549,6 +678,11 @@ impl TerminalPass2Snapshot {
             if projected.roles().pal() != self.symbolication.roles().pal() {
                 return Err(Error::BadPalTasks(
                     "snapshot PAL role evidence changed".into(),
+                ));
+            }
+            if projected.roles().startup() != self.symbolication.roles().startup() {
+                return Err(Error::BadStartupMetadata(
+                    "snapshot startup role evidence changed".into(),
                 ));
             }
             Ok(())
@@ -625,6 +759,19 @@ impl TerminalPass2Snapshot {
             "snapshot PAL manifest",
         )
         .map_err(|error| Error::BadPalTasks(error.to_string()))?;
+        validate_manifest_leaf(
+            &self.kit_root,
+            self.startup_managed,
+            self.startup
+                .as_ref()
+                .map(|state| state.manifest_bytes.as_ref()),
+            "startup_metadata",
+            &self.image_label,
+            "startup.json",
+            STARTUP_MANIFEST_LIMIT,
+            "snapshot startup manifest",
+        )
+        .map_err(|error| Error::BadStartupMetadata(error.to_string()))?;
         let runtime = match scatter {
             Some(artifact) => RuntimeImage::from_materialized(&raw, self.image_base, artifact)?,
             None => RuntimeImage::from_plan(&raw, self.image_base, None)?,
@@ -778,6 +925,99 @@ fn pal_relative(label: &str) -> PathBuf {
     Path::new("pal_tasks").join(label).join("tasks.json")
 }
 
+fn authenticate_startup(
+    bytes: &[u8],
+    runtime: &RuntimeImage<'_>,
+    label: &str,
+    toc_name: &str,
+    image_blake3: [u8; 32],
+    scatter_blake3: Option<[u8; 32]>,
+    exception_identity: Option<&str>,
+) -> Result<startup_metadata::ValidatedStartup> {
+    let inventories = peek_startup_inventories(bytes)?;
+    let (image_base, image_size) = runtime.image_bounds();
+    startup_metadata::read_bytes(
+        bytes,
+        runtime,
+        startup_metadata::StartupArtifactContext {
+            label,
+            toc_name,
+            image_base,
+            image_size,
+            image_blake3,
+            scatter_blake3,
+            scatter_entries: &inventories.scatter_entries,
+            functions_blake3: inventories.functions_blake3,
+            thumb_functions_blake3: inventories.thumb_functions_blake3,
+            exception_identity,
+            tool_version: env!("CARGO_PKG_VERSION"),
+        },
+    )
+    .map_err(|error| Error::BadStartupMetadata(error.to_string()))
+}
+
+struct StartupInventoryBinding {
+    scatter_entries: Vec<u32>,
+    functions_blake3: [u8; 32],
+    thumb_functions_blake3: Option<[u8; 32]>,
+}
+
+fn peek_startup_inventories(bytes: &[u8]) -> Result<StartupInventoryBinding> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        Error::BadStartupMetadata(format!("startup metadata schema is invalid: {error}"))
+    })?;
+    let inventories = value.get("inventories").ok_or_else(|| {
+        Error::BadStartupMetadata("startup metadata is missing inventories".into())
+    })?;
+    let functions = inventories
+        .get("functions_blake3")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::BadStartupMetadata("startup metadata is missing functions_blake3".into())
+        })?;
+    let functions_blake3 = crate::execution_ranges::parse_blake3(functions)
+        .map_err(|error| Error::BadStartupMetadata(error.to_string()))?;
+    let thumb_functions_blake3 = match inventories.get("thumb_functions_blake3") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            crate::execution_ranges::parse_blake3(value.as_str().ok_or_else(|| {
+                Error::BadStartupMetadata(
+                    "startup metadata thumb_functions_blake3 is not a string".into(),
+                )
+            })?)
+            .map_err(|error| Error::BadStartupMetadata(error.to_string()))?,
+        ),
+    };
+    let entries = value
+        .get("runtime")
+        .and_then(|runtime| runtime.get("scatter_entries_used"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::BadStartupMetadata("startup metadata is missing scatter_entries_used".into())
+        })?;
+    let mut scatter_entries = Vec::new();
+    scatter_entries
+        .try_reserve_exact(entries.len())
+        .map_err(|_| {
+            Error::BadStartupMetadata("startup scatter-entry projection allocation failed".into())
+        })?;
+    for entry in entries {
+        let Some(value) = entry.as_u64() else {
+            return Err(Error::BadStartupMetadata(
+                "startup scatter entry is not an integer".into(),
+            ));
+        };
+        let value = u32::try_from(value)
+            .map_err(|_| Error::BadStartupMetadata("startup scatter entry exceeds u32".into()))?;
+        scatter_entries.push(value);
+    }
+    Ok(StartupInventoryBinding {
+        scatter_entries,
+        functions_blake3,
+        thumb_functions_blake3,
+    })
+}
+
 fn pal_pass2_context(artifact: &pal_tasks::ValidatedTaskArtifact) -> symbolicate::PalPass2Context {
     let manifest_blake3 = crate::manifest::blake3_fixed(artifact.manifest_blake3);
     let scatter_load_map_blake3 = artifact
@@ -831,10 +1071,19 @@ fn pal_pass2_context(artifact: &pal_tasks::ValidatedTaskArtifact) -> symbolicate
 #[cfg(test)]
 mod tests {
     use super::{SnapshotBuildRequest, TerminalPass2Snapshot};
+    use crate::arm32::SystemDirection;
     use crate::decompile::{
         AppliedPalTasks, RuntimeExceptionState, RuntimeScatterState, RuntimeTaskState,
     };
+    use crate::execution_ranges::{DecodeIsa, FunctionOwner};
     use crate::pal_tasks::test_support::BASE;
+    use crate::startup_metadata::{
+        HardwareInit, PrivilegedClass, PrivilegedOp, Section, StackGuard, StartupApplication,
+        StartupArtifactContext, StartupPlan, StartupRole, materialize_image, read_bytes,
+    };
+    use crate::symbolicate::role_evidence::{
+        ArtifactState, CurrentSymbolicationContext, RuntimeBinding,
+    };
 
     struct CombinedFixture {
         _root: tempfile::TempDir,
@@ -1066,6 +1315,7 @@ mod tests {
                     *blake3::hash(&raw).as_bytes(),
                     crate::symbolicate::role_evidence::ArtifactState::Absent,
                 ),
+                crate::symbolicate::role_evidence::ArtifactState::Absent,
                 crate::symbolicate::role_evidence::ArtifactState::Absent,
                 crate::symbolicate::role_evidence::ArtifactState::Absent,
             )
@@ -1333,5 +1583,216 @@ mod tests {
             std::fs::read(kit.join("exception_roots/00_BOOT/roots.json")).unwrap(),
             b"old complete manifest"
         );
+    }
+
+    fn startup_digest(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn published_startup(
+        image: &std::path::Path,
+        label: &str,
+        toc_name: &str,
+        raw: &[u8],
+    ) -> (Vec<u8>, String, crate::startup_metadata::ValidatedStartup) {
+        let image_blake3 = *blake3::hash(raw).as_bytes();
+        let image_size = u32::try_from(raw.len()).unwrap();
+        let plan = StartupPlan {
+            image_label: label.to_owned(),
+            toc_name: toc_name.to_owned(),
+            image_base: 0x4001_0000,
+            image_size,
+            hardware_init: Section::Present(HardwareInit {
+                entry: 0x4001_0010,
+                isa: DecodeIsa::Arm,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: startup_digest(0x21),
+            }),
+            stack_guard: Section::Present(StackGuard {
+                entry: 0x4001_0020,
+                isa: DecodeIsa::Arm,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: startup_digest(0x22),
+                non_return: true,
+            }),
+            compiler: Section::Absent,
+            privileged_ops: vec![PrivilegedOp {
+                pc: 0x4001_0000,
+                isa: DecodeIsa::Arm,
+                entry: 0x4001_0000,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: startup_digest(0x24),
+                direction: SystemDirection::Write,
+                class: PrivilegedClass::Vbar,
+                coprocessor: Some(15),
+                opcode1: Some(0),
+                crn: Some(12),
+                crm: Some(0),
+                opcode2: Some(0),
+            }],
+            applications: vec![
+                StartupApplication {
+                    role: StartupRole::HardwareInit,
+                    entry: 0x4001_0010,
+                    isa: DecodeIsa::Arm,
+                    desired_primary: StartupRole::HardwareInit.desired_primary(),
+                    role_label: StartupRole::HardwareInit.role_label(),
+                    set_no_return: false,
+                },
+                StartupApplication {
+                    role: StartupRole::StackGuard,
+                    entry: 0x4001_0020,
+                    isa: DecodeIsa::Arm,
+                    desired_primary: StartupRole::StackGuard.desired_primary(),
+                    role_label: StartupRole::StackGuard.role_label(),
+                    set_no_return: true,
+                },
+            ],
+        };
+        let context = StartupArtifactContext {
+            label,
+            toc_name,
+            image_base: 0x4001_0000,
+            image_size,
+            image_blake3,
+            scatter_blake3: None,
+            scatter_entries: &[],
+            functions_blake3: startup_digest(0x31),
+            thumb_functions_blake3: None,
+            exception_identity: None,
+            tool_version: env!("CARGO_PKG_VERSION"),
+        };
+        let materialized = materialize_image(&plan, context, image).unwrap();
+        let bytes = std::fs::read(image.join(&materialized.relative_path)).unwrap();
+        let runtime =
+            crate::runtime_image::RuntimeImage::from_plan(raw, 0x4001_0000, None).unwrap();
+        let validated = read_bytes(&bytes, &runtime, context).unwrap();
+        (bytes, materialized.identity, validated)
+    }
+
+    fn snapshot_with_startup(
+        image: &std::path::Path,
+        kit: &std::path::Path,
+        startup: ArtifactState<crate::startup_metadata::ValidatedStartup>,
+    ) -> TerminalPass2Snapshot {
+        let raw = std::fs::read(image.join("00_BOOT.bin")).unwrap();
+        let symbolication = std::sync::Arc::new(
+            CurrentSymbolicationContext::new(
+                RuntimeBinding::new(
+                    "00_BOOT",
+                    "BOOT",
+                    0x4001_0000,
+                    *blake3::hash(&raw).as_bytes(),
+                    ArtifactState::Absent,
+                ),
+                ArtifactState::Absent,
+                ArtifactState::Absent,
+                startup,
+            )
+            .unwrap(),
+        );
+        TerminalPass2Snapshot::build(SnapshotBuildRequest {
+            image_dir: image,
+            kit_root: kit,
+            image_label: "00_BOOT",
+            toc_name: "BOOT",
+            image_base: 0x4001_0000,
+            scatter: RuntimeScatterState::Absent,
+            exception: &RuntimeExceptionState::Absent,
+            exception_applied: None,
+            pal: &RuntimeTaskState::Absent,
+            pal_applied: None,
+            symbolication,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_stages_startup_bytes_only_when_present() {
+        let (_present_root, present_image, present_kit) = raw_only_fixture();
+        let raw = std::fs::read(present_image.join("00_BOOT.bin")).unwrap();
+        let (bytes, identity, validated) =
+            published_startup(&present_image, "00_BOOT", "BOOT", &raw);
+        let present = snapshot_with_startup(
+            &present_image,
+            &present_kit,
+            ArtifactState::Present(validated),
+        );
+        let staged = present_kit.join("startup_metadata/00_BOOT/startup.json");
+        assert_eq!(present.startup_identity(), identity.as_str());
+        assert_ne!(present.startup_identity(), "none");
+        assert_eq!(present.startup_manifest(), Some(staged.clone()));
+        assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+
+        let (_absent_root, absent_image, absent_kit) = raw_only_fixture();
+        std::fs::create_dir_all(absent_kit.join("startup_metadata/00_BOOT")).unwrap();
+        std::fs::write(
+            absent_kit.join("startup_metadata/00_BOOT/startup.json"),
+            b"stale startup",
+        )
+        .unwrap();
+        let absent = snapshot_with_startup(&absent_image, &absent_kit, ArtifactState::Absent);
+        assert_eq!(absent.startup_identity(), "none");
+        assert_eq!(
+            absent
+                .startup_manifest()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "-".to_string()),
+            "-"
+        );
+        assert!(
+            !absent_kit
+                .join("startup_metadata/00_BOOT/startup.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_startup_drift_at_pre_spawn_gate() {
+        let (_root, image, kit) = raw_only_fixture();
+        let raw = std::fs::read(image.join("00_BOOT.bin")).unwrap();
+        let (_bytes, _identity, validated) = published_startup(&image, "00_BOOT", "BOOT", &raw);
+        let snapshot = snapshot_with_startup(&image, &kit, ArtifactState::Present(validated));
+        std::fs::write(
+            snapshot.startup_manifest().unwrap(),
+            b"changed startup manifest",
+        )
+        .unwrap();
+        let error = snapshot.validate_for_spawn().unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("startup"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn leftover_startup_json_without_publication_is_unmanaged_not_current() {
+        let (_root, image, kit) = raw_only_fixture();
+        std::fs::create_dir_all(image.join("startup_metadata")).unwrap();
+        std::fs::write(
+            image.join("startup_metadata/startup.json"),
+            b"leftover image",
+        )
+        .unwrap();
+        std::fs::create_dir_all(kit.join("startup_metadata/00_BOOT")).unwrap();
+        std::fs::write(
+            kit.join("startup_metadata/00_BOOT/startup.json"),
+            b"leftover kit",
+        )
+        .unwrap();
+        let snapshot = snapshot_with_startup(&image, &kit, ArtifactState::Unmanaged);
+        assert_eq!(snapshot.startup_identity(), "none");
+        assert_eq!(
+            snapshot
+                .startup_manifest()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "-".to_string()),
+            "-"
+        );
+        assert_eq!(
+            std::fs::read(kit.join("startup_metadata/00_BOOT/startup.json")).unwrap(),
+            b"leftover kit"
+        );
+        snapshot.validate_for_spawn().unwrap();
     }
 }

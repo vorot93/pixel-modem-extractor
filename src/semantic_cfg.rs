@@ -30,6 +30,11 @@ impl CfgLimits {
             max_blocks: 4_096,
         }
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn startup_metadata() -> Self {
+        Self::exception_roots()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

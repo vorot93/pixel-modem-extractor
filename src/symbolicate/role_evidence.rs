@@ -3,6 +3,7 @@ use crate::exception_roots::{self, ValidatedExceptionRoots};
 use crate::execution_ranges::DecodeIsa;
 use crate::pal_tasks::{self, ValidatedTaskArtifact};
 use crate::runtime_image::RuntimeImage;
+use crate::startup_metadata::{self, ValidatedStartup};
 use crate::trusted_fs::TrustedDirectory;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -60,6 +61,10 @@ impl RuntimeBinding {
 
     pub(crate) const fn image_base(&self) -> u32 {
         self.image_base
+    }
+
+    pub(crate) const fn scatter(&self) -> &ArtifactState<[u8; 32]> {
+        &self.scatter
     }
 
     fn role_scatter_blake3(&self) -> Option<[u8; 32]> {
@@ -250,6 +255,16 @@ impl ExceptionRoleSet {
 
     pub(crate) fn identity(&self) -> &str {
         &self.identity
+    }
+
+    pub(crate) fn reset_root(&self) -> Option<(u32, DecodeIsa)> {
+        self.applications.iter().find_map(|application| {
+            application
+                .claims
+                .iter()
+                .any(|claim| claim.role() == "reset" && claim.table_kind() == "initial")
+                .then_some((application.entry, application.isa))
+        })
     }
 
     pub(crate) const fn manifest_blake3(&self) -> [u8; 32] {
@@ -525,15 +540,175 @@ impl PalRoleSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupRoleApplication {
+    entry: u32,
+    isa: DecodeIsa,
+    desired_primary: String,
+    role: &'static str,
+    set_no_return: bool,
+}
+
+impl StartupRoleApplication {
+    #[cfg(test)]
+    pub(crate) const fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn isa(&self) -> DecodeIsa {
+        self.isa
+    }
+
+    pub(crate) fn desired_primary(&self) -> &str {
+        &self.desired_primary
+    }
+
+    pub(crate) const fn role(&self) -> &'static str {
+        self.role
+    }
+
+    pub(crate) const fn set_no_return(&self) -> bool {
+        self.set_no_return
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupRoleSet {
+    identity: String,
+    manifest_blake3: [u8; 32],
+    image_label: String,
+    toc_name: String,
+    image_base: u32,
+    image_blake3: [u8; 32],
+    scatter_load_map_blake3: Option<[u8; 32]>,
+    applications: Vec<StartupRoleApplication>,
+    application_index: BTreeMap<(u32, DecodeIsa), usize>,
+}
+
+impl StartupRoleSet {
+    fn from_validated(validated: &ValidatedStartup) -> Result<Self> {
+        let application_count = validated.plan.applications.len();
+        if application_count > startup_metadata::MAX_APPLICATIONS {
+            return Err(model_error(format!(
+                "startup application limit exceeded: {application_count} > {}",
+                startup_metadata::MAX_APPLICATIONS
+            )));
+        }
+        let no_return_roots = validated
+            .plan
+            .applications
+            .iter()
+            .filter(|application| application.set_no_return)
+            .count();
+        let expected_identity = format!(
+            "v1:{}:{application_count}:{no_return_roots}:{}",
+            crate::manifest::blake3_fixed(validated.manifest_blake3),
+            validated.plan.privileged_ops.len()
+        );
+        if validated.identity != expected_identity {
+            return Err(model_error(
+                "startup projection identity differs from its manifest and counts",
+            ));
+        }
+        if validated.image_label != validated.plan.image_label
+            || validated.toc_name != validated.plan.toc_name
+        {
+            return Err(model_error(
+                "startup projection image identity differs from its plan",
+            ));
+        }
+
+        let mut applications = Vec::new();
+        applications
+            .try_reserve_exact(application_count)
+            .map_err(|_| model_error("startup application projection allocation failed"))?;
+        let mut application_index = BTreeMap::new();
+        for application in &validated.plan.applications {
+            validate_primary(Some(application.desired_primary), "startup primary")?;
+            let key = (application.entry, application.isa);
+            if application_index.insert(key, applications.len()).is_some() {
+                return Err(model_error(format!(
+                    "duplicate startup application at {:#010x} ({:?})",
+                    key.0, key.1
+                )));
+            }
+            applications.push(StartupRoleApplication {
+                entry: application.entry,
+                isa: application.isa,
+                desired_primary: application.desired_primary.to_string(),
+                role: application.role.as_wire(),
+                set_no_return: application.set_no_return,
+            });
+        }
+
+        Ok(Self {
+            identity: validated.identity.clone(),
+            manifest_blake3: validated.manifest_blake3,
+            image_label: validated.image_label.clone(),
+            toc_name: validated.toc_name.clone(),
+            image_base: validated.plan.image_base,
+            image_blake3: validated.image_blake3,
+            scatter_load_map_blake3: validated.scatter_blake3,
+            applications,
+            application_index,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) const fn manifest_blake3(&self) -> [u8; 32] {
+        self.manifest_blake3
+    }
+
+    #[cfg(test)]
+    pub(crate) fn applications(&self) -> &[StartupRoleApplication] {
+        &self.applications
+    }
+
+    pub(crate) fn application(
+        &self,
+        entry: u32,
+        isa: DecodeIsa,
+    ) -> Option<&StartupRoleApplication> {
+        self.application_index
+            .get(&(entry, isa))
+            .and_then(|index| self.applications.get(*index))
+    }
+
+    fn validate_runtime_binding(&self, runtime: &RuntimeBinding) -> Result<()> {
+        if self.image_label != runtime.image_label
+            || self.toc_name != runtime.toc_name
+            || self.image_base != runtime.image_base
+            || self.image_blake3 != runtime.image_blake3
+        {
+            return Err(model_error(
+                "startup role evidence does not match the runtime raw-image binding",
+            ));
+        }
+        if self.scatter_load_map_blake3 != runtime.role_scatter_blake3() {
+            return Err(model_error(
+                "startup role evidence does not match the runtime scatter binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthenticatedRoleEvidence {
     exception: ArtifactState<ExceptionRoleSet>,
     pal: ArtifactState<PalRoleSet>,
+    startup: ArtifactState<StartupRoleSet>,
 }
 
 impl AuthenticatedRoleEvidence {
     fn from_validated(
         exception: ArtifactState<ValidatedExceptionRoots>,
         pal: ArtifactState<ValidatedTaskArtifact>,
+        startup: ArtifactState<ValidatedStartup>,
     ) -> Result<Self> {
         let exception = match exception {
             ArtifactState::Unmanaged => ArtifactState::Unmanaged,
@@ -549,7 +724,18 @@ impl AuthenticatedRoleEvidence {
                 ArtifactState::Present(PalRoleSet::from_validated(&validated)?)
             }
         };
-        Ok(Self { exception, pal })
+        let startup = match startup {
+            ArtifactState::Unmanaged => ArtifactState::Unmanaged,
+            ArtifactState::Absent => ArtifactState::Absent,
+            ArtifactState::Present(validated) => {
+                ArtifactState::Present(StartupRoleSet::from_validated(&validated)?)
+            }
+        };
+        Ok(Self {
+            exception,
+            pal,
+            startup,
+        })
     }
 
     pub(crate) const fn exception(&self) -> &ArtifactState<ExceptionRoleSet> {
@@ -560,12 +746,19 @@ impl AuthenticatedRoleEvidence {
         &self.pal
     }
 
+    pub(crate) const fn startup(&self) -> &ArtifactState<StartupRoleSet> {
+        &self.startup
+    }
+
     fn validate_runtime_binding(&self, runtime: &RuntimeBinding) -> Result<()> {
         if let ArtifactState::Present(exception) = &self.exception {
             exception.validate_runtime_binding(runtime)?;
         }
         if let ArtifactState::Present(pal) = &self.pal {
             pal.validate_runtime_binding(runtime)?;
+        }
+        if let ArtifactState::Present(startup) = &self.startup {
+            startup.validate_runtime_binding(runtime)?;
         }
         Ok(())
     }
@@ -582,9 +775,10 @@ impl CurrentSymbolicationContext {
         runtime: RuntimeBinding,
         exception: ArtifactState<ValidatedExceptionRoots>,
         pal: ArtifactState<ValidatedTaskArtifact>,
+        startup: ArtifactState<ValidatedStartup>,
     ) -> Result<Self> {
         runtime.validate()?;
-        let roles = AuthenticatedRoleEvidence::from_validated(exception, pal)?;
+        let roles = AuthenticatedRoleEvidence::from_validated(exception, pal, startup)?;
         roles.validate_runtime_binding(&runtime)?;
         Ok(Self { runtime, roles })
     }
@@ -663,10 +857,53 @@ impl CurrentSymbolicationContext {
             ArtifactState::Unmanaged
         };
 
+        let exception_identity = match &exception {
+            ArtifactState::Present(validated) => Some(validated.identity.as_str()),
+            ArtifactState::Absent | ArtifactState::Unmanaged => None,
+        };
+        let startup = if owned_leaf_present(
+            &image,
+            "startup_metadata",
+            "startup.json",
+            "retained startup metadata manifest",
+        )? {
+            let bytes = read_nested_leaf(
+                &image,
+                "startup_metadata",
+                "startup.json",
+                startup_metadata::MAX_MANIFEST_BYTES as u64,
+                "retained startup metadata manifest",
+            )?;
+            let image_size = u32::try_from(raw.len()).map_err(|_| {
+                current_error("raw image size exceeds the startup metadata u32 domain")
+            })?;
+            let binding = retained_startup_binding(&bytes)?;
+            ArtifactState::Present(startup_metadata::read_bytes(
+                &bytes,
+                &runtime,
+                startup_metadata::StartupArtifactContext {
+                    label: image_label,
+                    toc_name,
+                    image_base,
+                    image_size,
+                    image_blake3,
+                    scatter_blake3: role_scatter_blake3,
+                    scatter_entries: &binding.scatter_entries,
+                    functions_blake3: binding.functions_blake3,
+                    thumb_functions_blake3: binding.thumb_functions_blake3,
+                    exception_identity,
+                    tool_version: env!("CARGO_PKG_VERSION"),
+                },
+            )?)
+        } else {
+            ArtifactState::Absent
+        };
+
         Self::new(
             RuntimeBinding::new(image_label, toc_name, image_base, image_blake3, scatter),
             exception,
             pal,
+            startup,
         )
     }
 
@@ -691,6 +928,7 @@ impl CurrentSymbolicationContext {
         let runtime = runtime_from_binding(&image, &raw, &self.runtime)?;
         validate_exception_state(&image, &runtime, &self.runtime, &self.roles.exception)?;
         validate_pal_state(&image, &runtime, &self.runtime, &self.roles.pal)?;
+        validate_startup_state(&image, &runtime, &self.runtime, &self.roles)?;
         image.verify_path_binding(image_dir, "current symbolication image directory")?;
         let result = use_runtime(&image, &raw, &runtime, &self.roles);
         image.verify_path_binding(image_dir, "current symbolication image directory")?;
@@ -703,6 +941,26 @@ impl CurrentSymbolicationContext {
 
     pub(crate) const fn roles(&self) -> &AuthenticatedRoleEvidence {
         &self.roles
+    }
+
+    pub(crate) fn with_startup(&self, startup: ArtifactState<ValidatedStartup>) -> Result<Self> {
+        let startup = match startup {
+            ArtifactState::Unmanaged => ArtifactState::Unmanaged,
+            ArtifactState::Absent => ArtifactState::Absent,
+            ArtifactState::Present(validated) => {
+                ArtifactState::Present(StartupRoleSet::from_validated(&validated)?)
+            }
+        };
+        let roles = AuthenticatedRoleEvidence {
+            exception: self.roles.exception.clone(),
+            pal: self.roles.pal.clone(),
+            startup,
+        };
+        roles.validate_runtime_binding(&self.runtime)?;
+        Ok(Self {
+            runtime: self.runtime.clone(),
+            roles,
+        })
     }
 }
 
@@ -925,6 +1183,127 @@ fn validate_pal_state(
             Ok(())
         }
     }
+}
+
+fn validate_startup_state(
+    image: &TrustedDirectory,
+    runtime: &RuntimeImage<'_>,
+    binding: &RuntimeBinding,
+    roles: &AuthenticatedRoleEvidence,
+) -> Result<()> {
+    match &roles.startup {
+        ArtifactState::Unmanaged => Ok(()),
+        ArtifactState::Absent => {
+            if owned_leaf_present(
+                image,
+                "startup_metadata",
+                "startup.json",
+                "current startup metadata manifest",
+            )? {
+                return Err(current_error(
+                    "startup metadata manifest is present for explicit absence",
+                ));
+            }
+            Ok(())
+        }
+        ArtifactState::Present(expected) => {
+            if !owned_leaf_present(
+                image,
+                "startup_metadata",
+                "startup.json",
+                "current startup metadata manifest",
+            )? {
+                return Err(current_error(
+                    "current startup metadata manifest is missing for explicit presence",
+                ));
+            }
+            let bytes = read_nested_leaf(
+                image,
+                "startup_metadata",
+                "startup.json",
+                startup_metadata::MAX_MANIFEST_BYTES as u64,
+                "current startup metadata manifest",
+            )?;
+            let (_image_base, image_size) = runtime.image_bounds();
+            let startup_binding = retained_startup_binding(&bytes)?;
+            let exception_identity = roles.exception.present().map(ExceptionRoleSet::identity);
+            let validated = startup_metadata::read_bytes(
+                &bytes,
+                runtime,
+                startup_metadata::StartupArtifactContext {
+                    label: &binding.image_label,
+                    toc_name: &binding.toc_name,
+                    image_base: binding.image_base,
+                    image_size,
+                    image_blake3: binding.image_blake3,
+                    scatter_blake3: binding.role_scatter_blake3(),
+                    scatter_entries: &startup_binding.scatter_entries,
+                    functions_blake3: startup_binding.functions_blake3,
+                    thumb_functions_blake3: startup_binding.thumb_functions_blake3,
+                    exception_identity,
+                    tool_version: env!("CARGO_PKG_VERSION"),
+                },
+            )?;
+            let actual = StartupRoleSet::from_validated(&validated)?;
+            if actual != *expected {
+                return Err(current_error(
+                    "startup role projection changed after context construction",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+struct RetainedStartupBinding {
+    scatter_entries: Vec<u32>,
+    functions_blake3: [u8; 32],
+    thumb_functions_blake3: Option<[u8; 32]>,
+}
+
+fn retained_startup_binding(bytes: &[u8]) -> Result<RetainedStartupBinding> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| current_error(format!("startup metadata schema is invalid: {error}")))?;
+    let inventories = value
+        .get("inventories")
+        .ok_or_else(|| current_error("startup metadata is missing inventories"))?;
+    let functions = inventories
+        .get("functions_blake3")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| current_error("startup metadata is missing functions_blake3"))?;
+    let functions_blake3 = crate::execution_ranges::parse_blake3(functions)
+        .map_err(|error| current_error(error.to_string()))?;
+    let thumb_functions_blake3 = match inventories.get("thumb_functions_blake3") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            crate::execution_ranges::parse_blake3(value.as_str().ok_or_else(|| {
+                current_error("startup metadata thumb_functions_blake3 is not a string")
+            })?)
+            .map_err(|error| current_error(error.to_string()))?,
+        ),
+    };
+    let entries = value
+        .get("runtime")
+        .and_then(|runtime| runtime.get("scatter_entries_used"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| current_error("startup metadata is missing scatter_entries_used"))?;
+    let mut scatter_entries = Vec::new();
+    scatter_entries
+        .try_reserve_exact(entries.len())
+        .map_err(|_| current_error("startup scatter-entry projection allocation failed"))?;
+    for entry in entries {
+        let Some(value) = entry.as_u64() else {
+            return Err(current_error("startup scatter entry is not an integer"));
+        };
+        let value =
+            u32::try_from(value).map_err(|_| current_error("startup scatter entry exceeds u32"))?;
+        scatter_entries.push(value);
+    }
+    Ok(RetainedStartupBinding {
+        scatter_entries,
+        functions_blake3,
+        thumb_functions_blake3,
+    })
 }
 
 fn read_raw_image(image: &TrustedDirectory, image_label: &str) -> Result<Vec<u8>> {
@@ -1171,6 +1550,7 @@ pub(crate) fn context_from_test_pal_pass2(
     let roles = AuthenticatedRoleEvidence {
         exception: ArtifactState::Unmanaged,
         pal: ArtifactState::Present(pal),
+        startup: ArtifactState::Unmanaged,
     };
     roles.validate_runtime_binding(&runtime)?;
     Ok(CurrentSymbolicationContext { runtime, roles })
@@ -1388,6 +1768,7 @@ mod tests {
             ),
             ArtifactState::Present(exception),
             ArtifactState::Unmanaged,
+            ArtifactState::Unmanaged,
         )
         .unwrap_err()
         .to_string();
@@ -1403,6 +1784,7 @@ mod tests {
             runtime_binding(&pal_dir, PAL_LABEL, "MAIN", PAL_BASE, ArtifactState::Absent),
             ArtifactState::Absent,
             ArtifactState::Present(pal),
+            ArtifactState::Unmanaged,
         )
         .unwrap_err()
         .to_string();
@@ -1420,6 +1802,7 @@ mod tests {
                 ArtifactState::Unmanaged,
             ),
             ArtifactState::Present(exception),
+            ArtifactState::Unmanaged,
             ArtifactState::Unmanaged,
         )
         .unwrap_err()
@@ -1485,6 +1868,7 @@ mod tests {
             ),
             ArtifactState::Absent,
             ArtifactState::Unmanaged,
+            ArtifactState::Unmanaged,
         )
         .unwrap();
         let error = absent_exception
@@ -1501,6 +1885,7 @@ mod tests {
             runtime_binding(&pal_dir, PAL_LABEL, "MAIN", PAL_BASE, ArtifactState::Absent),
             ArtifactState::Absent,
             ArtifactState::Absent,
+            ArtifactState::Unmanaged,
         )
         .unwrap();
         let error = absent_pal
@@ -1538,6 +1923,7 @@ mod tests {
             ),
             ArtifactState::Unmanaged,
             ArtifactState::Unmanaged,
+            ArtifactState::Unmanaged,
         )
         .unwrap();
 
@@ -1547,6 +1933,7 @@ mod tests {
                 assert_eq!(runtime.image_bounds(), (0x1000, 16));
                 assert!(matches!(roles.exception(), ArtifactState::Unmanaged));
                 assert!(matches!(roles.pal(), ArtifactState::Unmanaged));
+                assert!(matches!(roles.startup(), ArtifactState::Unmanaged));
                 Ok(())
             })
             .unwrap();
@@ -1568,6 +1955,7 @@ mod tests {
             wrong_image,
             ArtifactState::Present(exception),
             ArtifactState::Unmanaged,
+            ArtifactState::Unmanaged,
         )
         .unwrap_err()
         .to_string();
@@ -1585,6 +1973,7 @@ mod tests {
             ),
             ArtifactState::Absent,
             ArtifactState::Present(pal),
+            ArtifactState::Unmanaged,
         )
         .unwrap_err()
         .to_string();
@@ -1603,6 +1992,7 @@ mod tests {
             ),
             ArtifactState::Unmanaged,
             ArtifactState::Unmanaged,
+            ArtifactState::Unmanaged,
         )
         .unwrap_err()
         .to_string();
@@ -1610,6 +2000,7 @@ mod tests {
 
         let error = CurrentSymbolicationContext::new(
             RuntimeBinding::new("CON", "CON", PAL_BASE, [0x22; 32], ArtifactState::Unmanaged),
+            ArtifactState::Unmanaged,
             ArtifactState::Unmanaged,
             ArtifactState::Unmanaged,
         )
@@ -1770,5 +2161,160 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot_tree(&image_dir), before);
+    }
+
+    const STARTUP_BASE: u32 = 0x4001_0000;
+    const STARTUP_LABEL: &str = "02_MAIN";
+
+    fn retained_startup_tree() -> (tempfile::TempDir, PathBuf, ValidatedStartup) {
+        use crate::startup_metadata::{
+            HardwareInit, Section, StackGuard, StartupApplication, StartupArtifactContext,
+            StartupPlan, StartupRole,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let image_dir = root.path().join("images").join(STARTUP_LABEL);
+        std::fs::create_dir_all(image_dir.join("startup_metadata")).unwrap();
+        let raw = vec![0x11u8; 0x40];
+        std::fs::write(image_dir.join(format!("{STARTUP_LABEL}.bin")), &raw).unwrap();
+        let image_blake3 = *blake3::hash(&raw).as_bytes();
+        let plan = StartupPlan {
+            image_label: STARTUP_LABEL.to_owned(),
+            toc_name: "MAIN".to_owned(),
+            image_base: STARTUP_BASE,
+            image_size: 0x40,
+            hardware_init: Section::Present(HardwareInit {
+                entry: STARTUP_BASE + 0x10,
+                isa: DecodeIsa::Arm,
+                owner: crate::execution_ranges::FunctionOwner::Ghidra,
+                execution_blake3: [0x21; 32],
+            }),
+            stack_guard: Section::Present(StackGuard {
+                entry: STARTUP_BASE + 0x20,
+                isa: DecodeIsa::Arm,
+                owner: crate::execution_ranges::FunctionOwner::Ghidra,
+                execution_blake3: [0x22; 32],
+                non_return: true,
+            }),
+            compiler: Section::Absent,
+            privileged_ops: Vec::new(),
+            applications: vec![
+                StartupApplication {
+                    role: StartupRole::HardwareInit,
+                    entry: STARTUP_BASE + 0x10,
+                    isa: DecodeIsa::Arm,
+                    desired_primary: StartupRole::HardwareInit.desired_primary(),
+                    role_label: StartupRole::HardwareInit.role_label(),
+                    set_no_return: false,
+                },
+                StartupApplication {
+                    role: StartupRole::StackGuard,
+                    entry: STARTUP_BASE + 0x20,
+                    isa: DecodeIsa::Arm,
+                    desired_primary: StartupRole::StackGuard.desired_primary(),
+                    role_label: StartupRole::StackGuard.role_label(),
+                    set_no_return: true,
+                },
+            ],
+        };
+        let generation = root.path().join("generation");
+        std::fs::create_dir(&generation).unwrap();
+        let context = StartupArtifactContext {
+            label: STARTUP_LABEL,
+            toc_name: "MAIN",
+            image_base: STARTUP_BASE,
+            image_size: 0x40,
+            image_blake3,
+            scatter_blake3: None,
+            scatter_entries: &[],
+            functions_blake3: [0x31; 32],
+            thumb_functions_blake3: None,
+            exception_identity: None,
+            tool_version: env!("CARGO_PKG_VERSION"),
+        };
+        let materialized =
+            crate::startup_metadata::materialize(&plan, context, &generation).unwrap();
+        std::fs::copy(
+            generation.join(&materialized.relative_path),
+            image_dir.join("startup_metadata/startup.json"),
+        )
+        .unwrap();
+        let runtime = RuntimeImage::from_plan(&raw, STARTUP_BASE, None).unwrap();
+        let bytes = std::fs::read(image_dir.join("startup_metadata/startup.json")).unwrap();
+        let validated = crate::startup_metadata::read_bytes(&bytes, &runtime, context).unwrap();
+        (root, image_dir, validated)
+    }
+
+    #[test]
+    fn from_retained_loads_startup_by_exact_entry_and_isa() {
+        let (_root, image_dir, _) = retained_startup_tree();
+        let context = CurrentSymbolicationContext::from_retained(
+            &image_dir,
+            STARTUP_LABEL,
+            "MAIN",
+            STARTUP_BASE,
+        )
+        .unwrap();
+        let startup = context
+            .roles()
+            .startup()
+            .present()
+            .expect("retained startup evidence");
+        assert!(startup.identity().starts_with("v1:"));
+        assert_eq!(
+            startup
+                .applications()
+                .iter()
+                .map(|application| (application.entry(), application.isa()))
+                .collect::<Vec<_>>(),
+            [
+                (STARTUP_BASE + 0x10, DecodeIsa::Arm),
+                (STARTUP_BASE + 0x20, DecodeIsa::Arm),
+            ]
+        );
+        assert!(
+            startup
+                .application(STARTUP_BASE + 0x10, DecodeIsa::Thumb)
+                .is_none()
+        );
+        let hw = startup
+            .application(STARTUP_BASE + 0x10, DecodeIsa::Arm)
+            .expect("hardware_init application");
+        assert_eq!(hw.desired_primary(), "hw_Init");
+        assert_eq!(hw.role(), "hardware_init");
+        assert!(!hw.set_no_return());
+        let guard = startup
+            .application(STARTUP_BASE + 0x20, DecodeIsa::Arm)
+            .expect("stack_guard application");
+        assert_eq!(guard.desired_primary(), "StackProtectionFailure");
+        assert_eq!(guard.role(), "stack_protection_failure");
+        assert!(guard.set_no_return());
+        assert!(matches!(context.roles().exception(), ArtifactState::Absent));
+        assert!(matches!(context.roles().pal(), ArtifactState::Absent));
+    }
+
+    #[test]
+    fn startup_projection_rejects_more_than_max_applications() {
+        let (_root, image_dir, mut validated) = retained_startup_tree();
+        let extra = validated.plan.applications[0].clone();
+        validated
+            .plan
+            .applications
+            .resize(crate::startup_metadata::MAX_APPLICATIONS + 1, extra);
+        let error = CurrentSymbolicationContext::new(
+            runtime_binding(
+                &image_dir,
+                STARTUP_LABEL,
+                "MAIN",
+                STARTUP_BASE,
+                ArtifactState::Absent,
+            ),
+            ArtifactState::Absent,
+            ArtifactState::Absent,
+            ArtifactState::Present(validated),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("application limit"), "{error}");
     }
 }

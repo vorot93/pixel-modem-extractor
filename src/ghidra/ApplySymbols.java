@@ -105,11 +105,13 @@ public class ApplySymbols extends HeadlessScript {
         final List<Planned> planned;
         final StringPropertyMap exceptionRegistry;
         final StringPropertyMap palRegistry;
+        final StringPropertyMap startupRegistry;
 
         Preflight(PalTasksSupport.SymbolMap map, String label,
                 ExceptionRootsSupport.Pass2MapState pass2State,
                 String palIdentity, boolean palPresent, List<Planned> planned,
-                StringPropertyMap exceptionRegistry, StringPropertyMap palRegistry) {
+                StringPropertyMap exceptionRegistry, StringPropertyMap palRegistry,
+                StringPropertyMap startupRegistry) {
             this.map = map;
             this.label = label;
             this.pass2State = pass2State;
@@ -118,6 +120,7 @@ public class ApplySymbols extends HeadlessScript {
             this.planned = planned;
             this.exceptionRegistry = exceptionRegistry;
             this.palRegistry = palRegistry;
+            this.startupRegistry = startupRegistry;
         }
     }
 
@@ -220,6 +223,7 @@ public class ApplySymbols extends HeadlessScript {
         if (exceptionPresent && exceptionRegistry == null) {
             fail("the exception ownership registry is missing under a present identity");
         }
+        StringPropertyMap startupRegistry = StartupMetadataSupport.currentRegistry(currentProgram);
         if (!pass2State.thumbOwnership().migrations.isEmpty()) {
             fail("ApplyThumbNames did not migrate predecessor Thumb ownership");
         }
@@ -241,13 +245,14 @@ public class ApplySymbols extends HeadlessScript {
                 fail("no function exists at the map execution entry " + entry);
             }
             verifyCurrentBody(execution, function);
-            verifyAndAuthorize(execution, decision, function, exceptionRegistry, palRegistry);
+            verifyAndAuthorize(execution, decision, function, exceptionRegistry, palRegistry,
+                    startupRegistry);
             boolean rename = "rename".equals(decision.action)
                     && !function.getName().equals(decision.finalPrimary);
             planned.add(new Planned(execution, decision, function, rename));
         }
         return new Preflight(map, label, pass2State, palIdentity, palPresent,
-                planned, exceptionRegistry, palRegistry);
+                planned, exceptionRegistry, palRegistry, startupRegistry);
         }
         catch (Throwable error) {
             try {
@@ -316,7 +321,8 @@ public class ApplySymbols extends HeadlessScript {
      */
     private void verifyAndAuthorize(PalTasksSupport.MapExecution execution,
             PalTasksSupport.MapDecision decision, Function function,
-            StringPropertyMap exceptionRegistry, StringPropertyMap palRegistry) {
+            StringPropertyMap exceptionRegistry, StringPropertyMap palRegistry,
+            StringPropertyMap startupRegistry) {
         Address entry = function.getEntryPoint();
         String currentName = function.getName();
         String currentSource =
@@ -403,6 +409,12 @@ public class ApplySymbols extends HeadlessScript {
                     return;
             }
         }
+        if (startupRegistry != null && startupRegistry.getString(entry) != null
+                && "rename".equals(decision.action)
+                && "analysis".equals(decision.finalSource)) {
+            fail("a startup-owned primary may not be replaced by a token or string-ref name at "
+                    + entry);
+        }
         // No PAL ownership: fresh defaults and Ghidra-analysis primaries may
         // be displaced (recovered and provisional names apply over them);
         // genuine imported or user-defined names remain protected.
@@ -468,6 +480,30 @@ public class ApplySymbols extends HeadlessScript {
         return ExceptionRootsSupport.parseRegistry(value).primaryDisposition;
     }
 
+    private void preserveStartupRoleLabels(StringPropertyMap registry) {
+        if (registry == null) {
+            return;
+        }
+        ghidra.program.model.symbol.Namespace namespace =
+                StartupMetadataSupport.currentNamespace(currentProgram);
+        ghidra.program.model.address.AddressIterator entries = registry.getPropertyIterator();
+        while (entries.hasNext()) {
+            Address entry = entries.next();
+            StartupMetadataSupport.RegistryEntry retained =
+                    StartupMetadataSupport.parseRegistry(registry.getString(entry));
+            ghidra.program.model.symbol.Symbol label =
+                    currentProgram.getSymbolTable().getSymbol(retained.labelId);
+            if (label == null
+                    || label.getSource() != SourceType.ANALYSIS
+                    || label.getSymbolType() != ghidra.program.model.symbol.SymbolType.LABEL
+                    || namespace == null
+                    || !label.getParentNamespace().equals(namespace)
+                    || !label.getAddress().equals(entry)) {
+                fail("a startup role label was not preserved at " + entry);
+            }
+        }
+    }
+
     private static void requirePalRegistryDisposition(StringPropertyMap registry, Address entry,
             String disposition) {
         String actual = palRegistryDisposition(registry, entry);
@@ -530,6 +566,7 @@ public class ApplySymbols extends HeadlessScript {
             else {
                 PalTasksSupport.validateAbsent(currentProgram);
             }
+            preserveStartupRoleLabels(preflight.startupRegistry);
             for (Planned plan : preflight.planned) {
                 String current = plan.function.getName();
                 String source =

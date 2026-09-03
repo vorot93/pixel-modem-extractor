@@ -77,13 +77,17 @@ impl CoprocessorTransfer {
 pub(crate) enum SystemEffect {
     None,
     CoprocessorTransfer(CoprocessorTransfer),
+    PsrTransfer {
+        direction: SystemDirection,
+        rd_or_rm: Register,
+    },
 }
 
 impl SystemEffect {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn transfer(self) -> Option<CoprocessorTransfer> {
         match self {
-            Self::None => None,
+            Self::None | Self::PsrTransfer { .. } => None,
             Self::CoprocessorTransfer(transfer) => Some(transfer),
         }
     }
@@ -3307,16 +3311,35 @@ fn a32_unsupported(pc: u32, length: u8, inst: &ArmA32Instruction) -> DecodedInst
             set([gpr(*rt), gpr(*rn)]),
             set([gpr(*rd)]),
         ),
-        ArmA32Instruction::Mrs_A1(cond, _, rd)
-        | ArmA32Instruction::MrsBanked_A1(cond, _, _, rd) => {
+        ArmA32Instruction::Mrs_A1(cond, _, rd) => {
+            a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rd)])).with_system(
+                SystemEffect::PsrTransfer {
+                    direction: SystemDirection::Read,
+                    rd_or_rm: gpr(*rd),
+                },
+            )
+        }
+        ArmA32Instruction::MrsBanked_A1(cond, _, _, rd) => {
             a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rd)]))
         }
-        ArmA32Instruction::Msr_Register_A1(cond, _, _, rm)
-        | ArmA32Instruction::MsrBanked_A1(cond, _, _, rm) => {
+        ArmA32Instruction::Msr_Register_A1(cond, _, _, rm) => {
+            a32_linear(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new()).with_system(
+                SystemEffect::PsrTransfer {
+                    direction: SystemDirection::Write,
+                    rd_or_rm: gpr(*rm),
+                },
+            )
+        }
+        ArmA32Instruction::MsrBanked_A1(cond, _, _, rm) => {
             a32_linear(pc, length, *cond, set([gpr(*rm)]), BTreeSet::new())
         }
         ArmA32Instruction::Msr_Immediate_A1(cond, _, _, _) => {
-            a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new())
+            a32_linear(pc, length, *cond, BTreeSet::new(), BTreeSet::new()).with_system(
+                SystemEffect::PsrTransfer {
+                    direction: SystemDirection::Write,
+                    rd_or_rm: Register(0),
+                },
+            )
         }
         ArmA32Instruction::Mrc_A1(cond, coprocessor, opcode1, rt, crn, crm, opcode2) => {
             a32_linear(pc, length, *cond, BTreeSet::new(), set([gpr(*rt)])).with_system(
@@ -3638,8 +3661,16 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
         | ArmT32Instruction::Udiv_T1(rd, rn, rm) => {
             t32_linear(pc, length, set([gpr(*rn), gpr(*rm)]), set([gpr(*rd)]))
         }
-        ArmT32Instruction::Mvn_Immediate_T1(rd, _, _) | ArmT32Instruction::Mrs_T1(rd, _) => {
+        ArmT32Instruction::Mvn_Immediate_T1(rd, _, _) => {
             t32_linear(pc, length, BTreeSet::new(), set([gpr(*rd)]))
+        }
+        ArmT32Instruction::Mrs_T1(rd, _) => {
+            t32_linear(pc, length, BTreeSet::new(), set([gpr(*rd)])).with_system(
+                SystemEffect::PsrTransfer {
+                    direction: SystemDirection::Read,
+                    rd_or_rm: gpr(*rd),
+                },
+            )
         }
         ArmT32Instruction::Mvn_Register_T2(rd, rm, _, _)
         | ArmT32Instruction::Clz_T1(rd, rm)
@@ -3713,7 +3744,12 @@ fn t32_unsupported(pc: u32, length: u8, inst: &ArmT32Instruction) -> DecodedInst
             set([gpr(*rdlo), gpr(*rdhi)]),
         ),
         ArmT32Instruction::Msr_Register_T1(_, rn) => {
-            t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new())
+            t32_linear(pc, length, set([gpr(*rn)]), BTreeSet::new()).with_system(
+                SystemEffect::PsrTransfer {
+                    direction: SystemDirection::Write,
+                    rd_or_rm: gpr(*rn),
+                },
+            )
         }
         ArmT32Instruction::LoadAcquire_T1(_, _, rt, rn)
         | ArmT32Instruction::UnprivLoadStore_T1(true, _, _, rt, rn, _) => {
@@ -3921,7 +3957,7 @@ mod tests {
     use crate::execution_ranges::DecodeIsa as Isa;
     use scaleservers_arm32_assembly::{
         Arm32Condition, Arm32GeneralPurposeRegister, Arm32LowGeneralPurposeRegister,
-        Arm32RegisterShift, ArmA32Instruction, ArmT32Instruction,
+        Arm32RegisterShift, ArmA32Instruction, ArmT32Instruction, ArmT32SpecialRegister,
     };
     use std::collections::BTreeSet;
 
@@ -4149,6 +4185,87 @@ mod tests {
         assert_eq!(read.effect, ValueEffect::Unsupported);
         assert_eq!(read.flags, FlagEffect::Clobbered);
         assert_eq!(read.flow, ControlFlow::Linear);
+    }
+
+    #[test]
+    fn mrs_a1_is_psr_transfer_read() {
+        let insn = decode_a32(0x1000, &ArmA32Instruction::Mrs_A1(always(), false, gpr(0)));
+        assert_eq!(
+            insn.system,
+            SystemEffect::PsrTransfer {
+                direction: SystemDirection::Read,
+                rd_or_rm: R0,
+            }
+        );
+        assert_eq!(insn.writes, regs(&[R0]));
+        assert!(insn.reads.is_empty());
+    }
+
+    #[test]
+    fn msr_register_a1_is_psr_transfer_write() {
+        let insn = decode_a32(
+            0x1000,
+            &ArmA32Instruction::Msr_Register_A1(always(), false, 0b1000, gpr(1)),
+        );
+        assert_eq!(
+            insn.system,
+            SystemEffect::PsrTransfer {
+                direction: SystemDirection::Write,
+                rd_or_rm: R1,
+            }
+        );
+        assert_eq!(insn.reads, regs(&[R1]));
+        assert!(insn.writes.is_empty());
+    }
+
+    #[test]
+    fn msr_immediate_a1_is_psr_transfer_write() {
+        let insn = decode_a32(
+            0x1000,
+            &ArmA32Instruction::Msr_Immediate_A1(always(), false, 0b1000, 0xF000_0000),
+        );
+        match insn.system {
+            SystemEffect::PsrTransfer { direction, .. } => {
+                assert_eq!(direction, SystemDirection::Write);
+            }
+            other => panic!("expected PsrTransfer, got {other:?}"),
+        }
+        assert!(insn.reads.is_empty());
+        assert!(insn.writes.is_empty());
+    }
+
+    #[test]
+    fn mrs_t1_is_psr_transfer_read() {
+        let insn = decode_t32(
+            0x2000,
+            &ArmT32Instruction::Mrs_T1(gpr(0), ArmT32SpecialRegister::Apsr),
+        );
+        assert_eq!(
+            insn.system,
+            SystemEffect::PsrTransfer {
+                direction: SystemDirection::Read,
+                rd_or_rm: R0,
+            }
+        );
+        assert_eq!(insn.writes, regs(&[R0]));
+        assert!(insn.reads.is_empty());
+    }
+
+    #[test]
+    fn msr_register_t1_is_psr_transfer_write() {
+        let insn = decode_t32(
+            0x2000,
+            &ArmT32Instruction::Msr_Register_T1(ArmT32SpecialRegister::Apsr, gpr(1)),
+        );
+        assert_eq!(
+            insn.system,
+            SystemEffect::PsrTransfer {
+                direction: SystemDirection::Write,
+                rd_or_rm: R1,
+            }
+        );
+        assert_eq!(insn.reads, regs(&[R1]));
+        assert!(insn.writes.is_empty());
     }
 
     #[test]

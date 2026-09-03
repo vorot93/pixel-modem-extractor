@@ -53,6 +53,8 @@ pub enum Error {
     BadDbtTraces(String),
     #[error("bad exception-root evidence: {0}")]
     BadExceptionRoots(String),
+    #[error("bad startup metadata: {0}")]
+    BadStartupMetadata(String),
     #[error("size mismatch for {name}: expected {expected}, got {actual}")]
     SizeMismatch {
         name: String,

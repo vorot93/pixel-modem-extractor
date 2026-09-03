@@ -1303,6 +1303,9 @@ mod tests {
             exception_proposed_primary,
             pal: None,
             pal_proposed_primary: None,
+            startup_manifest_blake3: None,
+            startup: None,
+            startup_proposed_primary: None,
         }
     }
 

@@ -1179,7 +1179,7 @@ pub(super) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A minimal canonical `pixel-modem-extractor-symbol-map-v4` covering the
+/// A minimal canonical `pixel-modem-extractor-symbol-map-v5` covering the
 /// two fixture executions (one PAL rename decision, one preserve), with
 /// the exact ordered fields the strict reader enforces.
 pub(super) fn canonical_symbol_map(
@@ -1202,7 +1202,7 @@ pub(super) fn canonical_symbol_map(
 
     let mut json = Json::new();
     json.open_object();
-    json.string_field(true, "format", "pixel-modem-extractor-symbol-map-v4");
+    json.string_field(true, "format", "pixel-modem-extractor-symbol-map-v5");
     json.key(false, "image");
     json.open_object();
     json.string_field(true, "label", LABEL);

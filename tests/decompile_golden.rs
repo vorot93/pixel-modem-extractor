@@ -612,6 +612,50 @@ fn prepared_pass2_map(
     .unwrap()
 }
 
+/// Twelve ExportDecomp script arguments: output, kit, label, exception
+/// identity/manifest, PAL identity/manifest, startup identity/manifest,
+/// scatter, map path, map hash.
+#[allow(clippy::too_many_arguments)]
+fn export_decomp_args(
+    export_dir: &std::path::Path,
+    kit_root: &std::path::Path,
+    label: &str,
+    exception_identity: &str,
+    exception_manifest: &str,
+    pal_identity: &str,
+    pal_manifest: &str,
+    startup_identity: &str,
+    startup_manifest: &str,
+    scatter: &str,
+    map: &str,
+    map_hash: &str,
+) -> Vec<String> {
+    vec![
+        export_dir.to_string_lossy().into_owned(),
+        kit_root.to_string_lossy().into_owned(),
+        label.to_string(),
+        exception_identity.to_string(),
+        exception_manifest.to_string(),
+        pal_identity.to_string(),
+        pal_manifest.to_string(),
+        startup_identity.to_string(),
+        startup_manifest.to_string(),
+        scatter.to_string(),
+        map.to_string(),
+        map_hash.to_string(),
+    ]
+}
+
+fn export_decomp_none_args(
+    export_dir: &std::path::Path,
+    kit_root: &std::path::Path,
+    label: &str,
+) -> Vec<String> {
+    export_decomp_args(
+        export_dir, kit_root, label, "none", "-", "none", "-", "none", "-", "-", "-", "none",
+    )
+}
+
 /// Drives one saved-project `-process` run with an optional seeding
 /// post-script followed by the shipping `ExportDecomp.java` under its
 /// pass-1-style argv (`-`/`none`), asserting success.
@@ -639,16 +683,11 @@ fn run_saved_project_export(
     command
         .arg("-postScript")
         .arg("ExportDecomp.java")
-        .arg(out.join("export").join(label))
-        .arg(&canonical_root)
-        .arg(label)
-        .arg("none")
-        .arg("-")
-        .arg("none")
-        .arg("-")
-        .arg("-")
-        .arg("-")
-        .arg("none")
+        .args(export_decomp_none_args(
+            &out.join("export").join(label),
+            &canonical_root,
+            label,
+        ))
         .output()
         .unwrap()
 }
@@ -957,7 +996,7 @@ fn immediate_run_applies_pal_tasks_by_default() {
     let marker = std::fs::read_to_string(out.join("export/02_MAIN.complete")).unwrap_or_default();
     assert!(
         marker.starts_with(
-            "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=v1:"
+            "pixel-modem-extractor-ghidra-export-v5\nexception_roots=none\npal_tasks=v1:"
         ),
         "the current marker must bind the applied PAL identity: {marker:?}"
     );
@@ -1023,7 +1062,7 @@ fn immediate_run_applies_pal_tasks_under_no_thumb_decompile() {
     let marker = std::fs::read_to_string(out.join("export/02_MAIN.complete")).unwrap_or_default();
     assert!(
         marker.starts_with(
-            "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=v1:"
+            "pixel-modem-extractor-ghidra-export-v5\nexception_roots=none\npal_tasks=v1:"
         ),
         "the datamark marker must bind the applied PAL identity: {marker:?}"
     );
@@ -1588,8 +1627,10 @@ fn generated_shell_completes_pal_run_from_root_with_spaces_and_metacharacters() 
     let marker = std::fs::read(out.join("export/02_MAIN.complete")).unwrap();
     assert_eq!(
         marker,
-        pixel_modem_extractor::decompile::export_completion_marker("none", &identity, "none"),
-        "the shell must compare the exact PAL-aware v4 marker"
+        pixel_modem_extractor::decompile::export_completion_marker(
+            "none", &identity, "none", "none"
+        ),
+        "the shell must compare the exact PAL-aware v5 marker"
     );
     let functions: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("export/02_MAIN/functions.json")).unwrap())
@@ -1823,16 +1864,11 @@ public class SeedMixedGap extends GhidraScript {
     .arg("SeedMixedGap.java")
     .arg("-postScript")
     .arg("ExportDecomp.java")
-    .arg(out.join("export/00_BOOT"))
-    .arg(&canonical_root)
-    .arg("00_BOOT")
-    .arg("none")
-    .arg("-")
-    .arg("none")
-    .arg("-")
-    .arg("-")
-    .arg("-")
-    .arg("none")
+    .args(export_decomp_none_args(
+        &out.join("export/00_BOOT"),
+        &canonical_root,
+        "00_BOOT",
+    ))
     .output()
     .unwrap();
     assert!(
@@ -2042,7 +2078,7 @@ public class SeedSavedProgram extends GhidraScript {
     let marker_after = std::fs::read(out.join("export/00_BOOT.complete")).unwrap();
     assert_eq!(
         marker_after,
-        pixel_modem_extractor::decompile::export_completion_marker("none", "none", "none")
+        pixel_modem_extractor::decompile::export_completion_marker("none", "none", "none", "none")
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -2602,16 +2638,20 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     .arg(creation_only_symbol_map.map_blake3())
     .arg("-postScript")
     .arg("ExportDecomp.java")
-    .arg(creation_only_out.join("export/00_BOOT"))
-    .arg(&creation_only_root)
-    .arg("00_BOOT")
-    .arg("none")
-    .arg("-")
-    .arg("none")
-    .arg("-")
-    .arg("-")
-    .arg(creation_only_symbol_map.path())
-    .arg(creation_only_symbol_map.map_blake3())
+    .args(export_decomp_args(
+        &creation_only_out.join("export/00_BOOT"),
+        &creation_only_root,
+        "00_BOOT",
+        "none",
+        "-",
+        "none",
+        "-",
+        "none",
+        "-",
+        "-",
+        &creation_only_symbol_map.path().to_string_lossy(),
+        creation_only_symbol_map.map_blake3(),
+    ))
     .env("XDG_CONFIG_HOME", creation_only_config)
     .env("XDG_CACHE_HOME", creation_only_cache)
     .env("GHIDRA_HEADLESS_JAVA_OPTIONS", creation_only_java_options)
@@ -2647,6 +2687,7 @@ public class SeedCreationOnlyCollisionProject extends GhidraScript {
     assert_eq!(
         std::fs::read(creation_only_out.join("export/00_BOOT.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
             "none",
             "none",
             creation_only_symbol_map.map_blake3(),
@@ -3025,6 +3066,7 @@ public class ProbeThumbCreationRollback extends GhidraScript {
         pixel_modem_extractor::decompile::export_completion_marker(
             "none",
             "none",
+            "none",
             symbol_map.map_blake3(),
         ),
     );
@@ -3386,21 +3428,20 @@ public class ProbeThumbCreationSkips extends GhidraScript {
             successor_prepared.path().to_string_lossy().into_owned(),
             successor_prepared.map_blake3().to_string(),
         ];
-        let successor_export_args = vec![
-            successor_out
-                .join("export/00_BOOT")
-                .to_string_lossy()
-                .into_owned(),
-            successor_root.to_string_lossy().into_owned(),
-            "00_BOOT".to_string(),
-            "none".to_string(),
-            "-".to_string(),
-            "none".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            successor_prepared.path().to_string_lossy().into_owned(),
-            successor_prepared.map_blake3().to_string(),
-        ];
+        let successor_export_args = export_decomp_args(
+            &successor_out.join("export/00_BOOT"),
+            &successor_root,
+            "00_BOOT",
+            "none",
+            "-",
+            "none",
+            "-",
+            "none",
+            "-",
+            "-",
+            &successor_prepared.path().to_string_lossy(),
+            successor_prepared.map_blake3(),
+        );
         std::fs::write(
             successor_out.join("scripts/FailAfterThumb.java"),
             r#"//@category PixelModemTest
@@ -3920,6 +3961,514 @@ public class ReplaceThumbCreation extends GhidraScript {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
+}
+
+const STARTUP_EXEC_HW: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const STARTUP_EXEC_STACK: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn startup_vector_blob() -> Vec<u8> {
+    let mut arm = vec![0x18u8, 0x00, 0x9f, 0xe5, 0x1e, 0xff, 0x2f, 0xe1];
+    for _ in 0..6 {
+        arm.extend([0xfe, 0xff, 0xff, 0xea]);
+    }
+    arm.extend([0x78, 0x56, 0x34, 0x12]);
+    arm
+}
+
+struct StartupPass1Kit {
+    dir: PathBuf,
+    out: PathBuf,
+    kit_root: PathBuf,
+    functions_path: PathBuf,
+    functions_blake3: String,
+    image_blake3: String,
+    image_size: u32,
+}
+
+fn startup_pass1_kit(home: &std::path::Path, case: &str) -> StartupPass1Kit {
+    let arm = startup_vector_blob();
+    let modem = craft_modem_bin(&arm);
+    let dir = std::env::temp_dir().join(format!("pme_startup_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let modem_path = dir.join("modem.bin");
+    std::fs::write(&modem_path, &modem).unwrap();
+    let out = dir.join("out");
+    let opts = pixel_modem_extractor::decompile::Opts {
+        run: true,
+        image: None,
+        ghidra_home: Some(home.to_path_buf()),
+        processor: "ARM:LE:32:v7".to_string(),
+        no_thumb_decompile: false,
+        rizin_fallback: false,
+        tighten_wall_clock_budget_override: None,
+        no_skip_opaque: false,
+    };
+    let report = pixel_modem_extractor::decompile::run_report(&modem_path, &opts, &out).unwrap();
+    assert!(
+        report.images.iter().any(|image| image.label == "00_BOOT"),
+        "pass 1 should have analyzed 00_BOOT"
+    );
+    let tame = std::fs::read_to_string(out.join("scripts/TameAnalysis.java")).unwrap();
+    assert!(
+        tame.contains("Non-Returning Functions - Discovered.Repair Flow Damage"),
+        "TameAnalysis must still disable Repair Flow Damage"
+    );
+    let apply = std::fs::read_to_string(out.join("scripts/ApplyStartupMetadata.java")).unwrap();
+    assert!(
+        !apply.contains("AutoAnalysisManager")
+            && !apply.contains("Repair Flow Damage")
+            && !apply.contains("analyze("),
+        "ApplyStartupMetadata must not call analysis APIs or re-enable Repair Flow Damage"
+    );
+    let functions_path = out.join("export/00_BOOT/functions.json");
+    let functions = std::fs::read(&functions_path).unwrap();
+    let image_path = out.join("images/00_BOOT");
+    let image = std::fs::read(&image_path).unwrap();
+    assert_eq!(image, arm);
+    StartupPass1Kit {
+        dir,
+        kit_root: std::fs::canonicalize(&out).unwrap(),
+        functions_blake3: blake3::hash(&functions).to_hex().to_string(),
+        image_blake3: blake3::hash(&image).to_hex().to_string(),
+        image_size: u32::try_from(image.len()).unwrap(),
+        functions_path,
+        out,
+    }
+}
+
+fn write_startup_manifest(
+    kit: &StartupPass1Kit,
+    hardware: Option<u32>,
+    stack: Option<(u32, bool)>,
+) -> (PathBuf, String, Vec<u8>) {
+    let manifest_dir = kit.out.join("startup_metadata/00_BOOT");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    let hardware_json = match hardware {
+        None => "{\n    \"status\": \"absent\"\n  }".to_string(),
+        Some(entry) => format!(
+            "{{\n    \"status\": \"present\",\n    \"entry\": \"{entry:#010x}\",\n    \"isa\": \"arm\",\n    \"owner\": {{\n      \"kind\": \"ghidra\"\n    }},\n    \"execution_blake3\": \"{STARTUP_EXEC_HW}\"\n  }}"
+        ),
+    };
+    let stack_json = match stack {
+        None => "{\n    \"status\": \"absent\"\n  }".to_string(),
+        Some((entry, non_return)) => format!(
+            "{{\n    \"status\": \"present\",\n    \"entry\": \"{entry:#010x}\",\n    \"isa\": \"arm\",\n    \"owner\": {{\n      \"kind\": \"ghidra\"\n    }},\n    \"execution_blake3\": \"{STARTUP_EXEC_STACK}\",\n    \"non_return\": {non_return}\n  }}"
+        ),
+    };
+    let mut applications = String::from("[\n");
+    let mut first = true;
+    if let Some(entry) = hardware {
+        applications.push_str(&format!(
+            "    {{\n      \"role\": \"hardware_init\",\n      \"entry\": \"{entry:#010x}\",\n      \"isa\": \"arm\",\n      \"desired_primary\": \"hw_Init\",\n      \"role_label\": \"startup_hardware_init\",\n      \"set_no_return\": false\n    }}"
+        ));
+        first = false;
+    }
+    if let Some((entry, non_return)) = stack {
+        if !first {
+            applications.push_str(",\n");
+        }
+        applications.push_str(&format!(
+            "    {{\n      \"role\": \"stack_protection_failure\",\n      \"entry\": \"{entry:#010x}\",\n      \"isa\": \"arm\",\n      \"desired_primary\": \"StackProtectionFailure\",\n      \"role_label\": \"startup_stack_protection_failure\",\n      \"set_no_return\": {non_return}\n    }}"
+        ));
+    }
+    if hardware.is_none() && stack.is_none() {
+        applications = "[]".to_string();
+    } else {
+        applications.push_str("\n  ]");
+    }
+    let named = usize::from(hardware.is_some()) + usize::from(stack.is_some());
+    let no_return = usize::from(stack.is_some_and(|(_, flag)| flag));
+    let text = format!(
+        "{{\n  \"format\": \"pixel-modem-extractor-startup-metadata-v1\",\n  \"schema_version\": 1,\n  \"tool_version\": \"{}\",\n  \"image\": {{\n    \"label\": \"00_BOOT\",\n    \"toc_name\": \"BOOT\",\n    \"base_addr\": \"0x00000000\",\n    \"size\": {},\n    \"blake3\": \"{}\"\n  }},\n  \"runtime\": {{\n    \"scatter_load_map_blake3\": null,\n    \"scatter_entries_used\": []\n  }},\n  \"inventories\": {{\n    \"functions_blake3\": \"{}\",\n    \"thumb_functions_blake3\": null\n  }},\n  \"decoder\": {{\n    \"crate\": \"scaleservers-arm32-assembly\",\n    \"version\": \"1.0.0\"\n  }},\n  \"exception_roots\": null,\n  \"hardware_init\": {hardware_json},\n  \"stack_guard\": {stack_json},\n  \"compiler\": {{\n    \"status\": \"absent\"\n  }},\n  \"privileged_ops\": [],\n  \"applications\": {applications}\n}}",
+        env!("CARGO_PKG_VERSION"),
+        kit.image_size,
+        kit.image_blake3,
+        kit.functions_blake3,
+    );
+    let bytes = text.into_bytes();
+    let path = manifest_dir.join("startup.json");
+    std::fs::write(&path, &bytes).unwrap();
+    let identity = format!("v1:{}:{named}:{no_return}:0", blake3::hash(&bytes).to_hex());
+    (std::fs::canonicalize(&path).unwrap(), identity, bytes)
+}
+
+fn apply_startup_args(
+    kit: &StartupPass1Kit,
+    identity: &str,
+    manifest: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        kit.kit_root.to_string_lossy().into_owned(),
+        "00_BOOT".to_string(),
+        kit.image_blake3.clone(),
+        identity.to_string(),
+        manifest.to_string_lossy().into_owned(),
+        "-".to_string(),
+        kit.functions_path.to_string_lossy().into_owned(),
+        kit.functions_blake3.clone(),
+    ]
+}
+
+fn startup_export_args(kit: &StartupPass1Kit, identity: &str, manifest: &str) -> Vec<String> {
+    export_decomp_args(
+        &kit.out.join("export/00_BOOT"),
+        &kit.kit_root,
+        "00_BOOT",
+        "none",
+        "-",
+        "none",
+        "-",
+        identity,
+        manifest,
+        "-",
+        "-",
+        "none",
+    )
+}
+
+const INSPECT_STARTUP_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.util.StringPropertyMap;
+
+public class InspectStartup extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Namespace ns = currentProgram.getSymbolTable().getNamespace(
+                "PixelModemExtractor_StartupMetadata_v1", currentProgram.getGlobalNamespace());
+        System.out.println("InspectStartup: namespace=" + (ns == null ? "absent" : "present"));
+        StringPropertyMap registry = currentProgram.getUsrPropertyManager()
+                .getStringPropertyMap("PixelModemExtractor.StartupMetadata.v1.Ownership");
+        System.out.println("InspectStartup: registry="
+                + (registry == null ? "absent" : Integer.toString(registry.getSize())));
+        Function hw = currentProgram.getFunctionManager().getFunctionAt(toAddr(0));
+        Function stack = currentProgram.getFunctionManager().getFunctionAt(toAddr(8));
+        Function missing = currentProgram.getFunctionManager().getFunctionAt(toAddr(0x20));
+        System.out.println("InspectStartup: hardware_fn="
+                + (hw == null ? "absent" : hw.getName()));
+        System.out.println("InspectStartup: hardware_source="
+                + (hw == null ? "absent" : hw.getSymbol().getSource().name()));
+        System.out.println("InspectStartup: stack_fn="
+                + (stack == null ? "absent" : stack.getName()));
+        System.out.println("InspectStartup: stack_no_return="
+                + (stack != null && stack.hasNoReturn()));
+        System.out.println("InspectStartup: missing_fn="
+                + (missing == null ? "absent" : "present"));
+        Symbol hwLabel = ns == null ? null : currentProgram.getSymbolTable()
+                .getSymbol("startup_hardware_init", toAddr(0), ns);
+        Symbol stackLabel = ns == null ? null : currentProgram.getSymbolTable()
+                .getSymbol("startup_stack_protection_failure", toAddr(8), ns);
+        System.out.println("InspectStartup: hardware_label="
+                + (hwLabel == null ? "absent" : hwLabel.getSource().name()));
+        System.out.println("InspectStartup: stack_label="
+                + (stackLabel == null ? "absent" : stackLabel.getSource().name()));
+        System.out.println("InspectStartup: ok");
+    }
+}
+"#;
+
+const SEED_STARTUP_STACK_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.symbol.SourceType;
+
+public class SeedStartupStack extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Address entry = toAddr(8);
+        FunctionManager functions = currentProgram.getFunctionManager();
+        if (functions.getFunctionAt(entry) == null) {
+            AddressSet body = new AddressSet(entry, toAddr(0xb));
+            if (functions.createFunction("startup_stack_fixture", entry, body,
+                    SourceType.ANALYSIS) == null) {
+                throw new AssertionError("could not create stack-guard fixture function");
+            }
+        }
+        System.out.println("SeedStartupStack: ok");
+    }
+}
+"#;
+
+const SEED_STARTUP_STRONGER_NAME_JAVA: &str = r#"//@category PixelModemTest
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.symbol.SourceType;
+
+public class SeedStartupStrongerName extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        Function function = currentProgram.getFunctionManager().getFunctionAt(toAddr(0));
+        if (function == null) {
+            throw new AssertionError("hardware-init function is missing");
+        }
+        function.setName("registered_hw_Init", SourceType.USER_DEFINED);
+        System.out.println("SeedStartupStrongerName: ok");
+    }
+}
+"#;
+
+fn write_startup_inspect_scripts(out: &std::path::Path) {
+    std::fs::write(
+        out.join("scripts/InspectStartup.java"),
+        INSPECT_STARTUP_JAVA,
+    )
+    .unwrap();
+    std::fs::write(
+        out.join("scripts/SeedStartupStack.java"),
+        SEED_STARTUP_STACK_JAVA,
+    )
+    .unwrap();
+    std::fs::write(
+        out.join("scripts/SeedStartupStrongerName.java"),
+        SEED_STARTUP_STRONGER_NAME_JAVA,
+    )
+    .unwrap();
+}
+
+fn inspect_startup(home: &std::path::Path, kit: &StartupPass1Kit) -> String {
+    let output = inspect_saved_project(home, &kit.out, "00_BOOT", "InspectStartup.java");
+    let diagnostics = process_diagnostics(&output);
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "InspectStartup: ok"),
+        "InspectStartup failed:\n{diagnostics}"
+    );
+    diagnostics
+}
+
+fn startup_success_summary(stdout: &str) -> serde_json::Value {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("ApplyStartupMetadata: "))
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .unwrap_or_else(|| panic!("missing ApplyStartupMetadata summary:\n{stdout}"))
+}
+
+#[test]
+fn pass2_applies_startup_labels_and_gated_no_return() {
+    let home = ghidra_home_or_skip!();
+    let kit = startup_pass1_kit(&home, "labels");
+    write_startup_inspect_scripts(&kit.out);
+    let seeded = inspect_saved_project(&home, &kit.out, "00_BOOT", "SeedStartupStack.java");
+    assert!(
+        seeded.status.success()
+            && String::from_utf8_lossy(&seeded.stdout)
+                .lines()
+                .any(|line| line == "SeedStartupStack: ok"),
+        "stack-guard fixture seed failed:\n{}",
+        process_diagnostics(&seeded)
+    );
+    let (manifest, identity, _) = write_startup_manifest(&kit, Some(0), Some((8, true)));
+    let _ = std::fs::remove_file(kit.out.join("export/00_BOOT.complete"));
+    let applied = inspect_saved_project_with_post_scripts(
+        &home,
+        &kit.out,
+        "00_BOOT",
+        &[
+            (
+                "ApplyStartupMetadata.java".to_string(),
+                apply_startup_args(&kit, &identity, &manifest),
+            ),
+            (
+                "ExportDecomp.java".to_string(),
+                startup_export_args(&kit, &identity, &manifest.to_string_lossy()),
+            ),
+        ],
+    );
+    let diagnostics = process_diagnostics(&applied);
+    assert!(
+        applied.status.success(),
+        "ApplyStartupMetadata + ExportDecomp failed:\n{diagnostics}"
+    );
+    let summary = startup_success_summary(&diagnostics);
+    assert_eq!(summary["image"], "00_BOOT");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["identity"], identity);
+    assert_eq!(summary["candidates"], 2);
+    assert_eq!(summary["labeled"], 2);
+    assert_eq!(summary["skipped_existing_label"], 0);
+    assert_eq!(summary["no_return_requested"], 1);
+    assert_eq!(summary["no_return_applied"], 1);
+    assert_eq!(summary["no_return_skipped"], 0);
+    let inspected = inspect_startup(&home, &kit);
+    assert!(inspected.contains("InspectStartup: namespace=present"));
+    assert!(inspected.contains("InspectStartup: hardware_label=ANALYSIS"));
+    assert!(inspected.contains("InspectStartup: stack_label=ANALYSIS"));
+    assert!(inspected.contains("InspectStartup: stack_no_return=true"));
+    assert_eq!(
+        std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            "none", "none", &identity, "none"
+        )
+    );
+
+    let empty = startup_pass1_kit(&home, "empty");
+    write_startup_inspect_scripts(&empty.out);
+    let (empty_manifest, empty_identity, _) = write_startup_manifest(&empty, None, None);
+    let _ = std::fs::remove_file(empty.out.join("export/00_BOOT.complete"));
+    let empty_applied = inspect_saved_project_with_post_scripts(
+        &home,
+        &empty.out,
+        "00_BOOT",
+        &[
+            (
+                "ApplyStartupMetadata.java".to_string(),
+                apply_startup_args(&empty, &empty_identity, &empty_manifest),
+            ),
+            (
+                "ExportDecomp.java".to_string(),
+                startup_export_args(&empty, &empty_identity, &empty_manifest.to_string_lossy()),
+            ),
+        ],
+    );
+    let empty_diagnostics = process_diagnostics(&empty_applied);
+    assert!(
+        empty_applied.status.success(),
+        "empty-application Present must succeed and still export:\n{empty_diagnostics}"
+    );
+    let empty_summary = startup_success_summary(&empty_diagnostics);
+    assert_eq!(empty_summary["status"], "ok");
+    assert_eq!(empty_summary["candidates"], 0);
+    assert_eq!(empty_summary["labeled"], 0);
+    assert_eq!(empty_summary["no_return_requested"], 0);
+    let empty_inspected = inspect_startup(&home, &empty);
+    assert!(empty_inspected.contains("InspectStartup: namespace=present"));
+    assert!(empty_inspected.contains("InspectStartup: hardware_label=absent"));
+    assert!(empty_inspected.contains("InspectStartup: stack_label=absent"));
+    assert_eq!(
+        std::fs::read(empty.out.join("export/00_BOOT.complete")).unwrap(),
+        pixel_modem_extractor::decompile::export_completion_marker(
+            "none",
+            "none",
+            &empty_identity,
+            "none"
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(&kit.dir);
+    let _ = std::fs::remove_dir_all(&empty.dir);
+}
+
+#[test]
+fn pass2_startup_missing_target_rolls_back_without_success_summary() {
+    let home = ghidra_home_or_skip!();
+    let kit = startup_pass1_kit(&home, "missing");
+    write_startup_inspect_scripts(&kit.out);
+    let before = inspect_startup(&home, &kit);
+    assert!(before.contains("InspectStartup: namespace=absent"));
+    assert!(before.contains("InspectStartup: missing_fn=absent"));
+    let (manifest, identity, _) = write_startup_manifest(&kit, Some(0), Some((0x20, true)));
+    let _ = std::fs::remove_file(kit.out.join("export/00_BOOT.complete"));
+    let applied = inspect_saved_project_with_post_scripts(
+        &home,
+        &kit.out,
+        "00_BOOT",
+        &[
+            (
+                "ApplyStartupMetadata.java".to_string(),
+                apply_startup_args(&kit, &identity, &manifest),
+            ),
+            (
+                "ExportDecomp.java".to_string(),
+                startup_export_args(&kit, "none", "-"),
+            ),
+        ],
+    );
+    let diagnostics = process_diagnostics(&applied);
+    assert!(
+        !diagnostics
+            .lines()
+            .any(|line| line.contains("ApplyStartupMetadata: ")
+                && line.contains("\"status\":\"ok\"")),
+        "missing target emitted a success summary:\n{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("ApplyStartupMetadata: ")
+            && diagnostics.contains("\"status\":\"error\""),
+        "missing target must emit an error summary so ExportDecomp can still run:\n{diagnostics}"
+    );
+    assert!(
+        applied.status.success() && diagnostics.contains("ExportDecomp: wrote export"),
+        "map-error must return so ExportDecomp still runs:\n{diagnostics}"
+    );
+    let after = inspect_startup(&home, &kit);
+    assert!(after.contains("InspectStartup: namespace=absent"));
+    assert!(after.contains("InspectStartup: hardware_label=absent"));
+    assert!(after.contains("InspectStartup: stack_label=absent"));
+    assert!(after.contains("InspectStartup: stack_no_return=false"));
+    let _ = std::fs::remove_dir_all(&kit.dir);
+}
+
+#[test]
+fn pass2_stronger_name_preserves_startup_role_label() {
+    let home = ghidra_home_or_skip!();
+    let kit = startup_pass1_kit(&home, "stronger");
+    write_startup_inspect_scripts(&kit.out);
+    let seeded = inspect_saved_project(&home, &kit.out, "00_BOOT", "SeedStartupStack.java");
+    assert!(
+        seeded.status.success(),
+        "stack-guard fixture seed failed:\n{}",
+        process_diagnostics(&seeded)
+    );
+    let (manifest, identity, _) = write_startup_manifest(&kit, Some(0), Some((8, true)));
+    let applied = inspect_saved_project_with_args(
+        &home,
+        &kit.out,
+        "00_BOOT",
+        "ApplyStartupMetadata.java",
+        &apply_startup_args(&kit, &identity, &manifest),
+    );
+    let apply_diagnostics = process_diagnostics(&applied);
+    assert!(
+        applied.status.success() && startup_success_summary(&apply_diagnostics)["status"] == "ok",
+        "initial startup apply failed:\n{apply_diagnostics}"
+    );
+    let renamed = inspect_saved_project(&home, &kit.out, "00_BOOT", "SeedStartupStrongerName.java");
+    assert!(
+        renamed.status.success()
+            && String::from_utf8_lossy(&renamed.stdout)
+                .lines()
+                .any(|line| line == "SeedStartupStrongerName: ok"),
+        "stronger-name seed failed:\n{}",
+        process_diagnostics(&renamed)
+    );
+    let replayed = inspect_saved_project_with_post_scripts(
+        &home,
+        &kit.out,
+        "00_BOOT",
+        &[
+            (
+                "ApplyStartupMetadata.java".to_string(),
+                apply_startup_args(&kit, &identity, &manifest),
+            ),
+            (
+                "ExportDecomp.java".to_string(),
+                startup_export_args(&kit, &identity, &manifest.to_string_lossy()),
+            ),
+        ],
+    );
+    let replay_diagnostics = process_diagnostics(&replayed);
+    assert!(
+        replayed.status.success(),
+        "startup replay after stronger name failed:\n{replay_diagnostics}"
+    );
+    let replay_summary = startup_success_summary(&replay_diagnostics);
+    assert_eq!(replay_summary["status"], "ok");
+    assert_eq!(replay_summary["skipped_existing_label"], 2);
+    let inspected = inspect_startup(&home, &kit);
+    assert!(inspected.contains("InspectStartup: hardware_fn=registered_hw_Init"));
+    assert!(inspected.contains("InspectStartup: hardware_source=USER_DEFINED"));
+    assert!(inspected.contains("InspectStartup: hardware_label=ANALYSIS"));
+    assert!(inspected.contains("InspectStartup: stack_label=ANALYSIS"));
+    let _ = std::fs::remove_dir_all(&kit.dir);
 }
 
 /// Build the raw pw_token DB byte stream the token parser accepts for
@@ -4890,8 +5439,8 @@ fn pal_support_strict_parsers_registry_and_digests() {
     std::fs::write(case_root.join("symbol_map.json"), &symbol_map).unwrap();
     let bad_symbol_map = replace_once(
         &symbol_map,
-        "\"format\": \"pixel-modem-extractor-symbol-map-v4\",",
-        "\"format\": \"pixel-modem-extractor-symbol-map-v4\",\n  \"unexpected\": true,",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v5\",",
+        "\"format\": \"pixel-modem-extractor-symbol-map-v5\",\n  \"unexpected\": true,",
     );
     std::fs::write(case_root.join("symbol_map_bad.json"), &bad_symbol_map).unwrap();
 
@@ -7311,21 +7860,14 @@ fn export_rejects_deadline_expiry_after_final_decompile_operation() {
         kit.out.join("scripts").to_string_lossy().into_owned(),
         "-postScript".to_string(),
         "ExportDecomp.java".to_string(),
-        kit.out
-            .join("export/00_BOOT")
-            .to_string_lossy()
-            .into_owned(),
-        root.to_string_lossy().into_owned(),
-        "00_BOOT".to_string(),
-        "none".to_string(),
-        "-".to_string(),
-        "none".to_string(),
-        "-".to_string(),
-        "-".to_string(),
-        "-".to_string(),
-        "none".to_string(),
     ]
-    .into();
+    .into_iter()
+    .chain(export_decomp_none_args(
+        &kit.out.join("export/00_BOOT"),
+        &root,
+        "00_BOOT",
+    ))
+    .collect();
     let diagnostics = tame_stdout(&tame_headless(&home, &kit, &args));
     assert!(
         diagnostics
@@ -7398,7 +7940,7 @@ fn build_pal_pass2_kit(
     }
     if export_pass1 {
         // One -process run applies PAL transactionally and exports pass 1
-        // under the strict ten-argument contract.
+        // under the strict twelve-argument contract.
         // The seed (pre-existing meaningful/coincident primaries) ran at
         // import time; this run only applies PAL and exports pass 1.
         let args: Vec<String> = [
@@ -7415,21 +7957,23 @@ fn build_pal_pass2_kit(
             kit.scatter_path.to_string_lossy().into_owned(),
             "-postScript".to_string(),
             "ExportDecomp.java".to_string(),
-            kit.out
-                .join("export/02_MAIN")
-                .to_string_lossy()
-                .into_owned(),
-            kit.kit_root.to_string_lossy().into_owned(),
-            "02_MAIN".to_string(),
-            "none".to_string(),
-            "-".to_string(),
-            kit.identity.clone(),
-            kit.manifest_path.to_string_lossy().into_owned(),
-            kit.scatter_path.to_string_lossy().into_owned(),
-            "-".to_string(),
-            "none".to_string(),
         ]
-        .into();
+        .into_iter()
+        .chain(export_decomp_args(
+            &kit.out.join("export/02_MAIN"),
+            &kit.kit_root,
+            "02_MAIN",
+            "none",
+            "-",
+            &kit.identity,
+            &kit.manifest_path.to_string_lossy(),
+            "none",
+            "-",
+            &kit.scatter_path.to_string_lossy(),
+            "-",
+            "none",
+        ))
+        .collect();
         let exported = pal_headless(home, &kit, &args);
         let expected = if seed.is_some() {
             pal_expected_summary(&kit, 4, 2, 4, 2)
@@ -7453,6 +7997,7 @@ fn build_pal_pass2_kit(
             pixel_modem_extractor::decompile::export_completion_marker(
                 "none",
                 &kit.identity,
+                "none",
                 "none",
             ),
             "the pass-1 marker must bind the PAL identity and no symbol map"
@@ -7591,23 +8136,22 @@ fn pal_apply_symbols(
         args.extend(script_args);
     }
     if with_export {
-        args.extend([
-            "-postScript".to_string(),
-            "ExportDecomp.java".to_string(),
-            kit.out
-                .join("export/02_MAIN")
-                .to_string_lossy()
-                .into_owned(),
-            kit.kit_root.to_string_lossy().into_owned(),
-            "02_MAIN".to_string(),
-            "none".to_string(),
-            "-".to_string(),
-            kit.identity.clone(),
-            kit.manifest_path.to_string_lossy().into_owned(),
-            kit.scatter_path.to_string_lossy().into_owned(),
-            state.map_path.to_string_lossy().into_owned(),
-            state.map_hash.clone(),
-        ]);
+        args.push("-postScript".to_string());
+        args.push("ExportDecomp.java".to_string());
+        args.extend(export_decomp_args(
+            &kit.out.join("export/02_MAIN"),
+            &kit.kit_root,
+            "02_MAIN",
+            "none",
+            "-",
+            &kit.identity,
+            &kit.manifest_path.to_string_lossy(),
+            "none",
+            "-",
+            &kit.scatter_path.to_string_lossy(),
+            &state.map_path.to_string_lossy(),
+            &state.map_hash,
+        ));
     }
     pal_headless(home, kit, &args)
 }
@@ -7619,7 +8163,7 @@ fn pal_export_only(home: &std::path::Path, state: &Pass2Kit, map: Option<(&str, 
         Some((path, hash)) => (path.to_string(), hash.to_string()),
         None => ("-".to_string(), "none".to_string()),
     };
-    let args: Vec<String> = [
+    let mut args: Vec<String> = [
         "-process".to_string(),
         "02_MAIN".to_string(),
         "-noanalysis".to_string(),
@@ -7627,26 +8171,27 @@ fn pal_export_only(home: &std::path::Path, state: &Pass2Kit, map: Option<(&str, 
         kit.out.join("scripts").to_string_lossy().into_owned(),
         "-postScript".to_string(),
         "ExportDecomp.java".to_string(),
-        kit.out
-            .join("export/02_MAIN")
-            .to_string_lossy()
-            .into_owned(),
-        kit.kit_root.to_string_lossy().into_owned(),
-        "02_MAIN".to_string(),
-        "none".to_string(),
-        "-".to_string(),
-        kit.identity.clone(),
-        kit.manifest_path.to_string_lossy().into_owned(),
-        kit.scatter_path.to_string_lossy().into_owned(),
-        map_argument,
-        map_hash,
     ]
     .into();
+    args.extend(export_decomp_args(
+        &kit.out.join("export/02_MAIN"),
+        &kit.kit_root,
+        "02_MAIN",
+        "none",
+        "-",
+        &kit.identity,
+        &kit.manifest_path.to_string_lossy(),
+        "none",
+        "-",
+        &kit.scatter_path.to_string_lossy(),
+        &map_argument,
+        &map_hash,
+    ));
     pal_headless(home, kit, &args)
 }
 
 fn pal_export_pass1_only(home: &std::path::Path, kit: &PalApplyKit) -> String {
-    let args: Vec<String> = [
+    let mut args: Vec<String> = [
         "-process".to_string(),
         "02_MAIN".to_string(),
         "-noanalysis".to_string(),
@@ -7654,21 +8199,22 @@ fn pal_export_pass1_only(home: &std::path::Path, kit: &PalApplyKit) -> String {
         kit.out.join("scripts").to_string_lossy().into_owned(),
         "-postScript".to_string(),
         "ExportDecomp.java".to_string(),
-        kit.out
-            .join("export/02_MAIN")
-            .to_string_lossy()
-            .into_owned(),
-        kit.kit_root.to_string_lossy().into_owned(),
-        "02_MAIN".to_string(),
-        "none".to_string(),
-        "-".to_string(),
-        kit.identity.clone(),
-        kit.manifest_path.to_string_lossy().into_owned(),
-        kit.scatter_path.to_string_lossy().into_owned(),
-        "-".to_string(),
-        "none".to_string(),
     ]
     .into();
+    args.extend(export_decomp_args(
+        &kit.out.join("export/02_MAIN"),
+        &kit.kit_root,
+        "02_MAIN",
+        "none",
+        "-",
+        &kit.identity,
+        &kit.manifest_path.to_string_lossy(),
+        "none",
+        "-",
+        &kit.scatter_path.to_string_lossy(),
+        "-",
+        "none",
+    ));
     pal_headless(home, kit, &args)
 }
 
@@ -8135,7 +8681,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
     // The map itself carries the exact PAL binding and the authorized
     // transition on the registration rename.
     let map_text = std::fs::read_to_string(&state.map_path).unwrap();
-    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v4\""));
+    assert!(map_text.contains("\"format\": \"pixel-modem-extractor-symbol-map-v5\""));
     assert!(map_text.contains(&format!("\"identity\": \"{}\"", state.kit.identity)));
     assert!(map_text.contains("\"from\": \"pal_owned\""));
     assert!(map_text.contains("\"to\": \"pass2_owned\""));
@@ -8171,6 +8717,7 @@ fn apply_symbols_pal_ownership_transitions_are_transactional() {
         pixel_modem_extractor::decompile::export_completion_marker(
             "none",
             &state.kit.identity,
+            "none",
             &state.map_hash
         )
     );
@@ -8724,6 +9271,7 @@ fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
             "none",
             &state.kit.identity,
             "none",
+            "none",
         )
     );
 
@@ -8740,6 +9288,7 @@ fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
         pixel_modem_extractor::decompile::export_completion_marker(
             "none",
             &state.kit.identity,
+            "none",
             &state.map_hash
         )
     );
@@ -8767,7 +9316,7 @@ fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
     // surface and fails.
     let none_identity = {
         let kit = &state.kit;
-        let args: Vec<String> = [
+        let mut args: Vec<String> = [
             "-process".to_string(),
             "02_MAIN".to_string(),
             "-noanalysis".to_string(),
@@ -8775,21 +9324,13 @@ fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
             kit.out.join("scripts").to_string_lossy().into_owned(),
             "-postScript".to_string(),
             "ExportDecomp.java".to_string(),
-            kit.out
-                .join("export/02_MAIN")
-                .to_string_lossy()
-                .into_owned(),
-            kit.kit_root.to_string_lossy().into_owned(),
-            "02_MAIN".to_string(),
-            "none".to_string(),
-            "-".to_string(),
-            "none".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            "none".to_string(),
         ]
         .into();
+        args.extend(export_decomp_none_args(
+            &kit.out.join("export/02_MAIN"),
+            &kit.kit_root,
+            "02_MAIN",
+        ));
         pal_headless(&home, kit, &args)
     };
     assert!(
@@ -8804,6 +9345,7 @@ fn export_pal_postflight_writes_v4_marker_and_rejects_stale_inputs() {
         pixel_modem_extractor::decompile::export_completion_marker(
             "none",
             &state.kit.identity,
+            "none",
             &state.map_hash
         )
     );
@@ -8881,35 +9423,34 @@ fn export_pal_postflight_rejects_program_drift() {
         )
         .unwrap();
         let kit = &state.kit;
-        let failed = pal_headless(
-            &home,
-            kit,
-            &[
-                "-process".to_string(),
-                "02_MAIN".to_string(),
-                "-noanalysis".to_string(),
-                "-scriptPath".to_string(),
-                kit.out.join("scripts").to_string_lossy().into_owned(),
-                "-postScript".to_string(),
-                "SeedCorrupt.java".to_string(),
-                mode.to_string(),
-                "-postScript".to_string(),
-                "ExportDecomp.java".to_string(),
-                kit.out
-                    .join("export/02_MAIN")
-                    .to_string_lossy()
-                    .into_owned(),
-                kit.kit_root.to_string_lossy().into_owned(),
-                "02_MAIN".to_string(),
-                "none".to_string(),
-                "-".to_string(),
-                kit.identity.clone(),
-                kit.manifest_path.to_string_lossy().into_owned(),
-                kit.scatter_path.to_string_lossy().into_owned(),
-                "-".to_string(),
-                "none".to_string(),
-            ],
-        );
+        let mut failed_args: Vec<String> = [
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "SeedCorrupt.java".to_string(),
+            mode.to_string(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+        ]
+        .into();
+        failed_args.extend(export_decomp_args(
+            &kit.out.join("export/02_MAIN"),
+            &kit.kit_root,
+            "02_MAIN",
+            "none",
+            "-",
+            &kit.identity,
+            &kit.manifest_path.to_string_lossy(),
+            "none",
+            "-",
+            &kit.scatter_path.to_string_lossy(),
+            "-",
+            "none",
+        ));
+        let failed = pal_headless(&home, kit, &failed_args);
         assert!(
             failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
             "corruption {case} missed {expected:?}:\n{failed}"
@@ -9035,38 +9576,37 @@ public class SeedExtraFunction extends GhidraScript {
         }
         std::fs::write(&script_path, script).unwrap();
         let kit = &state.kit;
-        let failed = pal_headless(
-            &home,
-            kit,
-            &[
-                "-process".to_string(),
-                "02_MAIN".to_string(),
-                "-noanalysis".to_string(),
-                "-scriptPath".to_string(),
-                kit.out.join("scripts").to_string_lossy().into_owned(),
-                "-preScript".to_string(),
-                "ApplyPalTasks.java".to_string(),
-                kit.kit_root.to_string_lossy().into_owned(),
-                "02_MAIN".to_string(),
-                kit.manifest_path.to_string_lossy().into_owned(),
-                kit.scatter_path.to_string_lossy().into_owned(),
-                "-postScript".to_string(),
-                "ExportDecomp.java".to_string(),
-                kit.out
-                    .join("export/02_MAIN")
-                    .to_string_lossy()
-                    .into_owned(),
-                kit.kit_root.to_string_lossy().into_owned(),
-                "02_MAIN".to_string(),
-                "none".to_string(),
-                "-".to_string(),
-                kit.identity.clone(),
-                kit.manifest_path.to_string_lossy().into_owned(),
-                kit.scatter_path.to_string_lossy().into_owned(),
-                "-".to_string(),
-                "none".to_string(),
-            ],
-        );
+        let mut failed_args: Vec<String> = [
+            "-process".to_string(),
+            "02_MAIN".to_string(),
+            "-noanalysis".to_string(),
+            "-scriptPath".to_string(),
+            kit.out.join("scripts").to_string_lossy().into_owned(),
+            "-preScript".to_string(),
+            "ApplyPalTasks.java".to_string(),
+            kit.kit_root.to_string_lossy().into_owned(),
+            "02_MAIN".to_string(),
+            kit.manifest_path.to_string_lossy().into_owned(),
+            kit.scatter_path.to_string_lossy().into_owned(),
+            "-postScript".to_string(),
+            "ExportDecomp.java".to_string(),
+        ]
+        .into();
+        failed_args.extend(export_decomp_args(
+            &kit.out.join("export/02_MAIN"),
+            &kit.kit_root,
+            "02_MAIN",
+            "none",
+            "-",
+            &kit.identity,
+            &kit.manifest_path.to_string_lossy(),
+            "none",
+            "-",
+            &kit.scatter_path.to_string_lossy(),
+            "-",
+            "none",
+        ));
+        let failed = pal_headless(&home, kit, &failed_args);
         assert!(
             failed.contains("REPORT SCRIPT ERROR") && failed.contains(expected),
             "limit {case} missed {expected:?}:\n{failed}"
@@ -10417,67 +10957,68 @@ fn exception_corrupt_and_export(
     for name in ["functions.json", "disasm.lst", "decompiled.c"] {
         let _ = std::fs::remove_file(export.join(name));
     }
-    exception_headless(
-        home,
-        kit,
-        &[
-            "-process".to_string(),
-            "00_BOOT".to_string(),
-            "-noanalysis".to_string(),
-            "-scriptPath".to_string(),
-            kit.out.join("scripts").to_string_lossy().into_owned(),
-            "-postScript".to_string(),
-            "ExceptionCorruptTerminal.java".to_string(),
-            mode.to_string(),
-            "-postScript".to_string(),
-            "ExportDecomp.java".to_string(),
-            export.to_string_lossy().into_owned(),
-            kit.kit_root.to_string_lossy().into_owned(),
-            "00_BOOT".to_string(),
-            kit.identity.clone(),
-            kit.manifest_path.to_string_lossy().into_owned(),
-            "none".to_string(),
-            "-".to_string(),
-            kit.scatter_path.as_ref().map_or_else(
-                || "-".to_string(),
-                |path| path.to_string_lossy().into_owned(),
-            ),
-            "-".to_string(),
-            "none".to_string(),
-        ],
-    )
+    let mut args: Vec<String> = [
+        "-process".to_string(),
+        "00_BOOT".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ExceptionCorruptTerminal.java".to_string(),
+        mode.to_string(),
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+    ]
+    .into();
+    args.extend(export_decomp_args(
+        &export,
+        &kit.kit_root,
+        "00_BOOT",
+        &kit.identity,
+        &kit.manifest_path.to_string_lossy(),
+        "none",
+        "-",
+        "none",
+        "-",
+        &kit.scatter_path.as_ref().map_or_else(
+            || "-".to_string(),
+            |path| path.to_string_lossy().into_owned(),
+        ),
+        "-",
+        "none",
+    ));
+    exception_headless(home, kit, &args)
 }
 
 fn exception_export_only(home: &std::path::Path, kit: &ExceptionApplyKit) -> std::process::Output {
-    exception_headless(
-        home,
-        kit,
-        &[
-            "-process".to_string(),
-            "00_BOOT".to_string(),
-            "-noanalysis".to_string(),
-            "-scriptPath".to_string(),
-            kit.out.join("scripts").to_string_lossy().into_owned(),
-            "-postScript".to_string(),
-            "ExportDecomp.java".to_string(),
-            kit.out
-                .join("export/00_BOOT")
-                .to_string_lossy()
-                .into_owned(),
-            kit.kit_root.to_string_lossy().into_owned(),
-            "00_BOOT".to_string(),
-            kit.identity.clone(),
-            kit.manifest_path.to_string_lossy().into_owned(),
-            "none".to_string(),
-            "-".to_string(),
-            kit.scatter_path.as_ref().map_or_else(
-                || "-".to_string(),
-                |path| path.to_string_lossy().into_owned(),
-            ),
-            "-".to_string(),
-            "none".to_string(),
-        ],
-    )
+    let mut args: Vec<String> = [
+        "-process".to_string(),
+        "00_BOOT".to_string(),
+        "-noanalysis".to_string(),
+        "-scriptPath".to_string(),
+        kit.out.join("scripts").to_string_lossy().into_owned(),
+        "-postScript".to_string(),
+        "ExportDecomp.java".to_string(),
+    ]
+    .into();
+    args.extend(export_decomp_args(
+        &kit.out.join("export/00_BOOT"),
+        &kit.kit_root,
+        "00_BOOT",
+        &kit.identity,
+        &kit.manifest_path.to_string_lossy(),
+        "none",
+        "-",
+        "none",
+        "-",
+        &kit.scatter_path.as_ref().map_or_else(
+            || "-".to_string(),
+            |path| path.to_string_lossy().into_owned(),
+        ),
+        "-",
+        "none",
+    ));
+    exception_headless(home, kit, &args)
 }
 
 fn assert_exception_pass2_survival(home: &std::path::Path) {
@@ -10719,23 +11260,22 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     let _ = std::fs::remove_dir_all(kit.out.join("export/00_BOOT"));
     let _ = std::fs::remove_file(kit.out.join("export/00_BOOT.complete"));
     let mut args = apply_args();
-    args.extend([
-        "-postScript".to_string(),
-        "ExportDecomp.java".to_string(),
-        kit.out
-            .join("export/00_BOOT")
-            .to_string_lossy()
-            .into_owned(),
-        kit.kit_root.to_string_lossy().into_owned(),
-        "00_BOOT".to_string(),
-        fixture.identity.clone(),
-        kit.manifest_path.to_string_lossy().into_owned(),
-        "none".to_string(),
-        "-".to_string(),
-        scatter.clone(),
-        prepared.path().to_string_lossy().into_owned(),
-        prepared.map_blake3().to_string(),
-    ]);
+    args.push("-postScript".to_string());
+    args.push("ExportDecomp.java".to_string());
+    args.extend(export_decomp_args(
+        &kit.out.join("export/00_BOOT"),
+        &kit.kit_root,
+        "00_BOOT",
+        &fixture.identity,
+        &kit.manifest_path.to_string_lossy(),
+        "none",
+        "-",
+        "none",
+        "-",
+        &scatter,
+        &prepared.path().to_string_lossy(),
+        prepared.map_blake3(),
+    ));
     let pass2 = exception_headless(home, &kit, &args);
     let diagnostics = process_diagnostics(&pass2);
     assert!(
@@ -10749,6 +11289,7 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
         std::fs::read(kit.out.join("export/00_BOOT.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
             &fixture.identity,
+            "none",
             "none",
             prepared.map_blake3(),
         )
@@ -10863,7 +11404,7 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
     );
 
     let export_args = || -> Vec<String> {
-        [
+        let mut args: Vec<String> = [
             "-process".to_string(),
             "00_BOOT".to_string(),
             "-noanalysis".to_string(),
@@ -10871,21 +11412,23 @@ fn assert_exception_pass2_survival(home: &std::path::Path) {
             kit.out.join("scripts").to_string_lossy().into_owned(),
             "-postScript".to_string(),
             "ExportDecomp.java".to_string(),
-            kit.out
-                .join("export/00_BOOT")
-                .to_string_lossy()
-                .into_owned(),
-            kit.kit_root.to_string_lossy().into_owned(),
-            "00_BOOT".to_string(),
-            fixture.identity.clone(),
-            kit.manifest_path.to_string_lossy().into_owned(),
-            "none".to_string(),
-            "-".to_string(),
-            scatter.clone(),
-            prepared.path().to_string_lossy().into_owned(),
-            prepared.map_blake3().to_string(),
         ]
-        .into()
+        .into();
+        args.extend(export_decomp_args(
+            &kit.out.join("export/00_BOOT"),
+            &kit.kit_root,
+            "00_BOOT",
+            &fixture.identity,
+            &kit.manifest_path.to_string_lossy(),
+            "none",
+            "-",
+            "none",
+            "-",
+            &scatter,
+            &prepared.path().to_string_lossy(),
+            prepared.map_blake3(),
+        ));
+        args
     };
 
     // A transitioned registry without the property is partial state, not a
@@ -11665,6 +12208,7 @@ fn pass1_applies_exception_roots_transactionally() {
             &production_identity,
             "none",
             "none",
+            "none",
         )
     );
     let exported: serde_json::Value = serde_json::from_slice(
@@ -11710,6 +12254,7 @@ fn pass1_applies_exception_roots_transactionally() {
         std::fs::read(generated_kit.out.join("export/00_BOOT.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
             &fixture.identity,
+            "none",
             "none",
             "none",
         )
@@ -12973,6 +13518,7 @@ fn assert_exception_production_mode(home: &std::path::Path, mode: &str, no_thumb
         std::fs::read(out.join("export/00_BOOT.complete")).unwrap(),
         pixel_modem_extractor::decompile::export_completion_marker(
             &fixture.identity,
+            "none",
             "none",
             "none",
         ),

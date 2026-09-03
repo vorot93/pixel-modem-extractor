@@ -40,9 +40,11 @@ const APPLY_SCATTER_LOAD_JAVA: &str = include_str!("ghidra/ApplyScatterLoad.java
 const APPLY_THUMB_NAMES_JAVA: &str = include_str!("ghidra/ApplyThumbNames.java");
 const APPLY_PAL_TASKS_JAVA: &str = include_str!("ghidra/ApplyPalTasks.java");
 const APPLY_EXCEPTION_ROOTS_JAVA: &str = include_str!("ghidra/ApplyExceptionRoots.java");
+const APPLY_STARTUP_METADATA_JAVA: &str = include_str!("ghidra/ApplyStartupMetadata.java");
 const PME_SCRIPT_SUPPORT_JAVA: &str = include_str!("ghidra/PmeScriptSupport.java");
 const PAL_TASKS_SUPPORT_JAVA: &str = include_str!("ghidra/PalTasksSupport.java");
 const EXCEPTION_ROOTS_SUPPORT_JAVA: &str = include_str!("ghidra/ExceptionRootsSupport.java");
+const STARTUP_METADATA_SUPPORT_JAVA: &str = include_str!("ghidra/StartupMetadataSupport.java");
 const GLOBALS_APPLY_ERROR_MAX_CHARS: usize = 2_048;
 
 #[cfg(test)]
@@ -58,18 +60,19 @@ fn test_runtime() -> RuntimeImage<'static> {
 /// (`-process`) so the two argument vectors never drift on a rename.
 const GHIDRA_PROJECT_NAME: &str = "pixel-modem";
 const GHIDRA_EXPORT_FILES: [&str; 3] = ["functions.json", "disasm.lst", "decompiled.c"];
-const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v4";
+const GHIDRA_EXPORT_COMPLETION: &str = "pixel-modem-extractor-ghidra-export-v5";
 
-/// Exact v4 completion-marker bytes. Each identity is this run's explicit
+/// Exact v5 completion-marker bytes. Each identity is this run's explicit
 /// present identity or `none`; `symbol_map` is the lowercase pass-2 map BLAKE3
 /// or `none`. Rust-driven and generated runs compare these bytes verbatim.
 pub fn export_completion_marker(
     exception_identity: &str,
     pal_identity: &str,
+    startup_identity: &str,
     symbol_map: &str,
 ) -> Vec<u8> {
     format!(
-        "{GHIDRA_EXPORT_COMPLETION}\nexception_roots={exception_identity}\npal_tasks={pal_identity}\nsymbol_map={symbol_map}\n"
+        "{GHIDRA_EXPORT_COMPLETION}\nexception_roots={exception_identity}\npal_tasks={pal_identity}\nstartup_metadata={startup_identity}\nsymbol_map={symbol_map}\n"
     )
     .into_bytes()
 }
@@ -290,9 +293,10 @@ fn headless_args(
             args.push(format!("{addr:08x}:{len:x}"));
         }
     }
-    // ExportDecomp receives explicit exception/PAL identity-manifest pairs,
-    // the shared scatter dependency, and the pass-1 symbol-map pair. No
-    // script infers currentness from path or project-state existence.
+    // ExportDecomp receives explicit exception/PAL/startup identity-manifest
+    // pairs, the shared scatter dependency, and the pass-1 symbol-map pair.
+    // Pass-1 generated scripts pass none/- for startup. No script infers
+    // currentness from path or project-state existence.
     let (exception_identity, exception_manifest) = match exception_roots {
         Some(plan) => (
             plan.identity.to_string(),
@@ -317,6 +321,8 @@ fn headless_args(
         exception_manifest,
         pal_identity,
         pal_manifest,
+        "none".to_string(),
+        "-".to_string(),
         scatter_argument,
         "-".to_string(),
         "none".to_string(),
@@ -672,6 +678,14 @@ pub struct ImageResult {
     /// applied for this image; a missing, duplicate, or malformed summary
     /// (or a wrong completion marker) rejects the image instead.
     pub pal_applied: Option<AppliedPalTasks>,
+    /// Pass-2 `ApplyStartupMetadata` labeled count. `None` until application
+    /// runs; `Some(0)` is an executed zero.
+    pub startup_apply_labeled: Option<usize>,
+    /// Pass-2 proven no-return applications. Same None-versus-Some(0) rule.
+    pub startup_apply_no_return: Option<usize>,
+    /// Reason-only startup-application failure from a valid error summary or a
+    /// missing, duplicate, malformed, wrong-image, or non-conserving summary.
+    pub startup_apply_error: Option<String>,
 }
 
 /// The parsed `ApplyPalTasks: {json}` current-run summary line.
@@ -1261,6 +1275,102 @@ fn validate_terminal_creation_functions(
     Ok(())
 }
 
+fn publish_kit_startup_metadata(
+    root: &Path,
+    label: &str,
+    raw: &[u8],
+    runtime: &RuntimeImage<'_>,
+    summary: &TerminalInventorySummary,
+    exception_state: &RuntimeExceptionState,
+    scatter_path: Option<&Path>,
+) -> crate::error::Result<()> {
+    let toc_name = crate::manifest::toc_name(label);
+    let export = root.join("export").join(label);
+    let functions_path = export.join("functions.json");
+    let functions_bytes = std::fs::read(&functions_path)?;
+    let functions_blake3 = *blake3::hash(&functions_bytes).as_bytes();
+    let thumb_path = export.join("thumb_functions.json");
+    let thumb_functions_blake3 = if thumb_path.is_file() {
+        Some(*blake3::hash(&std::fs::read(&thumb_path)?).as_bytes())
+    } else {
+        None
+    };
+    let mut inventories = summary.ghidra_records.clone();
+    inventories.extend(summary.thumb_records.iter().cloned());
+    let image_blake3 = *blake3::hash(raw).as_bytes();
+    let scatter_blake3 = scatter_path
+        .map(std::fs::read)
+        .transpose()?
+        .map(|bytes| *blake3::hash(&bytes).as_bytes());
+    let exception_identity = match exception_state {
+        RuntimeExceptionState::Present(map) => Some(map.identity.as_str()),
+        RuntimeExceptionState::Absent | RuntimeExceptionState::Unmanaged => None,
+    };
+    let reset = kit_startup_reset(
+        root,
+        label,
+        toc_name,
+        runtime,
+        exception_state,
+        image_blake3,
+        scatter_blake3,
+    )?;
+    let plan = crate::startup_metadata::discover(runtime, label, toc_name, &inventories, reset)?;
+    let (image_base, image_size) = runtime.image_bounds();
+    let context = crate::startup_metadata::StartupArtifactContext {
+        label,
+        toc_name,
+        image_base,
+        image_size,
+        image_blake3,
+        scatter_blake3,
+        scatter_entries: &[],
+        functions_blake3,
+        thumb_functions_blake3,
+        exception_identity,
+        tool_version: env!("CARGO_PKG_VERSION"),
+    };
+    crate::startup_metadata::materialize(&plan, context, root)?;
+    Ok(())
+}
+
+fn kit_startup_reset(
+    root: &Path,
+    label: &str,
+    toc_name: &str,
+    runtime: &RuntimeImage<'_>,
+    exception_state: &RuntimeExceptionState,
+    image_blake3: [u8; 32],
+    scatter_blake3: Option<[u8; 32]>,
+) -> crate::error::Result<Option<(u32, crate::execution_ranges::DecodeIsa)>> {
+    let RuntimeExceptionState::Present(map) = exception_state else {
+        return Ok(None);
+    };
+    let validated = crate::exception_roots::read(
+        &root.join(&map.relative_path),
+        runtime,
+        crate::exception_roots::ExceptionArtifactContext {
+            label,
+            toc_name,
+            image_blake3,
+            scatter_load_map_blake3: scatter_blake3,
+        },
+    )?;
+    validated
+        .plan
+        .initial_table
+        .slots
+        .iter()
+        .find(|slot| slot.role == crate::exception_roots::ExceptionRole::Reset)
+        .map(|slot| (slot.entry, slot.isa.decode_isa()))
+        .ok_or_else(|| {
+            Error::BadExceptionRoots(format!(
+                "present exception-root manifest for {label} has no reset slot"
+            ))
+        })
+        .map(Some)
+}
+
 pub(crate) fn validate_terminal_inventory_pair_staged(
     ghidra_functions_path: &Path,
     thumb_functions_path: &Path,
@@ -1524,6 +1634,7 @@ impl GhidraExportRun {
         &self,
         exception_identity: &str,
         pal_identity: &str,
+        startup_identity: &str,
         symbol_map: &str,
     ) -> std::result::Result<(), String> {
         for name in GHIDRA_EXPORT_FILES {
@@ -1538,7 +1649,12 @@ impl GhidraExportRun {
         }
         let marker = std::fs::read(&self.completion)
             .map_err(|error| format!("current Ghidra export lacks completion marker: {error}"))?;
-        let expected = export_completion_marker(exception_identity, pal_identity, symbol_map);
+        let expected = export_completion_marker(
+            exception_identity,
+            pal_identity,
+            startup_identity,
+            symbol_map,
+        );
         if marker != expected {
             return Err("current Ghidra export has an invalid completion marker".to_string());
         }
@@ -1929,11 +2045,12 @@ fn write_run_script(
                 shell_arg(&format!("{export_dir}/{name}"))
             ));
         }
-        // The exact four-line v4 marker is constructed from the same current
-        // per-image exception/PAL generation state as the invocation.
+        // The exact five-line v5 marker is constructed from the same current
+        // per-image exception/PAL generation state as the invocation. Pass-1
+        // never applies startup metadata.
         let exception_identity = exception_plan.map(|plan| plan.identity).unwrap_or("none");
         let pal_identity = pal_plan.map(|plan| plan.identity).unwrap_or("none");
-        let marker = export_completion_marker(exception_identity, pal_identity, "none");
+        let marker = export_completion_marker(exception_identity, pal_identity, "none", "none");
         let marker_lines: Vec<String> = String::from_utf8(marker)
             .expect("the completion marker is ASCII")
             .lines()
@@ -2283,14 +2400,14 @@ fn run_report_impl(
     let runtime_analysis = generate_runtime_analysis(&toc, &data, out)?;
 
     // 2. embedded Java scripts -> out/scripts/{ApplyScatterLoad,
-    //    ApplyExceptionRoots,ApplyPalTasks,PmeScriptSupport,
-    //    ExceptionRootsSupport,PalTasksSupport,TameAnalysis,ApplyThumbNames,
-    //    ApplySymbols,ApplyGlobals,ApplyGlobalTypes,ExportDecomp}.java
+    //    ApplyExceptionRoots,ApplyPalTasks,ApplyStartupMetadata,PmeScriptSupport,
+    //    ExceptionRootsSupport,PalTasksSupport,StartupMetadataSupport,TameAnalysis,
+    //    ApplyThumbNames,ApplySymbols,ApplyGlobals,ApplyGlobalTypes,ExportDecomp}.java
     //    (TameAnalysis pre-script tames Ghidra's auto-analysis; ExportDecomp post-script
     //    writes the decompiled C / disasm listing / function inventory; ApplyThumbNames,
-    //    ApplySymbols, ApplyGlobals, and ApplyGlobalTypes are staged for pass-2 application;
-    //    ApplyExceptionRoots and ApplyPalTasks transactionally seed their
-    //    functions before analysis; PmeScriptSupport owns generic script
+    //    ApplySymbols, ApplyStartupMetadata, ApplyGlobals, and ApplyGlobalTypes are staged
+    //    for pass-2 application; ApplyExceptionRoots and ApplyPalTasks transactionally
+    //    seed their functions before analysis; PmeScriptSupport owns generic script
     //    utilities, while each domain support owns its strict schema - no
     //    script may grow a second parser.)
     let scripts = out.join("scripts");
@@ -2312,6 +2429,14 @@ fn run_report_impl(
     std::fs::write(
         scripts.join("ExceptionRootsSupport.java"),
         EXCEPTION_ROOTS_SUPPORT_JAVA,
+    )?;
+    std::fs::write(
+        scripts.join("ApplyStartupMetadata.java"),
+        APPLY_STARTUP_METADATA_JAVA,
+    )?;
+    std::fs::write(
+        scripts.join("StartupMetadataSupport.java"),
+        STARTUP_METADATA_SUPPORT_JAVA,
     )?;
     std::fs::write(scripts.join("TameAnalysis.java"), TAME_ANALYSIS_JAVA)?;
     std::fs::write(scripts.join("ExportDecomp.java"), EXPORT_DECOMP_JAVA)?;
@@ -2473,6 +2598,9 @@ fn run_report_impl(
                     stats.window_min,
                     stats.frac_windows_high
                 );
+                if let Err(error) = crate::startup_metadata::clear_materialized(&root, &label) {
+                    tracing::warn!("startup metadata clear for {label} failed: {error}");
+                }
                 results.push(RunResult {
                     label,
                     outcome: ImageOutcome::SkippedOpaque(stats),
@@ -2746,12 +2874,15 @@ fn run_report_impl(
             let mut terminal_error = None;
             let mut outcome = match status.as_ref() {
                 Some(status) if status.success() => {
-                    // Currentness is explicit and conserving: exact v4 marker,
+                    // Currentness is explicit and conserving: exact v5 marker,
                     // one strict exception summary when present, then the PAL
                     // summary under its independent present-state rule.
-                    if let Err(reason) =
-                        export_attempt.validate_current(&exception_identity, &pal_identity, "none")
-                    {
+                    if let Err(reason) = export_attempt.validate_current(
+                        &exception_identity,
+                        &pal_identity,
+                        "none",
+                        "none",
+                    ) {
                         let reason = crate::error::bounded_reason(&reason);
                         tracing::warn!(
                             "ghidra: {label} current export is not this run's: {reason}"
@@ -2911,6 +3042,35 @@ fn run_report_impl(
             };
             if terminal_inventory.is_some() && matches!(outcome, ImageOutcome::Analyzed(_)) {
                 export_attempt.mark_current();
+                if let Some(summary) = &terminal_inventory {
+                    let scatter_path = runtime_analysis
+                        .scatter_paths
+                        .get(&label)
+                        .map(|path| root.join(path));
+                    match RuntimeImage::from_artifact(
+                        img,
+                        e.load_addr,
+                        &root,
+                        scatter_path.as_deref(),
+                    ) {
+                        Ok(runtime) => {
+                            if let Err(error) = publish_kit_startup_metadata(
+                                &root,
+                                &label,
+                                img,
+                                &runtime,
+                                summary,
+                                &exception_state,
+                                scatter_path.as_deref(),
+                            ) {
+                                tracing::warn!("startup metadata for {label} failed: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("startup metadata runtime for {label} failed: {error}");
+                        }
+                    }
+                }
             }
             if matches!(outcome, ImageOutcome::Analyzed(0)) {
                 tracing::warn!(
@@ -3048,6 +3208,9 @@ fn run_report_impl(
                         .as_deref()
                         .map(crate::error::bounded_reason),
                     pal_applied: r.pal_applied,
+                    startup_apply_labeled: None,
+                    startup_apply_no_return: None,
+                    startup_apply_error: None,
                 }
             })
             .collect();
@@ -3594,9 +3757,9 @@ impl Pass2Input {
 /// `-process` mode on the existing project so there is no re-import and no
 /// re-analysis: `ApplyThumbNames.java` first authenticates and applies the
 /// symbol map's creation section before any other pass-2 mutation; then the
-/// requested `ApplySymbols.java`, `ApplyGlobals.java`, and
-/// `ApplyGlobalTypes.java` scripts run in that order, followed by
-/// `ExportDecomp.java`.
+/// requested `ApplySymbols.java`, `ApplyStartupMetadata.java` when Present,
+/// `ApplyGlobals.java`, and `ApplyGlobalTypes.java` scripts run in that order,
+/// followed by `ExportDecomp.java`.
 ///
 /// `ApplyThumbNames` consumes exactly ten arguments (kit root, image label,
 /// image BLAKE3, exception identity/manifest, scatter manifest, retained
@@ -3604,9 +3767,9 @@ impl Pass2Input {
 /// `ApplySymbols` consumes exactly twelve arguments (kit root, image label,
 /// image BLAKE3, exception identity/manifest, PAL identity, task/scatter
 /// manifests, retained pass-1 functions.json, its BLAKE3, symbol map, its BLAKE3) and
-/// `ExportDecomp` exactly ten (output directory, kit root, image label,
-/// exception identity/manifest, PAL identity/manifest, scatter manifest,
-/// pass-1 symbol map, expected map BLAKE3).
+/// `ExportDecomp` exactly twelve (output directory, kit root, image label,
+/// exception identity/manifest, PAL identity/manifest, startup identity/manifest,
+/// scatter manifest, pass-1 symbol map, expected map BLAKE3).
 fn headless_process_args(
     root: &str,
     label: &str,
@@ -3688,6 +3851,30 @@ fn headless_process_args(
             map.map_blake3().to_string(),
         ]);
     }
+    if input.terminal.startup_identity() != "none" {
+        let Some(map) = function_map else {
+            return Err(Error::DecomposeIncomplete(
+                "present startup metadata requires retained functions.json".into(),
+            ));
+        };
+        let startup_manifest = input.terminal.startup_manifest().ok_or_else(|| {
+            Error::DecomposeIncomplete(
+                "a present pass-2 startup identity requires its manifest".into(),
+            )
+        })?;
+        args.extend([
+            "-postScript".to_string(),
+            "ApplyStartupMetadata.java".to_string(),
+            root.to_string(),
+            label.to_string(),
+            map.image_blake3().to_string(),
+            input.terminal.startup_identity().to_string(),
+            startup_manifest.to_string_lossy().into_owned(),
+            scatter_manifest.clone(),
+            map.functions.path().to_string_lossy().into_owned(),
+            map.functions_blake3().to_string(),
+        ]);
+    }
     if let Some(map) = global_map {
         args.extend([
             "-postScript".to_string(),
@@ -3702,6 +3889,13 @@ fn headless_process_args(
             map.path().to_string_lossy().into_owned(),
         ]);
     }
+    let startup_identity = input.terminal.startup_identity().to_string();
+    let startup_manifest = input
+        .terminal
+        .startup_manifest()
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_string());
     let map_argument = function_map
         .map(|map| map.path().to_string_lossy().into_owned())
         .unwrap_or_else(|| "-".to_string());
@@ -3718,6 +3912,8 @@ fn headless_process_args(
         exception_manifest,
         pal_identity,
         pal_manifest,
+        startup_identity,
+        startup_manifest,
         scatter_manifest,
         map_argument,
         map_hash,
@@ -4214,6 +4410,112 @@ fn parse_apply_global_types_summary(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyStartupMetadataSummary {
+    Ok {
+        labeled: usize,
+        no_return_applied: usize,
+    },
+    Error {
+        reason: String,
+    },
+}
+
+fn apply_startup_count(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<usize, String> {
+    let count = object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            format!("ApplyStartupMetadata summary {field} is not an unsigned integer")
+        })?;
+    usize::try_from(count)
+        .map_err(|_| format!("ApplyStartupMetadata summary {field} does not fit in usize"))
+}
+
+fn parse_apply_startup_metadata_summary(
+    stdout: &str,
+    expected_image: &str,
+) -> std::result::Result<ApplyStartupMetadataSummary, String> {
+    let mut payloads = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ApplyStartupMetadata: "));
+    let payload = payloads
+        .next()
+        .ok_or_else(|| "missing ApplyStartupMetadata summary".to_string())?;
+    if payloads.next().is_some() {
+        return Err("duplicate ApplyStartupMetadata summaries".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| format!("malformed ApplyStartupMetadata summary: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "ApplyStartupMetadata summary is not an object".to_string())?;
+    let image = object
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyStartupMetadata summary image is not a string".to_string())?;
+    if image != expected_image {
+        return Err(format!(
+            "ApplyStartupMetadata summary image {image:?} does not match {expected_image:?}"
+        ));
+    }
+    let status = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "ApplyStartupMetadata summary status is not a string".to_string())?;
+    match status {
+        "ok" => {
+            let candidates = apply_startup_count(object, "candidates")?;
+            let labeled = apply_startup_count(object, "labeled")?;
+            let skipped_existing_label = apply_startup_count(object, "skipped_existing_label")?;
+            let no_return_requested = apply_startup_count(object, "no_return_requested")?;
+            let no_return_applied = apply_startup_count(object, "no_return_applied")?;
+            let no_return_skipped = apply_startup_count(object, "no_return_skipped")?;
+            let labeled_total = labeled
+                .checked_add(skipped_existing_label)
+                .ok_or_else(|| "ApplyStartupMetadata summary counts overflow".to_string())?;
+            if labeled_total != candidates {
+                return Err(format!(
+                    "ApplyStartupMetadata summary does not conserve candidates: {labeled_total} != {candidates}"
+                ));
+            }
+            let no_return_total = no_return_applied
+                .checked_add(no_return_skipped)
+                .ok_or_else(|| "ApplyStartupMetadata summary counts overflow".to_string())?;
+            if no_return_total != no_return_requested {
+                return Err(format!(
+                    "ApplyStartupMetadata summary does not conserve no-return: {no_return_total} != {no_return_requested}"
+                ));
+            }
+            Ok(ApplyStartupMetadataSummary::Ok {
+                labeled,
+                no_return_applied,
+            })
+        }
+        "error" => {
+            let reason = object
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "ApplyStartupMetadata error summary has no string error".to_string()
+                })?;
+            let reason_chars = reason.chars().count();
+            if reason.is_empty() || reason_chars > GLOBALS_APPLY_ERROR_MAX_CHARS {
+                return Err(format!(
+                    "ApplyStartupMetadata error reason length {reason_chars} is outside 1..={GLOBALS_APPLY_ERROR_MAX_CHARS}"
+                ));
+            }
+            Ok(ApplyStartupMetadataSummary::Error {
+                reason: reason.to_string(),
+            })
+        }
+        other => Err(format!("unknown ApplyStartupMetadata status {other:?}")),
+    }
+}
+
 /// Pass 2 of two-pass decompile. Accepts the pass-1 `report` (callers run pass 1
 /// via `run_report` separately and pass its result here — running pass 1 again
 /// would triple Ghidra time on `02_MAIN`). Pass 2 runs only for images whose
@@ -4239,6 +4541,9 @@ fn reset_pass2_runtime_results(image: &mut ImageResult) {
     image.global_types_applied = None;
     image.global_types_apply_skipped = None;
     image.global_types_apply_error = None;
+    image.startup_apply_labeled = None;
+    image.startup_apply_no_return = None;
+    image.startup_apply_error = None;
 }
 
 #[derive(Debug)]
@@ -4357,6 +4662,7 @@ pub fn run_two_pass(
             if let Err(error) = export_attempt.validate_current(
                 &exception_identity,
                 &pal_identity,
+                input.terminal.startup_identity(),
                 &symbol_map_hash,
             ) {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4417,6 +4723,20 @@ pub fn run_two_pass(
                         }
                     },
                     Err(reason) => ir.global_types_apply_error = Some(reason),
+                }
+            }
+            if input.terminal.startup_identity() != "none" {
+                match parse_apply_startup_metadata_summary(&stdout, &ir.label) {
+                    Ok(ApplyStartupMetadataSummary::Ok {
+                        labeled,
+                        no_return_applied,
+                    }) => {
+                        ir.startup_apply_labeled = Some(labeled);
+                        ir.startup_apply_no_return = Some(no_return_applied);
+                    }
+                    Ok(ApplyStartupMetadataSummary::Error { reason }) | Err(reason) => {
+                        ir.startup_apply_error = Some(reason);
+                    }
                 }
             }
             outcomes.insert(ir.label.clone(), Pass2ProcessOutcome::ProcessSucceeded);
@@ -5235,6 +5555,7 @@ set -eu
 export_dir=
 exception_identity=none
 pal_identity=none
+startup_identity=none
 map_hash=none
 state=0
 for arg in "$@"; do
@@ -5250,9 +5571,11 @@ for arg in "$@"; do
     5) state=6 ;;
     6) pal_identity=$arg; state=7 ;;
     7) state=8 ;;
-    8) state=9 ;;
+    8) startup_identity=$arg; state=9 ;;
     9) state=10 ;;
-    10) map_hash=$arg; state=0 ;;
+    10) state=11 ;;
+    11) state=12 ;;
+    12) map_hash=$arg; state=0 ;;
     *) : ;;
   esac
 done
@@ -5265,7 +5588,7 @@ printf '%s
 export_root=$(dirname "$export_dir")
 label=$(basename "$export_dir")
 printf '%s
-' 'pixel-modem-extractor-ghidra-export-v4' "exception_roots=$exception_identity" "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
+' 'pixel-modem-extractor-ghidra-export-v5' "exception_roots=$exception_identity" "pal_tasks=$pal_identity" "startup_metadata=$startup_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
 "#,
         );
     }
@@ -5275,7 +5598,7 @@ printf '%s
     /// canonical kit root exactly, the generated script embeds the same
     /// argv over `$HERE`, the two differ only in root expansion, and the
     /// run consumes the strict `ApplyPalTasks` summary and identity-bound
-    /// v4 marker. Exercised under tighten (default), datamark
+    /// v5 marker. Exercised under tighten (default), datamark
     /// (`--no-thumb-decompile`), and a scatter+PAL MAIN.
     #[cfg(unix)]
     #[test]
@@ -5506,7 +5829,7 @@ printf '%s
         assert!(matches!(image.outcome, ImageOutcome::Analyzed(_)));
         assert_eq!(
             std::fs::read(out.join("export/00_BOOT.complete")).unwrap(),
-            export_completion_marker(&map.identity, "none", "none")
+            export_completion_marker(&map.identity, "none", "none", "none")
         );
         for (name, bytes) in [
             (
@@ -5802,7 +6125,7 @@ printf '%s
         );
         assert_eq!(
             std::fs::read(out.join("export/00_BOOT.complete")).unwrap(),
-            export_completion_marker(&map.identity, "none", "none")
+            export_completion_marker(&map.identity, "none", "none", "none")
         );
     }
 
@@ -5821,6 +6144,7 @@ set -eu
 export_dir=
 exception_identity=none
 pal_identity=none
+startup_identity=none
 map_hash=none
 exception_applied=0
 applied=0
@@ -5840,9 +6164,11 @@ for arg in "$@"; do
     5) state=6 ;;
     6) pal_identity=$arg; state=7 ;;
     7) state=8 ;;
-    8) state=9 ;;
+    8) startup_identity=$arg; state=9 ;;
     9) state=10 ;;
-    10) map_hash=$arg; state=0 ;;
+    10) state=11 ;;
+    11) state=12 ;;
+    12) map_hash=$arg; state=0 ;;
     *) : ;;
   esac
 done
@@ -5862,7 +6188,7 @@ if [ "$applied" = 1 ]; then
   printf 'ApplyPalTasks: {"image":"%s","status":"ok","identity":"%s","tasks":2,"entries":2,"functions_created":2,"functions_existing":0,"names_applied":2,"names_preserved":0,"shared_entries":0}\n' "$label" "$pal_identity"
 fi
 printf '%s
-' 'pixel-modem-extractor-ghidra-export-v4' "exception_roots=$exception_identity" "pal_tasks=$pal_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
+' 'pixel-modem-extractor-ghidra-export-v5' "exception_roots=$exception_identity" "pal_tasks=$pal_identity" "startup_metadata=$startup_identity" "symbol_map=$map_hash" > "$export_root/$label.complete"
 "#,
         );
     }
@@ -6110,19 +6436,24 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
-    fn export_source_contract_reauthenticates_exception_roots_and_emits_v4() {
+    fn export_source_contract_reauthenticates_exception_roots_and_emits_v5() {
         for required in [
             "ExceptionRootsSupport.preflight",
             "ExceptionRootsSupport.validateApplied",
             "ExceptionRootsSupport.validateAbsent",
-            "pixel-modem-extractor-ghidra-export-v4",
+            "pixel-modem-extractor-ghidra-export-v5",
             "exception_roots=",
+            "startup_metadata=",
+            "StartupMetadataSupport.retainForExport",
+            "StartupMetadataSupport.validateApplied",
+            "StartupMetadataSupport.validateAbsent",
         ] {
             assert!(
                 EXPORT_DECOMP_JAVA.contains(required),
                 "ExportDecomp.java must contain {required:?}"
             );
         }
+        assert!(!EXPORT_DECOMP_JAVA.contains("pixel-modem-extractor-ghidra-export-v4"));
         assert!(!EXPORT_DECOMP_JAVA.contains("pixel-modem-extractor-ghidra-export-v3"));
     }
 
@@ -6382,8 +6713,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                     let export = position("ExportDecomp.java").unwrap();
                     assert_eq!(args[export + 4], args[tame + 2]);
                     assert_eq!(args[export + 6], args[tame + 3]);
+                    assert_eq!(args[export + 8], "none");
+                    assert_eq!(args[export + 9], "-");
                     assert_eq!(
-                        args[export + 8],
+                        args[export + 10],
                         scatter.map_or("-", |_| "/out/scatter/02_MAIN/load_map.json")
                     );
                 }
@@ -6696,6 +7029,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             export_completion_marker(
                 "none",
                 "none",
+                "none",
                 input.function_map.as_ref().unwrap().map_blake3(),
             ),
         )
@@ -6789,6 +7123,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         };
         reset_pass2_runtime_results(&mut image);
 
@@ -6995,14 +7332,16 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             "-",
             "none",
             "-",
+            "none",
+            "-",
             "-",
             &map_path,
             symbol_map.map_blake3(),
         ];
         assert_eq!(
-            &args[export_at + 1..=export_at + 10],
+            &args[export_at + 1..=export_at + 12],
             expected_export,
-            "ExportDecomp must consume exactly its ten arguments"
+            "ExportDecomp must consume exactly its twelve arguments"
         );
         let apply_position = apply_at;
         let thumb_position = thumb_at;
@@ -7070,11 +7409,13 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 .position(|arg| arg == "ExportDecomp.java")
                 .unwrap();
             assert_eq!(
-                &args[export_at + 1..=export_at + 10],
+                &args[export_at + 1..=export_at + 12],
                 [
                     "/out/export/00_BOOT",
                     "/out",
                     "00_BOOT",
+                    "none",
+                    "-",
                     "none",
                     "-",
                     "none",
@@ -7101,36 +7442,22 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             .iter()
             .position(|arg| arg == "ExportDecomp.java")
             .unwrap();
-        assert_eq!(args[export_at + 8], "/out/scatter/02_MAIN/load_map.json");
+        assert_eq!(args[export_at + 8], "none");
+        assert_eq!(args[export_at + 9], "-");
+        assert_eq!(args[export_at + 10], "/out/scatter/02_MAIN/load_map.json");
     }
 
     #[test]
-    fn completion_marker_v4_binds_exception_pal_and_symbol_map() {
+    fn export_marker_is_v5_and_includes_startup_none_on_pass1() {
+        let marker =
+            String::from_utf8(export_completion_marker("none", "none", "none", "none")).unwrap();
         assert_eq!(
-            export_completion_marker("none", "none", "none"),
-            b"pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks=none\nsymbol_map=none\n",
-        );
-        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:6";
-        assert_eq!(
-            export_completion_marker("none", identity, "none"),
-            format!(
-                "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks={identity}\nsymbol_map=none\n"
-            )
-            .as_bytes(),
-        );
-        let hash = "b".repeat(64);
-        assert_eq!(
-            export_completion_marker("none", identity, &hash),
-            format!(
-                "pixel-modem-extractor-ghidra-export-v4\nexception_roots=none\npal_tasks={identity}\nsymbol_map={hash}\n"
-            )
-            .as_bytes(),
+            marker,
+            "pixel-modem-extractor-ghidra-export-v5\nexception_roots=none\npal_tasks=none\nstartup_metadata=none\nsymbol_map=none\n"
         );
 
-        // The generated turnkey script constructs the same expected bytes for
-        // its PAL-none single-pass invocations.
         let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0u8; 4])]);
-        let dir = std::env::temp_dir().join(format!("pme_marker_v4_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pme_marker_v5_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let modem = dir.join("modem.bin");
@@ -7140,9 +7467,50 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
         assert!(
             script.contains(
-                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v4' 'exception_roots=none' 'pal_tasks=none' 'symbol_map=none'"
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v5' 'exception_roots=none' 'pal_tasks=none' 'startup_metadata=none' 'symbol_map=none'"
             ),
-            "run_ghidra.sh must compare the exact v4 marker:\n{script}"
+            "pass-1 run_ghidra.sh must compare the exact v5 marker with startup none:\n{script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_marker_v5_binds_exception_pal_startup_and_symbol_map() {
+        assert_eq!(
+            export_completion_marker("none", "none", "none", "none"),
+            b"pixel-modem-extractor-ghidra-export-v5\nexception_roots=none\npal_tasks=none\nstartup_metadata=none\nsymbol_map=none\n",
+        );
+        let identity = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:6";
+        assert_eq!(
+            export_completion_marker("none", identity, "none", "none"),
+            format!(
+                "pixel-modem-extractor-ghidra-export-v5\nexception_roots=none\npal_tasks={identity}\nstartup_metadata=none\nsymbol_map=none\n"
+            )
+            .as_bytes(),
+        );
+        let hash = "b".repeat(64);
+        assert_eq!(
+            export_completion_marker("none", identity, "none", &hash),
+            format!(
+                "pixel-modem-extractor-ghidra-export-v5\nexception_roots=none\npal_tasks={identity}\nstartup_metadata=none\nsymbol_map={hash}\n"
+            )
+            .as_bytes(),
+        );
+
+        let buf = craft_modem_bin(&[("BOOT", 0x0, 1, &[0u8; 4])]);
+        let dir = std::env::temp_dir().join(format!("pme_marker_v5_pal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem = dir.join("modem.bin");
+        std::fs::write(&modem, &buf).unwrap();
+        let out = dir.join("out");
+        run(&modem, &generation_opts(None), &out).unwrap();
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(
+            script.contains(
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v5' 'exception_roots=none' 'pal_tasks=none' 'startup_metadata=none' 'symbol_map=none'"
+            ),
+            "run_ghidra.sh must compare the exact v5 marker:\n{script}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7150,8 +7518,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     #[test]
     fn export_completion_marker_binds_exception_roots() {
         assert_eq!(
-            export_completion_marker("v1:roots", "v1:pal", "maphash"),
-            b"pixel-modem-extractor-ghidra-export-v4\nexception_roots=v1:roots\npal_tasks=v1:pal\nsymbol_map=maphash\n"
+            export_completion_marker("v1:roots", "v1:pal", "none", "maphash"),
+            b"pixel-modem-extractor-ghidra-export-v5\nexception_roots=v1:roots\npal_tasks=v1:pal\nstartup_metadata=none\nsymbol_map=maphash\n"
         );
     }
 
@@ -7169,19 +7537,34 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         // A stale PAL identity under a marker that binds a map hash.
         std::fs::write(
             &run.completion,
-            export_completion_marker("none", identity, &hash),
+            export_completion_marker("none", identity, "none", &hash),
         )
         .unwrap();
-        assert!(run.validate_current("none", identity, &hash).is_ok());
-        assert!(run.validate_current("v1:stale", identity, &hash).is_err());
-        assert!(run.validate_current("none", "none", &hash).is_err());
-        assert!(run.validate_current("none", identity, "none").is_err());
+        assert!(
+            run.validate_current("none", identity, "none", &hash)
+                .is_ok()
+        );
+        assert!(
+            run.validate_current("v1:stale", identity, "none", &hash)
+                .is_err()
+        );
+        assert!(run.validate_current("none", "none", "none", &hash).is_err());
+        assert!(
+            run.validate_current("none", identity, "none", "none")
+                .is_err()
+        );
         // A truncated or extended marker never normalizes through.
-        let exact = export_completion_marker("none", "none", "none");
+        let exact = export_completion_marker("none", "none", "none", "none");
         std::fs::write(&run.completion, &exact[..exact.len() - 1]).unwrap();
-        assert!(run.validate_current("none", "none", "none").is_err());
+        assert!(
+            run.validate_current("none", "none", "none", "none")
+                .is_err()
+        );
         std::fs::write(&run.completion, [exact.as_slice(), b"trailing\n"].concat()).unwrap();
-        assert!(run.validate_current("none", "none", "none").is_err());
+        assert!(
+            run.validate_current("none", "none", "none", "none")
+                .is_err()
+        );
     }
 
     #[test]
@@ -7244,6 +7627,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 "-".to_string(),
                 "none".to_string(),
                 "-".to_string(),
+                "none".to_string(),
+                "-".to_string(),
                 "-".to_string(),
                 "-".to_string(),
                 "none".to_string(),
@@ -7259,6 +7644,274 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             headless_process_args(root.to_str().unwrap(), "02_MAIN", &input)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    fn pass2_input_with_present_startup() -> (tempfile::TempDir, PathBuf, Pass2Input) {
+        use crate::arm32::SystemDirection;
+        use crate::execution_ranges::FunctionOwner;
+        use crate::startup_metadata::{
+            HardwareInit, PrivilegedClass, PrivilegedOp, Section, StackGuard, StartupApplication,
+            StartupArtifactContext, StartupPlan, StartupRole, materialize_image, read_bytes,
+        };
+        use crate::symbolicate::role_evidence::{
+            ArtifactState, CurrentSymbolicationContext, RuntimeBinding,
+        };
+        use crate::terminal_pass2::{SnapshotBuildRequest, TerminalPass2Snapshot};
+
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("images/02_MAIN");
+        let kit = root.path().join("ghidra");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::create_dir(&kit).unwrap();
+        let raw = [0x11u8; 64];
+        std::fs::write(image.join("02_MAIN.bin"), raw).unwrap();
+        let image_blake3 = *blake3::hash(&raw).as_bytes();
+        let image_size = u32::try_from(raw.len()).unwrap();
+        let plan = StartupPlan {
+            image_label: "02_MAIN".to_owned(),
+            toc_name: "MAIN".to_owned(),
+            image_base: 0x4001_0000,
+            image_size,
+            hardware_init: Section::Present(HardwareInit {
+                entry: 0x4001_0010,
+                isa: DecodeIsa::Arm,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: [0x21; 32],
+            }),
+            stack_guard: Section::Present(StackGuard {
+                entry: 0x4001_0020,
+                isa: DecodeIsa::Arm,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: [0x22; 32],
+                non_return: true,
+            }),
+            compiler: Section::Absent,
+            privileged_ops: vec![PrivilegedOp {
+                pc: 0x4001_0000,
+                isa: DecodeIsa::Arm,
+                entry: 0x4001_0000,
+                owner: FunctionOwner::Ghidra,
+                execution_blake3: [0x24; 32],
+                direction: SystemDirection::Write,
+                class: PrivilegedClass::Vbar,
+                coprocessor: Some(15),
+                opcode1: Some(0),
+                crn: Some(12),
+                crm: Some(0),
+                opcode2: Some(0),
+            }],
+            applications: vec![
+                StartupApplication {
+                    role: StartupRole::HardwareInit,
+                    entry: 0x4001_0010,
+                    isa: DecodeIsa::Arm,
+                    desired_primary: StartupRole::HardwareInit.desired_primary(),
+                    role_label: StartupRole::HardwareInit.role_label(),
+                    set_no_return: false,
+                },
+                StartupApplication {
+                    role: StartupRole::StackGuard,
+                    entry: 0x4001_0020,
+                    isa: DecodeIsa::Arm,
+                    desired_primary: StartupRole::StackGuard.desired_primary(),
+                    role_label: StartupRole::StackGuard.role_label(),
+                    set_no_return: true,
+                },
+            ],
+        };
+        let context = StartupArtifactContext {
+            label: "02_MAIN",
+            toc_name: "MAIN",
+            image_base: 0x4001_0000,
+            image_size,
+            image_blake3,
+            scatter_blake3: None,
+            scatter_entries: &[],
+            functions_blake3: [0x31; 32],
+            thumb_functions_blake3: None,
+            exception_identity: None,
+            tool_version: env!("CARGO_PKG_VERSION"),
+        };
+        let materialized = materialize_image(&plan, context, &image).unwrap();
+        let bytes = std::fs::read(image.join(&materialized.relative_path)).unwrap();
+        let runtime =
+            crate::runtime_image::RuntimeImage::from_plan(&raw, 0x4001_0000, None).unwrap();
+        let validated = read_bytes(&bytes, &runtime, context).unwrap();
+        let symbolication = std::sync::Arc::new(
+            CurrentSymbolicationContext::new(
+                RuntimeBinding::new(
+                    "02_MAIN",
+                    "MAIN",
+                    0x4001_0000,
+                    image_blake3,
+                    ArtifactState::Absent,
+                ),
+                ArtifactState::Absent,
+                ArtifactState::Absent,
+                ArtifactState::Present(validated),
+            )
+            .unwrap(),
+        );
+        let snapshot = TerminalPass2Snapshot::build(SnapshotBuildRequest {
+            image_dir: &image,
+            kit_root: &kit,
+            image_label: "02_MAIN",
+            toc_name: "MAIN",
+            image_base: 0x4001_0000,
+            scatter: RuntimeScatterState::Absent,
+            exception: &RuntimeExceptionState::Absent,
+            exception_applied: None,
+            pal: &RuntimeTaskState::Absent,
+            pal_applied: None,
+            symbolication,
+        })
+        .unwrap();
+        let map_dir = PathBuf::from("target").join("pme_task13_pass2_startup");
+        std::fs::create_dir_all(&map_dir).unwrap();
+        let map_path = map_dir.join("map.json");
+        let functions_path = map_dir.join("functions.json");
+        let image_path = map_dir.join("image.bin");
+        std::fs::write(&map_path, b"startup map bytes").unwrap();
+        std::fs::write(&functions_path, b"startup functions bytes").unwrap();
+        std::fs::write(&image_path, raw).unwrap();
+        let function_map = PreparedSymbolPass2Map::new(
+            &map_path,
+            &functions_path,
+            &image_path,
+            "02_MAIN",
+            3,
+            3,
+            Vec::new(),
+        )
+        .unwrap();
+        let input = Pass2Input::new(std::sync::Arc::new(snapshot))
+            .with_function_map(function_map)
+            .unwrap();
+        (root, kit, input)
+    }
+
+    #[test]
+    fn headless_process_args_runs_startup_after_symbols_when_present() {
+        let (_temp, kit, input) = pass2_input_with_present_startup();
+        let kit_str = kit.to_string_lossy().into_owned();
+        let args = headless_process_args(&kit_str, "02_MAIN", &input)
+            .unwrap()
+            .expect("present startup with a function map must invoke pass two");
+        let symbols_at = args
+            .iter()
+            .position(|arg| arg == "ApplySymbols.java")
+            .expect("ApplySymbols must run");
+        let startup_at = args
+            .iter()
+            .position(|arg| arg == "ApplyStartupMetadata.java")
+            .expect("ApplyStartupMetadata must run after ApplySymbols when Present");
+        let globals_at = args.iter().position(|arg| arg == "ApplyGlobals.java");
+        let export_at = args
+            .iter()
+            .position(|arg| arg == "ExportDecomp.java")
+            .unwrap();
+        assert!(symbols_at < startup_at);
+        assert!(
+            globals_at.is_none_or(|globals| startup_at < globals),
+            "ApplyStartupMetadata must precede ApplyGlobals"
+        );
+        assert!(startup_at < export_at);
+        assert_eq!(args[startup_at - 1], "-postScript");
+        let function_map = input.function_map.as_ref().unwrap();
+        let startup_manifest = input
+            .terminal
+            .startup_manifest()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let expected = [
+            kit_str.as_str(),
+            "02_MAIN",
+            function_map.image_blake3(),
+            input.terminal.startup_identity(),
+            startup_manifest.as_str(),
+            "-",
+            function_map.functions.path().to_str().unwrap(),
+            function_map.functions_blake3(),
+        ];
+        assert_eq!(
+            &args[startup_at + 1..=startup_at + 8],
+            expected,
+            "ApplyStartupMetadata must consume kit-root, label, image-blake3, startup-identity, startup-manifest, scatter-map-or-dash, functions-json, functions-blake3"
+        );
+        assert_eq!(args[startup_at + 9], "-postScript");
+        assert_eq!(
+            args[export_at + 1..=export_at + 12].len(),
+            12,
+            "ExportDecomp must consume twelve arguments including the startup pair"
+        );
+    }
+
+    #[test]
+    fn pass2_argv_order_is_thumb_symbols_startup_globals_types_export() {
+        let (_temp, kit, mut input) = pass2_input_with_present_startup();
+        input.set_global_map(pass2_test_map("startup_order_globals.json", 1).unwrap());
+        input.set_global_types_map(pass2_test_map("startup_order_types.json", 1).unwrap());
+        let kit_str = kit.to_string_lossy().into_owned();
+        let args = headless_process_args(&kit_str, "02_MAIN", &input)
+            .unwrap()
+            .expect("present startup plus maps must invoke pass two");
+        let position = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .unwrap_or_else(|| panic!("{name} missing from pass-2 argv"))
+        };
+        let thumb = position("ApplyThumbNames.java");
+        let symbols = position("ApplySymbols.java");
+        let startup = position("ApplyStartupMetadata.java");
+        let globals = position("ApplyGlobals.java");
+        let types = position("ApplyGlobalTypes.java");
+        let export = position("ExportDecomp.java");
+        assert!(
+            thumb < symbols
+                && symbols < startup
+                && startup < globals
+                && globals < types
+                && types < export,
+            "order must be ApplyThumbNames -> ApplySymbols -> ApplyStartupMetadata -> ApplyGlobals -> ApplyGlobalTypes -> ExportDecomp"
+        );
+        let startup_identity = input.terminal.startup_identity().to_string();
+        let startup_manifest = input
+            .terminal
+            .startup_manifest()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let map_path = input
+            .function_map
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_string_lossy()
+            .into_owned();
+        let map_hash = input
+            .function_map
+            .as_ref()
+            .unwrap()
+            .map_blake3()
+            .to_string();
+        assert_eq!(
+            &args[export + 1..=export + 12],
+            [
+                format!("{kit_str}/export/02_MAIN"),
+                kit_str.clone(),
+                "02_MAIN".to_string(),
+                "none".to_string(),
+                "-".to_string(),
+                "none".to_string(),
+                "-".to_string(),
+                startup_identity,
+                startup_manifest,
+                "-".to_string(),
+                map_path,
+                map_hash,
+            ]
         );
     }
 
@@ -7665,6 +8318,97 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         assert!(
             parse_apply_globals_summary(&ok_globals_summary(6, 1, 1, 1, 1, 1), "02_MAIN").is_err()
         );
+    }
+
+    fn ok_startup_summary(
+        candidates: usize,
+        labeled: usize,
+        skipped: usize,
+        requested: usize,
+        applied: usize,
+        no_return_skipped: usize,
+    ) -> String {
+        format!(
+            "ApplyStartupMetadata: {{\"image\":\"02_MAIN\",\"status\":\"ok\",\
+             \"identity\":\"v1:ab\",\"candidates\":{candidates},\"labeled\":{labeled},\
+             \"skipped_existing_label\":{skipped},\"no_return_requested\":{requested},\
+             \"no_return_applied\":{applied},\"no_return_skipped\":{no_return_skipped}}}"
+        )
+    }
+
+    #[test]
+    fn parse_apply_startup_metadata_summary_accepts_conserving_counts() {
+        let summary =
+            parse_apply_startup_metadata_summary(&ok_startup_summary(2, 1, 1, 1, 1, 0), "02_MAIN")
+                .unwrap();
+        assert_eq!(
+            summary,
+            ApplyStartupMetadataSummary::Ok {
+                labeled: 1,
+                no_return_applied: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_apply_startup_metadata_summary_rejects_missing_duplicate_malformed_and_non_conserving()
+    {
+        assert!(parse_apply_startup_metadata_summary("ordinary Ghidra output", "02_MAIN").is_err());
+        let valid = ok_startup_summary(0, 0, 0, 0, 0, 0);
+        assert!(
+            parse_apply_startup_metadata_summary(&format!("{valid}\n{valid}"), "02_MAIN").is_err()
+        );
+        assert!(
+            parse_apply_startup_metadata_summary("ApplyStartupMetadata: {", "02_MAIN").is_err()
+        );
+        assert!(
+            parse_apply_startup_metadata_summary(&ok_startup_summary(1, 0, 0, 0, 0, 0), "02_MAIN")
+                .is_err()
+        );
+        assert!(
+            parse_apply_startup_metadata_summary(&ok_startup_summary(0, 0, 0, 1, 0, 0), "02_MAIN")
+                .is_err()
+        );
+        assert!(
+            parse_apply_startup_metadata_summary(&ok_startup_summary(0, 0, 0, 0, 0, 0), "04_VSS")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_apply_startup_metadata_summary_accepts_only_bounded_error_reason() {
+        let summary = parse_apply_startup_metadata_summary(
+            "ApplyStartupMetadata: {\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"bad map\"}",
+            "02_MAIN",
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            ApplyStartupMetadataSummary::Error {
+                reason: "bad map".to_string()
+            }
+        );
+        let max_reason = "x".repeat(2_048);
+        let at_limit = format!(
+            "ApplyStartupMetadata: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{max_reason}\"}}"
+        );
+        assert!(parse_apply_startup_metadata_summary(&at_limit, "02_MAIN").is_ok());
+        let over_limit = format!(
+            "ApplyStartupMetadata: {{\"image\":\"02_MAIN\",\"status\":\"error\",\"error\":\"{}\"}}",
+            "x".repeat(2_049)
+        );
+        assert!(parse_apply_startup_metadata_summary(&over_limit, "02_MAIN").is_err());
+    }
+
+    #[test]
+    fn apply_symbols_accepts_absent_startup_ownership_and_preserves_labels_on_retry() {
+        assert!(
+            APPLY_SYMBOLS_JAVA.contains(
+                "a startup-owned primary may not be replaced by a token or string-ref name"
+            )
+        );
+        assert!(APPLY_SYMBOLS_JAVA.contains("a startup role label was not preserved"));
+        assert!(APPLY_SYMBOLS_JAVA.contains("StartupMetadataSupport.currentRegistry"));
     }
 
     #[test]
@@ -9173,10 +9917,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         );
         assert!(
             script.contains(&format!(
-                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v4' 'exception_roots=none' 'pal_tasks={}' 'symbol_map=none'",
+                "printf '%s\\n' 'pixel-modem-extractor-ghidra-export-v5' 'exception_roots=none' 'pal_tasks={}' 'startup_metadata=none' 'symbol_map=none'",
                 map.identity
             )),
-            "run_ghidra.sh must compare the exact present-PAL v4 marker:\n{script}"
+            "run_ghidra.sh must compare the exact present-PAL v5 marker:\n{script}"
         );
 
         // Malformed: an ambiguous MAIN is the typed BadPalTasks error and
@@ -9702,6 +10446,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 exception_roots_applied: None,
                 exception_error: None,
                 pal_applied: None,
+                startup_apply_labeled: None,
+                startup_apply_no_return: None,
+                startup_apply_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
@@ -9768,6 +10515,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 exception_roots_applied: None,
                 exception_error: exception_error.map(str::to_string),
                 pal_applied: None,
+                startup_apply_labeled: None,
+                startup_apply_no_return: None,
+                startup_apply_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
@@ -10271,6 +11021,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 exception_roots_applied: None,
                 exception_error: None,
                 pal_applied: None,
+                startup_apply_labeled: None,
+                startup_apply_no_return: None,
+                startup_apply_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
@@ -10326,6 +11079,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 exception_roots_applied: None,
                 exception_error: None,
                 pal_applied: None,
+                startup_apply_labeled: None,
+                startup_apply_no_return: None,
+                startup_apply_error: None,
             }],
             spec_path: PathBuf::from("ghidra_load.json"),
             current_exports: BTreeSet::new(),
@@ -10382,6 +11138,9 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             exception_roots_applied: None,
             exception_error: None,
             pal_applied: None,
+            startup_apply_labeled: None,
+            startup_apply_no_return: None,
+            startup_apply_error: None,
         };
         assert_eq!(r.globals_provisional, Some(42));
         assert_eq!(r.globals_provisional_suppressed, Some(7));
@@ -10616,6 +11375,101 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
     }
 
     #[test]
+    fn kit_writes_apply_startup_metadata_script() {
+        let buf = craft_modem_bin(&[("MAIN", 0x4001_0000, 3, &[0u8; 8])]);
+        let dir = std::env::temp_dir().join(format!("pme_startup_scripts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let modem = dir.join("modem.bin");
+        std::fs::write(&modem, &buf).unwrap();
+        let out = dir.join("out");
+        run(&modem, &generation_opts(None), &out).unwrap();
+
+        let apply = std::fs::read_to_string(out.join("scripts/ApplyStartupMetadata.java"))
+            .expect("generated kits must stage ApplyStartupMetadata.java");
+        let support = std::fs::read_to_string(out.join("scripts/StartupMetadataSupport.java"))
+            .expect("generated kits must stage StartupMetadataSupport.java");
+        assert_eq!(
+            apply.as_bytes(),
+            APPLY_STARTUP_METADATA_JAVA.as_bytes(),
+            "generated kits must stage the exact ApplyStartupMetadata source"
+        );
+        assert_eq!(
+            support.as_bytes(),
+            STARTUP_METADATA_SUPPORT_JAVA.as_bytes(),
+            "generated kits must stage the exact StartupMetadataSupport source"
+        );
+
+        for required in [
+            "ApplyStartupMetadata:",
+            "skipped_existing_label",
+            "no_return_requested",
+            "no_return_applied",
+            "no_return_skipped",
+            "setNoReturn(true)",
+            "System.out.println",
+            r#"status\":\"error\""#,
+        ] {
+            assert!(
+                apply.contains(required),
+                "ApplyStartupMetadata.java must contain {required:?}"
+            );
+        }
+        assert!(
+            !apply.contains("startTransaction") && !apply.contains("currentProgram.start("),
+            "ApplyStartupMetadata must not open a nested transaction"
+        );
+        assert!(
+            !apply.contains("setNoReturn(false)"),
+            "ApplyStartupMetadata must not clear no-return on unrelated functions"
+        );
+        assert!(
+            apply.contains("println("),
+            "ApplyStartupMetadata must dual-emit the summary through println"
+        );
+        let apply_all = apply
+            .split("private void applyAll")
+            .nth(1)
+            .expect("ApplyStartupMetadata must define applyAll");
+        let namespace_at = apply_all
+            .find("ensureNamespace();")
+            .expect("empty-application Present must create the reserved namespace");
+        let loop_at = apply_all
+            .find("for (StartupMetadataSupport.Application")
+            .expect("applyAll must iterate applications");
+        assert!(
+            namespace_at < loop_at,
+            "empty-application Present must create the namespace before the apply loop"
+        );
+
+        for required in [
+            "pixel-modem-extractor-startup-metadata-v1",
+            "PixelModemExtractor_StartupMetadata_v1",
+            "PixelModemExtractor.StartupMetadata.v1.Ownership",
+            "PmeScriptSupport.canonicalJsonBytes",
+            "PmeScriptSupport.openCanonicalContainedFile",
+            "set_no_return",
+            "hardware_init",
+            "stack_protection_failure",
+        ] {
+            assert!(
+                support.contains(required),
+                "StartupMetadataSupport.java must contain {required:?}"
+            );
+        }
+        assert!(
+            support.contains("function.getBody().contains(span)"),
+            "keep body-contains-instruction as per-application integrity"
+        );
+        assert!(
+            !support.contains("spans.add(body)")
+                && !support.contains("prior.intersects(function.getBody())"),
+            "preflight must collide only derived instruction ranges"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn generated_kit_stages_pal_support() {
         // The Rust-side Ghidra leaf limit and the Java-side runtime
         // assertion must pin the same 2000-character ceiling.
@@ -10639,6 +11493,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             no_skip_opaque: false,
         };
         run(&modem, &opts, &out).unwrap();
+        let script = std::fs::read_to_string(out.join("run_ghidra.sh")).unwrap();
+        assert!(
+            !script.contains("ApplyStartupMetadata"),
+            "generated run_ghidra.sh must not call ApplyStartupMetadata:\n{script}"
+        );
+        assert!(
+            !out.join("startup_metadata").exists(),
+            "generation-only decompile skips 3B kit publication"
+        );
 
         let staged_path = out.join("scripts").join("PalTasksSupport.java");
         let staged = std::fs::read(&staged_path).unwrap_or_default();
@@ -10661,7 +11524,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let source = PAL_TASKS_SUPPORT_JAVA;
         for owned in [
             "pixel-modem-extractor-pal-tasks-v1",
-            "pixel-modem-extractor-symbol-map-v4",
+            "pixel-modem-extractor-symbol-map-v5",
             "PixelModemExtractor_PalTasks_v1",
             "PixelModemExtractor.PalTasks.v1.Ownership",
             "PixelModemExtractor.ThumbNames.v1.Ownership",
@@ -10699,6 +11562,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 out.join("scripts/ApplyGlobals.java").to_string_lossy(),
                 out.join("scripts/ApplyPalTasks.java").to_string_lossy(),
                 out.join("scripts/ApplyScatterLoad.java").to_string_lossy(),
+                out.join("scripts/ApplyStartupMetadata.java")
+                    .to_string_lossy(),
                 out.join("scripts/ApplySymbols.java").to_string_lossy(),
                 out.join("scripts/ApplyThumbNames.java").to_string_lossy(),
                 out.join("scripts/ExceptionRootsSupport.java")
@@ -10706,6 +11571,8 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 out.join("scripts/ExportDecomp.java").to_string_lossy(),
                 out.join("scripts/PalTasksSupport.java").to_string_lossy(),
                 out.join("scripts/PmeScriptSupport.java").to_string_lossy(),
+                out.join("scripts/StartupMetadataSupport.java")
+                    .to_string_lossy(),
                 out.join("scripts/TameAnalysis.java").to_string_lossy(),
             ]
         );
@@ -10739,6 +11606,85 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn present_exception_read_failure_does_not_invent_absent_reset() {
+        let root =
+            std::env::temp_dir().join(format!("pme_kit_startup_reset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = vec![0u8; 0x40];
+        let runtime = RuntimeImage::from_plan(&raw, 0x4000, None).unwrap();
+        let image_blake3 = *blake3::hash(&raw).as_bytes();
+        let present = RuntimeExceptionState::Present(MaterializedExceptionRoots {
+            relative_path: "exception_roots/02_MAIN/roots.json".into(),
+            blake3: "00".repeat(32),
+            identity: format!("v1:{}:1:8", "00".repeat(32)),
+            tables: 1,
+            roots: 8,
+        });
+
+        assert!(
+            kit_startup_reset(
+                &root,
+                "02_MAIN",
+                "MAIN",
+                &runtime,
+                &RuntimeExceptionState::Unmanaged,
+                image_blake3,
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            kit_startup_reset(
+                &root,
+                "02_MAIN",
+                "MAIN",
+                &runtime,
+                &RuntimeExceptionState::Absent,
+                image_blake3,
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        kit_startup_reset(
+            &root,
+            "02_MAIN",
+            "MAIN",
+            &runtime,
+            &present,
+            image_blake3,
+            None,
+        )
+        .expect_err("Present exception with an unreadable manifest must not become Absent reset");
+
+        std::fs::create_dir_all(root.join("export/02_MAIN")).unwrap();
+        std::fs::write(root.join("export/02_MAIN/functions.json"), b"[]").unwrap();
+        let summary = TerminalInventorySummary {
+            ghidra: ExecutionInventoryCounts {
+                raw: 0,
+                accepted: 0,
+                quarantined: 0,
+            },
+            thumb: None,
+            thumb_substantial: None,
+            thumb_metadata: None,
+            accepted_identities: Vec::new(),
+            ghidra_records: Vec::new(),
+            thumb_records: Vec::new(),
+        };
+        publish_kit_startup_metadata(&root, "02_MAIN", &raw, &runtime, &summary, &present, None)
+            .expect_err("publish must not commit after a Present exception re-read failure");
+        assert!(
+            !root.join("startup_metadata").exists(),
+            "failed Present exception re-read must not publish a startup kit artifact"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -11005,7 +11951,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         }
         std::fs::write(
             &run.completion,
-            export_completion_marker("none", "none", "none"),
+            export_completion_marker("none", "none", "none", "none"),
         )
         .unwrap();
 
@@ -11015,37 +11961,52 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         for name in GHIDRA_EXPORT_FILES {
             assert!(!run.directory.join(name).exists());
         }
-        assert!(run.validate_current("none", "none", "none").is_err());
+        assert!(
+            run.validate_current("none", "none", "none", "none")
+                .is_err()
+        );
 
         for name in GHIDRA_EXPORT_FILES {
             std::fs::write(run.directory.join(name), b"current\n").unwrap();
         }
         std::fs::write(&run.completion, b"wrong generation\n").unwrap();
-        assert!(run.validate_current("none", "none", "none").is_err());
+        assert!(
+            run.validate_current("none", "none", "none", "none")
+                .is_err()
+        );
         // A complete old v3 marker is stale, not normalized.
         std::fs::write(
             &run.completion,
             b"pixel-modem-extractor-ghidra-export-v3\npal_tasks=none\nsymbol_map=none\n",
         )
         .unwrap();
-        assert!(run.validate_current("none", "none", "none").is_err());
+        assert!(
+            run.validate_current("none", "none", "none", "none")
+                .is_err()
+        );
         std::fs::write(
             &run.completion,
-            export_completion_marker("none", "none", "none"),
+            export_completion_marker("none", "none", "none", "none"),
         )
         .unwrap();
-        run.validate_current("none", "none", "none").unwrap();
+        run.validate_current("none", "none", "none", "none")
+            .unwrap();
         // Stale identity or map binding values are rejected exactly.
         let bound = export_completion_marker(
             "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
             "none",
             "none",
+            "none",
         );
         std::fs::write(&run.completion, &bound).unwrap();
-        assert!(run.validate_current("none", "none", "none").is_err());
+        assert!(
+            run.validate_current("none", "none", "none", "none")
+                .is_err()
+        );
         assert!(
             run.validate_current(
                 "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2:2",
+                "none",
                 "none",
                 "none"
             )
@@ -11062,7 +12023,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         std::fs::write(run.directory.join("decompiled.c"), b"stale\n").unwrap();
         std::fs::write(
             &run.completion,
-            export_completion_marker("none", "none", "none"),
+            export_completion_marker("none", "none", "none", "none"),
         )
         .unwrap();
 

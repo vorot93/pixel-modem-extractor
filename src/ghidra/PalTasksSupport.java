@@ -70,7 +70,7 @@ import org.bouncycastle.crypto.digests.Blake3Digest;
 
 final class PalTasksSupport {
     static final String PAL_FORMAT = "pixel-modem-extractor-pal-tasks-v1";
-    static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v4";
+    static final String SYMBOL_MAP_FORMAT = "pixel-modem-extractor-symbol-map-v5";
     static final String RESERVED_NAMESPACE = "PixelModemExtractor_PalTasks_v1";
     static final String OWNERSHIP_MAP = "PixelModemExtractor.PalTasks.v1.Ownership";
     static final String THUMB_CREATION_OWNERSHIP_MAP =
