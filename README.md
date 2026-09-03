@@ -153,10 +153,13 @@ executions: hardware-init (`hw_Init`, only when uniquely reset-reachable), the s
 failure handler (`StackProtectionFailure`, named even when non-return is unproven), uninterpreted
 ARM RVCT callsite operands, and a privileged-operation inventory (CP15 and explicit CPSR/SPSR; no
 MPU/permissions). Unique ASCII seeds (`Invalid warm boot`, `Check a function`, `ARM RVCT`) are
-0 = Absent, 1 = unique, more than one = image-wide Ambiguous. `_ShannonOS_` is optional and is
+0 = Absent, 1 = unique, more than one = image-wide Ambiguous. Each unique hit is a containing
+C-string (tab, LF, CR, and printable ASCII; the walk back from the needle stops at NUL or a
+non-printable byte). `_ShannonOS_` is optional and is
 no-evidence on both retained MAIN images. Inventory membership is the scan domain, never independent
-validity. A section that crosses plausibility and then fails fails the whole image artifact; later
-images continue.
+validity. A function whose local CFG cannot be decoded is skipped during that sweep and is not an
+image failure. A section that crosses plausibility and then fails fails the whole image artifact; later
+images continue. Do not call Phase 3B landed until inventory-gated corpus pins are populated.
 
 A successful discovery publishes `startup_metadata/<label>/startup.json` in a standalone `--run` kit
 and `images/<label>/startup_metadata/startup.json` under `decompose` (retained by `--prune`). Format

@@ -1013,15 +1013,18 @@ fn parse_cstring(
         if byte == 0 {
             let needle_end = hit
                 .address
-                .checked_add(u32::try_from(needle_len).map_err(|_| {
-                    malformed("seed needle length does not fit u32")
-                })?)
+                .checked_add(
+                    u32::try_from(needle_len)
+                        .map_err(|_| malformed("seed needle length does not fit u32"))?,
+                )
                 .ok_or_else(|| malformed("seed needle wraps the address space"))?;
             let string_end = string_start
                 .checked_add(string_len)
                 .ok_or_else(|| malformed("containing C-string wraps the address space"))?;
             if hit.address < string_start || needle_end >= string_end {
-                return Err(malformed("seed needle is not inside the containing C-string"));
+                return Err(malformed(
+                    "seed needle is not inside the containing C-string",
+                ));
             }
             return Ok(SeedHit {
                 address: hit.address,

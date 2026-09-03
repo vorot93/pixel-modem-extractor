@@ -1179,8 +1179,11 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **Resource limits are named constants** (`startup_metadata/mod.rs`): 1 seed occurrence, 128-byte
   C-strings, 64 refs/callsites, 64 KiB / 32,768 insns / 4,096 blocks per CFG (`CfgLimits::startup_metadata()`),
   4,096 visited functions, depth 64, 2 applications, 65,536 privileged ops, 1 MiB manifest,
-  2,000-byte Java leaves, 2,048-char reasons. Charged CFG bytes are non-refundable inside one
-  image discovery. Exhaustion after plausibility is `ResourceLimit`.
+  2,000-byte Java leaves, 2,048-char reasons. Each inventory-sweep CFG decode uses a fresh
+  `CfgLimits::startup_metadata()` budget; an undecodable function CFG is skipped and contributes
+  no refs. `MAX_SEED_REFS` and targeted reset-walk exhaustion after plausibility stay
+  `ResourceLimit`. Containing C-strings allow tab, LF, CR, and `0x20..=0x7e`; the backward walk
+  stops at NUL or a disallowed byte.
 - **Canonical artifact and identity.** Format `pixel-modem-extractor-startup-metadata-v1`; two-space
   pretty JSON with no trailing newline. Identity `v1:<manifest-blake3>:<named-roots>:<no-return-roots>:<privileged-ops>`
   is rederived by the strict reader. Terminal leaf is `images/<label>/startup_metadata/startup.json`
