@@ -1,6 +1,8 @@
-use super::{MAX_CSTRING_BYTES, MessagePlan, PalMessageError, SEED};
+use super::{
+    MAX_CSTRING_BYTES, MAX_TABLE_CAPACITY, MAX_TABLE_STRIDE, MessagePlan, PalMessageError, SEED,
+};
 use crate::arm32::{
-    AddressBase, AddressOffset, DecodedInstruction, ValueEffect, ValueExpr, visible_pc,
+    AccessKind, AddressBase, AddressOffset, DecodedInstruction, ValueEffect, ValueExpr, visible_pc,
     wrapping_offset,
 };
 use crate::execution_ranges::DecodeIsa;
@@ -39,10 +41,13 @@ fn pal_message_cfg_limits() -> CfgLimits {
 
 pub(crate) fn discover(
     runtime: &RuntimeImage<'_>,
-    _label: &str,
+    label: &str,
 ) -> Result<Option<MessagePlan>, PalMessageError> {
-    let _ = find_unique_seed(runtime, SEED)?;
-    Ok(None)
+    let Some(seed) = find_unique_seed(runtime, SEED)? else {
+        return Ok(None);
+    };
+    let refs = semantic_refs(runtime, seed.string_start)?;
+    prove_plan(runtime, label, &refs)
 }
 
 pub(crate) fn semantic_refs(
@@ -65,7 +70,15 @@ pub(crate) fn semantic_refs(
                 CallPolicy::Fallthrough,
                 Some(512),
             ) {
-                collect_refs_from_cfg(&cfg, runtime, pc, DecodeIsa::Arm, string_start, &mut seen, &mut refs);
+                collect_refs_from_cfg(
+                    &cfg,
+                    runtime,
+                    pc,
+                    DecodeIsa::Arm,
+                    string_start,
+                    &mut seen,
+                    &mut refs,
+                );
             }
             pc = match pc.checked_add(4) {
                 Some(next) => next,
@@ -112,6 +125,147 @@ fn collect_refs_from_cfg(
                 address: string_start,
             });
         }
+    }
+}
+
+fn prove_plan(
+    runtime: &RuntimeImage<'_>,
+    label: &str,
+    refs: &[SemanticRef],
+) -> Result<Option<MessagePlan>, PalMessageError> {
+    let mut pcs = BTreeSet::new();
+    for reference in refs {
+        pcs.insert(reference.pc);
+    }
+    let setup_pc = match pcs.len() {
+        0 => return Ok(None),
+        1 => *pcs.iter().next().expect("one pc"),
+        _ => {
+            return Err(PalMessageError::Ambiguous {
+                values: pcs.into_iter().collect(),
+            });
+        }
+    };
+    let isa = refs
+        .iter()
+        .find(|reference| reference.pc == setup_pc)
+        .map(|reference| reference.isa)
+        .ok_or_else(|| malformed("setup reference is missing an ISA"))?;
+    let cfg = match SemanticCfg::decode_with_address_window(
+        runtime,
+        setup_pc,
+        isa,
+        pal_message_cfg_limits(),
+        CallPolicy::Fallthrough,
+        Some(512),
+    ) {
+        Ok(cfg) => cfg,
+        Err(_) => return Ok(None),
+    };
+    let Some((capacity, table_base, stride)) = unique_geometry(&cfg) else {
+        return Ok(None);
+    };
+    if runtime.hash_range(table_base, stride).is_err() {
+        return Ok(None);
+    }
+    let mut charged = 0u64;
+    let slots = crate::pal_messages::table::hash_slots(
+        runtime,
+        table_base,
+        stride,
+        capacity,
+        &mut charged,
+    )?;
+    let (image_base, image_size) = runtime.image_bounds();
+    let table_end = table_base
+        .checked_add(
+            capacity
+                .checked_mul(stride)
+                .ok_or_else(|| malformed("table size wrap"))?,
+        )
+        .ok_or_else(|| malformed("table end wraps the address space"))?;
+    Ok(Some(MessagePlan {
+        image_label: label.to_owned(),
+        image_base,
+        image_size,
+        setup_entry: setup_pc,
+        setup_isa: isa,
+        table_base,
+        table_end,
+        stride,
+        capacity,
+        slots,
+    }))
+}
+
+fn unique_geometry(cfg: &SemanticCfg) -> Option<(u32, u32, u32)> {
+    let mut stored_capacity = BTreeSet::new();
+    let mut table_bases = BTreeSet::new();
+    let mut store_regs = BTreeSet::new();
+    for (pc, instruction) in cfg.instructions() {
+        let ValueEffect::Memory(memory) = &instruction.effect else {
+            continue;
+        };
+        let Some(state) = cfg.exact_register_states().get(pc) else {
+            continue;
+        };
+        for transfer in &memory.transfers {
+            if transfer.kind != AccessKind::Write || transfer.width != 4 {
+                continue;
+            }
+            let Some(value_reg) = transfer.value else {
+                continue;
+            };
+            let AddressBase::Register(base_reg) = transfer.address.base else {
+                continue;
+            };
+            let AddressOffset::Immediate(0) = transfer.address.offset else {
+                continue;
+            };
+            let Some(capacity) = state
+                .get(value_reg)
+                .filter(|fact| (1..=MAX_TABLE_CAPACITY).contains(&fact.value))
+            else {
+                continue;
+            };
+            let Some(base) = state.get(base_reg) else {
+                continue;
+            };
+            stored_capacity.insert(capacity.value);
+            table_bases.insert(base.value);
+            store_regs.insert(value_reg);
+            store_regs.insert(base_reg);
+        }
+    }
+    let capacity = unique_value(&stored_capacity)?;
+    let table_base = unique_value(&table_bases)?;
+    let mut stride_immediates = BTreeSet::new();
+    for instruction in cfg.instructions().values() {
+        let ValueEffect::RegisterWrite {
+            dst,
+            value: ValueExpr::Immediate(value),
+        } = instruction.effect
+        else {
+            continue;
+        };
+        if store_regs.contains(&dst) {
+            continue;
+        }
+        if (4..=MAX_TABLE_STRIDE).contains(&value) && value % 4 == 0 && value != capacity {
+            stride_immediates.insert(value);
+        }
+    }
+    let stride = unique_value(&stride_immediates)?;
+    Some((capacity, table_base, stride))
+}
+
+fn unique_value(values: &BTreeSet<u32>) -> Option<u32> {
+    let mut iter = values.iter().copied();
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        None
+    } else {
+        Some(first)
     }
 }
 
@@ -416,6 +570,81 @@ mod tests {
             .expect("unique")
             .expect("present");
         let refs = super::semantic_refs(&runtime, seed.string_start).expect("refs");
-        assert!(refs.is_empty(), "ADD after MOVW/MOVT must not be a ref: {refs:?}");
+        assert!(
+            refs.is_empty(),
+            "ADD after MOVW/MOVT must not be a ref: {refs:?}"
+        );
+    }
+
+    const A32_MOV_R1_4: [u8; 4] = [0x04, 0x10, 0xa0, 0xe3];
+    const A32_MOV_R3_16: [u8; 4] = [0x10, 0x30, 0xa0, 0xe3];
+    const A32_STR_R1_R2: [u8; 4] = [0x00, 0x10, 0x82, 0xe5];
+    const A32_ADD_R0_PC_18: [u8; 4] = [0x18, 0x00, 0x8f, 0xe2];
+
+    fn plant_setup(image: &mut [u8], table_base: u32) {
+        image[0..4].copy_from_slice(&A32_ADD_R0_PC_18);
+        image[4..8].copy_from_slice(&A32_MOV_R1_4);
+        image[8..12].copy_from_slice(&A32_MOV_R3_16);
+        image[12..16].copy_from_slice(&a32_movw(2, (table_base & 0xffff) as u16));
+        image[16..20].copy_from_slice(&a32_movt(2, (table_base >> 16) as u16));
+        image[20..24].copy_from_slice(&A32_STR_R1_R2);
+        image[24..28].copy_from_slice(&A32_BX_LR);
+        image[0x20..0x20 + SEED.len()].copy_from_slice(SEED);
+        image[0x20 + SEED.len()] = 0;
+    }
+
+    #[test]
+    fn discover_present_for_unique_setup_and_complete_table() {
+        let mut image = vec![0u8; 0x100];
+        let table_base = BASE + 0x80;
+        plant_setup(&mut image, table_base);
+        let plan = discover(&runtime(&image), "02_MAIN")
+            .expect("discover")
+            .expect("present");
+        assert_eq!(plan.setup_entry, BASE);
+        assert_eq!(plan.capacity, 4);
+        assert_eq!(plan.stride, 16);
+        assert_eq!(plan.table_base, table_base);
+        assert_eq!(plan.slots.len(), 4);
+        assert_eq!(plan.table_end, table_base + 64);
+    }
+
+    #[test]
+    fn first_slot_unreadable_is_absence() {
+        let mut image = vec![0u8; 0x40];
+        plant_setup(&mut image, BASE + 0x1000);
+        assert!(
+            discover(&runtime(&image), "02_MAIN")
+                .expect("discover")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn readable_then_short_table_is_malformed() {
+        let mut image = vec![0u8; 0x90];
+        plant_setup(&mut image, BASE + 0x80);
+        match discover(&runtime(&image), "02_MAIN") {
+            Err(PalMessageError::Runtime { .. } | PalMessageError::Malformed { .. }) => {}
+            other => panic!("expected malformed or runtime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_complete_setups_are_ambiguous() {
+        let mut image = vec![0u8; 0x80];
+        image[0..4].copy_from_slice(&A32_ADD_R0_PC_18);
+        image[4..8].copy_from_slice(&A32_BX_LR);
+        image[8..12].copy_from_slice(&[0x10, 0x00, 0x8f, 0xe2]);
+        image[12..16].copy_from_slice(&A32_BX_LR);
+        let seed_off = 0x20;
+        image[seed_off..seed_off + SEED.len()].copy_from_slice(SEED);
+        image[seed_off + SEED.len()] = 0;
+        match discover(&runtime(&image), "02_MAIN") {
+            Err(PalMessageError::Ambiguous { values }) => {
+                assert_eq!(values.len(), 2);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
     }
 }
