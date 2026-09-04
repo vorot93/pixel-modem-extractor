@@ -19,7 +19,7 @@ use crate::execution_ranges::{
 };
 use crate::runtime_image::{ByteBackedRange, MAX_EXACT_READ, RuntimeImage};
 use crate::semantic_cfg::{BoundaryKind, CallPolicy, CfgLimits, SemanticCfg, SemanticCfgError};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -219,16 +219,13 @@ pub(crate) fn prove_hardware_init(
         })
         .collect();
     let visited = reachable_from_reset(runtime, inventories, reset, &containers)?;
-    let mut survivors: Vec<OwnedExecutionIdentity> = refs
-        .into_iter()
-        .map(|reference| reference.function)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|function| {
-            identity_isa(function)
-                .is_some_and(|isa| visited.contains(&(function.identity.entry, isa)))
-        })
-        .collect();
+    let mut survivors =
+        unique_named_containers(refs.into_iter().map(|reference| reference.function).filter(
+            |function| {
+                identity_isa(function)
+                    .is_some_and(|isa| visited.contains(&(function.identity.entry, isa)))
+            },
+        ));
     match survivors.len() {
         0 => Err(malformed("hardware_init is not reset-reachable")),
         1 => {
@@ -265,12 +262,8 @@ pub(crate) fn prove_stack_guard(
     if refs.is_empty() {
         return Ok(Section::Absent);
     }
-    let mut containers: Vec<OwnedExecutionIdentity> = refs
-        .into_iter()
-        .map(|reference| reference.function)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut containers =
+        unique_named_containers(refs.into_iter().map(|reference| reference.function));
     match containers.len() {
         0 => Ok(Section::Absent),
         1 => {
@@ -880,15 +873,10 @@ fn resolve_accepted(
     target: u32,
     isa: DecodeIsa,
 ) -> Option<&TaggedExecutionRecord> {
-    let mut matches = inventories
+    inventories
         .iter()
-        .filter(|record| record.entry == target && first_isa(record) == Some(isa));
-    let record = matches.next()?;
-    if matches.next().is_some() {
-        None
-    } else {
-        Some(record)
-    }
+        .filter(|record| record.entry == target && first_isa(record) == Some(isa))
+        .min_by_key(|record| record.owner)
 }
 
 fn first_isa(record: &TaggedExecutionRecord) -> Option<DecodeIsa> {
@@ -904,6 +892,29 @@ fn identity_isa(function: &OwnedExecutionIdentity) -> Option<DecodeIsa> {
         .decode_ranges
         .first()
         .map(|range| range.isa)
+}
+
+fn unique_named_containers(
+    functions: impl IntoIterator<Item = OwnedExecutionIdentity>,
+) -> Vec<OwnedExecutionIdentity> {
+    let mut by_key = BTreeMap::<(u32, DecodeIsa), OwnedExecutionIdentity>::new();
+    for function in functions {
+        let Some(isa) = identity_isa(&function) else {
+            continue;
+        };
+        let key = (function.identity.entry, isa);
+        match by_key.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(function);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if function.owner < slot.get().owner {
+                    slot.insert(function);
+                }
+            }
+        }
+    }
+    by_key.into_values().collect()
 }
 
 fn cfg_error(error: SemanticCfgError, isa: DecodeIsa) -> StartupMetadataError {
@@ -1058,6 +1069,7 @@ mod tests {
         SeedHit, SemanticRef, discover, find_unique_seed, prove_compiler, prove_hardware_init,
         prove_stack_guard, semantic_refs, sweep_privileged_ops,
     };
+    use crate::analysis_tool::AnalysisTool;
     use crate::arm32::SystemDirection;
     use crate::execution_ranges::{
         AuthenticatedDecodeRange, DecodeIsa, DecodeRangeError, DecodeRangeErrorKind,
@@ -1231,6 +1243,22 @@ mod tests {
                 end,
                 blake3: runtime.hash_range(entry, size).expect("range hash"),
             }]),
+        }
+    }
+
+    fn with_owner(
+        mut record: TaggedExecutionRecord,
+        owner: FunctionOwner,
+    ) -> TaggedExecutionRecord {
+        record.owner = owner;
+        record
+    }
+
+    fn radare2_run_owner() -> FunctionOwner {
+        FunctionOwner::Run {
+            producer: AnalysisTool::Radare2,
+            region_index: 0,
+            run_index: 0,
         }
     }
 
@@ -1529,6 +1557,38 @@ mod tests {
     }
 
     #[test]
+    fn hw_init_same_entry_ghidra_and_thumb_is_one_container() {
+        let mut image = vec![0u8; 0x40];
+        image[0..4].copy_from_slice(&a32_bl(BASE, BASE + 0x10));
+        image[4..8].copy_from_slice(&A32_BX_LR);
+        image[0x10..0x14].copy_from_slice(&A32_ADD_R0_PC_8);
+        image[0x14..0x18].copy_from_slice(&A32_BX_LR);
+        plant_seed(&mut image, 0x20);
+        let runtime = runtime(&image);
+        let reset = accepted_arm(&runtime, BASE, BASE + 8);
+        let ghidra = accepted_arm(&runtime, BASE + 0x10, BASE + 0x18);
+        let thumb = with_owner(
+            accepted_arm(&runtime, BASE + 0x10, BASE + 0x18),
+            radare2_run_owner(),
+        );
+        let expected = HardwareInit {
+            entry: BASE + 0x10,
+            isa: DecodeIsa::Arm,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: owned_identity(&ghidra).identity.execution_blake3,
+        };
+        assert_eq!(
+            prove_hardware_init(
+                &runtime,
+                &[reset, thumb, ghidra],
+                Some((BASE, DecodeIsa::Arm))
+            )
+            .expect("overlapping owners are one container"),
+            Section::Present(expected)
+        );
+    }
+
+    #[test]
     fn hw_init_reset_walk_resource_limit_still_fails() {
         const SPAN: usize = 64 * 1024 + 4;
         let mut image = vec![0u8; SPAN + 0x40];
@@ -1778,6 +1838,29 @@ mod tests {
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stack_guard_same_entry_ghidra_and_thumb_is_one_container() {
+        let mut image = vec![0u8; 0x30];
+        image[0..4].copy_from_slice(&A32_ADD_R0_PC_8);
+        image[4..8].copy_from_slice(&A32_BX_LR);
+        plant_cstr(&mut image, 0x10, SEED_STACK_GUARD);
+        let runtime = runtime(&image);
+        let ghidra = accepted_arm(&runtime, BASE, BASE + 8);
+        let thumb = with_owner(accepted_arm(&runtime, BASE, BASE + 8), radare2_run_owner());
+        let expected = StackGuard {
+            entry: BASE,
+            isa: DecodeIsa::Arm,
+            owner: FunctionOwner::Ghidra,
+            execution_blake3: owned_identity(&ghidra).identity.execution_blake3,
+            non_return: false,
+        };
+        assert_eq!(
+            prove_stack_guard(&runtime, &[thumb, ghidra])
+                .expect("overlapping owners are one container"),
+            Section::Present(expected)
+        );
     }
 
     const RVCT_CALL_LEN: u32 = 20;

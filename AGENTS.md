@@ -1166,9 +1166,11 @@ hardcoded. Two reference images exercise both models end-to-end:
   finalize: proofs are name-independent and hash the pass-1 inventories actually decoded.
 - **Four independent sections, one plan.** Unique ASCII seeds are 0 = `Absent`, 1 = unique,
   more than one = image-wide `Ambiguous`. Materialization is PAL-style (`ADR` / PC-relative
-  literal / `MOVW`/`MOVT`); analyzer xrefs are diagnostic only. `hardware_init` names `hw_Init`
+  literal / `MOVW`/`MOVT`); analyzer xrefs are diagnostic only.   `hardware_init` names `hw_Init`
   only when exactly one accepted container is reachable from that image's proven reset root (no
-  reset root is clean `Absent`, never a string-only guess). `stack_guard` names
+  reset root is clean `Absent`, never a string-only guess). Overlapping Ghidra and Thumb records at
+  the same `(entry, DecodeIsa)` are one container; the Ghidra-owned identity is preferred for the
+  named root and for reset-walk callee resolution. `stack_guard` names
   `StackProtectionFailure` from a unique container; non-return is a separate local-CFG must-proof
   (`CallPolicy::Fallthrough`) and incomplete CFG names without applying no-return. `compiler`
   records uninterpreted RVCT callsite operands (no major/minor/build); `_ShannonOS_` is optional

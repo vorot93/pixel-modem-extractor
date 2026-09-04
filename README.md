@@ -157,7 +157,8 @@ MPU/permissions). Unique ASCII seeds (`Invalid warm boot`, `Check a function`, `
 C-string (tab, LF, CR, and printable ASCII; the walk back from the needle stops at NUL or a
 non-printable byte). `_ShannonOS_` is optional and is
 no-evidence on both retained MAIN images. Inventory membership is the scan domain, never independent
-validity. A function whose local CFG cannot be decoded is skipped during that sweep and is not an
+validity. Ghidra and Thumb records at the same `(entry, decode ISA)` are one named-root container
+(Ghidra preferred). A function whose local CFG cannot be decoded is skipped during that sweep and is not an
 image failure. A section that crosses plausibility and then fails fails the whole image artifact; later
 images continue. Do not call Phase 3B landed until inventory-gated corpus pins are populated.
 
