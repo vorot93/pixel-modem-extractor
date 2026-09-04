@@ -22,6 +22,7 @@ pub(crate) struct MaterializedMessages {
     pub relative_path: String,
     pub blake3: String,
     pub identity: String,
+    pub slots: usize,
 }
 
 pub(crate) fn materialize(
@@ -53,6 +54,7 @@ pub(crate) fn materialize(
         ),
         blake3: hex_digest(digest),
         identity: identity(digest, 1, plan.slots.len()),
+        slots: plan.slots.len(),
     })
 }
 

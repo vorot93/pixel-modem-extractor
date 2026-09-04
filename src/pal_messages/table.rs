@@ -13,7 +13,7 @@ pub(crate) fn hash_slots(
     if capacity == 0 || capacity > MAX_TABLE_CAPACITY {
         return Err(malformed("table capacity is out of range"));
     }
-    if stride < 4 || stride > MAX_TABLE_STRIDE || stride % 4 != 0 {
+    if !(4..=MAX_TABLE_STRIDE).contains(&stride) || !stride.is_multiple_of(4) {
         return Err(malformed("table stride is out of range"));
     }
     let total = (capacity as u64)
@@ -35,7 +35,7 @@ pub(crate) fn hash_slots(
         let charge = u64::from(stride);
         let next = charged
             .checked_add(charge)
-            .ok_or_else(|| PalMessageError::ResourceLimit {
+            .ok_or(PalMessageError::ResourceLimit {
                 what: "validation bytes",
                 actual: u64::MAX,
                 limit: MAX_CANDIDATE_VALIDATION_BYTES,

@@ -752,6 +752,7 @@ pub(crate) fn test_decompile_report(
         runtime_scatter,
         runtime_exception_roots,
         runtime_tasks,
+        runtime_messages: HashMap::new(),
     }
 }
 
@@ -794,6 +795,7 @@ pub struct DecompileReport {
     runtime_scatter: HashMap<String, RuntimeScatterState>,
     runtime_exception_roots: HashMap<String, RuntimeExceptionState>,
     runtime_tasks: HashMap<String, RuntimeTaskState>,
+    runtime_messages: HashMap<String, RuntimeMessageState>,
 }
 
 impl DecompileReport {
@@ -815,6 +817,13 @@ impl DecompileReport {
             .unwrap_or(RuntimeTaskState::Unmanaged)
     }
 
+    pub(crate) fn runtime_message_state(&self, label: &str) -> RuntimeMessageState {
+        self.runtime_messages
+            .get(label)
+            .cloned()
+            .unwrap_or(RuntimeMessageState::Unmanaged)
+    }
+
     pub(crate) fn runtime_exception_state(&self, label: &str) -> RuntimeExceptionState {
         self.runtime_exception_roots
             .get(label)
@@ -828,6 +837,7 @@ impl DecompileReport {
             scatter: self.runtime_scatter_state(label),
             exception: self.runtime_exception_state(label),
             tasks: self.runtime_task_state(label),
+            messages: self.runtime_message_state(label),
         }
     }
 }
@@ -852,6 +862,13 @@ pub(crate) enum RuntimeTaskState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeMessageState {
+    Unmanaged,
+    Absent,
+    Present(crate::pal_messages::MaterializedMessages),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeExceptionState {
     Unmanaged,
     Absent,
@@ -863,6 +880,7 @@ pub(crate) struct RuntimeAnalysisState {
     pub scatter: RuntimeScatterState,
     pub exception: RuntimeExceptionState,
     pub tasks: RuntimeTaskState,
+    pub messages: RuntimeMessageState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2091,6 +2109,7 @@ struct RuntimeAnalysis {
     scatter_states: HashMap<String, RuntimeScatterState>,
     exception_roots: HashMap<String, RuntimeExceptionState>,
     tasks: HashMap<String, RuntimeTaskState>,
+    messages: HashMap<String, RuntimeMessageState>,
 }
 
 fn generate_runtime_analysis(toc: &Toc, data: &[u8], out: &Path) -> Result<RuntimeAnalysis> {
@@ -2293,11 +2312,40 @@ fn generate_runtime_analysis_with(
             }
         }
     }
+
+    let mut messages = HashMap::new();
+    if let Some((_, label, image, runtime)) = runtimes
+        .iter()
+        .find(|(entry, _, _, _)| entry.name == "MAIN")
+    {
+        let context = crate::pal_messages::MessageArtifactContext {
+            label,
+            image_blake3: *blake3::hash(image).as_bytes(),
+            scatter_load_map_blake3: scatter_blake3s.get(label).copied(),
+        };
+        match crate::pal_messages::discover(runtime, label)? {
+            Some(plan) => {
+                let materialized = crate::pal_messages::materialize(&plan, context, out)?;
+                tracing::info!(
+                    "pal messages: {label} -> {} ({})",
+                    materialized.relative_path,
+                    materialized.identity
+                );
+                messages.insert(label.clone(), RuntimeMessageState::Present(materialized));
+            }
+            None => {
+                crate::pal_messages::clear_materialized(out, label)?;
+                tracing::info!("pal messages: {label} has no messaging candidate");
+                messages.insert(label.clone(), RuntimeMessageState::Absent);
+            }
+        }
+    }
     Ok(RuntimeAnalysis {
         scatter_paths,
         scatter_states,
         exception_roots: exception_states,
         tasks,
+        messages,
     })
 }
 
@@ -3233,6 +3281,7 @@ fn run_report_impl(
         runtime_scatter: runtime_analysis.scatter_states,
         runtime_exception_roots: runtime_analysis.exception_roots,
         runtime_tasks: runtime_analysis.tasks,
+        runtime_messages: runtime_analysis.messages,
     })
 }
 
@@ -8030,6 +8079,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             runtime_scatter: HashMap::new(),
             runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
+            runtime_messages: HashMap::new(),
         };
         let mut opts = generation_opts(None);
         opts.run = true;
@@ -9867,6 +9917,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter: RuntimeScatterState::Unmanaged,
                 exception: RuntimeExceptionState::Absent,
                 tasks: RuntimeTaskState::Unmanaged,
+                messages: RuntimeMessageState::Unmanaged,
             }
         );
         assert_eq!(
@@ -9875,9 +9926,15 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
                 scatter: RuntimeScatterState::Unmanaged,
                 exception: RuntimeExceptionState::Unmanaged,
                 tasks: RuntimeTaskState::Unmanaged,
+                messages: RuntimeMessageState::Unmanaged,
             }
         );
+        assert_eq!(
+            report.runtime_analysis_state("00_BOOT").messages,
+            RuntimeMessageState::Unmanaged
+        );
         assert!(!out.join("pal_tasks").exists());
+        assert!(!out.join("pal_messages").exists());
 
         // Absent: a recognized MAIN with no PAL candidate clears the owned
         // manifest only after the successful no-candidate result.
@@ -9894,7 +9951,12 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             report.runtime_analysis_state("02_MAIN").tasks,
             RuntimeTaskState::Absent
         );
+        assert_eq!(
+            report.runtime_analysis_state("02_MAIN").messages,
+            RuntimeMessageState::Absent
+        );
         assert!(!out.join("pal_tasks/02_MAIN").exists());
+        assert!(!out.join("pal_messages/02_MAIN/messages.json").exists());
         let spec: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out.join("ghidra_load.json")).unwrap()).unwrap();
         assert!(spec["images"][0].get("pal_task_map").is_none());
@@ -9910,6 +9972,10 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
         let out = dir.path().join("out");
         std::fs::write(&modem, buf).unwrap();
         let report = run_report(&modem, &generation_opts(None), &out).unwrap();
+        assert_eq!(
+            report.runtime_analysis_state("02_MAIN").messages,
+            RuntimeMessageState::Absent
+        );
         let RuntimeTaskState::Present(map) = report.runtime_analysis_state("02_MAIN").tasks else {
             panic!("discoverable MAIN must report a present PAL map");
         };
@@ -9992,6 +10058,28 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             std::fs::read(&stale_manifest).unwrap(),
             b"older complete bytes",
             "a failed discovery must never pre-clear older physical bytes"
+        );
+    }
+
+    #[test]
+    fn message_generation_publishes_present_manifest() {
+        let main = crate::pal_messages::test_support::craft_discoverable_main_image();
+        let buf = craft_modem_bin(&[("MAIN", crate::pal_messages::test_support::BASE, 3, &main)]);
+        let dir = tempfile::tempdir().unwrap();
+        let modem = dir.path().join("modem.bin");
+        let out = dir.path().join("out");
+        std::fs::write(&modem, buf).unwrap();
+        let report = run_report(&modem, &generation_opts(None), &out).unwrap();
+        let RuntimeMessageState::Present(map) = report.runtime_analysis_state("02_MAIN").messages
+        else {
+            panic!("discoverable MAIN must report present PAL messages");
+        };
+        assert_eq!(map.relative_path, "pal_messages/02_MAIN/messages.json");
+        assert_eq!(map.slots, 4);
+        assert!(out.join(&map.relative_path).is_file());
+        assert_eq!(
+            report.runtime_analysis_state("02_MAIN").tasks,
+            RuntimeTaskState::Absent
         );
     }
 
@@ -10505,6 +10593,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             runtime_scatter: HashMap::new(),
             runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
+            runtime_messages: HashMap::new(),
         };
 
         let err = report_failure(&report).expect("thumb error should fail standalone run");
@@ -10574,6 +10663,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             runtime_scatter: HashMap::new(),
             runtime_exception_roots,
             runtime_tasks: HashMap::new(),
+            runtime_messages: HashMap::new(),
         }
     }
 
@@ -11080,6 +11170,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             runtime_scatter: HashMap::new(),
             runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
+            runtime_messages: HashMap::new(),
         };
         assert!(report_failure(&report).is_none());
     }
@@ -11138,6 +11229,7 @@ printf '%s\n' '[{"name":"sym.thumb_func","addr":1073807360,"size":2,"realsz":2,"
             runtime_scatter: HashMap::new(),
             runtime_exception_roots: HashMap::new(),
             runtime_tasks: HashMap::new(),
+            runtime_messages: HashMap::new(),
         };
 
         let err = report_failure(&report).expect("thumb error should fail standalone run");

@@ -665,9 +665,12 @@ fn main_image_dir_name(images_dir: &Path) -> Option<String> {
 ///                                -> `<images>/<label>/exception_roots/roots.json`
 ///   present `<ghidra>/pal_tasks/<label>/tasks.json`
 ///                                             -> `<images>/<label>/pal_tasks/tasks.json`
+///   present `<ghidra>/pal_messages/<label>/messages.json`
+///                                             -> `<images>/<label>/pal_messages/messages.json`
 ///   current raw-only scatter state              -> remove terminal `scatter/`
 ///   explicit exception-root absence              -> remove owned terminal manifest
 ///   explicit PAL absence                        -> remove terminal `pal_tasks/`
+///   explicit PAL-messages absence               -> remove owned terminal leaf
 ///
 /// Every subsystem follows explicit ownership: its `Unmanaged` state leaves
 /// terminal and source bytes untouched. Exception generation completes before
@@ -751,6 +754,7 @@ struct MarshalImageStages {
     scatter: MarshalComponentOutcome,
     exception: ExceptionMarshalStatus,
     pal: MarshalComponentOutcome,
+    messages: MarshalComponentOutcome,
     symbolication: Option<
         std::result::Result<Arc<symbolicate::role_evidence::CurrentSymbolicationContext>, String>,
     >,
@@ -758,14 +762,20 @@ struct MarshalImageStages {
 
 impl MarshalImageStages {
     fn first_pipeline_failure(&self) -> Option<&str> {
-        [&self.raw, &self.export, &self.scatter, &self.pal]
-            .into_iter()
-            .find_map(MarshalComponentOutcome::failure_reason)
-            .or_else(|| {
-                self.symbolication
-                    .as_ref()
-                    .and_then(|context| context.as_ref().err().map(String::as_str))
-            })
+        [
+            &self.raw,
+            &self.export,
+            &self.scatter,
+            &self.pal,
+            &self.messages,
+        ]
+        .into_iter()
+        .find_map(MarshalComponentOutcome::failure_reason)
+        .or_else(|| {
+            self.symbolication
+                .as_ref()
+                .and_then(|context| context.as_ref().err().map(String::as_str))
+        })
     }
 
     fn is_terminal_pass2_ready(
@@ -825,6 +835,25 @@ fn component_matches_task_state(
         ) | (
             MarshalComponentOutcome::Unmanaged,
             decompile::RuntimeTaskState::Unmanaged
+        )
+    )
+}
+
+fn component_matches_message_state(
+    outcome: &MarshalComponentOutcome,
+    state: &decompile::RuntimeMessageState,
+) -> bool {
+    matches!(
+        (outcome, state),
+        (
+            MarshalComponentOutcome::Current,
+            decompile::RuntimeMessageState::Present(_)
+        ) | (
+            MarshalComponentOutcome::Absent,
+            decompile::RuntimeMessageState::Absent
+        ) | (
+            MarshalComponentOutcome::Unmanaged,
+            decompile::RuntimeMessageState::Unmanaged
         )
     )
 }
@@ -908,6 +937,7 @@ fn marshal_image_stages(
             scatter: MarshalComponentOutcome::blocked(&reason),
             exception: ExceptionMarshalStatus::Failed(crate::error::bounded_reason(&reason)),
             pal: MarshalComponentOutcome::blocked(&reason),
+            messages: MarshalComponentOutcome::blocked(&reason),
             symbolication: None,
         };
     }
@@ -1091,12 +1121,48 @@ fn marshal_image_stages(
             Err(error) => (MarshalComponentOutcome::failed(error.to_string()), None),
         }
     };
+    let messages_dependency =
+        matches!(runtime.messages, decompile::RuntimeMessageState::Present(_))
+            .then(|| {
+                if !raw.is_current() {
+                    Some("current raw image publication failed".to_string())
+                } else {
+                    None
+                }
+            })
+            .flatten();
+    let messages = if let Some(reason) = messages_dependency {
+        MarshalComponentOutcome::blocked(format!(
+            "PAL messages publication for {label} blocked: {reason}"
+        ))
+    } else {
+        match marshal_pal_messages(
+            ghidra_dir,
+            images_dir,
+            label,
+            &runtime.messages,
+            image_start,
+            exception_scatter_state,
+        ) {
+            Ok(symbolicate::role_evidence::ArtifactState::Present(_)) => {
+                MarshalComponentOutcome::Current
+            }
+            Ok(symbolicate::role_evidence::ArtifactState::Absent) => {
+                MarshalComponentOutcome::Absent
+            }
+            Ok(symbolicate::role_evidence::ArtifactState::Unmanaged) => {
+                MarshalComponentOutcome::Unmanaged
+            }
+            Err(error) => MarshalComponentOutcome::failed(error.to_string()),
+        }
+    };
     let mut stages = MarshalImageStages {
         raw,
         export,
         scatter,
         exception,
         pal,
+        messages,
         symbolication: None,
     };
     if stages.is_terminal_pass2_ready(export_current, runtime, exception_scatter_state) {
@@ -1148,6 +1214,9 @@ fn marshal_image(
 /// The terminal `pal_tasks/tasks.json` file name, shared by the marshal
 /// commit and the terminal validation paths.
 const PAL_MANIFEST_FILE: &str = "tasks.json";
+
+/// The terminal `pal_messages/messages.json` leaf.
+const MESSAGE_MANIFEST_FILE: &str = "messages.json";
 
 /// The terminal exception-root manifest leaf, shared by marshalling,
 /// terminal context construction, pass-2 restaging, and prune tests.
@@ -1631,6 +1700,172 @@ fn pal_tasks_stage(
     StageReport::ok("pal_tasks", &output(), duration_ms)
 }
 
+fn marshal_pal_messages(
+    ghidra_dir: &Path,
+    images_dir: &Path,
+    label: &str,
+    state: &decompile::RuntimeMessageState,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+) -> Result<symbolicate::role_evidence::ArtifactState<crate::pal_messages::MessagePlan>> {
+    let image_dir = images_dir.join(label);
+    let message_dir = image_dir.join("pal_messages");
+    let map = match state {
+        decompile::RuntimeMessageState::Unmanaged => {
+            return Ok(symbolicate::role_evidence::ArtifactState::Unmanaged);
+        }
+        decompile::RuntimeMessageState::Absent => {
+            remove_any(&message_dir.join(MESSAGE_MANIFEST_FILE))?;
+            return Ok(symbolicate::role_evidence::ArtifactState::Absent);
+        }
+        decompile::RuntimeMessageState::Present(map) => map,
+    };
+    let source_root =
+        crate::trusted_fs::TrustedDirectory::new(ghidra_dir, "PAL messages source kit")
+            .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    let mut source = source_root
+        .open_regular_file(
+            Path::new(&map.relative_path),
+            "current PAL messages manifest",
+        )
+        .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    let manifest_bytes = read_retained_manifest(
+        &mut source,
+        crate::pal_messages::MAX_MANIFEST_BYTES,
+        &map.blake3,
+        "current PAL messages manifest",
+    )?;
+    let validated = validate_terminal_message_manifest_bytes(
+        &image_dir,
+        label,
+        image_start,
+        scatter_state,
+        &manifest_bytes,
+        &map.identity,
+    )?;
+    let image = crate::trusted_fs::TrustedDirectory::new(
+        &image_dir,
+        "terminal PAL messages image directory",
+    )
+    .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    let terminal = image
+        .open_or_create_directory_child("pal_messages", "terminal PAL messages directory")
+        .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    terminal
+        .verify_path_binding(&message_dir, "terminal PAL messages directory")
+        .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    terminal
+        .copy_verified_atomic(
+            MESSAGE_MANIFEST_FILE,
+            &mut std::io::Cursor::new(manifest_bytes.as_slice()),
+            crate::trusted_fs::ExpectedFileIdentity::from_bytes(&manifest_bytes),
+            "terminal PAL messages manifest",
+        )
+        .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    terminal
+        .verify_path_binding(&message_dir, "terminal PAL messages directory")
+        .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    Ok(symbolicate::role_evidence::ArtifactState::Present(
+        validated,
+    ))
+}
+
+fn validate_terminal_message_manifest_bytes(
+    image_dir: &Path,
+    label: &str,
+    image_start: u32,
+    scatter_state: decompile::RuntimeScatterState,
+    manifest_bytes: &[u8],
+    expected_identity: &str,
+) -> Result<crate::pal_messages::MessagePlan> {
+    let raw = std::fs::read(image_dir.join(format!("{label}.bin")))?;
+    let (runtime, scatter_load_map_blake3) = match scatter_state {
+        decompile::RuntimeScatterState::Present => {
+            let runtime =
+                crate::runtime_image::RuntimeImage::for_image_dir(&raw, image_start, image_dir)?;
+            let bytes = std::fs::read(image_dir.join("scatter").join("load_map.json"))?;
+            (runtime, Some(*blake3::hash(&bytes).as_bytes()))
+        }
+        decompile::RuntimeScatterState::Absent => (
+            crate::runtime_image::RuntimeImage::from_plan(&raw, image_start, None)?,
+            None,
+        ),
+        decompile::RuntimeScatterState::Unmanaged => {
+            return Err(Error::DecomposeIncomplete(format!(
+                "current scatter state for PAL messages in {label} is unmanaged"
+            )));
+        }
+    };
+    let context = crate::pal_messages::MessageArtifactContext {
+        label,
+        image_blake3: *blake3::hash(&raw).as_bytes(),
+        scatter_load_map_blake3,
+    };
+    let artifact = crate::pal_messages::read_bytes(manifest_bytes, &runtime, context)
+        .map_err(|error| Error::BadPalMessages(error.to_string()))?;
+    let identity = format!(
+        "v1:{}:1:{}",
+        crate::manifest::blake3_bytes(manifest_bytes),
+        artifact.slots.len()
+    );
+    if identity != expected_identity {
+        return Err(Error::DecomposeIncomplete(format!(
+            "current PAL messages manifest for {label} has identity {identity}, expected {expected_identity}"
+        )));
+    }
+    Ok(artifact)
+}
+
+#[derive(Debug, Default)]
+struct MessageMarshalTally {
+    images: usize,
+    slots: usize,
+}
+
+impl MessageMarshalTally {
+    fn record(&mut self, map: &crate::pal_messages::MaterializedMessages) -> Result<()> {
+        let add = |total: usize, count: usize| {
+            total.checked_add(count).ok_or_else(|| {
+                Error::DecomposeIncomplete("PAL messages marshalling totals overflow".to_string())
+            })
+        };
+        self.images = add(self.images, 1)?;
+        self.slots = add(self.slots, map.slots)?;
+        Ok(())
+    }
+}
+
+fn pal_messages_stage(
+    tally: Option<&MessageMarshalTally>,
+    errors: &[(String, String)],
+    duration_ms: u128,
+) -> StageReport {
+    let Some(tally) = tally else {
+        return StageReport::skipped("pal_messages", "pass 1 failed");
+    };
+    let output = || {
+        format!(
+            "images/*/pal_messages/messages.json (images={}, slots={})",
+            tally.images, tally.slots
+        )
+    };
+    if !errors.is_empty() {
+        return StageReport {
+            stage: "pal_messages",
+            status: "failed",
+            output: (tally.images > 0).then(output),
+            reason: None,
+            error: Some(crate::error::bounded_labelled_reasons(errors, "\n")),
+            images: Vec::new(),
+            duration_ms,
+        };
+    }
+    if tally.images == 0 {
+        return StageReport::skipped("pal_messages", "no PAL messaging initializer");
+    }
+    StageReport::ok("pal_messages", &output(), duration_ms)
+}
+
 enum StartupMetadataOutcome {
     Success {
         hardware_init: Option<String>,
@@ -1965,10 +2200,12 @@ struct MarshalPass1Batch {
     image_reports: Vec<ImageReport>,
     marshal_error: Option<String>,
     pal_tally: PalMarshalTally,
+    message_tally: MessageMarshalTally,
     exception_tally: ExceptionMarshalTally,
     exception_absent: usize,
     exception_errors: Vec<(String, String)>,
     pal_errors: Vec<(String, String)>,
+    message_errors: Vec<(String, String)>,
     symbolication_contexts: CurrentSymbolicationContexts,
 }
 
@@ -2003,10 +2240,12 @@ where
         .collect::<Vec<_>>();
     let mut marshal_error = None;
     let mut pal_tally = PalMarshalTally::default();
+    let mut message_tally = MessageMarshalTally::default();
     let mut exception_tally = ExceptionMarshalTally::default();
     let mut exception_absent = 0usize;
     let mut exception_errors = Vec::new();
     let mut pal_errors = Vec::new();
+    let mut message_errors = Vec::new();
     let mut symbolication_contexts = HashMap::new();
 
     for (index, label, export_current, runtime, exception_scatter, image_start) in requests {
@@ -2036,6 +2275,14 @@ where
                         image.label.clone(),
                         crate::error::bounded_reason(&format!(
                             "pass-1 marshal stopped before PAL commit: {reason}"
+                        )),
+                    ));
+                }
+                if !matches!(runtime.messages, decompile::RuntimeMessageState::Unmanaged) {
+                    message_errors.push((
+                        image.label.clone(),
+                        crate::error::bounded_reason(&format!(
+                            "pass-1 marshal stopped before PAL messages commit: {reason}"
                         )),
                     ));
                 }
@@ -2095,6 +2342,23 @@ where
             pal_errors.push((label.clone(), reason.clone()));
             marshal_error.get_or_insert(reason);
         }
+        if let MarshalComponentOutcome::Failed(reason) = &stages.messages {
+            message_errors.push((label.clone(), crate::error::bounded_reason(reason)));
+        } else if !component_matches_message_state(&stages.messages, &runtime.messages) {
+            message_errors.push((
+                label.clone(),
+                "PAL messages terminal outcome does not match current generation state".to_string(),
+            ));
+        }
+        if stages.messages.is_current()
+            && let decompile::RuntimeMessageState::Present(map) = &runtime.messages
+            && let Err(error) = message_tally.record(map)
+        {
+            snapshot_ready = false;
+            let reason = crate::error::bounded_reason(&error.to_string());
+            message_errors.push((label.clone(), reason.clone()));
+            marshal_error.get_or_insert(reason);
+        }
         if snapshot_ready {
             match stages.symbolication {
                 Some(Ok(context)) => {
@@ -2116,10 +2380,12 @@ where
         image_reports: report.images.iter().map(ImageReport::from_result).collect(),
         marshal_error,
         pal_tally,
+        message_tally,
         exception_tally,
         exception_absent,
         exception_errors,
         pal_errors,
+        message_errors,
         symbolication_contexts,
     }
 }
@@ -4659,6 +4925,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         &batch.pal_errors,
                         pal_started.elapsed().as_millis(),
                     ));
+                    stages.push(pal_messages_stage(
+                        Some(&batch.message_tally),
+                        &batch.message_errors,
+                        pal_started.elapsed().as_millis(),
+                    ));
                 }
                 Some(err) => {
                     stages.push(StageReport::decompile_failed(
@@ -4677,6 +4948,11 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         &batch.pal_errors,
                         pal_started.elapsed().as_millis(),
                     ));
+                    stages.push(pal_messages_stage(
+                        Some(&batch.message_tally),
+                        &batch.message_errors,
+                        pal_started.elapsed().as_millis(),
+                    ));
                 }
             }
             Some(rep)
@@ -4691,6 +4967,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             // The failed decompile command owns the failure (e.g. malformed
             // PAL generation); the PAL stage defers to it.
             stages.push(pal_tasks_stage(None, &[], 0));
+            stages.push(pal_messages_stage(None, &[], 0));
             None
         }
     };
@@ -5451,6 +5728,7 @@ mod tests {
             scatter,
             exception,
             tasks,
+            messages: decompile::RuntimeMessageState::Unmanaged,
         }
     }
 
@@ -9558,6 +9836,7 @@ mod tests {
                         scatter: MarshalComponentOutcome::Unmanaged,
                         exception: ExceptionMarshalStatus::Absent,
                         pal: MarshalComponentOutcome::Unmanaged,
+                        messages: MarshalComponentOutcome::Unmanaged,
                         symbolication: None,
                     })
                 }
@@ -9629,6 +9908,7 @@ mod tests {
                 },
                 exception: ExceptionMarshalStatus::Unmanaged,
                 pal: MarshalComponentOutcome::Unmanaged,
+                messages: MarshalComponentOutcome::Unmanaged,
                 symbolication: (index == 1).then(|| Ok(test_symbolication_context("01_MAIN"))),
             })
         });
@@ -9661,6 +9941,7 @@ mod tests {
                 scatter: MarshalComponentOutcome::Unmanaged,
                 exception: ExceptionMarshalStatus::Unmanaged,
                 pal: MarshalComponentOutcome::Unmanaged,
+                messages: MarshalComponentOutcome::Unmanaged,
                 symbolication: None,
             })
         });
@@ -9737,6 +10018,7 @@ mod tests {
                     scatter: MarshalComponentOutcome::Unmanaged,
                     exception,
                     pal: MarshalComponentOutcome::Unmanaged,
+                    messages: MarshalComponentOutcome::Unmanaged,
                     symbolication: None,
                 })
             },
@@ -10400,6 +10682,83 @@ mod tests {
         )
         .unwrap();
         assert!(!images.join(label).join("pal_tasks").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pal_messages_marshal_honors_explicit_state() {
+        let root = pal_temp_root("messages_marshal_states");
+        let ghidra = root.join("ghidra");
+        let images = root.join("images");
+        let label = "02_MAIN";
+        let image_bytes = crate::pal_messages::test_support::craft_discoverable_main_image();
+        let base = crate::pal_messages::test_support::BASE;
+        let runtime = crate::runtime_image::RuntimeImage::from_plan(&image_bytes, base, None)
+            .expect("raw fixture runtime");
+        let plan = crate::pal_messages::discover(&runtime, label)
+            .expect("fixture discovery succeeds")
+            .expect("fixture has a discoverable table");
+        let context = crate::pal_messages::MessageArtifactContext {
+            label,
+            image_blake3: *blake3::hash(&image_bytes).as_bytes(),
+            scatter_load_map_blake3: None,
+        };
+        let map = crate::pal_messages::materialize(&plan, context, &ghidra)
+            .expect("fixture materializes");
+        let manifest_bytes = std::fs::read(
+            ghidra
+                .join("pal_messages")
+                .join(label)
+                .join("messages.json"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(ghidra.join("images")).unwrap();
+        std::fs::write(ghidra.join("images").join(label), &image_bytes).unwrap();
+        let old = images.join(label).join("pal_messages");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("messages.json"), b"old complete terminal bytes").unwrap();
+        std::fs::rename(
+            ghidra.join("images").join(label),
+            images.join(label).join(format!("{label}.bin")),
+        )
+        .unwrap();
+
+        marshal_pal_messages(
+            &ghidra,
+            &images,
+            label,
+            &decompile::RuntimeMessageState::Present(map.clone()),
+            base,
+            decompile::RuntimeScatterState::Absent,
+        )
+        .unwrap();
+        let terminal = images
+            .join(label)
+            .join("pal_messages")
+            .join("messages.json");
+        assert_eq!(std::fs::read(&terminal).unwrap(), manifest_bytes);
+
+        marshal_pal_messages(
+            &ghidra,
+            &images,
+            label,
+            &decompile::RuntimeMessageState::Unmanaged,
+            base,
+            decompile::RuntimeScatterState::Absent,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&terminal).unwrap(), manifest_bytes);
+
+        marshal_pal_messages(
+            &ghidra,
+            &images,
+            label,
+            &decompile::RuntimeMessageState::Absent,
+            base,
+            decompile::RuntimeScatterState::Absent,
+        )
+        .unwrap();
+        assert!(!terminal.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11655,6 +12014,12 @@ mod tests {
             b"{\"format\":\"pixel-modem-extractor-startup-metadata-v1\"}",
         )
         .unwrap();
+        std::fs::create_dir_all(out.join("images/02_MAIN/pal_messages")).unwrap();
+        std::fs::write(
+            out.join("images/02_MAIN/pal_messages/messages.json"),
+            b"{\"format\":\"pixel-modem-extractor-pal-messages-v1\"}",
+        )
+        .unwrap();
         std::fs::create_dir_all(out.join("rf").join("decoded")).unwrap();
         std::fs::create_dir_all(out.join("tokens")).unwrap();
         std::fs::write(out.join("manifest.json"), b"{}").unwrap();
@@ -11717,6 +12082,11 @@ mod tests {
             std::fs::read(out.join("images/02_MAIN/startup_metadata/startup.json")).unwrap(),
             b"{\"format\":\"pixel-modem-extractor-startup-metadata-v1\"}",
             "the startup-metadata manifest is a retained leaf"
+        );
+        assert_eq!(
+            std::fs::read(out.join("images/02_MAIN/pal_messages/messages.json")).unwrap(),
+            b"{\"format\":\"pixel-modem-extractor-pal-messages-v1\"}",
+            "the PAL messages manifest is a retained leaf"
         );
         assert!(out.join("rf").join("decoded").exists());
         assert!(out.join("tokens").exists());
