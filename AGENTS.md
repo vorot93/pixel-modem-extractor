@@ -108,6 +108,15 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   **Runtime PAL task inventory** below for the commands, the digest-population procedure, and
   the gating test (`no_corpus_environment_skips_independently`) that proves each leg skips
   only on unset/missing input.
+- **Private-corpus PAL messages goldens** (`tests/pal_messages_golden.rs`) consume those same
+  independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load `0x40010000`
+  through production scatter + `pal_messages` generation. Pins (setup entry/ISA, table
+  base/stride/capacity, slot count, named roots, `manifest_blake3`) are empty sentinels until a
+  lawful first run prints `PIN OBSERVED` and those values are copied. Only an unset variable
+  skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test pal_messages_golden -- --nocapture`.
+  Never infer a corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
+  legs PASS with copied pins. No Ghidra legs.
 - **Private-corpus exception-root goldens** (`tests/exception_roots_golden.rs`) consume those
   same independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load
   `0x40010000` through production runtime generation, materialization, and strict on-disk reading:
@@ -315,7 +324,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `gzip.rs` | Gunzip the `RF_CFG_*` calibration blobs |
 | `toc.rs` | `modem.bin` TOC parse + split into the model-dependent embedded images |
 | `classify.rs` | 5-test opaque battery — whole-image H, χ²/df, serial correlation, 64-KiB window entropies; unanimous fail-closed verdict |
-| `semantic_cfg.rs` | Shared bounded A32/T32 direct-edge CFG, compact dominance, typed handoffs, and exact must-value dataflow used by PAL, exception roots, and startup metadata |
+| `semantic_cfg.rs` | Shared bounded A32/T32 direct-edge CFG, compact dominance, typed handoffs, and exact must-value dataflow used by PAL, exception roots, startup metadata, and pal_messages |
 | `scatter/mod.rs` | Semantic A32 scatter discovery, exact bounded-table classification, and checked runtime planning |
 | `scatter/decompress.rs` | Strict corpus-validated `decompress1` decoder and cumulative decode-work budget |
 | `scatter/artifact.rs` | Deterministic load-map manifest/payload materialization and staged publication |
@@ -332,6 +341,10 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `pal_tasks/discover.rs` | Bounded anchor sweep, unique-prologue root selection, initializer proofs (loop/guard/suffix/slot base) |
 | `pal_tasks/table.rs` | Slot parsing, descriptor-v1 field relationships, and the deterministic application/label allocator |
 | `pal_tasks/artifact.rs` | Canonical authenticated v1 task manifest: serialize, strict typed reader, materialize, and clear |
+| `pal_messages/mod.rs` | PAL messaging types, named limits, unique `PAL_MSG_MAX_ENTITY_COUNT` seed, and the discover/materialize/read/clear boundary |
+| `pal_messages/discover.rs` | Unique C-string seed, PAL-style ADR/literal/MOVW+MOVT refs, one initializer proof |
+| `pal_messages/table.rs` | Raw hashed descriptor slots under the shared validation budget |
+| `pal_messages/artifact.rs` | Canonical authenticated v1 `messages.json`: serialize, strict reader, materialize, and leaf-only clear |
 | `dbt_traces/mod.rs` | DBT debug-trace limits, `DbtTraceError`, standalone `decode-traces` run (this-run scatter bind only) |
 | `dbt_traces/discover.rs` | `DBT:` sweep, threshold, quarantine, record-spill staging |
 | `dbt_traces/artifact.rs` | Five-table catalog serialize, staging rename, identity |
@@ -678,7 +691,9 @@ module; when a file outgrows that, split it.
       cargo test exception_roots:: -- --nocapture
       cargo test semantic_cfg:: -- --nocapture
       cargo test pal_tasks:: -- --nocapture
+      cargo test pal_messages:: -- --nocapture
       cargo test startup_metadata:: -- --nocapture
+      cargo test --test pal_messages_golden -- --nocapture
       cargo test --test exception_roots_golden -- --nocapture --test-threads=1
       cargo test --test startup_metadata_golden -- --nocapture
       GHIDRA_INSTALL_DIR=/opt/ghidra cargo test --test decompile_golden \
@@ -1136,6 +1151,16 @@ hardcoded. Two reference images exercise both models end-to-end:
         cargo test --test pal_tasks_golden no_corpus_environment_skips_independently \
         -- --exact --nocapture --test-threads=1
 
+- **Private-corpus PAL messages goldens** (`tests/pal_messages_golden.rs`) consume those same
+  independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load `0x40010000`
+  through production scatter + `pal_messages` generation. Pins (setup entry/ISA, table
+  base/stride/capacity, slot count, named roots, `manifest_blake3`) are empty sentinels until a
+  lawful first run prints `PIN OBSERVED` and those values are copied. Only an unset variable
+  skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test pal_messages_golden -- --nocapture`.
+  Never infer a corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
+  legs PASS with copied pins. No Ghidra legs.
+
   The `manifest_blake3` / `metadata_blake3` pins commit no names or firmware bytes, so they
   are population points: run once with the corpus, copy the digests the unpopulated pins print,
   and every later run enforces them. Never infer a corpus pass from a clean env-gated skip.
@@ -1152,6 +1177,25 @@ hardcoded. Two reference images exercise both models end-to-end:
   evidence, never validity), fixed per-model addresses or strides, raw shape scanning, byte
   signatures for the loader, and any artifact-only or opt-in seeding fallback (a MAIN either
   proves its initializer or the command fails; it never ships half-seeded).
+
+### Runtime PAL messaging inventory
+
+- **Discovery is generation-time, MAIN-only, and default-on.** After MAIN PAL, generation
+  searches for a unique `PAL_MSG_MAX_ENTITY_COUNT` C-string (same containing-string walk as
+  startup). Materialization is PAL-style (`ADR` / PC-relative literal / `MOVW`/`MOVT`). One
+  initializer proof must yield unique exact capacity, table base, and unused Immediate stride;
+  first-slot unreadable is clean `Ok(None)`; later slot failure is Malformed/Runtime; several
+  complete survivors are Ambiguous. The published sidecar is evidence-only: hashed raw descriptor
+  slots, no entity/queue/route graph, no Ghidra apply script, no export-v5 token.
+- **Rejected approaches, keep rejecting them.** Xref-count, adjacency, `dm_TraceMsg` threshold,
+  and analyzer inventories are never validity. Do not mint `pal_MsgSendTo` / `dm_TraceMsg`
+  strings as primaries. Optional `msg_send` / `que_init` stay omitted unless uniquely proven.
+- **Terminal leaf.** Generation writes `pal_messages/<label>/messages.json`; `decompose` marshals
+  to `images/<label>/pal_messages/messages.json` (Present replace, Absent clear leaf, failed
+  preserve). `--prune` retains it. Format `pixel-modem-extractor-pal-messages-v1`. Identity
+  `v1:<manifest-blake3>:1:<slots>`. Stage `pal_messages` follows `pal_tasks`.
+- **Corpus pins stay empty until copied.** `tests/pal_messages_golden.rs` prints `PIN OBSERVED`
+  on a lawful first run. Do not call Phase 4 landed until both MAIN legs PASS with copied pins.
 
 ### Runtime startup metadata
 
