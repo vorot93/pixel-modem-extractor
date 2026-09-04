@@ -33,13 +33,13 @@ const S5400: CorpusPin = CorpusPin {
     stack_guard_seed: true,
     rvct_seed: true,
     shannon_os_seed: false,
-    hardware_init: "",
-    stack_guard: "",
-    compiler: "",
-    privileged_ops: None,
-    named_roots: None,
-    no_return_roots: None,
-    manifest_blake3: "",
+    hardware_init: "absent",
+    stack_guard: "present",
+    compiler: "present",
+    privileged_ops: Some(481),
+    named_roots: Some(1),
+    no_return_roots: Some(0),
+    manifest_blake3: "d79072dd2f2d65256928f518668bcf879761cd003005fbfd45cc1e38b2c1f78d",
 };
 
 const S5300: CorpusPin = CorpusPin {
@@ -50,13 +50,13 @@ const S5300: CorpusPin = CorpusPin {
     stack_guard_seed: true,
     rvct_seed: true,
     shannon_os_seed: false,
-    hardware_init: "",
-    stack_guard: "",
-    compiler: "",
-    privileged_ops: None,
-    named_roots: None,
-    no_return_roots: None,
-    manifest_blake3: "",
+    hardware_init: "absent",
+    stack_guard: "present",
+    compiler: "absent",
+    privileged_ops: Some(308),
+    named_roots: Some(1),
+    no_return_roots: Some(0),
+    manifest_blake3: "c4699d4ff87399843b72b0a5026e6cc232e3f1596f7f0dce94bff0e536facda8",
 };
 
 #[test]

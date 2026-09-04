@@ -160,7 +160,7 @@ no-evidence on both retained MAIN images. Inventory membership is the scan domai
 validity. Ghidra and Thumb records at the same `(entry, decode ISA)` are one named-root container
 (Ghidra preferred). A function whose local CFG cannot be decoded is skipped during that sweep and is not an
 image failure. A section that crosses plausibility and then fails fails the whole image artifact; later
-images continue. Do not call Phase 3B landed until inventory-gated corpus pins are populated.
+images continue.
 
 A successful discovery publishes `startup_metadata/<label>/startup.json` in a standalone `--run` kit
 and `images/<label>/startup_metadata/startup.json` under `decompose` (retained by `--prune`). Format

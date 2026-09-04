@@ -668,9 +668,9 @@ module; when a file outgrows that, split it.
   uninterpreted RVCT operands, and privileged-operation evidence — and remains architecturally
   separate from immutable pre-analysis Phase 3A. That 3A acceptance emitted export-v4; this tree
   emits export-v5. Present startup is a pass-2 scheduling reason even with empty applications and
-  no recovered names; `functions.json` / blake3 then come from the terminal snapshot. Do not call
-  3B landed until inventory-gated corpus pins are populated or explicitly still-unrun. Phase 4
-  follows 3B.
+  no recovered names; `functions.json` / blake3 then come from the terminal snapshot. Phase 3B
+  corpus pins are populated (2026-09-04): both MAIN images publish stack_guard Present with
+  unproven no-return, honest hardware_init Absent, and S5400-only RVCT Present. Phase 4 follows 3B.
 - **Focused verification is explicit.** Run exception discovery/artifact/CFG/PAL/startup unit
   batteries, both independently configured corpus legs, focused serial real-Ghidra tests (not the
   full `decompile_golden` binary in parallel), and the retained-tree report-shape gate:
@@ -1211,10 +1211,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   the same None-versus-Some(0) rule as exception application. Re-apply after
   `refresh_decompile_stage_images` the same way global-shapes outcomes survive that rebuild.
 - **Corpus pins stay honest.** Both retained MAIN images have unique warm-boot / stack-guard /
-  RVCT seeds and no `_ShannonOS_`. Inventory-gated statuses, counts, identity, and manifest
-  BLAKE3 remain empty sentinels until `PIN OBSERVED` is copied from a lawful first run. Unique
-  seeds are not named roots: the 2026-08-27 probe did not close hardware-init reset reachability
-  or stack-handler non-return. Never infer a corpus pass from an unset-variable skip.
+  RVCT seeds and no `_ShannonOS_`. Inventory-gated pins (2026-09-04): hardware_init `absent` on
+  both; stack_guard `present` (no-return unproven); compiler `present` on S5400 / `absent` on
+  S5300; privileged_ops 481 / 308; named_roots 1; no_return_roots 0. Unique seeds are not named
+  roots. Never infer a corpus pass from an unset-variable skip.
 - **Rejected approaches, keep rejecting them.** Pre-analysis function creation, re-enabling
   Repair Flow Damage, string-only `hw_Init` without reset reachability, applying no-return
   during analysis, publishing proven sections while another section is malformed, MPU permission
