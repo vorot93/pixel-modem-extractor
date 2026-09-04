@@ -99,9 +99,18 @@ fn assert_corpus(pins: &CorpusPin) {
     assert_eq!(spec["images"].as_array().unwrap().len(), 1);
 
     let manifest_path = out.join(&expected_relative);
+    if !manifest_path.is_file() {
+        eprintln!("PIN OBSERVED: {} status=absent", pins.env_var);
+        assert!(
+            pins.manifest_blake3.is_empty(),
+            "{} generation was clean absence but a Present pin is populated",
+            pins.env_var
+        );
+        return;
+    }
     let manifest_bytes = fs::read(&manifest_path).unwrap_or_else(|error| {
         panic!(
-            "{} did not publish {}: {error}",
+            "{} could not read {}: {error}",
             pins.env_var,
             manifest_path.display()
         )

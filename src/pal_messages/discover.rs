@@ -1,9 +1,10 @@
 use super::{
-    MAX_CSTRING_BYTES, MAX_TABLE_CAPACITY, MAX_TABLE_STRIDE, MessagePlan, PalMessageError, SEED,
+    MAX_CSTRING_BYTES, MAX_MOVW_MOVT_SPAN_INSTRUCTIONS, MAX_TABLE_CAPACITY, MAX_TABLE_STRIDE,
+    MessagePlan, PalMessageError, SEED,
 };
 use crate::arm32::{
-    AccessKind, AddressBase, AddressOffset, DecodedInstruction, ValueEffect, ValueExpr, visible_pc,
-    wrapping_offset,
+    AccessKind, AddressBase, AddressOffset, ControlFlow, DecodedInstruction, ItRangeState,
+    Register, ValueEffect, ValueExpr, decode_a32, decode_t32, visible_pc, wrapping_offset,
 };
 use crate::execution_ranges::DecodeIsa;
 use crate::runtime_image::{ByteBackedRange, MAX_EXACT_READ, RuntimeImage};
@@ -57,75 +58,177 @@ pub(crate) fn semantic_refs(
     let mut refs = Vec::new();
     let mut seen = BTreeSet::new();
     for range in runtime.byte_backed_ranges() {
-        let mut pc = range.start & !3;
-        if pc < range.start {
-            pc = pc.saturating_add(4);
-        }
-        while pc.saturating_add(4) <= range.end {
-            if let Ok(cfg) = SemanticCfg::decode_with_address_window(
-                runtime,
-                pc,
-                DecodeIsa::Arm,
-                pal_message_cfg_limits(),
-                CallPolicy::Fallthrough,
-                Some(512),
-            ) {
-                collect_refs_from_cfg(
-                    &cfg,
-                    runtime,
-                    pc,
-                    DecodeIsa::Arm,
-                    string_start,
-                    &mut seen,
-                    &mut refs,
-                );
-            }
-            pc = match pc.checked_add(4) {
-                Some(next) => next,
-                None => break,
-            };
-        }
+        scan_isa(
+            runtime,
+            range,
+            DecodeIsa::Arm,
+            4,
+            string_start,
+            &mut seen,
+            &mut refs,
+        )?;
+        scan_isa(
+            runtime,
+            range,
+            DecodeIsa::Thumb,
+            2,
+            string_start,
+            &mut seen,
+            &mut refs,
+        )?;
     }
     Ok(refs)
 }
 
-fn collect_refs_from_cfg(
-    cfg: &SemanticCfg,
+fn scan_isa(
     runtime: &RuntimeImage<'_>,
-    entry: u32,
+    range: ByteBackedRange,
     isa: DecodeIsa,
+    step: u32,
     string_start: u32,
     seen: &mut BTreeSet<u32>,
     refs: &mut Vec<SemanticRef>,
-) {
-    for state in cfg.exact_register_states().values() {
-        for (_, value) in state.iter() {
-            if value.value != string_start {
-                continue;
-            }
-            let Some(pc) = value.root() else {
-                continue;
-            };
-            let Some(definition) = value.definition() else {
-                continue;
-            };
-            let Some(instruction) = cfg.instructions().get(&definition) else {
-                continue;
-            };
-            if !is_pal_materialization(instruction, string_start, runtime) {
-                continue;
-            }
-            if !seen.insert(pc) {
-                continue;
-            }
-            refs.push(SemanticRef {
-                entry,
-                isa,
-                pc,
-                address: string_start,
-            });
+) -> Result<(), PalMessageError> {
+    let mask = step.wrapping_sub(1);
+    let mut pc = range.start & !mask;
+    if pc < range.start {
+        pc = match pc.checked_add(step) {
+            Some(next) => next,
+            None => return Ok(()),
+        };
+    }
+    while pc.saturating_add(step) <= range.end {
+        if let Some(instruction) = decode_at(runtime, pc, isa)
+            && let Some(reference) = materialization_ref(runtime, &instruction, isa, string_start)
+            && seen.insert(reference.pc)
+        {
+            refs.push(reference);
+        }
+        pc = match pc.checked_add(step) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    Ok(())
+}
+
+fn decode_at(runtime: &RuntimeImage<'_>, pc: u32, isa: DecodeIsa) -> Option<DecodedInstruction> {
+    let bytes = runtime.read_exact(pc, 4).ok()?;
+    match isa {
+        DecodeIsa::Arm => decode_a32(pc, bytes.as_ref()).ok(),
+        DecodeIsa::Thumb => {
+            let mut it = ItRangeState::default();
+            decode_t32(&mut it, pc, bytes.as_ref()).ok()
         }
     }
+}
+
+fn materialization_ref(
+    runtime: &RuntimeImage<'_>,
+    instruction: &DecodedInstruction,
+    isa: DecodeIsa,
+    string_start: u32,
+) -> Option<SemanticRef> {
+    if is_direct_materialization(instruction, string_start, runtime) {
+        return Some(SemanticRef {
+            entry: instruction.pc,
+            isa,
+            pc: instruction.pc,
+            address: string_start,
+        });
+    }
+    let ValueEffect::RegisterWrite {
+        dst,
+        value: ValueExpr::Immediate(low),
+    } = instruction.effect
+    else {
+        return None;
+    };
+    if low != (string_start & 0xffff) || string_start <= 0xffff {
+        return None;
+    }
+    if !movw_movt_completes(runtime, instruction, dst, low, isa, string_start) {
+        return None;
+    }
+    Some(SemanticRef {
+        entry: instruction.pc,
+        isa,
+        pc: instruction.pc,
+        address: string_start,
+    })
+}
+
+fn is_direct_materialization(
+    instruction: &DecodedInstruction,
+    string_start: u32,
+    runtime: &RuntimeImage<'_>,
+) -> bool {
+    match &instruction.effect {
+        ValueEffect::RegisterWrite {
+            value:
+                ValueExpr::ArchitecturalPc {
+                    addend,
+                    align_to_four,
+                },
+            ..
+        } => wrapping_offset(visible_pc(instruction.pc, *align_to_four), *addend) == string_start,
+        ValueEffect::RegisterWrite {
+            value: ValueExpr::Immediate(value),
+            ..
+        } => *value == string_start,
+        ValueEffect::LiteralWordLoad { address, .. } => {
+            let crate::arm32::AddressExpr {
+                base: AddressBase::ArchitecturalPc { align_to_four },
+                offset: AddressOffset::Immediate(offset),
+            } = address
+            else {
+                return false;
+            };
+            let literal = wrapping_offset(visible_pc(instruction.pc, *align_to_four), *offset);
+            runtime.read_u32(literal).ok() == Some(string_start)
+        }
+        _ => false,
+    }
+}
+
+fn movw_movt_completes(
+    runtime: &RuntimeImage<'_>,
+    movw: &DecodedInstruction,
+    destination: Register,
+    low: u32,
+    isa: DecodeIsa,
+    string_start: u32,
+) -> bool {
+    let Some(mut pc) = movw.pc.checked_add(u32::from(movw.length)) else {
+        return false;
+    };
+    let mut remaining = MAX_MOVW_MOVT_SPAN_INSTRUCTIONS.saturating_sub(1);
+    while remaining > 0 {
+        remaining -= 1;
+        let Some(instruction) = decode_at(runtime, pc, isa) else {
+            return false;
+        };
+        if !matches!(instruction.flow, ControlFlow::Linear) {
+            return false;
+        }
+        if let ValueEffect::RegisterWrite {
+            dst,
+            value: ValueExpr::ReplaceHighHalf { source, high },
+        } = instruction.effect
+            && dst == destination
+            && source == destination
+        {
+            return (u32::from(high) << 16) | (low & 0xffff) == string_start;
+        }
+        if instruction.writes.contains(&destination) {
+            return false;
+        }
+        let Some(next) = pc.checked_add(u32::from(instruction.length)) else {
+            return false;
+        };
+        pc = next;
+    }
+    false
 }
 
 fn prove_plan(
@@ -266,43 +369,6 @@ fn unique_value(values: &BTreeSet<u32>) -> Option<u32> {
         None
     } else {
         Some(first)
-    }
-}
-
-fn is_pal_materialization(
-    instruction: &DecodedInstruction,
-    string_start: u32,
-    runtime: &RuntimeImage<'_>,
-) -> bool {
-    match &instruction.effect {
-        ValueEffect::RegisterWrite {
-            value:
-                ValueExpr::ArchitecturalPc {
-                    addend,
-                    align_to_four,
-                },
-            ..
-        } => wrapping_offset(visible_pc(instruction.pc, *align_to_four), *addend) == string_start,
-        ValueEffect::RegisterWrite {
-            value: ValueExpr::Immediate(value),
-            ..
-        } => *value == string_start,
-        ValueEffect::RegisterWrite {
-            value: ValueExpr::ReplaceHighHalf { .. },
-            ..
-        } => true,
-        ValueEffect::LiteralWordLoad { address, .. } => {
-            let crate::arm32::AddressExpr {
-                base: AddressBase::ArchitecturalPc { align_to_four },
-                offset: AddressOffset::Immediate(offset),
-            } = address
-            else {
-                return false;
-            };
-            let literal = wrapping_offset(visible_pc(instruction.pc, *align_to_four), *offset);
-            runtime.read_u32(literal).ok() == Some(string_start)
-        }
-        _ => false,
     }
 }
 
@@ -550,6 +616,23 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].pc, BASE);
         assert_eq!(refs[0].address, seed.string_start);
+    }
+
+    #[test]
+    fn movw_movt_materialization_is_a_ref() {
+        let mut image = vec![0u8; 0x40];
+        let string_off = 0x20;
+        image[string_off..string_off + SEED.len()].copy_from_slice(SEED);
+        image[string_off + SEED.len()] = 0;
+        let string_start = BASE + string_off as u32;
+        image[0..4].copy_from_slice(&a32_movw(0, (string_start & 0xffff) as u16));
+        image[4..8].copy_from_slice(&a32_movt(0, (string_start >> 16) as u16));
+        image[8..12].copy_from_slice(&A32_BX_LR);
+        let runtime = runtime(&image);
+        let refs = super::semantic_refs(&runtime, string_start).expect("refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].pc, BASE);
+        assert_eq!(refs[0].address, string_start);
     }
 
     #[test]

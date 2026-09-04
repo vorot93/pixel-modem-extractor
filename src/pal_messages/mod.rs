@@ -19,6 +19,7 @@ pub(crate) const MAX_CSTRING_BYTES: usize = 128;
 pub(crate) const MAX_TABLE_CAPACITY: u32 = 4096;
 pub(crate) const MAX_TABLE_STRIDE: u32 = 64 * 1024;
 pub(crate) const MAX_CANDIDATE_VALIDATION_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_MOVW_MOVT_SPAN_INSTRUCTIONS: usize = 32;
 pub(crate) const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub(crate) const FORMAT: &str = "pixel-modem-extractor-pal-messages-v1";
 
