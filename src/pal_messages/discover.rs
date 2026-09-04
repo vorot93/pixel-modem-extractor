@@ -1,5 +1,12 @@
 use super::{MAX_CSTRING_BYTES, MessagePlan, PalMessageError, SEED};
+use crate::arm32::{
+    AddressBase, AddressOffset, DecodedInstruction, ValueEffect, ValueExpr, visible_pc,
+    wrapping_offset,
+};
+use crate::execution_ranges::DecodeIsa;
 use crate::runtime_image::{ByteBackedRange, MAX_EXACT_READ, RuntimeImage};
+use crate::semantic_cfg::{CallPolicy, CfgLimits, SemanticCfg};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SeedHit {
@@ -14,12 +21,135 @@ struct Occurrence {
     range: ByteBackedRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SemanticRef {
+    pub entry: u32,
+    pub isa: DecodeIsa,
+    pub pc: u32,
+    pub address: u32,
+}
+
+fn pal_message_cfg_limits() -> CfgLimits {
+    CfgLimits {
+        max_charged_bytes: 512,
+        max_instructions: 256,
+        max_blocks: 256,
+    }
+}
+
 pub(crate) fn discover(
     runtime: &RuntimeImage<'_>,
     _label: &str,
 ) -> Result<Option<MessagePlan>, PalMessageError> {
     let _ = find_unique_seed(runtime, SEED)?;
     Ok(None)
+}
+
+pub(crate) fn semantic_refs(
+    runtime: &RuntimeImage<'_>,
+    string_start: u32,
+) -> Result<Vec<SemanticRef>, PalMessageError> {
+    let mut refs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for range in runtime.byte_backed_ranges() {
+        let mut pc = range.start & !3;
+        if pc < range.start {
+            pc = pc.saturating_add(4);
+        }
+        while pc.saturating_add(4) <= range.end {
+            if let Ok(cfg) = SemanticCfg::decode_with_address_window(
+                runtime,
+                pc,
+                DecodeIsa::Arm,
+                pal_message_cfg_limits(),
+                CallPolicy::Fallthrough,
+                Some(512),
+            ) {
+                collect_refs_from_cfg(&cfg, runtime, pc, DecodeIsa::Arm, string_start, &mut seen, &mut refs);
+            }
+            pc = match pc.checked_add(4) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+    }
+    Ok(refs)
+}
+
+fn collect_refs_from_cfg(
+    cfg: &SemanticCfg,
+    runtime: &RuntimeImage<'_>,
+    entry: u32,
+    isa: DecodeIsa,
+    string_start: u32,
+    seen: &mut BTreeSet<u32>,
+    refs: &mut Vec<SemanticRef>,
+) {
+    for state in cfg.exact_register_states().values() {
+        for (_, value) in state.iter() {
+            if value.value != string_start {
+                continue;
+            }
+            let Some(pc) = value.root() else {
+                continue;
+            };
+            let Some(definition) = value.definition() else {
+                continue;
+            };
+            let Some(instruction) = cfg.instructions().get(&definition) else {
+                continue;
+            };
+            if !is_pal_materialization(instruction, string_start, runtime) {
+                continue;
+            }
+            if !seen.insert(pc) {
+                continue;
+            }
+            refs.push(SemanticRef {
+                entry,
+                isa,
+                pc,
+                address: string_start,
+            });
+        }
+    }
+}
+
+fn is_pal_materialization(
+    instruction: &DecodedInstruction,
+    string_start: u32,
+    runtime: &RuntimeImage<'_>,
+) -> bool {
+    match &instruction.effect {
+        ValueEffect::RegisterWrite {
+            value:
+                ValueExpr::ArchitecturalPc {
+                    addend,
+                    align_to_four,
+                },
+            ..
+        } => wrapping_offset(visible_pc(instruction.pc, *align_to_four), *addend) == string_start,
+        ValueEffect::RegisterWrite {
+            value: ValueExpr::Immediate(value),
+            ..
+        } => *value == string_start,
+        ValueEffect::RegisterWrite {
+            value: ValueExpr::ReplaceHighHalf { .. },
+            ..
+        } => true,
+        ValueEffect::LiteralWordLoad { address, .. } => {
+            let crate::arm32::AddressExpr {
+                base: AddressBase::ArchitecturalPc { align_to_four },
+                offset: AddressOffset::Immediate(offset),
+            } = address
+            else {
+                return false;
+            };
+            let literal = wrapping_offset(visible_pc(instruction.pc, *align_to_four), *offset);
+            runtime.read_u32(literal).ok() == Some(string_start)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn find_unique_seed(
@@ -233,5 +363,59 @@ mod tests {
             }
             other => panic!("expected non-printable, got {other:?}"),
         }
+    }
+
+    const A32_ADD_R0_PC_8: [u8; 4] = [0x08, 0x00, 0x8f, 0xe2];
+    const A32_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
+
+    fn a32_movw(rd: u8, imm16: u16) -> [u8; 4] {
+        let imm4 = u32::from(imm16) >> 12;
+        let imm12 = u32::from(imm16) & 0xfff;
+        (0xe300_0000 | (imm4 << 16) | (u32::from(rd) << 12) | imm12).to_le_bytes()
+    }
+
+    fn a32_movt(rd: u8, imm16: u16) -> [u8; 4] {
+        let imm4 = u32::from(imm16) >> 12;
+        let imm12 = u32::from(imm16) & 0xfff;
+        (0xe340_0000 | (imm4 << 16) | (u32::from(rd) << 12) | imm12).to_le_bytes()
+    }
+
+    #[test]
+    fn adr_materialization_is_a_ref() {
+        let mut image = vec![0u8; 0x40];
+        image[0..4].copy_from_slice(&A32_ADD_R0_PC_8);
+        image[4..8].copy_from_slice(&A32_BX_LR);
+        let string_off = 0x10;
+        image[string_off..string_off + SEED.len()].copy_from_slice(SEED);
+        image[string_off + SEED.len()] = 0;
+        let runtime = runtime(&image);
+        let seed = find_unique_seed(&runtime, SEED)
+            .expect("unique")
+            .expect("present");
+        let refs = super::semantic_refs(&runtime, seed.string_start).expect("refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].pc, BASE);
+        assert_eq!(refs[0].address, seed.string_start);
+    }
+
+    #[test]
+    fn add_immediate_after_movw_movt_is_not_a_ref() {
+        let mut image = vec![0u8; 0x40];
+        let string_off = 0x20;
+        image[string_off..string_off + SEED.len()].copy_from_slice(SEED);
+        image[string_off + SEED.len()] = 0;
+        let string_start = BASE + string_off as u32;
+        let low = (string_start.wrapping_sub(4) & 0xffff) as u16;
+        let high = (string_start.wrapping_sub(4) >> 16) as u16;
+        image[0..4].copy_from_slice(&a32_movw(0, low));
+        image[4..8].copy_from_slice(&a32_movt(0, high));
+        image[8..12].copy_from_slice(&[0x04, 0x00, 0x80, 0xe2]);
+        image[12..16].copy_from_slice(&A32_BX_LR);
+        let runtime = runtime(&image);
+        let seed = find_unique_seed(&runtime, SEED)
+            .expect("unique")
+            .expect("present");
+        let refs = super::semantic_refs(&runtime, seed.string_start).expect("refs");
+        assert!(refs.is_empty(), "ADD after MOVW/MOVT must not be a ref: {refs:?}");
     }
 }
