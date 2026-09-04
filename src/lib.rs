@@ -22,6 +22,8 @@ pub mod hwcfg;
 pub mod manifest;
 pub mod model;
 #[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod pal_messages;
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod pal_tasks;
 pub mod pipeline;
 pub mod recover_source;

@@ -49,6 +49,8 @@ pub enum Error {
     BadTokenDb(String),
     #[error("bad PAL task evidence: {0}")]
     BadPalTasks(String),
+    #[error("bad PAL messages: {0}")]
+    BadPalMessages(String),
     #[error("dbt trace analysis failed: {0}")]
     BadDbtTraces(String),
     #[error("bad exception-root evidence: {0}")]
