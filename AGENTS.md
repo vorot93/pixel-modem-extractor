@@ -116,7 +116,8 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path with
   `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test pal_messages_golden -- --nocapture`.
   Never infer a corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
-  legs PASS with copied pins. No Ghidra legs.
+  legs PASS with copied pins from a real initializer. Do not copy Present pins from the
+  log/SVC `DST SIZE is OVER …` sites. No Ghidra legs.
 - **Private-corpus exception-root goldens** (`tests/exception_roots_golden.rs`) consume those
   same independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load
   `0x40010000` through production runtime generation, materialization, and strict on-disk reading:
@@ -1159,7 +1160,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path with
   `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test pal_messages_golden -- --nocapture`.
   Never infer a corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
-  legs PASS with copied pins. No Ghidra legs.
+  legs PASS with copied pins from a real initializer. Do not copy Present pins from the
+  log/SVC `DST SIZE is OVER …` sites. No Ghidra legs.
 
   The `manifest_blake3` / `metadata_blake3` pins commit no names or firmware bytes, so they
   are population points: run once with the corpus, copy the digests the unpopulated pins print,
@@ -1187,6 +1189,13 @@ hardcoded. Two reference images exercise both models end-to-end:
   first-slot unreadable is clean `Ok(None)`; later slot failure is Malformed/Runtime; several
   complete survivors are Ambiguous. The published sidecar is evidence-only: hashed raw descriptor
   slots, no entity/queue/route graph, no Ghidra apply script, no export-v5 token.
+- **Both retained MAIN images are honest `Ok(None)` (2026-09-05).** The unique hit is the log
+  format `DST SIZE is OVER PAL_MSG_MAX_ENTITY_COUNT` (len 42, needle at +17). No literal pool
+  and no ADR/A32 MOVW of `string_start` or the needle. The only Thumb `MOVW`/`MOVT` pair that
+  completes that address spans `stmdb`/`dmb`/`svc #1`/`dmb`/`ldmia` then `str`/`bl` — two
+  identical log/SVC trampoline sites per model. `SVC` is not Linear, so v1 correctly yields
+  zero refs. Do not admit SVC-spanning pairs (that would be Ambiguous log sites, not a setup),
+  do not retarget needle/interior offsets, and do not switch seeds in this increment.
 - **Rejected approaches, keep rejecting them.** Xref-count, adjacency, `dm_TraceMsg` threshold,
   and analyzer inventories are never validity. Do not mint `pal_MsgSendTo` / `dm_TraceMsg`
   strings as primaries. Optional `msg_send` / `que_init` stay omitted unless uniquely proven.
@@ -1195,7 +1204,8 @@ hardcoded. Two reference images exercise both models end-to-end:
   preserve). `--prune` retains it. Format `pixel-modem-extractor-pal-messages-v1`. Identity
   `v1:<manifest-blake3>:1:<slots>`. Stage `pal_messages` follows `pal_tasks`.
 - **Corpus pins stay empty until copied.** `tests/pal_messages_golden.rs` prints `PIN OBSERVED`
-  on a lawful first run. Do not call Phase 4 landed until both MAIN legs PASS with copied pins.
+  on a lawful first run. Do not copy Present pins from the log/SVC sites above. Do not call
+  Phase 4 landed until both MAIN legs PASS with copied pins from a real initializer.
 
 ### Runtime startup metadata
 
