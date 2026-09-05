@@ -2459,6 +2459,7 @@ pub struct Pass2MapBundle {
     /// recovery.
     pub function_names: HashMap<String, String>,
     pub evidence_name_projection: crate::globals::FunctionEvidenceNameProjection,
+    pub(crate) ss: SsReport,
 }
 
 /// Build the ranked symbol set for one image and write its strict pass-2 map
@@ -2516,7 +2517,7 @@ pub(crate) fn prepare_pass2_symbol_map_from_runtime(
     exception_application: Option<&ExceptionPass2Context>,
     pal_application: Option<&PalPass2Context>,
 ) -> Result<Pass2MapBundle> {
-    let (symbols, _) = build_map_from_runtime(
+    let (symbols, ss) = build_map_from_runtime(
         image_dir,
         tokens,
         image_bytes,
@@ -2554,6 +2555,7 @@ pub(crate) fn prepare_pass2_symbol_map_from_runtime(
         symbols,
         function_names,
         evidence_name_projection,
+        ss,
     })
 }
 
@@ -3197,13 +3199,119 @@ pub(crate) struct SsReport {
 }
 
 impl SsReport {
-    const fn absent() -> Self {
+    pub(crate) const fn absent() -> Self {
         Self {
             recovered: None,
             conflicts: None,
             error: None,
         }
     }
+}
+
+impl Default for SsReport {
+    fn default() -> Self {
+        Self::absent()
+    }
+}
+
+/// Inventory-free helper proof plus optional inventory-gated 1:1 counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsCorpusReport {
+    pub helper_entry: Option<String>,
+    pub helper_isa: Option<String>,
+    pub callsites: Option<usize>,
+    pub recovered: Option<usize>,
+    pub conflicts: Option<usize>,
+    pub error: Option<String>,
+}
+
+fn ss_isa_name(isa: DecodeIsa) -> &'static str {
+    match isa {
+        DecodeIsa::Arm => "arm",
+        DecodeIsa::Thumb => "thumb",
+    }
+}
+
+/// Scatter-backed ss discovery for private-corpus goldens.
+///
+/// Without `inventories_dir`, recovered/conflicts stay unset (the 1:1 naming
+/// leg is skipped) while helper entry/ISA and callsite count still pin.
+pub fn generate_ss_names_corpus(
+    raw: &[u8],
+    image_base: u32,
+    inventories_dir: Option<&Path>,
+) -> Result<SsCorpusReport> {
+    let scatter_plan = crate::scatter::discover(raw, image_base)
+        .map_err(|error| Error::BadScatter(error.to_string()))?;
+    let runtime = RuntimeImage::from_plan(raw, image_base, scatter_plan.as_ref())?;
+    let (containers, global_names, fn_names) = match inventories_dir {
+        Some(dir) => load_ss_corpus_inventories(dir, &runtime)?,
+        None => (Vec::new(), HashSet::new(), HashSet::new()),
+    };
+    let gated = inventories_dir.is_some();
+    Ok(
+        match ss::discover(&runtime, &containers, &global_names, &fn_names) {
+            ss::SsOutcome::Absent => SsCorpusReport {
+                helper_entry: None,
+                helper_isa: None,
+                callsites: None,
+                recovered: None,
+                conflicts: None,
+                error: None,
+            },
+            ss::SsOutcome::Present(plan) => SsCorpusReport {
+                helper_entry: Some(format!("{:#010x}", plan.helper_entry)),
+                helper_isa: Some(ss_isa_name(plan.helper_isa).to_string()),
+                callsites: Some(plan.callsites),
+                recovered: gated.then_some(plan.names.len()),
+                conflicts: gated.then_some(plan.conflicts),
+                error: None,
+            },
+            ss::SsOutcome::Failed(error) => SsCorpusReport {
+                helper_entry: None,
+                helper_isa: None,
+                callsites: None,
+                recovered: None,
+                conflicts: None,
+                error: Some(error.to_string()),
+            },
+        },
+    )
+}
+
+fn load_ss_corpus_inventories(
+    dir: &Path,
+    runtime: &RuntimeImage<'_>,
+) -> Result<(Vec<ss::SsContainer>, HashSet<String>, HashSet<String>)> {
+    let disasm = String::new();
+    let index = DisasmIndex::new(&disasm);
+    let mut funcs = load_functions_file(File::open(dir.join("functions.json"))?, &index, runtime)?;
+    let thumb_path = dir.join("thumb_functions.json");
+    match File::open(&thumb_path) {
+        Ok(file) => funcs.extend(load_thumb_functions_file(file, runtime)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut fn_names = HashSet::new();
+    for function in &funcs {
+        if is_real_name(&function.current_primary) {
+            fn_names.insert(function.current_primary.clone());
+        }
+        if is_real_name(&function.name) {
+            fn_names.insert(function.name.clone());
+        }
+    }
+    let global_names = match File::open(dir.join("globals.json")) {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            load_global_names_bytes(&bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let containers = funcs.iter().filter_map(ss_container_from_func).collect();
+    Ok((containers, global_names, fn_names))
 }
 
 fn ss_container_from_func(f: &FuncRec<'_>) -> Option<ss::SsContainer> {
@@ -3845,12 +3953,13 @@ pub(crate) fn run_current(
     root: &Path,
     opts: &Opts,
     contexts: &HashMap<String, std::sync::Arc<role_evidence::CurrentSymbolicationContext>>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, HashMap<String, SsReport>)> {
     let root = std::fs::canonicalize(root)?;
     let images = root.join("images");
     let tokens = load_symbolication_tokens(opts)?;
     let mut labels = contexts.keys().cloned().collect::<Vec<_>>();
     labels.sort();
+    let mut ss_reports = HashMap::new();
 
     for label in &labels {
         let image_dir = images.join(label);
@@ -3861,7 +3970,7 @@ pub(crate) fn run_current(
         let image_dir = images.join(label);
         let output =
             contexts[label].validate(&image_dir, |trusted_image, image, runtime, roles| {
-                let (decompiled, symbols, _) = build_final_map_from_trusted(
+                let (decompiled, symbols, ss) = build_final_map_from_trusted(
                     trusted_image,
                     &tokens,
                     image,
@@ -3869,6 +3978,7 @@ pub(crate) fn run_current(
                     runtime,
                     roles,
                 )?;
+                ss_reports.insert(label.clone(), ss);
                 finalize_image_trusted(
                     &image_dir,
                     &decompiled,
@@ -3883,7 +3993,7 @@ pub(crate) fn run_current(
         println!("symbolicated {label} -> {}", output.display());
     }
     println!("symbolicate: {} image(s)", labels.len());
-    Ok(root)
+    Ok((root, ss_reports))
 }
 
 /// Symbolicate every image under `<root>/images/*` that has a `decompiled/` dir.
@@ -3919,7 +4029,8 @@ pub fn run(root: &Path, opts: &Opts) -> Result<PathBuf> {
         )?;
         contexts.insert(label, std::sync::Arc::new(context));
     }
-    run_current(&root, opts, &contexts)
+    let (root, _) = run_current(&root, opts, &contexts)?;
+    Ok(root)
 }
 
 #[cfg(test)]

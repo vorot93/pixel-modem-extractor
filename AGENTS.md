@@ -119,6 +119,16 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   Never infer a corpus pass from a clean env-gated skip. Do not copy Present pins from the
   log/SVC `DST SIZE is OVER …` sites. Do not switch `SEED` to `pal_Init1` or
   `PAL_QUEUE_FULL(%s, %s, %s)`. No Ghidra legs.
+- **Private-corpus ss-name goldens** (`tests/ss_names_golden.rs`) consume those same
+  independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load `0x40010000`
+  through production scatter + `symbolicate::generate_ss_names_corpus`. Inventory-free pins
+  are helper entry/ISA and callsite count; inventory-gated (`PME_DECOMPOSED_GOLDEN_DIR`)
+  pins are recovered/conflicts. Empty sentinels until a lawful first run prints `PIN OBSERVED`.
+  Only an unset variable skips; a set missing/non-regular/symlink path fails. Verify the
+  no-corpus path with
+  `env -u PME_S5400_MAIN -u PME_S5300_MAIN -u PME_DECOMPOSED_GOLDEN_DIR cargo test --test ss_names_golden -- --nocapture`.
+  Never infer a corpus pass from a clean env-gated skip. Do not call H1.1 landed until both
+  inventory-gated legs PASS with copied pins. No firmware names. No Ghidra legs.
 - **Private-corpus exception-root goldens** (`tests/exception_roots_golden.rs`) consume those
   same independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load
   `0x40010000` through production runtime generation, materialization, and strict on-disk reading:
@@ -369,6 +379,7 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
 | `thumb_analysis/rizin.rs` | Rizin command profile, inventory aliases/bounds, trailing `axlj` streaming, filtering, and range assignment |
 | `disasm_index.rs` | Shared address-indexed `disasm.lst` view (O(log L + k) slice lookup); consumed by `symbolicate::load_functions` and `globals::run`'s Phase 3.0.1 path |
 | `symbolicate.rs` | Recover names + log/assert annotations into the decompiled artifacts (+ `symbols.json`) |
+| `symbolicate/ss.rs` | Unique `ss_DecodeGmmFacilityMsg` helper proof, same-ISA BL callsite scan, 1:1 Recovered names |
 | `symbolicate/role_evidence.rs` | Bounded immutable exception/PAL/startup role projection, explicit artifact state, and strict retained/current runtime reauthentication |
 | `globals.rs` | Phase 3.0 global-name recovery + Phase 3.0.1 disasm-anchored Recovered + name-prior Provisional (+ per-image `globals.json`) |
 | `execution_ranges.rs` | Tagged execution-range projection (`decode_ranges` / `decode_range_errors`) shared by Ghidra, both Thumb backends, and `global_shapes` |
@@ -531,7 +542,7 @@ module; when a file outgrows that, split it.
   claims for one role remain non-shared and keep their unique primary.
 - **Exception naming survives pass 2 through closed primary dispositions.** Symbolication attaches
   `exception_root` evidence only on exact normalized `(entry, decode ISA)` keys and ranks names as
-  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`. The summary supplies
+  `__func__ > registration > ss > exception_root > pal_task > startup > token > string_ref`. The summary supplies
   exactly `exception_owned`, `preserved`, `not_requested`, or `pass2_owned` state. Only
   `exception_owned` may create a `func`/`registration` transition; preserved and shared label-only
   applications force exact preservation and cannot acquire generic, PAL, or thunk-mirror renames.
@@ -701,6 +712,7 @@ module; when a file outgrows that, split it.
       cargo test pal_messages:: -- --nocapture
       cargo test startup_metadata:: -- --nocapture
       cargo test --test pal_messages_golden -- --nocapture
+      cargo test --test ss_names_golden -- --nocapture
       cargo test --test exception_roots_golden -- --nocapture --test-threads=1
       cargo test --test startup_metadata_golden -- --nocapture
       GHIDRA_INSTALL_DIR=/opt/ghidra cargo test --test decompile_golden \
@@ -1217,10 +1229,26 @@ hardcoded. Two reference images exercise both models end-to-end:
   on both retained MAIN images. Do not copy Present pins from the log/SVC sites. Phase 4 first
   increment is parked; do not call it landed Present. H0 (2026-09-05) found no setup-shaped
   alternate seed on both corpora.
-- **Scheduled remaining evidence (not this subsystem).** H1.1 specialized `ss_*` names, H1.2
-  structured-trace schema decoder, then H2 MMIO. H3 (PAL graphs, MPU, `hw_Init` deepening) stays
-  conditional. Closed on this corpus: ISR whole-table, exact-byte name transfer, pointer-tracking
-  for global shapes, `_ShannonOS_`, `QUEUE_NAME`.
+- **Scheduled remaining evidence (not this subsystem).** H1.2 structured-trace schema decoder,
+  then H2 MMIO. H3 (PAL graphs, MPU, `hw_Init` deepening) stays conditional. Closed on this
+  corpus: ISR whole-table, exact-byte name transfer, pointer-tracking for global shapes,
+  `_ShannonOS_`, `QUEUE_NAME`.
+
+### Specialized ss names
+
+- **Rank.** `__func__ > registration > ss > exception_root > pal_task > startup > token > string_ref`.
+  Kind `"ss"`. Tier Recovered from the unique `ss_DecodeGmmFacilityMsg` helper: the same-ISA
+  `BL` that consumes the seed as AAPCS r0 with no intervening r0 write, then 1:1 names at
+  containing accepted executions. Image-local Ambiguous sets `ss_error` and omits counts;
+  later images continue. `report.json` per-image fields are `ss_recovered`, `ss_conflicts`,
+  `ss_error` (skip if None).
+- **Rejected adjacency.** The helper is not "next branch within five instructions" and not a
+  hardcoded address. Do not admit SVC-spanning `MOVW`/`MOVT` pairs. Do not mint names from
+  string adjacency or analyzer xrefs.
+- **Pin procedure.** `tests/ss_names_golden.rs`: leave sentinels empty, run a lawful corpus
+  leg, copy only the printed `PIN OBSERVED` helper entry/ISA, callsite count, and (when
+  `PME_DECOMPOSED_GOLDEN_DIR` is set) recovered/conflicts. No firmware names. Do not call
+  H1.1 landed until both inventory-gated legs PASS with copied pins.
 
 ### Runtime startup metadata
 
@@ -1271,7 +1299,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   startup-owned primary. Export-v5 binds `startup_metadata=<identity-or-none>`; generated pass-1
   kits write `none`.
 - **Naming precedence includes startup.**
-  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`.
+  `__func__ > registration > ss > exception_root > pal_task > startup > token > string_ref`.
   `kind: "startup"` attaches by exact `(entry, DecodeIsa)` without merging producer identities.
 - **Report surface.** Stage `startup_metadata` after inventories and before `symbol_map`; stage
   `startup_metadata_apply` after pass 2 (skipped for `--no-symbol-pass` or no Present artifact).
@@ -1347,9 +1375,10 @@ hardcoded. Two reference images exercise both models end-to-end:
   edge (`cli::run() -> anyhow::Result<()>`). `bin/main.rs` initializes `tracing` on
   stderr, prints `error: {e:#}` on failure, and exits 1.
 - **Symbolication is fail-closed.** Every primary-name decision uses one order:
-  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`. A recovered
+  `__func__ > registration > ss > exception_root > pal_task > startup > token > string_ref`. A recovered
   `__func__` (an assert site referencing both its `__FILE__` and a unique identifier string) and a
-  registration-table match are authoritative `Recovered` names. Exception-root, PAL-task, and startup
+  registration-table match are authoritative `Recovered` names. ss names from the unique
+  `ss_DecodeGmmFacilityMsg` helper are Recovered below registration. Exception-root, PAL-task, and startup
   names are durable role evidence below those firmware-native names. Token and string-ref survivors are
   marked `Provisional` `guess_*_<addr>` names, never unmarked; file attribution and DBT evidence
   are annotations only and never primary names. Token immediates are recovered by `movw`/`movt`
@@ -1420,7 +1449,7 @@ hardcoded. Two reference images exercise both models end-to-end:
   scans the raw split image for contiguous `{name_ptr, fn_ptr}` tables — the
   AT-command dispatch, ISR, and protocol-handler tables baseband firmware is
   full of — and mints a **bare `Recovered` name** for each. The same global order applies:
-  `__func__ > registration > exception_root > pal_task > startup > token > string_ref`. The **fail-closed gate
+  `__func__ > registration > ss > exception_root > pal_task > startup > token > string_ref`. The **fail-closed gate
   is the function inventory**: the pointer (Thumb bit stripped) must resolve to a
   known ARM/Thumb entry, so a name is only minted for a confirmed function — no
   prologue heuristics. Further fail-closed rules: the name must be a clean

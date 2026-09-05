@@ -304,6 +304,16 @@ pub struct ImageReport {
     /// Reason-only application failure. Exclusive with the apply counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_apply_error: Option<String>,
+    /// Count of 1:1 ss Recovered names. `None` when discovery did not complete
+    /// or was Absent; `Some(0)` is a completed zero. Exclusive with `ss_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ss_recovered: Option<usize>,
+    /// Dropped 1:1 conflict pairs. Exclusive with `ss_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ss_conflicts: Option<usize>,
+    /// Reason-only ss discovery failure. Exclusive with the counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ss_error: Option<String>,
 }
 
 impl ImageReport {
@@ -440,6 +450,9 @@ impl ImageReport {
             startup_apply_labeled: r.startup_apply_labeled,
             startup_apply_no_return: r.startup_apply_no_return,
             startup_apply_error: r.startup_apply_error.clone(),
+            ss_recovered: None,
+            ss_conflicts: None,
+            ss_error: None,
         }
     }
 }
@@ -3411,8 +3424,13 @@ struct GlobalsStageOutcome {
 }
 
 /// Per-image symbol map outcome from [`build_and_write_symbol_maps`]: the
-/// successful `(label, prepared map)` entries plus any per-image errors.
-type SymbolMapsResult = (HashMap<String, PreparedFunctionMap>, Vec<(String, String)>);
+/// successful `(label, prepared map)` entries, any per-image errors, and the
+/// ss discovery report collected from the same `build_map` call.
+type SymbolMapsResult = (
+    HashMap<String, PreparedFunctionMap>,
+    Vec<(String, String)>,
+    HashMap<String, symbolicate::SsReport>,
+);
 
 type TerminalPass2Snapshots = HashMap<String, Arc<crate::terminal_pass2::TerminalPass2Snapshot>>;
 type CurrentSymbolicationContexts =
@@ -3596,6 +3614,7 @@ fn prepare_function_map(
         symbols,
         function_names,
         evidence_name_projection,
+        ss: _,
     } = bundle;
     let creation_plan = decompile::Pass2CreationPlan {
         candidates: map.creation_count,
@@ -4484,6 +4503,29 @@ fn apply_global_shapes_outcome(image: &mut ImageReport, outcome: &GlobalShapesOu
 /// absent from `outcomes` (no code image, or the whole stage was skipped) is
 /// left untouched — `report_images` is always a fresh rebuild at the call
 /// site, so its `global_shapes_*` fields are already `None` there.
+fn apply_ss_report(image: &mut ImageReport, report: &symbolicate::SsReport) {
+    if report.error.is_some() {
+        image.ss_recovered = None;
+        image.ss_conflicts = None;
+        image.ss_error = report.error.clone();
+    } else {
+        image.ss_recovered = report.recovered;
+        image.ss_conflicts = report.conflicts;
+        image.ss_error = None;
+    }
+}
+
+fn reapply_ss_outcomes(
+    report_images: &mut [ImageReport],
+    outcomes: &HashMap<String, symbolicate::SsReport>,
+) {
+    for image in report_images {
+        if let Some(report) = outcomes.get(&image.image) {
+            apply_ss_report(image, report);
+        }
+    }
+}
+
 fn reapply_global_shapes_outcomes(
     report_images: &mut [ImageReport],
     outcomes: &HashMap<String, GlobalShapesOutcome>,
@@ -4756,9 +4798,10 @@ fn build_and_write_symbol_maps(
     if let Err(e) = std::fs::create_dir_all(&maps_dir) {
         // Without the maps dir we can't write anything; record once and bail.
         errors.push(("<maps_dir>".into(), format!("create_dir_all: {e}")));
-        return (HashMap::new(), errors);
+        return (HashMap::new(), errors, HashMap::new());
     }
     let mut out_maps = HashMap::new();
+    let mut ss_reports = HashMap::new();
     let mut labels = snapshots.keys().cloned().collect::<Vec<_>>();
     labels.sort();
     for label in labels {
@@ -4785,6 +4828,7 @@ fn build_and_write_symbol_maps(
         });
         match bundle {
             Ok(bundle) => {
+                ss_reports.insert(label.clone(), bundle.ss.clone());
                 let (prepared, validation_error) =
                     prepare_function_map(&label, &dir, &map_path, bundle);
                 if let Some(error) = validation_error {
@@ -4797,7 +4841,7 @@ fn build_and_write_symbol_maps(
             }
         }
     }
-    (out_maps, errors)
+    (out_maps, errors, ss_reports)
 }
 
 /// Exhaustive pipeline into one per-image tree. Ghidra and radare2 are required;
@@ -5130,6 +5174,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
     //    never establishes currentness.
     let mut terminal_pass2_snapshots = TerminalPass2Snapshots::new();
     let t = Instant::now();
+    let mut ss_outcomes: HashMap<String, symbolicate::SsReport> = HashMap::new();
     let (mut function_maps, symbol_map_errors) = if opts.no_symbol_pass {
         (HashMap::new(), Vec::new())
     } else {
@@ -5148,8 +5193,9 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             record_terminal_snapshot_issues(report, &snapshot_errors);
         }
         terminal_pass2_snapshots = snapshots;
-        let (maps, errors) =
+        let (maps, errors, reports) =
             build_and_write_symbol_maps(out, &images_dir, &token_db, &terminal_pass2_snapshots);
+        ss_outcomes.extend(reports);
         let mut errors = errors;
         for issue in snapshot_errors {
             errors.push((issue.label, issue.reason));
@@ -5164,6 +5210,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             symbol_map_errors,
             t.elapsed().as_millis(),
         ));
+        reapply_ss_outcomes(decompile_stage_images_mut(&mut stages), &ss_outcomes);
     }
     if let Some(report) = pass1_report.as_mut() {
         retain_pass2_creation_plans(&mut report.images, &function_maps);
@@ -5213,21 +5260,30 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
             SymbolRouteStep::Finalize {
                 rewrite_decompiled_c,
             } => {
-                run_stage(
-                    &mut stages,
-                    "symbolicate_finalize",
-                    "images/*/decompiled/symbols.json",
-                    || {
-                        symbolicate::run_current(
-                            out,
-                            &symbolicate::Opts {
-                                token_db: token_db.exists().then(|| token_db.clone()),
-                                rewrite_decompiled_c,
-                            },
-                            current_contexts,
-                        )
+                let t = Instant::now();
+                match symbolicate::run_current(
+                    out,
+                    &symbolicate::Opts {
+                        token_db: token_db.exists().then(|| token_db.clone()),
+                        rewrite_decompiled_c,
                     },
-                );
+                    current_contexts,
+                ) {
+                    Ok((_, reports)) => {
+                        ss_outcomes.extend(reports);
+                        reapply_ss_outcomes(decompile_stage_images_mut(&mut stages), &ss_outcomes);
+                        stages.push(StageReport::ok(
+                            "symbolicate_finalize",
+                            "images/*/decompiled/symbols.json",
+                            t.elapsed().as_millis(),
+                        ));
+                    }
+                    Err(error) => stages.push(StageReport::failed(
+                        "symbolicate_finalize",
+                        error.to_string(),
+                        t.elapsed().as_millis(),
+                    )),
+                }
             }
             SymbolRouteStep::LoadFinalizedNames => {
                 let recovered_names = pass1_report
@@ -5277,6 +5333,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                         decompile_stage_images_mut(&mut stages),
                         &startup_outcomes,
                     );
+                    reapply_ss_outcomes(decompile_stage_images_mut(&mut stages), &ss_outcomes);
                     stages.push(StageReport::skipped("decompile_pass2", "--no-symbol-pass"));
                     stages.push(globals_apply_stage(true, &HashMap::new(), None, 0));
                     stages.push(startup_metadata_apply_stage(true, &[], None, 0));
@@ -5482,6 +5539,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     decompile_stage_images_mut(&mut stages),
                     &startup_outcomes,
                 );
+                reapply_ss_outcomes(decompile_stage_images_mut(&mut stages), &ss_outcomes);
             }
             SymbolRouteStep::RefreshGlobalShapes => {
                 // Re-run the stage after the route's LAST rewrite of the
@@ -6027,6 +6085,7 @@ mod tests {
             symbols,
             function_names,
             evidence_name_projection,
+            ss: symbolicate::SsReport::default(),
         }
     }
 
@@ -8064,6 +8123,9 @@ mod tests {
                         startup_apply_labeled: None,
                         startup_apply_no_return: None,
                         startup_apply_error: None,
+                        ss_recovered: None,
+                        ss_conflicts: None,
+                        ss_error: None,
                     },
                     ImageReport {
                         image: "04_VSS".into(),
@@ -8152,6 +8214,9 @@ mod tests {
                         startup_apply_labeled: None,
                         startup_apply_no_return: None,
                         startup_apply_error: None,
+                        ss_recovered: None,
+                        ss_conflicts: None,
+                        ss_error: None,
                     },
                 ],
                 10,
@@ -8831,6 +8896,9 @@ mod tests {
             startup_apply_labeled: None,
             startup_apply_no_return: None,
             startup_apply_error: None,
+            ss_recovered: None,
+            ss_conflicts: None,
+            ss_error: None,
         }];
         let mut stages = vec![StageReport::decompile(pre_enrich_images, 12345)];
 
@@ -12883,6 +12951,82 @@ mod tests {
         assert!(!json.contains("globals_recovered"));
         assert!(!json.contains("global_shapes_"));
         assert!(!json.contains("global_shape_observations"));
+        assert!(!json.contains("ss_recovered"));
+        assert!(!json.contains("ss_conflicts"));
+        assert!(!json.contains("ss_error"));
+    }
+
+    #[test]
+    fn image_report_omits_ss_fields_when_none() {
+        let report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("ss_recovered").is_none());
+        assert!(value.get("ss_conflicts").is_none());
+        assert!(value.get("ss_error").is_none());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("ss_recovered"));
+        assert!(!json.contains("ss_conflicts"));
+        assert!(!json.contains("ss_error"));
+    }
+
+    #[test]
+    fn image_report_includes_ss_recovered_zero() {
+        let mut report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        report.ss_recovered = Some(0);
+        report.ss_conflicts = Some(0);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["ss_recovered"], 0);
+        assert_eq!(value["ss_conflicts"], 0);
+        assert!(value.get("ss_error").is_none());
+    }
+
+    #[test]
+    fn image_report_ss_error_omits_counts() {
+        let mut report = ImageReport::from_result(&analyzed_image("02_MAIN"));
+        report.ss_error = Some("ss names ambiguous: [1]".into());
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["ss_error"], "ss names ambiguous: [1]");
+        assert!(value.get("ss_recovered").is_none());
+        assert!(value.get("ss_conflicts").is_none());
+    }
+
+    #[test]
+    fn reapply_ss_outcomes_sets_counts_and_omits_them_on_error() {
+        let mut images = vec![
+            ImageReport::from_result(&analyzed_image("02_MAIN")),
+            ImageReport::from_result(&analyzed_image("03_APM")),
+        ];
+        let outcomes = HashMap::from([
+            (
+                "02_MAIN".to_string(),
+                symbolicate::SsReport {
+                    recovered: Some(2),
+                    conflicts: Some(0),
+                    error: None,
+                },
+            ),
+            (
+                "03_APM".to_string(),
+                symbolicate::SsReport {
+                    recovered: Some(4),
+                    conflicts: Some(1),
+                    error: Some("ss names ambiguous: [1]".into()),
+                },
+            ),
+        ]);
+        reapply_ss_outcomes(&mut images, &outcomes);
+        assert_eq!(images[0].ss_recovered, Some(2));
+        assert_eq!(images[0].ss_conflicts, Some(0));
+        assert!(images[0].ss_error.is_none());
+        assert!(images[1].ss_recovered.is_none());
+        assert!(images[1].ss_conflicts.is_none());
+        assert_eq!(
+            images[1].ss_error.as_deref(),
+            Some("ss names ambiguous: [1]")
+        );
+        let value = serde_json::to_value(&images[1]).unwrap();
+        assert!(value.get("ss_recovered").is_none());
+        assert!(value.get("ss_conflicts").is_none());
     }
 
     #[test]
