@@ -13,7 +13,7 @@ pub(crate) use artifact::{
     MaterializedMessages, MessageArtifactContext, clear_materialized, materialize, read_bytes,
 };
 pub(crate) use discover::discover;
-#[allow(unused_imports)]
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use discover::{SemanticRef, find_unique_seed, semantic_refs};
 
 pub(crate) const SEED: &[u8] = b"PAL_MSG_MAX_ENTITY_COUNT";

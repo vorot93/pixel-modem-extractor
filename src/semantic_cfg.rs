@@ -36,7 +36,7 @@ impl CfgLimits {
         Self::exception_roots()
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn ss_names() -> Self {
         Self {
             max_charged_bytes: 512,
@@ -446,7 +446,6 @@ impl SemanticCfg {
         &self.instructions
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn exact_register_states(&self) -> &BTreeMap<u32, RegisterState> {
         &self.exact_register_states
     }
