@@ -110,14 +110,15 @@ CI runs lint plus the test suite on Linux (x86_64 and arm), macOS, and Windows.
   only on unset/missing input.
 - **Private-corpus PAL messages goldens** (`tests/pal_messages_golden.rs`) consume those same
   independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load `0x40010000`
-  through production scatter + `pal_messages` generation. Pins (setup entry/ISA, table
-  base/stride/capacity, slot count, named roots, `manifest_blake3`) are empty sentinels until a
-  lawful first run prints `PIN OBSERVED` and those values are copied. Only an unset variable
-  skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path with
+  through production scatter + `pal_messages` generation. Phase 4 first increment is parked as
+  honest absence: Present pins (setup entry/ISA, table base/stride/capacity, slot count, named
+  roots, `manifest_blake3`) stay empty sentinels; a lawful run prints `PIN OBSERVED: status=absent`.
+  Only an unset variable skips; a set missing/non-regular/symlink path fails. Verify the no-corpus
+  path with
   `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test pal_messages_golden -- --nocapture`.
-  Never infer a corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
-  legs PASS with copied pins from a real initializer. Do not copy Present pins from the
-  log/SVC `DST SIZE is OVER …` sites. No Ghidra legs.
+  Never infer a corpus pass from a clean env-gated skip. Do not copy Present pins from the
+  log/SVC `DST SIZE is OVER …` sites. Do not switch `SEED` to `pal_Init1` or
+  `PAL_QUEUE_FULL(%s, %s, %s)`. No Ghidra legs.
 - **Private-corpus exception-root goldens** (`tests/exception_roots_golden.rs`) consume those
   same independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load
   `0x40010000` through production runtime generation, materialization, and strict on-disk reading:
@@ -684,7 +685,12 @@ module; when a file outgrows that, split it.
   emits export-v5. Present startup is a pass-2 scheduling reason even with empty applications and
   no recovered names; `functions.json` / blake3 then come from the terminal snapshot. Phase 3B
   corpus pins are populated (2026-09-04): both MAIN images publish stack_guard Present with
-  unproven no-return, honest hardware_init Absent, and S5400-only RVCT Present. Phase 4 follows 3B.
+  unproven no-return, honest hardware_init Absent, and S5400-only RVCT Present. Phase 4 first
+  increment (`pal_messages`) is parked (2026-09-05): both MAIN images honest `Ok(None)` on the
+  log-format seed. H0 unique single-ref alternates (`pal_Init1`, `PAL_QUEUE_FULL(%s, %s, %s)`)
+  are not setup-shaped (no capacity/base/stride). Remaining scheduled evidence work is H1
+  specialized names (`ss_*`, then structured-trace schema), then H2 MMIO. Phase 5 MPU stays
+  blocked on `hw_Init`.
 - **Focused verification is explicit.** Run exception discovery/artifact/CFG/PAL/startup unit
   batteries, both independently configured corpus legs, focused serial real-Ghidra tests (not the
   full `decompile_golden` binary in parallel), and the retained-tree report-shape gate:
@@ -1154,14 +1160,15 @@ hardcoded. Two reference images exercise both models end-to-end:
 
 - **Private-corpus PAL messages goldens** (`tests/pal_messages_golden.rs`) consume those same
   independently configured `PME_S5400_MAIN` / `PME_S5300_MAIN` inputs at load `0x40010000`
-  through production scatter + `pal_messages` generation. Pins (setup entry/ISA, table
-  base/stride/capacity, slot count, named roots, `manifest_blake3`) are empty sentinels until a
-  lawful first run prints `PIN OBSERVED` and those values are copied. Only an unset variable
-  skips; a set missing/non-regular/symlink path fails. Verify the no-corpus path with
+  through production scatter + `pal_messages` generation. Phase 4 first increment is parked as
+  honest absence: Present pins (setup entry/ISA, table base/stride/capacity, slot count, named
+  roots, `manifest_blake3`) stay empty sentinels; a lawful run prints `PIN OBSERVED: status=absent`.
+  Only an unset variable skips; a set missing/non-regular/symlink path fails. Verify the no-corpus
+  path with
   `env -u PME_S5400_MAIN -u PME_S5300_MAIN cargo test --test pal_messages_golden -- --nocapture`.
-  Never infer a corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
-  legs PASS with copied pins from a real initializer. Do not copy Present pins from the
-  log/SVC `DST SIZE is OVER …` sites. No Ghidra legs.
+  Never infer a corpus pass from a clean env-gated skip. Do not copy Present pins from the
+  log/SVC `DST SIZE is OVER …` sites. Do not switch `SEED` to `pal_Init1` or
+  `PAL_QUEUE_FULL(%s, %s, %s)`. No Ghidra legs.
 
   The `manifest_blake3` / `metadata_blake3` pins commit no names or firmware bytes, so they
   are population points: run once with the corpus, copy the digests the unpopulated pins print,
@@ -1195,17 +1202,25 @@ hardcoded. Two reference images exercise both models end-to-end:
   completes that address spans `stmdb`/`dmb`/`svc #1`/`dmb`/`ldmia` then `str`/`bl` — two
   identical log/SVC trampoline sites per model. `SVC` is not Linear, so v1 correctly yields
   zero refs. Do not admit SVC-spanning pairs (that would be Ambiguous log sites, not a setup),
-  do not retarget needle/interior offsets, and do not switch seeds in this increment.
+  do not retarget needle/interior offsets, and do not switch `SEED` to `pal_Init1` or
+  `PAL_QUEUE_FULL(%s, %s, %s)`.
 - **Rejected approaches, keep rejecting them.** Xref-count, adjacency, `dm_TraceMsg` threshold,
-  and analyzer inventories are never validity. Do not mint `pal_MsgSendTo` / `dm_TraceMsg`
-  strings as primaries. Optional `msg_send` / `que_init` stay omitted unless uniquely proven.
+  and analyzer inventories are never validity. Do not mint `pal_MsgSendTo` / `dm_TraceMsg` /
+  `pal_Init1` strings as primaries. Do not switch `SEED` to `pal_Init1` or
+  `PAL_QUEUE_FULL(%s, %s, %s)` (name string and queue-full log format, not a descriptor-table
+  initializer). Optional `msg_send` / `que_init` stay omitted unless uniquely proven.
 - **Terminal leaf.** Generation writes `pal_messages/<label>/messages.json`; `decompose` marshals
   to `images/<label>/pal_messages/messages.json` (Present replace, Absent clear leaf, failed
   preserve). `--prune` retains it. Format `pixel-modem-extractor-pal-messages-v1`. Identity
   `v1:<manifest-blake3>:1:<slots>`. Stage `pal_messages` follows `pal_tasks`.
-- **Corpus pins stay empty until copied.** `tests/pal_messages_golden.rs` prints `PIN OBSERVED`
-  on a lawful first run. Do not copy Present pins from the log/SVC sites above. Do not call
-  Phase 4 landed until both MAIN legs PASS with copied pins from a real initializer.
+- **Corpus pins stay empty.** `tests/pal_messages_golden.rs` prints `PIN OBSERVED: status=absent`
+  on both retained MAIN images. Do not copy Present pins from the log/SVC sites. Phase 4 first
+  increment is parked; do not call it landed Present. H0 (2026-09-05) found no setup-shaped
+  alternate seed on both corpora.
+- **Scheduled remaining evidence (not this subsystem).** H1.1 specialized `ss_*` names, H1.2
+  structured-trace schema decoder, then H2 MMIO. H3 (PAL graphs, MPU, `hw_Init` deepening) stays
+  conditional. Closed on this corpus: ISR whole-table, exact-byte name transfer, pointer-tracking
+  for global shapes, `_ShannonOS_`, `QUEUE_NAME`.
 
 ### Runtime startup metadata
 

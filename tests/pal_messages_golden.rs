@@ -1,10 +1,12 @@
 //! Private-corpus PAL messages goldens for retained S5400 and S5300 MAIN images.
 //!
 //! Path: production scatter + `pal_messages` generation through `decompile::run_report`.
-//! Pins stay empty sentinels until a lawful first run prints `PIN OBSERVED`. Only an
+//! Phase 4 first increment is parked as honest absence: both MAIN images print
+//! `PIN OBSERVED: status=absent` and Present pin fields stay empty. Only an
 //! unset variable skips; a set missing/non-regular/symlink path fails. Never infer a
-//! corpus pass from a clean env-gated skip. Do not call Phase 4 landed until both
-//! legs PASS with copied pins.
+//! corpus pass from a clean env-gated skip. Do not copy Present pins from the
+//! log/SVC `DST SIZE is OVER …` sites. Do not switch `SEED` to `pal_Init1` or
+//! `PAL_QUEUE_FULL(%s, %s, %s)`.
 
 use serde_json::Value;
 use std::ffi::OsString;

@@ -433,9 +433,11 @@ Reverse-engineered; magic numbers and offsets only (no proprietary data is embed
 - **PAL messages manifest** — `pixel-modem-extractor-pal-messages-v1`: generation-time MAIN-only
   inventory of one proven messaging table, written at `pal_messages/<label>/messages.json`
   (`images/<MAIN>/pal_messages/messages.json` under `decompose`, retained by `--prune`). Unique
-  `PAL_MSG_MAX_ENTITY_COUNT` plus one initializer proof; slots are raw hashed descriptors. Both
-  retained MAIN images currently prove clean absence (the unique hit is a log format, not a
-  table initializer). No Ghidra apply script. Identity `v1:<manifest-blake3>:1:<slots>`.
+  `PAL_MSG_MAX_ENTITY_COUNT` plus one initializer proof; slots are raw hashed descriptors. Phase 4
+  first increment is parked (2026-09-05): both retained MAIN images prove clean absence (the unique
+  hit is a log format, not a table initializer). Alternate unique hits (`pal_Init1`, the
+  `PAL_QUEUE_FULL(%s, %s, %s)` log format) are not setup seeds. Entity, queue, and route graphs
+  are not scheduled. No Ghidra apply script. Identity `v1:<manifest-blake3>:1:<slots>`.
   Xref-count, adjacency, and `dm_TraceMsg` are never validity.
 - **Startup-metadata manifest** — `pixel-modem-extractor-startup-metadata-v1`: four independent
   post-inventory proofs for one TOC image, written at `startup_metadata/<label>/startup.json`
