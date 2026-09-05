@@ -13,7 +13,7 @@
 //! finalize rewrite, so they never even appear in Ghidra's pass-2 input.
 //! Registration names, being `Recovered`, are computed at the symbol_map stage
 //! and therefore *do* reach Ghidra pass 2. Everything else is a comment.
-//! Precedence from strongest to weakest: `__func__`, registration,
+//! Precedence from strongest to weakest: `__func__`, registration, ss,
 //! exception_root, pal_task, startup, token, string-ref.
 //! See `symbolicate/name_guess.rs` for the string-reference classifier.
 use crate::decompile::{ExceptionApplicationRef, ExceptionDispositionKind, ExceptionPrimaryRef};
@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 pub mod name_guess;
 pub mod reg_table;
 pub(crate) mod role_evidence;
+pub mod ss;
 pub use crate::decompile::ExceptionPass2Context;
 
 pub const GUESS_PREFIX: &str = "guess_";
@@ -79,13 +80,14 @@ pub const MAX_MAP_ANNOTATION_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_PRIMARY_CHARS: usize = 2000;
 
 /// Explicit naming authority. Lower rank (ordinal) is stronger; the order is
-/// the pinned precedence: `__func__`, registration, exception_root, pal_task,
+/// the pinned precedence: `__func__`, registration, ss, exception_root, pal_task,
 /// startup, token, string_ref. `file` and `dbt_source` evidence are annotation-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Authority {
     Func,
     Registration,
+    Ss,
     ExceptionRoot,
     PalTask,
     Startup,
@@ -98,6 +100,7 @@ impl Authority {
         match self {
             Self::Func => "func",
             Self::Registration => "registration",
+            Self::Ss => "ss",
             Self::ExceptionRoot => "exception_root",
             Self::PalTask => "pal_task",
             Self::Startup => "startup",
@@ -320,6 +323,9 @@ pub enum TaggedEvidence {
     Registration {
         value: String,
     },
+    Ss {
+        value: String,
+    },
     ExceptionRoot {
         manifest_blake3: String,
         table_kind: &'static str,
@@ -361,6 +367,7 @@ impl TaggedEvidence {
         match self {
             Self::Func { .. } => "func",
             Self::Registration { .. } => "registration",
+            Self::Ss { .. } => "ss",
             Self::ExceptionRoot { .. } => "exception_root",
             Self::PalTask { .. } => "pal_task",
             Self::Startup { .. } => "startup",
@@ -708,8 +715,8 @@ struct NameCandidate {
 }
 
 /// Apply the ranked, fail-closed naming policy for one function. Ranks are
-/// the pinned precedence: `__func__`, registration, exception_root, pal_task,
-/// token, string_ref. The strongest rank with a proposal wins and every weaker
+/// the pinned precedence: `__func__`, registration, ss, exception_root, pal_task,
+/// startup, token, string_ref. The strongest rank with a proposal wins and every weaker
 /// candidate is retained as evidence. Two distinct names at the winning rank
 /// apply neither: the sorted candidates are serialized as `name_conflicts`.
 /// Shared exception/task roles and preserved role primaries block every weaker
@@ -942,6 +949,7 @@ pub(crate) fn decide(
     let tier = match winner.authority {
         Authority::Func
         | Authority::Registration
+        | Authority::Ss
         | Authority::ExceptionRoot
         | Authority::PalTask
         | Authority::Startup => Tier::Recovered,
@@ -6166,6 +6174,21 @@ mod tests {
             pal_proposed_primary,
             ..raw()
         }
+    }
+
+    #[test]
+    fn ss_authority_ranks_between_registration_and_exception_root() {
+        assert!(Authority::Registration < Authority::Ss);
+        assert!(Authority::Ss < Authority::ExceptionRoot);
+        assert_eq!(Authority::Ss.as_str(), "ss");
+    }
+
+    #[test]
+    fn tagged_evidence_ss_kind_is_ss() {
+        let ev = TaggedEvidence::Ss {
+            value: "ss_DecodeGmmFacilityMsg".into(),
+        };
+        assert_eq!(ev.kind(), "ss");
     }
 
     #[test]

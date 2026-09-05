@@ -35,6 +35,15 @@ impl CfgLimits {
     pub(crate) const fn startup_metadata() -> Self {
         Self::exception_roots()
     }
+
+    #[allow(dead_code)]
+    pub(crate) const fn ss_names() -> Self {
+        Self {
+            max_charged_bytes: 512,
+            max_instructions: 256,
+            max_blocks: 256,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
