@@ -480,6 +480,9 @@ pub(crate) struct RawEvidence {
     /// (`reg_table::scan`). Outranks exception_root, pal_task, token, and
     /// string-ref; only `__func__` wins.
     pub(crate) registration: Option<String>,
+    /// Recovered `ss_*` name from a unique helper-callsite argument.
+    /// Outranked by `__func__` and registration; outranks token and string-ref.
+    pub(crate) ss: Option<String>,
     /// Manifest identity attached separately from the role-only projection.
     pub(crate) exception_manifest_blake3: Option<String>,
     /// The authenticated exception application at this exact entry and decode
@@ -878,6 +881,14 @@ pub(crate) fn decide(
             authority: Authority::Registration,
             kind: "registration",
             proposed_name: sanitize_ident(reg),
+        });
+    }
+    if let Some(ss) = &raw.ss {
+        ev.push(TaggedEvidence::Ss { value: ss.clone() });
+        candidates.push(NameCandidate {
+            authority: Authority::Ss,
+            kind: "ss",
+            proposed_name: sanitize_ident(ss),
         });
     }
     if let Some((id, class)) = &raw.ident_guess {
@@ -2505,7 +2516,7 @@ pub(crate) fn prepare_pass2_symbol_map_from_runtime(
     exception_application: Option<&ExceptionPass2Context>,
     pal_application: Option<&PalPass2Context>,
 ) -> Result<Pass2MapBundle> {
-    let symbols = build_map_from_runtime(
+    let (symbols, _) = build_map_from_runtime(
         image_dir,
         tokens,
         image_bytes,
@@ -3176,6 +3187,56 @@ fn registration_for_record(
     }
 }
 
+/// Per-image ss discovery outcome carried beside `build_map` symbols.
+/// Absent → all None; Present → Some(counts); Failed → error Some, counts None.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SsReport {
+    pub recovered: Option<usize>,
+    pub conflicts: Option<usize>,
+    pub error: Option<String>,
+}
+
+impl SsReport {
+    const fn absent() -> Self {
+        Self {
+            recovered: None,
+            conflicts: None,
+            error: None,
+        }
+    }
+}
+
+fn ss_container_from_func(f: &FuncRec<'_>) -> Option<ss::SsContainer> {
+    let entry = u32::try_from(f.entry).ok()?;
+    let execution = f.execution.as_ref()?;
+    let first = execution.decode_ranges.first()?;
+    let isa = first.isa;
+    Some(ss::SsContainer {
+        entry,
+        isa,
+        ranges: execution
+            .decode_ranges
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect(),
+        ghidra: f.owner == FunctionOwner::Ghidra,
+    })
+}
+
+fn ss_name_for(
+    entry: u64,
+    isa: DecodeIsa,
+    names: &BTreeMap<(u32, DecodeIsa), String>,
+) -> Option<String> {
+    let entry = u32::try_from(entry).ok()?;
+    names.get(&(entry, isa)).cloned().or_else(|| {
+        let stripped = entry & !1;
+        (stripped != entry)
+            .then(|| names.get(&(stripped, isa)).cloned())
+            .flatten()
+    })
+}
+
 /// Pure: build the per-image `Symbol` set from pass-1 outputs. No file writes.
 /// `pal` supplies the authenticated PAL task state when the generation claims
 /// one; it attaches `pal_task` evidence per exact entry and lets the
@@ -3189,7 +3250,7 @@ pub(crate) fn build_map(
     manifest: &Path,
     roles: &role_evidence::AuthenticatedRoleEvidence,
     purpose: SymbolBuildPurpose<'_>,
-) -> Result<Vec<Symbol>> {
+) -> Result<(Vec<Symbol>, SsReport)> {
     let load_addr = crate::manifest::load_addr_for_image(manifest, image_label)?
         .ok_or_else(|| Error::Serialize(format!("load_addr missing for {image_label}")))?;
     let image_bytes = std::fs::read(image_dir.join(format!("{image_label}.bin")))?;
@@ -3213,7 +3274,7 @@ pub(crate) fn build_final_map_from_runtime(
     load_addr: u64,
     runtime: &RuntimeImage<'_>,
     roles: &role_evidence::AuthenticatedRoleEvidence,
-) -> Result<Vec<Symbol>> {
+) -> Result<(Vec<Symbol>, SsReport)> {
     build_map_from_runtime(
         image_dir,
         tokens,
@@ -3232,9 +3293,9 @@ fn build_final_map_from_trusted(
     load_addr: u64,
     runtime: &RuntimeImage<'_>,
     roles: &role_evidence::AuthenticatedRoleEvidence,
-) -> Result<(TrustedDirectory, Vec<Symbol>)> {
+) -> Result<(TrustedDirectory, Vec<Symbol>, SsReport)> {
     let (decompiled, inputs) = SymbolicationInputFiles::from_trusted(image)?;
-    let symbols = build_map_from_input_files(
+    let (symbols, ss) = build_map_from_input_files(
         inputs,
         tokens,
         image_bytes,
@@ -3243,7 +3304,7 @@ fn build_final_map_from_trusted(
         roles,
         SymbolBuildPurpose::FinalArtifact,
     )?;
-    Ok((decompiled, symbols))
+    Ok((decompiled, symbols, ss))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3255,7 +3316,7 @@ fn build_map_from_runtime(
     runtime: &RuntimeImage<'_>,
     roles: &role_evidence::AuthenticatedRoleEvidence,
     purpose: SymbolBuildPurpose<'_>,
-) -> Result<Vec<Symbol>> {
+) -> Result<(Vec<Symbol>, SsReport)> {
     if let SymbolBuildPurpose::Pass2 {
         exception_application,
         pal_application,
@@ -3315,7 +3376,7 @@ fn build_map_from_input_files(
     runtime: &RuntimeImage<'_>,
     roles: &role_evidence::AuthenticatedRoleEvidence,
     purpose: SymbolBuildPurpose<'_>,
-) -> Result<Vec<Symbol>> {
+) -> Result<(Vec<Symbol>, SsReport)> {
     let disasm = match inputs.disasm.take() {
         Some(file) => String::from_utf8(read_open_file(file)?).unwrap_or_default(),
         None => String::new(),
@@ -3384,6 +3445,28 @@ fn build_map_from_input_files(
         &fn_names,
     )
     .names;
+
+    let containers: Vec<ss::SsContainer> =
+        funcs.iter().filter_map(ss_container_from_func).collect();
+    let (ss_report, ss_names) = match ss::discover(runtime, &containers, &global_names, &fn_names) {
+        ss::SsOutcome::Absent => (SsReport::absent(), BTreeMap::new()),
+        ss::SsOutcome::Present(plan) => (
+            SsReport {
+                recovered: Some(plan.names.len()),
+                conflicts: Some(plan.conflicts),
+                error: None,
+            },
+            plan.names,
+        ),
+        ss::SsOutcome::Failed(error) => (
+            SsReport {
+                recovered: None,
+                conflicts: None,
+                error: Some(error.to_string()),
+            },
+            BTreeMap::new(),
+        ),
+    };
 
     // String-reference guess tier (fail-closed, lowest precedence). Active only
     // when the raw image (=> non-empty string_map) and globals.json are present.
@@ -3613,6 +3696,7 @@ fn build_map_from_input_files(
                 role_owns_current_primary,
                 reg_names.get(&f.entry),
             ),
+            ss: ss_name_for(f.entry, record_decode_isa, &ss_names),
             exception_manifest_blake3,
             exception: exception_app,
             exception_proposed_primary,
@@ -3648,7 +3732,7 @@ fn build_map_from_input_files(
         });
     }
     finalize_names(&mut symbols);
-    Ok(symbols)
+    Ok((symbols, ss_report))
 }
 
 /// Apply the built symbols to a per-image `decompiled/` dir in place; returns
@@ -3728,7 +3812,7 @@ fn symbolicate_image(
         role_evidence::ArtifactState::Unmanaged,
         role_evidence::ArtifactState::Unmanaged,
     )?;
-    let symbols = build_final_map_from_runtime(
+    let (symbols, _) = build_final_map_from_runtime(
         image_dir,
         tokens,
         &image,
@@ -3777,7 +3861,7 @@ pub(crate) fn run_current(
         let image_dir = images.join(label);
         let output =
             contexts[label].validate(&image_dir, |trusted_image, image, runtime, roles| {
-                let (decompiled, symbols) = build_final_map_from_trusted(
+                let (decompiled, symbols, _) = build_final_map_from_trusted(
                     trusted_image,
                     &tokens,
                     image,
@@ -3881,7 +3965,7 @@ mod tests {
                 role_evidence::ArtifactState::Unmanaged,
             )?
         };
-        super::build_map(
+        let (symbols, _) = super::build_map(
             image_dir,
             image_label,
             tokens,
@@ -3891,7 +3975,8 @@ mod tests {
                 exception_application,
                 pal_application,
             },
-        )
+        )?;
+        Ok(symbols)
     }
 
     fn ghidra_function(name: &str, entry: u32, end: u32, data_refs: &[u32]) -> serde_json::Value {
@@ -4139,6 +4224,7 @@ mod tests {
             dbt_sources: vec![],
             ident_guess: None,
             registration: None,
+            ss: None,
             exception_manifest_blake3: None,
             exception: None,
             exception_proposed_primary: None,
@@ -5418,6 +5504,115 @@ mod tests {
         assert_eq!(s.tier, Tier::Recovered);
         assert!(s.evidence.iter().any(|e| e.kind() == "registration"));
         assert_eq!(by_addr("0x40000280").name.as_deref(), Some("Handler_Three"));
+    }
+
+    #[test]
+    fn decide_ss_outranked_by_registration() {
+        let r = RawEvidence {
+            registration: Some("Handler_One".into()),
+            ss: Some("ss_Foo".into()),
+            ..raw()
+        };
+        let (name, tier, ev, _, _) = decide("40010050", &r);
+        assert_eq!(name.as_deref(), Some("Handler_One"));
+        assert_eq!(tier, Tier::Recovered);
+        assert!(ev.iter().any(|e| e.kind() == "registration"));
+        assert!(ev.iter().any(|e| e.kind() == "ss"));
+    }
+
+    #[test]
+    fn decide_ss_outranks_token() {
+        let r = RawEvidence {
+            ss: Some("ss_Foo".into()),
+            tokens: vec![(0x3c2a, "■format♦tok■domain♦D".into())],
+            ..raw()
+        };
+        let (name, tier, ev, _, _) = decide("40010050", &r);
+        assert_eq!(name.as_deref(), Some("ss_Foo"));
+        assert_eq!(tier, Tier::Recovered);
+        assert!(ev.iter().any(|e| e.kind() == "ss"));
+        assert!(ev.iter().any(|e| e.kind() == "token"));
+    }
+
+    #[test]
+    fn build_map_applies_ss_names_from_helper_callsite() {
+        let root = tmp("pme_sym_ss_callsite");
+        let dec = root.join("images/02_MAIN/decompiled");
+        std::fs::create_dir_all(&dec).unwrap();
+        const BASE: u32 = 0x4001_0000;
+        const A32_ADD_R0_PC_24: [u8; 4] = [0x18, 0x00, 0x8f, 0xe2];
+        const A32_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
+        let a32_bl = |pc: u32, target: u32| -> [u8; 4] {
+            let imm24 = target.wrapping_sub(pc.wrapping_add(8)) / 4;
+            (0xeb00_0000 | (imm24 & 0x00ff_ffff)).to_le_bytes()
+        };
+        let mut img = vec![0u8; 0x80];
+        img[0..4].copy_from_slice(&A32_ADD_R0_PC_24);
+        img[4..8].copy_from_slice(&0xeb00000du32.to_le_bytes());
+        img[8..12].copy_from_slice(&A32_BX_LR);
+        img[32..32 + ss::SEED.len()].copy_from_slice(ss::SEED);
+        img[0x40..0x44].copy_from_slice(&A32_BX_LR);
+        img[0x50..0x54].copy_from_slice(&A32_ADD_R0_PC_24);
+        img[0x54..0x58].copy_from_slice(&a32_bl(0x54, 0x40));
+        img[0x58..0x5c].copy_from_slice(&A32_BX_LR);
+        img[0x70..0x76].copy_from_slice(b"ss_Foo");
+        std::fs::write(root.join("images/02_MAIN/02_MAIN.bin"), &img).unwrap();
+        std::fs::write(
+            dec.join("functions.json"),
+            serde_json::to_vec(&vec![
+                ghidra_function_in_image("FUN_40010000", BASE, BASE + 0x10, &[], &img, BASE),
+                ghidra_function_in_image("FUN_40010050", BASE + 0x50, BASE + 0x60, &[], &img, BASE),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dec.join("disasm.lst"), "").unwrap();
+        let manifest = root.join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"toc":[{"name":"MAIN","load_addr":1073807360}]}"#,
+        )
+        .unwrap();
+
+        let image_dir = root.join("images/02_MAIN");
+        let context = role_evidence::CurrentSymbolicationContext::new(
+            role_evidence::RuntimeBinding::new(
+                "02_MAIN",
+                crate::manifest::toc_name("02_MAIN"),
+                BASE,
+                *blake3::hash(&img).as_bytes(),
+                role_evidence::ArtifactState::Unmanaged,
+            ),
+            role_evidence::ArtifactState::Unmanaged,
+            role_evidence::ArtifactState::Unmanaged,
+            role_evidence::ArtifactState::Unmanaged,
+        )
+        .unwrap();
+        let (symbols, report) = super::build_map(
+            &image_dir,
+            "02_MAIN",
+            &HashMap::new(),
+            &manifest,
+            context.roles(),
+            SymbolBuildPurpose::Pass2 {
+                exception_application: None,
+                pal_application: None,
+            },
+        )
+        .unwrap();
+
+        let by_addr = |a: &str| symbols.iter().find(|s| s.address == a).unwrap();
+        let seed = by_addr("0x40010000");
+        assert_eq!(seed.name.as_deref(), Some("ss_DecodeGmmFacilityMsg"));
+        assert_eq!(seed.tier, Tier::Recovered);
+        assert!(seed.evidence.iter().any(|e| e.kind() == "ss"));
+        let foo = by_addr("0x40010050");
+        assert_eq!(foo.name.as_deref(), Some("ss_Foo"));
+        assert_eq!(foo.tier, Tier::Recovered);
+        assert!(foo.evidence.iter().any(|e| e.kind() == "ss"));
+        assert_eq!(report.recovered, Some(2));
+        assert_eq!(report.conflicts, Some(0));
+        assert_eq!(report.error, None);
     }
 
     #[test]
@@ -7214,7 +7409,7 @@ mod tests {
         )
         .unwrap();
 
-        let symbols = build_final_map_from_runtime(
+        let (symbols, _) = build_final_map_from_runtime(
             &root,
             &HashMap::new(),
             &image,
@@ -7266,7 +7461,7 @@ mod tests {
             serde_json::json!(crate::manifest::blake3_bytes(&pal_image[start..start + 2]));
         write_map_functions(&pal_dir, &[record]);
 
-        let pal_symbols = build_final_map_from_runtime(
+        let (pal_symbols, _) = build_final_map_from_runtime(
             &pal_dir,
             &HashMap::new(),
             &pal_image,
@@ -7434,7 +7629,7 @@ mod tests {
         .unwrap();
         let tokens = HashMap::from([(0u32, "■format♦weaker_token_name■domain♦test".to_string())]);
 
-        let symbols = build_final_map_from_runtime(
+        let (symbols, _) = build_final_map_from_runtime(
             &root,
             &tokens,
             &image,
@@ -7475,7 +7670,7 @@ mod tests {
         )
         .unwrap();
 
-        let symbols = build_final_map_from_runtime(
+        let (symbols, _) = build_final_map_from_runtime(
             &root,
             &HashMap::new(),
             &image,
@@ -7542,7 +7737,7 @@ mod tests {
             EXCEPTION_TEST_BASE,
         )
         .unwrap();
-        let arm_symbols = build_final_map_from_runtime(
+        let (arm_symbols, _) = build_final_map_from_runtime(
             &arm_root,
             &HashMap::new(),
             &image,
@@ -7576,7 +7771,7 @@ mod tests {
         )
         .unwrap();
 
-        let symbols = build_map_from_runtime(
+        let (symbols, _) = build_map_from_runtime(
             &root,
             &HashMap::new(),
             &image,

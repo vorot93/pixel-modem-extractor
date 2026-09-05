@@ -1298,6 +1298,7 @@ mod tests {
             dbt_sources: Vec::new(),
             ident_guess: None,
             registration: None,
+            ss: None,
             exception_manifest_blake3: Some(manifest_blake3.to_string()),
             exception: Some(ExceptionRoleRefSet::from_pass2(&application)),
             exception_proposed_primary,
