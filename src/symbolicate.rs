@@ -3328,6 +3328,7 @@ fn ss_container_from_func(f: &FuncRec<'_>) -> Option<ss::SsContainer> {
             .map(|range| (range.start, range.end))
             .collect(),
         ghidra: f.owner == FunctionOwner::Ghidra,
+        current_primary: f.current_primary.clone(),
     })
 }
 
@@ -3556,7 +3557,10 @@ fn build_map_from_input_files(
 
     let containers: Vec<ss::SsContainer> =
         funcs.iter().filter_map(ss_container_from_func).collect();
-    let (ss_report, ss_names) = match ss::discover(runtime, &containers, &global_names, &fn_names) {
+    let mut ss_aliases = fn_names.clone();
+    ss_aliases.extend(reg_names.values().cloned());
+    let (ss_report, ss_names) = match ss::discover(runtime, &containers, &global_names, &ss_aliases)
+    {
         ss::SsOutcome::Absent => (SsReport::absent(), BTreeMap::new()),
         ss::SsOutcome::Present(plan) => (
             SsReport {

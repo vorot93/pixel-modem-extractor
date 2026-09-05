@@ -4496,13 +4496,6 @@ fn apply_global_shapes_outcome(image: &mut ImageReport, outcome: &GlobalShapesOu
     }
 }
 
-/// Re-apply every retained `global_shapes` outcome onto `report_images` by
-/// label. Called from `DispatchPass2` after every point that rebuilds the
-/// `decompile` stage's `ImageReport`s (see `GlobalShapesOutcome`'s doc
-/// comment for why that rebuild otherwise discards this data). A label
-/// absent from `outcomes` (no code image, or the whole stage was skipped) is
-/// left untouched — `report_images` is always a fresh rebuild at the call
-/// site, so its `global_shapes_*` fields are already `None` there.
 fn apply_ss_report(image: &mut ImageReport, report: &symbolicate::SsReport) {
     if report.error.is_some() {
         image.ss_recovered = None;
@@ -4526,6 +4519,22 @@ fn reapply_ss_outcomes(
     }
 }
 
+fn merge_ss_reports(
+    dst: &mut HashMap<String, symbolicate::SsReport>,
+    src: HashMap<String, symbolicate::SsReport>,
+) {
+    for (label, report) in src {
+        dst.entry(label).or_insert(report);
+    }
+}
+
+/// Re-apply every retained `global_shapes` outcome onto `report_images` by
+/// label. Called from `DispatchPass2` after every point that rebuilds the
+/// `decompile` stage's `ImageReport`s (see `GlobalShapesOutcome`'s doc
+/// comment for why that rebuild otherwise discards this data). A label
+/// absent from `outcomes` (no code image, or the whole stage was skipped) is
+/// left untouched — `report_images` is always a fresh rebuild at the call
+/// site, so its `global_shapes_*` fields are already `None` there.
 fn reapply_global_shapes_outcomes(
     report_images: &mut [ImageReport],
     outcomes: &HashMap<String, GlobalShapesOutcome>,
@@ -5195,7 +5204,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
         terminal_pass2_snapshots = snapshots;
         let (maps, errors, reports) =
             build_and_write_symbol_maps(out, &images_dir, &token_db, &terminal_pass2_snapshots);
-        ss_outcomes.extend(reports);
+        merge_ss_reports(&mut ss_outcomes, reports);
         let mut errors = errors;
         for issue in snapshot_errors {
             errors.push((issue.label, issue.reason));
@@ -5270,7 +5279,7 @@ pub fn run(img: &Path, opts: &Opts, out: &Path) -> Result<PathBuf> {
                     current_contexts,
                 ) {
                     Ok((_, reports)) => {
-                        ss_outcomes.extend(reports);
+                        merge_ss_reports(&mut ss_outcomes, reports);
                         reapply_ss_outcomes(decompile_stage_images_mut(&mut stages), &ss_outcomes);
                         stages.push(StageReport::ok(
                             "symbolicate_finalize",
@@ -13027,6 +13036,43 @@ mod tests {
         let value = serde_json::to_value(&images[1]).unwrap();
         assert!(value.get("ss_recovered").is_none());
         assert!(value.get("ss_conflicts").is_none());
+    }
+
+    #[test]
+    fn merge_ss_reports_keeps_existing_present() {
+        let mut dst = HashMap::from([(
+            "02_MAIN".to_string(),
+            symbolicate::SsReport {
+                recovered: Some(2),
+                conflicts: Some(0),
+                error: None,
+            },
+        )]);
+        merge_ss_reports(
+            &mut dst,
+            HashMap::from([(
+                "02_MAIN".to_string(),
+                symbolicate::SsReport {
+                    recovered: Some(0),
+                    conflicts: Some(2),
+                    error: None,
+                },
+            )]),
+        );
+        assert_eq!(dst["02_MAIN"].recovered, Some(2));
+        assert_eq!(dst["02_MAIN"].conflicts, Some(0));
+        merge_ss_reports(
+            &mut dst,
+            HashMap::from([(
+                "03_APM".to_string(),
+                symbolicate::SsReport {
+                    recovered: Some(1),
+                    conflicts: Some(0),
+                    error: None,
+                },
+            )]),
+        );
+        assert_eq!(dst["03_APM"].recovered, Some(1));
     }
 
     #[test]

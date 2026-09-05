@@ -96,6 +96,7 @@ pub(crate) struct SsContainer {
     pub isa: DecodeIsa,
     pub ranges: Vec<(u32, u32)>,
     pub ghidra: bool,
+    pub current_primary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +257,7 @@ fn name_at_callsite(
     pc: u32,
     helper_isa: DecodeIsa,
     containers: &[SsContainer],
-) -> Option<(u32, DecodeIsa, String)> {
+) -> Option<(u32, DecodeIsa, String, String)> {
     let container = unique_container(containers, pc, helper_isa)?;
     let cfg = SemanticCfg::decode_with_address_window(
         runtime,
@@ -273,7 +274,12 @@ fn name_at_callsite(
         .and_then(|state| state.get(Register(0)))
         .map(|value| value.value)?;
     let name = read_ss_ident(runtime, address)?;
-    Some((container.entry, container.isa, name))
+    Some((
+        container.entry,
+        container.isa,
+        name,
+        container.current_primary.clone(),
+    ))
 }
 
 fn unique_container(
@@ -338,11 +344,18 @@ fn cstring_content_byte(byte: u8) -> bool {
 }
 
 fn one_to_one(
-    pairs: Vec<(u32, DecodeIsa, String)>,
+    pairs: Vec<(u32, DecodeIsa, String, String)>,
     globals: &HashSet<String>,
     fn_names: &HashSet<String>,
 ) -> (BTreeMap<(u32, DecodeIsa), String>, usize) {
-    let unique: BTreeSet<(u32, DecodeIsa, String)> = pairs.into_iter().collect();
+    let mut primaries: BTreeMap<(u32, DecodeIsa), String> = BTreeMap::new();
+    let unique: BTreeSet<(u32, DecodeIsa, String)> = pairs
+        .into_iter()
+        .map(|(entry, isa, name, current_primary)| {
+            primaries.entry((entry, isa)).or_insert(current_primary);
+            (entry, isa, name)
+        })
+        .collect();
     let total = unique.len();
     let mut names_for_id: BTreeMap<(u32, DecodeIsa), BTreeSet<String>> = BTreeMap::new();
     let mut ids_for_name: BTreeMap<String, BTreeSet<(u32, DecodeIsa)>> = BTreeMap::new();
@@ -365,7 +378,10 @@ fn one_to_one(
         if ids_for_name[&name].len() != 1 {
             continue;
         }
-        if globals.contains(&name) || fn_names.contains(&name) {
+        let self_primary = primaries.get(&identity).map(String::as_str);
+        if self_primary != Some(name.as_str())
+            && (globals.contains(&name) || fn_names.contains(&name))
+        {
             continue;
         }
         names.insert(identity, name);
@@ -493,6 +509,10 @@ mod tests {
     use super::{SEED, SsContainer, SsNameError, SsOutcome, discover, prove_helper};
     use crate::execution_ranges::DecodeIsa;
     use crate::runtime_image::RuntimeImage;
+    use scaleservers_arm32_assembly::{
+        Arm32GeneralPurposeRegister as Gpr, Arm32LowGeneralPurposeRegister as Low,
+        ArmT32Instruction as T32,
+    };
     use std::collections::HashSet;
 
     const BASE: u32 = 0x4001_0000;
@@ -536,6 +556,46 @@ mod tests {
             SsOutcome::Present(plan) => {
                 assert_eq!(plan.helper_entry, BASE + 0x40);
                 assert_eq!(plan.helper_isa, DecodeIsa::Arm);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn enc_t32(instruction: &T32) -> Vec<u8> {
+        instruction.encode().expect("fixture encodes")
+    }
+
+    fn t32_low(number: u8) -> Low {
+        Low::from_operand_bits(number)
+    }
+
+    fn t32_gpr(number: u8) -> Gpr {
+        Gpr::from_operand_bits(number)
+    }
+
+    fn put_t32(image: &mut [u8], offset: usize, instruction: &T32) {
+        let bytes = enc_t32(instruction);
+        image[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    fn t32_adr_r0_bl_image() -> Vec<u8> {
+        let mut image = vec![0u8; 0x80];
+        put_t32(&mut image, 0, &T32::Adr_T1(t32_low(0), 0x1c));
+        put_t32(&mut image, 2, &T32::Bl_T1(0x3a));
+        put_t32(&mut image, 6, &T32::Bx_T1(t32_gpr(14)));
+        plant_seed(&mut image, 0x20);
+        put_t32(&mut image, 0x40, &T32::Bx_T1(t32_gpr(14)));
+        image
+    }
+
+    #[test]
+    fn unique_seed_thumb_adr_r0_bl_proves_helper() {
+        let image = t32_adr_r0_bl_image();
+        let runtime = RuntimeImage::from_plan(&image, BASE, None).unwrap();
+        match prove_helper(&runtime) {
+            SsOutcome::Present(plan) => {
+                assert_eq!(plan.helper_entry, BASE + 0x40);
+                assert_eq!(plan.helper_isa, DecodeIsa::Thumb);
             }
             other => panic!("{other:?}"),
         }
@@ -653,6 +713,7 @@ mod tests {
             isa: DecodeIsa::Arm,
             ranges: vec![(BASE, BASE + 0x10)],
             ghidra: true,
+            current_primary: String::new(),
         }
     }
 
@@ -662,6 +723,36 @@ mod tests {
             isa: DecodeIsa::Arm,
             ranges: vec![(BASE + 0x50, BASE + 0x60)],
             ghidra: true,
+            current_primary: String::new(),
+        }
+    }
+
+    fn t32_foo_callsite_image(name: &[u8]) -> Vec<u8> {
+        let mut image = t32_adr_r0_bl_image();
+        put_t32(&mut image, 0x50, &T32::Adr_T1(t32_low(0), 0x1c));
+        put_t32(&mut image, 0x52, &T32::Bl_T1(-0x16));
+        put_t32(&mut image, 0x56, &T32::Bx_T1(t32_gpr(14)));
+        plant_cstr(&mut image, 0x70, name);
+        image
+    }
+
+    fn t32_seed_container() -> SsContainer {
+        SsContainer {
+            entry: BASE,
+            isa: DecodeIsa::Thumb,
+            ranges: vec![(BASE, BASE + 0x10)],
+            ghidra: true,
+            current_primary: String::new(),
+        }
+    }
+
+    fn t32_foo_container() -> SsContainer {
+        SsContainer {
+            entry: BASE + 0x50,
+            isa: DecodeIsa::Thumb,
+            ranges: vec![(BASE + 0x50, BASE + 0x60)],
+            ghidra: true,
+            current_primary: String::new(),
         }
     }
 
@@ -694,6 +785,21 @@ mod tests {
     }
 
     #[test]
+    fn thumb_callsite_names_containing_function() {
+        let image = t32_foo_callsite_image(b"ss_Foo");
+        let containers = [t32_seed_container(), t32_foo_container()];
+        let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
+        assert_eq!(plan.helper_entry, BASE + 0x40);
+        assert_eq!(plan.helper_isa, DecodeIsa::Thumb);
+        assert_eq!(
+            plan.names
+                .get(&(BASE + 0x50, DecodeIsa::Thumb))
+                .map(String::as_str),
+            Some("ss_Foo")
+        );
+    }
+
+    #[test]
     fn duplicate_name_is_conflict_not_recovered() {
         let mut image = foo_callsite_image(b"ss_Foo");
         image.resize(0xc0, 0);
@@ -706,6 +812,7 @@ mod tests {
             isa: DecodeIsa::Arm,
             ranges: vec![(BASE + 0x80, BASE + 0x90)],
             ghidra: true,
+            current_primary: String::new(),
         };
         let containers = [seed_container(), foo_container(), second];
         let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
@@ -728,6 +835,23 @@ mod tests {
         let fn_names = HashSet::from(["ss_Foo".to_string()]);
         let plan = discover_names(&image, &containers, &HashSet::new(), &fn_names);
         assert!(!plan.names.contains_key(&(BASE + 0x50, DecodeIsa::Arm)));
+    }
+
+    #[test]
+    fn own_current_primary_ss_name_is_not_an_alias() {
+        let image = foo_callsite_image(b"ss_Foo");
+        let foo = SsContainer {
+            current_primary: "ss_Foo".into(),
+            ..foo_container()
+        };
+        let fn_names = HashSet::from(["ss_Foo".to_string()]);
+        let plan = discover_names(&image, &[seed_container(), foo], &HashSet::new(), &fn_names);
+        assert_eq!(
+            plan.names
+                .get(&(BASE + 0x50, DecodeIsa::Arm))
+                .map(String::as_str),
+            Some("ss_Foo")
+        );
     }
 
     #[test]

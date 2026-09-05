@@ -68,7 +68,11 @@ fn assert_corpus(pins: &CorpusPin) {
     )
     .unwrap_or_else(|error| panic!("{} generation failed: {error}", pins.env_var));
 
-    if report.helper_entry.is_none() && report.error.is_none() {
+    if let Some(error) = &report.error {
+        panic!("{} generation failed: {error}", pins.env_var);
+    }
+
+    if report.helper_entry.is_none() {
         eprintln!("PIN OBSERVED: {} status=absent", pins.env_var);
         assert!(
             pins.helper_entry.is_empty() && pins.helper_isa.is_empty() && pins.callsites.is_empty(),

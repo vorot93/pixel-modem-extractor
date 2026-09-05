@@ -1245,9 +1245,15 @@ hardcoded. Two reference images exercise both models end-to-end:
 - **Rejected adjacency.** The helper is not "next branch within five instructions" and not a
   hardcoded address. Do not admit SVC-spanning `MOVW`/`MOVT` pairs. Do not mint names from
   string adjacency or analyzer xrefs.
+- **1:1 alias set.** Drop a name that collides with a recovered global, a `__func__` name, or
+  another function's registration name. A pair whose name equals that identity's current
+  primary is self, not an alias — finalize inventories carry already-applied `ss_*`
+  primaries, and treating those as aliases zeros every recovered name. `merge_ss_reports`
+  keeps the first Present report so a later empty finalize cannot overwrite it.
 - **Pin procedure.** `tests/ss_names_golden.rs`: leave sentinels empty, run a lawful corpus
   leg, copy only the printed `PIN OBSERVED` helper entry/ISA, callsite count, and (when
-  `PME_DECOMPOSED_GOLDEN_DIR` is set) recovered/conflicts. No firmware names. Do not call
+  `PME_DECOMPOSED_GOLDEN_DIR` is set) recovered/conflicts. `report.error` is a failed
+  generation, never an empty-sentinel success. No firmware names. Do not call
   H1.1 landed until both inventory-gated legs PASS with copied pins.
 
 ### Runtime startup metadata
