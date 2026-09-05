@@ -7,15 +7,13 @@ use crate::execution_ranges::DecodeIsa;
 use crate::pal_messages::{PalMessageError, SemanticRef, find_unique_seed, semantic_refs};
 use crate::runtime_image::RuntimeImage;
 use crate::semantic_cfg::{CallPolicy, CfgLimits, SemanticCfg, SemanticCfgError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 pub(crate) const SEED: &[u8] = b"ss_DecodeGmmFacilityMsg";
 #[allow(dead_code)]
 pub(crate) const MAX_CSTRING_BYTES: usize = 128;
-#[allow(dead_code)]
 pub(crate) const MAX_SS_CALLSITES: usize = 4096;
-#[allow(dead_code)]
 pub(crate) const MAX_IDENT_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +90,6 @@ pub(crate) fn map_pal_error(error: PalMessageError) -> SsNameError {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SsContainer {
     pub entry: u32,
@@ -172,6 +169,209 @@ pub(crate) fn prove_helper(runtime: &RuntimeImage<'_>) -> SsOutcome {
         },
         Err(error) => SsOutcome::Failed(error),
     }
+}
+
+pub(crate) fn discover(
+    runtime: &RuntimeImage<'_>,
+    containers: &[SsContainer],
+    globals: &HashSet<String>,
+    fn_names: &HashSet<String>,
+) -> SsOutcome {
+    let mut plan = match prove_helper(runtime) {
+        SsOutcome::Present(plan) => plan,
+        other => return other,
+    };
+    let callsites = match collect_helper_callsites(runtime, plan.helper_entry, plan.helper_isa) {
+        Ok(callsites) => callsites,
+        Err(error) => return SsOutcome::Failed(error),
+    };
+    plan.callsites = callsites.len();
+    let mut pairs = Vec::new();
+    for pc in callsites {
+        if let Some(pair) = name_at_callsite(runtime, pc, plan.helper_isa, containers) {
+            pairs.push(pair);
+        }
+    }
+    let (names, conflicts) = one_to_one(pairs, globals, fn_names);
+    plan.names = names;
+    plan.conflicts = conflicts;
+    SsOutcome::Present(plan)
+}
+
+fn collect_helper_callsites(
+    runtime: &RuntimeImage<'_>,
+    helper_entry: u32,
+    helper_isa: DecodeIsa,
+) -> Result<Vec<u32>, SsNameError> {
+    let step: u32 = match helper_isa {
+        DecodeIsa::Arm => 4,
+        DecodeIsa::Thumb => 2,
+    };
+    let mut callsites = Vec::new();
+    for range in runtime.byte_backed_ranges() {
+        let mask = step.wrapping_sub(1);
+        let mut pc = range.start & !mask;
+        if pc < range.start {
+            pc = match pc.checked_add(step) {
+                Some(next) => next,
+                None => continue,
+            };
+        }
+        while pc.saturating_add(step) <= range.end {
+            if let Some(instruction) = decode_at(runtime, pc, helper_isa)
+                && let ControlFlow::DirectCall { target } = instruction.flow
+                && target == helper_entry
+            {
+                callsites.push(pc);
+                if callsites.len() > MAX_SS_CALLSITES {
+                    return Err(SsNameError::ResourceLimit {
+                        what: "callsites",
+                        actual: callsites.len() as u64,
+                        limit: MAX_SS_CALLSITES as u64,
+                    });
+                }
+            }
+            pc = match pc.checked_add(step) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+    }
+    Ok(callsites)
+}
+
+fn decode_at(runtime: &RuntimeImage<'_>, pc: u32, isa: DecodeIsa) -> Option<DecodedInstruction> {
+    let bytes = runtime.read_exact(pc, 4).ok()?;
+    match isa {
+        DecodeIsa::Arm => decode_a32(pc, bytes.as_ref()).ok(),
+        DecodeIsa::Thumb => {
+            let mut it = ItRangeState::default();
+            decode_t32(&mut it, pc, bytes.as_ref()).ok()
+        }
+    }
+}
+
+fn name_at_callsite(
+    runtime: &RuntimeImage<'_>,
+    pc: u32,
+    helper_isa: DecodeIsa,
+    containers: &[SsContainer],
+) -> Option<(u32, DecodeIsa, String)> {
+    let container = unique_container(containers, pc, helper_isa)?;
+    let cfg = SemanticCfg::decode_with_address_window(
+        runtime,
+        container.entry,
+        container.isa,
+        CfgLimits::ss_names(),
+        CallPolicy::Fallthrough,
+        Some(512),
+    )
+    .ok()?;
+    let address = cfg
+        .exact_register_states()
+        .get(&pc)
+        .and_then(|state| state.get(Register(0)))
+        .map(|value| value.value)?;
+    let name = read_ss_ident(runtime, address)?;
+    Some((container.entry, container.isa, name))
+}
+
+fn unique_container(
+    containers: &[SsContainer],
+    pc: u32,
+    helper_isa: DecodeIsa,
+) -> Option<&SsContainer> {
+    let mut by_entry: BTreeMap<u32, &SsContainer> = BTreeMap::new();
+    for container in containers {
+        if container.isa != helper_isa {
+            continue;
+        }
+        if !container
+            .ranges
+            .iter()
+            .any(|&(start, end)| start <= pc && pc < end)
+        {
+            continue;
+        }
+        match by_entry.get(&container.entry) {
+            Some(existing) if existing.ghidra || !container.ghidra => {}
+            _ => {
+                by_entry.insert(container.entry, container);
+            }
+        }
+    }
+    if by_entry.len() != 1 {
+        return None;
+    }
+    by_entry.into_values().next()
+}
+
+fn read_ss_ident(runtime: &RuntimeImage<'_>, address: u32) -> Option<String> {
+    let mut bytes = Vec::new();
+    for offset in 0..=MAX_IDENT_BYTES {
+        let offset = u32::try_from(offset).ok()?;
+        let cursor = address.checked_add(offset)?;
+        if !runtime.is_byte_backed(cursor, 1).ok()? {
+            return None;
+        }
+        let byte = runtime.read_u8(cursor).ok()?;
+        if byte == 0 {
+            let name = String::from_utf8(bytes).ok()?;
+            if name.starts_with("ss_") && super::name_guess::is_ident(&name) {
+                return Some(name);
+            }
+            return None;
+        }
+        if !cstring_content_byte(byte) {
+            return None;
+        }
+        if offset as usize == MAX_IDENT_BYTES {
+            return None;
+        }
+        bytes.push(byte);
+    }
+    None
+}
+
+fn cstring_content_byte(byte: u8) -> bool {
+    byte == b'\t' || byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte)
+}
+
+fn one_to_one(
+    pairs: Vec<(u32, DecodeIsa, String)>,
+    globals: &HashSet<String>,
+    fn_names: &HashSet<String>,
+) -> (BTreeMap<(u32, DecodeIsa), String>, usize) {
+    let unique: BTreeSet<(u32, DecodeIsa, String)> = pairs.into_iter().collect();
+    let total = unique.len();
+    let mut names_for_id: BTreeMap<(u32, DecodeIsa), BTreeSet<String>> = BTreeMap::new();
+    let mut ids_for_name: BTreeMap<String, BTreeSet<(u32, DecodeIsa)>> = BTreeMap::new();
+    for (entry, isa, name) in &unique {
+        names_for_id
+            .entry((*entry, *isa))
+            .or_default()
+            .insert(name.clone());
+        ids_for_name
+            .entry(name.clone())
+            .or_default()
+            .insert((*entry, *isa));
+    }
+    let mut names = BTreeMap::new();
+    for (identity, name_set) in names_for_id {
+        if name_set.len() != 1 {
+            continue;
+        }
+        let name = name_set.into_iter().next().expect("len == 1");
+        if ids_for_name[&name].len() != 1 {
+            continue;
+        }
+        if globals.contains(&name) || fn_names.contains(&name) {
+            continue;
+        }
+        names.insert(identity, name);
+    }
+    let conflicts = total - names.len();
+    (names, conflicts)
 }
 
 fn consuming_helpers(
@@ -290,9 +490,10 @@ fn decode_helper_instruction(
 
 #[cfg(test)]
 mod tests {
-    use super::{SEED, SsNameError, SsOutcome, prove_helper};
+    use super::{SEED, SsContainer, SsNameError, SsOutcome, discover, prove_helper};
     use crate::execution_ranges::DecodeIsa;
     use crate::runtime_image::RuntimeImage;
+    use std::collections::HashSet;
 
     const BASE: u32 = 0x4001_0000;
     const A32_ADD_R0_PC_24: [u8; 4] = [0x18, 0x00, 0x8f, 0xe2];
@@ -425,5 +626,140 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn a32_bl(pc: u32, target: u32) -> [u8; 4] {
+        let imm24 = target.wrapping_sub(pc.wrapping_add(8)) / 4;
+        (0xeb00_0000 | (imm24 & 0x00ff_ffff)).to_le_bytes()
+    }
+
+    fn plant_cstr(image: &mut [u8], offset: usize, bytes: &[u8]) {
+        image[offset..offset + bytes.len()].copy_from_slice(bytes);
+        image[offset + bytes.len()] = 0;
+    }
+
+    fn foo_callsite_image(name: &[u8]) -> Vec<u8> {
+        let mut image = adr_r0_bl_image();
+        image[0x50..0x54].copy_from_slice(&A32_ADD_R0_PC_24);
+        image[0x54..0x58].copy_from_slice(&a32_bl(0x54, 0x40));
+        image[0x58..0x5c].copy_from_slice(&A32_BX_LR);
+        plant_cstr(&mut image, 0x70, name);
+        image
+    }
+
+    fn seed_container() -> SsContainer {
+        SsContainer {
+            entry: BASE,
+            isa: DecodeIsa::Arm,
+            ranges: vec![(BASE, BASE + 0x10)],
+            ghidra: true,
+        }
+    }
+
+    fn foo_container() -> SsContainer {
+        SsContainer {
+            entry: BASE + 0x50,
+            isa: DecodeIsa::Arm,
+            ranges: vec![(BASE + 0x50, BASE + 0x60)],
+            ghidra: true,
+        }
+    }
+
+    fn discover_names(
+        image: &[u8],
+        containers: &[SsContainer],
+        globals: &HashSet<String>,
+        fn_names: &HashSet<String>,
+    ) -> super::SsPlan {
+        let runtime = RuntimeImage::from_plan(image, BASE, None).unwrap();
+        match discover(&runtime, containers, globals, fn_names) {
+            SsOutcome::Present(plan) => plan,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn callsite_names_containing_function() {
+        let image = foo_callsite_image(b"ss_Foo");
+        let containers = [seed_container(), foo_container()];
+        let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
+        assert_eq!(plan.helper_entry, BASE + 0x40);
+        assert_eq!(plan.helper_isa, DecodeIsa::Arm);
+        assert_eq!(
+            plan.names
+                .get(&(BASE + 0x50, DecodeIsa::Arm))
+                .map(String::as_str),
+            Some("ss_Foo")
+        );
+    }
+
+    #[test]
+    fn duplicate_name_is_conflict_not_recovered() {
+        let mut image = foo_callsite_image(b"ss_Foo");
+        image.resize(0xc0, 0);
+        image[0x80..0x84].copy_from_slice(&[0x08, 0x00, 0x8f, 0xe2]);
+        image[0x84..0x88].copy_from_slice(&a32_bl(0x84, 0x40));
+        image[0x88..0x8c].copy_from_slice(&A32_BX_LR);
+        plant_cstr(&mut image, 0x90, b"ss_Foo");
+        let second = SsContainer {
+            entry: BASE + 0x80,
+            isa: DecodeIsa::Arm,
+            ranges: vec![(BASE + 0x80, BASE + 0x90)],
+            ghidra: true,
+        };
+        let containers = [seed_container(), foo_container(), second];
+        let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
+        assert!(!plan.names.values().any(|name| name == "ss_Foo"));
+        assert!(plan.conflicts >= 2);
+    }
+
+    #[test]
+    fn non_ss_prefix_is_dropped() {
+        let image = foo_callsite_image(b"Foo");
+        let containers = [seed_container(), foo_container()];
+        let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
+        assert!(!plan.names.contains_key(&(BASE + 0x50, DecodeIsa::Arm)));
+    }
+
+    #[test]
+    fn name_in_fn_names_is_dropped() {
+        let image = foo_callsite_image(b"ss_Foo");
+        let containers = [seed_container(), foo_container()];
+        let fn_names = HashSet::from(["ss_Foo".to_string()]);
+        let plan = discover_names(&image, &containers, &HashSet::new(), &fn_names);
+        assert!(!plan.names.contains_key(&(BASE + 0x50, DecodeIsa::Arm)));
+    }
+
+    #[test]
+    fn missing_container_skips_callsite() {
+        let image = foo_callsite_image(b"ss_Foo");
+        let containers = [seed_container()];
+        let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
+        assert!(!plan.names.contains_key(&(BASE + 0x50, DecodeIsa::Arm)));
+    }
+
+    #[test]
+    fn proven_helper_without_valid_callsite_names_is_present_empty() {
+        let image = adr_r0_bl_image();
+        let plan = discover_names(&image, &[], &HashSet::new(), &HashSet::new());
+        assert_eq!(plan.helper_entry, BASE + 0x40);
+        assert!(plan.names.is_empty());
+    }
+
+    #[test]
+    fn ghidra_preferred_over_thumb_at_same_entry() {
+        let image = foo_callsite_image(b"ss_Foo");
+        let thumb = SsContainer {
+            ghidra: false,
+            ..foo_container()
+        };
+        let containers = [seed_container(), thumb, foo_container()];
+        let plan = discover_names(&image, &containers, &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            plan.names
+                .get(&(BASE + 0x50, DecodeIsa::Arm))
+                .map(String::as_str),
+            Some("ss_Foo")
+        );
     }
 }
